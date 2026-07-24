@@ -332,7 +332,7 @@ impl Checker {
     /// construcción (ver check_expr/synth_expr) -- nunca por is_subtype,
     /// que compara genéricos nominalmente (mismo nombre + mismos args ya
     /// alcanza vía la igualdad derivada, ver types.rs).
-    fn expand_generic_struct(&self, name: &str, args: &[Type]) -> Result<Vec<FieldType>, CheckError> {
+    pub(crate) fn expand_generic_struct(&self, name: &str, args: &[Type]) -> Result<Vec<FieldType>, CheckError> {
         let decl = self.types.get(name).ok_or_else(|| err(format!("tipo desconocido: '{name}'")))?;
         let TypeExpr::Struct(fields) = &decl.ty else {
             return Err(err(format!("'{name}' no es un struct genérico, no se puede construir con {{...}}")));
@@ -758,7 +758,7 @@ impl Checker {
         }
     }
 
-    fn enum_variant_names(&self, name: &str) -> Result<Vec<String>, CheckError> {
+    pub(crate) fn enum_variant_names(&self, name: &str) -> Result<Vec<String>, CheckError> {
         self.enums
             .get(name)
             .map(|e| e.variants.iter().map(|v| v.name.clone()).collect())
@@ -808,7 +808,7 @@ impl Checker {
         }
     }
 
-    fn variant_field_types(
+    pub(crate) fn variant_field_types(
         &self,
         scrutinee_ty: &Type,
         enum_name: &str,

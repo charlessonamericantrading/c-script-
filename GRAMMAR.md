@@ -520,6 +520,30 @@ S_ret <: T_ret  (el retorno, en el mismo sentido que todo lo demás)
 
 Es una decisión de alcance real, no una omisión: para un lenguaje cuyo propósito central es un contrato RPC tipado (PLAN.md §1), el consumidor principal de closures completos serían combinadores sobre colecciones que todavía no existen. Implementar closures de verdad (captura por valor vs. por referencia, análisis de qué variables escapan, su equivalente al emitir TypeScript) antes de tener ese consumidor sería construir infraestructura sin un caso de uso real que la ejercite todavía — mismo criterio que ya se aplicó al posponer WASM/LSP/gestor de paquetes a Fase 1+ (PLAN.md §4).
 
+### 3.11 Validadores runtime (`validators.ts`) — RESUELTO
+
+Planeado desde el documento original (`PLAN.md` §3.1: *"[4b] Emisor de contrato → .d.ts + cliente TS + validadores"*, *"esto es lo que hace la seguridad real en el borde, no solo compile-time"*) pero nunca construido hasta ahora — `compiler/src/codegen/ts_emit.rs` solo emitía `.d.ts` y `client.ts`. `linkc build`/`linkc dev` ahora generan un tercer archivo, `validators.ts` (`compiler/src/codegen/validators_emit.rs`), y `client.ts` valida cada respuesta contra él antes de devolverla.
+
+```typescript
+async getById(id: number): Promise<User | null> {
+  const res = await fetch(...);
+  if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+  const json: unknown = await res.json();
+  if (!(json === null || isUser(json))) throw new LinkValidationError("getById", json);
+  return json as User | null;
+}
+```
+
+**Generación por tipo concreto alcanzado, no por declaración con nombre.** Recorre las mismas firmas de rpc ya resueltas que usa `emit_client`, y genera una función `isX(x: unknown): x is X` por cada tipo con identidad propia (struct con nombre, enum, `Result<T,E>`, `Patch<T>`, instanciación de un genérico) que aparece en ellas — nunca para `Box<T>` abstracto (opaco, GRAMMAR.md §3.6), solo para instanciaciones concretas como `Box<Int>` que ya llegan resueltas. Un tipo estructural (Optional/List/Tuple/Union/Map/struct anónimo) no tiene función propia — se valida inline, igual que `render_type`/`render_type_atom` (ts_emit.rs) tratan esa misma división entre "tiene nombre" y "se renderiza en el lugar".
+
+**Predicados a mano, no Zod/typia.** Consumir `validators.ts` no debería exigirle al usuario instalar nada — mismo criterio de cero dependencias nuevas que el resto del compilador (`tiny_http` + `serde_json` siguen siendo las únicas, y son del lado Rust, no del TS generado).
+
+**`Patch<T>` tiene su propio validador, no delega en el de `T`.** Igual que `render_type` vuelve cada campo `?:` para `Patch<T>` (`Partial<T>`, §3.4), su validador vuelve cada campo `=== undefined || <chequeo>` — incluidos los que en `T` eran requeridos. Validar un patch contra el validador de `T` a secas rechazaría de forma incorrecta un patch parcial válido.
+
+**Tercera categoría de error, `LinkValidationError`.** Ni un error de dominio declarado (`Result<T,E>`, siempre vuelve como valor) ni un fallo de transporte (`LinkTransportError`, red/5xx/timeout) — "el servidor respondió 200 pero el payload no matchea el contrato" es su propio modo de falla, con su propia clase, consistente con la línea divisoria que ya traza §3.5 entre las otras dos.
+
+**Límite real: solo valida lo que efectivamente cruza el wire.** Un `type`/`enum` que ningún `rpc` usa como parámetro o retorno no genera validador — no hay ningún valor real en runtime que necesite chequear su forma. Si se agrega un `rpc` nuevo que lo referencia, el próximo `linkc build`/`linkc dev` lo agrega solo.
+
 ---
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)

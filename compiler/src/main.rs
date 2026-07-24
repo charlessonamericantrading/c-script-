@@ -105,6 +105,13 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
             return BuildResult { ok: false, touched };
         }
     };
+    let validators = match codegen::validators_emit::emit_validators(&program) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error al emitir validators.ts: {e}");
+            return BuildResult { ok: false, touched };
+        }
+    };
 
     if let Err(e) = fs::create_dir_all(outdir) {
         eprintln!("no se pudo crear {outdir}: {e}");
@@ -112,6 +119,7 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
     }
     let contract_path = format!("{outdir}/contract.d.ts");
     let client_path = format!("{outdir}/client.ts");
+    let validators_path = format!("{outdir}/validators.ts");
     if let Err(e) = fs::write(&contract_path, contract) {
         eprintln!("no se pudo escribir {contract_path}: {e}");
         return BuildResult { ok: false, touched };
@@ -120,8 +128,12 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
         eprintln!("no se pudo escribir {client_path}: {e}");
         return BuildResult { ok: false, touched };
     }
+    if let Err(e) = fs::write(&validators_path, validators) {
+        eprintln!("no se pudo escribir {validators_path}: {e}");
+        return BuildResult { ok: false, touched };
+    }
 
-    println!("OK: generado {contract_path} y {client_path}");
+    println!("OK: generado {contract_path}, {client_path} y {validators_path}");
     BuildResult { ok: true, touched }
 }
 

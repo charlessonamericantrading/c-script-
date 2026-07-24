@@ -6,6 +6,7 @@
 // emite: es lógica interna del backend, no parte del contrato (GRAMMAR.md
 // nota sobre fn_decl en §2.1).
 
+use super::validators_emit;
 use crate::ast::*;
 use crate::checker::Checker;
 use crate::types::Type;
@@ -112,8 +113,10 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     };
 
     // Primera pasada: resolver todas las firmas para (a) saber qué importar
-    // de "./contract" y (b) no resolver dos veces lo mismo en la segunda.
+    // de "./contract" y "./validators" y (b) no resolver dos veces lo mismo
+    // en la segunda.
     let mut imported_names = std::collections::BTreeSet::new();
+    let mut validator_names = std::collections::BTreeSet::new();
     let mut resolved: Vec<(&RpcDecl, bool, Vec<Type>, Type)> = Vec::new();
     for m in &service.members {
         let (rpc, is_stream) = match m {
@@ -128,19 +131,44 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         }
         let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
         collect_type_names(&ret_ty, &mut imported_names);
+        // El stub de stream (más abajo) no valida nada todavía -- no hace
+        // falta importar su validador hasta que streaming esté implementado.
+        if !is_stream {
+            validators_emit::collect_validator_names(&ret_ty, &mut validator_names);
+        }
         resolved.push((rpc, is_stream, param_tys, ret_ty));
     }
     imported_names.insert(format!("{}Client", service.name));
 
     out.push_str(&format!(
-        "import type {{ {} }} from \"./contract\";\n\n",
+        "import type {{ {} }} from \"./contract\";\n",
         imported_names.into_iter().collect::<Vec<_>>().join(", ")
     ));
+    if !validator_names.is_empty() {
+        out.push_str(&format!(
+            "import {{ {} }} from \"./validators\";\n",
+            validator_names.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    out.push('\n');
     // Errores de transporte vs de dominio (GRAMMAR.md §3.5): esta excepción es
     // SOLO para fallos de infraestructura (red, 5xx, timeout) — los errores de
     // dominio que un rpc declaró en su Result<T,E> siempre vuelven como valor,
     // nunca se lanzan.
     out.push_str("export class LinkTransportError extends Error {}\n\n");
+    // Distinta de las dos anteriores: ni un error de dominio declarado
+    // (Result<T,E>) ni un fallo de transporte -- "el servidor respondió 200
+    // pero el payload no matchea el contrato", su propia categoría (GRAMMAR.md
+    // §3.5 ya traza exactamente esta línea divisoria para las otras dos).
+    out.push_str("export class LinkValidationError extends Error {\n");
+    out.push_str("  rpcName: string;\n");
+    out.push_str("  received: unknown;\n");
+    out.push_str("  constructor(rpcName: string, received: unknown) {\n");
+    out.push_str("    super(`la respuesta de '${rpcName}' no matchea el contrato declarado`);\n");
+    out.push_str("    this.rpcName = rpcName;\n");
+    out.push_str("    this.received = received;\n");
+    out.push_str("  }\n");
+    out.push_str("}\n\n");
 
     out.push_str(&format!("class {name}ClientImpl implements {name}Client {{\n", name = service.name));
     // Constructor explícito, no "parameter property" (`private x: T` en la
@@ -191,7 +219,13 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         out.push_str(&format!("      body: JSON.stringify({{ {} }}),\n", arg_names.join(", ")));
         out.push_str("    });\n");
         out.push_str("    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);\n");
-        out.push_str("    return res.json();\n");
+        out.push_str("    const json: unknown = await res.json();\n");
+        let check = validators_emit::render_check_expr(ret_ty, "json");
+        out.push_str(&format!(
+            "    if (!({check})) throw new LinkValidationError(\"{}\", json);\n",
+            rpc.name
+        ));
+        out.push_str(&format!("    return json as {};\n", render_type(ret_ty)));
         out.push_str("  }\n\n");
     }
     out.push_str("}\n\n");
@@ -312,7 +346,7 @@ fn emit_service_interface(out: &mut String, s: &ServiceDecl, checker: &Checker) 
 }
 
 /// Type resuelto -> string TypeScript, siguiendo GRAMMAR.md §4 al pie de la letra.
-fn render_type(ty: &Type) -> String {
+pub(crate) fn render_type(ty: &Type) -> String {
     match ty {
         Type::Int | Type::Float => "number".to_string(),
         Type::String => "string".to_string(),
@@ -383,7 +417,7 @@ fn render_type(ty: &Type) -> String {
 /// referenciados por `ty`, para saber qué importar de "./contract" en
 /// client.ts. Los tipos estructurales (Optional/List/Tuple/Function) no
 /// tienen nombre propio — solo se recorren para encontrar los que sí.
-fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeSet<String>) {
+pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeSet<String>) {
     match ty {
         Type::Struct { name: Some(n), .. } => {
             names.insert(n.clone());
