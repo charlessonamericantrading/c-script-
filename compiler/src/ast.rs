@@ -159,6 +159,14 @@ pub enum Expr {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `[e1, e2, ...]` -- vacío (`[]`) solo es válido en modo chequeo,
+    /// ver checker.rs (no se puede sintetizar un elemento de la nada).
+    ArrayLit(Vec<Expr>),
+    /// `base[index]` -- postfix, ver GRAMMAR.md §2.3.
+    Index {
+        base: Box<Expr>,
+        index: Box<Expr>,
+    },
     /// `Nombre { campos }` o `Enum.Variante { campos }` (GRAMMAR.md §2.3 struct_or_variant_lit).
     StructLit {
         name: String,

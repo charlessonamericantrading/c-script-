@@ -323,6 +323,16 @@ impl Checker {
             Expr::StructLit { name, variant: Some(v), fields } if name == "Result" => {
                 self.check_result_lit(v, fields, expected, env)
             }
+            // '[]' vacío: sin esto, synth_expr fallaría (no hay elemento del
+            // que inferir el tipo). Con un List(T) esperado, alcanza con
+            // verificar que efectivamente se pidió una lista -- vacía
+            // satisface "todos los elementos son T" sin elementos que revisar.
+            Expr::ArrayLit(items) if items.is_empty() => match expected {
+                Type::List(_) | Type::Dynamic => Ok(()),
+                other => Err(err(format!(
+                    "un array vacío '[]' requiere un tipo esperado de lista, se esperaba {other:?}"
+                ))),
+            },
             _ => {
                 let t = self.synth_expr(e, env)?;
                 if is_subtype(&t, expected) {
@@ -561,6 +571,30 @@ impl Checker {
             )),
             Expr::Binary { op, left, right } => self.synth_binary(*op, left, right, env),
             Expr::Unary { op, operand } => self.synth_unary(*op, operand, env),
+            // Un array vacío no sintetiza -- no hay de dónde inferir el
+            // tipo del elemento (GRAMMAR.md §2.3). Eso vive en check_expr.
+            Expr::ArrayLit(items) => {
+                let mut iter = items.iter();
+                let Some(first) = iter.next() else {
+                    return Err(err(
+                        "un array vacío '[]' no se puede sintetizar sin un tipo esperado (ej. anotá el 'let': let xs: Int[] = [])",
+                    ));
+                };
+                let elem_ty = self.synth_expr(first, env)?;
+                for item in iter {
+                    self.check_expr(item, &elem_ty, env)?;
+                }
+                Ok(Type::List(Box::new(elem_ty)))
+            }
+            Expr::Index { base, index } => {
+                let base_ty = self.synth_expr(base, env)?;
+                self.check_expr(index, &Type::Int, env)?;
+                match base_ty {
+                    Type::List(elem_ty) => Ok(*elem_ty),
+                    Type::Dynamic => Ok(Type::Dynamic),
+                    other => Err(err(format!("no se puede indexar un valor de tipo {other:?} (se esperaba una lista)"))),
+                }
+            }
             Expr::Paren(inner) => self.synth_expr(inner, env),
         }
     }
@@ -809,6 +843,26 @@ mod tests {
     fn assigning_wrong_type_is_rejected() {
         let result = check_source(r#"fn f() -> Int { let mut x = 1; x = "no"; x }"#);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn array_literal_infers_from_first_element_and_checks_the_rest() {
+        assert!(check_source("fn f() -> Int[] { [1, 2, 3] }").is_ok());
+        assert!(check_source(r#"fn f() -> Int[] { [1, "no", 3] }"#).is_err());
+    }
+
+    #[test]
+    fn empty_array_needs_an_expected_type() {
+        assert!(check_source("fn f() -> Int[] { [] }").is_ok());
+        // en posición de síntesis (sin contexto) debe fallar
+        assert!(check_source("fn f() -> Int { let xs = []; 0 }").is_err());
+    }
+
+    #[test]
+    fn indexing_returns_the_element_type_and_requires_int_index() {
+        assert!(check_source("fn f() -> Int { let xs = [1, 2, 3]; xs[0] }").is_ok());
+        assert!(check_source(r#"fn f() -> Int { let xs = [1, 2, 3]; xs["0"] }"#).is_err());
+        assert!(check_source("fn f() -> Int { let x = 5; x[0] }").is_err()); // Int no es indexable
     }
 
     #[test]

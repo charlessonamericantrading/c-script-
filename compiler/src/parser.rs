@@ -758,6 +758,15 @@ impl Parser {
                         args,
                     };
                 }
+                TokenKind::LBracket => {
+                    self.advance();
+                    let index = self.parse_expr()?; // dentro de [], struct lit permitido de nuevo
+                    self.eat(&TokenKind::RBracket)?;
+                    e = Expr::Index {
+                        base: Box::new(e),
+                        index: Box::new(index),
+                    };
+                }
                 _ => break,
             }
         }
@@ -789,6 +798,22 @@ impl Parser {
             TokenKind::Null => {
                 self.advance();
                 Ok(Expr::Null)
+            }
+            TokenKind::LBracket => {
+                self.advance();
+                let mut items = Vec::new();
+                if !self.check(&TokenKind::RBracket) {
+                    items.push(self.parse_expr()?);
+                    while self.check(&TokenKind::Comma) {
+                        self.advance();
+                        if self.check(&TokenKind::RBracket) {
+                            break; // coma final: [1, 2, 3,]
+                        }
+                        items.push(self.parse_expr()?);
+                    }
+                }
+                self.eat(&TokenKind::RBracket)?;
+                Ok(Expr::ArrayLit(items))
             }
             TokenKind::LParen => {
                 self.advance();
@@ -1165,6 +1190,41 @@ mod tests {
                 assert_eq!(*value, Expr::Int(2));
             }
             other => panic!("se esperaba Stmt::Assign, fue {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_literal_and_indexing_parse() {
+        let prog = parse_source("fn f() -> Int { let xs = [1, 2, 3]; xs[0] }");
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        match &body.stmts[0] {
+            Stmt::Let { value, .. } => {
+                assert_eq!(*value, Expr::ArrayLit(vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)]));
+            }
+            other => panic!("se esperaba Stmt::Let, fue {other:?}"),
+        }
+        match body.tail.as_deref().unwrap() {
+            Expr::Index { base, index } => {
+                assert_eq!(**base, Expr::Ident("xs".into()));
+                assert_eq!(**index, Expr::Int(0));
+            }
+            other => panic!("se esperaba Index, fue {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_array_literal_and_trailing_comma_parse() {
+        assert_eq!(
+            parse_source("fn f() -> Int[] { [] }").items.len(),
+            1
+        );
+        let prog = parse_source("fn f() -> Int { let xs = [1, 2,]; 0 }"); // coma final
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        match &body.stmts[0] {
+            Stmt::Let { value, .. } => {
+                assert_eq!(*value, Expr::ArrayLit(vec![Expr::Int(1), Expr::Int(2)]));
+            }
+            other => panic!("se esperaba Stmt::Let, fue {other:?}"),
         }
     }
 

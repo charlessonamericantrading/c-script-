@@ -174,6 +174,29 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
         }
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns),
         Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns),
+        Expr::ArrayLit(items) => {
+            let vs = items
+                .iter()
+                .map(|e| eval_expr(e, env, db, fns))
+                .collect::<Result<Vec<_>, RuntimeError>>()?;
+            Ok(Value::List(vs))
+        }
+        Expr::Index { base, index } => {
+            let base_v = eval_expr(base, env, db, fns)?;
+            let idx = as_int(&eval_expr(index, env, db, fns)?)?;
+            match base_v {
+                Value::List(items) => {
+                    let i: usize = idx
+                        .try_into()
+                        .map_err(|_| err(format!("índice negativo: {idx}")))?;
+                    if i >= items.len() {
+                        return Err(err(format!("índice {idx} fuera de rango (largo {})", items.len())));
+                    }
+                    Ok(items[i].clone())
+                }
+                other => Err(err(format!("no se puede indexar un valor {other:?}"))),
+            }
+        }
     }
 }
 
@@ -494,6 +517,38 @@ mod tests {
         assert_eq!(positive, json!(1));
         let negative = invoke_rpc(&program, "S", "classify", &json!({"n": -5}), &db).unwrap();
         assert_eq!(negative, json!(-1));
+    }
+
+    #[test]
+    fn array_literal_and_indexing_work_in_runtime() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc f() -> Int {
+                    let xs = [10, 20, 30];
+                    xs[1]
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "f", &json!({}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(20));
+    }
+
+    #[test]
+    fn indexing_out_of_range_is_a_runtime_error_not_null() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc f() -> Int {
+                    let xs = [1, 2, 3];
+                    xs[10]
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "f", &json!({}), &Db::seeded());
+        assert!(result.is_err(), "indexar fuera de rango debería fallar, no devolver null");
     }
 
     #[test]
