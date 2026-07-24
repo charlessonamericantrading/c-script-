@@ -1400,4 +1400,29 @@ mod tests {
         "#;
         assert!(check_source(src).is_ok());
     }
+
+    #[test]
+    fn named_fn_referenced_by_name_synthesizes_a_function_type() {
+        // GRAMMAR.md §3.10: una `fn` de nivel superior referenciada por
+        // nombre (sin llamarla ahí mismo) es un valor de tipo Function --
+        // Expr::Ident cae a `self.fns` cuando no hay binding local con ese
+        // nombre. Ver runtime/mod.rs para la contraparte en ejecución (FnRef).
+        let src = r#"
+            fn add_one(x: Int) -> Int { x + 1 }
+            fn apply_twice(f: (Int) -> Int, x: Int) -> Int { f(f(x)) }
+            fn use_it() -> Int { apply_twice(add_one, 5) }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn fn_reference_with_incompatible_signature_is_rejected() {
+        let src = r#"
+            fn add_one(x: Int) -> Int { x + 1 }
+            fn apply_to_bool(f: (Bool) -> Bool, x: Bool) -> Bool { f(x) }
+            fn use_it() -> Bool { apply_to_bool(add_one, true) }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "(Int)->Int no debería servir donde se pide (Bool)->Bool");
+    }
 }

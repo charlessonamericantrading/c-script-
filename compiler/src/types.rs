@@ -93,6 +93,19 @@ pub fn is_subtype(sub: &Type, sup: &Type) -> bool {
         (ResultOf(a1, b1), ResultOf(a2, b2)) => is_subtype(a1, a2) && is_subtype(b1, b2),
         (PatchOf(a), PatchOf(b)) => is_subtype(a, b),
         (MapOf(k1, v1), MapOf(k2, v2)) => is_subtype(k1, k2) && is_subtype(v1, v2),
+        // Regla estándar de subtipado de funciones (contravariante en los
+        // parámetros, covariante en el retorno): S <: T si T acepta todo lo
+        // que S acepta (T_param <: S_param, por eso p2/p1 al revés abajo) y
+        // S devuelve algo tan específico como T promete (S_ret <: T_ret).
+        // Sin esta regla, dos tipos función solo eran "iguales" por la
+        // igualdad estructural de arriba (`sub == sup`) -- exacta, sin
+        // aprovechar el subtipado de structs/optional/unión ya definido
+        // para params y retorno.
+        (Function(p1, r1), Function(p2, r2)) => {
+            p1.len() == p2.len()
+                && p2.iter().zip(p1.iter()).all(|(t2, t1)| is_subtype(t2, t1))
+                && is_subtype(r1, r2)
+        }
         (
             Struct {
                 fields: sub_fields, ..
@@ -182,6 +195,37 @@ mod tests {
         assert!(is_subtype(&narrow, &same));
         let different_value = Type::MapOf(Box::new(Type::String), Box::new(Type::String));
         assert!(!is_subtype(&narrow, &different_value));
+    }
+
+    #[test]
+    fn function_subtyping_is_contravariant_in_params_covariant_in_return() {
+        let narrow_point = Type::Struct {
+            name: None,
+            fields: vec![FieldType { name: "x".into(), optional: false, ty: Type::Int }],
+        };
+        let wide_point = Type::Struct {
+            name: None,
+            fields: vec![
+                FieldType { name: "x".into(), optional: false, ty: Type::Int },
+                FieldType { name: "y".into(), optional: false, ty: Type::Int },
+            ],
+        };
+        // Retorno COVARIANTE: una fn que devuelve el struct más ancho (con
+        // más campos) sirve donde se espera una que devuelve el angosto --
+        // igual que width subtyping ya hacía para structs sueltos.
+        let returns_wide = Type::Function(vec![], Box::new(wide_point.clone()));
+        let returns_narrow = Type::Function(vec![], Box::new(narrow_point.clone()));
+        assert!(is_subtype(&returns_wide, &returns_narrow));
+        assert!(!is_subtype(&returns_narrow, &returns_wide));
+
+        // Parámetro CONTRAVARIANTE: una fn que acepta el struct angosto (pide
+        // menos) sirve donde se espera una que acepta el ancho -- puede
+        // recibir cualquier cosa que tenga al menos 'x', que es lo único
+        // que necesita, así que también funciona si le llega el ancho.
+        let accepts_narrow = Type::Function(vec![narrow_point.clone()], Box::new(Type::Void));
+        let accepts_wide = Type::Function(vec![wide_point.clone()], Box::new(Type::Void));
+        assert!(is_subtype(&accepts_narrow, &accepts_wide));
+        assert!(!is_subtype(&accepts_wide, &accepts_narrow));
     }
 
     #[test]

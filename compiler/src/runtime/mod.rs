@@ -29,6 +29,12 @@ pub enum Value {
     Db,
     DbCollection(String),
     BoundMethod(Box<Value>, String),
+    /// Una `fn` de nivel superior referenciada POR NOMBRE, ej. `let g = add_one;`
+    /// (GRAMMAR.md §3.10). Es una REFERENCIA a función (como un `fn` pointer
+    /// de Rust), no un closure -- no captura ninguna variable, porque una
+    /// `fn` de nivel superior no tiene scope léxico exterior que capturar.
+    /// Nunca cruza el wire, igual que `Type::Function` (tabla de mapeo, §4).
+    FnRef(String),
 }
 
 #[derive(Debug)]
@@ -99,9 +105,17 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
             if name == "db" {
                 return Ok(Value::Db);
             }
-            env.get(name)
-                .map(|c| c.borrow().clone())
-                .ok_or_else(|| err(format!("variable no declarada en runtime: '{name}'")))
+            if let Some(c) = env.get(name) {
+                return Ok(c.borrow().clone());
+            }
+            // No es una variable local -- si es una `fn` de nivel superior,
+            // referenciarla por nombre produce un FnRef (ver su doc en el
+            // enum Value), no un error: el checker ya la trata como un valor
+            // de tipo Function en este mismo caso (checker.rs, synth_expr).
+            if fns.contains_key(name.as_str()) {
+                return Ok(Value::FnRef(name.clone()));
+            }
+            Err(err(format!("variable no declarada en runtime: '{name}'")))
         }
         Expr::FieldAccess { base, field } => {
             let base_v = eval_expr(base, env, db, fns)?;
@@ -122,23 +136,29 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
             }
         }
         Expr::Call { callee, args } => {
-            // Llamada a una `fn` de usuario -- se resuelve por nombre ANTES
-            // de evaluar `callee` genéricamente, porque una fn no tiene un
-            // Value propio (a diferencia de db.*, que sí usa BoundMethod).
+            // Llamada directa a una `fn` de usuario por nombre -- atajo
+            // frecuente que evita pasar por FnRef (ver Expr::Ident arriba)
+            // solo para volver a buscar el mismo nombre en `fns`.
             if let Expr::Ident(name) = &**callee {
                 if let Some(decl) = fns.get(name.as_str()) {
                     let arg_vs = eval_args(args, env, db, fns)?;
-                    let mut fn_env = Env::new();
-                    for (p, v) in decl.params.iter().zip(arg_vs) {
-                        fn_env.insert(p.name.clone(), cell(v));
-                    }
-                    return eval_block(&decl.body, &fn_env, db, fns);
+                    return call_fn_decl(decl, arg_vs, db, fns);
                 }
             }
             let callee_v = eval_expr(callee, env, db, fns)?;
             let arg_vs = eval_args(args, env, db, fns)?;
             match callee_v {
                 Value::BoundMethod(receiver, method) => call_method(*receiver, &method, arg_vs, db),
+                // Llamada INDIRECTA: `callee` fue una variable/parámetro que
+                // contenía una referencia a función (GRAMMAR.md §3.10), no
+                // el nombre escrito ahí mismo -- ej. dentro de
+                // `apply_twice(f, x) { f(f(x)) }`, `f` llega como FnRef.
+                Value::FnRef(name) => {
+                    let decl = fns
+                        .get(name.as_str())
+                        .ok_or_else(|| err(format!("fn desconocida: '{name}'")))?;
+                    call_fn_decl(decl, arg_vs, db, fns)
+                }
                 other => Err(err(format!("no se puede llamar un valor {other:?}"))),
             }
         }
@@ -306,6 +326,17 @@ fn eval_args(args: &[Expr], env: &Env, db: &Db, fns: &Fns) -> Result<Vec<Value>,
     args.iter().map(|a| eval_expr(a, env, db, fns)).collect()
 }
 
+/// Invoca una `fn` de usuario ya resuelta con argumentos ya evaluados --
+/// compartido por la llamada directa (`f(x)`) y la indirecta a través de un
+/// `Value::FnRef` (`let g = f; g(x)`), para no duplicar el armado del scope.
+fn call_fn_decl(decl: &FnDecl, arg_vs: Vec<Value>, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
+    let mut fn_env = Env::new();
+    for (p, v) in decl.params.iter().zip(arg_vs) {
+        fn_env.insert(p.name.clone(), cell(v));
+    }
+    eval_block(&decl.body, &fn_env, db, fns)
+}
+
 fn try_match_pattern(pattern: &Pattern, v: &Value) -> Option<Vec<(String, Value)>> {
     match pattern {
         Pattern::Bind(name) => Some(vec![(name.clone(), v.clone())]),
@@ -452,7 +483,9 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::BoundMethod(_, _) => serde_json::Value::Null,
+        Value::Db | Value::DbCollection(_) | Value::BoundMethod(_, _) | Value::FnRef(_) => {
+            serde_json::Value::Null
+        }
     }
 }
 
@@ -753,5 +786,28 @@ mod tests {
         assert_eq!(result["error"]["type"], json!("TooShort"));
         assert_eq!(result["error"]["field"], json!("name"));
         assert_eq!(result["error"]["min"], json!(2));
+    }
+
+    #[test]
+    fn named_fn_passed_by_reference_is_callable_through_the_parameter() {
+        // Alcance real de "funciones de primera clase" en v0 (GRAMMAR.md
+        // §3.10): una `fn` de nivel superior referenciada POR NOMBRE (sin
+        // llamarla ahí mismo) tiene que poder viajar como valor -- acá, como
+        // argumento -- y ser invocable a través del parámetro que la recibe.
+        // Antes del fix esto fallaba en runtime aunque el checker ya lo
+        // aceptaba (Expr::Ident cae a `self.fns` en synth_expr).
+        let program = program_from(
+            r#"
+            fn add_one(x: Int) -> Int { x + 1 }
+            fn apply_twice(f: (Int) -> Int, x: Int) -> Int { f(f(x)) }
+            service S {
+                rpc run(x: Int) -> Int {
+                    apply_twice(add_one, x)
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "run", &json!({"x": 5}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(7));
     }
 }

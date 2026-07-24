@@ -419,6 +419,34 @@ export interface Event {
 
 **Por qué a veces aparece un paréntesis (`(A | B)[]`):** igual que `Optional`/tipo función dentro de un `List` (§2.2), un miembro que en TS se renderiza con `|` o `=>` en su nivel superior necesita paréntesis explícitos al aparecer dentro de otra construcción — `number | string[]` en TS significa `number | (string[])`, no `(number | string)[]`. El emisor ya aplicaba esta regla para `Optional`/`Function` (`render_type_atom`); ahora también protege a `Union`, en ambas direcciones: como elemento de un `List`, y como miembro de otra unión.
 
+### 3.10 Funciones como valores — RESUELTO (referencias, no closures)
+
+Una `fn` de nivel superior, referenciada por su nombre sin llamarla ahí mismo, ya es un valor de primera clase: se puede pasar como argumento, guardar en una variable, o recibir a través de un parámetro tipado `(A) -> B`. `Expr::Ident` para un nombre que no resuelve a una variable local cae al conjunto de `fn`s declaradas y sintetiza `Type::Function(params, ret)` (checker.rs) / produce un `Value::FnRef(nombre)` en runtime (runtime/mod.rs) — nunca captura nada, porque una `fn` de nivel superior no tiene ningún scope léxico exterior que capturar.
+
+```
+fn add_one(x: Int) -> Int { x + 1 }
+fn apply_twice(f: (Int) -> Int, x: Int) -> Int { f(f(x)) }
+
+fn use_it() -> Int { apply_twice(add_one, 5) } // 7
+```
+
+**Subtipado de tipos función — contravariante en parámetros, covariante en el retorno** (regla estándar): una función que acepta MENOS de lo estrictamente necesario (parámetro declarado más angosto) o devuelve MÁS de lo prometido (retorno más ancho) sirve donde se espera la firma original. Antes de esto, dos tipos función solo se consideraban compatibles por igualdad estructural exacta (misma lista de params, mismo retorno, sin aprovechar el subtipado ya definido para structs/`Optional`/unión):
+
+```
+S <: T          (para cada parámetro, EN SENTIDO INVERSO: T_param <: S_param)
+S_ret <: T_ret  (el retorno, en el mismo sentido que todo lo demás)
+──────────────────────────────────────────────────────────────────  (Function-Sub)
+(S_params) -> S_ret  <:  (T_params) -> T_ret
+```
+
+**Lo que NO está implementado, y por qué:**
+- **No hay literales de función anónima** (`fn(x) { x + 1 }`, `|x| x + 1`, o equivalente): `fn` solo existe como ítem de nivel superior (§2.1) — no hay ninguna expresión que produzca una función nueva ahí mismo, en medio de otro código.
+- **No hay closures léxicos de verdad** (capturar una variable del scope que la rodea): consecuencia directa del punto anterior — una `fn` de nivel superior no tiene "scope que la rodea" para capturar nada. Lo que existe es una referencia a una función ya declarada (equivalente a un `fn` pointer de Rust/C), no un closure (`Fn`/`FnMut`/`FnOnce`).
+- **No hay métodos de orden superior sobre `List`** (`.map()`, `.filter()`, `.reduce()`) — serían el consumidor más natural de "función como valor", pero `List` hoy solo tiene indexado (§2.3) y no participa de los métodos builtin de §3.8 (esos son sobre primitivos: `Int`/`Float`/`String`).
+- Ninguno de los tres cruza el wire — un valor de tipo función ya estaba documentado como "solo campo de tipo local" en la tabla de mapeo (§4) desde antes de esta sección.
+
+Es una decisión de alcance real, no una omisión: para un lenguaje cuyo propósito central es un contrato RPC tipado (PLAN.md §1), el consumidor principal de closures completos serían combinadores sobre colecciones que todavía no existen. Implementar closures de verdad (captura por valor vs. por referencia, análisis de qué variables escapan, su equivalente al emitir TypeScript) antes de tener ese consumidor sería construir infraestructura sin un caso de uso real que la ejercite todavía — mismo criterio que ya se aplicó al posponer WASM/LSP/gestor de paquetes a Fase 1+ (PLAN.md §4).
+
 ---
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
