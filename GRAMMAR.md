@@ -38,7 +38,7 @@ keyword      = "type" | "enum" | "service" | "rpc" | "stream" | "match"
 
 ```ebnf
 program      = { item } ;
-item         = import_decl | type_decl | enum_decl | service_decl | const_decl | fn_decl ;
+item         = import_decl | type_decl | enum_decl | service_decl | const_decl | fn_decl | db_decl ;
 
 import_decl  = "import" , "{" , ident_list , "}" , "from" , string_lit , ";" ;
 ident_list   = identifier , { "," , identifier } ;
@@ -63,6 +63,8 @@ param_list   = param , { "," , param } ;
 param        = identifier , ":" , type_expr , [ "=" , expr ] ;
 
 fn_decl      = "fn" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
+
+db_decl      = "db" , "{" , field_list , "}" ;   (* "db" NO es keyword -- ver §3.12 *)
 ```
 
 **El `;` de `type_decl` es opcional.** Un `type X = { ... }` termina en `}`; exigir además un `;` es la misma incomodidad que Rust/Go evitan después de un `struct`. `const_decl`/`let_stmt`/`return_stmt` sí exigen `;` — su valor no siempre termina en `}` (`const MAX: Int = 100`) y v0 no tiene todavía operadores infijos que hicieran innecesaria la marca de fin de sentencia.
@@ -543,6 +545,44 @@ async getById(id: number): Promise<User | null> {
 **Tercera categoría de error, `LinkValidationError`.** Ni un error de dominio declarado (`Result<T,E>`, siempre vuelve como valor) ni un fallo de transporte (`LinkTransportError`, red/5xx/timeout) — "el servidor respondió 200 pero el payload no matchea el contrato" es su propio modo de falla, con su propia clase, consistente con la línea divisoria que ya traza §3.5 entre las otras dos.
 
 **Límite real: solo valida lo que efectivamente cruza el wire.** Un `type`/`enum` que ningún `rpc` usa como parámetro o retorno no genera validador — no hay ningún valor real en runtime que necesite chequear su forma. Si se agrega un `rpc` nuevo que lo referencia, el próximo `linkc build`/`linkc dev` lo agrega solo.
+
+**Efecto secundario real: construir esto expuso un bug de serialización preexistente.** `Value::Variant` (runtime/mod.rs) siempre serializaba como `{ type: "..." }`, sin importar si el enum era simple (`Role`, todo unit) o un ADT (`ValidationError`) — nadie lo había notado porque nada construía un enum simple vía la sintaxis del lenguaje (`Role.Member {}`) antes de esta sesión; los datos sembrados a mano en `db.rs` usaban directamente un string de Rust, sin pasar por acá. `validators.ts` es justo lo bastante estricto como para haberlo atrapado apenas se ejercitó de punta a punta: `isRole` exige un string plano, no un objeto. Arreglado dándole a `Value::Variant` también el nombre del ENUM (no solo el de la variante), para que el runtime pueda replicar exactamente el mismo chequeo `all_unit` que ya usa `emit_enum_decl` (ts_emit.rs) al serializar — la variante ganadora no alcanza para decidirlo sola: un ADT puede tener una variante sin campos propios (ej. `enum Wrapped { Has{value:Int}, Empty }`) que igual debe serializar como `{type:"Empty"}`, no como un string suelto.
+
+### 3.12 "DB tipada" v0 (`db { ... }`) — RESUELTO
+
+`db` dejó de ser `Type::Dynamic` (cualquier `db.lo-que-sea.como-sea(...)` tipaba, y solo fallaba en runtime). Un nuevo ítem de nivel superior declara la forma real:
+
+```
+db {
+  users: User[],
+  posts: Post[],
+}
+```
+
+**`db` no es palabra reservada.** Se reconoce por texto ("db" seguido de `{`) solo en posición de ítem de nivel superior — en cualquier otro lado (`let db = 5;`, un parámetro, un campo) sigue siendo un identificador común. De hecho, esto arregló un bug real: antes, el string mágico `"db"` se chequeaba ANTES del lookup de variables (tanto en el checker como en runtime/mod.rs), así que un `let db = ...` de un usuario quedaba sombreado en silencio por el builtin. Ahora el lookup de variables va primero.
+
+**Cada colección necesita un campo `id: Int`.** No es un capricho — es lo que hace posible que `insert` pida `Omit<T, "id">` (los campos de T menos `id`, un utility type nativo de TS, sin sintaxis nueva) en vez de T completo. Sin esta regla, `insert` habría exigido el struct entero — y **habría roto el propio demo insignia**, donde la forma de creación (`NewUser`) es deliberadamente un subconjunto de `User` (sin `id`, `role`, `deletedAt`). El checker lo exige al procesar `db { ... }`, con un error claro si falta.
+
+```
+type User = { id: Int, name: String, email: String, role: Role, bio?: String, deletedAt: String? }
+db { users: User[] }
+
+// insert pide Omit<User, "id"> -- NO el User completo. Como el lenguaje no
+// tiene sintaxis de struct literal anónimo (siempre hace falta un nombre
+// declarado, ver struct_or_variant_lit §2.3), la forma completa de creación
+// se modela con un `type` propio, estructuralmente idéntico a Omit<User,"id">:
+type NewUserRecord = { name: String, email: String, role: Role, bio?: String, deletedAt: String? }
+fn makeUser(input: NewUser) -> NewUserRecord {
+  NewUserRecord { name: input.name, email: input.email, role: Role.Member {}, deletedAt: null }
+}
+// db.users.insert(makeUser(input)) -- NewUserRecord <: Omit<User,"id"> por subtipado estructural
+```
+
+**Métodos:** `all() -> T[]`, `find(id: Int) -> T?`, `insert(x: Omit<T,"id">) -> T`, `applyPatch(id: Int, p: Patch<T>) -> T` — resueltos contra el tipo de elemento de verdad (`Type::DbCollection`, checker.rs). Un nombre de colección o de método desconocido ya es un error del checker (`db.usres.fnid(1)`, con AMBOS typo'd, se rechaza en tiempo de chequeo), no algo que se descubre recién en runtime.
+
+**Runtime: en memoria, generalizado — sigue sin ser Postgres real.** `runtime/db.rs`'s `Db` pasó de estar hardcodeado a una única colección `"users"` a `HashMap<String, Mutex<Vec<Value>>>`, una entrada por colección declarada. `Db::new(&program)` arranca cada colección vacía (uso real); `Db::seeded()` se mantiene aparte, como conveniencia para tests/demo, sembrando los mismos dos usuarios de siempre. Se eliminó el hack que le ponía un default a `deletedAt` en `insert` — bajo la regla `Omit<T,"id">`, `deletedAt` (requerido, nullable) es un campo obligado del argumento; quien inserta pasa `deletedAt: null` explícito, consistente con "sin coerción implícita en ningún lado" (§3.7).
+
+**Fuera de alcance, a propósito:** ningún driver SQL real (Postgres, etc.) — eso sigue siendo Fase 2 "Beta" en la tabla de `PLAN.md` §4. Esto es la forma más chica y honesta de darle a `db` un tipo REAL sin la infraestructura de una base de datos de verdad detrás.
 
 ---
 

@@ -20,7 +20,14 @@ pub enum Value {
     Bool(bool),
     Null,
     Struct(Vec<(String, Value)>),
-    Variant { variant: String, fields: Vec<(String, Value)> },
+    /// `enum_name` (ej. "Role") además de `variant` (ej. "Member") -- hace
+    /// falta para que `value_to_json` sepa si ESTE enum es "simple" (todo
+    /// unit, serializa como string plano, ej. Role) o un ADT (serializa
+    /// como objeto con tag `type`, ej. ValidationError) -- esa distinción
+    /// es de la DECLARACIÓN completa (GRAMMAR.md §4, emit_enum_decl en
+    /// ts_emit.rs), no algo que se pueda inferir de un solo Value::Variant
+    /// suelto (un ADT puede tener variantes propias sin campos).
+    Variant { enum_name: String, variant: String, fields: Vec<(String, Value)> },
     List(Vec<Value>),
     Tuple(Vec<Value>),
     /// Marcadores internos — nunca deberían llegar a `value_to_json` (ver la
@@ -162,13 +169,15 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                 other => Err(err(format!("no se puede llamar un valor {other:?}"))),
             }
         }
-        Expr::StructLit { variant, fields, .. } => {
+        Expr::StructLit { name, variant, fields } => {
             let evaluated = fields
                 .iter()
                 .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns)?)))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             match variant {
-                Some(v) => Ok(Value::Variant { variant: v.clone(), fields: evaluated }),
+                Some(v) => {
+                    Ok(Value::Variant { enum_name: name.clone(), variant: v.clone(), fields: evaluated })
+                }
                 None => Ok(Value::Struct(evaluated)),
             }
         }
@@ -352,7 +361,7 @@ fn try_match_pattern(pattern: &Pattern, v: &Value) -> Option<Vec<(String, Value)
         Pattern::Bind(name) => Some(vec![(name.clone(), v.clone())]),
         Pattern::Literal(lit) => literal_matches(lit, v).then(Vec::new),
         Pattern::Variant { variant_name, fields, .. } => {
-            let Value::Variant { variant, fields: value_fields } = v else {
+            let Value::Variant { variant, fields: value_fields, .. } = v else {
                 return None;
             };
             if variant != variant_name {
@@ -476,10 +485,29 @@ pub fn invoke_rpc(
     }
 
     let result = eval_block(&rpc.body, &env, db, &fns)?;
-    Ok(value_to_json(&result))
+    let simple_enums = simple_enum_names(program);
+    Ok(value_to_json(&result, &simple_enums))
 }
 
-pub fn value_to_json(v: &Value) -> serde_json::Value {
+/// Nombres de los enums "simples" (todas sus variantes son unitarias) de
+/// todo el programa -- calculado UNA vez acá, no en cada `value_to_json`
+/// recursivo. Mismo chequeo `all_unit` que ya usa `emit_enum_decl`
+/// (ts_emit.rs) para decidir "string plano" vs "objeto con tag" en la
+/// firma TS -- el runtime tiene que serializar EXACTAMENTE igual, o el
+/// valor real no matchea lo que el contrato promete (ni lo que
+/// `validators.ts` espera, GRAMMAR.md §3.11).
+fn simple_enum_names(program: &Program) -> std::collections::HashSet<String> {
+    program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Enum(e) if e.variants.iter().all(|v| v.fields.is_none()) => Some(e.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>) -> serde_json::Value {
     use serde_json::json;
     match v {
         Value::Int(n) => json!(n),
@@ -490,20 +518,30 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Struct(fields) => {
             let mut m = serde_json::Map::new();
             for (k, v) in fields {
-                m.insert(k.clone(), value_to_json(v));
+                m.insert(k.clone(), value_to_json(v, simple_enums));
             }
             serde_json::Value::Object(m)
         }
-        Value::Variant { variant, fields } => {
+        // Enum simple (Role, etc.) -> string plano, igual que `emit_enum_decl`
+        // lo mapea a un `type Role = "Admin" | "Member" | "Guest"` de TS, no
+        // a un objeto -- antes de esto, CUALQUIER Value::Variant serializaba
+        // como `{type: ...}` sin excepción, así que construir un enum simple
+        // vía la sintaxis del lenguaje (`Role.Member {}`) daba un valor que
+        // no matcheaba ni el contrato ni el validador generado.
+        Value::Variant { enum_name, variant, fields } if simple_enums.contains(enum_name) => {
+            debug_assert!(fields.is_empty(), "un enum simple no debería tener variantes con campos");
+            json!(variant)
+        }
+        Value::Variant { variant, fields, .. } => {
             let mut m = serde_json::Map::new();
             m.insert("type".to_string(), json!(variant));
             for (k, v) in fields {
-                m.insert(k.clone(), value_to_json(v));
+                m.insert(k.clone(), value_to_json(v, simple_enums));
             }
             serde_json::Value::Object(m)
         }
         Value::List(items) | Value::Tuple(items) => {
-            serde_json::Value::Array(items.iter().map(value_to_json).collect())
+            serde_json::Value::Array(items.iter().map(|v| value_to_json(v, simple_enums)).collect())
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
@@ -808,6 +846,40 @@ mod tests {
     }
 
     #[test]
+    fn constructing_a_simple_enum_variant_serializes_as_a_bare_string() {
+        // Bug real encontrado al implementar "DB tipada": Value::Variant
+        // SIEMPRE serializaba como `{type: "..."}`, sin importar si el enum
+        // era simple (Role) o un ADT (ValidationError) -- nadie lo notó
+        // porque nada construía un enum simple vía la sintaxis del lenguaje
+        // (`Role.Member {}`) antes; los datos sembrados a mano en db.rs
+        // usaban Value::Str directo, sin pasar por acá. Justo lo que
+        // emit_enum_decl (ts_emit.rs) promete como `type Role = "Admin" |
+        // ...` -- y lo que isRole (validators.ts) exige -- es un string
+        // plano, no un objeto.
+        let program = program_from(
+            r#"
+            enum Role { Admin, Member, Guest }
+            enum Wrapped { Has { value: Int }, Empty }
+            service S {
+                rpc getRole() -> Role { Role.Member {} }
+                rpc getEmpty() -> Wrapped { Wrapped.Empty {} }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let role = invoke_rpc(&program, "S", "getRole", &json!({}), &db).unwrap();
+        assert_eq!(role, json!("Member"), "un enum simple debe serializar como string plano");
+
+        // Contraste importante: `Empty` no tiene campos propios, pero
+        // `Wrapped` en su conjunto NO es un enum simple (`Has` sí tiene
+        // datos) -- así que `Empty` tiene que seguir siendo un objeto con
+        // tag, no un string plano. La distinción es de la DECLARACIÓN
+        // completa, nunca de si esta variante puntual tiene campos.
+        let empty = invoke_rpc(&program, "S", "getEmpty", &json!({}), &db).unwrap();
+        assert_eq!(empty["type"], json!("Empty"));
+    }
+
+    #[test]
     fn create_wraps_the_new_user_in_result_ok() {
         let program = users_demo();
         let db = Db::seeded();
@@ -821,6 +893,15 @@ mod tests {
         .unwrap();
         assert_eq!(result["type"], json!("Ok"));
         assert_eq!(result["value"]["name"], json!("Grace Hopper"));
+        // "DB tipada" (GRAMMAR.md §2.1): `insert` ahora pide Omit<User,"id">
+        // completo -- `validate` rellena role/deletedAt antes de insertar,
+        // en vez del hack viejo en db.rs que solo ponía deletedAt (y ni
+        // eso, si ya venía en el input) y dejaba 'role' directamente ausente.
+        assert_eq!(result["value"]["role"], json!("Member"));
+        assert_eq!(result["value"]["deletedAt"], serde_json::Value::Null);
+        // 'id' lo asigna `db.users.insert` -- nunca lo manda el caller
+        // (Omit<User,"id">), así que tiene que ser un entero nuevo real.
+        assert!(result["value"]["id"].is_i64());
     }
 
     #[test]
@@ -838,6 +919,40 @@ mod tests {
         assert_eq!(result["name"], json!("Ada, Countess of Lovelace"));
         // el resto de los campos no se toca -- semántica de Patch<T>, GRAMMAR.md §3.4
         assert_eq!(result["email"], json!("ada@example.com"));
+    }
+
+    #[test]
+    fn db_new_gives_each_declared_collection_its_own_independent_empty_store() {
+        // "DB tipada" v0 (GRAMMAR.md §2.1): antes, runtime/db.rs solo
+        // conocía una colección "users" hardcodeada -- Db::new arranca una
+        // vacía por cada colección que el programa declare, ninguna
+        // comparte estado con las demás.
+        let program = program_from(
+            r#"
+            type Post = { id: Int, title: String }
+            type Comment = { id: Int, body: String }
+            db { posts: Post[], comments: Comment[] }
+            fn newPost(title: String) -> Post { db.posts.insert(Post { title: title }) }
+            fn newComment(body: String) -> Comment { db.comments.insert(Comment { body: body }) }
+            service S {
+                rpc addPost(title: String) -> Post { newPost(title) }
+                rpc addComment(body: String) -> Comment { newComment(body) }
+                rpc allPosts() -> Post[] { db.posts.all() }
+                rpc allComments() -> Comment[] { db.comments.all() }
+            }
+        "#,
+        );
+        let db = Db::new(&program);
+
+        let post = invoke_rpc(&program, "S", "addPost", &json!({"title": "Hola"}), &db).unwrap();
+        assert_eq!(post["id"], json!(1)); // primer id de ESTA colección, no compartido con comments
+        invoke_rpc(&program, "S", "addComment", &json!({"body": "Primer comentario"}), &db).unwrap();
+        invoke_rpc(&program, "S", "addComment", &json!({"body": "Segundo comentario"}), &db).unwrap();
+
+        let posts = invoke_rpc(&program, "S", "allPosts", &json!({}), &db).unwrap();
+        assert_eq!(posts.as_array().unwrap().len(), 1);
+        let comments = invoke_rpc(&program, "S", "allComments", &json!({}), &db).unwrap();
+        assert_eq!(comments.as_array().unwrap().len(), 2);
     }
 
     #[test]

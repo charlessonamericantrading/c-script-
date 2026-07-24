@@ -9,6 +9,13 @@ type User = {
 
 enum Role { Admin, Member, Guest }
 
+// "DB tipada" v0 (GRAMMAR.md §2.1): toda colección necesita un campo
+// `id: Int` -- es lo que hace posible que `insert` pida Omit<User,"id">
+// en vez del struct completo, sin romper la creación de abajo.
+db {
+  users: User[],
+}
+
 enum ValidationError {
   InvalidEmail { field: String },
   TooShort     { field: String, min: Int },
@@ -19,8 +26,21 @@ type NewUser = {
   email: String,
 }
 
+// Forma completa que espera `db.users.insert` (Omit<User,"id"> --
+// estructuralmente idéntica: los mismos campos de User salvo `id`).
+// `NewUser` (arriba) sigue siendo la forma PÚBLICA, chica, que ve el
+// frontend -- acá se completan los defaults de un usuario nuevo (role
+// Member, deletedAt null) antes de insertar.
+type NewUserRecord = {
+  name: String,
+  email: String,
+  role: Role,
+  bio?: String,
+  deletedAt: String?,
+}
+
 enum ValidateResult {
-  Ok  { value: NewUser },
+  Ok  { value: NewUserRecord },
   Err { error: ValidationError },
 }
 
@@ -30,7 +50,7 @@ fn validate(input: NewUser) -> ValidateResult {
   } else if input.name.length() < 2 {
     ValidateResult.Err { error: ValidationError.TooShort { field: "name", min: 2 } }
   } else {
-    ValidateResult.Ok { value: input }
+    ValidateResult.Ok { value: NewUserRecord { name: input.name, email: input.email, role: Role.Member {}, deletedAt: null } }
   }
 }
 

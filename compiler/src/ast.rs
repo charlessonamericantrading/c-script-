@@ -18,6 +18,20 @@ pub enum Item {
     Service(ServiceDecl),
     Const(ConstDecl),
     Fn(FnDecl),
+    Db(DbDecl),
+}
+
+/// `db { users: User[], posts: Post[] }` (GRAMMAR.md §2.1) -- "DB tipada"
+/// v0. `db` NO es palabra reservada (así una variable/campo llamado `db`
+/// sigue siendo válido en cualquier otro lado) -- se reconoce por texto
+/// ("db" seguido de `{`) solo en posición de ítem de nivel superior, igual
+/// que un contextual keyword. Reusa `field_list`/`type_expr` tal cual --
+/// sin gramática nueva para el tipo de cada colección, el checker exige
+/// que cada uno resuelva a un struct con un campo `id: Int` (no la
+/// gramática, ver checker.rs).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbDecl {
+    pub collections: Vec<Field>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -111,10 +111,26 @@ impl Parser {
             TokenKind::Service => Ok(Item::Service(self.parse_service_decl()?)),
             TokenKind::Const => Ok(Item::Const(self.parse_const_decl()?)),
             TokenKind::Fn => Ok(Item::Fn(self.parse_fn_decl()?)),
+            // `db` NO es palabra reservada (ast.rs, doc de DbDecl) -- se
+            // reconoce por texto solo acá, en posición de ítem de nivel
+            // superior, seguido de `{`. En cualquier otro contexto (una
+            // expresión, un patrón, un nombre de campo) "db" sigue siendo
+            // un identificador común y corriente.
+            TokenKind::Ident(name) if name == "db" && *self.peek_at(1) == TokenKind::LBrace => {
+                Ok(Item::Db(self.parse_db_decl()?))
+            }
             other => Err(self.error(format!(
-                "se esperaba un ítem de nivel superior (import/type/enum/service/const/fn), se encontró {other:?}"
+                "se esperaba un ítem de nivel superior (import/type/enum/service/const/fn/db), se encontró {other:?}"
             ))),
         }
+    }
+
+    fn parse_db_decl(&mut self) -> Result<DbDecl, ParseError> {
+        self.advance(); // "db"
+        self.eat(&TokenKind::LBrace)?;
+        let collections = self.parse_field_list()?;
+        self.eat(&TokenKind::RBrace)?;
+        Ok(DbDecl { collections })
     }
 
     fn parse_import_decl(&mut self) -> Result<ImportDecl, ParseError> {
@@ -1413,8 +1429,9 @@ mod tests {
         )
         .expect("no se pudo leer examples/users.link");
         let prog = parse_source(&src);
-        // 2 type + 3 enum + 1 fn + 1 service = 7 ítems de nivel superior
-        assert_eq!(prog.items.len(), 7);
+        // 3 type (User, NewUser, NewUserRecord) + 3 enum (Role,
+        // ValidationError, ValidateResult) + 1 db + 1 fn + 1 service = 9
+        assert_eq!(prog.items.len(), 9);
         let service = prog
             .items
             .iter()

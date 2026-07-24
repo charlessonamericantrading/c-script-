@@ -146,7 +146,13 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     ));
     if !validator_names.is_empty() {
         out.push_str(&format!(
-            "import {{ {} }} from \"./validators\";\n",
+            // `.ts` explícito, a diferencia del import de "./contract" de
+            // arriba: ese es `import type` (se borra del todo al compilar,
+            // Node nunca lo resuelve en runtime); este es un import de
+            // VALOR real -- el loader ESM nativo de Node exige la
+            // extensión explícita para resolverlo (mismo motivo que
+            // frontend/src/main.ts ya importa "../../gen/client.ts" así).
+            "import {{ {} }} from \"./validators.ts\";\n",
             validator_names.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
@@ -410,6 +416,12 @@ pub(crate) fn render_type(ty: &Type) -> String {
             .map(render_type_atom)
             .collect::<Vec<_>>()
             .join(" | "),
+        // `db`/`db.<coleccion>` son internos del checker (GRAMMAR.md §2.1,
+        // DbDecl) -- nunca aparecen en un TypeExpr escrito por el usuario,
+        // así que jamás llegan a resolverse en una firma real de rpc/type.
+        Type::Db | Type::DbCollection(_) => {
+            unreachable!("Type::Db/DbCollection nunca aparece en un TypeExpr real")
+        }
     }
 }
 
@@ -472,6 +484,9 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
             }
         }
         Type::Int | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
+        Type::Db | Type::DbCollection(_) => {
+            unreachable!("Type::Db/DbCollection nunca aparece en un TypeExpr real")
+        }
     }
 }
 

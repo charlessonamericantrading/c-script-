@@ -55,6 +55,11 @@ pub struct Checker {
     pub(crate) types: HashMap<String, TypeDecl>,
     pub(crate) enums: HashMap<String, EnumDecl>,
     fns: HashMap<String, (Vec<Type>, Type)>,
+    /// Nombre de colección -> tipo de elemento ya resuelto, desde `db {
+    /// ... }` (GRAMMAR.md §2.1, DbDecl). Vacío si el programa no declara
+    /// ninguna `db` -- en ese caso `db` sigue existiendo como identificador
+    /// (Type::Db), simplemente sin ninguna colección real.
+    db_collections: HashMap<String, Type>,
 }
 
 impl Checker {
@@ -67,6 +72,7 @@ impl Checker {
             types: HashMap::new(),
             enums: HashMap::new(),
             fns: HashMap::new(),
+            db_collections: HashMap::new(),
         };
         let mut errors = Vec::new();
 
@@ -108,7 +114,56 @@ impl Checker {
             }
         }
 
+        // Item::Db -- DESPUÉS de types/enums (resolver "User[]" necesita
+        // poder encontrar "User" ya insertado). A lo sumo un `db { ... }`
+        // en todo el Program ya fusionado (imports lo aplanan todo a un
+        // solo Program, modules.rs, así que no hay "por archivo" acá).
+        let mut db_decl_seen = false;
+        for item in &program.items {
+            if let Item::Db(db) = item {
+                if db_decl_seen {
+                    errors.push(err("ya hay un 'db { ... }' declarado en este programa (duplicado)"));
+                    continue;
+                }
+                db_decl_seen = true;
+                for coll in &db.collections {
+                    match checker.resolve_type(&coll.ty) {
+                        Ok(Type::List(element_ty)) => match checker.validate_db_element_type(&element_ty) {
+                            Ok(()) => {
+                                checker.db_collections.insert(coll.name.clone(), *element_ty);
+                            }
+                            Err(e) => errors.push(e),
+                        },
+                        Ok(other) => errors.push(err(format!(
+                            "la colección '{}' de 'db' tiene que ser una lista de structs (T[]), se encontró {other:?}",
+                            coll.name
+                        ))),
+                        Err(e) => errors.push(e),
+                    }
+                }
+            }
+        }
+
         (checker, errors)
+    }
+
+    /// Toda colección de `db` necesita un campo `id: Int` requerido --
+    /// es lo que hace posible `insert(x: Omit<T,"id">)` sin romper la
+    /// forma completa de T (GRAMMAR.md §2.1): sin esta regla, `insert`
+    /// exigiendo el struct COMPLETO habría rechazado el propio demo
+    /// insignia, donde `NewUser` es deliberadamente un subconjunto de `User`.
+    fn validate_db_element_type(&self, element_ty: &Type) -> Result<(), CheckError> {
+        let Type::Struct { fields, .. } = element_ty else {
+            return Err(err(format!(
+                "el tipo de elemento de una colección de 'db' tiene que ser un struct, se encontró {element_ty:?}"
+            )));
+        };
+        if !fields.iter().any(|f| f.name == "id" && f.ty == Type::Int && !f.optional) {
+            return Err(err(
+                "toda colección de 'db' necesita un campo 'id: Int' requerido (no opcional, no nullable)",
+            ));
+        }
+        Ok(())
     }
 
     pub fn check_program(program: &Program) -> Result<(), Vec<CheckError>> {
@@ -872,12 +927,15 @@ impl Checker {
             Expr::Bool(_) => Ok(Type::Bool),
             Expr::Null => Ok(Type::Null),
             Expr::Ident(name) => {
-                if name == "db" {
-                    // Runtime builtin aún no modelado (ver Type::Dynamic).
-                    return Ok(Type::Dynamic);
-                }
+                // El lookup de variables va PRIMERO -- antes, "db" se
+                // chequeaba acá arriba de todo, así que un `let db = ...`
+                // de un usuario quedaba sombreado en silencio por el
+                // builtin (hallado al diseñar "DB tipada", GRAMMAR.md §2.1).
                 if let Some(b) = env.get(name) {
                     return Ok(b.ty.clone());
+                }
+                if name == "db" {
+                    return Ok(Type::Db);
                 }
                 if let Some((params, ret)) = self.fns.get(name) {
                     return Ok(Type::Function(params.clone(), Box::new(ret.clone())));
@@ -900,6 +958,13 @@ impl Checker {
                         .find(|f| &f.name == field)
                         .map(|f| f.ty)
                         .ok_or_else(|| err(format!("el struct no tiene campo '{field}'"))),
+                    // `db.<coleccion>` -- nombre desconocido ya es un error
+                    // acá mismo, no `Dynamic` dejando pasar cualquier cosa.
+                    Type::Db => self
+                        .db_collections
+                        .get(field.as_str())
+                        .map(|element_ty| Type::DbCollection(Box::new(element_ty.clone())))
+                        .ok_or_else(|| err(format!("'db' no tiene ninguna colección llamada '{field}'"))),
                     other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
                 }
             }
@@ -1085,6 +1150,13 @@ impl Checker {
             return Ok(None);
         };
         let base_ty = self.synth_expr(base, env)?;
+        // `db.<coleccion>.<metodo>(...)` -- a diferencia de los builtins de
+        // primitivos de abajo, un nombre de método desconocido acá es
+        // siempre un error, nunca `Ok(None)` (que dejaría que el camino
+        // genérico de Call lo reintente y produzca un error más confuso).
+        if let Type::DbCollection(element_ty) = &base_ty {
+            return self.check_db_method(element_ty, field, args, env).map(Some);
+        }
         let ty = match (&base_ty, field.as_str()) {
             (Type::Int, "toFloat") => {
                 self.expect_no_args(args, "toFloat")?;
@@ -1105,9 +1177,80 @@ impl Checker {
                 self.check_expr(needle, &Type::String, env)?;
                 Some(Type::Bool)
             }
+            // Ya tenía implementación real en runtime/mod.rs (call_method)
+            // desde antes -- lo que faltaba era la regla del checker. Nunca
+            // se notó porque `db.coleccion.all()` devolvía `Dynamic` (sin
+            // chequear nada) hasta esta misma tarea; recién ahora que
+            // devuelve `List<T>` de verdad hace falta esta regla para que
+            // `.take(n)` siga tipando.
+            (Type::List(inner), "take") => {
+                let [n_arg] = args else {
+                    return Err(err("'take' toma exactamente 1 argumento (n: Int)"));
+                };
+                self.check_expr(n_arg, &Type::Int, env)?;
+                Some(Type::List(inner.clone()))
+            }
             _ => None,
         };
         Ok(ty)
+    }
+
+    /// `all/find/insert/applyPatch` sobre una colección de `db` (GRAMMAR.md
+    /// §2.1) -- resueltos contra `element_ty` de verdad, así que un método
+    /// desconocido ya es un error de tipos acá, no algo que se descubre en
+    /// runtime (`Type::Dynamic` dejaba pasar cualquier nombre antes).
+    fn check_db_method(&self, element_ty: &Type, method: &str, args: &[Expr], env: &Env) -> Result<Type, CheckError> {
+        match method {
+            "all" => {
+                self.expect_no_args(args, "all")?;
+                Ok(Type::List(Box::new(element_ty.clone())))
+            }
+            "find" => {
+                let [id_arg] = args else {
+                    return Err(err("'find' toma exactamente 1 argumento (id: Int)"));
+                };
+                self.check_expr(id_arg, &Type::Int, env)?;
+                Ok(Type::Optional(Box::new(element_ty.clone())))
+            }
+            "insert" => {
+                // Omit<T, "id"> (GRAMMAR.md §2.1): T completo rechazaría el
+                // propio demo insignia, donde el shape de creación
+                // (NewUser) es deliberadamente un subconjunto de T.
+                let [value_arg] = args else {
+                    return Err(err("'insert' toma exactamente 1 argumento"));
+                };
+                let insertable = self.omit_id_field(element_ty)?;
+                self.check_expr(value_arg, &insertable, env)?;
+                Ok(element_ty.clone())
+            }
+            "applyPatch" => {
+                let [id_arg, patch_arg] = args else {
+                    return Err(err("'applyPatch' toma exactamente 2 argumentos (id: Int, patch: Patch<T>)"));
+                };
+                self.check_expr(id_arg, &Type::Int, env)?;
+                self.check_expr(patch_arg, &Type::PatchOf(Box::new(element_ty.clone())), env)?;
+                Ok(element_ty.clone())
+            }
+            other => Err(err(format!(
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch)"
+            ))),
+        }
+    }
+
+    /// "Los campos de T menos 'id'" -- estructural, sin sintaxis de tipo
+    /// nueva (se emite como `Omit<T, "id">`, un utility type nativo de TS,
+    /// ver ts_emit.rs). `validate_db_element_type` ya garantizó que 'id'
+    /// existe al procesar `Item::Db` -- el chequeo acá es una segunda
+    /// defensa, no la única.
+    fn omit_id_field(&self, element_ty: &Type) -> Result<Type, CheckError> {
+        let Type::Struct { fields, .. } = element_ty else {
+            return Err(err("una colección de 'db' debe resolver a un struct"));
+        };
+        if !fields.iter().any(|f| f.name == "id") {
+            return Err(err("cada colección de 'db' necesita un campo 'id: Int'"));
+        }
+        let without_id: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
+        Ok(Type::Struct { name: None, fields: without_id })
     }
 
     fn expect_no_args(&self, args: &[Expr], method: &str) -> Result<(), CheckError> {
@@ -1760,5 +1903,110 @@ mod tests {
         "#;
         let result = check_source(src);
         assert!(result.is_err(), "(Int)->Int no debería servir donde se pide (Bool)->Bool");
+    }
+
+    #[test]
+    fn db_collection_without_id_field_is_rejected() {
+        let src = r#"
+            type Post = { title: String }
+            db { posts: Post[] }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "toda colección de db necesita un campo 'id: Int'");
+    }
+
+    #[test]
+    fn db_collection_that_is_not_a_list_of_structs_is_rejected() {
+        let src = "db { posts: Int }";
+        let result = check_source(src);
+        assert!(result.is_err(), "una colección de db tiene que ser T[], no un tipo suelto");
+    }
+
+    #[test]
+    fn duplicate_db_declaration_is_rejected() {
+        let src = r#"
+            type Post = { id: Int }
+            db { posts: Post[] }
+            db { posts: Post[] }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "no puede haber dos 'db {{ ... }}' en el mismo programa");
+    }
+
+    #[test]
+    fn unknown_db_collection_name_is_rejected() {
+        let src = r#"
+            type Post = { id: Int }
+            db { posts: Post[] }
+            fn broken() -> Post? { db.comments.find(1) }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("comments"), "debería señalar la colección desconocida: {msg}");
+    }
+
+    #[test]
+    fn unknown_db_method_is_rejected() {
+        let src = r#"
+            type Post = { id: Int }
+            db { posts: Post[] }
+            fn broken() -> Post? { db.posts.fnid(1) }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "'fnid' no es un método real de una colección de db");
+    }
+
+    #[test]
+    fn db_all_and_find_resolve_to_the_real_collection_type() {
+        let src = r#"
+            type Post = { id: Int, title: String }
+            db { posts: Post[] }
+            fn listAll() -> Post[] { db.posts.all() }
+            fn one(id: Int) -> Post? { db.posts.find(id) }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn db_insert_accepts_the_element_type_without_id_but_rejects_the_id_field_missing_other_fields() {
+        let src = r#"
+            type Post = { id: Int, title: String }
+            db { posts: Post[] }
+            type NewPost = { title: String }
+            fn create(input: NewPost) -> Post { db.posts.insert(input) }
+        "#;
+        assert!(check_source(src).is_ok(), "NewPost (sin id) debería servir para insert: Omit<Post,\"id\">");
+
+        let src_missing_field = r#"
+            type Post = { id: Int, title: String, body: String }
+            db { posts: Post[] }
+            type Incomplete = { title: String }
+            fn create(input: Incomplete) -> Post { db.posts.insert(input) }
+        "#;
+        let result = check_source(src_missing_field);
+        assert!(result.is_err(), "falta 'body' -- Incomplete no alcanza para Omit<Post,\"id\">");
+    }
+
+    #[test]
+    fn db_apply_patch_requires_a_patch_of_the_element_type() {
+        // Mismo patrón que examples/users.link: Patch<T> llega como
+        // parámetro (del wire), no se construye con un literal acá.
+        let src = r#"
+            type Post = { id: Int, title: String }
+            db { posts: Post[] }
+            fn rename(id: Int, patch: Patch<Post>) -> Post { db.posts.applyPatch(id, patch) }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn user_variable_named_db_shadows_the_builtin() {
+        // Hallado al diseñar "DB tipada": antes, "db" se chequeaba ANTES del
+        // lookup de variables, así que un `let db = ...` de un usuario
+        // quedaba sombreado en silencio por el builtin. Ahora el lookup de
+        // variables va primero.
+        let src = "fn f() -> Int { let db = 5; db }";
+        assert!(check_source(src).is_ok());
     }
 }

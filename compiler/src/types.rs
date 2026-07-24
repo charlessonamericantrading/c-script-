@@ -60,12 +60,24 @@ pub enum Type {
     /// así que no hay ninguna construcción sintáctica que "angostar"
     /// pudiera usar todavía. Documentado como límite real, no escondido.
     Union(Vec<Type>),
-    /// Pseudo-tipo para valores del runtime aún no modelado (p. ej. `db`).
-    /// Compatible con cualquier tipo en ambas direcciones, como `any` de TS —
-    /// deliberado para v0: el checker todavía no conoce la forma de la base
-    /// de datos (eso es Fase 2 "DB tipada" en PLAN.md §4), así que cualquier
-    /// cadena `db.algo.mas(...)` queda sin verificar en vez de fallar.
+    /// Pseudo-tipo para valores del runtime aún no modelado. Compatible con
+    /// cualquier tipo en ambas direcciones, como `any` de TS -- reservado
+    /// para lo que de verdad no tiene forma conocida todavía (ya no `db`,
+    /// ver Type::Db/Type::DbCollection: "DB tipada" v0 resuelto).
     Dynamic,
+    /// Tipo interno SOLO del identificador `db` en sí (GRAMMAR.md §2.1,
+    /// DbDecl) -- nunca aparece en una firma de tipo escrita por el
+    /// usuario, ni cruza a TypeExpr. `db.<coleccion>` lo resuelve a
+    /// `DbCollection`.
+    Db,
+    /// `db.<coleccion>` ya resuelto contra lo declarado en `db { ... }` --
+    /// el elemento es el tipo de struct de esa colección (siempre con un
+    /// campo `id: Int`, exigido por el checker al procesar `Item::Db`).
+    /// Los métodos builtin (`all/find/insert/applyPatch`) se resuelven
+    /// contra esto en vez de caer a `Dynamic` -- por eso un nombre de
+    /// colección o de método desconocido ya es un error de tipos, no algo
+    /// que se descubre recién en runtime.
+    DbCollection(Box<Type>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
