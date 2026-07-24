@@ -11,7 +11,7 @@
 //   - clave ausente en el patch  -> no tocar el campo
 //   - clave presente con valor   -> fijar el campo a ese valor
 //   - clave presente con `null`  -> limpiar el campo (solo si es nullable
-//                                    en la base, es decir, declarado T? en Link)
+//                                    en la base, es decir, declarado T? en c-script)
 
 type User = {
   id: number;
@@ -20,7 +20,7 @@ type User = {
   deletedAt: string | null;  // nullable siempre -> clave siempre presente, null hasta borrarse
 };
 
-// Patch<User> generado por Link: todos los campos vuelven `?:`, preservando
+// Patch<User> generado por c-script: todos los campos vuelven `?:`, preservando
 // si además eran nullable (`| null`) en la base.
 type PatchUser = {
   name?: string;

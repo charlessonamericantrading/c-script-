@@ -1,6 +1,6 @@
 *[Leer en español](README.es.md)*
 
-# Link
+# c-script
 
 A compiled backend language whose entire point is **end-to-end type safety with TypeScript**: rename a field in the backend, and the frontend fails to compile (`tsc`) instead of failing in production.
 
@@ -34,7 +34,7 @@ cd ../compiler && ./target/debug/linkc serve ../examples/users.link 8787 &
 cd ../frontend && node src/main.ts                  # calls the real server, typed end-to-end
 ```
 
-Now break something: in `examples/users.link`, rename `name` to `fullName` inside `type User`. Re-run `linkc build` and `npx tsc --noEmit` **without touching `frontend/src/main.ts`**. `tsc` fails on every line that used `.name` — exactly the blind spot Link exists to eliminate (see [PLAN.md](PLAN.md) §3).
+Now break something: in `examples/users.link`, rename `name` to `fullName` inside `type User`. Re-run `linkc build` and `npx tsc --noEmit` **without touching `frontend/src/main.ts`**. `tsc` fails on every line that used `.name` — exactly the blind spot c-script exists to eliminate (see [PLAN.md](PLAN.md) §3).
 
 ## Why not just tRPC / Bun / Deno?
 
@@ -42,7 +42,7 @@ They solve adjacent but different problems:
 
 - **tRPC, Encore.ts, Convex** give you E2E type safety by having *no language boundary at all* — the backend already is TypeScript. Clever, but only works if your whole stack is TS.
 - **Bun, Deno** are faster, more modern JS/TS runtimes — but still JS/TS semantics under the hood, not systems-language performance.
-- **Rust+ts-rs, Go+tygo, gRPC/protobuf, OpenAPI codegen** are the actual comparison set: a non-TS backend bridged to a TS frontend. They require a separate IDL/schema you keep in sync by hand, or give you types without a full RPC client. Link's bet: the backend type declaration itself *is* the contract — no separate schema, automatic client, automatic wire validators.
+- **Rust+ts-rs, Go+tygo, gRPC/protobuf, OpenAPI codegen** are the actual comparison set: a non-TS backend bridged to a TS frontend. They require a separate IDL/schema you keep in sync by hand, or give you types without a full RPC client. c-script's bet: the backend type declaration itself *is* the contract — no separate schema, automatic client, automatic wire validators.
 
 ## Status
 

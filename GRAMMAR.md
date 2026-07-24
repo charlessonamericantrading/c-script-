@@ -1,6 +1,6 @@
-# Especificación Formal: Gramática y Sistema de Tipos de **Link**
+# Especificación Formal: Gramática y Sistema de Tipos de **c-script**
 
-> Complementa a [`PLAN.md`](./PLAN.md). Aquí se define, con precisión de implementación: la gramática léxica y sintáctica (EBNF), las reglas del type checker (bidireccional), la tabla de mapeo exhaustiva Link→TypeScript, y la semántica de nullability y errores.
+> Complementa a [`PLAN.md`](./PLAN.md). Aquí se define, con precisión de implementación: la gramática léxica y sintáctica (EBNF), las reglas del type checker (bidireccional), la tabla de mapeo exhaustiva c-script→TypeScript, y la semántica de nullability y errores.
 >
 > Notación EBNF (estilo ISO/Wirth): `,` secuencia · `|` alternativa · `[x]` opcional (0 o 1) · `{x}` repetición (0 o más) · `"texto"` terminal literal.
 
@@ -220,7 +220,7 @@ para cada arm en match:
 error si cubierto ≠ todas_las_variantes(EnumType)
 ```
 
-Esto es lo que hace que el compilador de Link, igual que Rust, **rechace un `match` que no cubre un nuevo variant** añadido a un enum. Es una propiedad valiosa por sí misma (no solo para el puente con TS): añadir un caso a `Result` rompe la compilación en *todos* los `match` que lo consumen, en el backend, no solo en el frontend.
+Esto es lo que hace que el compilador de c-script, igual que Rust, **rechace un `match` que no cubre un nuevo variant** añadido a un enum. Es una propiedad valiosa por sí misma (no solo para el puente con TS): añadir un caso a `Result` rompe la compilación en *todos* los `match` que lo consumen, en el backend, no solo en el frontend.
 
 ### 3.4 Nullability (`T?`) — RESUELTO (default aplicado)
 
@@ -234,7 +234,7 @@ S <: T?
 
 **Decisión:** el default recomendado en `PLAN.md` §8.3, aplicado sin pasar por el TODO del usuario (ver `examples/decision-nullability.ts` para el resultado).
 
-| Sintaxis Link | Significado | TypeScript | Wire (JSON) |
+| Sintaxis c-script | Significado | TypeScript | Wire (JSON) |
 |---|---|---|---|
 | `x: T` | requerido, nunca ausente ni null | `x: T` | clave siempre presente |
 | `x: T?` | la clave siempre está; el **valor** puede ser null | `x: T \| null` | clave presente, valor `null` |
@@ -289,7 +289,7 @@ service Users {
 }
 ```
 
-Nótese el patrón `ValidateResult.Ok { value: v }`, no `Ok(v)`: los variants de Link se declaran con campos nombrados (§3.5 arriba), así que su patrón es struct-style (§2.3), no posicional al estilo Rust `Some(x)`. Es una consecuencia directa de la gramática de patrones, no una elección nueva.
+Nótese el patrón `ValidateResult.Ok { value: v }`, no `Ok(v)`: los variants de c-script se declaran con campos nombrados (§3.5 arriba), así que su patrón es struct-style (§2.3), no posicional al estilo Rust `Some(x)`. Es una consecuencia directa de la gramática de patrones, no una elección nueva.
 
 Mapeo a TS (reusa la regla general de enum-con-datos, §4):
 
@@ -344,9 +344,9 @@ Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos,
 
 ---
 
-## 4. Tabla de Mapeo Link → TypeScript (exhaustiva)
+## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
-| Construcción Link | TypeScript emitido | Forma JSON en el cable | Nota |
+| Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
 |---|---|---|---|
 | `Int`, `Float` | `number` | número | — |
 | `Int64` | `bigint` | `string` | Evita pérdida de precisión >2^53; el validador generado parsea el string |

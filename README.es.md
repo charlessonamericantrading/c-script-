@@ -1,6 +1,6 @@
 *[Read in English](README.md)*
 
-# Link
+# c-script
 
 Un lenguaje backend compilado cuyo diferenciador es la **type-safety de extremo a extremo con TypeScript**: cambiar un tipo en el backend rompe la compilación (`tsc`) del frontend, en vez de fallar en producción.
 
@@ -34,7 +34,7 @@ cd ../compiler && ./target/debug/linkc serve ../examples/users.link 8787 &
 cd ../frontend && node src/main.ts                  # llama al server real, tipado end-to-end
 ```
 
-Ahora rompé algo: en `examples/users.link`, renombrá `name` a `fullName` dentro de `type User`. Volvé a correr `linkc build` y `npx tsc --noEmit` **sin tocar `frontend/src/main.ts`**. `tsc` va a fallar en cada línea que usaba `.name` — exactamente el punto ciego que Link existe para eliminar (ver [PLAN.md](PLAN.md) §3).
+Ahora rompé algo: en `examples/users.link`, renombrá `name` a `fullName` dentro de `type User`. Volvé a correr `linkc build` y `npx tsc --noEmit` **sin tocar `frontend/src/main.ts`**. `tsc` va a fallar en cada línea que usaba `.name` — exactamente el punto ciego que c-script existe para eliminar (ver [PLAN.md](PLAN.md) §3).
 
 ## Estado
 

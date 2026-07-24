@@ -1,6 +1,6 @@
 // Demo E2E (PLAN.md §8.2 / Fase 0): este archivo NUNCA se toca cuando el
 // backend cambia. Si `tsc` falla después de recompilar el backend, es la
-// prueba de que Link cumple su promesa central — romper en compilación,
+// prueba de que c-script cumple su promesa central — romper en compilación,
 // no en producción.
 
 import { createUsersClient } from "../../gen/client.ts";
@@ -15,7 +15,7 @@ async function main() {
     console.log(`Usuario #${maybeUser.id}: ${maybeUser.name} <${maybeUser.email}> (${maybeUser.role})`);
   }
 
-  // list -- limit es opcional (tenía default en Link)
+  // list -- limit es opcional (tenía default en c-script)
   const all = await users.list();
   const firstFive = await users.list(5);
   console.log(`${all.length} usuarios en total, mostrando ${firstFive.length}`);

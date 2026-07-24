@@ -11,7 +11,7 @@ pub fn serve(program: Program, port: u16) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
     let db = Db::seeded();
-    println!("Link server escuchando en http://localhost:{port}  (Ctrl+C para detener)");
+    println!("c-script server escuchando en http://localhost:{port}  (Ctrl+C para detener)");
 
     for mut request in server.incoming_requests() {
         if *request.method() == tiny_http::Method::Options {

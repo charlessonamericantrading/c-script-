@@ -1,4 +1,4 @@
-# Plan de Desarrollo: **Link** — Lenguaje Backend con End-to-End Type Safety para TypeScript
+# Plan de Desarrollo: **c-script** — Lenguaje Backend con End-to-End Type Safety para TypeScript
 
 > Documento de ingeniería. Versión 1.0 · Objetivo: plan realista, detallado y honesto para diseñar y construir un lenguaje backend compilado cuyo diferenciador es la **interoperabilidad de tipos nativa y automática con frontends TypeScript**.
 
@@ -37,7 +37,7 @@ Este documento cubre **ambos caminos**: el plan del lenguaje completo (porque lo
 | **gRPC + protobuf / Connect** | Cualquiera | ✅ vía IDL | Muy alto | Sí | IDL aparte; DX web pobre; no idiomático en TS |
 | **Fern / Smithy** | Cualquiera | ✅ vía IDL | N/A | Sí | Escribes un IDL separado del código |
 | **WASM Component Model (WIT)** | Cualquiera | ✅ vía WIT | Alto | Sí | Inmaduro; overhead de bindings |
-| **Link (propuesto)** | **Nuevo, compilado** | **✅ nativo** | **Alto (nativo/WASM)** | **Automático** | **Coste de crear un lenguaje** |
+| **c-script (propuesto)** | **Nuevo, compilado** | **✅ nativo** | **Alto (nativo/WASM)** | **Automático** | **Coste de crear un lenguaje** |
 
 ### 1.2 El gap que justificaría un lenguaje nuevo
 
@@ -119,7 +119,7 @@ service Users {
 
 ### 2.3 Sistema de tipos — el mapeo 1:1 a TypeScript (el corazón del proyecto)
 
-| Tipo en Link | Tipo en TypeScript | Forma JSON |
+| Tipo en c-script | Tipo en TypeScript | Forma JSON |
 |---|---|---|
 | `Int`, `Float` | `number` | número |
 | `Int64`, `BigInt` | `bigint` \| `string`* | string (para no perder precisión) |
@@ -270,7 +270,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 - **Cuña inicial**: equipos full-stack TypeScript que ya usan tRPC pero necesitan más rendimiento en el backend. No compitas con Go/Rust de frente; compite en *"la mejor experiencia backend para un frontend TS"*.
 - **"Time to wow" < 5 minutos**: `link new` → editas un tipo → el frontend deja de compilar. Ese momento vende el proyecto.
-- **Docs y templates**: starter Next.js + Link, ejemplos reales, migración desde tRPC.
+- **Docs y templates**: starter Next.js + c-script, ejemplos reales, migración desde tRPC.
 - **Open source con gobernanza clara** (licencia permisiva, RFCs públicos). La comunidad es el activo, no el compilador.
 
 ---
@@ -314,4 +314,4 @@ Antes de escribir el emisor, hay que decidir **cómo se representa la ausencia**
 
 ### Sobre el nombre
 
-`Link` es claro pero muy sobrecargado (linkers, `<link>`, LinkedIn). Alternativas que evocan "puente / contrato / mismo tipo a ambos lados": **Conduit**, **Weld**, **Isotype** (iso = mismo), **Seam**, **Tether**. Es la decisión menos importante — no le dediques tiempo hasta la Fase 1.
+Decidido: **c-script**, en minúsculas. La extensión de archivo (`.link`) y el nombre del binario del compilador (`linkc`) se mantienen como está — no hace falta que deletreen la marca, igual que `.rs` no dice "rust". Ver GRAMMAR.md para el resto de las convenciones de nomenclatura.
