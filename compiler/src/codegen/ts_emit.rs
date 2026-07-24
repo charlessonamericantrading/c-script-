@@ -35,11 +35,6 @@ pub fn emit_contract(program: &Program) -> Result<String, String> {
         }
     }
     for item in &program.items {
-        if let Item::Const(c) = item {
-            emit_const_decl(&mut out, c, &checker)?;
-        }
-    }
-    for item in &program.items {
         if let Item::Service(s) = item {
             emit_service_interface(&mut out, s, &checker)?;
         }
@@ -47,12 +42,20 @@ pub fn emit_contract(program: &Program) -> Result<String, String> {
     Ok(out)
 }
 
-/// `const X: T = v` (GRAMMAR.md §4) -- hallado sin emitir durante la
-/// auditoría final: se parseaba y el checker ahora sí lo valida
-/// (checker.rs, check_const), pero el emisor lo ignoraba del todo.
+/// `const X: T = v` (GRAMMAR.md §4) -- va a `client.ts`, NO a
+/// `contract.d.ts`.
+///
+/// Un `.d.ts` es un archivo de declaraciones AMBIENTALES: describe tipos y
+/// firmas, no lleva código. TypeScript rechaza cualquier inicializador ahí
+/// con `TS1039: Initializers are not allowed in ambient contexts`, así que
+/// emitir `export const MAX: number = 3;` en el contrato hacía que
+/// CUALQUIER programa con un `const` produjera un contrato que no compila
+/// (bug real de la auditoría; el demo no tiene ningún `const`, por eso
+/// nunca se notó). Un `const` es un VALOR, y los valores viven en el
+/// módulo real -- de ahí que se emita acá.
 fn emit_const_decl(out: &mut String, c: &ConstDecl, checker: &Checker) -> Result<(), String> {
     let ty = checker.resolve_type(&c.ty).map_err(|e| e.to_string())?;
-    let value = render_const_value(&c.value)?;
+    let value = render_const_value(&c.value, checker)?;
     out.push_str(&format!("export const {}: {} = {};\n\n", c.name, render_type(&ty), value));
     Ok(())
 }
@@ -63,7 +66,7 @@ fn emit_const_decl(out: &mut String, c: &ConstDecl, checker: &Checker) -> Result
 /// valor fijo hasta que corren) y no tienen ningún equivalente como
 /// constante de módulo en TS -- por eso un `const` con ese tipo de valor
 /// es un error del checker, no algo que el emisor intente adivinar.
-fn render_const_value(e: &Expr) -> Result<String, String> {
+fn render_const_value(e: &Expr, checker: &Checker) -> Result<String, String> {
     match e {
         Expr::Int(n) => Ok(n.to_string()),
         Expr::Float(n) => Ok(n.to_string()),
@@ -71,20 +74,33 @@ fn render_const_value(e: &Expr) -> Result<String, String> {
         Expr::Bool(b) => Ok(b.to_string()),
         Expr::Null => Ok("null".to_string()),
         Expr::ArrayLit(items) => {
-            let parts: Vec<String> = items.iter().map(render_const_value).collect::<Result<_, _>>()?;
+            let parts: Vec<String> =
+                items.iter().map(|i| render_const_value(i, checker)).collect::<Result<_, _>>()?;
             Ok(format!("[{}]", parts.join(", ")))
         }
         Expr::TupleLit(items) => {
-            let parts: Vec<String> = items.iter().map(render_const_value).collect::<Result<_, _>>()?;
+            let parts: Vec<String> =
+                items.iter().map(|i| render_const_value(i, checker)).collect::<Result<_, _>>()?;
             Ok(format!("[{}]", parts.join(", ")))
         }
-        Expr::StructLit { variant, fields, .. } => {
+        Expr::StructLit { name, variant, fields } => {
             let mut parts: Vec<String> = Vec::new();
             if let Some(v) = variant {
+                // Un enum SIMPLE (todas sus variantes unitarias) se emite
+                // como unión de literales string, así que su valor es el
+                // string pelado -- no `{ type: "..." }`. Es exactamente la
+                // misma distinción `all_unit` que ya hacen `emit_enum_decl`
+                // (acá al lado) y `value_to_json` (runtime/mod.rs); este
+                // tercer lugar se la había perdido, y emitía un valor que
+                // ni siquiera era asignable al tipo que el propio contrato
+                // declaraba dos líneas más arriba.
+                if is_simple_enum(name, checker) {
+                    return Ok(format!("{v:?}"));
+                }
                 parts.push(format!("type: {v:?}"));
             }
             for (k, fe) in fields {
-                parts.push(format!("{k}: {}", render_const_value(fe)?));
+                parts.push(format!("{k}: {}", render_const_value(fe, checker)?));
             }
             Ok(format!("{{ {} }}", parts.join(", ")))
         }
@@ -139,6 +155,15 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         resolved.push((rpc, is_stream, param_tys, ret_ty));
     }
     imported_names.insert(format!("{}Client", service.name));
+    // Los `const` se emiten en ESTE archivo (ver `emit_const_decl`), así que
+    // su tipo declarado también hay que importarlo -- `const DEF: Role = ...`
+    // no compila si `Role` no está en scope acá.
+    for item in &program.items {
+        if let Item::Const(c) = item {
+            let ty = checker.resolve_type(&c.ty).map_err(|e| e.to_string())?;
+            collect_type_names(&ty, &mut imported_names);
+        }
+    }
 
     out.push_str(&format!(
         "import type {{ {} }} from \"./contract\";\n",
@@ -175,6 +200,14 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     out.push_str("    this.received = received;\n");
     out.push_str("  }\n");
     out.push_str("}\n\n");
+
+    // Los `const` viven acá, no en contract.d.ts -- ver `emit_const_decl`:
+    // un .d.ts es ambiental y TypeScript rechaza los inicializadores.
+    for item in &program.items {
+        if let Item::Const(c) = item {
+            emit_const_decl(&mut out, c, &checker)?;
+        }
+    }
 
     out.push_str(&format!("class {name}ClientImpl implements {name}Client {{\n", name = service.name));
     // Constructor explícito, no "parameter property" (`private x: T` en la
@@ -328,15 +361,32 @@ fn emit_type_decl(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(
     Ok(())
 }
 
+/// ¿`name` es un enum "simple" (todas sus variantes unitarias)? Esa es la
+/// distinción que decide entre "string plano" y "objeto con tag `type`"
+/// en TODOS lados: la firma emitida (`emit_enum_decl`), el valor
+/// serializado (`runtime/mod.rs::value_to_json`) y el valor de un `const`
+/// (`render_const_value`). Que los tres coincidan no es opcional.
+fn is_simple_enum(name: &str, checker: &Checker) -> bool {
+    checker
+        .enums
+        .get(name)
+        .is_some_and(|e| e.variants.iter().all(|v| v.fields.is_none()))
+}
+
 fn emit_enum_decl(out: &mut String, e: &EnumDecl, checker: &Checker) -> Result<(), String> {
     let generics = type_params_suffix(&e.type_params);
     let all_unit = e.variants.iter().all(|v| v.fields.is_none());
     if all_unit {
-        // enum simple -> unión de literales string (GRAMMAR.md §4). No
-        // puede ser genérico de verdad (no hay dónde usar T sin campos),
-        // pero la sintaxis lo permitiría -- se ignoran type_params acá.
+        // enum simple -> unión de literales string (GRAMMAR.md §4). Un
+        // enum así no puede USAR su parámetro de tipo (no hay campos donde
+        // meter T), pero la sintaxis lo permite -- y si se declaró, hay que
+        // CONSERVARLO en la firma emitida: `render_type` sigue produciendo
+        // `G<number>` para una instanciación, así que emitir `type G = ...`
+        // a secas daba `TS2315: Type 'G' is not generic` en los tres
+        // archivos generados. Un parámetro de tipo sin usar es TS válido;
+        // referenciar como genérico algo que no lo es, no.
         let variants: Vec<String> = e.variants.iter().map(|v| format!("\"{}\"", v.name)).collect();
-        out.push_str(&format!("export type {} = {};\n\n", e.name, variants.join(" | ")));
+        out.push_str(&format!("export type {}{} = {};\n\n", e.name, generics, variants.join(" | ")));
         return Ok(());
     }
     // ADT -> unión discriminada con tag `type` (GRAMMAR.md §4)
@@ -654,13 +704,57 @@ mod tests {
     }
 
     #[test]
-    fn const_decl_is_emitted_as_a_real_ts_export() {
-        // Hallado sin emitir durante la auditoría final: Item::Const no
-        // tenía ningún brazo en emit_contract, así que desaparecía del
-        // contrato en silencio (GRAMMAR.md §4).
-        let src = "const MAX_RETRIES: Int = 3;";
+    fn const_decl_is_emitted_into_the_client_not_the_ambient_contract() {
+        // Un .d.ts es un archivo de declaraciones AMBIENTALES: TypeScript
+        // rechaza cualquier inicializador ahí (TS1039), así que emitir el
+        // const en el contrato hacía que ningún programa con un `const`
+        // produjera un contrato compilable -- bug de la auditoría. El valor
+        // vive en client.ts, que sí es un módulo real.
+        let src = r#"
+            const MAX_RETRIES: Int = 3;
+            service S { rpc ping() -> Int { 1 } }
+        "#;
+        let (contract, client) = emit_both(src);
+        assert!(
+            !contract.contains("MAX_RETRIES"),
+            "un const no puede ir al .d.ts: los inicializadores son ilegales en contexto ambiental"
+        );
+        assert!(client.contains("export const MAX_RETRIES: number = 3;"), "{client}");
+    }
+
+    #[test]
+    fn a_const_of_a_simple_enum_uses_the_bare_string_form() {
+        // Misma distinción all_unit que ya hacen emit_enum_decl y
+        // value_to_json: un enum simple ES un string en el wire y en el
+        // tipo emitido, así que `{ type: "Admin" }` no era ni siquiera
+        // asignable al `type Role = "Admin" | "Member"` de dos líneas
+        // más arriba en el propio contrato generado.
+        let src = r#"
+            enum Role { Admin, Member }
+            enum Shape { Circle { r: Int }, Square { s: Int } }
+            const DEF: Role = Role.Admin {};
+            const SH: Shape = Shape.Circle { r: 1 };
+            service S { rpc ping() -> Int { 1 } }
+        "#;
+        let (_, client) = emit_both(src);
+        assert!(client.contains(r#"export const DEF: Role = "Admin";"#), "{client}");
+        // Un ADT sí conserva el tag `type`.
+        assert!(client.contains(r#"export const SH: Shape = { type: "Circle", r: 1 };"#), "{client}");
+        // Y el tipo del const tiene que estar importado para que compile.
+        assert!(client.contains("Role"), "el tipo de un const emitido acá tiene que importarse");
+    }
+
+    #[test]
+    fn an_all_unit_generic_enum_keeps_its_type_parameters() {
+        // `render_type` sigue produciendo `G<number>` para una
+        // instanciación, así que emitir `type G = ...` sin parámetros daba
+        // TS2315 ("Type 'G' is not generic") en los tres archivos.
+        let src = r#"
+            enum G<T> { A, B }
+            service S { rpc g() -> G<Int> { G.A {} } }
+        "#;
         let (contract, _) = emit_both(src);
-        assert!(contract.contains("export const MAX_RETRIES: number = 3;"));
+        assert!(contract.contains(r#"export type G<T> = "A" | "B";"#), "{contract}");
     }
 
     #[test]
@@ -668,10 +762,11 @@ mod tests {
         let src = r#"
             fn compute() -> Int { 1 + 1 }
             const TOTAL: Int = compute();
+            service S { rpc ping() -> Int { 1 } }
         "#;
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         let program = parse(tokens).unwrap_or_else(|e| panic!("{e}"));
-        let result = emit_contract(&program);
+        let result = emit_client(&program);
         assert!(result.is_err(), "un const cuyo valor es una llamada no tiene forma de literal TS");
     }
 

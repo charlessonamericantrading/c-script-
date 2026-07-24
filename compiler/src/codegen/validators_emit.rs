@@ -77,10 +77,57 @@ pub fn emit_validators(program: &Program) -> Result<String, String> {
     Ok(out)
 }
 
+/// Encola `ty` -- y, si `ty` no tiene validador propio, todo lo que
+/// CONTENGA que sí lo tenga.
+///
+/// Ese segundo caso faltaba y era un bug real: un service cuyo único rpc
+/// devolvía `C[]` (o `C?`, o una tupla con un `C`) generaba un `client.ts`
+/// con `import { isC } from "./validators.ts"` y un `validators.ts` que no
+/// definía `isC` -- el frontend generado no compilaba. `examples/users.link`
+/// se salvaba de casualidad porque `isUser` se sembraba igual vía
+/// `create() -> Result<User, ...>` y `update() -> User`.
+///
+/// La causa de fondo era que esta función y `collect_validator_names` (que
+/// decide qué IMPORTA client.ts) recorrían el tipo con criterios distintos.
+/// Tienen que coincidir exactamente: una emite y la otra importa lo mismo.
 fn enqueue(ty: &Type, worklist: &mut Vec<Type>, seen: &mut Vec<Type>) {
-    if validator_fn_name(ty).is_some() && !seen.contains(ty) {
-        seen.push(ty.clone());
-        worklist.push(ty.clone());
+    if validator_fn_name(ty).is_some() {
+        if !seen.contains(ty) {
+            seen.push(ty.clone());
+            worklist.push(ty.clone());
+        }
+        return;
+    }
+    // Sin nombre propio: se valida inline, pero puede envolver tipos que sí
+    // necesitan su propia función.
+    match ty {
+        Type::Optional(inner) | Type::List(inner) => enqueue(inner, worklist, seen),
+        Type::Tuple(items) => {
+            for i in items {
+                enqueue(i, worklist, seen);
+            }
+        }
+        Type::Function(params, ret) => {
+            for p in params {
+                enqueue(p, worklist, seen);
+            }
+            enqueue(ret, worklist, seen);
+        }
+        Type::Struct { fields, .. } => {
+            for f in fields {
+                enqueue(&f.ty, worklist, seen);
+            }
+        }
+        Type::MapOf(k, v) => {
+            enqueue(k, worklist, seen);
+            enqueue(v, worklist, seen);
+        }
+        Type::Union(members) => {
+            for m in members {
+                enqueue(m, worklist, seen);
+            }
+        }
+        _ => {}
     }
 }
 
