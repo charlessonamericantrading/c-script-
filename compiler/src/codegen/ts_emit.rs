@@ -34,11 +34,65 @@ pub fn emit_contract(program: &Program) -> Result<String, String> {
         }
     }
     for item in &program.items {
+        if let Item::Const(c) = item {
+            emit_const_decl(&mut out, c, &checker)?;
+        }
+    }
+    for item in &program.items {
         if let Item::Service(s) = item {
             emit_service_interface(&mut out, s, &checker)?;
         }
     }
     Ok(out)
+}
+
+/// `const X: T = v` (GRAMMAR.md §4) -- hallado sin emitir durante la
+/// auditoría final: se parseaba y el checker ahora sí lo valida
+/// (checker.rs, check_const), pero el emisor lo ignoraba del todo.
+fn emit_const_decl(out: &mut String, c: &ConstDecl, checker: &Checker) -> Result<(), String> {
+    let ty = checker.resolve_type(&c.ty).map_err(|e| e.to_string())?;
+    let value = render_const_value(&c.value)?;
+    out.push_str(&format!("export const {}: {} = {};\n\n", c.name, render_type(&ty), value));
+    Ok(())
+}
+
+/// Solo expresiones con forma de literal -- lo único que este emisor puede
+/// bajar a código TS estático. `Call`/`FieldAccess`/`Match`/etc. son
+/// computaciones en runtime (necesitan `db`, o simplemente no tienen un
+/// valor fijo hasta que corren) y no tienen ningún equivalente como
+/// constante de módulo en TS -- por eso un `const` con ese tipo de valor
+/// es un error del checker, no algo que el emisor intente adivinar.
+fn render_const_value(e: &Expr) -> Result<String, String> {
+    match e {
+        Expr::Int(n) => Ok(n.to_string()),
+        Expr::Float(n) => Ok(n.to_string()),
+        Expr::Str(s) => Ok(format!("{s:?}")),
+        Expr::Bool(b) => Ok(b.to_string()),
+        Expr::Null => Ok("null".to_string()),
+        Expr::ArrayLit(items) => {
+            let parts: Vec<String> = items.iter().map(render_const_value).collect::<Result<_, _>>()?;
+            Ok(format!("[{}]", parts.join(", ")))
+        }
+        Expr::TupleLit(items) => {
+            let parts: Vec<String> = items.iter().map(render_const_value).collect::<Result<_, _>>()?;
+            Ok(format!("[{}]", parts.join(", ")))
+        }
+        Expr::StructLit { variant, fields, .. } => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(v) = variant {
+                parts.push(format!("type: {v:?}"));
+            }
+            for (k, fe) in fields {
+                parts.push(format!("{k}: {}", render_const_value(fe)?));
+            }
+            Ok(format!("{{ {} }}", parts.join(", ")))
+        }
+        other => Err(format!(
+            "el valor de un 'const' tiene que ser un literal (número, string, bool, null, array, tupla o \
+             struct/variant literal) -- se encontró {other:?}, que es una computación en runtime sin ningún \
+             equivalente como constante estática de TS"
+        )),
+    }
 }
 
 pub fn emit_client(program: &Program) -> Result<String, String> {
@@ -509,6 +563,28 @@ mod tests {
         assert!(contract.contains("flags: Record<string, boolean>;"));
         // Record es nativo de TS -- no debería aparecer en ningún import
         assert!(!contract.contains("import"));
+    }
+
+    #[test]
+    fn const_decl_is_emitted_as_a_real_ts_export() {
+        // Hallado sin emitir durante la auditoría final: Item::Const no
+        // tenía ningún brazo en emit_contract, así que desaparecía del
+        // contrato en silencio (GRAMMAR.md §4).
+        let src = "const MAX_RETRIES: Int = 3;";
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("export const MAX_RETRIES: number = 3;"));
+    }
+
+    #[test]
+    fn const_with_a_non_literal_value_is_rejected_by_the_emitter() {
+        let src = r#"
+            fn compute() -> Int { 1 + 1 }
+            const TOTAL: Int = compute();
+        "#;
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e}"));
+        let result = emit_contract(&program);
+        assert!(result.is_err(), "un const cuyo valor es una llamada no tiene forma de literal TS");
     }
 
     #[test]

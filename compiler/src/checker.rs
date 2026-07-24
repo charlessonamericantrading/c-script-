@@ -116,6 +116,11 @@ impl Checker {
                         }
                     }
                 }
+                Item::Const(c) => {
+                    if let Err(e) = checker.check_const(c) {
+                        errors.push(e);
+                    }
+                }
                 _ => {}
             }
         }
@@ -349,6 +354,15 @@ impl Checker {
             env.insert(p.name.clone(), immutable(self.resolve_type(&p.ty)?));
         }
         self.check_block(&f.body, &ret, &env)
+    }
+
+    /// `const X: T = v` (GRAMMAR.md §2.1) -- hallado sin chequear ni emitir
+    /// durante la auditoría final: se parseaba, pero `check_program` lo
+    /// ignoraba del todo (`_ => {}`) y el emisor nunca lo tocaba. Ahora se
+    /// valida `v ⇐ T` igual que cualquier otro valor con tipo esperado.
+    fn check_const(&self, c: &ConstDecl) -> Result<(), CheckError> {
+        let ty = self.resolve_type(&c.ty)?;
+        self.check_expr(&c.value, &ty, &Env::new())
     }
 
     fn check_rpc(&self, r: &RpcDecl) -> Result<(), CheckError> {
@@ -1598,6 +1612,19 @@ mod tests {
             fn use_it() -> Int { f(A { x: 1 }) }
         "#;
         assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn const_value_matching_its_declared_type_is_accepted() {
+        // Hallado sin chequear durante la auditoría final: check_program
+        // ignoraba Item::Const del todo (GRAMMAR.md §2.1/§4).
+        assert!(check_source("const MAX_RETRIES: Int = 3;").is_ok());
+    }
+
+    #[test]
+    fn const_value_not_matching_its_declared_type_is_rejected() {
+        let result = check_source(r#"const MAX_RETRIES: Int = "tres";"#);
+        assert!(result.is_err(), "un const declarado Int no debería aceptar un valor String");
     }
 
     #[test]

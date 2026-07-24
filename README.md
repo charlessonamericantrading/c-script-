@@ -46,9 +46,9 @@ They solve adjacent but different problems:
 
 ## Status
 
-Done (Phase 0): lexer, parser, bidirectional type checker (structural/nominal subtyping, `match` exhaustiveness, `Result<T,E>` and `Patch<T>` as builtins, arithmetic/comparison/logical operators, `if/else`), contract emitter, minimal interpreted runtime. 64 tests, all passing.
+Done (Phase 0): lexer, parser, bidirectional type checker (structural/nominal subtyping, `Result<T,E>` and `Patch<T>` as builtins, arithmetic/comparison/logical operators, `if/else`, assignment and mutability, arrays, tuples, explicit numeric conversion, `Map<K,V>`, string builtin methods), user-defined generics via monomorphization, union types (`A | B`) with value-flow subtyping, functions as first-class values (named references, with real contravariant/covariant function subtyping), `match` exhaustiveness extended with literal patterns, or-patterns, and guards, contract emitter, minimal interpreted runtime. 129 tests, all passing.
 
-Not done yet: a real compilation backend (Cranelift/WASM), an LSP, a package manager, real streaming over WebSocket/SSE, a typed DB layer, user-defined generics, union types.
+Not done yet: a real compilation backend (Cranelift/WASM), an LSP, a package manager, real streaming over WebSocket/SSE, a typed DB layer, anonymous function literals / true lexical closures, higher-order `List` methods (`.map`/`.filter`), and narrowing a union-typed value back to a concrete member. See [GRAMMAR.md](GRAMMAR.md) §3.6, §3.9, §3.10 for exactly what each of those means and why.
 
 ## License
 

@@ -69,6 +69,8 @@ fn_decl      = "fn" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr
 
 **`fn` — funciones libres, no expuestas como RPC.** A diferencia de `rpc`/`stream`, no vive dentro de un `service` y no entra al contrato `.d.ts` — es lógica interna del backend (p. ej. `validate` llamada desde un `rpc`). Misma forma que `rpc_decl` porque comparten `param_list`/`block`; la diferencia es de visibilidad, no de sintaxis.
 
+**`import_decl` parsea pero todavía no tiene ningún efecto semántico — v0 es de un solo archivo.** A diferencia de la brecha que tenía `const_decl` (existía completo pero nadie lo invocaba — ver §4 y el changelog de la auditoría final), esto no es un olvido de conectar algo ya diseñado: requiere resolución de módulos de verdad (mapear el `string_lit` a otro archivo `.link`, parsearlo y chequearlo, exponer sus símbolos al archivo que importa, decidir qué pasa con imports circulares). Es la misma clase de trabajo que el package manager/LSP — correctamente Fase 1+ (PLAN.md §4), no algo que debería colarse a medio hacer en v0. Hoy, un programa entero vive en un solo archivo `.link`.
+
 ### 2.2 Expresiones de tipo — y la trampa del postfix
 
 ```ebnf
@@ -405,7 +407,7 @@ if (result.type === "Ok") {
 
 ### 3.7 Operadores e `if/else`
 
-Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos, no `"11"`. Cada operador exige que ambos operandos ya tengan el tipo correcto (vía la regla de Subsunción de §3.1); si hace falta convertir, se hace explícito en una versión futura con algo como `Int.toFloat()`, no automáticamente.
+Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos, no `"11"`. Cada operador exige que ambos operandos ya tengan el tipo correcto (vía la regla de Subsunción de §3.1); si hace falta convertir, es explícito (`.toFloat()`/`.toInt()`, §3.8), nunca automático.
 
 | Operador | Regla | Resultado |
 |---|---|---|
@@ -507,19 +509,18 @@ Es una decisión de alcance real, no una omisión: para un lenguaje cuyo propós
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
 |---|---|---|---|
 | `Int`, `Float` | `number` | número | — |
-| `Int64` | `bigint` | `string` | Evita pérdida de precisión >2^53; el validador generado parsea el string |
 | `String` | `string` | string | — |
 | `Bool` | `boolean` | bool | — |
 | `Void` | `void` | — (sin cuerpo) | Solo válido como retorno de `rpc` |
 | `T[]` | `T[]` | array | — |
-| `{K: V}` | `Record<K, V>` | objeto | `K` limitado a `String`/`Int` (claves JSON) |
+| `Map<K, V>` | `Record<K, V>` | objeto | `K` limitado a `String`/`Int` (claves JSON); `{K: V}` como literal de tipo NO se parsea, ver §2.2 |
 | `(A, B)` | `[A, B]` | array de longitud fija | tupla, ver §2.2 sobre ambigüedad de paréntesis |
 | `(A) -> B` | `(a: A) => B` | — | solo como campo de tipo función local; no cruza el wire |
 | `A \| B` | `A \| B` | valor tal cual, con la forma de cualquiera de los miembros | subtipado de flujo de valor, sin angosto — resuelto en §3.9 |
 | `type X = {...}` | `interface X {...}` (structural) | objeto | subtipado estructural, §3.2 |
 | `type X<T> = {...}` | `interface X<T> {...}` | objeto | monomorfizado en el backend, genérico en TS, §3.6 |
 | `enum E { A, B }` | `type E = "A" \| "B"` | string | enum simple = unión de literales |
-| `enum` con datos (ADT) | unión discriminada con tag configurable (default `type`) | objeto con campo tag | ver ejemplo `Result` en PLAN.md §2.2 |
+| `enum` con datos (ADT) | unión discriminada con tag fijo `type` (no configurable en v0) | objeto con campo `type` | ver ejemplo `Result` en PLAN.md §2.2 |
 | `x: T?` (campo) | `x: T \| null` | clave presente, valor `null` | resuelto en §3.4 |
 | `x?: T` (campo) | `x?: T` (clave ausente = `undefined`) | clave omitida | resuelto en §3.4 |
 | `Patch<T>` | todos los campos `?:`, preserva nullability de cada uno | — | utilitario análogo a `Partial<T>`, resuelto en §3.4 |

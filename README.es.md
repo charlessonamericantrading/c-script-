@@ -38,9 +38,9 @@ Ahora rompé algo: en `examples/users.link`, renombrá `name` a `fullName` dentr
 
 ## Estado
 
-Completo (Fase 0): lexer, parser, type checker bidireccional (subtipado estructural/nominal, exhaustividad de `match`, `Result<T,E>` y `Patch<T>` como builtins, operadores aritmético-lógicos, `if/else`), emisor de contrato, runtime interpretado mínimo. 64 tests, todos pasando.
+Completo (Fase 0): lexer, parser, type checker bidireccional (subtipado estructural/nominal, `Result<T,E>` y `Patch<T>` como builtins, operadores aritmético-lógicos, `if/else`, asignación y mutabilidad, arrays, tuplas, conversión numérica explícita, `Map<K,V>`, métodos builtin de `String`), genéricos definidos por el usuario vía monomorfización, uniones de tipo (`A | B`) con subtipado de flujo de valor, funciones como valores de primera clase (referencias con nombre, con subtipado de funciones contravariante/covariante real), exhaustividad de `match` extendida con patrones de literales, or-patterns y guardas, emisor de contrato, runtime interpretado mínimo. 129 tests, todos pasando.
 
-Pendiente (Fase 1+, ver PLAN.md §4): backend de compilación real (Cranelift/WASM), LSP, package manager, streaming real por WebSocket/SSE, "DB tipada", genéricos definidos por el usuario, uniones de tipo.
+Pendiente (Fase 1+, ver PLAN.md §4): backend de compilación real (Cranelift/WASM), LSP, package manager, streaming real por WebSocket/SSE, "DB tipada", literales de función anónima / closures léxicos de verdad, métodos de orden superior sobre `List` (`.map`/`.filter`), y angostar (narrowing) un valor de tipo unión a su miembro concreto. Ver [GRAMMAR.md](GRAMMAR.md) §3.6, §3.9, §3.10 para el detalle exacto de cada uno y por qué.
 
 ## Licencia
 
