@@ -1,0 +1,18 @@
+// Proyecto generado con `linkc new` -- este archivo es el punto de partida.
+//
+// Probá el killer feature: agregá un campo a `Greeting`, corré
+// `linkc build main.link gen` de nuevo, y mirá cómo `frontend/src/main.ts`
+// sigue tipando bien (no lo usa) -- ahora renombrá `message` a otra cosa y
+// mirá cómo `npx tsc --noEmit` sí se rompe en el frontend, sin que hayas
+// tocado ese archivo. Esa es la idea central de c-script.
+
+type Greeting = {
+  message: String,
+  recipient: String,
+}
+
+service Greeter {
+  rpc greet(name: String) -> Greeting {
+    Greeting { message: "Hola", recipient: name }
+  }
+}

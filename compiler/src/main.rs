@@ -4,12 +4,14 @@ mod codegen;
 mod lexer;
 mod parser;
 mod runtime;
+mod scaffold;
 mod token;
 mod types;
 
 use ast::Program;
 use std::env;
 use std::fs;
+use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -17,14 +19,24 @@ fn main() -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("build") => cmd_build(&args[2..]),
         Some("serve") => cmd_serve(&args[2..]),
+        Some("new") => cmd_new(&args[2..]),
         Some(path) => cmd_check(path), // `linkc <archivo.link>` -- solo lex+parse+check
         None => {
             eprintln!("uso: linkc <archivo.link>                  (lexea, parsea y tipa)");
+            eprintln!("     linkc new <nombre>                     (crea un proyecto nuevo)");
             eprintln!("     linkc build <archivo.link> <outdir>    (+ emite contract.d.ts y client.ts)");
             eprintln!("     linkc serve <archivo.link> <puerto>    (+ sirve los rpc por HTTP)");
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_new(args: &[String]) -> ExitCode {
+    let Some(name) = args.first() else {
+        eprintln!("uso: linkc new <nombre>");
+        return ExitCode::FAILURE;
+    };
+    scaffold::new_project(name)
 }
 
 fn load_and_check(path: &str) -> Result<Program, ExitCode> {
@@ -54,6 +66,13 @@ fn load_and_check(path: &str) -> Result<Program, ExitCode> {
 }
 
 fn cmd_check(path: &str) -> ExitCode {
+    // `linkc <algo>` cae acá para cualquier <algo> que no sea "build"/"serve"/
+    // "new" -- si además no parece un archivo real, es casi seguro un
+    // subcomando mal escrito, no un archivo que el usuario quiere tipar.
+    if !path.ends_with(".link") && !Path::new(path).exists() {
+        eprintln!("'{path}' no es un subcomando conocido (build, serve, new) ni un archivo .link existente");
+        return ExitCode::FAILURE;
+    }
     match load_and_check(path) {
         Ok(program) => {
             println!("OK: {path} tipa correctamente ({} ítems)", program.items.len());
