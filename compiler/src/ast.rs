@@ -134,6 +134,13 @@ pub enum Stmt {
     },
     Return(Option<Expr>),
     Expr(Expr),
+    /// `x = expr;` -- solo variables simples (no `obj.field = ...` ni
+    /// `arr[i] = ...` todavía). El checker exige que `x` haya sido
+    /// declarada con `mut` (GRAMMAR.md §2.3).
+    Assign {
+        name: String,
+        value: Expr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

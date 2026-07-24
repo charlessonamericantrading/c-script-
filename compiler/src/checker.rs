@@ -21,7 +21,19 @@ fn err(msg: impl Into<String>) -> CheckError {
     CheckError { message: msg.into() }
 }
 
-type Env = HashMap<String, Type>;
+/// Cada binding rastrea su tipo Y si se declaró `mut` -- lo segundo es lo
+/// que `check_block` consulta al validar un `assign_stmt` (GRAMMAR.md §2.3).
+#[derive(Clone)]
+struct Binding {
+    ty: Type,
+    mutable: bool,
+}
+
+fn immutable(ty: Type) -> Binding {
+    Binding { ty, mutable: false }
+}
+
+type Env = HashMap<String, Binding>;
 
 pub struct Checker {
     pub(crate) types: HashMap<String, TypeDecl>,
@@ -212,7 +224,9 @@ impl Checker {
         let ret = self.resolve_type(&f.return_type)?;
         let mut env = Env::new();
         for p in &f.params {
-            env.insert(p.name.clone(), self.resolve_type(&p.ty)?);
+            // Los parámetros no tienen sintaxis `mut` propia -- son
+            // siempre inmutables, igual que los bindings de patrones.
+            env.insert(p.name.clone(), immutable(self.resolve_type(&p.ty)?));
         }
         self.check_block(&f.body, &ret, &env)
     }
@@ -225,7 +239,7 @@ impl Checker {
             if let Some(default) = &p.default {
                 self.check_expr(default, &pty, &Env::new())?;
             }
-            env.insert(p.name.clone(), pty);
+            env.insert(p.name.clone(), immutable(pty));
         }
         self.check_block(&r.body, &ret, &env)
     }
@@ -236,7 +250,7 @@ impl Checker {
         let mut local = env.clone();
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Let { name, ty, value, .. } => {
+                Stmt::Let { name, mutable, ty, value } => {
                     let value_ty = match ty {
                         Some(t) => {
                             let resolved = self.resolve_type(t)?;
@@ -245,13 +259,34 @@ impl Checker {
                         }
                         None => self.synth_expr(value, &local)?,
                     };
-                    local.insert(name.clone(), value_ty);
+                    local.insert(name.clone(), Binding { ty: value_ty, mutable: *mutable });
+                }
+                Stmt::Assign { name, value } => {
+                    let binding = local
+                        .get(name)
+                        .ok_or_else(|| err(format!("variable no declarada: '{name}'")))?
+                        .clone();
+                    if !binding.mutable {
+                        return Err(err(format!(
+                            "no se puede asignar a '{name}': no fue declarada con 'mut' (GRAMMAR.md §2.3)"
+                        )));
+                    }
+                    self.check_expr(value, &binding.ty, &local)?;
                 }
                 Stmt::Return(Some(e)) => self.check_expr(e, expected, &local)?,
                 Stmt::Return(None) => {
                     if !is_subtype(&Type::Void, expected) {
                         return Err(err("'return' sin valor en una función que no devuelve Void"));
                     }
+                }
+                // if/match en posición de sentencia no tienen valor que
+                // alguien use -- se chequean contra Void, lo que en la
+                // práctica exige que cada rama sea puro efecto (sin tail),
+                // igual que exigir `if cond { ... } else { ... }` sin usar
+                // el resultado. synth_expr no sirve acá: if/match nunca
+                // sintetizan (§3.1/§3.7, son de modo chequeo).
+                Stmt::Expr(e @ (Expr::If { .. } | Expr::Match { .. })) => {
+                    self.check_expr(e, &Type::Void, &local)?;
                 }
                 Stmt::Expr(e) => {
                     self.synth_expr(e, &local)?;
@@ -405,7 +440,7 @@ impl Checker {
     fn bind_pattern(&self, pattern: &Pattern, ty: &Type, env: &mut Env) -> Result<(), CheckError> {
         match pattern {
             Pattern::Bind(name) => {
-                env.insert(name.clone(), ty.clone());
+                env.insert(name.clone(), immutable(ty.clone()));
                 Ok(())
             }
             Pattern::Variant { enum_name, variant_name, fields } => {
@@ -470,8 +505,8 @@ impl Checker {
                     // Runtime builtin aún no modelado (ver Type::Dynamic).
                     return Ok(Type::Dynamic);
                 }
-                if let Some(t) = env.get(name) {
-                    return Ok(t.clone());
+                if let Some(b) = env.get(name) {
+                    return Ok(b.ty.clone());
                 }
                 if let Some((params, ret)) = self.fns.get(name) {
                     return Ok(Type::Function(params.clone(), Box::new(ret.clone())));
@@ -747,6 +782,32 @@ mod tests {
             fn use_it() -> Int { add(1) }
         "#;
         let result = check_source(src);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn assigning_to_mut_variable_is_accepted() {
+        assert!(check_source(
+            "fn f() -> Int { let mut x = 1; x = 2; x }"
+        ).is_ok());
+    }
+
+    #[test]
+    fn assigning_to_non_mut_variable_is_rejected() {
+        let result = check_source("fn f() -> Int { let x = 1; x = 2; x }");
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("mut"), "el error debería mencionar 'mut': {msg}");
+    }
+
+    #[test]
+    fn assigning_to_undeclared_variable_is_rejected() {
+        assert!(check_source("fn f() -> Int { x = 2; 0 }").is_err());
+    }
+
+    #[test]
+    fn assigning_wrong_type_is_rejected() {
+        let result = check_source(r#"fn f() -> Int { let mut x = 1; x = "no"; x }"#);
         assert!(result.is_err());
     }
 

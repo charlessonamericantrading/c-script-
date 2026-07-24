@@ -8,7 +8,9 @@ pub mod server;
 
 use crate::ast::*;
 use db::Db;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
@@ -41,8 +43,20 @@ fn err(msg: impl Into<String>) -> RuntimeError {
     RuntimeError(msg.into())
 }
 
-type Env = HashMap<String, Value>;
+/// Cada variable es su propia celda compartida, no un `Value` directo. Es lo
+/// que hace que la mutación (`x = ...`, GRAMMAR.md §2.3) atraviese bloques
+/// anidados de verdad: `eval_block` clona el mapa `Env` al entrar a un bloque
+/// (para que un `let` adentro no se filtre afuera), pero clonar un `HashMap`
+/// de `Rc<RefCell<_>>` copia los punteros, no el contenido -- así que
+/// `x = 2` dentro de un `if` muta la MISMA celda que ve el scope exterior.
+/// Un `let` (mut o no) siempre crea una celda nueva -- así se sombrea
+/// correctamente una variable exterior con el mismo nombre en vez de mutarla.
+type Env = HashMap<String, Rc<RefCell<Value>>>;
 type Fns<'a> = HashMap<String, &'a FnDecl>;
+
+fn cell(v: Value) -> Rc<RefCell<Value>> {
+    Rc::new(RefCell::new(v))
+}
 
 pub fn eval_block(block: &Block, env: &Env, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
     let mut local = env.clone();
@@ -50,7 +64,14 @@ pub fn eval_block(block: &Block, env: &Env, db: &Db, fns: &Fns) -> Result<Value,
         match stmt {
             Stmt::Let { name, value, .. } => {
                 let v = eval_expr(value, &local, db, fns)?;
-                local.insert(name.clone(), v);
+                local.insert(name.clone(), cell(v));
+            }
+            Stmt::Assign { name, value } => {
+                let v = eval_expr(value, &local, db, fns)?;
+                let target = local
+                    .get(name)
+                    .ok_or_else(|| err(format!("variable no declarada en runtime: '{name}'")))?;
+                *target.borrow_mut() = v;
             }
             Stmt::Return(Some(e)) => return eval_expr(e, &local, db, fns),
             Stmt::Return(None) => return Ok(Value::Null),
@@ -78,7 +99,7 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                 return Ok(Value::Db);
             }
             env.get(name)
-                .cloned()
+                .map(|c| c.borrow().clone())
                 .ok_or_else(|| err(format!("variable no declarada en runtime: '{name}'")))
         }
         Expr::FieldAccess { base, field } => {
@@ -105,7 +126,7 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                     let arg_vs = eval_args(args, env, db, fns)?;
                     let mut fn_env = Env::new();
                     for (p, v) in decl.params.iter().zip(arg_vs) {
-                        fn_env.insert(p.name.clone(), v);
+                        fn_env.insert(p.name.clone(), cell(v));
                     }
                     return eval_block(&decl.body, &fn_env, db, fns);
                 }
@@ -132,7 +153,7 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
             for arm in arms {
                 if let Some(bindings) = try_match_pattern(&arm.pattern, &v) {
                     let mut arm_env = env.clone();
-                    arm_env.extend(bindings);
+                    arm_env.extend(bindings.into_iter().map(|(k, v)| (k, cell(v))));
                     return match &arm.body {
                         MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns),
                         MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns),
@@ -331,7 +352,7 @@ pub fn invoke_rpc(
                 None => Value::Null,
             },
         };
-        env.insert(p.name.clone(), v);
+        env.insert(p.name.clone(), cell(v));
     }
 
     let result = eval_block(&rpc.body, &env, db, &fns)?;
@@ -429,6 +450,50 @@ mod tests {
         let db = Db::seeded();
         let result = invoke_rpc(&program, "Users", "list", &json!({"limit": 1}), &db).unwrap();
         assert_eq!(result.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn assignment_mutates_the_existing_binding() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc f() -> Int {
+                    let mut x = 1;
+                    x = 2;
+                    x
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "f", &json!({}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(2));
+    }
+
+    #[test]
+    fn assignment_inside_if_branch_propagates_to_outer_scope() {
+        // La razón de todo el rediseño con Rc<RefCell<Value>>: sin esto, la
+        // mutación de "x" adentro del if quedaría atrapada en la copia local
+        // de ese bloque y "x" seguiría valiendo 1 afuera.
+        let program = program_from(
+            r#"
+            service S {
+                rpc classify(n: Int) -> Int {
+                    let mut result = 0;
+                    if n > 0 {
+                        result = 1;
+                    } else {
+                        result = -1;
+                    }
+                    result
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let positive = invoke_rpc(&program, "S", "classify", &json!({"n": 5}), &db).unwrap();
+        assert_eq!(positive, json!(1));
+        let negative = invoke_rpc(&program, "S", "classify", &json!({"n": -5}), &db).unwrap();
+        assert_eq!(negative, json!(-1));
     }
 
     #[test]

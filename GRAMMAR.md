@@ -101,8 +101,9 @@ Dos decisiones sutiles del diseño de gramática, no obvias hasta que las rompes
 
 ```ebnf
 block        = "{" , { stmt } , [ expr ] , "}" ;
-stmt         = let_stmt | expr_stmt | return_stmt ;
+stmt         = let_stmt | assign_stmt | expr_stmt | return_stmt ;
 let_stmt     = "let" , [ "mut" ] , identifier , [ ":" , type_expr ] , "=" , expr , ";" ;
+assign_stmt  = identifier , "=" , expr , ";" ;
 return_stmt  = "return" , [ expr ] , ";" ;
 expr_stmt    = expr , ";" ;
 
@@ -148,6 +149,8 @@ field_pattern       = identifier , [ ":" , pattern ] ;        (* shorthand: `x` 
 **Nota de implementación — lookahead de `struct_or_variant_lit`:** distinguir `Result.Ok { value: u }` (literal de variante) de `db.users` (acceso encadenado, sin `{` después) requiere que el parser mire hasta 2 tokens adelante antes de decidir. No es una ambigüedad del lenguaje — es la misma clase de decisión que "no struct literals en la condición de un `if`" en Rust: una regla del parser, no del árbol de derivación.
 
 **`if` siempre exige `else`.** Es una expresión total: si `if` pudiera faltar el `else`, ¿qué tipo tendría la rama ausente? Rust resuelve esto dándole tipo `()` al `if` sin `else` y exigiendo que solo se use donde `()` es válido; acá se simplifica exigiendo `else` siempre. Un condicional de solo-efecto se escribe `if cond { ... } else { }` explícito.
+
+**Mutabilidad — por qué `let mut` no alcanza sin `assign_stmt`.** Antes de `assign_stmt`, `mut` era una palabra reservada sin ningún efecto: se podía escribir `let mut x = 1`, pero no había ninguna sentencia que permitiera cambiar `x` después. El checker exige que el nombre a la izquierda de un `assign_stmt` ya exista en el scope **y** haya sido declarado con `mut` — asignar a un binding inmutable, o a un nombre que no existe, es un error de tipos (checker.rs), no algo que el parser rechace. `assign_stmt` solo cubre variables simples (`x = ...`) — todavía no hay mutación de campos (`obj.campo = ...`) ni de posiciones de array (`arr[i] = ...`).
 
 **Fuera de alcance en v0** (ahora más acotado que antes): or-patterns (`p1 | p2`), patrones de literales en `match` (`0 => ...`), guardas (`if` dentro de un arm de `match`). Los operadores aritmético-lógicos e `if/else` ya están definidos arriba y implementados (checker.rs §3, runtime).
 

@@ -438,6 +438,34 @@ impl Parser {
             match self.peek().clone() {
                 TokenKind::Let => stmts.push(self.parse_let_stmt()?),
                 TokenKind::Return => stmts.push(self.parse_return_stmt()?),
+                // `identifier =` (y no `==`, ya son tokens distintos) es una
+                // asignación -- se detecta con 1 token de lookahead antes de
+                // caer al parseo genérico de expresión, igual que la
+                // desambiguación de struct_or_variant_lit (GRAMMAR.md §2.2).
+                TokenKind::Ident(name) if matches!(self.peek_at(1), TokenKind::Equals) => {
+                    self.advance();
+                    self.advance(); // '='
+                    let value = self.parse_expr()?;
+                    self.eat(&TokenKind::Semi)?;
+                    stmts.push(Stmt::Assign { name, value });
+                }
+                // `if`/`match` son "block-like": terminan en '}', así que no
+                // deberían necesitar un ';' para seguir siendo una sentencia
+                // seguida de más código (`if cond { x = 1; } else { x = 2; }`
+                // sin ';' y con algo más abajo). Sin este caso, el `_` de
+                // abajo los trataría como el tail apenas ve que no hay ';',
+                // y rompería con cualquier código real después.
+                TokenKind::If | TokenKind::Match => {
+                    let e = self.parse_expr()?;
+                    if self.check(&TokenKind::RBrace) {
+                        tail = Some(Box::new(e));
+                        break;
+                    }
+                    if self.check(&TokenKind::Semi) {
+                        self.advance(); // ';' opcional acá, no obligatorio
+                    }
+                    stmts.push(Stmt::Expr(e));
+                }
                 _ => {
                     let e = self.parse_expr()?;
                     if self.check(&TokenKind::Semi) {
@@ -1109,6 +1137,34 @@ mod tests {
                 assert!(matches!(**scrutinee, Expr::Binary { op: BinaryOp::Add, .. }));
             }
             other => panic!("se esperaba Match, fue {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_else_as_statement_does_not_need_a_semicolon() {
+        // Bug real encontrado al implementar asignación: sin este caso, el
+        // parser trataba el if/else como el tail del bloque en cuanto veía
+        // que no había ';', y fallaba con cualquier código real después.
+        let prog = parse_source(
+            "fn f(n: Int) -> Int { if n > 0 { r = 1; } else { r = -1; } r }",
+        );
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        assert_eq!(body.stmts.len(), 1); // el if/else es la única sentencia; `r` es el tail
+        assert!(matches!(body.stmts[0], Stmt::Expr(Expr::If { .. })));
+        assert_eq!(body.tail.as_deref(), Some(&Expr::Ident("r".into())));
+    }
+
+    #[test]
+    fn assignment_statement_parses() {
+        let prog = parse_source("fn f() -> Int { let mut x = 1; x = 2; x }");
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        assert_eq!(body.stmts.len(), 2);
+        match &body.stmts[1] {
+            Stmt::Assign { name, value } => {
+                assert_eq!(name, "x");
+                assert_eq!(*value, Expr::Int(2));
+            }
+            other => panic!("se esperaba Stmt::Assign, fue {other:?}"),
         }
     }
 
