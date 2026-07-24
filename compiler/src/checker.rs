@@ -119,6 +119,27 @@ fn type_contains_function(ty: &Type) -> bool {
     }
 }
 
+/// El tipo que produce LEER un campo (`v.campo`). Para un campo declarado
+/// `x?: T` -- clave que puede estar AUSENTE (GRAMMAR.md §3.4) -- eso es
+/// `T?`, no `T`: leerlo puede no dar nada, y el lenguaje ya tiene una forma
+/// de expresar eso.
+///
+/// Sin esto (el bug que había hasta la auditoría), `o.note` sobre un
+/// `note?: String` sintetizaba `String` a secas -- así que un rpc podía
+/// declarar `-> String`, devolver `o.note`, tipar perfecto, y después
+/// fallar en runtime con "no existe el campo 'note'" al recibir un objeto
+/// SIN esa clave (que es exactamente lo que `x?: T` permite). También hacía
+/// pasar aritmética como `o.note + 1`. Nótese el contraste con `x: T?`
+/// (clave siempre presente, valor nullable), que ya se rechazaba bien:
+/// el bug era solo para la opcionalidad de CLAVE.
+fn field_access_ty(f: &FieldType) -> Type {
+    if f.optional {
+        Type::Optional(Box::new(f.ty.clone()))
+    } else {
+        f.ty.clone()
+    }
+}
+
 /// ¿Se puede PROBAR que dos miembros de una unión son distinguibles en
 /// runtime? "No" es la respuesta segura cuando el análisis no puede probar
 /// que sí (GRAMMAR.md §3.9, `check_exhaustive_union`) -- falla cerrado, no
@@ -1322,14 +1343,14 @@ impl Checker {
                     Type::Struct { fields, .. } => fields
                         .iter()
                         .find(|f| &f.name == field)
-                        .map(|f| f.ty.clone())
+                        .map(field_access_ty)
                         .ok_or_else(|| err(format!("el struct no tiene campo '{field}'"))),
                     // struct genérico instanciado, ej. una variable Box<Int>
                     Type::Generic(name, args) => self
                         .expand_generic_struct(&name, &args)?
-                        .into_iter()
+                        .iter()
                         .find(|f| &f.name == field)
-                        .map(|f| f.ty)
+                        .map(field_access_ty)
                         .ok_or_else(|| err(format!("el struct no tiene campo '{field}'"))),
                     // `db.<coleccion>` -- nombre desconocido ya es un error
                     // acá mismo, no `Dynamic` dejando pasar cualquier cosa.
@@ -2701,6 +2722,51 @@ mod tests {
     }
 
     // ---- narrowing de uniones (GRAMMAR.md §3.9) ----
+
+    #[test]
+    fn reading_an_optional_key_field_yields_an_optional_type() {
+        // `note?: String` es opcionalidad de CLAVE (puede estar ausente,
+        // GRAMMAR.md §3.4) -- leerlo da `String?`, no `String`. Antes de la
+        // auditoría esto tipaba y después fallaba en runtime con "no existe
+        // el campo 'note'" al recibir un objeto válido sin esa clave.
+        let src = r#"
+            type A = { id: Int, note?: String }
+            fn get(a: A) -> String { a.note }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "leer un campo de clave opcional no puede dar el tipo pelado");
+
+        // Declarado como `String?` sí tipa -- que es justo la forma de
+        // escribirlo correctamente.
+        let ok = r#"
+            type A = { id: Int, note?: String }
+            fn get(a: A) -> String? { a.note }
+        "#;
+        assert!(check_source(ok).is_ok());
+    }
+
+    #[test]
+    fn arithmetic_on_an_optional_key_field_is_rejected() {
+        let src = r#"
+            type A = { n?: Int }
+            fn get(a: A) -> Int { a.n + 1 }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn a_struct_missing_an_optional_field_is_still_a_subtype() {
+        // Width subtyping (GRAMMAR.md §3.2/§3.4): si el supertipo declara el
+        // campo OPCIONAL, un valor que no lo trae sigue siendo válido -- la
+        // clave puede estar ausente, ese es todo el punto de `y?: T`.
+        let src = r#"
+            type Narrow = { x: Int }
+            type Wide = { x: Int, y?: String }
+            fn takesWide(w: Wide) -> Int { w.x }
+            fn pass(n: Narrow) -> Int { takesWide(n) }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
 
     #[test]
     fn union_match_with_type_patterns_for_every_member_typechecks() {

@@ -30,10 +30,26 @@ impl Db {
         Db { collections }
     }
 
-    /// Conveniencia para tests/demo: siembra los mismos dos usuarios de
-    /// siempre bajo la colección "users" -- así los tests existentes (y el
-    /// demo E2E) no necesitan repetir la siembra a mano cada vez.
+    /// Fixture SOLO para tests y para el demo -- **no** es lo que usa
+    /// `linkc serve` (ver `runtime/server.rs`, que usa `Db::new`). Siembra
+    /// los mismos dos usuarios de siempre bajo la colección "users", así
+    /// los tests no repiten la siembra a mano cada vez.
+    ///
+    /// Ojo con la forma de los valores: tienen que ser EXACTAMENTE los que
+    /// produciría el propio lenguaje al construirlos, no una aproximación
+    /// escrita a mano. De ahí que `role` sea un `Value::Variant` real y no
+    /// un `Value::Str("Admin".into())`: las dos cosas serializan igual al wire
+    /// (un enum simple sale como string plano, GRAMMAR.md §4), pero se
+    /// comparan distinto con `==` contra un `Role.Admin {}` construido en
+    /// el backend o recibido por el wire -- que es justo el bug de
+    /// "dos representaciones internas del mismo valor del contrato" que la
+    /// auditoría encontró y que la validación tipada del borde eliminó.
     pub fn seeded() -> Self {
+        let role = |variant: &str| Value::Variant {
+            enum_name: "Role".to_string(),
+            variant: variant.to_string(),
+            fields: Vec::new(),
+        };
         let mut collections = HashMap::new();
         collections.insert(
             "users".to_string(),
@@ -42,7 +58,7 @@ impl Db {
                     ("id".into(), Value::Int(1)),
                     ("name".into(), Value::Str("Ada Lovelace".into())),
                     ("email".into(), Value::Str("ada@example.com".into())),
-                    ("role".into(), Value::Str("Admin".into())),
+                    ("role".into(), role("Admin")),
                     ("bio".into(), Value::Str("Pionera de la programación".into())),
                     ("deletedAt".into(), Value::Null),
                 ]),
@@ -50,7 +66,7 @@ impl Db {
                     ("id".into(), Value::Int(2)),
                     ("name".into(), Value::Str("Grace Hopper".into())),
                     ("email".into(), Value::Str("grace@example.com".into())),
-                    ("role".into(), Value::Str("Member".into())),
+                    ("role".into(), role("Member")),
                     // 'bio' se OMITE del todo -- `bio?: String` es opcional
                     // por CLAVE (ausente = "no tiene"), no nullable (GRAMMAR.md
                     // §3.4). Un bug real y preexistente (nunca antes se validó
@@ -68,14 +84,14 @@ impl Db {
         let cell = self
             .collections
             .get(collection)
-            .ok_or_else(|| RuntimeError(format!("colección desconocida: '{collection}'")))?;
+            .ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
         let mut rows = cell.lock().expect("lock de db envenenado");
         match method {
             "all" => Ok(Value::List(rows.clone())),
             "find" => {
                 let id = as_int(
                     args.first()
-                        .ok_or_else(|| RuntimeError("find requiere 1 argumento".into()))?,
+                        .ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?,
                 )?;
                 Ok(rows
                     .iter()
@@ -87,7 +103,7 @@ impl Db {
                 let mut v = args
                     .into_iter()
                     .next()
-                    .ok_or_else(|| RuntimeError("insert requiere 1 argumento".into()))?;
+                    .ok_or_else(|| RuntimeError::new("insert requiere 1 argumento"))?;
                 let new_id = rows.len() as i64 + 1;
                 if let Value::Struct(fields) = &mut v {
                     // El checker ya exige Omit<T,"id"> (checker.rs,
@@ -108,18 +124,21 @@ impl Db {
                 let mut it = args.into_iter();
                 let id = as_int(
                     &it.next()
-                        .ok_or_else(|| RuntimeError("applyPatch requiere 2 argumentos".into()))?,
+                        .ok_or_else(|| RuntimeError::new("applyPatch requiere 2 argumentos"))?,
                 )?;
                 let patch = it
                     .next()
-                    .ok_or_else(|| RuntimeError("applyPatch requiere 2 argumentos".into()))?;
+                    .ok_or_else(|| RuntimeError::new("applyPatch requiere 2 argumentos"))?;
                 let Value::Struct(patch_fields) = patch else {
-                    return Err(RuntimeError("applyPatch: el patch debe ser un objeto".into()));
+                    return Err(RuntimeError::new("applyPatch: el patch debe ser un objeto"));
                 };
                 let user = rows
                     .iter_mut()
                     .find(|u| field_int(u, "id") == Some(id))
-                    .ok_or_else(|| RuntimeError(format!("usuario {id} no encontrado")))?;
+                    // "usuario" era un resto de cuando la db solo tenía la
+                    // colección "users" hardcodeada -- el mensaje mentía
+                    // para cualquier otra colección.
+                    .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con id {id} en '{collection}'")))?;
                 if let Value::Struct(fields) = user {
                     for (k, v) in patch_fields {
                         match fields.iter_mut().find(|(n, _)| *n == k) {
@@ -130,7 +149,7 @@ impl Db {
                 }
                 Ok(user.clone())
             }
-            other => Err(RuntimeError(format!("método desconocido: 'db.{collection}.{other}'"))),
+            other => Err(RuntimeError::new(format!("método desconocido: 'db.{collection}.{other}'"))),
         }
     }
 }

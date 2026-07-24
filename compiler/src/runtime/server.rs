@@ -33,7 +33,16 @@ static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 pub fn serve(program: Program, port: u16) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
-    let db = Db::seeded();
+    // Db::new(&program), NO Db::seeded(): una colección vacía por cada una
+    // que el programa DECLARA. `Db::seeded()` es un fixture de tests/demo
+    // que inserta una colección "users" hardcodeada e ignora el programa
+    // por completo -- que fuera lo que usaba el servidor real era un bug
+    // encontrado en la auditoría, con dos síntomas confirmados: un programa
+    // con `db { items: Item[] }` tipaba y después daba 500 "colección
+    // desconocida: 'items'" en cada rpc; y uno que sí declaraba `users`
+    // pero con otra forma recibía los campos del `User` del demo, que su
+    // propio tipo no tiene.
+    let db = Db::new(&program);
     println!("c-script server escuchando en http://localhost:{port}  (Ctrl+C para detener)");
 
     for mut request in server.incoming_requests() {
@@ -72,8 +81,9 @@ pub fn serve(program: Program, port: u16) {
                     "check_rpc (checker.rs) exige que el cuerpo de un stream sea List<T> -- invoke_rpc no puede devolver otra cosa acá",
                 ),
                 Err(e) => {
-                    let _ = request.respond(cors_response(500, error_json(&e.to_string())));
-                    println!("[req {req_id}] 500");
+                    let status = status_for(&e);
+                    let _ = request.respond(cors_response(status, error_json(&e.to_string())));
+                    println!("[req {req_id}] {status}");
                     continue;
                 }
             };
@@ -110,7 +120,19 @@ fn handle_rpc(program: &Program, db: &Db, service_name: &str, rpc_name: &str, bo
     };
     match invoke_rpc(program, service_name, rpc_name, &args_json, db) {
         Ok(result) => (200, result.to_string()),
-        Err(e) => (500, error_json(&e.to_string())),
+        Err(e) => (status_for(&e), error_json(&e.to_string())),
+    }
+}
+
+/// Un request que no matchea el contrato declarado es culpa del CLIENTE
+/// (400), no del servidor (500) -- devolver 500 haría parecer que el
+/// backend se rompió cuando en realidad rechazó correctamente algo mal
+/// formado. Es la contraparte servidor del `LinkValidationError` que el
+/// cliente generado ya lanza para respuestas que no matchean.
+fn status_for(e: &super::RuntimeError) -> u16 {
+    match e.kind {
+        super::ErrorKind::BadRequest => 400,
+        super::ErrorKind::Runtime => 500,
     }
 }
 

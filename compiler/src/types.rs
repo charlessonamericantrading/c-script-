@@ -122,14 +122,19 @@ pub fn is_subtype(sub: &Type, sup: &Type) -> bool {
                 fields: sup_fields, ..
             },
         ) => sup_fields.iter().all(|sup_f| {
-            sub_fields
-                .iter()
-                .find(|sub_f| sub_f.name == sup_f.name)
-                .is_some_and(|sub_f| {
-                    // Width/depth (GRAMMAR.md §3.2): si el supertipo exige el
-                    // campo (optional=false), el subtipo también debe exigirlo.
-                    (sup_f.optional || !sub_f.optional) && is_subtype(&sub_f.ty, &sup_f.ty)
-                })
+            match sub_fields.iter().find(|sub_f| sub_f.name == sup_f.name) {
+                // Width/depth (GRAMMAR.md §3.2): si el supertipo exige el
+                // campo (optional=false), el subtipo también debe exigirlo.
+                Some(sub_f) => (sup_f.optional || !sub_f.optional) && is_subtype(&sub_f.ty, &sup_f.ty),
+                // El subtipo NO declara el campo. Solo está bien si el
+                // supertipo lo declaraba opcional (`y?: T`): esa clave puede
+                // estar ausente, así que "no tenerla" es una forma válida de
+                // cumplirlo. Antes de la auditoría esto era `is_some_and`,
+                // que devolvía false acá y rechazaba `{x}` como subtipo de
+                // `{x, y?}` -- un falso rechazo de código perfectamente
+                // válido (y que TypeScript acepta).
+                None => sup_f.optional,
+            }
         }),
         // Unión a la IZQUIERDA primero (más específico): una unión es
         // subtipo de T si TODOS sus miembros lo son -- así, si `sup`
@@ -217,6 +222,15 @@ mod tests {
         assert!(is_subtype(&required, &optional));
         // ...pero no al revés: falta la garantía de que siempre esté.
         assert!(!is_subtype(&optional, &required));
+
+        // Y no declararlo EN ABSOLUTO también sirve donde se pide opcional:
+        // `y?: T` significa que la clave puede faltar, así que un struct que
+        // ni la menciona lo cumple. (Falso rechazo hallado en la auditoría:
+        // el `is_some_and` anterior devolvía false cuando el campo no
+        // existía, sin mirar si el supertipo lo pedía opcional.)
+        let absent = Type::Struct { name: None, fields: vec![] };
+        assert!(is_subtype(&absent, &optional));
+        assert!(!is_subtype(&absent, &required));
     }
 
     #[test]

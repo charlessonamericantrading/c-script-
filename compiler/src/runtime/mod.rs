@@ -119,17 +119,50 @@ impl std::fmt::Debug for Value {
     }
 }
 
+/// De quién es la culpa -- lo único que `server.rs` necesita para elegir
+/// entre 4xx y 5xx. Un request que no matchea el contrato declarado es un
+/// error del CLIENTE (400): devolverlo como 500 haría parecer que el
+/// servidor se rompió, cuando en realidad rechazó correctamente algo mal
+/// formado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    Runtime,
+    BadRequest,
+}
+
 #[derive(Debug)]
-pub struct RuntimeError(pub String);
+pub struct RuntimeError {
+    pub message: String,
+    pub kind: ErrorKind,
+}
+
+impl RuntimeError {
+    pub fn new(message: impl Into<String>) -> Self {
+        RuntimeError { message: message.into(), kind: ErrorKind::Runtime }
+    }
+
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        RuntimeError { message: message.into(), kind: ErrorKind::BadRequest }
+    }
+}
 
 impl std::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "error en runtime: {}", self.0)
+        match self.kind {
+            ErrorKind::Runtime => write!(f, "error en runtime: {}", self.message),
+            ErrorKind::BadRequest => write!(f, "request inválido: {}", self.message),
+        }
     }
 }
 
 fn err(msg: impl Into<String>) -> RuntimeError {
-    RuntimeError(msg.into())
+    RuntimeError::new(msg)
+}
+
+/// Para todo lo que rechaza un request por no matchear el contrato
+/// (`json_to_typed_value` y su familia).
+fn bad_req(msg: impl Into<String>) -> RuntimeError {
+    RuntimeError::bad_request(msg)
 }
 
 /// Cada variable es su propia celda compartida, no un `Value` directo. Es lo
@@ -142,62 +175,61 @@ fn err(msg: impl Into<String>) -> RuntimeError {
 /// correctamente una variable exterior con el mismo nombre en vez de mutarla.
 type Env = HashMap<String, Rc<RefCell<Value>>>;
 type Fns<'a> = HashMap<String, &'a FnDecl>;
-type Types<'a> = HashMap<String, &'a TypeDecl>;
-type Enums<'a> = HashMap<String, &'a EnumDecl>;
-
-/// Las dos tablas de símbolos que el narrowing de uniones necesita en
-/// runtime (GRAMMAR.md §3.9) -- `value_matches_type` tiene que poder
-/// resolver un `TypeExpr::Named("User", [])` de un patrón `nombre: Tipo` a
-/// sus campos reales, y hasta esta ronda nada en este módulo conocía
-/// ningún `type`/`enum` declarado (`db`/`fns` eran las únicas tablas que
-/// ya existían). Empaquetadas juntas -- un solo parámetro nuevo enhebrado,
-/// en vez de duplicar el enhebrado de dos tablas sueltas en cada función
-/// que ya pasa `db`/`fns` explícitamente.
-pub(crate) struct Symbols<'a> {
-    types: Types<'a>,
-    enums: Enums<'a>,
-}
+/// El runtime lleva un `&Checker` -- no una tabla de símbolos propia.
+///
+/// Hace falta poder resolver un `TypeExpr` a un `Type` real en dos lugares:
+/// los patrones de narrowing (`nombre: Tipo`, GRAMMAR.md §3.9) y la
+/// validación tipada de los argumentos que llegan por el wire
+/// (`json_to_typed_value`). La primera versión de esto traía un resolvedor
+/// propio y simplificado acá (`resolve_pattern_type`), y esa duplicación
+/// causó un bug real encontrado en la auditoría: devolvía `Type::Dynamic`
+/// para `Generic`/`Tuple`/`Map`, así que un `match` sobre una unión con un
+/// miembro `Box<Int>` compilaba y después NUNCA matcheaba en runtime
+/// ("ningún arm coincidió"). Reusar el resolvedor del checker -- la única
+/// fuente de verdad, que ya sabe de genéricos, alias, `Result`/`Patch`/
+/// `Map` -- elimina la clase entera de bugs por divergencia entre los dos.
+type Checker = crate::checker::Checker;
 
 fn cell(v: Value) -> Rc<RefCell<Value>> {
     Rc::new(RefCell::new(v))
 }
 
-pub(crate) fn eval_block(block: &Block, env: &Env, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Value, RuntimeError> {
+pub(crate) fn eval_block(block: &Block, env: &Env, db: &Db, fns: &Fns, checker: &Checker) -> Result<Value, RuntimeError> {
     let mut local = env.clone();
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let { name, value, .. } => {
-                let v = eval_expr(value, &local, db, fns, symbols)?;
+                let v = eval_expr(value, &local, db, fns, checker)?;
                 local.insert(name.clone(), cell(v));
             }
             Stmt::Assign { name, value } => {
-                let v = eval_expr(value, &local, db, fns, symbols)?;
+                let v = eval_expr(value, &local, db, fns, checker)?;
                 let target = local
                     .get(name)
                     .ok_or_else(|| err(format!("variable no declarada en runtime: '{name}'")))?;
                 *target.borrow_mut() = v;
             }
-            Stmt::Return(Some(e)) => return eval_expr(e, &local, db, fns, symbols),
+            Stmt::Return(Some(e)) => return eval_expr(e, &local, db, fns, checker),
             Stmt::Return(None) => return Ok(Value::Null),
             Stmt::Expr(e) => {
-                eval_expr(e, &local, db, fns, symbols)?;
+                eval_expr(e, &local, db, fns, checker)?;
             }
         }
     }
     match &block.tail {
-        Some(e) => eval_expr(e, &local, db, fns, symbols),
+        Some(e) => eval_expr(e, &local, db, fns, checker),
         None => Ok(Value::Null),
     }
 }
 
-pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Value, RuntimeError> {
+pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Checker) -> Result<Value, RuntimeError> {
     match e {
         Expr::Int(n) => Ok(Value::Int(*n)),
         Expr::Float(n) => Ok(Value::Float(*n)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
         Expr::Null => Ok(Value::Null),
-        Expr::Paren(inner) => eval_expr(inner, env, db, fns, symbols),
+        Expr::Paren(inner) => eval_expr(inner, env, db, fns, checker),
         Expr::Ident(name) => {
             if name == "db" {
                 return Ok(Value::Db);
@@ -215,13 +247,22 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, symbols: &Symbo
             Err(err(format!("variable no declarada en runtime: '{name}'")))
         }
         Expr::FieldAccess { base, field } => {
-            let base_v = eval_expr(base, env, db, fns, symbols)?;
+            let base_v = eval_expr(base, env, db, fns, checker)?;
             match base_v {
-                Value::Struct(fields) | Value::Variant { fields, .. } => fields
+                // Un campo ausente da `null`, no un error. El checker ya
+                // rechaza leer un campo que el tipo no declara, así que
+                // "no está" solo puede significar una clave declarada
+                // OPCIONAL (`x?: T`, GRAMMAR.md §3.4) que efectivamente no
+                // vino -- y para eso el tipo sintetizado ya es `T?`
+                // (checker.rs::field_access_ty), así que `null` es
+                // exactamente el valor que corresponde. Antes esto era un
+                // error de runtime: un objeto perfectamente válido sin esa
+                // clave reventaba al leerla.
+                Value::Struct(fields) | Value::Variant { fields, .. } => Ok(fields
                     .into_iter()
                     .find(|(n, _)| n == field)
                     .map(|(_, v)| v)
-                    .ok_or_else(|| err(format!("no existe el campo '{field}'"))),
+                    .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
                 // Métodos builtin sobre primitivos (GRAMMAR.md §3.8, ej.
                 // `x.toFloat()`) usan el mismo BoundMethod que db/listas --
@@ -238,14 +279,14 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, symbols: &Symbo
             // solo para volver a buscar el mismo nombre en `fns`.
             if let Expr::Ident(name) = &**callee {
                 if let Some(decl) = fns.get(name.as_str()) {
-                    let arg_vs = eval_args(args, env, db, fns, symbols)?;
-                    return call_fn_decl(decl, arg_vs, db, fns, symbols);
+                    let arg_vs = eval_args(args, env, db, fns, checker)?;
+                    return call_fn_decl(decl, arg_vs, db, fns, checker);
                 }
             }
-            let callee_v = eval_expr(callee, env, db, fns, symbols)?;
-            let arg_vs = eval_args(args, env, db, fns, symbols)?;
+            let callee_v = eval_expr(callee, env, db, fns, checker)?;
+            let arg_vs = eval_args(args, env, db, fns, checker)?;
             match callee_v {
-                Value::BoundMethod(receiver, method) => call_method(*receiver, &method, arg_vs, db, fns, symbols),
+                Value::BoundMethod(receiver, method) => call_method(*receiver, &method, arg_vs, db, fns, checker),
                 // Llamada INDIRECTA: `callee` fue una variable/parámetro que
                 // contenía una referencia a función o un closure (GRAMMAR.md
                 // §3.10), no el nombre escrito ahí mismo -- ej. dentro de
@@ -254,13 +295,13 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, symbols: &Symbo
                 // Closure. `call_callable` despacha ambos casos (y produce
                 // el mismo error de "no se puede llamar" para cualquier otra
                 // cosa, ver su propio fallback).
-                other => call_callable(other, arg_vs, db, fns, symbols),
+                other => call_callable(other, arg_vs, db, fns, checker),
             }
         }
         Expr::StructLit { name, variant, fields } => {
             let evaluated = fields
                 .iter()
-                .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, symbols)?)))
+                .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, checker)?)))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             match variant {
                 Some(v) => {
@@ -270,13 +311,13 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, symbols: &Symbo
             }
         }
         Expr::Match { scrutinee, arms } => {
-            let v = eval_expr(scrutinee, env, db, fns, symbols)?;
+            let v = eval_expr(scrutinee, env, db, fns, checker)?;
             for arm in arms {
-                if let Some(bindings) = try_match_pattern(&arm.pattern, &v, symbols) {
+                if let Some(bindings) = try_match_pattern(&arm.pattern, &v, checker) {
                     let mut arm_env = env.clone();
                     arm_env.extend(bindings.into_iter().map(|(k, v)| (k, cell(v))));
                     if let Some(guard) = &arm.guard {
-                        match eval_expr(guard, &arm_env, db, fns, symbols)? {
+                        match eval_expr(guard, &arm_env, db, fns, checker)? {
                             Value::Bool(true) => {}
                             // El patrón matcheó pero el guard no se cumplió --
                             // se sigue probando el resto de los arms, no se
@@ -286,8 +327,8 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, symbols: &Symbo
                         }
                     }
                     return match &arm.body {
-                        MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns, symbols),
-                        MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns, symbols),
+                        MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns, checker),
+                        MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns, checker),
                     };
                 }
             }
@@ -296,25 +337,25 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, symbols: &Symbo
             Err(err("ningún arm de match coincidió — el checker debería haber impedido esto"))
         }
         Expr::If { cond, then_block, else_block } => {
-            let c = eval_expr(cond, env, db, fns, symbols)?;
+            let c = eval_expr(cond, env, db, fns, checker)?;
             match c {
-                Value::Bool(true) => eval_block(then_block, env, db, fns, symbols),
-                Value::Bool(false) => eval_block(else_block, env, db, fns, symbols),
+                Value::Bool(true) => eval_block(then_block, env, db, fns, checker),
+                Value::Bool(false) => eval_block(else_block, env, db, fns, checker),
                 other => Err(err(format!("la condición de 'if' no es Bool en runtime: {other:?}"))),
             }
         }
-        Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, symbols),
-        Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, symbols),
+        Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, checker),
+        Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, checker),
         Expr::ArrayLit(items) => {
             let vs = items
                 .iter()
-                .map(|e| eval_expr(e, env, db, fns, symbols))
+                .map(|e| eval_expr(e, env, db, fns, checker))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             Ok(Value::List(vs))
         }
         Expr::Index { base, index } => {
-            let base_v = eval_expr(base, env, db, fns, symbols)?;
-            let idx = as_int(&eval_expr(index, env, db, fns, symbols)?)?;
+            let base_v = eval_expr(base, env, db, fns, checker)?;
+            let idx = as_int(&eval_expr(index, env, db, fns, checker)?)?;
             match base_v {
                 Value::List(items) => {
                     let i: usize = idx
@@ -331,12 +372,12 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, symbols: &Symbo
         Expr::TupleLit(items) => {
             let vs = items
                 .iter()
-                .map(|e| eval_expr(e, env, db, fns, symbols))
+                .map(|e| eval_expr(e, env, db, fns, checker))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             Ok(Value::Tuple(vs))
         }
         Expr::TupleIndex { base, index } => {
-            let base_v = eval_expr(base, env, db, fns, symbols)?;
+            let base_v = eval_expr(base, env, db, fns, checker)?;
             match base_v {
                 Value::Tuple(items) => items
                     .get(*index)
@@ -363,22 +404,22 @@ fn eval_binary(
     env: &Env,
     db: &Db,
     fns: &Fns,
-    symbols: &Symbols,
+    checker: &Checker,
 ) -> Result<Value, RuntimeError> {
     use BinaryOp::*;
     // && / || cortocircuitan: el lado derecho no se evalúa si ya se sabe el
     // resultado, igual que en cualquier lenguaje con estos operadores.
     if matches!(op, And | Or) {
-        let l = as_bool(&eval_expr(left, env, db, fns, symbols)?)?;
+        let l = as_bool(&eval_expr(left, env, db, fns, checker)?)?;
         return match (op, l) {
             (And, false) => Ok(Value::Bool(false)),
             (Or, true) => Ok(Value::Bool(true)),
-            _ => Ok(Value::Bool(as_bool(&eval_expr(right, env, db, fns, symbols)?)?)),
+            _ => Ok(Value::Bool(as_bool(&eval_expr(right, env, db, fns, checker)?)?)),
         };
     }
 
-    let l = eval_expr(left, env, db, fns, symbols)?;
-    let r = eval_expr(right, env, db, fns, symbols)?;
+    let l = eval_expr(left, env, db, fns, checker)?;
+    let r = eval_expr(right, env, db, fns, checker)?;
     match op {
         // '+' concatena si ambos lados son String (checker.rs ya garantizó
         // que no llega acá un String mezclado con Int/Float).
@@ -406,9 +447,9 @@ fn eval_unary(
     env: &Env,
     db: &Db,
     fns: &Fns,
-    symbols: &Symbols,
+    checker: &Checker,
 ) -> Result<Value, RuntimeError> {
-    let v = eval_expr(operand, env, db, fns, symbols)?;
+    let v = eval_expr(operand, env, db, fns, checker)?;
     match op {
         UnaryOp::Neg => match v {
             Value::Int(n) => Ok(Value::Int(-n)),
@@ -452,22 +493,22 @@ fn compare(l: Value, r: Value, accept: impl Fn(std::cmp::Ordering) -> bool) -> R
     Ok(Value::Bool(accept(ordering)))
 }
 
-fn eval_args(args: &[Expr], env: &Env, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Vec<Value>, RuntimeError> {
-    args.iter().map(|a| eval_expr(a, env, db, fns, symbols)).collect()
+fn eval_args(args: &[Expr], env: &Env, db: &Db, fns: &Fns, checker: &Checker) -> Result<Vec<Value>, RuntimeError> {
+    args.iter().map(|a| eval_expr(a, env, db, fns, checker)).collect()
 }
 
 /// Invoca una `fn` de usuario ya resuelta con argumentos ya evaluados --
 /// compartido por la llamada directa (`f(x)`) y la indirecta a través de un
 /// `Value::FnRef` (`let g = f; g(x)`), para no duplicar el armado del scope.
-fn call_fn_decl(decl: &FnDecl, arg_vs: Vec<Value>, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Value, RuntimeError> {
+fn call_fn_decl(decl: &FnDecl, arg_vs: Vec<Value>, db: &Db, fns: &Fns, checker: &Checker) -> Result<Value, RuntimeError> {
     let mut fn_env = Env::new();
     for (p, v) in decl.params.iter().zip(arg_vs) {
         fn_env.insert(p.name.clone(), cell(v));
     }
-    eval_block(&decl.body, &fn_env, db, fns, symbols)
+    eval_block(&decl.body, &fn_env, db, fns, checker)
 }
 
-fn try_match_pattern(pattern: &Pattern, v: &Value, symbols: &Symbols) -> Option<Vec<(String, Value)>> {
+fn try_match_pattern(pattern: &Pattern, v: &Value, checker: &Checker) -> Option<Vec<(String, Value)>> {
     match pattern {
         Pattern::Bind(name) => Some(vec![(name.clone(), v.clone())]),
         Pattern::Literal(lit) => literal_matches(lit, v).then(Vec::new),
@@ -482,7 +523,7 @@ fn try_match_pattern(pattern: &Pattern, v: &Value, symbols: &Symbols) -> Option<
             if let Some(field_patterns) = fields {
                 for fp in field_patterns {
                     let field_v = value_fields.iter().find(|(n, _)| n == &fp.name).map(|(_, v)| v)?;
-                    bindings.extend(try_match_pattern(&fp.pattern, field_v, symbols)?);
+                    bindings.extend(try_match_pattern(&fp.pattern, field_v, checker)?);
                 }
             }
             Some(bindings)
@@ -490,14 +531,14 @@ fn try_match_pattern(pattern: &Pattern, v: &Value, symbols: &Symbols) -> Option<
         // Ninguna alternativa liga nada (el checker ya lo garantizó, ver
         // bind_pattern), así que probar cada una hasta la primera que
         // matchee y devolver sus bindings (vacíos) alcanza.
-        Pattern::Or(subs) => subs.iter().find_map(|p| try_match_pattern(p, v, symbols)),
+        Pattern::Or(subs) => subs.iter().find_map(|p| try_match_pattern(p, v, checker)),
         // Narrowing de uniones (GRAMMAR.md §3.9): resuelve el texpr del
-        // patrón a un `Type` (con los mismos `types`/`enums` que el checker
-        // ya validó que existen -- `check_exhaustive_union` corrió antes
-        // que esto) y chequea el SHAPE real del valor contra él.
+        // patrón con el resolvedor REAL del checker (que ya validó este
+        // mismo texpr en `check_exhaustive_union` antes de que la ejecución
+        // llegue acá) y chequea el SHAPE real del valor contra él.
         Pattern::Type(name, texpr) => {
-            let resolved = resolve_pattern_type(texpr, &symbols.types, &symbols.enums);
-            value_matches_type(v, &resolved).then(|| vec![(name.clone(), v.clone())])
+            let resolved = checker.resolve_type(texpr).ok()?;
+            value_matches_type(v, &resolved, checker).then(|| vec![(name.clone(), v.clone())])
         }
     }
 }
@@ -511,60 +552,6 @@ fn literal_matches(lit: &LiteralPattern, v: &Value) -> bool {
     }
 }
 
-/// Resuelve el `TypeExpr` de un patrón `nombre: Tipo` (GRAMMAR.md §3.9) al
-/// `Type` (types.rs -- se reusa tal cual, no se inventa un enum paralelo)
-/// que `value_matches_type` necesita. Deliberadamente más simple que
-/// `Checker::resolve_type` (checker.rs): no maneja genéricos ni
-/// type_params -- el checker YA validó (`check_exhaustive_union`) que este
-/// texpr corresponde a un miembro concreto real de la unión antes de que
-/// la ejecución llegue acá, así que alcanza con una resolución de struct/
-/// enum/primitivo/Optional/List de un solo nivel, recursiva solo en eso.
-fn resolve_pattern_type(texpr: &TypeExpr, types: &Types, enums: &Enums) -> crate::types::Type {
-    use crate::types::{FieldType, Type};
-    match texpr {
-        TypeExpr::Named(name, _) => match name.as_str() {
-            "Int" => Type::Int,
-            "Float" => Type::Float,
-            "String" => Type::String,
-            "Bool" => Type::Bool,
-            "Void" => Type::Void,
-            _ => {
-                if let Some(decl) = types.get(name.as_str()) {
-                    match &decl.ty {
-                        TypeExpr::Struct(fields) => Type::Struct {
-                            name: Some(name.clone()),
-                            fields: fields
-                                .iter()
-                                .map(|f| FieldType {
-                                    name: f.name.clone(),
-                                    optional: f.optional,
-                                    ty: resolve_pattern_type(&f.ty, types, enums),
-                                })
-                                .collect(),
-                        },
-                        // Alias a un tipo no-struct, ej. `type Id = Int`.
-                        other => resolve_pattern_type(other, types, enums),
-                    }
-                } else if enums.contains_key(name.as_str()) {
-                    Type::Enum(name.clone())
-                } else {
-                    // No debería pasar -- el checker ya validó este texpr
-                    // como miembro real de la unión antes de llegar acá.
-                    Type::Dynamic
-                }
-            }
-        },
-        TypeExpr::Optional(inner) => Type::Optional(Box::new(resolve_pattern_type(inner, types, enums))),
-        TypeExpr::List(inner) => Type::List(Box::new(resolve_pattern_type(inner, types, enums))),
-        // Tuple/Function/struct-anónimo/Map/Union anidados como miembro
-        // DIRECTO de un patrón de narrowing -- fuera de alcance v0 (no es
-        // el caso de uso que esta ronda apunta a cubrir); `Dynamic` hace
-        // que `value_matches_type` los trate de forma segura (nunca
-        // matchea nada por accidente).
-        _ => Type::Dynamic,
-    }
-}
-
 /// ¿El SHAPE real de `v` corresponde a `ty`? Superficial pero recursivo en
 /// los campos REQUERIDOS de un struct (no solo su presencia, también que el
 /// valor guardado ahí tenga a su vez el shape correcto) -- eso es lo que
@@ -574,27 +561,75 @@ fn resolve_pattern_type(texpr: &TypeExpr, types: &Types, enums: &Enums) -> crate
 /// tipo REAL del valor guardado en ese campo, no por su mera presencia (que
 /// el subtipado estructural de ancho podría satisfacer para ambos a la vez
 /// con un tercer tipo más ancho).
-fn value_matches_type(v: &Value, ty: &crate::types::Type) -> bool {
+fn value_matches_type(v: &Value, ty: &crate::types::Type, checker: &Checker) -> bool {
     use crate::types::Type;
     match ty {
         Type::Int => matches!(v, Value::Int(_)),
         Type::Float => matches!(v, Value::Float(_)),
         Type::String => matches!(v, Value::Str(_)),
         Type::Bool => matches!(v, Value::Bool(_)),
-        Type::Optional(inner) => matches!(v, Value::Null) || value_matches_type(v, inner),
-        Type::List(_) => matches!(v, Value::List(_)),
+        Type::Optional(inner) => matches!(v, Value::Null) || value_matches_type(v, inner, checker),
+        Type::List(inner) => match v {
+            Value::List(items) => items.iter().all(|i| value_matches_type(i, inner, checker)),
+            _ => false,
+        },
+        Type::Tuple(tys) => match v {
+            Value::Tuple(items) => {
+                items.len() == tys.len()
+                    && items.iter().zip(tys).all(|(i, t)| value_matches_type(i, t, checker))
+            }
+            _ => false,
+        },
+        Type::MapOf(_, val_ty) => match v {
+            Value::Struct(entries) => entries.iter().all(|(_, val)| value_matches_type(val, val_ty, checker)),
+            _ => false,
+        },
         Type::Enum(name) => matches!(v, Value::Variant { enum_name, .. } if enum_name == name),
-        Type::Struct { fields, .. } => match v {
-            Value::Struct(vfields) => fields.iter().filter(|f| !f.optional).all(|f| {
-                vfields
+        Type::ResultOf(..) => matches!(v, Value::Variant { enum_name, .. } if enum_name == "Result"),
+        Type::Struct { fields, .. } => struct_matches_fields(v, fields, checker),
+        // Un genérico de usuario ya instanciado (`Box<Int>`): se expande a
+        // su forma real -- struct o enum -- en vez de tratarse como opaco.
+        // La versión anterior de este código lo resolvía a `Dynamic` y
+        // devolvía `false` siempre, así que un `match` sobre una unión con
+        // un miembro genérico compilaba y NUNCA matcheaba en runtime.
+        Type::Generic(name, args) => {
+            if let Ok(fields) = checker.expand_generic_struct(name, args) {
+                return struct_matches_fields(v, &fields, checker);
+            }
+            // No es un struct genérico -> es un enum genérico instanciado;
+            // esos siguen siendo nominales por su nombre base.
+            matches!(v, Value::Variant { enum_name, .. } if enum_name == name)
+        }
+        Type::PatchOf(inner) => match (v, &**inner) {
+            // Todo campo es opcional en un Patch<T>, pero los que estén
+            // presentes tienen que tener el tipo declarado en T.
+            (Value::Struct(entries), Type::Struct { fields, .. }) => entries.iter().all(|(k, val)| {
+                fields
                     .iter()
-                    .find(|(n, _)| n == &f.name)
-                    .is_some_and(|(_, fv)| value_matches_type(fv, &f.ty))
+                    .find(|f| &f.name == k)
+                    .is_some_and(|f| value_matches_type(val, &f.ty, checker))
             }),
             _ => false,
         },
-        // Dynamic/Function/etc -- no debería llegar acá como resultado de
-        // `resolve_pattern_type` para un texpr que el checker ya validó.
+        Type::Null => matches!(v, Value::Null),
+        Type::Void => matches!(v, Value::Null),
+        Type::Union(members) => members.iter().any(|m| value_matches_type(v, m, checker)),
+        Type::Dynamic => true,
+        // Function/Db/DbCollection/TypeParam -- ninguno es un valor que
+        // pueda existir con una forma verificable acá.
+        _ => false,
+    }
+}
+
+fn struct_matches_fields(v: &Value, fields: &[crate::types::FieldType], checker: &Checker) -> bool {
+    match v {
+        Value::Struct(vfields) => fields.iter().all(|f| {
+            match vfields.iter().find(|(n, _)| n == &f.name) {
+                Some((_, fv)) => value_matches_type(fv, &f.ty, checker),
+                // Ausente: solo válido si la clave era opcional (`x?: T`).
+                None => f.optional,
+            }
+        }),
         _ => false,
     }
 }
@@ -612,13 +647,13 @@ fn call_closure(
     arg_vs: Vec<Value>,
     db: &Db,
     fns: &Fns,
-    symbols: &Symbols,
+    checker: &Checker,
 ) -> Result<Value, RuntimeError> {
     let mut call_env = captured_env.clone();
     for (name, v) in param_names.iter().zip(arg_vs) {
         call_env.insert(name.clone(), cell(v));
     }
-    eval_block(body, &call_env, db, fns, symbols)
+    eval_block(body, &call_env, db, fns, checker)
 }
 
 /// Cualquier `Value` invocable -- una referencia a `fn` por nombre o un
@@ -626,16 +661,16 @@ fn call_closure(
 /// indirecta de `Expr::Call` y por `.map`/`.filter` (más abajo), que
 /// necesitan invocar su callback sin que les importe cuál de las dos formas
 /// sea.
-fn call_callable(v: Value, arg_vs: Vec<Value>, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Value, RuntimeError> {
+fn call_callable(v: Value, arg_vs: Vec<Value>, db: &Db, fns: &Fns, checker: &Checker) -> Result<Value, RuntimeError> {
     match v {
         Value::FnRef(name) => {
             let decl = fns
                 .get(name.as_str())
                 .ok_or_else(|| err(format!("fn desconocida: '{name}'")))?;
-            call_fn_decl(decl, arg_vs, db, fns, symbols)
+            call_fn_decl(decl, arg_vs, db, fns, checker)
         }
         Value::Closure(params, body, captured_env) => {
-            call_closure(&params, &body, &captured_env, arg_vs, db, fns, symbols)
+            call_closure(&params, &body, &captured_env, arg_vs, db, fns, checker)
         }
         other => Err(err(format!("no se puede llamar un valor {other:?}"))),
     }
@@ -647,7 +682,7 @@ fn call_method(
     args: Vec<Value>,
     db: &Db,
     fns: &Fns,
-    symbols: &Symbols,
+    checker: &Checker,
 ) -> Result<Value, RuntimeError> {
     match receiver {
         Value::DbCollection(coll) => db.call(&coll, method, args),
@@ -660,7 +695,7 @@ fn call_method(
                 let f = args.into_iter().next().ok_or_else(|| err("'filter' requiere 1 argumento"))?;
                 let mut kept = Vec::new();
                 for item in items {
-                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, symbols)?)? {
+                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker)?)? {
                         kept.push(item);
                     }
                 }
@@ -670,7 +705,7 @@ fn call_method(
                 let f = args.into_iter().next().ok_or_else(|| err("'map' requiere 1 argumento"))?;
                 let mut mapped = Vec::with_capacity(items.len());
                 for item in items {
-                    mapped.push(call_callable(f.clone(), vec![item], db, fns, symbols)?);
+                    mapped.push(call_callable(f.clone(), vec![item], db, fns, checker)?);
                 }
                 Ok(Value::List(mapped))
             }
@@ -744,46 +779,323 @@ pub fn invoke_rpc(
         })
         .collect();
 
-    // Narrowing de uniones (GRAMMAR.md §3.9): `value_matches_type` necesita
-    // poder resolver un `TypeExpr::Named("User", [])` de un patrón `nombre:
-    // Tipo` a sus campos reales -- mismo patrón que `fns` de arriba (y que
-    // `simple_enum_names` más abajo), armado UNA vez acá, no en cada
-    // llamada a `try_match_pattern`.
-    let types: Types = program
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Type(t) => Some((t.name.clone(), t)),
-            _ => None,
-        })
-        .collect();
-    let enums: Enums = program
-        .items
-        .iter()
-        .filter_map(|i| match i {
-            Item::Enum(e) => Some((e.name.clone(), e)),
-            _ => None,
-        })
-        .collect();
-    let symbols = Symbols { types, enums };
+    // El resolvedor de tipos REAL (checker.rs), no una tabla propia --
+    // hace falta para resolver los tipos declarados de los parámetros y
+    // para los patrones de narrowing. El programa ya fue chequeado antes de
+    // llegar acá (main.rs::load_and_check), así que no puede traer errores
+    // de símbolos; aun así se propagan en vez de ignorarse.
+    let (checker, symbol_errors) = crate::checker::Checker::build_symbols(program);
+    if let Some(e) = symbol_errors.into_iter().next() {
+        return Err(err(format!("programa inválido: {e}")));
+    }
 
     let empty = serde_json::Map::new();
     let args_obj = args_json.as_object().unwrap_or(&empty);
     let mut env = Env::new();
     for p in &rpc.params {
+        let declared = checker
+            .resolve_type(&p.ty)
+            .map_err(|e| err(format!("no se pudo resolver el tipo del parámetro '{}': {e}", p.name)))?;
         let v = match args_obj.get(&p.name) {
-            Some(j) => json_to_value(j),
+            // ACÁ es donde el borde se volvió tipado: el JSON que llega se
+            // valida contra el tipo DECLARADO y se reconstruye con la forma
+            // interna correcta (un enum pasa a ser Value::Variant, no un
+            // Str/Struct suelto). Ver `json_to_typed_value`.
+            Some(j) => json_to_typed_value(j, &declared, &checker, &p.name)?,
             None => match &p.default {
-                Some(default_expr) => eval_expr(default_expr, &Env::new(), db, &fns, &symbols)?,
-                None => Value::Null,
+                Some(default_expr) => eval_expr(default_expr, &Env::new(), db, &fns, &checker)?,
+                // Antes esto era `Value::Null` en silencio -- un parámetro
+                // requerido que no venía en el body producía un fallo
+                // confuso mucho más adentro (o ninguno).
+                None if matches!(declared, crate::types::Type::Optional(_)) => Value::Null,
+                None => {
+                    return Err(bad_req(format!(
+                        "falta el parámetro requerido '{}' (se esperaba {})",
+                        p.name,
+                        describe_type(&declared)
+                    )))
+                }
             },
         };
         env.insert(p.name.clone(), cell(v));
     }
 
-    let result = eval_block(&rpc.body, &env, db, &fns, &symbols)?;
+    let result = eval_block(&rpc.body, &env, db, &fns, &checker)?;
     let simple_enums = simple_enum_names(program);
     Ok(value_to_json(&result, &simple_enums))
+}
+
+/// Convierte el JSON que llegó por el wire al `Value` interno que
+/// corresponde al tipo DECLARADO, validándolo en el camino.
+///
+/// Esto es la contraparte, del lado servidor, de lo que `validators.ts` ya
+/// hacía del lado cliente desde que existe (GRAMMAR.md §3.11): el cliente
+/// verificaba cada RESPUESTA contra el contrato, pero el servidor nunca
+/// verificó ninguna PETICIÓN -- `json_to_value` era una conversión
+/// puramente sintáctica, sin ningún tipo a la vista. La auditoría mostró
+/// las cuatro consecuencias, todas reproducidas de verdad contra un
+/// servidor real:
+///
+/// 1. Un enum que llegaba por el wire (`"Admin"`, o `{type:"Circle",r:3}`)
+///    se convertía en `Value::Str`/`Value::Struct`, nunca en
+///    `Value::Variant`. Así que `match` sobre CUALQUIER parámetro de tipo
+///    enum fallaba siempre con "ningún arm coincidió — el checker debería
+///    haber impedido esto" (500), pese a que el cliente mandaba
+///    exactamente lo que el contrato exige.
+/// 2. Por lo mismo, `r == Role.Admin {}` daba `false` para un valor que
+///    vino del wire y `true` para uno construido en el backend: dos
+///    representaciones internas del mismo valor del contrato.
+/// 3. JSON arbitrario (un String donde se declaró Int, campos que el tipo
+///    no tiene, `null` en un campo no-nullable) entraba al intérprete y se
+///    PERSISTÍA en la db, de donde salía después en respuestas que el
+///    propio `validators.ts` del cliente rechazaba -- un cliente
+///    malintencionado o simplemente roto podía dejar una fila inservible
+///    para todos los demás.
+/// 4. Un parámetro requerido ausente se volvía `Value::Null` en silencio.
+///
+/// Sobre campos de más: se ACEPTAN pero se DESCARTAN. Aceptarlos es
+/// coherente con el subtipado estructural de ancho (GRAMMAR.md §3.2, un
+/// valor con campos de más es un subtipo válido); descartarlos es lo que
+/// garantiza que el `Value` resultante tenga EXACTAMENTE la forma
+/// declarada, que es lo que corta la clase de bug (3).
+fn json_to_typed_value(
+    j: &serde_json::Value,
+    ty: &crate::types::Type,
+    checker: &Checker,
+    path: &str,
+) -> Result<Value, RuntimeError> {
+    use crate::types::Type;
+    let mismatch = || {
+        bad_req(format!(
+            "'{path}': se esperaba {}, se recibió {}",
+            describe_type(ty),
+            describe_json(j)
+        ))
+    };
+    match ty {
+        Type::Int => j.as_i64().map(Value::Int).ok_or_else(mismatch),
+        Type::Float => j.as_f64().map(Value::Float).ok_or_else(mismatch),
+        Type::String => j.as_str().map(|s| Value::Str(s.to_string())).ok_or_else(mismatch),
+        Type::Bool => j.as_bool().map(Value::Bool).ok_or_else(mismatch),
+        Type::Optional(inner) => {
+            if j.is_null() {
+                Ok(Value::Null)
+            } else {
+                json_to_typed_value(j, inner, checker, path)
+            }
+        }
+        Type::List(inner) => {
+            let items = j.as_array().ok_or_else(mismatch)?;
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| json_to_typed_value(item, inner, checker, &format!("{path}[{i}]")))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List)
+        }
+        Type::Tuple(tys) => {
+            let items = j.as_array().ok_or_else(mismatch)?;
+            if items.len() != tys.len() {
+                return Err(bad_req(format!(
+                    "'{path}': se esperaba una tupla de {} elementos, se recibieron {}",
+                    tys.len(),
+                    items.len()
+                )));
+            }
+            items
+                .iter()
+                .zip(tys)
+                .enumerate()
+                .map(|(i, (item, t))| json_to_typed_value(item, t, checker, &format!("{path}.{i}")))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Tuple)
+        }
+        Type::MapOf(key_ty, val_ty) => {
+            let obj = j.as_object().ok_or_else(mismatch)?;
+            let mut entries = Vec::with_capacity(obj.len());
+            for (k, v) in obj {
+                // Las claves de un objeto JSON son siempre string; para un
+                // Map<Int,V> tienen que parsear como entero de verdad.
+                if matches!(**key_ty, Type::Int) && k.parse::<i64>().is_err() {
+                    return Err(bad_req(format!(
+                        "'{path}': la clave '{k}' no es un entero válido para un Map<Int, _>"
+                    )));
+                }
+                entries.push((k.clone(), json_to_typed_value(v, val_ty, checker, &format!("{path}.{k}"))?));
+            }
+            Ok(Value::Struct(entries))
+        }
+        Type::Struct { fields, .. } => struct_from_json(j, fields, checker, path, &mismatch),
+        Type::Generic(name, args) => {
+            if let Ok(fields) = checker.expand_generic_struct(name, args) {
+                return struct_from_json(j, &fields, checker, path, &mismatch);
+            }
+            variant_from_json(j, ty, name, checker, path, &mismatch)
+        }
+        Type::Enum(name) => variant_from_json(j, ty, name, checker, path, &mismatch),
+        Type::ResultOf(..) => variant_from_json(j, ty, "Result", checker, path, &mismatch),
+        Type::PatchOf(inner) => {
+            let Type::Struct { fields, .. } = &**inner else {
+                return Err(bad_req(format!("'{path}': Patch<T> requiere que T sea un struct")));
+            };
+            let obj = j.as_object().ok_or_else(mismatch)?;
+            let mut out = Vec::new();
+            for (k, v) in obj {
+                // Un campo que el tipo base no declara se descarta: sin
+                // esto, `applyPatch` escribía claves inventadas directo en
+                // la fila almacenada (bug real de la auditoría).
+                if let Some(f) = fields.iter().find(|f| &f.name == k) {
+                    out.push((k.clone(), json_to_typed_value(v, &f.ty, checker, &format!("{path}.{k}"))?));
+                }
+            }
+            Ok(Value::Struct(out))
+        }
+        // Una unión acepta el primer miembro que encaje. El checker ya
+        // rechaza las uniones cuyos miembros no se puedan distinguir
+        // (GRAMMAR.md §3.9), así que "el primero que encaja" no es
+        // ambiguo para las que sí se pueden matchear.
+        Type::Union(members) => members
+            .iter()
+            .find_map(|m| json_to_typed_value(j, m, checker, path).ok())
+            .ok_or_else(mismatch),
+        Type::Void | Type::Null => Ok(Value::Null),
+        // Sin forma declarada que verificar: se acepta tal cual.
+        Type::Dynamic => Ok(json_to_value(j)),
+        // Una función no puede cruzar el wire (tabla de mapeo, §4).
+        Type::Function(..) => Err(bad_req(format!(
+            "'{path}': un valor de tipo función no puede recibirse por la red"
+        ))),
+        other => Err(bad_req(format!("'{path}': tipo no soportado en el wire: {other:?}"))),
+    }
+}
+
+fn struct_from_json(
+    j: &serde_json::Value,
+    fields: &[crate::types::FieldType],
+    checker: &Checker,
+    path: &str,
+    mismatch: &dyn Fn() -> RuntimeError,
+) -> Result<Value, RuntimeError> {
+    let obj = j.as_object().ok_or_else(mismatch)?;
+    let mut out = Vec::with_capacity(fields.len());
+    for f in fields {
+        match obj.get(&f.name) {
+            Some(fv) => {
+                out.push((f.name.clone(), json_to_typed_value(fv, &f.ty, checker, &format!("{path}.{}", f.name))?))
+            }
+            // `x?: T` -- clave que puede estar ausente (GRAMMAR.md §3.4):
+            // simplemente no se incluye en el valor resultante.
+            None if f.optional => {}
+            None => {
+                return Err(bad_req(format!(
+                    "'{path}': falta el campo requerido '{}' (se esperaba {})",
+                    f.name,
+                    describe_type(&f.ty)
+                )))
+            }
+        }
+    }
+    // Nótese que solo se copian los campos DECLARADOS: los de más se
+    // aceptan (width subtyping) pero no sobreviven.
+    Ok(Value::Struct(out))
+}
+
+/// Reconstruye un `Value::Variant` desde su forma de wire. Es el paso que
+/// faltaba por completo: la serialización (`value_to_json`) distingue enum
+/// "simple" (string plano) de ADT (objeto con tag `type`), pero no existía
+/// la inversa, así que nada que llegara del cliente era nunca un Variant.
+fn variant_from_json(
+    j: &serde_json::Value,
+    ty: &crate::types::Type,
+    enum_name: &str,
+    checker: &Checker,
+    path: &str,
+    mismatch: &dyn Fn() -> RuntimeError,
+) -> Result<Value, RuntimeError> {
+    let all_unit = checker
+        .enums
+        .get(enum_name)
+        .is_some_and(|e| e.variants.iter().all(|v| v.fields.is_none()));
+
+    if all_unit {
+        let s = j.as_str().ok_or_else(mismatch)?;
+        let names = checker
+            .enum_variant_names(enum_name)
+            .map_err(|e| bad_req(format!("'{path}': {e}")))?;
+        if !names.iter().any(|n| n == s) {
+            return Err(bad_req(format!(
+                "'{path}': '{s}' no es una variante de '{enum_name}' (son: {})",
+                names.join(", ")
+            )));
+        }
+        return Ok(Value::Variant {
+            enum_name: enum_name.to_string(),
+            variant: s.to_string(),
+            fields: Vec::new(),
+        });
+    }
+
+    let obj = j.as_object().ok_or_else(mismatch)?;
+    let variant = obj
+        .get("type")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| bad_req(format!("'{path}': falta el tag 'type' que identifica la variante de '{enum_name}'")))?;
+    let declared = checker
+        .variant_field_types(ty, enum_name, variant)
+        .map_err(|e| bad_req(format!("'{path}': {e}")))?;
+    let mut fields = Vec::with_capacity(declared.len());
+    for (fname, fty) in &declared {
+        let fv = obj
+            .get(fname)
+            .ok_or_else(|| bad_req(format!("'{path}': la variante '{variant}' requiere el campo '{fname}'")))?;
+        fields.push((fname.clone(), json_to_typed_value(fv, fty, checker, &format!("{path}.{fname}"))?));
+    }
+    Ok(Value::Variant {
+        enum_name: enum_name.to_string(),
+        variant: variant.to_string(),
+        fields,
+    })
+}
+
+/// Nombre legible de un tipo para los mensajes de error del borde -- el
+/// `{:?}` de `Type` es útil para depurar el compilador, pero ilegible para
+/// quien está mandando un request mal formado.
+fn describe_type(ty: &crate::types::Type) -> String {
+    use crate::types::Type;
+    match ty {
+        Type::Int => "Int".into(),
+        Type::Float => "Float".into(),
+        Type::String => "String".into(),
+        Type::Bool => "Bool".into(),
+        Type::Null | Type::Void => "null".into(),
+        Type::Optional(inner) => format!("{}?", describe_type(inner)),
+        Type::List(inner) => format!("{}[]", describe_type(inner)),
+        Type::Tuple(items) => format!("({})", items.iter().map(describe_type).collect::<Vec<_>>().join(", ")),
+        Type::MapOf(k, v) => format!("Map<{}, {}>", describe_type(k), describe_type(v)),
+        Type::Enum(name) => name.clone(),
+        Type::ResultOf(ok, e) => format!("Result<{}, {}>", describe_type(ok), describe_type(e)),
+        Type::PatchOf(inner) => format!("Patch<{}>", describe_type(inner)),
+        Type::Generic(name, args) => {
+            format!("{name}<{}>", args.iter().map(describe_type).collect::<Vec<_>>().join(", "))
+        }
+        Type::Struct { name: Some(n), .. } => n.clone(),
+        Type::Struct { fields, .. } => {
+            format!("{{ {} }}", fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>().join(", "))
+        }
+        Type::Union(members) => members.iter().map(describe_type).collect::<Vec<_>>().join(" | "),
+        other => format!("{other:?}"),
+    }
+}
+
+fn describe_json(j: &serde_json::Value) -> &'static str {
+    match j {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "un booleano",
+        serde_json::Value::Number(_) => "un número",
+        serde_json::Value::String(_) => "un string",
+        serde_json::Value::Array(_) => "un array",
+        serde_json::Value::Object(_) => "un objeto",
+    }
 }
 
 /// Si `service_name.rpc_name` es un `stream` (no un `rpc` normal). Deliberadamente
@@ -1502,5 +1814,190 @@ mod tests {
             invoke_rpc(&program, "S", "describe", &json!({"v": {"x": "hola"}}), &db).unwrap(),
             json!("B")
         );
+    }
+
+    // ---- validación tipada del borde (auditoría) ----
+    //
+    // Todos estos casos se reprodujeron primero contra un servidor real:
+    // el cliente mandaba exactamente lo que el contrato exige y el
+    // servidor respondía 500, o aceptaba basura con 200.
+
+    fn wire_demo() -> Program {
+        program_from(
+            r#"
+            enum Role { Admin, Member }
+            enum Shape { Circle { r: Int }, Square { s: Int } }
+            type Item = { id: Int, price: Int }
+            type OptKey = { id: Int, note?: String }
+            service S {
+                rpc matchEnum(r: Role) -> String {
+                    match r {
+                        Role.Admin => "admin",
+                        Role.Member => "member",
+                    }
+                }
+                rpc matchAdt(sh: Shape) -> Int {
+                    match sh {
+                        Shape.Circle { r: r } => r,
+                        Shape.Square { s: s } => s,
+                    }
+                }
+                rpc eqEnum(r: Role) -> Bool { r == Role.Admin {} }
+                rpc addOne(n: Int) -> Int { n + 1 }
+                rpc readNote(o: OptKey) -> String? { o.note }
+                rpc echoItem(i: Item) -> Item { i }
+            }
+        "#,
+        )
+    }
+
+    #[test]
+    fn an_enum_arriving_from_the_wire_becomes_a_real_variant_and_matches() {
+        // Un enum simple viaja como string plano (GRAMMAR.md §4). Antes,
+        // json_to_value lo dejaba como Value::Str y `match` no encontraba
+        // ningún arm -> 500 "el checker debería haber impedido esto".
+        let program = wire_demo();
+        let db = Db::seeded();
+        assert_eq!(
+            invoke_rpc(&program, "S", "matchEnum", &json!({"r": "Admin"}), &db).unwrap(),
+            json!("admin")
+        );
+        // Un ADT viaja como objeto con tag `type`.
+        assert_eq!(
+            invoke_rpc(&program, "S", "matchAdt", &json!({"sh": {"type": "Circle", "r": 3}}), &db).unwrap(),
+            json!(3)
+        );
+    }
+
+    #[test]
+    fn equality_holds_between_a_wire_value_and_one_built_in_the_backend() {
+        // El síntoma más sutil de la misma causa: dos representaciones
+        // internas del mismo valor del contrato daban != entre sí.
+        let program = wire_demo();
+        assert_eq!(
+            invoke_rpc(&program, "S", "eqEnum", &json!({"r": "Admin"}), &Db::seeded()).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            invoke_rpc(&program, "S", "eqEnum", &json!({"r": "Member"}), &Db::seeded()).unwrap(),
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn a_value_that_does_not_match_the_declared_type_is_rejected_as_a_bad_request() {
+        let program = wire_demo();
+        let db = Db::seeded();
+        for (rpc, args) in [
+            ("addOne", json!({"n": "no soy un int"})),
+            ("addOne", json!({"n": 1.5})),
+            ("addOne", json!({})), // parámetro requerido ausente
+            ("matchEnum", json!({"r": "NoExiste"})),
+            ("matchEnum", json!({"r": {"type": "Admin"}})), // forma de ADT para un enum simple
+            ("matchAdt", json!({"sh": {"type": "Circle"}})), // falta el campo de la variante
+            ("matchAdt", json!({"sh": "Circle"})),
+            ("echoItem", json!({"i": {"id": 1}})), // falta un campo requerido
+            ("echoItem", json!({"i": {"id": "x", "price": 1}})),
+        ] {
+            let e = invoke_rpc(&program, "S", rpc, &args, &db)
+                .expect_err(&format!("{rpc} con {args} debería rechazarse"));
+            assert_eq!(e.kind, ErrorKind::BadRequest, "{rpc} con {args}: {e}");
+        }
+    }
+
+    #[test]
+    fn extra_fields_are_accepted_but_dropped() {
+        // Aceptarlos es coherente con el subtipado de ancho (GRAMMAR.md
+        // §3.2); descartarlos es lo que evita que se persistan y salgan
+        // después en una respuesta que el validador del cliente rechaza.
+        let program = wire_demo();
+        let result = invoke_rpc(
+            &program,
+            "S",
+            "echoItem",
+            &json!({"i": {"id": 1, "price": 2, "colado": true}}),
+            &Db::seeded(),
+        )
+        .unwrap();
+        assert_eq!(result, json!({"id": 1, "price": 2}));
+        assert!(result.get("colado").is_none(), "un campo no declarado no debe sobrevivir");
+    }
+
+    #[test]
+    fn an_absent_optional_key_reads_as_null_instead_of_failing() {
+        let program = wire_demo();
+        let db = Db::seeded();
+        assert_eq!(
+            invoke_rpc(&program, "S", "readNote", &json!({"o": {"id": 1}}), &db).unwrap(),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            invoke_rpc(&program, "S", "readNote", &json!({"o": {"id": 1, "note": "hola"}}), &db).unwrap(),
+            json!("hola")
+        );
+    }
+
+    #[test]
+    fn a_patch_cannot_smuggle_undeclared_fields_into_a_stored_row() {
+        // Bug real: `applyPatch` escribía CUALQUIER clave del patch directo
+        // en la fila almacenada, así que un request malformado dejaba una
+        // fila que después ni el propio contrato admitía.
+        let program = users_demo();
+        let db = Db::seeded();
+        let result = invoke_rpc(
+            &program,
+            "Users",
+            "update",
+            &json!({"id": 1, "patch": {"name": "Ada L.", "colado": {"x": 1}}}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(result["name"], json!("Ada L."));
+        assert!(result.get("colado").is_none(), "un campo fuera del contrato no debe entrar a la fila");
+    }
+
+    #[test]
+    fn a_patch_with_a_wrong_typed_field_is_rejected() {
+        let program = users_demo();
+        let e = invoke_rpc(
+            &program,
+            "Users",
+            "update",
+            &json!({"id": 1, "patch": {"name": 123}}),
+            &Db::seeded(),
+        )
+        .expect_err("un patch con un campo del tipo equivocado debería rechazarse");
+        assert_eq!(e.kind, ErrorKind::BadRequest, "{e}");
+    }
+
+    #[test]
+    fn a_null_in_a_non_nullable_field_is_rejected() {
+        let program = users_demo();
+        let e = invoke_rpc(
+            &program,
+            "Users",
+            "update",
+            &json!({"id": 1, "patch": {"name": null}}),
+            &Db::seeded(),
+        )
+        .expect_err("null en un campo no-nullable debería rechazarse");
+        assert_eq!(e.kind, ErrorKind::BadRequest, "{e}");
+    }
+
+    #[test]
+    fn db_new_declares_exactly_the_collections_the_program_declares() {
+        // `serve` usa Db::new, no Db::seeded: un programa que declara una
+        // colección que no se llama "users" tiene que funcionar.
+        let program = program_from(
+            r#"
+            type Item = { id: Int, price: Int }
+            db { items: Item[] }
+            service S {
+                rpc all() -> Item[] { db.items.all() }
+            }
+        "#,
+        );
+        let db = Db::new(&program);
+        assert_eq!(invoke_rpc(&program, "S", "all", &json!({}), &db).unwrap(), json!([]));
     }
 }
