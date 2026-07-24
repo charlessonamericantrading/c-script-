@@ -231,6 +231,10 @@ pub enum UnaryOp {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: Pattern,
+    /// `pattern if guard => body` (GRAMMAR.md §3.3). Un arm con guard NUNCA
+    /// descarta exhaustividad por sí solo -- la condición podría ser falsa
+    /// en runtime, así que el checker lo trata como si no cubriera nada.
+    pub guard: Option<Expr>,
     pub body: MatchArmBody,
 }
 
@@ -244,6 +248,12 @@ pub enum MatchArmBody {
 pub enum Pattern {
     /// binding simple, incluye `_` (wildcard)
     Bind(String),
+    /// `1`, `"texto"`, `true`/`false` (GRAMMAR.md §3.3) -- deliberadamente
+    /// SIN Float (comparar floats por igualdad exacta es la misma trampa
+    /// que Rust terminó prohibiendo en sus propios patrones) y sin `null`
+    /// (matchear un `T?` directamente queda para cuando exista ese diseño;
+    /// hoy la forma de testear nullability es `== null` en un `if`, §3.7).
+    Literal(LiteralPattern),
     /// `Enum.Variante { campo: patrón, ... }` — la variante unitaria sin
     /// llaves (`Enum.Variante`) se representa con `fields: None`.
     Variant {
@@ -251,6 +261,21 @@ pub enum Pattern {
         variant_name: String,
         fields: Option<Vec<FieldPattern>>,
     },
+    /// `P1 | P2 | ...` (GRAMMAR.md §3.3). Alcance v0: ninguna alternativa
+    /// puede introducir bindings -- exigir que las N alternativas liguen
+    /// exactamente las mismas variables del mismo tipo (la regla real de
+    /// Rust) es la parte cara de or-patterns; acá se prohíbe bindear del
+    /// todo dentro de un `Or` (el checker lo rechaza explícitamente), que
+    /// cubre el caso común (combinar variantes/literales con un mismo
+    /// cuerpo) sin la complejidad de reconciliar bindings entre ramas.
+    Or(Vec<Pattern>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiteralPattern {
+    Int(i64),
+    Str(String),
+    Bool(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]

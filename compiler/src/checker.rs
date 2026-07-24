@@ -35,6 +35,22 @@ fn immutable(ty: Type) -> Binding {
 
 type Env = HashMap<String, Binding>;
 
+/// Todos los nombres que un patrón ligaría, recursivamente -- usado por
+/// `bind_pattern` solo para RECHAZAR un `Pattern::Or` cuyas alternativas
+/// intenten bindear algo (ver su doc en ast.rs), no para resolver tipos.
+fn pattern_bindings(pattern: &Pattern) -> Vec<String> {
+    match pattern {
+        Pattern::Bind(name) => vec![name.clone()],
+        Pattern::Literal(_) => Vec::new(),
+        Pattern::Variant { fields, .. } => fields
+            .iter()
+            .flatten()
+            .flat_map(|fp| pattern_bindings(&fp.pattern))
+            .collect(),
+        Pattern::Or(subs) => subs.iter().flat_map(pattern_bindings).collect(),
+    }
+}
+
 pub struct Checker {
     pub(crate) types: HashMap<String, TypeDecl>,
     pub(crate) enums: HashMap<String, EnumDecl>,
@@ -531,18 +547,40 @@ impl Checker {
         env: &Env,
     ) -> Result<(), CheckError> {
         let scrutinee_ty = self.synth_expr(scrutinee, env)?;
-        let enum_name = match &scrutinee_ty {
-            Type::Enum(n) => n.clone(),
-            Type::ResultOf(_, _) => "Result".to_string(),
-            Type::Generic(n, _) => n.clone(), // enum genérico instanciado, ej. Option<Int>
-            other => return Err(err(format!("'match' requiere un valor de tipo enum, se encontró {other:?}"))),
-        };
 
-        self.check_exhaustive(&scrutinee_ty, &enum_name, arms)?;
+        match &scrutinee_ty {
+            Type::Enum(_) | Type::ResultOf(_, _) | Type::Generic(_, _) => {
+                let enum_name = match &scrutinee_ty {
+                    Type::Enum(n) => n.clone(),
+                    Type::ResultOf(_, _) => "Result".to_string(),
+                    Type::Generic(n, _) => n.clone(), // enum genérico instanciado, ej. Option<Int>
+                    _ => unreachable!(),
+                };
+                self.check_exhaustive_enum(&scrutinee_ty, &enum_name, arms)?;
+            }
+            // Extensión más allá de enum (GRAMMAR.md §3.3): matchear un
+            // primitivo con patrones de literal. Deliberadamente sin Float
+            // (igualdad exacta de floats) ni Optional/Null (matchear un `T?`
+            // directamente queda para más adelante, ver Pattern::Literal).
+            Type::Int | Type::String | Type::Bool => {
+                self.check_exhaustive_literal(&scrutinee_ty, arms)?;
+            }
+            other => {
+                return Err(err(format!(
+                    "'match' requiere un valor de tipo enum, Int, String o Bool; se encontró {other:?}"
+                )))
+            }
+        }
 
         for arm in arms {
             let mut arm_env = env.clone();
             self.bind_pattern(&arm.pattern, &scrutinee_ty, &mut arm_env)?;
+            // El guard ve las variables que el patrón acaba de ligar, ej.
+            // `Status.Setting { level } if level > 10 => ...` -- por eso se
+            // chequea acá, con arm_env, no con env.
+            if let Some(guard) = &arm.guard {
+                self.check_expr(guard, &Type::Bool, &arm_env)?;
+            }
             match &arm.body {
                 MatchArmBody::Expr(e) => self.check_expr(e, expected, &arm_env)?,
                 MatchArmBody::Block(b) => self.check_block(b, expected, &arm_env)?,
@@ -551,9 +589,11 @@ impl Checker {
         Ok(())
     }
 
-    /// Algoritmo de GRAMMAR.md §3.3: cualquier `Pattern::Bind` (incluye `_` y
-    /// bindings con nombre, ej. `otro => ...`) es un catch-all irrefutable.
-    fn check_exhaustive(&self, scrutinee_ty: &Type, enum_name: &str, arms: &[MatchArm]) -> Result<(), CheckError> {
+    /// Algoritmo de GRAMMAR.md §3.3: cualquier `Pattern::Bind` SIN GUARD
+    /// (incluye `_` y bindings con nombre, ej. `otro => ...`) es un catch-all
+    /// irrefutable. Un arm CON guard nunca descarta exhaustividad -- la
+    /// condición podría ser falsa en runtime, así que no cuenta como cubierto.
+    fn check_exhaustive_enum(&self, scrutinee_ty: &Type, enum_name: &str, arms: &[MatchArm]) -> Result<(), CheckError> {
         let variants: Vec<String> = if matches!(scrutinee_ty, Type::ResultOf(_, _)) {
             vec!["Ok".to_string(), "Err".to_string()]
         } else {
@@ -563,17 +603,10 @@ impl Checker {
         let mut covered = HashSet::new();
         let mut wildcard = false;
         for arm in arms {
-            match &arm.pattern {
-                Pattern::Bind(_) => wildcard = true,
-                Pattern::Variant { enum_name: en, variant_name, .. } => {
-                    if en != enum_name {
-                        return Err(err(format!(
-                            "patrón para el enum '{en}' no coincide con el tipo del escrutinio ('{enum_name}')"
-                        )));
-                    }
-                    covered.insert(variant_name.clone());
-                }
+            if arm.guard.is_some() {
+                continue;
             }
+            self.collect_variant_coverage(&arm.pattern, enum_name, &mut wildcard, &mut covered)?;
         }
 
         if wildcard || variants.iter().all(|v| covered.contains(v)) {
@@ -583,6 +616,116 @@ impl Checker {
             Err(err(format!(
                 "match no exhaustivo sobre '{enum_name}': falta cubrir {missing:?} (GRAMMAR.md §3.3)"
             )))
+        }
+    }
+
+    /// Recorre un patrón (posiblemente un `Or`) sumando a `covered`/`wildcard`
+    /// -- separado de `check_exhaustive_enum` para que `Or` sea un solo punto
+    /// de recursión, no un caso más a duplicar en cada algoritmo.
+    fn collect_variant_coverage(
+        &self,
+        pattern: &Pattern,
+        enum_name: &str,
+        wildcard: &mut bool,
+        covered: &mut HashSet<String>,
+    ) -> Result<(), CheckError> {
+        match pattern {
+            Pattern::Bind(_) => {
+                *wildcard = true;
+                Ok(())
+            }
+            Pattern::Variant { enum_name: en, variant_name, .. } => {
+                if en != enum_name {
+                    return Err(err(format!(
+                        "patrón para el enum '{en}' no coincide con el tipo del escrutinio ('{enum_name}')"
+                    )));
+                }
+                covered.insert(variant_name.clone());
+                Ok(())
+            }
+            Pattern::Or(subs) => {
+                for s in subs {
+                    self.collect_variant_coverage(s, enum_name, wildcard, covered)?;
+                }
+                Ok(())
+            }
+            Pattern::Literal(lit) => Err(err(format!(
+                "patrón literal {lit:?} no válido contra un escrutinio de tipo enum ('{enum_name}')"
+            ))),
+        }
+    }
+
+    /// Exhaustividad para un escrutinio Int/String/Bool (GRAMMAR.md §3.3):
+    /// los patrones de literal nunca alcanzan por sí solos -- Int/String
+    /// tienen un espacio de valores no enumerable, así que siempre hace
+    /// falta un catch-all sin guard. Única excepción: Bool, que sí se puede
+    /// cubrir del todo con 'true' Y 'false' (es, en los hechos, un enum de
+    /// dos variantes).
+    fn check_exhaustive_literal(&self, scrutinee_ty: &Type, arms: &[MatchArm]) -> Result<(), CheckError> {
+        let mut wildcard = false;
+        let mut covered_bools: HashSet<bool> = HashSet::new();
+        for arm in arms {
+            if arm.guard.is_some() {
+                continue;
+            }
+            self.collect_literal_coverage(&arm.pattern, scrutinee_ty, &mut wildcard, &mut covered_bools)?;
+        }
+
+        let bool_exhaustive = matches!(scrutinee_ty, Type::Bool) && covered_bools.len() == 2;
+
+        if wildcard || bool_exhaustive {
+            Ok(())
+        } else {
+            Err(err(format!(
+                "match no exhaustivo: los patrones de literal nunca alcanzan por sí solos sobre {scrutinee_ty:?} -- \
+                 hace falta un arm final sin guard que capture el resto (ej. '_ => ...'), salvo Bool con 'true' y \
+                 'false' ambos cubiertos (GRAMMAR.md §3.3)"
+            )))
+        }
+    }
+
+    fn collect_literal_coverage(
+        &self,
+        pattern: &Pattern,
+        scrutinee_ty: &Type,
+        wildcard: &mut bool,
+        covered_bools: &mut HashSet<bool>,
+    ) -> Result<(), CheckError> {
+        match pattern {
+            Pattern::Bind(_) => {
+                *wildcard = true;
+                Ok(())
+            }
+            Pattern::Literal(lit) => {
+                self.check_literal_matches_type(lit, scrutinee_ty)?;
+                if let LiteralPattern::Bool(b) = lit {
+                    covered_bools.insert(*b);
+                }
+                Ok(())
+            }
+            Pattern::Or(subs) => {
+                for s in subs {
+                    self.collect_literal_coverage(s, scrutinee_ty, wildcard, covered_bools)?;
+                }
+                Ok(())
+            }
+            Pattern::Variant { enum_name, .. } => Err(err(format!(
+                "patrón de variante de enum ('{enum_name}') no válido contra un escrutinio de tipo {scrutinee_ty:?}"
+            ))),
+        }
+    }
+
+    fn check_literal_matches_type(&self, lit: &LiteralPattern, ty: &Type) -> Result<(), CheckError> {
+        let ok = matches!(
+            (lit, ty),
+            (LiteralPattern::Int(_), Type::Int)
+                | (LiteralPattern::Str(_), Type::String)
+                | (LiteralPattern::Bool(_), Type::Bool)
+        );
+        if ok {
+            Ok(())
+        } else {
+            Err(err(format!("el patrón literal {lit:?} no coincide con el tipo del escrutinio ({ty:?})")))
         }
     }
 
@@ -601,6 +744,7 @@ impl Checker {
                 env.insert(name.clone(), immutable(ty.clone()));
                 Ok(())
             }
+            Pattern::Literal(lit) => self.check_literal_matches_type(lit, ty),
             Pattern::Variant { enum_name, variant_name, fields } => {
                 let variant_fields = self.variant_field_types(ty, enum_name, variant_name)?;
                 if let Some(fps) = fields {
@@ -612,6 +756,23 @@ impl Checker {
                             .ok_or_else(|| err(format!("'{enum_name}.{variant_name}' no tiene campo '{}'", fp.name)))?;
                         self.bind_pattern(&fp.pattern, &field_ty, env)?;
                     }
+                }
+                Ok(())
+            }
+            // Alcance v0 (ver doc de Pattern::Or en ast.rs): ninguna
+            // alternativa puede ligar nombres -- evita tener que reconciliar
+            // "las N ramas bindean las mismas variables del mismo tipo"
+            // (la parte cara de or-patterns en otros lenguajes).
+            Pattern::Or(subs) => {
+                for s in subs {
+                    if !pattern_bindings(s).is_empty() {
+                        return Err(err(
+                            "las alternativas de un patrón 'A | B' no pueden introducir bindings (GRAMMAR.md §3.3) \
+                             -- ninguna rama puede usar un nombre propio ni capturar un campo, solo literales o \
+                             variantes sin capturar",
+                        ));
+                    }
+                    self.bind_pattern(s, ty, env)?;
                 }
                 Ok(())
             }
@@ -1076,6 +1237,139 @@ mod tests {
                 match s {
                     Status.Active => "activo",
                     other => "otro",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn or_pattern_combines_enum_variants_into_one_arm() {
+        let src = r#"
+            enum Status { Active, Paused, Cancelled }
+            fn describe(s: Status) -> String {
+                match s {
+                    Status.Active | Status.Paused => "en curso",
+                    Status.Cancelled => "cancelado",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn or_pattern_branch_that_binds_a_field_is_rejected() {
+        // Alcance v0 (ast.rs, doc de Pattern::Or): ninguna alternativa de un
+        // '|' puede introducir bindings, así que combinar dos variantes que
+        // capturan un campo -- aunque compartan nombre -- no está permitido.
+        let src = r#"
+            enum Shape { Circle { r: Int }, Square { r: Int } }
+            fn area_hint(s: Shape) -> Int {
+                match s {
+                    Shape.Circle { r } | Shape.Square { r } => r,
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "un patrón 'A | B' no debería poder bindear campos");
+    }
+
+    #[test]
+    fn literal_match_over_int_requires_a_trailing_catch_all() {
+        // Int tiene un espacio de valores no enumerable -- a diferencia de un
+        // enum, ningún conjunto finito de literales agota el tipo (GRAMMAR.md §3.3).
+        let src = r#"
+            fn describe(n: Int) -> String {
+                match n {
+                    1 => "uno",
+                    2 => "dos",
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "literales sobre Int nunca deberían bastar sin un catch-all");
+    }
+
+    #[test]
+    fn literal_match_over_int_with_wildcard_and_or_pattern_is_accepted() {
+        let src = r#"
+            fn describe(n: Int) -> String {
+                match n {
+                    1 | 2 => "bajo",
+                    -1 => "negativo",
+                    _ => "otro",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn bool_match_covering_both_values_is_exhaustive_without_wildcard() {
+        // Bool es, en los hechos, un enum de dos variantes -- único caso
+        // donde literales solos (sin catch-all) sí alcanzan (GRAMMAR.md §3.3).
+        let src = r#"
+            fn describe(b: Bool) -> String {
+                match b {
+                    true => "sí",
+                    false => "no",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn string_literal_pattern_type_mismatch_is_rejected() {
+        let src = r#"
+            fn describe(n: Int) -> String {
+                match n {
+                    "uno" => "no debería tipar",
+                    _ => "otro",
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "un patrón String no debería aceptarse contra un escrutinio Int");
+    }
+
+    #[test]
+    fn guarded_arm_alone_does_not_satisfy_exhaustiveness() {
+        // Un guard puede fallar en runtime -- por más que su patrón sería un
+        // catch-all sin el guard, no puede ser la única cobertura del match.
+        let src = r#"
+            fn describe(n: Int) -> String {
+                match n {
+                    x if x > 0 => "positivo",
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "un solo arm con guard nunca es exhaustivo por sí solo");
+    }
+
+    #[test]
+    fn guard_condition_must_synthesize_bool() {
+        let src = r#"
+            fn describe(n: Int) -> String {
+                match n {
+                    x if x => "no debería tipar",
+                    _ => "otro",
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "el guard 'if x' sobre un Int no es Bool");
+    }
+
+    #[test]
+    fn guard_sees_the_bindings_introduced_by_its_own_pattern() {
+        let src = r#"
+            enum Setting { Level { value: Int } }
+            fn describe(s: Setting) -> String {
+                match s {
+                    Setting.Level { value } if value > 10 => "alto",
+                    Setting.Level { value } => "bajo",
                 }
             }
         "#;

@@ -147,11 +147,14 @@ array_lit = "[" , [ expr , { "," , expr } , [ "," ] ] , "]" ;
 tuple_lit = "(" , expr , "," , [ expr , { "," , expr } ] , ")" ;
 
 match_expr   = "match" , expr , "{" , { match_arm } , "}" ;
-match_arm    = pattern , "=>" , ( expr , "," | block ) ;
+match_arm    = pattern , [ "if" , expr ] , "=>" , ( expr , "," | block ) ;
 
-pattern      = identifier                                    (* binding, incl. "_" *)
+pattern      = pattern_atom , { "|" , pattern_atom } ;        (* or-pattern *)
+pattern_atom = identifier                                    (* binding, incl. "_" *)
              | identifier , "." , identifier ,
-               [ "{" , field_pattern_list , "}" ] ;           (* Enum.Variant { .. } *)
+               [ "{" , field_pattern_list , "}" ]             (* Enum.Variant { .. } *)
+             | literal_pattern ;
+literal_pattern = int_lit | "-" , int_lit | str_lit | "true" | "false" ;
 field_pattern_list = field_pattern , { "," , field_pattern } ;
 field_pattern       = identifier , [ ":" , pattern ] ;        (* shorthand: `x` ≡ `x: x` *)
 ```
@@ -168,7 +171,7 @@ field_pattern       = identifier , [ ":" , pattern ] ;        (* shorthand: `x` 
 
 **Mutabilidad — por qué `let mut` no alcanza sin `assign_stmt`.** Antes de `assign_stmt`, `mut` era una palabra reservada sin ningún efecto: se podía escribir `let mut x = 1`, pero no había ninguna sentencia que permitiera cambiar `x` después. El checker exige que el nombre a la izquierda de un `assign_stmt` ya exista en el scope **y** haya sido declarado con `mut` — asignar a un binding inmutable, o a un nombre que no existe, es un error de tipos (checker.rs), no algo que el parser rechace. `assign_stmt` solo cubre variables simples (`x = ...`) — todavía no hay mutación de campos (`obj.campo = ...`) ni de posiciones de array (`arr[i] = ...`).
 
-**Fuera de alcance en v0** (ahora más acotado que antes): or-patterns (`p1 | p2`), patrones de literales en `match` (`0 => ...`), guardas (`if` dentro de un arm de `match`). Los operadores aritmético-lógicos e `if/else` ya están definidos arriba y implementados (checker.rs §3, runtime).
+Or-patterns, patrones de literales y guardas ya están resueltos — ver §3.3 para el algoritmo de exhaustividad extendido y sus límites de alcance explícitos (en particular, ninguna alternativa de un `p1 | p2` puede introducir bindings).
 
 ---
 
@@ -224,22 +227,72 @@ S <: T'
 - **`type` es estructural** (como TS): si `S` tiene al menos los campos de `T'` con tipos compatibles, `S <: T'`. Esto es necesario para que el mapeo a TS sea 1:1 — TS *solo* entiende structural typing para tipos objeto.
 - **`enum` es nominal**: dos enums con las mismas variantes pero nombres distintos NO son intercambiables. Esto también refleja TS: una unión discriminada se distingue por el tipo declarado, no por su forma accidental.
 
-### 3.3 Exhaustividad en `match`
+### 3.3 Exhaustividad en `match` — RESUELTO (enum + literales, or-patterns, guardas)
 
-Algoritmo (informal, suficiente para v0 — sin patrones anidados todavía):
+Algoritmo base sobre un scrutinee **enum** (incluye `Result<T,E>` y enums genéricos instanciados):
 
 ```
 cubierto := ∅
-para cada arm en match:
-  si arm.pattern == "_":
+para cada arm SIN guard en match:      -- un arm CON guard nunca cuenta, ver más abajo
+  si arm.pattern == "_" (o un bind con nombre):
     cubierto := todas_las_variantes(EnumType)
   si no:
-    cubierto := cubierto ∪ { variante_de(arm.pattern) }
+    cubierto := cubierto ∪ variantes_de(arm.pattern)   -- un Or aporta la unión de sus alternativas
 
 error si cubierto ≠ todas_las_variantes(EnumType)
 ```
 
 Esto es lo que hace que el compilador de c-script, igual que Rust, **rechace un `match` que no cubre un nuevo variant** añadido a un enum. Es una propiedad valiosa por sí misma (no solo para el puente con TS): añadir un caso a `Result` rompe la compilación en *todos* los `match` que lo consumen, en el backend, no solo en el frontend.
+
+**Extensión: `match` también acepta un scrutinee `Int`/`String`/`Bool`** (antes, `match` exigía un enum a secas — matchear un primitivo directamente no tenía ninguna forma de patrón que no fuera un bind, así que era, en los hechos, imposible de usar con más de un arm real). El algoritmo para este caso es distinto porque `Int`/`String` tienen un espacio de valores no enumerable:
+
+```
+error si NO hay un catch-all (bind sin guard) entre los arms
+   Y  NO ( tipo == Bool  Y  'true' y 'false' están ambos cubiertos por un literal sin guard )
+```
+
+`Bool` es, en los hechos, un enum de dos variantes — es el único tipo no-enum donde un conjunto de literales, sin catch-all, alcanza para ser exhaustivo. `Int`/`String` **siempre** necesitan un arm final sin guard (`_ => ...` o un bind con nombre) — ningún conjunto finito de literales agota sus valores posibles.
+
+```
+fn describe(n: Int) -> String {
+  match n {
+    1 | 2 => "bajo",     // or-pattern: aporta {1, 2} a la cobertura
+    -1    => "negativo", // literal negativo: un solo token de patrón, no unario aplicado a un patrón
+    _     => "otro",     // catch-all obligatorio -- Int no es enumerable
+  }
+}
+```
+
+**Guardas (`pattern if cond => body`) nunca descartan exhaustividad por sí solas.** La condición podría ser `false` en runtime, así que un arm con guard —aunque su patrón sería, sin el guard, un catch-all o cubriría el último variant que faltaba— **no cuenta** para el algoritmo de arriba: sigue habiendo que cubrir ese caso con algún otro arm sin guard. En runtime, si el patrón matchea pero el guard da `false`, la búsqueda **continúa con el siguiente arm** (igual que Rust), no se trata como "sin match":
+
+```
+fn classify(n: Int) -> String {
+  match n {
+    x if x > 100 => "grande",
+    x if x > 0   => "positivo chico",
+    _            => "cero o negativo",
+  }
+}
+```
+
+El guard ve las variables que el propio patrón acaba de ligar — `Setting.Level { value } if value > 10 => ...` puede usar `value` en la condición — y debe sintetizar `Bool`, como cualquier condición (§3.7).
+
+**Or-patterns (`p1 | p2 | ...`) — alcance v0: ninguna alternativa puede introducir bindings.** La regla completa de otros lenguajes (cada alternativa debe ligar exactamente las mismas variables, con el mismo tipo) es la parte cara de implementar or-patterns; acá se evita ese problema entero prohibiendo bindear del todo dentro de un `Or` — cubre el caso común (combinar variantes unitarias o literales que comparten cuerpo) sin esa complejidad:
+
+```
+enum Status { Active, Paused, Cancelled }
+match s {
+  Status.Active | Status.Paused => "en curso",   // ok: ninguna alternativa liga nada
+  Status.Cancelled => "cancelado",
+}
+
+enum Shape { Circle { r: Int }, Square { r: Int } }
+match sh {
+  Shape.Circle { r } | Shape.Square { r } => r,  // ERROR: cada alternativa intenta ligar 'r'
+}
+```
+
+**Deliberadamente fuera de alcance: literales `Float`, y matchear un `T?` directamente.** Sin patrón `Float`: comparar floats por igualdad exacta es una trampa conocida (`0.1 + 0.2 != 0.3`) — Rust llegó a la misma conclusión y terminó prohibiéndolo en sus propios patrones (antes era solo un warning). Sin `null` como patrón: eso requeriría que `match` acepte un scrutinee `Optional(T)`, una extensión relacionada pero distinta que queda para más adelante — hoy la forma de testear nullability sigue siendo `== null` / `!= null` dentro de un `if/else` (§3.7), que ya funciona porque `Null <: Optional(_)` (§3.4) hace que la comparación tipe.
 
 ### 3.4 Nullability (`T?`) — RESUELTO (default aplicado)
 

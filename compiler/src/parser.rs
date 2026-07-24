@@ -675,6 +675,16 @@ impl Parser {
 
     fn parse_match_arm(&mut self) -> Result<MatchArm, ParseError> {
         let pattern = self.parse_pattern()?;
+        let guard = if self.check(&TokenKind::If) {
+            self.advance();
+            // Mismo no_struct_lit=true que la condición de un 'if' (GRAMMAR.md
+            // §2.3) -- un guard, igual que esa condición, siempre termina
+            // justo antes de un token que decide el resto del arm (acá, `=>`),
+            // así que restringir struct-lits acá no pierde generalidad real.
+            Some(self.parse_or_expr(true)?)
+        } else {
+            None
+        };
         self.eat(&TokenKind::FatArrow)?;
         let body = if self.check(&TokenKind::LBrace) {
             MatchArmBody::Block(self.parse_block()?)
@@ -683,39 +693,92 @@ impl Parser {
             self.eat(&TokenKind::Comma)?; // obligatoria tras un arm-expr (GRAMMAR.md §2.3)
             MatchArmBody::Expr(e)
         };
-        Ok(MatchArm { pattern, body })
+        Ok(MatchArm { pattern, guard, body })
     }
 
+    /// `pattern_atom , { "|" , pattern_atom }` (GRAMMAR.md §3.3) -- un solo
+    /// átomo se devuelve tal cual, sin envolver en `Or`, para no complicar
+    /// el resto del checker/runtime con el caso trivial de un solo patrón.
     fn parse_pattern(&mut self) -> Result<Pattern, ParseError> {
-        let name = self.eat_ident()?;
-        if self.check(&TokenKind::Dot) {
-            self.advance();
-            let variant_name = self.eat_ident()?;
-            let fields = if self.check(&TokenKind::LBrace) {
+        let first = self.parse_pattern_atom()?;
+        if self.check(&TokenKind::Pipe) {
+            let mut alts = vec![first];
+            while self.check(&TokenKind::Pipe) {
                 self.advance();
-                let mut fs = Vec::new();
-                if !self.check(&TokenKind::RBrace) {
-                    fs.push(self.parse_field_pattern()?);
-                    while self.check(&TokenKind::Comma) {
-                        self.advance();
-                        if self.check(&TokenKind::RBrace) {
-                            break;
-                        }
-                        fs.push(self.parse_field_pattern()?);
-                    }
-                }
-                self.eat(&TokenKind::RBrace)?;
-                Some(fs)
-            } else {
-                None
-            };
-            Ok(Pattern::Variant {
-                enum_name: name,
-                variant_name,
-                fields,
-            })
+                alts.push(self.parse_pattern_atom()?);
+            }
+            Ok(Pattern::Or(alts))
         } else {
-            Ok(Pattern::Bind(name))
+            Ok(first)
+        }
+    }
+
+    fn parse_pattern_atom(&mut self) -> Result<Pattern, ParseError> {
+        match self.peek().clone() {
+            TokenKind::Int(n) => {
+                self.advance();
+                Ok(Pattern::Literal(LiteralPattern::Int(n)))
+            }
+            // `-1` como patrón: no es "unario aplicado a un patrón" (los
+            // patrones no son expresiones) -- es un solo literal negativo,
+            // igual que en Rust. Por eso se combina acá mismo, no se delega
+            // a ninguna regla general de unario.
+            TokenKind::Minus => {
+                self.advance();
+                match self.peek().clone() {
+                    TokenKind::Int(n) => {
+                        self.advance();
+                        Ok(Pattern::Literal(LiteralPattern::Int(-n)))
+                    }
+                    other => Err(self.error(format!(
+                        "se esperaba un entero después de '-' en un patrón, se encontró {other:?}"
+                    ))),
+                }
+            }
+            TokenKind::Str(s) => {
+                self.advance();
+                Ok(Pattern::Literal(LiteralPattern::Str(s)))
+            }
+            TokenKind::True => {
+                self.advance();
+                Ok(Pattern::Literal(LiteralPattern::Bool(true)))
+            }
+            TokenKind::False => {
+                self.advance();
+                Ok(Pattern::Literal(LiteralPattern::Bool(false)))
+            }
+            _ => {
+                let name = self.eat_ident()?;
+                if self.check(&TokenKind::Dot) {
+                    self.advance();
+                    let variant_name = self.eat_ident()?;
+                    let fields = if self.check(&TokenKind::LBrace) {
+                        self.advance();
+                        let mut fs = Vec::new();
+                        if !self.check(&TokenKind::RBrace) {
+                            fs.push(self.parse_field_pattern()?);
+                            while self.check(&TokenKind::Comma) {
+                                self.advance();
+                                if self.check(&TokenKind::RBrace) {
+                                    break;
+                                }
+                                fs.push(self.parse_field_pattern()?);
+                            }
+                        }
+                        self.eat(&TokenKind::RBrace)?;
+                        Some(fs)
+                    } else {
+                        None
+                    };
+                    Ok(Pattern::Variant {
+                        enum_name: name,
+                        variant_name,
+                        fields,
+                    })
+                } else {
+                    Ok(Pattern::Bind(name))
+                }
+            }
         }
     }
 
@@ -1054,6 +1117,58 @@ mod tests {
                     other => panic!("se esperaba Pattern::Variant, fue {other:?}"),
                 }
                 assert_eq!(arms[1].pattern, Pattern::Bind("_".into()));
+            }
+            other => panic!("se esperaba Match, fue {other:?}"),
+        }
+    }
+
+    #[test]
+    fn literal_and_or_patterns_parse() {
+        let prog = parse_source(
+            r#"fn describe(n: Int) -> String {
+                match n {
+                    1 | 2 => "bajo",
+                    -1 => "negativo",
+                    _ => "otro",
+                }
+            }"#,
+        );
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        let tail = body.tail.as_deref().unwrap();
+        match tail {
+            Expr::Match { arms, .. } => {
+                assert_eq!(arms.len(), 3);
+                assert_eq!(
+                    arms[0].pattern,
+                    Pattern::Or(vec![
+                        Pattern::Literal(LiteralPattern::Int(1)),
+                        Pattern::Literal(LiteralPattern::Int(2)),
+                    ])
+                );
+                assert_eq!(arms[1].pattern, Pattern::Literal(LiteralPattern::Int(-1)));
+                assert_eq!(arms[2].pattern, Pattern::Bind("_".into()));
+            }
+            other => panic!("se esperaba Match, fue {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_arm_guard_parses_between_pattern_and_arrow() {
+        let prog = parse_source(
+            r#"fn describe(n: Int) -> String {
+                match n {
+                    x if x > 0 => "positivo",
+                    _ => "no positivo",
+                }
+            }"#,
+        );
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        let tail = body.tail.as_deref().unwrap();
+        match tail {
+            Expr::Match { arms, .. } => {
+                assert_eq!(arms[0].pattern, Pattern::Bind("x".into()));
+                assert!(arms[0].guard.is_some());
+                assert!(arms[1].guard.is_none());
             }
             other => panic!("se esperaba Match, fue {other:?}"),
         }

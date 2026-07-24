@@ -178,6 +178,16 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                 if let Some(bindings) = try_match_pattern(&arm.pattern, &v) {
                     let mut arm_env = env.clone();
                     arm_env.extend(bindings.into_iter().map(|(k, v)| (k, cell(v))));
+                    if let Some(guard) = &arm.guard {
+                        match eval_expr(guard, &arm_env, db, fns)? {
+                            Value::Bool(true) => {}
+                            // El patrón matcheó pero el guard no se cumplió --
+                            // se sigue probando el resto de los arms, no se
+                            // considera "sin match" (GRAMMAR.md §3.3).
+                            Value::Bool(false) => continue,
+                            other => return Err(err(format!("el guard de 'match' no es Bool en runtime: {other:?}"))),
+                        }
+                    }
                     return match &arm.body {
                         MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns),
                         MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns),
@@ -340,6 +350,7 @@ fn call_fn_decl(decl: &FnDecl, arg_vs: Vec<Value>, db: &Db, fns: &Fns) -> Result
 fn try_match_pattern(pattern: &Pattern, v: &Value) -> Option<Vec<(String, Value)>> {
     match pattern {
         Pattern::Bind(name) => Some(vec![(name.clone(), v.clone())]),
+        Pattern::Literal(lit) => literal_matches(lit, v).then(Vec::new),
         Pattern::Variant { variant_name, fields, .. } => {
             let Value::Variant { variant, fields: value_fields } = v else {
                 return None;
@@ -356,6 +367,19 @@ fn try_match_pattern(pattern: &Pattern, v: &Value) -> Option<Vec<(String, Value)
             }
             Some(bindings)
         }
+        // Ninguna alternativa liga nada (el checker ya lo garantizó, ver
+        // bind_pattern), así que probar cada una hasta la primera que
+        // matchee y devolver sus bindings (vacíos) alcanza.
+        Pattern::Or(subs) => subs.iter().find_map(|p| try_match_pattern(p, v)),
+    }
+}
+
+fn literal_matches(lit: &LiteralPattern, v: &Value) -> bool {
+    match (lit, v) {
+        (LiteralPattern::Int(a), Value::Int(b)) => a == b,
+        (LiteralPattern::Str(a), Value::Str(b)) => a == b,
+        (LiteralPattern::Bool(a), Value::Bool(b)) => a == b,
+        _ => false,
     }
 }
 
@@ -594,6 +618,71 @@ mod tests {
         assert_eq!(positive, json!(1));
         let negative = invoke_rpc(&program, "S", "classify", &json!({"n": -5}), &db).unwrap();
         assert_eq!(negative, json!(-1));
+    }
+
+    #[test]
+    fn literal_and_or_patterns_dispatch_to_the_right_arm() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc describe(n: Int) -> String {
+                    match n {
+                        1 | 2 => "bajo",
+                        -1 => "negativo",
+                        _ => "otro",
+                    }
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"n": 1}), &db).unwrap(), json!("bajo"));
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"n": 2}), &db).unwrap(), json!("bajo"));
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"n": -1}), &db).unwrap(), json!("negativo"));
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"n": 99}), &db).unwrap(), json!("otro"));
+    }
+
+    #[test]
+    fn failed_guard_falls_through_to_the_next_arm() {
+        // La prueba de verdad del guard: no alcanza con que el checker lo
+        // acepte -- el runtime tiene que efectivamente seguir probando arms
+        // cuando el patrón matchea pero la condición del guard da false.
+        let program = program_from(
+            r#"
+            service S {
+                rpc classify(n: Int) -> String {
+                    match n {
+                        x if x > 100 => "grande",
+                        x if x > 0 => "positivo chico",
+                        _ => "cero o negativo",
+                    }
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "classify", &json!({"n": 200}), &db).unwrap(), json!("grande"));
+        assert_eq!(invoke_rpc(&program, "S", "classify", &json!({"n": 5}), &db).unwrap(), json!("positivo chico"));
+        assert_eq!(invoke_rpc(&program, "S", "classify", &json!({"n": -5}), &db).unwrap(), json!("cero o negativo"));
+    }
+
+    #[test]
+    fn bool_match_without_wildcard_runs_correctly() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc describe(b: Bool) -> String {
+                    match b {
+                        true => "sí",
+                        false => "no",
+                    }
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"b": true}), &db).unwrap(), json!("sí"));
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"b": false}), &db).unwrap(), json!("no"));
     }
 
     #[test]
