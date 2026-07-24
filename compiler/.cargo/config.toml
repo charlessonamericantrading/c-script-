@@ -1,0 +1,6 @@
+# v0 de "compilar a WASM" (GRAMMAR.md/PLAN.md §2.4): corre binarios
+# wasm32-wasip1 con wasmtime como host, para que
+# `cargo run --target wasm32-wasip1 --bin wasm_demo` sea un comando real y
+# repetible, no un demo manual que se pudre con el tiempo.
+[target.wasm32-wasip1]
+runner = "wasmtime run --"

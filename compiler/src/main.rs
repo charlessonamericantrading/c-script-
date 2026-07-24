@@ -1,15 +1,5 @@
-mod ast;
-mod checker;
-mod codegen;
-mod lexer;
-mod modules;
-mod parser;
-mod runtime;
-mod scaffold;
-mod token;
-mod types;
-
-use ast::Program;
+use linkc::ast::Program;
+use linkc::{checker, codegen, modules, runtime, scaffold};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -2,10 +2,19 @@
 name = "linkc"
 version = "0.1.0"
 edition = "2021"
+default-run = "linkc"
+
+[lib]
+name = "linkc"
+path = "src/lib.rs"
 
 [[bin]]
 name = "linkc"
 path = "src/main.rs"
+
+[[bin]]
+name = "wasm_demo"
+path = "src/bin/wasm_demo.rs"
 
 [dependencies]
 tiny_http = "0.12"
