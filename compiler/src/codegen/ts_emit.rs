@@ -131,11 +131,11 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         }
         let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
         collect_type_names(&ret_ty, &mut imported_names);
-        // El stub de stream (más abajo) no valida nada todavía -- no hace
-        // falta importar su validador hasta que streaming esté implementado.
-        if !is_stream {
-            validators_emit::collect_validator_names(&ret_ty, &mut validator_names);
-        }
+        // Un `stream` valida cada ELEMENTO que emite contra este mismo
+        // ret_ty (la firma declara el elemento, no List<T> -- ver
+        // check_rpc en checker.rs), igual que un rpc normal valida su
+        // único valor de retorno: mismo validador, ningún caso especial.
+        validators_emit::collect_validator_names(&ret_ty, &mut validator_names);
         resolved.push((rpc, is_stream, param_tys, ret_ty));
     }
     imported_names.insert(format!("{}Client", service.name));
@@ -185,16 +185,6 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     out.push_str("  constructor(baseUrl: string) {\n    this.baseUrl = baseUrl;\n  }\n\n");
 
     for (rpc, is_stream, param_tys, ret_ty) in &resolved {
-        if *is_stream {
-            // Streaming real (SSE/WS) es Fase 1 (PLAN.md §4) — el método
-            // queda en la interfaz del contrato pero no implementado acá.
-            out.push_str(&format!(
-                "  async *{name}(): AsyncIterable<unknown> {{\n    throw new Error(\"streaming no implementado en el MVP (Fase 0)\");\n  }}\n\n",
-                name = rpc.name
-            ));
-            continue;
-        }
-
         let params: Vec<String> = rpc
             .params
             .iter()
@@ -209,6 +199,48 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
             })
             .collect();
         let arg_names: Vec<&str> = rpc.params.iter().map(|p| p.name.as_str()).collect();
+        let check = validators_emit::render_check_expr(ret_ty, "json");
+
+        if *is_stream {
+            // Alcance v0 explícito (GRAMMAR.md §2.1): el servidor manda la
+            // secuencia YA CALCULADA entera como eventos SSE (server.rs,
+            // `serve_stream`); acá del lado del cliente sólo hace falta
+            // parsear ese framing (`data: ...\n\n`) e ir devolviendo cada
+            // elemento -- ya validado, igual que un rpc normal -- a medida
+            // que llega. No usa EventSource (es GET-only, sin body) porque
+            // el resto del contrato ya asume POST+JSON body para args; en
+            // cambio lee el ReadableStream nativo de fetch() a mano.
+            out.push_str(&format!(
+                "  async *{}({}): AsyncIterable<{}> {{\n",
+                rpc.name,
+                params.join(", "),
+                render_type(ret_ty)
+            ));
+            push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names);
+            out.push_str("    if (!res.body) throw new LinkTransportError(\"el servidor no devolvió un body de stream\");\n");
+            out.push_str("    const reader = res.body.getReader();\n");
+            out.push_str("    const decoder = new TextDecoder();\n");
+            out.push_str("    let buffer = \"\";\n");
+            out.push_str("    while (true) {\n");
+            out.push_str("      const { done, value } = await reader.read();\n");
+            out.push_str("      if (done) break;\n");
+            out.push_str("      buffer += decoder.decode(value, { stream: true });\n");
+            out.push_str("      let sep: number;\n");
+            out.push_str("      while ((sep = buffer.indexOf(\"\\n\\n\")) !== -1) {\n");
+            out.push_str("        const frame = buffer.slice(0, sep);\n");
+            out.push_str("        buffer = buffer.slice(sep + 2);\n");
+            out.push_str("        if (!frame.startsWith(\"data: \")) continue;\n");
+            out.push_str("        const json: unknown = JSON.parse(frame.slice(6));\n");
+            out.push_str(&format!(
+                "        if (!({check})) throw new LinkValidationError(\"{}\", json);\n",
+                rpc.name
+            ));
+            out.push_str(&format!("        yield json as {};\n", render_type(ret_ty)));
+            out.push_str("      }\n");
+            out.push_str("    }\n");
+            out.push_str("  }\n\n");
+            continue;
+        }
 
         out.push_str(&format!(
             "  async {}({}): Promise<{}> {{\n",
@@ -216,17 +248,8 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
             params.join(", "),
             render_type(ret_ty)
         ));
-        out.push_str(&format!(
-            "    const res = await fetch(`${{this.baseUrl}}/{}/{}`, {{\n",
-            service.name, rpc.name
-        ));
-        out.push_str("      method: \"POST\",\n");
-        out.push_str("      headers: { \"Content-Type\": \"application/json\" },\n");
-        out.push_str(&format!("      body: JSON.stringify({{ {} }}),\n", arg_names.join(", ")));
-        out.push_str("    });\n");
-        out.push_str("    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);\n");
+        push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names);
         out.push_str("    const json: unknown = await res.json();\n");
-        let check = validators_emit::render_check_expr(ret_ty, "json");
         out.push_str(&format!(
             "    if (!({check})) throw new LinkValidationError(\"{}\", json);\n",
             rpc.name
@@ -242,6 +265,22 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     ));
 
     Ok(out)
+}
+
+/// El `fetch()` + chequeo de status es idéntico para un rpc normal y para
+/// un stream (ambos mandan los mismos args por POST+JSON body) -- lo único
+/// que difiere entre los dos es qué se hace DESPUÉS con `res` (un solo
+/// `res.json()` vs. leer `res.body` incrementalmente), así que solo esta
+/// parte vale la pena compartir.
+fn push_fetch_call(out: &mut String, service_name: &str, rpc_name: &str, arg_names: &[&str]) {
+    out.push_str(&format!(
+        "    const res = await fetch(`${{this.baseUrl}}/{service_name}/{rpc_name}`, {{\n"
+    ));
+    out.push_str("      method: \"POST\",\n");
+    out.push_str("      headers: { \"Content-Type\": \"application/json\" },\n");
+    out.push_str(&format!("      body: JSON.stringify({{ {} }}),\n", arg_names.join(", ")));
+    out.push_str("    });\n");
+    out.push_str("    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);\n");
 }
 
 /// `<T, U>` para una declaración genérica, o "" si no tiene type_params.

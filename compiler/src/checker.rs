@@ -178,10 +178,11 @@ impl Checker {
                 }
                 Item::Service(s) => {
                     for m in &s.members {
-                        let rpc = match m {
-                            Member::Rpc(r) | Member::Stream(r) => r,
+                        let (rpc, is_stream) = match m {
+                            Member::Rpc(r) => (r, false),
+                            Member::Stream(r) => (r, true),
                         };
-                        if let Err(e) = checker.check_rpc(rpc) {
+                        if let Err(e) = checker.check_rpc(rpc, is_stream) {
                             errors.push(e);
                         }
                     }
@@ -435,8 +436,19 @@ impl Checker {
         self.check_expr(&c.value, &ty, &Env::new())
     }
 
-    fn check_rpc(&self, r: &RpcDecl) -> Result<(), CheckError> {
+    /// `is_stream` (`stream` en vez de `rpc`, GRAMMAR.md §2.1): la firma
+    /// declara el tipo de ELEMENTO (ej. `-> User`, igual que un rpc normal
+    /// -- así `AsyncIterable<User>` en el contrato TS sale del mismo
+    /// `resolve_type(&r.return_type)` sin ningún caso especial en
+    /// ts_emit.rs), pero el CUERPO tiene que producir la secuencia
+    /// COMPLETA ya calculada: `List<User>`, no `User` suelto. Alcance v0
+    /// explícito (PLAN.md §4, Fase 2): repetir una lista ya calculada por
+    /// SSE real, no generadores ni suscripción a eventos futuros -- el
+    /// lenguaje hoy no tiene ningún constructo de loop, así que "generador
+    /// real" queda fuera de alcance con o sin este cambio.
+    fn check_rpc(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
         let ret = self.resolve_type(&r.return_type)?;
+        let expected = if is_stream { Type::List(Box::new(ret)) } else { ret };
         let mut env = Env::new();
         for p in &r.params {
             let pty = self.resolve_type(&p.ty)?;
@@ -445,7 +457,7 @@ impl Checker {
             }
             env.insert(p.name.clone(), immutable(pty));
         }
-        self.check_block(&r.body, &ret, &env)
+        self.check_block(&r.body, &expected, &env)
     }
 
     // ---- bloques y sentencias ----
@@ -2008,5 +2020,58 @@ mod tests {
         // variables va primero.
         let src = "fn f() -> Int { let db = 5; db }";
         assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn stream_rpc_body_is_checked_against_list_of_the_declared_element_type() {
+        // La firma declara el ELEMENTO (`-> User`, igual que un rpc normal),
+        // pero el cuerpo de un `stream` tiene que devolver la secuencia
+        // COMPLETA ya calculada (GRAMMAR.md §2.1).
+        let src = r#"
+            type User = { id: Int, name: String }
+            db { users: User[] }
+            service Users {
+                stream watchAll() -> User { db.users.all() }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn stream_rpc_body_returning_bare_element_instead_of_list_is_rejected() {
+        // El error real que este chequeo existe para atrapar: devolver un
+        // solo User (lo que un `rpc` normal pediría) donde `stream` pide
+        // List<User> -- antes de esta ronda el checker chequeaba el cuerpo
+        // de un `stream` contra `User` directamente (mismo camino que
+        // `rpc`), así que esto SÍ tipaba antes y no debería tipar ahora.
+        // Literal directo (no `db.users.find(id)`, que devuelve `User?` y
+        // fallaría de todos modos por nullable-vs-no-nullable, sin probar
+        // lo que este test quiere probar).
+        let src = r#"
+            type User = { id: Int, name: String }
+            service Users {
+                stream watchOne() -> User { User { id: 1, name: "Ada" } }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "un stream que devuelve un User suelto (no List<User>) debería fallar");
+    }
+
+    #[test]
+    fn stream_rpc_body_returning_list_of_wrong_element_type_is_rejected() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            type Post = { id: Int, title: String }
+            db { users: User[] }
+            fn allPosts() -> Post[] { [] }
+            service Users {
+                stream watchAll() -> User { allPosts() }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(
+            result.is_err(),
+            "un stream declarado -> User no debería aceptar un cuerpo List<Post>"
+        );
     }
 }

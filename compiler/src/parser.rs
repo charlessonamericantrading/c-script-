@@ -1441,6 +1441,7 @@ mod tests {
             })
             .expect("se esperaba un service");
         assert_eq!(service.name, "Users");
-        assert_eq!(service.members.len(), 4);
+        // list, getById, create, update, watchAll (stream)
+        assert_eq!(service.members.len(), 5);
     }
 }

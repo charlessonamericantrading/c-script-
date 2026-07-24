@@ -248,6 +248,8 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 | **Fase 2 · Beta** | +6–9 meses | Usable en proyectos reales | DB tipada · auth · WebSocket/SSE · validadores runtime · hot reload · LSP completo · package manager · observabilidad | 3–5 |
 | **Fase 3 · 1.0** | +6–12 meses | Producción | Estabilidad de sintaxis · ecosistema · docs · deploy edge/serverless · debugging con source maps | 4–6+ |
 
+**v0 implementado y verificado (Fase 2, de los ítems de esta fila: validadores runtime, DB tipada y WebSocket/SSE):** ver GRAMMAR.md §3.11 (`validators.ts`), §3.12 (`db { ... }`) y §3.13 (`stream` sobre SSE real, no WebSocket -- HTTP chunked transfer alcanza para "una secuencia ya calculada, sin suscripción a eventos futuros", que es el alcance real de esta ronda; WebSocket solo haría falta para push bidireccional o eventos genuinamente futuros, ninguno de los dos construido todavía). `auth`, `LSP completo`, `package manager` en red y `observabilidad` de fondo de esta misma fila siguen sin empezar -- ver GRAMMAR.md §2.1 y el README para el detalle de qué falta y por qué se dejó afuera de esta ronda.
+
 **Hitos "go / no-go":**
 - Fin de Fase 0: ¿la demo E2E convence a 5 devs externos? Si no, replantear.
 - Fin de Fase 1: ¿alguien construye algo real sin abandonar? Si no, seguir como framework, no como lenguaje.

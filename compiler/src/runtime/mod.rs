@@ -489,6 +489,25 @@ pub fn invoke_rpc(
     Ok(value_to_json(&result, &simple_enums))
 }
 
+/// Si `service_name.rpc_name` es un `stream` (no un `rpc` normal). Deliberadamente
+/// una función APARTE en vez de cambiar la firma de retorno de `invoke_rpc` --
+/// invoke_rpc ya hace la MISMA búsqueda y evalúa igual para ambos casos
+/// (Member::Rpc(r) | Member::Stream(r), arriba), y su resultado (un
+/// serde_json::Value) es idéntico en forma para quien lo llama; lo único que
+/// server.rs necesita ANTES de invocar es "¿tengo que armar la respuesta como
+/// un único JSON o como una secuencia de eventos SSE?" -- eso se resuelve acá,
+/// sin forzar a los ~30 call sites de test existentes (todos `.unwrap()` un
+/// solo Value) a desestructurar una tupla que no les interesa.
+pub fn is_stream_member(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) if s.name == service_name => s
+            .members
+            .iter()
+            .any(|m| matches!(m, Member::Stream(r) if r.name == rpc_name)),
+        _ => false,
+    })
+}
+
 /// Nombres de los enums "simples" (todas sus variantes son unitarias) de
 /// todo el programa -- calculado UNA vez acá, no en cada `value_to_json`
 /// recursivo. Mismo chequeo `all_unit` que ya usa `emit_enum_decl`
@@ -1013,5 +1032,45 @@ mod tests {
         );
         let result = invoke_rpc(&program, "S", "run", &json!({"x": 5}), &Db::seeded()).unwrap();
         assert_eq!(result, json!(7));
+    }
+
+    #[test]
+    fn is_stream_member_distinguishes_stream_from_rpc_and_unknown() {
+        let program = program_from(
+            r#"
+            type User = { id: Int, name: String }
+            db { users: User[] }
+            service Users {
+                rpc getById(id: Int) -> User? { db.users.find(id) }
+                stream watchAll() -> User { db.users.all() }
+            }
+        "#,
+        );
+        assert!(is_stream_member(&program, "Users", "watchAll"));
+        assert!(!is_stream_member(&program, "Users", "getById"));
+        assert!(!is_stream_member(&program, "Users", "noExiste"));
+        assert!(!is_stream_member(&program, "NoService", "watchAll"));
+    }
+
+    #[test]
+    fn invoke_rpc_on_a_stream_member_evaluates_the_body_to_a_json_array() {
+        // El checker ya exige que el cuerpo de un `stream` sea List<T>
+        // (check_rpc, checker.rs) -- acá se confirma que invoke_rpc (que no
+        // distingue Rpc/Stream al evaluar, ver Member::Rpc(r) | Member::Stream(r)
+        // más arriba) de verdad produce un array JSON, la forma que
+        // server.rs necesita para poder emitir un evento SSE por elemento.
+        let program = program_from(
+            r#"
+            type User = { id: Int, name: String }
+            db { users: User[] }
+            service Users {
+                stream watchAll() -> User { db.users.all() }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "Users", "watchAll", &json!({}), &db).unwrap();
+        let arr = result.as_array().expect("el resultado de un stream debería ser un array JSON");
+        assert_eq!(arr.len(), 2, "Db::seeded() siembra 2 usuarios bajo 'users'");
     }
 }

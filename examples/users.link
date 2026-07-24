@@ -73,4 +73,15 @@ service Users {
   rpc update(id: Int, patch: Patch<User>) -> User {
     db.users.applyPatch(id, patch)
   }
+
+  // "Streaming real" v0 (GRAMMAR.md §2.1): la firma declara el ELEMENTO
+  // (User, igual que un rpc normal), pero el cuerpo tiene que devolver la
+  // secuencia YA CALCULADA entera -- acá, la misma lista que ya arma
+  // `list` de arriba. El servidor la manda como eventos SSE reales, uno
+  // por usuario, en vez de un solo JSON. Alcance explícito: NO se
+  // suscribe a usuarios creados después -- eso necesitaría una capa de
+  // pub-sub sobre `db` que no existe todavía.
+  stream watchAll() -> User {
+    db.users.all()
+  }
 }
