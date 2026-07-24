@@ -216,6 +216,27 @@ pub enum Expr {
         operand: Box<Expr>,
     },
     Paren(Box<Expr>),
+    /// `|params| { block }` (GRAMMAR.md §3.10) -- SIEMPRE un bloque con
+    /// llaves, nunca una expresión suelta (no existe "bloque como
+    /// expresión general" en el lenguaje; esto reusa `Block` tal cual, sin
+    /// inventar ese concepto). Sin params implica `||`, que lexea como un
+    /// solo token `PipePipe` distinto de `Pipe` -- alcance v0 deliberado:
+    /// closures de 0 parámetros no tienen consumidor real todavía
+    /// (`.map`/`.filter` siempre pasan 1 argumento), así que no se soportan.
+    Closure {
+        params: Vec<ClosureParam>,
+        body: Block,
+    },
+}
+
+/// `nombre` o `nombre: Tipo` dentro de `|...|`. Sin anotación solo es válido
+/// cuando el closure se chequea (⇐) contra un `Type::Function` ya conocido
+/// (ej. el callback de `.filter`/`.map`) -- `checker.rs::synth_expr` exige
+/// que TODOS estén anotados si el closure se sintetiza sin ese contexto.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureParam {
+    pub name: String,
+    pub ty: Option<TypeExpr>,
 }
 
 /// GRAMMAR.md §3.7 — sin coerción implícita entre variantes.

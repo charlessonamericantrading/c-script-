@@ -51,6 +51,68 @@ fn pattern_bindings(pattern: &Pattern) -> Vec<String> {
     }
 }
 
+/// ¿Hay algún `Stmt::Return` alcanzable desde este bloque? Usado por
+/// `synth_block` (GRAMMAR.md §3.10) para rechazar `return` de entrada en
+/// vez de heredar el bug preexistente de `check_block` (mismo `expected`
+/// para la cola y para un `return` anidado dentro de un if/match en
+/// posición de sentencia). `return` es siempre una SENTENCIA (ast.rs) --
+/// nunca aparece anidado dentro de una expresión -- así que la única forma
+/// de que esté "escondido" respecto de este bloque es a través de un
+/// `if`/`match` cuyo cuerpo es, a su vez, otro `Block`; por eso alcanza con
+/// recursar exactamente en esos dos casos.
+fn block_has_return(block: &Block) -> bool {
+    block.stmts.iter().any(|s| match s {
+        Stmt::Return(_) => true,
+        Stmt::Let { value, .. } | Stmt::Assign { value, .. } => expr_has_return(value),
+        Stmt::Expr(e) => expr_has_return(e),
+    }) || block.tail.as_deref().is_some_and(expr_has_return)
+}
+
+fn expr_has_return(e: &Expr) -> bool {
+    match e {
+        Expr::If { cond, then_block, else_block } => {
+            expr_has_return(cond) || block_has_return(then_block) || block_has_return(else_block)
+        }
+        Expr::Match { scrutinee, arms } => {
+            expr_has_return(scrutinee)
+                || arms.iter().any(|arm| match &arm.body {
+                    MatchArmBody::Expr(e) => expr_has_return(e),
+                    MatchArmBody::Block(b) => block_has_return(b),
+                })
+        }
+        // Un closure anidado tiene su PROPIO contexto de retorno,
+        // chequeado aparte cuando a él le toque (synth_expr/check_expr
+        // sobre ESE Expr::Closure) -- su `return` no es asunto del
+        // synth_block que lo contiene.
+        Expr::Closure { .. } => false,
+        // Todo lo demás no puede contener un `return` sintácticamente --
+        // `return` es una sentencia, nunca anidada dentro de una expresión.
+        _ => false,
+    }
+}
+
+/// ¿`ty` es, o contiene recursivamente (en un campo, elemento, miembro de
+/// unión, etc.), un `Type::Function`? Usado para rechazar `==`/`!=` sobre
+/// closures (`synth_binary`, GRAMMAR.md §3.10). Motivo real, no teórico: un
+/// closure recursivo armado reasignando un `mut` (`let mut f = |x|{x}; f =
+/// |x|{ ... f(x-1) ... };`) captura, en runtime, un `Env` que termina
+/// conteniendo una referencia a sí mismo (`Rc` cíclico) -- comparar o
+/// debug-imprimir un valor así recursaría para siempre. Rechazarlo acá, en
+/// tiempo de chequeo, es más barato y más claro que confiar solo en que
+/// `Value` nunca se compare/imprima por accidente en runtime.
+fn type_contains_function(ty: &Type) -> bool {
+    match ty {
+        Type::Function(..) => true,
+        Type::Optional(inner) | Type::List(inner) | Type::PatchOf(inner) | Type::DbCollection(inner) => {
+            type_contains_function(inner)
+        }
+        Type::Tuple(items) | Type::Union(items) => items.iter().any(type_contains_function),
+        Type::ResultOf(a, b) | Type::MapOf(a, b) => type_contains_function(a) || type_contains_function(b),
+        Type::Struct { fields, .. } => fields.iter().any(|f| type_contains_function(&f.ty)),
+        _ => false,
+    }
+}
+
 pub struct Checker {
     pub(crate) types: HashMap<String, TypeDecl>,
     pub(crate) enums: HashMap<String, EnumDecl>,
@@ -523,6 +585,74 @@ impl Checker {
         }
     }
 
+    /// Sintetiza el tipo de la cola de un bloque SIN ningún tipo esperado
+    /// del contexto -- lo que necesita un closure cuyos parámetros están
+    /// anotados pero cuyo tipo de retorno no viene de ningún lado
+    /// (GRAMMAR.md §3.10, `synth_expr(Expr::Closure)`).
+    ///
+    /// A propósito NO es "espejar `check_block` y cambiar `check_expr` por
+    /// `synth_expr` en la cola": `check_block` usa el mismo `expected` tanto
+    /// para la cola como para cualquier `Stmt::Return` anidado, y un
+    /// `if`/`match` en posición de sentencia (no cola) YA se chequea hoy
+    /// contra `Type::Void` sin importar el `expected` real del bloque que
+    /// lo contiene -- un bug preexistente y real (nunca ejercitado: `return`
+    /// no se usa en ningún `.link` ni test existente), pero ortogonal a
+    /// esta ronda -- se documenta acá, no se arregla. En vez de heredar ese
+    /// bug de otra forma (ej. intentando enhebrar un "expected de return"
+    /// separado a través de `check_expr`/`check_match`, que reimplementaría
+    /// esa lógica), `synth_block` rechaza de entrada, con un error claro,
+    /// cualquier `return` alcanzable desde el bloque que recorre -- incluso
+    /// dentro de un `if`/`match` no-cola. `block_has_return`/`expr_has_return`
+    /// (funciones libres, debajo de este `impl`) hacen ese barrido; nunca
+    /// descienden a un `Expr::Closure` anidado -- ese closure tiene su
+    /// PROPIO contexto de retorno, chequeado aparte cuando a él le toque.
+    fn synth_block(&self, block: &Block, env: &Env) -> Result<Type, CheckError> {
+        if block_has_return(block) {
+            return Err(err(
+                "un closure sin tipo de retorno conocido por contexto no puede usar 'return' -- anotá los tipos para que se chequee contra un tipo esperado, o reescribilo sin 'return' (GRAMMAR.md §3.10)",
+            ));
+        }
+        let mut local = env.clone();
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Let { name, mutable, ty, value } => {
+                    let value_ty = match ty {
+                        Some(t) => {
+                            let resolved = self.resolve_type(t)?;
+                            self.check_expr(value, &resolved, &local)?;
+                            resolved
+                        }
+                        None => self.synth_expr(value, &local)?,
+                    };
+                    local.insert(name.clone(), Binding { ty: value_ty, mutable: *mutable });
+                }
+                Stmt::Assign { name, value } => {
+                    let binding = local
+                        .get(name)
+                        .ok_or_else(|| err(format!("variable no declarada: '{name}'")))?
+                        .clone();
+                    if !binding.mutable {
+                        return Err(err(format!(
+                            "no se puede asignar a '{name}': no fue declarada con 'mut' (GRAMMAR.md §2.3)"
+                        )));
+                    }
+                    self.check_expr(value, &binding.ty, &local)?;
+                }
+                Stmt::Return(_) => unreachable!("descartado por block_has_return arriba"),
+                Stmt::Expr(e @ (Expr::If { .. } | Expr::Match { .. })) => {
+                    self.check_expr(e, &Type::Void, &local)?;
+                }
+                Stmt::Expr(e) => {
+                    self.synth_expr(e, &local)?;
+                }
+            }
+        }
+        match &block.tail {
+            Some(e) => self.synth_expr(e, &local),
+            None => Ok(Type::Void),
+        }
+    }
+
     // ---- chequeo (modo ⇐): match y la construcción de Result<T,E> ----
 
     fn check_expr(&self, e: &Expr, expected: &Type, env: &Env) -> Result<(), CheckError> {
@@ -556,6 +686,13 @@ impl Checker {
                     "un array vacío '[]' requiere un tipo esperado de lista, se esperaba {other:?}"
                 ))),
             },
+            // Rama EXPLÍCITA, no delegar al fallback de abajo -- si esto
+            // solo existiera en `synth_expr`, un closure sin anotar caería
+            // acá, exigiría anotación en cada param (la regla de síntesis) y
+            // perdería toda la inferencia contextual, que es todo el punto
+            // de chequear (⇐) un closure contra un `Type::Function` ya
+            // conocido (GRAMMAR.md §3.10, ej. el callback de `.filter`).
+            Expr::Closure { params, body } => self.check_closure(params, body, expected, env),
             _ => {
                 let t = self.synth_expr(e, env)?;
                 if is_subtype(&t, expected) {
@@ -565,6 +702,53 @@ impl Checker {
                 }
             }
         }
+    }
+
+    /// `check_expr(Expr::Closure, expected, env)` -- solo válido si
+    /// `expected` es un `Type::Function` ya conocido. Por cada parámetro,
+    /// anotado o no, `expected_params[i]` es la referencia: si el usuario
+    /// anotó un tipo, tiene que ACEPTAR lo que el contexto va a pasarle
+    /// (contravariante -- `is_subtype(expected_pty, anotación)`, NUNCA al
+    /// revés; ver el contraejemplo real en `types::params_accept`, que
+    /// documenta esta misma dirección para que no se pueda invertir por
+    /// accidente en un segundo lugar); si no anotó, se liga directo a
+    /// `expected_params[i]` -- acá es donde `list.filter(|x| x.activo)`
+    /// infiere el tipo de `x` sin que el usuario lo escriba.
+    fn check_closure(
+        &self,
+        params: &[ClosureParam],
+        body: &Block,
+        expected: &Type,
+        env: &Env,
+    ) -> Result<(), CheckError> {
+        let Type::Function(expected_params, expected_ret) = expected else {
+            return Err(err(format!("se esperaba un valor de tipo {expected:?}, se encontró un closure")));
+        };
+        if params.len() != expected_params.len() {
+            return Err(err(format!(
+                "el closure tiene {} parámetro(s), el contexto espera {}",
+                params.len(),
+                expected_params.len()
+            )));
+        }
+        let mut local = env.clone();
+        for (p, expected_pty) in params.iter().zip(expected_params) {
+            let pty = match &p.ty {
+                Some(texpr) => {
+                    let annotated = self.resolve_type(texpr)?;
+                    if !is_subtype(expected_pty, &annotated) {
+                        return Err(err(format!(
+                            "el parámetro '{}' anotado como {annotated:?} no acepta lo que el contexto le pasa ({expected_pty:?})",
+                            p.name
+                        )));
+                    }
+                    annotated
+                }
+                None => expected_pty.clone(),
+            };
+            local.insert(p.name.clone(), immutable(pty));
+        }
+        self.check_block(body, expected_ret, &local)
     }
 
     fn check_result_lit(
@@ -1064,6 +1248,28 @@ impl Checker {
                 }
             }
             Expr::Paren(inner) => self.synth_expr(inner, env),
+            // Sin ningún `Type::Function` esperado del contexto (a
+            // diferencia de `check_closure`), la ÚNICA forma de saber el
+            // tipo de cada parámetro es que el usuario lo haya anotado --
+            // de ahí el error explícito si falta, en vez de un mensaje
+            // confuso de "no se pudo resolver" más abajo.
+            Expr::Closure { params, body } => {
+                let mut param_tys = Vec::new();
+                let mut local = env.clone();
+                for p in params {
+                    let Some(texpr) = &p.ty else {
+                        return Err(err(format!(
+                            "el parámetro '{}' de este closure necesita anotación de tipo -- sin un tipo de función esperado del contexto (ej. como argumento de '.filter'/'.map', o un 'let' con tipo declarado), cada parámetro tiene que anotarse (GRAMMAR.md §3.10)",
+                            p.name
+                        )));
+                    };
+                    let ty = self.resolve_type(texpr)?;
+                    local.insert(p.name.clone(), immutable(ty.clone()));
+                    param_tys.push(ty);
+                }
+                let ret_ty = self.synth_block(body, &local)?;
+                Ok(Type::Function(param_tys, Box::new(ret_ty)))
+            }
         }
     }
 
@@ -1105,6 +1311,11 @@ impl Checker {
             Eq | NotEq => {
                 let l = self.synth_expr(left, env)?;
                 let r = self.synth_expr(right, env)?;
+                if type_contains_function(&l) || type_contains_function(&r) {
+                    return Err(err(
+                        "'==' / '!=' no están definidos sobre valores de tipo función/closure (GRAMMAR.md §3.10)",
+                    ));
+                }
                 // Comparables si son mutuamente compatibles (mismo tipo, o
                 // uno de los dos Dynamic) -- no solo primitivos: dos enums
                 // nominales del mismo tipo también se pueden comparar.
@@ -1202,9 +1413,95 @@ impl Checker {
                 self.check_expr(n_arg, &Type::Int, env)?;
                 Some(Type::List(inner.clone()))
             }
+            // El caso FÁCIL de los dos métodos de orden superior (GRAMMAR.md
+            // §3.10): el tipo del callback (T) -> Bool ya se conoce ENTERO
+            // de entrada, así que alcanza con el mismo check_expr(Closure,
+            // expected, ...) que cualquier otro argumento de tipo función.
+            (Type::List(inner), "filter") => {
+                let [pred_arg] = args else {
+                    return Err(err("'filter' toma exactamente 1 argumento (predicado (T) -> Bool)"));
+                };
+                let expected_fn = Type::Function(vec![(**inner).clone()], Box::new(Type::Bool));
+                self.check_expr(pred_arg, &expected_fn, env)?;
+                Some(Type::List(inner.clone()))
+            }
+            // El caso DIFÍCIL: el tipo de retorno del callback (U) es
+            // exactamente lo que no se conoce de entrada -- `synth_callback_result`
+            // lo sintetiza en vez de chequearlo contra un tipo ya fijo.
+            (Type::List(inner), "map") => {
+                let [f_arg] = args else {
+                    return Err(err("'map' toma exactamente 1 argumento (f: (T) -> U)"));
+                };
+                let result_ty = self.synth_callback_result(f_arg, inner, env)?;
+                Some(Type::List(Box::new(result_ty)))
+            }
             _ => None,
         };
         Ok(ty)
+    }
+
+    /// Tipo de retorno de invocar `callback` con un único argumento de tipo
+    /// `param_ty` -- lo que `.map` necesita para saber el tipo de elemento
+    /// de la lista resultante, que no se conoce de entrada (a diferencia de
+    /// `.filter`, cuyo callback siempre devuelve `Bool`).
+    ///
+    /// Dos formas de callback, dos caminos DISTINTOS a propósito:
+    /// - Un closure literal: no hay ningún `Type::Function` ya resuelto del
+    ///   que `synth_expr` pueda partir (el propio closure es lo que hay que
+    ///   sintetizar) -- se liga el param a `param_ty` (single-source-of-truth
+    ///   si no está anotado; si está anotado, tiene que ACEPTAR `param_ty`,
+    ///   comprobado con `is_subtype(param_ty, anotación)` -- dirección NORMAL
+    ///   de argumento, no la contravariante de `check_closure`, porque acá
+    ///   `param_ty` es un tipo CONCRETO que de verdad se va a pasar, no el
+    ///   tipo esperado de un `Type::Function` completo) y se sintetiza el
+    ///   cuerpo con `synth_block`.
+    /// - Cualquier otra cosa (ej. una `fn` referenciada por nombre): ya
+    ///   sintetiza un `Type::Function` completo por su cuenta -- se verifica
+    ///   que acepte `param_ty` como argumento (subtipado normal, igual que
+    ///   cualquier otro argumento de una llamada) y se devuelve su retorno.
+    fn synth_callback_result(&self, callback: &Expr, param_ty: &Type, env: &Env) -> Result<Type, CheckError> {
+        if let Expr::Closure { params, body } = callback {
+            let [p] = params.as_slice() else {
+                return Err(err(format!(
+                    "el callback de 'map' necesita exactamente 1 parámetro, se encontraron {}",
+                    params.len()
+                )));
+            };
+            let bound_ty = match &p.ty {
+                Some(texpr) => {
+                    let annotated = self.resolve_type(texpr)?;
+                    if !is_subtype(param_ty, &annotated) {
+                        return Err(err(format!(
+                            "el parámetro '{}' anotado como {annotated:?} no acepta el elemento real de la lista ({param_ty:?})",
+                            p.name
+                        )));
+                    }
+                    annotated
+                }
+                None => param_ty.clone(),
+            };
+            let mut local = env.clone();
+            local.insert(p.name.clone(), immutable(bound_ty));
+            return self.synth_block(body, &local);
+        }
+        let callback_ty = self.synth_expr(callback, env)?;
+        let Type::Function(actual_params, ret) = callback_ty else {
+            return Err(err(format!(
+                "el callback de 'map' tiene que ser una función de 1 parámetro, se encontró {callback_ty:?}"
+            )));
+        };
+        let [actual_param] = actual_params.as_slice() else {
+            return Err(err(format!(
+                "el callback de 'map' necesita exactamente 1 parámetro, se encontraron {}",
+                actual_params.len()
+            )));
+        };
+        if !is_subtype(param_ty, actual_param) {
+            return Err(err(format!(
+                "el callback de 'map' no acepta el elemento real de la lista ({param_ty:?} no es subtipo de {actual_param:?})"
+            )));
+        }
+        Ok(*ret)
     }
 
     /// `all/find/insert/applyPatch` sobre una colección de `db` (GRAMMAR.md
@@ -2073,5 +2370,156 @@ mod tests {
             result.is_err(),
             "un stream declarado -> User no debería aceptar un cuerpo List<Post>"
         );
+    }
+
+    // ---- closures + List.map/.filter (GRAMMAR.md §3.10) ----
+
+    #[test]
+    fn closure_param_annotated_narrower_than_actual_element_is_accepted() {
+        // El closure solo pide lo que usa ({x: Int}) -- la lista real trae
+        // más campos (WidePoint), y eso tiene que alcanzar por contravarianza
+        // (types::params_accept).
+        let src = r#"
+            type WidePoint = { x: Int, y: Int, z: Int }
+            fn run(points: WidePoint[]) -> WidePoint[] {
+                points.filter(|p: { x: Int }| { p.x > 0 })
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn closure_param_annotated_wider_than_actual_element_is_rejected() {
+        // Al revés: el closure anota MÁS campos de los que el elemento real
+        // tiene -- si esto se aceptara, el cuerpo podría leer un campo que
+        // el dato real nunca tuvo y crashear en runtime. Una implementación
+        // con la dirección de subtipado invertida aceptaría esto por error
+        // (hallado por un review de diseño antes de escribir el resto de
+        // la feature, ver el comentario de `types::params_accept`).
+        let src = r#"
+            type NarrowPoint = { x: Int }
+            type WidePoint = { x: Int, y: Int, z: Int }
+            fn run(points: NarrowPoint[]) -> NarrowPoint[] {
+                points.filter(|p: WidePoint| { p.x > 0 })
+            }
+        "#;
+        let result = check_source(src);
+        assert!(
+            result.is_err(),
+            "un closure que anota MÁS campos de los que el elemento real tiene debería rechazarse"
+        );
+    }
+
+    #[test]
+    fn equality_between_function_typed_values_is_rejected() {
+        let src = r#"
+            fn same(a: (Int) -> Int, b: (Int) -> Int) -> Bool { a == b }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "comparar dos valores de tipo función debería rechazarse");
+    }
+
+    #[test]
+    fn closure_without_context_needs_every_param_annotated() {
+        let src = r#"
+            fn make() -> Int {
+                let f = |x| { x + 1 };
+                f(1)
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "un closure sin contexto (let sin tipo declarado) necesita anotar sus params");
+    }
+
+    #[test]
+    fn return_inside_a_closure_without_known_return_type_is_rejected() {
+        let src = r#"
+            fn make() -> Int {
+                let f = |x: Int| { return x + 1; };
+                f(1)
+            }
+        "#;
+        let result = check_source(src);
+        assert!(
+            result.is_err(),
+            "un closure sintetizado (sin retorno conocido por contexto) no puede usar 'return'"
+        );
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("return"), "el error debería mencionar 'return': {msg}");
+    }
+
+    #[test]
+    fn closure_with_unannotated_params_infers_from_let_type_annotation() {
+        let src = r#"
+            fn make() -> Int {
+                let f: (Int) -> Int = |x| { x + 1 };
+                f(5)
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn filter_over_a_list_keeps_the_same_element_type() {
+        let src = r#"
+            type User = { id: Int, active: Bool }
+            fn activeOnly(users: User[]) -> User[] {
+                users.filter(|u: User| { u.active })
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn filter_rejects_a_predicate_that_does_not_return_bool() {
+        let src = r#"
+            fn run(xs: Int[]) -> Int[] {
+                xs.filter(|x: Int| { x + 1 })
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn map_over_a_list_can_change_the_element_type() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            fn names(users: User[]) -> String[] {
+                users.map(|u: User| { u.name })
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn map_accepts_a_named_fn_reference_as_callback() {
+        let src = r#"
+            fn double(x: Int) -> Int { x * 2 }
+            fn run(xs: Int[]) -> Int[] {
+                xs.map(double)
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn map_infers_unannotated_closure_param_from_the_list_element_type() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            fn names(users: User[]) -> String[] {
+                users.map(|u| { u.name })
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn nested_closure_inside_a_closure_body_typechecks() {
+        let src = r#"
+            fn run(xs: Int[]) -> Int[][] {
+                xs.map(|x: Int| { xs.filter(|y: Int| { y > x }) })
+            }
+        "#;
+        assert!(check_source(src).is_ok());
     }
 }

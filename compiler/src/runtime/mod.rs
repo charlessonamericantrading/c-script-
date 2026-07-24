@@ -12,7 +12,18 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-#[derive(Debug, Clone, PartialEq)]
+/// `PartialEq`/`Debug` NO se derivan (ver los `impl` a mano más abajo) --
+/// `Value::Closure` guarda el `Env` que capturó, y un closure recursivo
+/// armado reasignando un `mut` (`let mut f = |x|{x}; f = |x|{ ... f(x-1)
+/// ... };`) captura un `Env` que termina conteniendo una referencia a sí
+/// mismo (`Rc` cíclico, GRAMMAR.md §3.10) -- derivar estos dos impls
+/// recursaría para siempre el día que algo compare o debug-imprima ese
+/// valor. El checker ya rechaza `==`/`!=` sobre tipos función de entrada
+/// (checker.rs, `type_contains_function`), pero esto es la defensa en
+/// runtime para cualquier OTRO código (mensajes de error, tests) que
+/// pueda comparar/imprimir un `Value` arbitrario sin saber que puede ser
+/// autorreferencial.
+#[derive(Clone)]
 pub enum Value {
     Int(i64),
     Float(f64),
@@ -42,6 +53,70 @@ pub enum Value {
     /// `fn` de nivel superior no tiene scope léxico exterior que capturar.
     /// Nunca cruza el wire, igual que `Type::Function` (tabla de mapeo, §4).
     FnRef(String),
+    /// `|params| { body }` evaluado -- a diferencia de `FnRef`, SÍ tiene
+    /// captura léxica real: `Env` es el entorno en el momento en que el
+    /// closure se construyó (GRAMMAR.md §3.10). Nunca cruza el wire, igual
+    /// que `FnRef` (`value_to_json` lo trata como marcador interno).
+    Closure(Vec<String>, Block, Env),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        use Value::*;
+        match (self, other) {
+            (Int(a), Int(b)) => a == b,
+            (Float(a), Float(b)) => a == b,
+            (Str(a), Str(b)) => a == b,
+            (Bool(a), Bool(b)) => a == b,
+            (Null, Null) => true,
+            (Struct(a), Struct(b)) => a == b,
+            (
+                Variant { enum_name: en1, variant: v1, fields: f1 },
+                Variant { enum_name: en2, variant: v2, fields: f2 },
+            ) => en1 == en2 && v1 == v2 && f1 == f2,
+            (List(a), List(b)) => a == b,
+            (Tuple(a), Tuple(b)) => a == b,
+            (Db, Db) => true,
+            (DbCollection(a), DbCollection(b)) => a == b,
+            (BoundMethod(a, m1), BoundMethod(b, m2)) => a == b && m1 == m2,
+            (FnRef(a), FnRef(b)) => a == b,
+            // Nunca iguales, ni siquiera el mismo closure consigo mismo --
+            // comparar closures no tiene un significado útil (el checker ya
+            // lo rechaza de entrada), y esto es lo que evita recursar dentro
+            // de `captured_env`.
+            (Closure(..), Closure(..)) => false,
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Int(n) => f.debug_tuple("Int").field(n).finish(),
+            Value::Float(n) => f.debug_tuple("Float").field(n).finish(),
+            Value::Str(s) => f.debug_tuple("Str").field(s).finish(),
+            Value::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
+            Value::Null => write!(f, "Null"),
+            Value::Struct(fields) => f.debug_tuple("Struct").field(fields).finish(),
+            Value::Variant { enum_name, variant, fields } => f
+                .debug_struct("Variant")
+                .field("enum_name", enum_name)
+                .field("variant", variant)
+                .field("fields", fields)
+                .finish(),
+            Value::List(items) => f.debug_tuple("List").field(items).finish(),
+            Value::Tuple(items) => f.debug_tuple("Tuple").field(items).finish(),
+            Value::Db => write!(f, "Db"),
+            Value::DbCollection(name) => f.debug_tuple("DbCollection").field(name).finish(),
+            Value::BoundMethod(recv, method) => f.debug_tuple("BoundMethod").field(recv).field(method).finish(),
+            Value::FnRef(name) => f.debug_tuple("FnRef").field(name).finish(),
+            // A propósito NO imprime `captured_env` -- podría ser cíclico
+            // (ver el comentario en el enum), y de todos modos un entorno
+            // capturado entero no aporta nada legible a un mensaje de error.
+            Value::Closure(params, ..) => write!(f, "Closure({params:?}, <cuerpo y entorno omitidos>)"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -155,18 +230,16 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
             let callee_v = eval_expr(callee, env, db, fns)?;
             let arg_vs = eval_args(args, env, db, fns)?;
             match callee_v {
-                Value::BoundMethod(receiver, method) => call_method(*receiver, &method, arg_vs, db),
+                Value::BoundMethod(receiver, method) => call_method(*receiver, &method, arg_vs, db, fns),
                 // Llamada INDIRECTA: `callee` fue una variable/parámetro que
-                // contenía una referencia a función (GRAMMAR.md §3.10), no
-                // el nombre escrito ahí mismo -- ej. dentro de
-                // `apply_twice(f, x) { f(f(x)) }`, `f` llega como FnRef.
-                Value::FnRef(name) => {
-                    let decl = fns
-                        .get(name.as_str())
-                        .ok_or_else(|| err(format!("fn desconocida: '{name}'")))?;
-                    call_fn_decl(decl, arg_vs, db, fns)
-                }
-                other => Err(err(format!("no se puede llamar un valor {other:?}"))),
+                // contenía una referencia a función o un closure (GRAMMAR.md
+                // §3.10), no el nombre escrito ahí mismo -- ej. dentro de
+                // `apply_twice(f, x) { f(f(x)) }`, `f` llega como FnRef;
+                // `list.filter(f)` con `f` un closure ya evaluado, como
+                // Closure. `call_callable` despacha ambos casos (y produce
+                // el mismo error de "no se puede llamar" para cualquier otra
+                // cosa, ver su propio fallback).
+                other => call_callable(other, arg_vs, db, fns),
             }
         }
         Expr::StructLit { name, variant, fields } => {
@@ -256,6 +329,14 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                     .ok_or_else(|| err(format!("índice de tupla .{index} fuera de rango"))),
                 other => Err(err(format!("'.{index}' requiere una tupla, se encontró {other:?}"))),
             }
+        }
+        // Captura el env ACTUAL -- esa es la captura léxica real (GRAMMAR.md
+        // §3.10). `env.clone()` es barato: clona el HashMap pero solo hace
+        // bump de refcount en cada `Rc<RefCell<Value>>`, no clona las celdas
+        // (mismo mecanismo que ya usa `eval_block` para bloques anidados).
+        Expr::Closure { params, body } => {
+            let param_names = params.iter().map(|p| p.name.clone()).collect();
+            Ok(Value::Closure(param_names, body.clone(), env.clone()))
         }
     }
 }
@@ -392,13 +473,70 @@ fn literal_matches(lit: &LiteralPattern, v: &Value) -> bool {
     }
 }
 
-fn call_method(receiver: Value, method: &str, args: Vec<Value>, db: &Db) -> Result<Value, RuntimeError> {
+/// Invoca un closure YA evaluado -- a diferencia de `call_fn_decl` (que
+/// arranca de un `Env::new()` vacío, porque una `fn` de nivel superior no
+/// tiene scope que capturar), acá el scope de la llamada arranca del
+/// `captured_env` que el closure guardó al construirse (GRAMMAR.md §3.10)
+/// -- ESA es la captura léxica real. Los parámetros se ligan encima,
+/// sombreando cualquier variable capturada con el mismo nombre.
+fn call_closure(
+    param_names: &[String],
+    body: &Block,
+    captured_env: &Env,
+    arg_vs: Vec<Value>,
+    db: &Db,
+    fns: &Fns,
+) -> Result<Value, RuntimeError> {
+    let mut call_env = captured_env.clone();
+    for (name, v) in param_names.iter().zip(arg_vs) {
+        call_env.insert(name.clone(), cell(v));
+    }
+    eval_block(body, &call_env, db, fns)
+}
+
+/// Cualquier `Value` invocable -- una referencia a `fn` por nombre o un
+/// closure -- con argumentos ya evaluados. Compartido por la llamada
+/// indirecta de `Expr::Call` y por `.map`/`.filter` (más abajo), que
+/// necesitan invocar su callback sin que les importe cuál de las dos formas
+/// sea.
+fn call_callable(v: Value, arg_vs: Vec<Value>, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
+    match v {
+        Value::FnRef(name) => {
+            let decl = fns
+                .get(name.as_str())
+                .ok_or_else(|| err(format!("fn desconocida: '{name}'")))?;
+            call_fn_decl(decl, arg_vs, db, fns)
+        }
+        Value::Closure(params, body, captured_env) => call_closure(&params, &body, &captured_env, arg_vs, db, fns),
+        other => Err(err(format!("no se puede llamar un valor {other:?}"))),
+    }
+}
+
+fn call_method(receiver: Value, method: &str, args: Vec<Value>, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
     match receiver {
         Value::DbCollection(coll) => db.call(&coll, method, args),
         Value::List(items) => match method {
             "take" => {
                 let n = as_int(args.first().ok_or_else(|| err("take requiere 1 argumento"))?)? as usize;
                 Ok(Value::List(items.into_iter().take(n).collect()))
+            }
+            "filter" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'filter' requiere 1 argumento"))?;
+                let mut kept = Vec::new();
+                for item in items {
+                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns)?)? {
+                        kept.push(item);
+                    }
+                }
+                Ok(Value::List(kept))
+            }
+            "map" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'map' requiere 1 argumento"))?;
+                let mut mapped = Vec::with_capacity(items.len());
+                for item in items {
+                    mapped.push(call_callable(f.clone(), vec![item], db, fns)?);
+                }
+                Ok(Value::List(mapped))
             }
             other => Err(err(format!("método de lista desconocido: '{other}'"))),
         },
@@ -564,7 +702,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::BoundMethod(_, _) | Value::FnRef(_) => {
+        Value::Db | Value::DbCollection(_) | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -1072,5 +1210,84 @@ mod tests {
         let result = invoke_rpc(&program, "Users", "watchAll", &json!({}), &db).unwrap();
         let arr = result.as_array().expect("el resultado de un stream debería ser un array JSON");
         assert_eq!(arr.len(), 2, "Db::seeded() siembra 2 usuarios bajo 'users'");
+    }
+
+    // ---- closures + List.map/.filter (GRAMMAR.md §3.10) ----
+
+    #[test]
+    fn filter_and_map_actually_transform_the_list_at_runtime() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc run() -> Int[] {
+                    let xs = [1, 2, 3, 4, 5];
+                    let evens = xs.filter(|x: Int| { x > 2 });
+                    evens.map(|x: Int| { x * 10 })
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "run", &json!({}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!([30, 40, 50]));
+    }
+
+    #[test]
+    fn map_invokes_a_named_fn_reference_at_runtime() {
+        let program = program_from(
+            r#"
+            fn double(x: Int) -> Int { x * 2 }
+            service S {
+                rpc run() -> Int[] {
+                    [1, 2, 3].map(double)
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "run", &json!({}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!([2, 4, 6]));
+    }
+
+    #[test]
+    fn closure_captures_and_sees_later_mutation_of_the_captured_variable() {
+        // La misma celda Rc<RefCell<Value>> que ve el scope exterior --
+        // mutar `total` DESPUÉS de crear el closure sigue siendo visible
+        // adentro de él en la llamada siguiente (mismo mecanismo que
+        // assignment_inside_if_branch_propagates_to_outer_scope).
+        let program = program_from(
+            r#"
+            service S {
+                rpc run() -> Int {
+                    let mut total = 0;
+                    let addToTotal = |x: Int| { total = total + x; x };
+                    addToTotal(5);
+                    addToTotal(10);
+                    total
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "run", &json!({}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(15));
+    }
+
+    #[test]
+    fn recursive_closure_via_mut_reassignment_does_not_hang_and_computes_correctly() {
+        // Construye un ciclo real de Rc (el segundo closure captura un Env
+        // que contiene la misma celda que 'f' está a punto de sobreescribir,
+        // ver el comentario sobre Value::PartialEq/Debug a mano) -- confirma
+        // que invocarla funciona bien y el programa termina normalmente.
+        let program = program_from(
+            r#"
+            service S {
+                rpc run(n: Int) -> Int {
+                    let mut f: (Int) -> Int = |x: Int| { x };
+                    f = |x: Int| { if x <= 1 { 1 } else { x * f(x - 1) } };
+                    f(n)
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "run", &json!({"n": 5}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(120));
     }
 }

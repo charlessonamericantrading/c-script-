@@ -957,8 +957,55 @@ impl Parser {
                 }
                 Ok(Expr::Ident(name))
             }
+            TokenKind::Pipe => self.parse_closure_expr(),
             other => Err(self.error(format!("se esperaba una expresión, se encontró {other:?}"))),
         }
+    }
+
+    /// `|params| { block }` (GRAMMAR.md §3.10). `||` lexea como un solo
+    /// token `PipePipe` (token.rs), así que nunca llega hasta acá -- pero
+    /// `| |` (con espacio) sigue siendo dos `Pipe` separados, de ahí el
+    /// chequeo explícito de "al menos 1 param" más abajo en vez de confiar
+    /// en que el token ya lo descarta.
+    fn parse_closure_expr(&mut self) -> Result<Expr, ParseError> {
+        self.eat(&TokenKind::Pipe)?;
+        let mut params = Vec::new();
+        if !self.check(&TokenKind::Pipe) {
+            params.push(self.parse_closure_param()?);
+            while self.check(&TokenKind::Comma) {
+                self.advance();
+                if self.check(&TokenKind::Pipe) {
+                    break; // coma final: |x, y,|
+                }
+                params.push(self.parse_closure_param()?);
+            }
+        }
+        self.eat(&TokenKind::Pipe)?;
+        if params.is_empty() {
+            return Err(self.error(
+                "un closure necesita al menos 1 parámetro -- `||` (0 parámetros) no se soporta todavía (GRAMMAR.md §3.10)",
+            ));
+        }
+        let body = self.parse_block()?;
+        Ok(Expr::Closure { params, body })
+    }
+
+    /// `nombre (":" tipo)?` -- a diferencia de `parse_param` (fn/rpc), la
+    /// anotación es OPCIONAL (se infiere en modo chequeo desde el
+    /// `Type::Function` esperado, ver checker.rs). El tipo se parsea con
+    /// `parse_postfix_type`, NO `parse_type_expr`: ese último consume `|`
+    /// en loop para uniones, y se comería el `|` de CIERRE del closure
+    /// (`|x: Int | String| {...}` se malinterpretaría). Un tipo unión en
+    /// un param de closure necesita paréntesis: `|x: (Int | String)| {...}`.
+    fn parse_closure_param(&mut self) -> Result<ClosureParam, ParseError> {
+        let name = self.eat_ident()?;
+        let ty = if self.check(&TokenKind::Colon) {
+            self.advance();
+            Some(self.parse_postfix_type()?)
+        } else {
+            None
+        };
+        Ok(ClosureParam { name, ty })
     }
 
     fn parse_field_init_list(&mut self) -> Result<Vec<(String, Expr)>, ParseError> {
@@ -1441,7 +1488,7 @@ mod tests {
             })
             .expect("se esperaba un service");
         assert_eq!(service.name, "Users");
-        // list, getById, create, update, watchAll (stream)
-        assert_eq!(service.members.len(), 5);
+        // list, getById, create, update, listByRole, listEmails, watchAll (stream)
+        assert_eq!(service.members.len(), 7);
     }
 }

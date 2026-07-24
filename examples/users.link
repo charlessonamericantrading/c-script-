@@ -74,6 +74,19 @@ service Users {
     db.users.applyPatch(id, patch)
   }
 
+  // Closures reales (GRAMMAR.md §3.10): `role` viene del parámetro de ESTE
+  // rpc, no de `db.users` -- el closure lo captura del scope que lo rodea
+  // (captura léxica real, no una referencia a `fn` con nombre).
+  rpc listByRole(role: Role) -> User[] {
+    db.users.all().filter(|u: User| { u.role == role })
+  }
+
+  // `.map` (GRAMMAR.md §3.10): cambia el tipo de elemento de la lista
+  // (User -> String), a diferencia de `.filter` que siempre preserva T.
+  rpc listEmails() -> String[] {
+    db.users.all().map(|u: User| { u.email })
+  }
+
   // "Streaming real" v0 (GRAMMAR.md §2.1): la firma declara el ELEMENTO
   // (User, igual que un rpc normal), pero el cuerpo tiene que devolver la
   // secuencia YA CALCULADA entera -- acá, la misma lista que ya arma

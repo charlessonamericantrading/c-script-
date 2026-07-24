@@ -113,11 +113,7 @@ pub fn is_subtype(sub: &Type, sup: &Type) -> bool {
         // igualdad estructural de arriba (`sub == sup`) -- exacta, sin
         // aprovechar el subtipado de structs/optional/unión ya definido
         // para params y retorno.
-        (Function(p1, r1), Function(p2, r2)) => {
-            p1.len() == p2.len()
-                && p2.iter().zip(p1.iter()).all(|(t2, t1)| is_subtype(t2, t1))
-                && is_subtype(r1, r2)
-        }
+        (Function(p1, r1), Function(p2, r2)) => params_accept(p2, p1) && is_subtype(r1, r2),
         (
             Struct {
                 fields: sub_fields, ..
@@ -145,6 +141,29 @@ pub fn is_subtype(sub: &Type, sup: &Type) -> bool {
         (sub, Union(members)) => members.iter().any(|m| is_subtype(sub, m)),
         _ => false,
     }
+}
+
+/// ¿Una función con params `candidate_params` puede usarse donde se
+/// requieren `expected_params`? Contravariante: cada tipo ESPERADO tiene
+/// que ser subtipo del CANDIDATO correspondiente en esa posición -- "T
+/// acepta todo lo que S acepta" (ver el comentario en `is_subtype`'s rama
+/// `Function`, que llama a esto mismo en vez de repetir la lógica).
+///
+/// Nombrada y expuesta aparte (no solo inline dentro de `is_subtype`)
+/// porque checker.rs necesita exactamente esta misma comparación al
+/// chequear un closure anotado contra un `Type::Function` esperado
+/// (GRAMMAR.md §3.10) -- escribirla una segunda vez ahí, a mano, es
+/// exactamente cómo se invierte la dirección por accidente (`is_subtype(anotación,
+/// esperado)` en vez de `is_subtype(esperado, anotación)`): un review de
+/// diseño encontró ese error concreto antes de que se escribiera código,
+/// con un contraejemplo real (un closure que acepta un struct más ANCHO
+/// que el que el llamador realmente tiene, aceptado por error, y que
+/// después crashea en runtime leyendo un campo que el dato real nunca
+/// tuvo). Una sola función con la dirección ya resuelta es la manera de
+/// que ese error no se pueda cometer dos veces.
+pub(crate) fn params_accept(expected_params: &[Type], candidate_params: &[Type]) -> bool {
+    expected_params.len() == candidate_params.len()
+        && expected_params.iter().zip(candidate_params).all(|(e, c)| is_subtype(e, c))
 }
 
 #[cfg(test)]
