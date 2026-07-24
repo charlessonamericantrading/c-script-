@@ -52,6 +52,14 @@ pub enum Type {
     /// nunca durante el chequeo de un programa real (ahí siempre hay un
     /// `Generic` con args concretos). Ver `resolve_type_abstract`.
     TypeParam(String),
+    /// `A | B` (GRAMMAR.md §2.2). Alcance deliberado de v0: sirve para
+    /// ACEPTAR/PASAR un valor de cualquiera de los miembros (subtipado más
+    /// abajo), pero angostar (recuperar el miembro concreto después) NO
+    /// está implementado -- el lenguaje no tiene ningún operador de test de
+    /// tipo (`is`/`typeof`) ni forma de hacer `match` sobre una unión cruda,
+    /// así que no hay ninguna construcción sintáctica que "angostar"
+    /// pudiera usar todavía. Documentado como límite real, no escondido.
+    Union(Vec<Type>),
     /// Pseudo-tipo para valores del runtime aún no modelado (p. ej. `db`).
     /// Compatible con cualquier tipo en ambas direcciones, como `any` de TS —
     /// deliberado para v0: el checker todavía no conoce la forma de la base
@@ -102,6 +110,14 @@ pub fn is_subtype(sub: &Type, sup: &Type) -> bool {
                     (sup_f.optional || !sub_f.optional) && is_subtype(&sub_f.ty, &sup_f.ty)
                 })
         }),
+        // Unión a la IZQUIERDA primero (más específico): una unión es
+        // subtipo de T si TODOS sus miembros lo son -- así, si `sup`
+        // también es una unión, cada miembro recursa a la regla de abajo.
+        (Union(members), sup) => members.iter().all(|m| is_subtype(m, sup)),
+        // Unión a la derecha: S es subtipo de una unión si encaja en
+        // AL MENOS UN miembro -- así fluye un valor concreto hacia un
+        // parámetro/campo tipado como unión.
+        (sub, Union(members)) => members.iter().any(|m| is_subtype(sub, m)),
         _ => false,
     }
 }
@@ -166,6 +182,24 @@ mod tests {
         assert!(is_subtype(&narrow, &same));
         let different_value = Type::MapOf(Box::new(Type::String), Box::new(Type::String));
         assert!(!is_subtype(&narrow, &different_value));
+    }
+
+    #[test]
+    fn concrete_member_flows_into_union_typed_slot() {
+        let u = Type::Union(vec![Type::Int, Type::String]);
+        assert!(is_subtype(&Type::Int, &u));
+        assert!(is_subtype(&Type::String, &u));
+        assert!(!is_subtype(&Type::Bool, &u));
+    }
+
+    #[test]
+    fn union_is_subtype_of_t_only_if_every_member_is() {
+        let u = Type::Union(vec![Type::Int, Type::String]);
+        // Ningún tipo concreto simple contiene a Int Y a String a la vez.
+        assert!(!is_subtype(&u, &Type::Int));
+        // Pero una unión más ancha que cubre ambos miembros sí.
+        let wider = Type::Union(vec![Type::Int, Type::String, Type::Bool]);
+        assert!(is_subtype(&u, &wider));
     }
 
     #[test]

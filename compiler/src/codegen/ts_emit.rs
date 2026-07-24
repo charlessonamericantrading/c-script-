@@ -313,6 +313,15 @@ fn render_type(ty: &Type) -> String {
         // como el nombre literal del parámetro de tipo.
         Type::TypeParam(name) => name.clone(),
         Type::Dynamic => "unknown".to_string(),
+        // Cada miembro pasa por render_type_atom (no render_type) por la
+        // misma razón que List en su elemento: un miembro Function (`=>`)
+        // sin paréntesis rompe la precedencia de TS dentro de un `|`
+        // (ver la nota de render_type_atom más abajo).
+        Type::Union(members) => members
+            .iter()
+            .map(render_type_atom)
+            .collect::<Vec<_>>()
+            .join(" | "),
     }
 }
 
@@ -369,6 +378,11 @@ fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeSet<String>)
                 collect_type_names(a, names);
             }
         }
+        Type::Union(members) => {
+            for m in members {
+                collect_type_names(m, names);
+            }
+        }
         Type::Int | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
     }
 }
@@ -378,7 +392,7 @@ fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeSet<String>)
 /// tipo cuya forma renderizada use `|` o `=>` en su nivel superior.
 fn render_type_atom(ty: &Type) -> String {
     match ty {
-        Type::Optional(_) | Type::Function(_, _) => format!("({})", render_type(ty)),
+        Type::Optional(_) | Type::Function(_, _) | Type::Union(_) => format!("({})", render_type(ty)),
         _ => render_type(ty),
     }
 }
@@ -512,6 +526,24 @@ mod tests {
         assert!(contract.contains("export interface Box<T> {"));
         assert!(contract.contains("value: T;"));
         assert!(contract.contains("get(): Promise<Box<number>>;"));
+    }
+
+    #[test]
+    fn union_field_renders_as_ts_pipe_type() {
+        let src = "type Event = { payload: Int | String }";
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("payload: number | string;"));
+    }
+
+    #[test]
+    fn union_inside_list_gets_parenthesized_to_avoid_ts_ambiguity() {
+        // `(Int | String)[]` es sintaxis real del lenguaje (agrupación pura
+        // + postfix `[]`, GRAMMAR.md §2.2) -- sin paréntesis en la salida,
+        // `number | string[]` significa en TS `number | (string[])`, no
+        // `(number | string)[]` (ver la nota en render_type_atom).
+        let src = "type Basket = { items: (Int | String)[] }";
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("items: (number | string)[];"));
     }
 
     #[test]

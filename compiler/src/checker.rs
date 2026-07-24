@@ -170,9 +170,13 @@ impl Checker {
             TypeExpr::Map(_, _) => Err(err(
                 "tipo map { K: V } todavía no soportado por el checker (ambigüedad real con structs de un campo, GRAMMAR.md §2.2) — usa Map<K, V>",
             )),
-            TypeExpr::Union(_) => Err(err(
-                "uniones de tipo (A | B) todavía no soportadas por el checker — pendiente de una fase posterior",
-            )),
+            TypeExpr::Union(members) => {
+                let mut tys = Vec::new();
+                for m in members {
+                    tys.push(self.resolve_type_subst(m, subst)?);
+                }
+                Ok(Type::Union(tys))
+            }
         }
     }
 
@@ -1358,6 +1362,41 @@ mod tests {
             fn classify(x: Int) -> String {
                 if x > 0 { "positivo" } else if x < 0 { "negativo" } else { "cero" }
             }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn concrete_member_of_a_union_param_is_accepted() {
+        // Alcance v0 (types.rs, doc de Type::Union): flujo de valor hacia
+        // un parámetro/campo tipado como unión, sin angosto posterior.
+        let src = r#"
+            fn f(x: Int | String) -> Int { 0 }
+            fn use_it() -> Int { f(1) }
+        "#;
+        assert!(check_source(src).is_ok());
+        let src2 = r#"
+            fn f(x: Int | String) -> Int { 0 }
+            fn use_it() -> Int { f("hola") }
+        "#;
+        assert!(check_source(src2).is_ok());
+    }
+
+    #[test]
+    fn non_member_type_is_rejected_by_union_param() {
+        let src = r#"
+            fn f(x: Int | String) -> Int { 0 }
+            fn use_it() -> Int { f(true) }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "Bool no es miembro de Int | String");
+    }
+
+    #[test]
+    fn union_field_in_struct_is_accepted() {
+        let src = r#"
+            type Event = { payload: Int | String }
+            fn make() -> Event { Event { payload: 1 } }
         "#;
         assert!(check_source(src).is_ok());
     }

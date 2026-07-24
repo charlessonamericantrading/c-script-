@@ -378,6 +378,47 @@ Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos,
 
 No hay coerción implícita en ningún operador (§3.7) — estas son las únicas conversiones numéricas, y son siempre explícitas. `.length()`/`.contains()` son método, no propiedad (`x.length`, sin paréntesis) — consistencia con `.toFloat()`/`.toInt()` importó más acá que imitar la convención de propiedad de JS/TS.
 
+### 3.9 Uniones de tipo (`A | B`) — RESUELTO (subtipado de flujo de valor, sin angosto)
+
+`x: Int | String` ya se resuelve, se acepta como tipo de parámetro/campo, y se emite como la unión nativa de TypeScript (`number | string`). La gramática (§2.2) ya traía `union_type` desde el principio; lo que faltaba era que el checker supiera qué hacer con un `TypeExpr::Union` en vez de devolver un error fijo.
+
+**Regla de subtipado — dos direcciones, no una:**
+
+```
+S <: Tᵢ   para algún i ∈ 1..n
+──────────────────────────────  (Union-Intro, "a la derecha")
+S <: (T₁ | ... | Tₙ)
+
+∀i ∈ 1..n.  Sᵢ <: T
+──────────────────────────────  (Union-Elim, "a la izquierda")
+(S₁ | ... | Sₙ) <: T
+```
+
+La primera es la que cubre el caso real más común: un valor concreto (`Int`) fluye hacia un parámetro/campo tipado como unión con solo encajar en UNO de los miembros. La segunda es la que hace que una unión sea, a su vez, subtipo de otra unión más ancha (`Int | String <: Int | String | Bool`) — cada miembro de la izquierda tiene que encajar en algo de la derecha.
+
+```
+type Event = { payload: Int | String }
+
+fn accept(x: Int | String) -> Void {}
+
+fn f() -> Void {
+  accept(1);        // Int <: Int | String -- ok (Union-Intro)
+  accept("hola");   // String <: Int | String -- ok (Union-Intro)
+}
+```
+
+Emitido:
+
+```typescript
+export interface Event {
+  payload: number | string;
+}
+```
+
+**Lo que NO está implementado: angostar (narrowing).** Una vez que un valor entra a una unión, no hay forma de recuperar el miembro concreto después: no existe ningún operador `is`/`typeof`, y `match` (§3.3) solo opera sobre `enum` declarados — no sobre un `TypeExpr::Union` crudo. No hay ninguna construcción sintáctica en la que "angostar" pudiera engancharse todavía. En la práctica, `x: Int | String` sirve para **aceptar** cualquiera de los dos, pero dentro del cuerpo de la función no hay forma de preguntar cuál de los dos es. Es una limitación real y documentada, no un error silencioso: si hace falta distinguir casos hoy, la alternativa es modelar la alternancia como `enum` (que sí tiene `match` exhaustivo, §3.3) en vez de una unión estructural.
+
+**Por qué a veces aparece un paréntesis (`(A | B)[]`):** igual que `Optional`/tipo función dentro de un `List` (§2.2), un miembro que en TS se renderiza con `|` o `=>` en su nivel superior necesita paréntesis explícitos al aparecer dentro de otra construcción — `number | string[]` en TS significa `number | (string[])`, no `(number | string)[]`. El emisor ya aplicaba esta regla para `Optional`/`Function` (`render_type_atom`); ahora también protege a `Union`, en ambas direcciones: como elemento de un `List`, y como miembro de otra unión.
+
 ---
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
@@ -393,6 +434,7 @@ No hay coerción implícita en ningún operador (§3.7) — estas son las única
 | `{K: V}` | `Record<K, V>` | objeto | `K` limitado a `String`/`Int` (claves JSON) |
 | `(A, B)` | `[A, B]` | array de longitud fija | tupla, ver §2.2 sobre ambigüedad de paréntesis |
 | `(A) -> B` | `(a: A) => B` | — | solo como campo de tipo función local; no cruza el wire |
+| `A \| B` | `A \| B` | valor tal cual, con la forma de cualquiera de los miembros | subtipado de flujo de valor, sin angosto — resuelto en §3.9 |
 | `type X = {...}` | `interface X {...}` (structural) | objeto | subtipado estructural, §3.2 |
 | `type X<T> = {...}` | `interface X<T> {...}` | objeto | monomorfizado en el backend, genérico en TS, §3.6 |
 | `enum E { A, B }` | `type E = "A" \| "B"` | string | enum simple = unión de literales |
