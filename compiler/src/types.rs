@@ -39,6 +39,19 @@ pub enum Type {
     /// de un campo. `K` limitado a `String`/`Int` (claves JSON), igual que
     /// `{K: V}` en la tabla de mapeo (§4). Se emite como `Record<K, V>`.
     MapOf(Box<Type>, Box<Type>),
+    /// Instanciación de un `type`/`enum` genérico DECLARADO POR EL USUARIO
+    /// (GRAMMAR.md §3.6) -- ej. `Box<Int>`. A diferencia de Result/Patch/Map
+    /// (siempre expandidos), este queda "opaco" (nombre base + args ya
+    /// resueltos) hasta que hace falta la forma real (field access,
+    /// construcción, match) -- ver `Checker::expand_generic` en checker.rs.
+    /// Por monomorfización (PLAN.md §3.6): cada instanciación distinta
+    /// (`Box<Int>` vs `Box<String>`) es un tipo concreto propio.
+    Generic(String, Vec<Type>),
+    /// Parámetro de tipo SIN instanciar -- solo aparece al emitir la
+    /// declaración ABSTRACTA de un genérico al `.d.ts` (`interface Box<T>`),
+    /// nunca durante el chequeo de un programa real (ahí siempre hay un
+    /// `Generic` con args concretos). Ver `resolve_type_abstract`.
+    TypeParam(String),
     /// Pseudo-tipo para valores del runtime aún no modelado (p. ej. `db`).
     /// Compatible con cualquier tipo en ambas direcciones, como `any` de TS —
     /// deliberado para v0: el checker todavía no conoce la forma de la base

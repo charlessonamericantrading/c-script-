@@ -150,18 +150,34 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     Ok(out)
 }
 
-fn emit_type_decl(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(), String> {
-    if !t.type_params.is_empty() {
-        return Err(format!(
-            "'{}' es genérico — emisión de type/enum genéricos declarados por el usuario aún no soportada (PLAN.md §3.6)",
-            t.name
-        ));
+/// `<T, U>` para una declaración genérica, o "" si no tiene type_params.
+fn type_params_suffix(type_params: &[String]) -> String {
+    if type_params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", type_params.join(", "))
     }
+}
+
+/// Resuelve el tipo de un campo dentro de una declaración que puede ser
+/// genérica: con type_params, usa `resolve_type_abstract` (T se queda como
+/// T, ver GRAMMAR.md §3.6) -- TS ya tiene genéricos nativos, así que la
+/// declaración se emite tal cual, sin monomorfizar.
+fn resolve_field_ty(checker: &Checker, ty: &TypeExpr, type_params: &[String]) -> Result<Type, String> {
+    if type_params.is_empty() {
+        checker.resolve_type(ty).map_err(|e| e.to_string())
+    } else {
+        checker.resolve_type_abstract(ty, type_params).map_err(|e| e.to_string())
+    }
+}
+
+fn emit_type_decl(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(), String> {
+    let generics = type_params_suffix(&t.type_params);
     match &t.ty {
         TypeExpr::Struct(fields) => {
-            out.push_str(&format!("export interface {} {{\n", t.name));
+            out.push_str(&format!("export interface {}{} {{\n", t.name, generics));
             for f in fields {
-                let ty = checker.resolve_type(&f.ty).map_err(|e| e.to_string())?;
+                let ty = resolve_field_ty(checker, &f.ty, &t.type_params)?;
                 out.push_str(&format!(
                     "  {}{}: {};\n",
                     f.name,
@@ -172,34 +188,31 @@ fn emit_type_decl(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(
             out.push_str("}\n\n");
         }
         other => {
-            let ty = checker.resolve_type(other).map_err(|e| e.to_string())?;
-            out.push_str(&format!("export type {} = {};\n\n", t.name, render_type(&ty)));
+            let ty = resolve_field_ty(checker, other, &t.type_params)?;
+            out.push_str(&format!("export type {}{} = {};\n\n", t.name, generics, render_type(&ty)));
         }
     }
     Ok(())
 }
 
 fn emit_enum_decl(out: &mut String, e: &EnumDecl, checker: &Checker) -> Result<(), String> {
-    if !e.type_params.is_empty() {
-        return Err(format!(
-            "'{}' es genérico — emisión de enums genéricos aún no soportada (PLAN.md §3.6)",
-            e.name
-        ));
-    }
+    let generics = type_params_suffix(&e.type_params);
     let all_unit = e.variants.iter().all(|v| v.fields.is_none());
     if all_unit {
-        // enum simple -> unión de literales string (GRAMMAR.md §4)
+        // enum simple -> unión de literales string (GRAMMAR.md §4). No
+        // puede ser genérico de verdad (no hay dónde usar T sin campos),
+        // pero la sintaxis lo permitiría -- se ignoran type_params acá.
         let variants: Vec<String> = e.variants.iter().map(|v| format!("\"{}\"", v.name)).collect();
         out.push_str(&format!("export type {} = {};\n\n", e.name, variants.join(" | ")));
         return Ok(());
     }
     // ADT -> unión discriminada con tag `type` (GRAMMAR.md §4)
-    out.push_str(&format!("export type {} =\n", e.name));
+    out.push_str(&format!("export type {}{} =\n", e.name, generics));
     for v in &e.variants {
         let mut parts = vec![format!("type: \"{}\"", v.name)];
         if let Some(fields) = &v.fields {
             for f in fields {
-                let ty = checker.resolve_type(&f.ty).map_err(|e| e.to_string())?;
+                let ty = resolve_field_ty(checker, &f.ty, &e.type_params)?;
                 parts.push(format!(
                     "{}{}: {}",
                     f.name,
@@ -288,6 +301,17 @@ fn render_type(ty: &Type) -> String {
         // Result/Patch, no hace falta definirlo en el preámbulo del
         // contrato ni importarlo (ver collect_type_names).
         Type::MapOf(k, v) => format!("Record<{}, {}>", render_type(k), render_type(v)),
+        // Instanciación de un genérico DECLARADO POR EL USUARIO (GRAMMAR.md
+        // §3.6) -- a diferencia de Result/Patch/Map, TS ya soporta genéricos
+        // nativos: alcanza con emitir el nombre + args, sin expandir la
+        // estructura inline (eso ya lo hace TS al instanciar `Box<number>`).
+        Type::Generic(name, args) => {
+            format!("{name}<{}>", args.iter().map(render_type).collect::<Vec<_>>().join(", "))
+        }
+        // Solo aparece al emitir la declaración ABSTRACTA de un genérico
+        // (`interface Box<T>`, ver resolve_type_abstract) -- se renderiza
+        // como el nombre literal del parámetro de tipo.
+        Type::TypeParam(name) => name.clone(),
         Type::Dynamic => "unknown".to_string(),
     }
 }
@@ -336,7 +360,16 @@ fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeSet<String>)
             }
             collect_type_names(ret, names);
         }
-        Type::Int | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic => {}
+        // A diferencia de Result/Patch/Map (builtins de TS), un genérico
+        // DECLARADO POR EL USUARIO (`Box<T>`) sí se emite como su propia
+        // interface/type -- necesita import, igual que un struct/enum normal.
+        Type::Generic(name, args) => {
+            names.insert(name.clone());
+            for a in args {
+                collect_type_names(a, names);
+            }
+        }
+        Type::Int | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
     }
 }
 
@@ -462,5 +495,36 @@ mod tests {
         assert!(contract.contains("flags: Record<string, boolean>;"));
         // Record es nativo de TS -- no debería aparecer en ningún import
         assert!(!contract.contains("import"));
+    }
+
+    #[test]
+    fn user_generic_struct_emits_real_ts_generic_not_monomorphized() {
+        // La declaración se emite UNA vez, como genérico real de TS -- no
+        // una interface por cada instanciación usada (eso es cosa del
+        // checker/runtime internos, GRAMMAR.md §3.6).
+        let src = r#"
+            type Box<T> = { value: T }
+            service S {
+                rpc get() -> Box<Int> { db.thing.get() }
+            }
+        "#;
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("export interface Box<T> {"));
+        assert!(contract.contains("value: T;"));
+        assert!(contract.contains("get(): Promise<Box<number>>;"));
+    }
+
+    #[test]
+    fn user_generic_enum_emits_discriminated_union_with_type_param() {
+        let src = r#"
+            enum Option<T> { Some { value: T }, None }
+            service S {
+                rpc get() -> Option<String> { db.thing.get() }
+            }
+        "#;
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("export type Option<T> ="));
+        assert!(contract.contains("| { type: \"Some\"; value: T }"));
+        assert!(contract.contains("get(): Promise<Option<string>>;"));
     }
 }

@@ -338,14 +338,17 @@ if (result.type === "Ok") {
 
 **Errores de transporte vs errores de dominio:** el cliente generado **nunca** lanza (`throw`) para un error que el `rpc` declaró en su `Result<T,E>` — esos siempre vuelven como valor. El cliente **sí** puede lanzar `LinkTransportError` para fallos fuera del contrato de dominio (red caída, 5xx, timeout) — son excepcionales por definición, no algo que el backend predijo. Es la misma línea divisoria que separa `Result`/`Option` de `panic!` en Rust.
 
-### 3.6 Genéricos — recomendación con motivo (no bloqueante)
+### 3.6 Genéricos definidos por el usuario — RESUELTO (monomorfización)
 
-`type_params` ya está en la gramática (`type Box<T> = { value: T }`). Dos estrategias de implementación:
+`type Box<T> = { value: T }` / `enum Option<T> { Some{value:T}, None }` ya funcionan: se instancian (`Box<Int>`), se construyen, se accede a sus campos, y se hace `match` exhaustivo sobre enums genéricos.
 
-- **Monomorfización** (como Rust): el compilador genera una versión especializada por cada instanciación concreta. Más rápido en runtime, más binario, más simple de mapear a TS (cada instanciación es un tipo TS genérico natural: `Box<T>` → `type Box<T> = { value: T }`).
-- **Type erasure** (como TS/Java): los genéricos desaparecen en runtime, una sola implementación. Menos código generado, pero pierdes especialización (p.ej. no puedes tener un layout de memoria distinto para `Box<Int>` vs `Box<String>`).
+**Cómo se resuelve una instanciación.** `resolve_type` arma un *subst* (`type_param -> tipo concreto`, ej. `{"T": Int}`) y lo aplica recursivamente al cuerpo de la declaración — es monomorfización real, no type erasure: `Box<Int>` y `Box<String>` son dos tipos concretos distintos para el checker, tal como se recomendaba acá antes de implementarlo. La instanciación queda **opaca** (`Type::Generic(nombre, args)`, sin expandir) hasta que hace falta la forma real — field access, construcción, match — el mismo patrón que ya usaban `Result<T,E>`/`Patch<T>`/`Map<K,V>`.
 
-**Recomendación:** monomorfización. TypeScript ya modela sus genéricos así a nivel de tipos (aunque erasure en runtime JS), así que el mapeo es más directo, y el rendimiento nativo es parte de la propuesta de valor del proyecto. Esta no la marco como pregunta abierta porque no cambia la experiencia del usuario del lenguaje ni el `.d.ts` emitido — es un detalle de implementación del compilador.
+**Construcción: solo en modo chequeo, igual que `Result`.** `Box { value: 5 }` no trae los argumentos de tipo en su sintaxis (no hay `Box<Int> { value: 5 }`) — así que, igual que `Result.Ok`, necesita un tipo esperado ya instanciado viniendo del contexto (anotación de `let`, tipo de retorno declarado, etc.). Sintetizar `Box { value: 5 }` sin ese contexto es un error explícito: no hay de dónde sacar el argumento de tipo.
+
+**Decisión: la comparación de un genérico ya instanciado es NOMINAL, no estructural.** `Box<Int>` y un struct suelto `{ value: Int }` con la misma forma **no** son intercambiables, aunque `type` sin genéricos sí es estructural (§3.2). Es una simplificación deliberada: sostener estructural-a-través-de-un-genérico exigiría que `is_subtype` pudiera "ver a través" de una instanciación opaca, lo cual necesita acceso a las tablas de símbolos que hoy no tiene (es una función libre, sin ese contexto) — y en la práctica varios lenguajes con tipado estructural (la propia TypeScript incluida, en varios casos con genéricos) tampoco garantizan esa equivalencia en general.
+
+**La declaración se emite como genérico real de TypeScript, no monomorfizada.** A diferencia del checker (que sí monomorfiza internamente), el `.d.ts` emite `export interface Box<T> { value: T; }` **una sola vez** — TypeScript ya tiene genéricos nativos, así que no hace falta (ni conviene) generar una interface por cada instanciación usada. Una referencia a `Box<Int>` en una firma se emite como `Box<number>`, dejando que el propio `tsc` haga la instanciación.
 
 ### 3.7 Operadores e `if/else`
 

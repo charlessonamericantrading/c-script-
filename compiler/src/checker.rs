@@ -112,36 +112,60 @@ impl Checker {
     }
 
     // ---- resolución de TypeExpr (sintáctico) -> Type (resuelto) ----
+    //
+    // `resolve_type` es la fachada pública (subst vacío) que ya usa el
+    // resto del checker sin cambios. `resolve_type_subst` es la que de
+    // verdad hace el trabajo, y sabe qué hacer cuando un identificador de
+    // tipo (ej. "T") está LIGADO a un tipo concreto por el subst actual --
+    // así es como se resuelve el CUERPO de un genérico instanciado
+    // (GRAMMAR.md §3.6, monomorfización): `Box<Int>` arma `{"T": Int}` y
+    // resuelve `{value: T}` con ese subst, dando `{value: Int}`.
 
     pub(crate) fn resolve_type(&self, texpr: &TypeExpr) -> Result<Type, CheckError> {
+        self.resolve_type_subst(texpr, &HashMap::new())
+    }
+
+    /// Resuelve la declaración ABSTRACTA (sin instanciar) de un genérico,
+    /// para emitir `interface Box<T> { value: T }` tal cual en el .d.ts
+    /// (ts_emit.rs) -- cada type_param se liga a `Type::TypeParam(nombre)`,
+    /// que se renderiza literalmente como ese nombre en TypeScript.
+    pub(crate) fn resolve_type_abstract(&self, texpr: &TypeExpr, type_params: &[String]) -> Result<Type, CheckError> {
+        let subst: HashMap<String, Type> = type_params
+            .iter()
+            .map(|p| (p.clone(), Type::TypeParam(p.clone())))
+            .collect();
+        self.resolve_type_subst(texpr, &subst)
+    }
+
+    fn resolve_type_subst(&self, texpr: &TypeExpr, subst: &HashMap<String, Type>) -> Result<Type, CheckError> {
         match texpr {
-            TypeExpr::Named(name, args) => self.resolve_named_type(name, args),
+            TypeExpr::Named(name, args) => self.resolve_named_type_subst(name, args, subst),
             TypeExpr::Struct(fields) => {
                 let mut ftys = Vec::new();
                 for f in fields {
                     ftys.push(FieldType {
                         name: f.name.clone(),
                         optional: f.optional,
-                        ty: self.resolve_type(&f.ty)?,
+                        ty: self.resolve_type_subst(&f.ty, subst)?,
                     });
                 }
                 Ok(Type::Struct { name: None, fields: ftys })
             }
-            TypeExpr::Optional(inner) => Ok(Type::Optional(Box::new(self.resolve_type(inner)?))),
-            TypeExpr::List(inner) => Ok(Type::List(Box::new(self.resolve_type(inner)?))),
+            TypeExpr::Optional(inner) => Ok(Type::Optional(Box::new(self.resolve_type_subst(inner, subst)?))),
+            TypeExpr::List(inner) => Ok(Type::List(Box::new(self.resolve_type_subst(inner, subst)?))),
             TypeExpr::Tuple(items) => {
                 let mut tys = Vec::new();
                 for i in items {
-                    tys.push(self.resolve_type(i)?);
+                    tys.push(self.resolve_type_subst(i, subst)?);
                 }
                 Ok(Type::Tuple(tys))
             }
             TypeExpr::Function(params, ret) => {
                 let mut ptys = Vec::new();
                 for p in params {
-                    ptys.push(self.resolve_type(p)?);
+                    ptys.push(self.resolve_type_subst(p, subst)?);
                 }
-                Ok(Type::Function(ptys, Box::new(self.resolve_type(ret)?)))
+                Ok(Type::Function(ptys, Box::new(self.resolve_type_subst(ret, subst)?)))
             }
             TypeExpr::Map(_, _) => Err(err(
                 "tipo map { K: V } todavía no soportado por el checker (ambigüedad real con structs de un campo, GRAMMAR.md §2.2) — usa Map<K, V>",
@@ -152,7 +176,15 @@ impl Checker {
         }
     }
 
-    fn resolve_named_type(&self, name: &str, args: &[TypeExpr]) -> Result<Type, CheckError> {
+    fn resolve_named_type_subst(&self, name: &str, args: &[TypeExpr], subst: &HashMap<String, Type>) -> Result<Type, CheckError> {
+        // "T" dentro del cuerpo de un genérico que YA está siendo resuelto
+        // (instanciado o en modo abstracto) -- ver resolve_type_abstract.
+        if let Some(bound) = subst.get(name) {
+            if !args.is_empty() {
+                return Err(err(format!("'{name}' es un parámetro de tipo, no toma argumentos")));
+            }
+            return Ok(bound.clone());
+        }
         match name {
             "Int" => Ok(Type::Int),
             "Float" => Ok(Type::Float),
@@ -167,8 +199,8 @@ impl Checker {
                     return Err(err("Result<T, E> requiere exactamente 2 argumentos de tipo"));
                 };
                 Ok(Type::ResultOf(
-                    Box::new(self.resolve_type(a)?),
-                    Box::new(self.resolve_type(b)?),
+                    Box::new(self.resolve_type_subst(a, subst)?),
+                    Box::new(self.resolve_type_subst(b, subst)?),
                 ))
             }
             "Patch" => {
@@ -177,8 +209,8 @@ impl Checker {
                 let [inner] = args else {
                     return Err(err("Patch<T> requiere exactamente 1 argumento de tipo"));
                 };
-                match self.resolve_type(inner)? {
-                    Type::Struct { .. } => Ok(Type::PatchOf(Box::new(self.resolve_type(inner)?))),
+                match self.resolve_type_subst(inner, subst)? {
+                    Type::Struct { .. } => Ok(Type::PatchOf(Box::new(self.resolve_type_subst(inner, subst)?))),
                     other => Err(err(format!(
                         "Patch<T> requiere que T sea un struct, se encontró {other:?}"
                     ))),
@@ -191,38 +223,91 @@ impl Checker {
                 let [k, v] = args else {
                     return Err(err("Map<K, V> requiere exactamente 2 argumentos de tipo"));
                 };
-                let k_ty = self.resolve_type(k)?;
+                let k_ty = self.resolve_type_subst(k, subst)?;
                 if !matches!(k_ty, Type::String | Type::Int) {
                     return Err(err(format!(
                         "Map<K, V>: K debe ser String o Int (son las únicas claves JSON válidas), se encontró {k_ty:?}"
                     )));
                 }
-                Ok(Type::MapOf(Box::new(k_ty), Box::new(self.resolve_type(v)?)))
+                Ok(Type::MapOf(Box::new(k_ty), Box::new(self.resolve_type_subst(v, subst)?)))
             }
             _ => {
                 if let Some(decl) = self.types.get(name) {
-                    if !decl.type_params.is_empty() {
-                        return Err(err(format!(
-                            "'{name}' es genérico — instanciar type/enum declarados por el usuario aún no está soportado (PLAN.md §3.6)"
-                        )));
+                    if decl.type_params.is_empty() {
+                        if !args.is_empty() {
+                            return Err(err(format!("'{name}' no es genérico, no toma argumentos de tipo")));
+                        }
+                        let resolved = self.resolve_type_subst(&decl.ty, subst)?;
+                        Ok(match resolved {
+                            Type::Struct { fields, .. } => Type::Struct { name: Some(name.to_string()), fields },
+                            other => other, // alias a un tipo no-struct, ej. `type Id = Int`
+                        })
+                    } else {
+                        // Genérico (GRAMMAR.md §3.6): NO se expande acá --
+                        // queda "opaco" como Type::Generic hasta que hace
+                        // falta la forma real (expand_generic_struct,
+                        // variant_field_types), igual que Result/Patch/Map.
+                        if args.len() != decl.type_params.len() {
+                            return Err(err(format!(
+                                "'{name}' espera {} argumento(s) de tipo, se dieron {}",
+                                decl.type_params.len(),
+                                args.len()
+                            )));
+                        }
+                        let resolved_args = args
+                            .iter()
+                            .map(|a| self.resolve_type_subst(a, subst))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(Type::Generic(name.to_string(), resolved_args))
                     }
-                    let resolved = self.resolve_type(&decl.ty)?;
-                    Ok(match resolved {
-                        Type::Struct { fields, .. } => Type::Struct { name: Some(name.to_string()), fields },
-                        other => other, // alias a un tipo no-struct, ej. `type Id = Int`
-                    })
-                } else if self.enums.contains_key(name) {
-                    if !args.is_empty() {
-                        return Err(err(format!(
-                            "'{name}' no toma argumentos de tipo (genéricos en enums declarados por el usuario aún no soportados)"
-                        )));
+                } else if let Some(decl) = self.enums.get(name) {
+                    if decl.type_params.is_empty() {
+                        if !args.is_empty() {
+                            return Err(err(format!("'{name}' no es genérico, no toma argumentos de tipo")));
+                        }
+                        Ok(Type::Enum(name.to_string()))
+                    } else {
+                        if args.len() != decl.type_params.len() {
+                            return Err(err(format!(
+                                "'{name}' espera {} argumento(s) de tipo, se dieron {}",
+                                decl.type_params.len(),
+                                args.len()
+                            )));
+                        }
+                        let resolved_args = args
+                            .iter()
+                            .map(|a| self.resolve_type_subst(a, subst))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Ok(Type::Generic(name.to_string(), resolved_args))
                     }
-                    Ok(Type::Enum(name.to_string()))
                 } else {
                     Err(err(format!("tipo desconocido: '{name}'")))
                 }
             }
         }
+    }
+
+    /// Expande un `type` genérico instanciado a sus campos reales, ej.
+    /// `Box<Int>` -> `[FieldType{value, Int}]`. Usado por field access y
+    /// construcción (ver check_expr/synth_expr) -- nunca por is_subtype,
+    /// que compara genéricos nominalmente (mismo nombre + mismos args ya
+    /// alcanza vía la igualdad derivada, ver types.rs).
+    fn expand_generic_struct(&self, name: &str, args: &[Type]) -> Result<Vec<FieldType>, CheckError> {
+        let decl = self.types.get(name).ok_or_else(|| err(format!("tipo desconocido: '{name}'")))?;
+        let TypeExpr::Struct(fields) = &decl.ty else {
+            return Err(err(format!("'{name}' no es un struct genérico, no se puede construir con {{...}}")));
+        };
+        let subst: HashMap<String, Type> = decl.type_params.iter().cloned().zip(args.iter().cloned()).collect();
+        fields
+            .iter()
+            .map(|f| {
+                Ok(FieldType {
+                    name: f.name.clone(),
+                    optional: f.optional,
+                    ty: self.resolve_type_subst(&f.ty, &subst)?,
+                })
+            })
+            .collect()
     }
 
     fn resolve_fn_signature(&self, f: &FnDecl) -> Result<(Vec<Type>, Type), CheckError> {
@@ -338,6 +423,13 @@ impl Checker {
             Expr::StructLit { name, variant: Some(v), fields } if name == "Result" => {
                 self.check_result_lit(v, fields, expected, env)
             }
+            // Construcción de un type/enum genérico DECLARADO POR EL USUARIO
+            // (GRAMMAR.md §3.6) -- igual que Result, no se puede sintetizar
+            // sin contexto (¿de dónde saldrían los argumentos de tipo?),
+            // así que necesita el `expected` ya instanciado como Generic.
+            Expr::StructLit { name, variant, fields } if self.is_user_generic(name) => {
+                self.check_generic_struct_lit(name, variant.as_deref(), fields, expected, env)
+            }
             // '[]' vacío: sin esto, synth_expr fallaría (no hay elemento del
             // que inferir el tipo). Con un List(T) esperado, alcanza con
             // verificar que efectivamente se pidió una lista -- vacía
@@ -391,6 +483,42 @@ impl Checker {
         self.check_expr(&fields[0].1, ty, env)
     }
 
+    /// `true` si `name` es un `type`/`enum` DECLARADO POR EL USUARIO con
+    /// type_params -- distinto de "Result"/"Patch"/"Map" (builtins, ya
+    /// manejados aparte) y de un type/enum normal (sin type_params, sigue
+    /// el camino existente de synth_struct_lit).
+    fn is_user_generic(&self, name: &str) -> bool {
+        self.types.get(name).is_some_and(|d| !d.type_params.is_empty())
+            || self.enums.get(name).is_some_and(|d| !d.type_params.is_empty())
+    }
+
+    fn check_generic_struct_lit(
+        &self,
+        name: &str,
+        variant: Option<&str>,
+        fields: &[(String, Expr)],
+        expected: &Type,
+        env: &Env,
+    ) -> Result<(), CheckError> {
+        let Type::Generic(gname, gargs) = expected else {
+            return Err(err(format!(
+                "'{name}' es genérico -- se necesita un tipo esperado ya instanciado (ej. anotá el 'let', o usalo donde el tipo ya se conoce), se encontró {expected:?}"
+            )));
+        };
+        if gname != name {
+            return Err(err(format!("se esperaba '{gname}', se encontró una construcción de '{name}'")));
+        }
+        let field_decls: Vec<FieldType> = match variant {
+            None => self.expand_generic_struct(name, gargs)?,
+            Some(vname) => self
+                .variant_field_types(expected, name, vname)?
+                .into_iter()
+                .map(|(n, ty)| FieldType { name: n, optional: false, ty })
+                .collect(),
+        };
+        self.check_fields_against_resolved(&field_decls, fields, env)
+    }
+
     fn check_match(
         &self,
         scrutinee: &Expr,
@@ -402,6 +530,7 @@ impl Checker {
         let enum_name = match &scrutinee_ty {
             Type::Enum(n) => n.clone(),
             Type::ResultOf(_, _) => "Result".to_string(),
+            Type::Generic(n, _) => n.clone(), // enum genérico instanciado, ej. Option<Int>
             other => return Err(err(format!("'match' requiere un valor de tipo enum, se encontró {other:?}"))),
         };
 
@@ -498,6 +627,29 @@ impl Checker {
                 other => Err(err(format!("Result no tiene variante '{other}'"))),
             };
         }
+        // Enum genérico instanciado (GRAMMAR.md §3.6): arma el subst
+        // type_param->arg concreto y resuelve los campos de la variante
+        // con ESE subst, igual que expand_generic_struct para structs.
+        if let Type::Generic(base_name, args) = scrutinee_ty {
+            let decl = self
+                .enums
+                .get(base_name.as_str())
+                .ok_or_else(|| err(format!("enum desconocido: '{base_name}'")))?;
+            let variant = decl
+                .variants
+                .iter()
+                .find(|v| v.name == variant_name)
+                .ok_or_else(|| err(format!("'{base_name}' no tiene variante '{variant_name}'")))?;
+            let subst: HashMap<String, Type> =
+                decl.type_params.iter().cloned().zip(args.iter().cloned()).collect();
+            let mut out = Vec::new();
+            if let Some(fields) = &variant.fields {
+                for f in fields {
+                    out.push((f.name.clone(), self.resolve_type_subst(&f.ty, &subst)?));
+                }
+            }
+            return Ok(out);
+        }
         let decl = self
             .enums
             .get(enum_name)
@@ -546,6 +698,13 @@ impl Checker {
                         .iter()
                         .find(|f| &f.name == field)
                         .map(|f| f.ty.clone())
+                        .ok_or_else(|| err(format!("el struct no tiene campo '{field}'"))),
+                    // struct genérico instanciado, ej. una variable Box<Int>
+                    Type::Generic(name, args) => self
+                        .expand_generic_struct(&name, &args)?
+                        .into_iter()
+                        .find(|f| &f.name == field)
+                        .map(|f| f.ty)
                         .ok_or_else(|| err(format!("el struct no tiene campo '{field}'"))),
                     other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
                 }
@@ -776,6 +935,14 @@ impl Checker {
                 "'Result.Ok'/'Result.Err' necesitan un tipo esperado del contexto (ej. el retorno declarado del rpc) — no se pueden usar en posición de síntesis (GRAMMAR.md §3.5)",
             ));
         }
+        // Un type/enum genérico no puede sintetizarse: ¿de dónde saldrían
+        // sus argumentos de tipo sin un `expected` que ya los traiga? Mismo
+        // motivo que Result arriba -- ver check_generic_struct_lit.
+        if self.is_user_generic(name) {
+            return Err(err(format!(
+                "'{name}' es genérico -- necesita un tipo esperado del contexto para inferir los argumentos de tipo (ej. anotá el 'let', o usalo donde el tipo ya se conoce)"
+            )));
+        }
         match variant {
             Some(vname) => {
                 let decl = self
@@ -796,7 +963,7 @@ impl Checker {
                     return Err(err(format!("'{name}' no es un tipo struct, no se puede construir con {{...}}")));
                 };
                 self.check_fields_against(decl_fields, fields, env)?;
-                self.resolve_named_type(name, &[])
+                self.resolve_type(&TypeExpr::Named(name.to_string(), vec![]))
             }
         }
     }
@@ -807,13 +974,35 @@ impl Checker {
         given: &[(String, Expr)],
         env: &Env,
     ) -> Result<(), CheckError> {
+        let resolved = decl_fields
+            .iter()
+            .map(|f| {
+                Ok(FieldType {
+                    name: f.name.clone(),
+                    optional: f.optional,
+                    ty: self.resolve_type(&f.ty)?,
+                })
+            })
+            .collect::<Result<Vec<_>, CheckError>>()?;
+        self.check_fields_against_resolved(&resolved, given, env)
+    }
+
+    /// Igual que `check_fields_against`, pero para cuando los campos ya
+    /// están resueltos (con un subst de genérico ya aplicado) -- ver
+    /// `check_generic_struct_lit`, que no puede usar `resolve_type` normal
+    /// porque los campos de un genérico instanciado necesitan `resolve_type_subst`.
+    fn check_fields_against_resolved(
+        &self,
+        decl_fields: &[FieldType],
+        given: &[(String, Expr)],
+        env: &Env,
+    ) -> Result<(), CheckError> {
         for (fname, fexpr) in given {
             let decl_f = decl_fields
                 .iter()
                 .find(|f| &f.name == fname)
                 .ok_or_else(|| err(format!("campo desconocido: '{fname}'")))?;
-            let fty = self.resolve_type(&decl_f.ty)?;
-            self.check_expr(fexpr, &fty, env)?;
+            self.check_expr(fexpr, &decl_f.ty, env)?;
         }
         for decl_f in decl_fields {
             if !decl_f.optional && !given.iter().any(|(n, _)| n == &decl_f.name) {
@@ -995,6 +1184,90 @@ mod tests {
     fn map_rejects_non_json_key_types() {
         let result = check_source("fn f(m: Map<Bool, Int>) -> Int { 0 }");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn generic_struct_instantiates_constructs_and_accesses_fields() {
+        let src = r#"
+            type Box<T> = { value: T }
+            fn wrap(n: Int) -> Box<Int> { Box { value: n } }
+            fn unwrap(b: Box<Int>) -> Int { b.value }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn generic_enum_instantiates_constructs_matches_exhaustively() {
+        let src = r#"
+            enum Option<T> {
+                Some { value: T },
+                None,
+            }
+            fn find(has_it: Bool, n: Int) -> Option<Int> {
+                // Option.None necesita "{}" explícito COMO EXPRESIÓN (el
+                // lookahead del parser solo reconoce un literal de variante
+                // si ve "{" después) -- distinto del patrón de match, que
+                // no lo exige para una variante sin campos.
+                if has_it { Option.Some { value: n } } else { Option.None {} }
+            }
+            fn unwrap_or(o: Option<Int>, default: Int) -> Int {
+                match o {
+                    Option.Some { value: v } => v,
+                    Option.None => default,
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn generic_match_still_requires_exhaustiveness() {
+        let src = r#"
+            enum Option<T> { Some { value: T }, None }
+            fn f(o: Option<Int>) -> Int {
+                match o {
+                    Option.Some { value: v } => v,
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn generic_construction_without_context_is_rejected() {
+        // Igual que Result: no hay de dónde inferir los argumentos de tipo
+        // sin un `expected` -- síntesis pura no alcanza (GRAMMAR.md §3.6).
+        let src = r#"
+            type Box<T> = { value: T }
+            fn f() -> Int {
+                let b = Box { value: 1 };
+                0
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn generic_wrong_arg_count_is_rejected() {
+        let src = r#"
+            type Pair<A, B> = { first: A, second: B }
+            fn f(p: Pair<Int>) -> Int { 0 }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn different_generic_instantiations_are_not_interchangeable() {
+        // Decisión deliberada (GRAMMAR.md §3.6): una vez genérico, la
+        // comparación es NOMINAL (nombre + args), no estructural -- aunque
+        // Box<Int> y un struct plano {value: Int} tengan la misma forma,
+        // no son intercambiables.
+        let src = r#"
+            type Box<T> = { value: T }
+            fn takes_box(b: Box<Int>) -> Int { b.value }
+            fn f(plain: { value: Int }) -> Int { takes_box(plain) }
+        "#;
+        assert!(check_source(src).is_err());
     }
 
     #[test]
