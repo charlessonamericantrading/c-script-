@@ -721,6 +721,17 @@ impl Checker {
                 self.expect_no_args(args, "toInt")?;
                 Some(Type::Int)
             }
+            (Type::String, "length") => {
+                self.expect_no_args(args, "length")?;
+                Some(Type::Int)
+            }
+            (Type::String, "contains") => {
+                let [needle] = args else {
+                    return Err(err("'contains' toma exactamente 1 argumento"));
+                };
+                self.check_expr(needle, &Type::String, env)?;
+                Some(Type::Bool)
+            }
             _ => None,
         };
         Ok(ty)
@@ -918,6 +929,18 @@ mod tests {
     fn numeric_conversion_methods_work() {
         assert!(check_source("fn f(n: Int) -> Float { n.toFloat() }").is_ok());
         assert!(check_source("fn f(n: Float) -> Int { n.toInt() }").is_ok());
+    }
+
+    #[test]
+    fn string_length_and_contains_work() {
+        assert!(check_source(r#"fn f(s: String) -> Int { s.length() }"#).is_ok());
+        assert!(check_source(r#"fn f(s: String) -> Bool { s.contains("@") }"#).is_ok());
+    }
+
+    #[test]
+    fn string_methods_reject_wrong_args() {
+        assert!(check_source(r#"fn f(s: String) -> Int { s.length(1) }"#).is_err());
+        assert!(check_source(r#"fn f(s: String) -> Bool { s.contains(1) }"#).is_err());
     }
 
     #[test]

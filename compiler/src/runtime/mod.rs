@@ -114,7 +114,7 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                 // Métodos builtin sobre primitivos (GRAMMAR.md §3.8, ej.
                 // `x.toFloat()`) usan el mismo BoundMethod que db/listas --
                 // el checker ya validó que el nombre existe para este tipo.
-                Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Float(_) => {
+                Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -327,6 +327,19 @@ fn call_method(receiver: Value, method: &str, args: Vec<Value>, db: &Db) -> Resu
         Value::Float(n) => match method {
             "toInt" => Ok(Value::Int(n as i64)), // trunca hacia cero, no redondea (GRAMMAR.md §3.8)
             other => Err(err(format!("método desconocido sobre Float: '{other}'"))),
+        },
+        Value::Str(s) => match method {
+            // chars().count(), no .len(): .len() cuenta bytes UTF-8, no
+            // caracteres -- "é" son 2 bytes pero 1 carácter.
+            "length" => Ok(Value::Int(s.chars().count() as i64)),
+            "contains" => {
+                let needle = match args.first() {
+                    Some(Value::Str(n)) => n,
+                    _ => return Err(err("'contains' requiere un argumento String")),
+                };
+                Ok(Value::Bool(s.contains(needle.as_str())))
+            }
+            other => Err(err(format!("método desconocido sobre String: '{other}'"))),
         },
         other => Err(err(format!("no se puede invocar '{method}' sobre {other:?}"))),
     }
@@ -563,6 +576,36 @@ mod tests {
     }
 
     #[test]
+    fn string_methods_work_in_runtime() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc len(s: String) -> Int { s.length() }
+                rpc has(s: String, needle: String) -> Bool { s.contains(needle) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(
+            invoke_rpc(&program, "S", "len", &json!({"s": "hola"}), &db).unwrap(),
+            json!(4)
+        );
+        // "é" es 2 bytes en UTF-8 pero 1 carácter -- .length() cuenta caracteres.
+        assert_eq!(
+            invoke_rpc(&program, "S", "len", &json!({"s": "café"}), &db).unwrap(),
+            json!(4)
+        );
+        assert_eq!(
+            invoke_rpc(&program, "S", "has", &json!({"s": "ada@example.com", "needle": "@"}), &db).unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            invoke_rpc(&program, "S", "has", &json!({"s": "sin arroba", "needle": "@"}), &db).unwrap(),
+            json!(false)
+        );
+    }
+
+    #[test]
     fn numeric_conversion_works_in_runtime() {
         let program = program_from(
             r#"
@@ -671,6 +714,6 @@ mod tests {
         assert_eq!(result["type"], json!("Err"));
         assert_eq!(result["error"]["type"], json!("TooShort"));
         assert_eq!(result["error"]["field"], json!("name"));
-        assert_eq!(result["error"]["min"], json!(1));
+        assert_eq!(result["error"]["min"], json!(2));
     }
 }

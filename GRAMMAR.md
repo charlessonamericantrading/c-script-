@@ -362,8 +362,10 @@ Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos,
 |---|---|---|---|
 | `.toFloat()` | `Int` | `Float` | conversión exacta |
 | `.toInt()` | `Float` | `Int` | trunca hacia cero (`3.9`→`3`, `-3.9`→`-3`), igual que `as` en Rust — no redondea |
+| `.length()` | `String` | `Int` | cantidad de caracteres |
+| `.contains(s: String)` | `String` | `Bool` | substring, no regex |
 
-No hay coerción implícita en ningún operador (§3.7) — estas son las únicas conversiones numéricas, y son siempre explícitas.
+No hay coerción implícita en ningún operador (§3.7) — estas son las únicas conversiones numéricas, y son siempre explícitas. `.length()`/`.contains()` son método, no propiedad (`x.length`, sin paréntesis) — consistencia con `.toFloat()`/`.toInt()` importó más acá que imitar la convención de propiedad de JS/TS.
 
 ---
 
