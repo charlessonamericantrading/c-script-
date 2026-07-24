@@ -184,6 +184,21 @@ impl Checker {
                     ))),
                 }
             }
+            "Map" => {
+                // Builtin (GRAMMAR.md §2.2) -- documentado como el reemplazo
+                // de `{K: V}` desde que se descubrió esa ambigüedad, pero
+                // nunca conectado acá hasta ahora (bug real, no solo gap).
+                let [k, v] = args else {
+                    return Err(err("Map<K, V> requiere exactamente 2 argumentos de tipo"));
+                };
+                let k_ty = self.resolve_type(k)?;
+                if !matches!(k_ty, Type::String | Type::Int) {
+                    return Err(err(format!(
+                        "Map<K, V>: K debe ser String o Int (son las únicas claves JSON válidas), se encontró {k_ty:?}"
+                    )));
+                }
+                Ok(Type::MapOf(Box::new(k_ty), Box::new(self.resolve_type(v)?)))
+            }
             _ => {
                 if let Some(decl) = self.types.get(name) {
                     if !decl.type_params.is_empty() {
@@ -536,6 +551,9 @@ impl Checker {
                 }
             }
             Expr::Call { callee, args } => {
+                if let Some(ty) = self.try_builtin_method(callee, args, env)? {
+                    return Ok(ty);
+                }
                 let callee_ty = self.synth_expr(callee, env)?;
                 match callee_ty {
                     Type::Dynamic => {
@@ -682,6 +700,37 @@ impl Checker {
                 Ok(Type::Bool)
             }
         }
+    }
+
+    /// Reconoce `base.metodo(args)` como un builtin sobre un primitivo
+    /// (GRAMMAR.md §3.8) antes de que el camino genérico intente resolver
+    /// `callee` como FieldAccess normal (que fallaría: Int/Float/String no
+    /// son Struct ni Dynamic). `Ok(None)` = no es un builtin conocido, seguí
+    /// con el camino genérico de Call sin tocar nada.
+    fn try_builtin_method(&self, callee: &Expr, args: &[Expr], env: &Env) -> Result<Option<Type>, CheckError> {
+        let Expr::FieldAccess { base, field } = callee else {
+            return Ok(None);
+        };
+        let base_ty = self.synth_expr(base, env)?;
+        let ty = match (&base_ty, field.as_str()) {
+            (Type::Int, "toFloat") => {
+                self.expect_no_args(args, "toFloat")?;
+                Some(Type::Float)
+            }
+            (Type::Float, "toInt") => {
+                self.expect_no_args(args, "toInt")?;
+                Some(Type::Int)
+            }
+            _ => None,
+        };
+        Ok(ty)
+    }
+
+    fn expect_no_args(&self, args: &[Expr], method: &str) -> Result<(), CheckError> {
+        if !args.is_empty() {
+            return Err(err(format!("'{method}' no toma argumentos")));
+        }
+        Ok(())
     }
 
     fn synth_struct_lit(
@@ -863,6 +912,33 @@ mod tests {
         assert!(check_source("fn f() -> Int { let xs = [1, 2, 3]; xs[0] }").is_ok());
         assert!(check_source(r#"fn f() -> Int { let xs = [1, 2, 3]; xs["0"] }"#).is_err());
         assert!(check_source("fn f() -> Int { let x = 5; x[0] }").is_err()); // Int no es indexable
+    }
+
+    #[test]
+    fn numeric_conversion_methods_work() {
+        assert!(check_source("fn f(n: Int) -> Float { n.toFloat() }").is_ok());
+        assert!(check_source("fn f(n: Float) -> Int { n.toInt() }").is_ok());
+    }
+
+    #[test]
+    fn numeric_conversion_rejects_wrong_receiver_or_args() {
+        assert!(check_source("fn f(n: Float) -> Float { n.toFloat() }").is_err()); // toFloat es de Int
+        assert!(check_source("fn f(n: Int) -> Float { n.toFloat(1) }").is_err()); // no toma argumentos
+    }
+
+    #[test]
+    fn map_of_string_int_is_accepted() {
+        // Bug real: esto estaba documentado en GRAMMAR.md como el reemplazo
+        // de {K:V} pero nunca se conectó al checker -- tiraba "tipo
+        // desconocido: 'Map'" antes de este fix.
+        assert!(check_source("fn f(m: Map<String, Int>) -> Int { 0 }").is_ok());
+        assert!(check_source("fn f(m: Map<Int, String>) -> Int { 0 }").is_ok());
+    }
+
+    #[test]
+    fn map_rejects_non_json_key_types() {
+        let result = check_source("fn f(m: Map<Bool, Int>) -> Int { 0 }");
+        assert!(result.is_err());
     }
 
     #[test]

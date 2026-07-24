@@ -111,7 +111,10 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                     .map(|(_, v)| v)
                     .ok_or_else(|| err(format!("no existe el campo '{field}'"))),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
-                Value::DbCollection(_) | Value::List(_) => {
+                // Métodos builtin sobre primitivos (GRAMMAR.md §3.8, ej.
+                // `x.toFloat()`) usan el mismo BoundMethod que db/listas --
+                // el checker ya validó que el nombre existe para este tipo.
+                Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Float(_) => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -316,6 +319,14 @@ fn call_method(receiver: Value, method: &str, args: Vec<Value>, db: &Db) -> Resu
                 Ok(Value::List(items.into_iter().take(n).collect()))
             }
             other => Err(err(format!("método de lista desconocido: '{other}'"))),
+        },
+        Value::Int(n) => match method {
+            "toFloat" => Ok(Value::Float(n as f64)),
+            other => Err(err(format!("método desconocido sobre Int: '{other}'"))),
+        },
+        Value::Float(n) => match method {
+            "toInt" => Ok(Value::Int(n as i64)), // trunca hacia cero, no redondea (GRAMMAR.md §3.8)
+            other => Err(err(format!("método desconocido sobre Float: '{other}'"))),
         },
         other => Err(err(format!("no se puede invocar '{method}' sobre {other:?}"))),
     }
@@ -549,6 +560,32 @@ mod tests {
         );
         let result = invoke_rpc(&program, "S", "f", &json!({}), &Db::seeded());
         assert!(result.is_err(), "indexar fuera de rango debería fallar, no devolver null");
+    }
+
+    #[test]
+    fn numeric_conversion_works_in_runtime() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc toFloat(n: Int) -> Float { n.toFloat() }
+                rpc toInt(n: Float) -> Int { n.toInt() }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(
+            invoke_rpc(&program, "S", "toFloat", &json!({"n": 3}), &db).unwrap(),
+            json!(3.0)
+        );
+        // trunca hacia cero, no redondea
+        assert_eq!(
+            invoke_rpc(&program, "S", "toInt", &json!({"n": 3.9}), &db).unwrap(),
+            json!(3)
+        );
+        assert_eq!(
+            invoke_rpc(&program, "S", "toInt", &json!({"n": -3.9}), &db).unwrap(),
+            json!(-3)
+        );
     }
 
     #[test]

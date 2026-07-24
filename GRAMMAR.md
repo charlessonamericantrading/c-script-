@@ -354,6 +354,17 @@ Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos,
 
 `if cond { A } else { B }` es de **modo chequeo**, igual que `match` (§3.1): no tiene un tipo propio que sintetizar, necesita el tipo esperado del contexto para verificar que `cond ⇐ Bool` y que tanto `A` como `B` chequean contra ese mismo tipo esperado. Es la misma familia de regla que `match` — control de flujo condicional siempre se chequea top-down, nunca se infiere bottom-up.
 
+### 3.8 Métodos builtin sobre primitivos
+
+`x.metodo()` sobre un valor primitivo (no un struct/enum declarado) no es acceso a un campo real — es azúcar reconocida por nombre y tipo del receptor, resuelta ANTES de intentar el `FieldAccess` genérico (que fallaría: `Int`/`Float`/`String` no son `Struct` ni `Dynamic`). Es el mismo mecanismo que ya resolvía `db.users.find(...)` (`checker.rs`/`runtime/mod.rs`, `BoundMethod`), generalizado a primitivos.
+
+| Método | Receptor | Resultado | Nota |
+|---|---|---|---|
+| `.toFloat()` | `Int` | `Float` | conversión exacta |
+| `.toInt()` | `Float` | `Int` | trunca hacia cero (`3.9`→`3`, `-3.9`→`-3`), igual que `as` en Rust — no redondea |
+
+No hay coerción implícita en ningún operador (§3.7) — estas son las únicas conversiones numéricas, y son siempre explícitas.
+
 ---
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)

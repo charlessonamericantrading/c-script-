@@ -34,6 +34,11 @@ pub enum Type {
     /// Se emite como el `Partial<T>` de TS (ver codegen/ts_emit.rs), que ya
     /// tiene exactamente la semántica que se documentó ahí.
     PatchOf(Box<Type>),
+    /// `Map<K, V>` builtin (GRAMMAR.md §2.2) -- la forma de reemplazar el
+    /// `{K: V}` literal que se dejó deferido por ambigüedad real con structs
+    /// de un campo. `K` limitado a `String`/`Int` (claves JSON), igual que
+    /// `{K: V}` en la tabla de mapeo (§4). Se emite como `Record<K, V>`.
+    MapOf(Box<Type>, Box<Type>),
     /// Pseudo-tipo para valores del runtime aún no modelado (p. ej. `db`).
     /// Compatible con cualquier tipo en ambas direcciones, como `any` de TS —
     /// deliberado para v0: el checker todavía no conoce la forma de la base
@@ -66,6 +71,7 @@ pub fn is_subtype(sub: &Type, sup: &Type) -> bool {
         }
         (ResultOf(a1, b1), ResultOf(a2, b2)) => is_subtype(a1, a2) && is_subtype(b1, b2),
         (PatchOf(a), PatchOf(b)) => is_subtype(a, b),
+        (MapOf(k1, v1), MapOf(k2, v2)) => is_subtype(k1, k2) && is_subtype(v1, v2),
         (
             Struct {
                 fields: sub_fields, ..
@@ -138,6 +144,15 @@ mod tests {
         assert!(is_subtype(&required, &optional));
         // ...pero no al revés: falta la garantía de que siempre esté.
         assert!(!is_subtype(&optional, &required));
+    }
+
+    #[test]
+    fn map_of_subtyping_is_covariant_in_key_and_value() {
+        let narrow = Type::MapOf(Box::new(Type::String), Box::new(Type::Int));
+        let same = Type::MapOf(Box::new(Type::String), Box::new(Type::Int));
+        assert!(is_subtype(&narrow, &same));
+        let different_value = Type::MapOf(Box::new(Type::String), Box::new(Type::String));
+        assert!(!is_subtype(&narrow, &different_value));
     }
 
     #[test]

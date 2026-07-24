@@ -284,6 +284,10 @@ fn render_type(ty: &Type) -> String {
         Type::Enum(name) => name.clone(),
         Type::ResultOf(a, b) => format!("Result<{}, {}>", render_type(a), render_type(b)),
         Type::PatchOf(inner) => format!("Patch<{}>", render_type(inner)),
+        // `Record<K,V>` es un utility type NATIVO de TS -- a diferencia de
+        // Result/Patch, no hace falta definirlo en el preámbulo del
+        // contrato ni importarlo (ver collect_type_names).
+        Type::MapOf(k, v) => format!("Record<{}, {}>", render_type(k), render_type(v)),
         Type::Dynamic => "unknown".to_string(),
     }
 }
@@ -313,6 +317,12 @@ fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeSet<String>)
         Type::PatchOf(inner) => {
             names.insert("Patch".to_string());
             collect_type_names(inner, names);
+        }
+        // Record<K,V> es nativo de TS -- no se agrega "Map"/"Record" a los
+        // imports, solo se recorre K y V por si referencian algo propio.
+        Type::MapOf(k, v) => {
+            collect_type_names(k, names);
+            collect_type_names(v, names);
         }
         Type::Optional(inner) | Type::List(inner) => collect_type_names(inner, names),
         Type::Tuple(items) => {
@@ -443,5 +453,14 @@ mod tests {
     fn patch_is_just_partial() {
         let (contract, _) = emit_both(&users_demo_src());
         assert!(contract.contains("export type Patch<T> = Partial<T>;"));
+    }
+
+    #[test]
+    fn map_renders_as_native_record_without_needing_an_import() {
+        let src = "type Config = { flags: Map<String, Bool> }";
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("flags: Record<string, boolean>;"));
+        // Record es nativo de TS -- no debería aparecer en ningún import
+        assert!(!contract.contains("import"));
     }
 }
