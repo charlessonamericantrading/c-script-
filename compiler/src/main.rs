@@ -12,8 +12,9 @@ mod types;
 use ast::Program;
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, SystemTime};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -21,11 +22,13 @@ fn main() -> ExitCode {
         Some("build") => cmd_build(&args[2..]),
         Some("serve") => cmd_serve(&args[2..]),
         Some("new") => cmd_new(&args[2..]),
+        Some("dev") => cmd_dev(&args[2..]),
         Some(path) => cmd_check(path), // `linkc <archivo.link>` -- solo lex+parse+check
         None => {
             eprintln!("uso: linkc <archivo.link>                  (lexea, parsea y tipa)");
             eprintln!("     linkc new <nombre>                     (crea un proyecto nuevo)");
             eprintln!("     linkc build <archivo.link> <outdir>    (+ emite contract.d.ts y client.ts)");
+            eprintln!("     linkc dev <archivo.link> <outdir>      (+ observa y reconstruye solo)");
             eprintln!("     linkc serve <archivo.link> <puerto>    (+ sirve los rpc por HTTP)");
             ExitCode::FAILURE
         }
@@ -57,11 +60,11 @@ fn load_and_check(path: &str) -> Result<Program, ExitCode> {
 }
 
 fn cmd_check(path: &str) -> ExitCode {
-    // `linkc <algo>` cae acá para cualquier <algo> que no sea "build"/"serve"/
-    // "new" -- si además no parece un archivo real, es casi seguro un
+    // `linkc <algo>` cae acá para cualquier <algo> que no sea un subcomando
+    // conocido -- si además no parece un archivo real, es casi seguro un
     // subcomando mal escrito, no un archivo que el usuario quiere tipar.
     if !path.ends_with(".link") && !Path::new(path).exists() {
-        eprintln!("'{path}' no es un subcomando conocido (build, serve, new) ni un archivo .link existente");
+        eprintln!("'{path}' no es un subcomando conocido (build, serve, new, dev) ni un archivo .link existente");
         return ExitCode::FAILURE;
     }
     match load_and_check(path) {
@@ -73,49 +76,105 @@ fn cmd_check(path: &str) -> ExitCode {
     }
 }
 
-fn cmd_build(args: &[String]) -> ExitCode {
-    let (Some(path), Some(outdir)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc build <archivo.link> <outdir>");
-        return ExitCode::FAILURE;
-    };
+/// Resultado de un build: si tuvo éxito, y qué archivos físicos se
+/// tocaron. `link dev` necesita `touched` INCLUSO cuando `ok` es falso --
+/// si el error es de tipos (no de carga), ya sabemos qué archivos observar
+/// para el próximo intento; si falló la carga misma, al menos queda el
+/// archivo de entrada.
+struct BuildResult {
+    ok: bool,
+    touched: Vec<PathBuf>,
+}
 
-    let program = match load_and_check(path) {
-        Ok(p) => p,
-        Err(code) => return code,
+fn build_once(path: &str, outdir: &str) -> BuildResult {
+    let (program, touched) = match modules::load_program(Path::new(path)) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("{e}");
+            return BuildResult { ok: false, touched: vec![PathBuf::from(path)] };
+        }
     };
+    if let Err(errors) = checker::Checker::check_program(&program) {
+        for e in &errors {
+            eprintln!("{e}");
+        }
+        return BuildResult { ok: false, touched };
+    }
 
     let contract = match codegen::ts_emit::emit_contract(&program) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error al emitir contract.d.ts: {e}");
-            return ExitCode::FAILURE;
+            return BuildResult { ok: false, touched };
         }
     };
     let client = match codegen::ts_emit::emit_client(&program) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error al emitir client.ts: {e}");
-            return ExitCode::FAILURE;
+            return BuildResult { ok: false, touched };
         }
     };
 
     if let Err(e) = fs::create_dir_all(outdir) {
         eprintln!("no se pudo crear {outdir}: {e}");
-        return ExitCode::FAILURE;
+        return BuildResult { ok: false, touched };
     }
     let contract_path = format!("{outdir}/contract.d.ts");
     let client_path = format!("{outdir}/client.ts");
     if let Err(e) = fs::write(&contract_path, contract) {
         eprintln!("no se pudo escribir {contract_path}: {e}");
-        return ExitCode::FAILURE;
+        return BuildResult { ok: false, touched };
     }
     if let Err(e) = fs::write(&client_path, client) {
         eprintln!("no se pudo escribir {client_path}: {e}");
-        return ExitCode::FAILURE;
+        return BuildResult { ok: false, touched };
     }
 
     println!("OK: generado {contract_path} y {client_path}");
-    ExitCode::SUCCESS
+    BuildResult { ok: true, touched }
+}
+
+fn cmd_build(args: &[String]) -> ExitCode {
+    let (Some(path), Some(outdir)) = (args.first(), args.get(1)) else {
+        eprintln!("uso: linkc build <archivo.link> <outdir>");
+        return ExitCode::FAILURE;
+    };
+    if build_once(path, outdir).ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+/// Snapshot de mtimes de una lista de archivos, en el mismo orden -- `None`
+/// si un archivo dejó de existir (se borró, o el path quedó viejo tras un
+/// rename). Comparar dos snapshots detecta tanto "un archivo cambió" como
+/// "la lista de archivos a observar cambió de tamaño" (ej. una import
+/// nueva) en una sola comparación de `Vec`.
+fn snapshot_mtimes(paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
+    paths.iter().map(|p| fs::metadata(p).and_then(|m| m.modified()).ok()).collect()
+}
+
+fn cmd_dev(args: &[String]) -> ExitCode {
+    let (Some(path), Some(outdir)) = (args.first(), args.get(1)) else {
+        eprintln!("uso: linkc dev <archivo.link> <outdir>");
+        return ExitCode::FAILURE;
+    };
+
+    println!("linkc dev: observando '{path}' y sus imports (Ctrl+C para detener)");
+    let mut result = build_once(path, outdir);
+    let mut mtimes = snapshot_mtimes(&result.touched);
+
+    loop {
+        std::thread::sleep(Duration::from_millis(400));
+        let current = snapshot_mtimes(&result.touched);
+        if current != mtimes {
+            println!("cambio detectado, reconstruyendo...");
+            result = build_once(path, outdir);
+            mtimes = snapshot_mtimes(&result.touched);
+        }
+    }
 }
 
 fn cmd_serve(args: &[String]) -> ExitCode {

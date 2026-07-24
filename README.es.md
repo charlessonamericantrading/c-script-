@@ -36,6 +36,8 @@ cd ../frontend && node src/main.ts                  # llama al server real, tipa
 
 Ahora rompé algo: en `examples/users.link`, renombrá `name` a `fullName` dentro de `type User`. Volvé a correr `linkc build` y `npx tsc --noEmit` **sin tocar `frontend/src/main.ts`**. `tsc` va a fallar en cada línea que usaba `.name` — exactamente el punto ciego que c-script existe para eliminar (ver [PLAN.md](PLAN.md) §3).
 
+Arrancar un proyecto de cero es más rápido: `linkc new mi-app` scaffoldea un `.link` mínimo más un `frontend/` a juego; `linkc dev mi-app/main.link mi-app/gen` lo observa (y a todo lo que importe) y regenera el contrato en cada guardado, en vez de correr `build` a mano cada vez.
+
 ## Estado
 
 Completo (Fase 0): lexer, parser, type checker bidireccional (subtipado estructural/nominal, `Result<T,E>` y `Patch<T>` como builtins, operadores aritmético-lógicos, `if/else`, asignación y mutabilidad, arrays, tuplas, conversión numérica explícita, `Map<K,V>`, métodos builtin de `String`), genéricos definidos por el usuario vía monomorfización, uniones de tipo (`A | B`) con subtipado de flujo de valor, funciones como valores de primera clase (referencias con nombre, con subtipado de funciones contravariante/covariante real), exhaustividad de `match` extendida con patrones de literales, or-patterns y guardas, declaraciones `const`, emisor de contrato, runtime interpretado mínimo. 133 tests, todos pasando.

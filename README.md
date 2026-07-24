@@ -36,6 +36,8 @@ cd ../frontend && node src/main.ts                  # calls the real server, typ
 
 Now break something: in `examples/users.link`, rename `name` to `fullName` inside `type User`. Re-run `linkc build` and `npx tsc --noEmit` **without touching `frontend/src/main.ts`**. `tsc` fails on every line that used `.name` — exactly the blind spot c-script exists to eliminate (see [PLAN.md](PLAN.md) §3).
 
+Starting a project from scratch is faster: `linkc new my-app` scaffolds a minimal `.link` file plus a matching `frontend/`; `linkc dev my-app/main.link my-app/gen` watches it (and anything it `import`s) and regenerates the contract on every save, instead of re-running `build` by hand.
+
 ## Why not just tRPC / Bun / Deno?
 
 They solve adjacent but different problems:
