@@ -124,12 +124,14 @@ unary_expr        = ( "!" | "-" ) , unary_expr | postfix_expr ;
 
 postfix_expr = primary_expr , { postfix_op } ;
 postfix_op   = "." , identifier                   (* acceso a campo / método: db.users *)
+             | "." , int_lit                       (* acceso posicional a tupla: t.0 *)
              | "(" , [ arg_list ] , ")"            (* llamada: f(x), o encadenada: db.users.find(id) *)
              | "[" , expr , "]" ;                  (* indexado: arr[i] *)
 arg_list     = expr , { "," , expr } ;
 
 primary_expr = struct_or_variant_lit
              | array_lit
+             | tuple_lit
              | identifier
              | int_lit | float_lit | string_lit | bool_lit | "null"
              | "(" , expr , ")" ;
@@ -139,6 +141,10 @@ field_init_list        = field_init , { "," , field_init } ;
 field_init             = identifier , ":" , expr ;
 
 array_lit = "[" , [ expr , { "," , expr } , [ "," ] ] , "]" ;
+
+(* misma ambigüedad y misma solución que en tipos (§2.2): (a) es agrupación,
+   (a,) tupla de 1, (a,b) tupla de 2+ -- requiere ≥1 coma para NO ser Paren. *)
+tuple_lit = "(" , expr , "," , [ expr , { "," , expr } ] , ")" ;
 
 match_expr   = "match" , expr , "{" , { match_arm } , "}" ;
 match_arm    = pattern , "=>" , ( expr , "," | block ) ;
@@ -153,6 +159,8 @@ field_pattern       = identifier , [ ":" , pattern ] ;        (* shorthand: `x` 
 **`[]` vacío solo en modo chequeo.** Sin elementos no hay de dónde sintetizar el tipo — `[]` únicamente es válido donde el contexto ya da un tipo esperado `T[]` (ej. `let xs: Int[] = [];`), igual que `Result.Ok`/`Result.Err` (§3.5). Un array no vacío sí sintetiza: se infiere del primer elemento y se chequea que el resto coincida.
 
 **Indexar fuera de rango es un error de runtime, no `null`.** `arr[i]` con `i` fuera de rango falla en tiempo de ejecución en vez de devolver un valor nulo silencioso — la alternativa (devolver `T?` siempre, incluso cuando `T` no es nullable) ensuciaría el tipo de CADA acceso a un array por un caso excepcional. Es la misma decisión que Rust (panic) y distinta de la de JS (`undefined`).
+
+**`t.0.1` no encadena — limitación conocida del lexer, no un error silencioso.** El lexer decide si `0.1` es un solo `float_lit` o dos `int_lit` separados por un `.` mirando únicamente los caracteres, sin saber que venía de un acceso posicional a tupla — así que `t.0.1` se lexea como `Ident("t")`, `Dot`, `Float(0.1)`, no como dos accesos encadenados. Rust tiene el mismo problema de fondo y lo resuelve con una regla especial en su lexer; acá, mientras tanto, la forma de acceder a una tupla anidada es `let inner = t.0; inner.1;`.
 
 **Nota de implementación — lookahead de `struct_or_variant_lit`:** distinguir `Result.Ok { value: u }` (literal de variante) de `db.users` (acceso encadenado, sin `{` después) requiere que el parser mire hasta 2 tokens adelante antes de decidir. No es una ambigüedad del lenguaje — es la misma clase de decisión que "no struct literals en la condición de un `if`" en Rust: una regla del parser, no del árbol de derivación.
 

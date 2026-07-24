@@ -613,6 +613,26 @@ impl Checker {
                     other => Err(err(format!("no se puede indexar un valor de tipo {other:?} (se esperaba una lista)"))),
                 }
             }
+            Expr::TupleLit(items) => {
+                let mut tys = Vec::new();
+                for item in items {
+                    tys.push(self.synth_expr(item, env)?);
+                }
+                Ok(Type::Tuple(tys))
+            }
+            Expr::TupleIndex { base, index } => {
+                let base_ty = self.synth_expr(base, env)?;
+                match base_ty {
+                    Type::Tuple(items) => items.get(*index).cloned().ok_or_else(|| {
+                        err(format!(
+                            "índice de tupla .{index} fuera de rango (tiene {} elementos)",
+                            items.len()
+                        ))
+                    }),
+                    Type::Dynamic => Ok(Type::Dynamic),
+                    other => Err(err(format!("'.{index}' requiere una tupla, se encontró {other:?}"))),
+                }
+            }
             Expr::Paren(inner) => self.synth_expr(inner, env),
         }
     }
@@ -929,6 +949,19 @@ mod tests {
     fn numeric_conversion_methods_work() {
         assert!(check_source("fn f(n: Int) -> Float { n.toFloat() }").is_ok());
         assert!(check_source("fn f(n: Float) -> Int { n.toInt() }").is_ok());
+    }
+
+    #[test]
+    fn tuple_literal_synthesizes_and_index_returns_element_type() {
+        assert!(check_source(r#"fn f() -> (Int, String) { (1, "a") }"#).is_ok());
+        assert!(check_source(r#"fn f() -> Int { let t = (1, "a"); t.0 }"#).is_ok());
+        assert!(check_source(r#"fn f() -> String { let t = (1, "a"); t.1 }"#).is_ok());
+    }
+
+    #[test]
+    fn tuple_index_out_of_range_or_wrong_type_is_rejected() {
+        assert!(check_source(r#"fn f() -> Int { let t = (1, "a"); t.2 }"#).is_err());
+        assert!(check_source("fn f() -> Int { let x = 5; x.0 }").is_err());
     }
 
     #[test]

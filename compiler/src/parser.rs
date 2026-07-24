@@ -734,13 +734,27 @@ impl Parser {
         let mut e = self.parse_primary_expr(no_struct_lit)?;
         loop {
             match self.peek().clone() {
+                // `.identifier` es FieldAccess, `.0`/`.1`/... (un entero) es
+                // acceso posicional a tupla -- se distinguen con 1 token de
+                // lookahead después del punto.
                 TokenKind::Dot => {
                     self.advance();
-                    let field = self.eat_ident()?;
-                    e = Expr::FieldAccess {
-                        base: Box::new(e),
-                        field,
-                    };
+                    match self.peek().clone() {
+                        TokenKind::Int(n) => {
+                            self.advance();
+                            let index: usize = n
+                                .try_into()
+                                .map_err(|_| self.error("índice de tupla inválido (negativo)"))?;
+                            e = Expr::TupleIndex { base: Box::new(e), index };
+                        }
+                        _ => {
+                            let field = self.eat_ident()?;
+                            e = Expr::FieldAccess {
+                                base: Box::new(e),
+                                field,
+                            };
+                        }
+                    }
                 }
                 TokenKind::LParen => {
                     self.advance();
@@ -817,9 +831,24 @@ impl Parser {
             }
             TokenKind::LParen => {
                 self.advance();
-                let e = self.parse_expr()?; // dentro de paréntesis, struct lit permitido de nuevo
+                // Misma ambigüedad que a nivel de tipos (§2.2): (a) es
+                // agrupación, (a,) es tupla de 1, (a,b) es tupla de 2+.
+                let mut items = vec![self.parse_expr()?]; // dentro de (), struct lit permitido de nuevo
+                let mut had_comma = false;
+                while self.check(&TokenKind::Comma) {
+                    self.advance();
+                    had_comma = true;
+                    if self.check(&TokenKind::RParen) {
+                        break; // coma final: (a,)
+                    }
+                    items.push(self.parse_expr()?);
+                }
                 self.eat(&TokenKind::RParen)?;
-                Ok(Expr::Paren(Box::new(e)))
+                if items.len() == 1 && !had_comma {
+                    Ok(Expr::Paren(Box::new(items.into_iter().next().unwrap())))
+                } else {
+                    Ok(Expr::TupleLit(items))
+                }
             }
             TokenKind::Ident(name) => {
                 self.advance();
@@ -1225,6 +1254,40 @@ mod tests {
                 assert_eq!(*value, Expr::ArrayLit(vec![Expr::Int(1), Expr::Int(2)]));
             }
             other => panic!("se esperaba Stmt::Let, fue {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_literal_vs_grouping_disambiguation() {
+        // (a) sigue siendo agrupación -- misma regla que a nivel de tipos.
+        let prog = parse_source("fn f() -> Int { (1) }");
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        assert_eq!(body.tail.as_deref(), Some(&Expr::Paren(Box::new(Expr::Int(1)))));
+
+        // (a, b) es TupleLit de 2.
+        let prog2 = parse_source(r#"fn f() -> Int { (1, "a") }"#);
+        let Item::Fn(FnDecl { body, .. }) = &prog2.items[0] else { panic!() };
+        assert_eq!(
+            body.tail.as_deref(),
+            Some(&Expr::TupleLit(vec![Expr::Int(1), Expr::Str("a".into())]))
+        );
+
+        // (a,) con coma final es TupleLit de 1, no agrupación.
+        let prog3 = parse_source("fn f() -> Int { (1,) }");
+        let Item::Fn(FnDecl { body, .. }) = &prog3.items[0] else { panic!() };
+        assert_eq!(body.tail.as_deref(), Some(&Expr::TupleLit(vec![Expr::Int(1)])));
+    }
+
+    #[test]
+    fn tuple_positional_access_parses() {
+        let prog = parse_source(r#"fn f() -> Int { let t = (1, "a"); t.0 }"#);
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        match body.tail.as_deref().unwrap() {
+            Expr::TupleIndex { base, index } => {
+                assert_eq!(**base, Expr::Ident("t".into()));
+                assert_eq!(*index, 0);
+            }
+            other => panic!("se esperaba TupleIndex, fue {other:?}"),
         }
     }
 

@@ -167,6 +167,16 @@ pub enum Expr {
         base: Box<Expr>,
         index: Box<Expr>,
     },
+    /// `(e1, e2, ...)` -- distinto de `Paren` (agrupación) por la misma
+    /// regla de la coma obligatoria que ya usa el nivel de tipos (§2.2).
+    TupleLit(Vec<Expr>),
+    /// `base.0`, `base.1`, ... -- acceso posicional. Un solo nivel: `t.0.1`
+    /// NO encadena (ver nota del lexer en GRAMMAR.md §2.3), es una
+    /// limitación conocida, no un error silencioso.
+    TupleIndex {
+        base: Box<Expr>,
+        index: usize,
+    },
     /// `Nombre { campos }` o `Enum.Variante { campos }` (GRAMMAR.md §2.3 struct_or_variant_lit).
     StructLit {
         name: String,

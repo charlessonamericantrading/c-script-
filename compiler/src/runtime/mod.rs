@@ -22,6 +22,7 @@ pub enum Value {
     Struct(Vec<(String, Value)>),
     Variant { variant: String, fields: Vec<(String, Value)> },
     List(Vec<Value>),
+    Tuple(Vec<Value>),
     /// Marcadores internos — nunca deberían llegar a `value_to_json` (ver la
     /// salvaguarda ahí). Representan `db`, `db.coleccion`, y un método ligado
     /// (`recv.metodo`) a la espera de ser invocado, ej. `db.users.find`.
@@ -198,6 +199,23 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                     Ok(items[i].clone())
                 }
                 other => Err(err(format!("no se puede indexar un valor {other:?}"))),
+            }
+        }
+        Expr::TupleLit(items) => {
+            let vs = items
+                .iter()
+                .map(|e| eval_expr(e, env, db, fns))
+                .collect::<Result<Vec<_>, RuntimeError>>()?;
+            Ok(Value::Tuple(vs))
+        }
+        Expr::TupleIndex { base, index } => {
+            let base_v = eval_expr(base, env, db, fns)?;
+            match base_v {
+                Value::Tuple(items) => items
+                    .get(*index)
+                    .cloned()
+                    .ok_or_else(|| err(format!("índice de tupla .{index} fuera de rango"))),
+                other => Err(err(format!("'.{index}' requiere una tupla, se encontró {other:?}"))),
             }
         }
     }
@@ -429,7 +447,9 @@ pub fn value_to_json(v: &Value) -> serde_json::Value {
             }
             serde_json::Value::Object(m)
         }
-        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
+        Value::List(items) | Value::Tuple(items) => {
+            serde_json::Value::Array(items.iter().map(value_to_json).collect())
+        }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
         Value::Db | Value::DbCollection(_) | Value::BoundMethod(_, _) => serde_json::Value::Null,
@@ -573,6 +593,24 @@ mod tests {
         );
         let result = invoke_rpc(&program, "S", "f", &json!({}), &Db::seeded());
         assert!(result.is_err(), "indexar fuera de rango debería fallar, no devolver null");
+    }
+
+    #[test]
+    fn tuple_construction_access_and_json_shape() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc pair() -> (Int, String) { (1, "a") }
+                rpc first() -> Int { let t = (1, "a"); t.0 }
+                rpc second() -> String { let t = (1, "a"); t.1 }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        // (A, B) -> [A, B] en el cable (GRAMMAR.md §4), igual que un array.
+        assert_eq!(invoke_rpc(&program, "S", "pair", &json!({}), &db).unwrap(), json!([1, "a"]));
+        assert_eq!(invoke_rpc(&program, "S", "first", &json!({}), &db).unwrap(), json!(1));
+        assert_eq!(invoke_rpc(&program, "S", "second", &json!({}), &db).unwrap(), json!("a"));
     }
 
     #[test]
