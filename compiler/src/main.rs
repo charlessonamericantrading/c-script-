@@ -2,6 +2,7 @@ mod ast;
 mod checker;
 mod codegen;
 mod lexer;
+mod modules;
 mod parser;
 mod runtime;
 mod scaffold;
@@ -40,17 +41,7 @@ fn cmd_new(args: &[String]) -> ExitCode {
 }
 
 fn load_and_check(path: &str) -> Result<Program, ExitCode> {
-    let source = fs::read_to_string(path).map_err(|e| {
-        eprintln!("no se pudo leer {path}: {e}");
-        ExitCode::FAILURE
-    })?;
-
-    let tokens = lexer::tokenize(&source).map_err(|e| {
-        eprintln!("{e}");
-        ExitCode::FAILURE
-    })?;
-
-    let program = parser::parse(tokens).map_err(|e| {
+    let (program, _touched) = modules::load_program(Path::new(path)).map_err(|e| {
         eprintln!("{e}");
         ExitCode::FAILURE
     })?;

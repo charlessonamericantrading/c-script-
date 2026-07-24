@@ -72,8 +72,19 @@ impl Checker {
 
         for item in &program.items {
             match item {
+                // Duplicado detectado -- hallado al diseñar imports
+                // multi-archivo (GRAMMAR.md §2.1): dos `type`/`enum` con el
+                // mismo nombre ganaban por orden de inserción, en silencio.
+                // Con un solo archivo ya era un gap real; con imports,
+                // colisiones entre archivos se vuelven mucho más probables.
+                Item::Type(t) if checker.types.contains_key(&t.name) => {
+                    errors.push(err(format!("'{}' ya está declarado (type duplicado)", t.name)));
+                }
                 Item::Type(t) => {
                     checker.types.insert(t.name.clone(), t.clone());
+                }
+                Item::Enum(e) if checker.enums.contains_key(&e.name) => {
+                    errors.push(err(format!("'{}' ya está declarado (enum duplicado)", e.name)));
                 }
                 Item::Enum(e) => {
                     checker.enums.insert(e.name.clone(), e.clone());
@@ -84,6 +95,10 @@ impl Checker {
 
         for item in &program.items {
             if let Item::Fn(f) = item {
+                if checker.fns.contains_key(&f.name) {
+                    errors.push(err(format!("'{}' ya está declarado (fn duplicada)", f.name)));
+                    continue;
+                }
                 match checker.resolve_fn_signature(f) {
                     Ok(sig) => {
                         checker.fns.insert(f.name.clone(), sig);

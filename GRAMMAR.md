@@ -69,7 +69,25 @@ fn_decl      = "fn" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr
 
 **`fn` — funciones libres, no expuestas como RPC.** A diferencia de `rpc`/`stream`, no vive dentro de un `service` y no entra al contrato `.d.ts` — es lógica interna del backend (p. ej. `validate` llamada desde un `rpc`). Misma forma que `rpc_decl` porque comparten `param_list`/`block`; la diferencia es de visibilidad, no de sintaxis.
 
-**`import_decl` parsea pero todavía no tiene ningún efecto semántico — v0 es de un solo archivo.** A diferencia de la brecha que tenía `const_decl` (existía completo pero nadie lo invocaba — ver §4 y el changelog de la auditoría final), esto no es un olvido de conectar algo ya diseñado: requiere resolución de módulos de verdad (mapear el `string_lit` a otro archivo `.link`, parsearlo y chequearlo, exponer sus símbolos al archivo que importa, decidir qué pasa con imports circulares). Es la misma clase de trabajo que el package manager/LSP — correctamente Fase 1+ (PLAN.md §4), no algo que debería colarse a medio hacer en v0. Hoy, un programa entero vive en un solo archivo `.link`.
+**`import_decl` — RESUELTO (multi-archivo + package manager mínimo, `compiler/src/modules.rs`).** `import { X, Y } from "./otro.link";` ya resuelve de verdad: cada `.link` alcanzado se lexea/parsea, y sus ítems (menos los `Item::Import` ya resueltos) se funden en un solo `Program` antes de llegar al checker — que sigue viendo un único árbol, sin ningún concepto nuevo de "archivo".
+
+```
+type Point = { x: Int, y: Int }        // b.link
+
+import { Point } from "./b.link";      // a.link
+fn origin() -> Point { Point { x: 0, y: 0 } }
+```
+
+- **`from` relativo (`./`/`../`) vs. nombre pelado.** Un `from` que empieza con `./` o `../` es una ruta relativa al archivo que importa. Un nombre pelado (`import { X } from "shapes";`) se busca en `dependencies` de un `link.json` en el directorio del archivo de entrada — la raíz del proyecto, sin buscar hacia arriba en el árbol (eso es útil para monorepos, un caso más avanzado que v0 no necesita):
+  ```json
+  { "dependencies": { "shapes": "./libs/shapes.link" } }
+  ```
+  **Sin lockfile en v0**: con dependencias puramente por ruta no hay versión ni conflicto que "lockear" todavía — un lockfile acá sería aparentar robustez sobre un problema que no existe (la misma trampa que la fila `Int64` fantasma que se encontró y sacó de este documento en la auditoría final).
+- **Ciclos se rechazan con un error claro** (no un stack overflow silencioso ni un colgado): se detectan sobre la pila de imports que se está resolviendo en ese momento, no sobre "todo lo que ya se vio alguna vez" (eso rompería el caso diamante de abajo).
+- **Sin re-exports, a propósito.** Un import se valida contra los ítems NATIVOS del archivo importado — nunca contra su cierre ya fusionado con SUS PROPIOS imports. Si A importa `X` de B, y B a su vez importa `X` de C (pero no declara `X` él mismo), el import de A **falla**: B nunca declaró `X` nativamente, así que no hay nada que A pueda "heredar" a través de B. Si hiciera falta lo contrario, hay que importar `X` directamente de C.
+- **Namespaces cruzados.** `types`/`enums`/`fns`/`const`s son namespaces independientes (el checker los guarda en tablas separadas) — un import busca el nombre en los cuatro y alcanza con que matchee en uno; error solo si no matchea en ninguno. `service` queda afuera: no es algo que se referencie por nombre en ningún otro lado del lenguaje, así que "importar un service" no tiene un significado real todavía.
+- **Sin visibilidad real (`pub`/privado).** El `Program` final que llega al checker es la unión plana de los ítems nativos de todo archivo alcanzado transitivamente — el import valida "¿existe ese nombre en ESE archivo puntual?" pero no oculta nada de los demás archivos del cierre entre sí (dos archivos no relacionados por ningún import, pero alcanzados por el mismo cierre transitivo, pueden verse los símbolos entre sí sin querer). Implementar visibilidad real necesitaría un scoping por archivo en el checker, que hoy no tiene ningún concepto de "de qué archivo vino este símbolo" — una extensión más grande, correctamente fuera de alcance acá.
+- **Detección de colisiones, de paso.** Al construir esto se encontró que dos `type`/`enum`/`fn` con el mismo nombre en el mismo `Program` (antes, solo pasaba dentro de un único archivo; con imports, entre archivos) ganaban por orden de inserción, en silencio — `checker.rs::build_symbols` ahora rechaza el duplicado explícitamente.
 
 ### 2.2 Expresiones de tipo — y la trampa del postfix
 
