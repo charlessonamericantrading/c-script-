@@ -1,0 +1,4 @@
+/compiler/target/
+/frontend/node_modules/
+/gen/
+.claude/

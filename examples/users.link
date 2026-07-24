@@ -1,0 +1,56 @@
+type User = {
+  id: Int,
+  name: String,
+  email: String,
+  role: Role,
+  bio?: String,
+  deletedAt: String?,
+}
+
+enum Role { Admin, Member, Guest }
+
+enum ValidationError {
+  InvalidEmail { field: String },
+  TooShort     { field: String, min: Int },
+}
+
+type NewUser = {
+  name: String,
+  email: String,
+}
+
+enum ValidateResult {
+  Ok  { value: NewUser },
+  Err { error: ValidationError },
+}
+
+fn validate(input: NewUser) -> ValidateResult {
+  if input.email == "" {
+    ValidateResult.Err { error: ValidationError.InvalidEmail { field: "email" } }
+  } else if input.name == "" {
+    ValidateResult.Err { error: ValidationError.TooShort { field: "name", min: 1 } }
+  } else {
+    ValidateResult.Ok { value: input }
+  }
+}
+
+service Users {
+  rpc list(limit: Int = 20) -> User[] {
+    db.users.all().take(limit)
+  }
+
+  rpc getById(id: Int) -> User? {
+    db.users.find(id)
+  }
+
+  rpc create(input: NewUser) -> Result<User, ValidationError> {
+    match validate(input) {
+      ValidateResult.Ok  { value: v } => Result.Ok  { value: db.users.insert(v) },
+      ValidateResult.Err { error: e } => Result.Err { error: e },
+    }
+  }
+
+  rpc update(id: Int, patch: Patch<User>) -> User {
+    db.users.applyPatch(id, patch)
+  }
+}
