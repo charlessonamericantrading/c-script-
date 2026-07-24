@@ -172,7 +172,12 @@ fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, env: &Env, db: &Db, fns:
     let l = eval_expr(left, env, db, fns)?;
     let r = eval_expr(right, env, db, fns)?;
     match op {
-        Add => numeric_op(l, r, |a, b| a + b, |a, b| a + b),
+        // '+' concatena si ambos lados son String (checker.rs ya garantizó
+        // que no llega acá un String mezclado con Int/Float).
+        Add => match (l, r) {
+            (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
+            (l, r) => numeric_op(l, r, |a, b| a + b, |a, b| a + b),
+        },
         Sub => numeric_op(l, r, |a, b| a - b, |a, b| a - b),
         Mul => numeric_op(l, r, |a, b| a * b, |a, b| a * b),
         Div => numeric_op(l, r, |a, b| a / b, |a, b| a / b),
@@ -424,6 +429,22 @@ mod tests {
         let db = Db::seeded();
         let result = invoke_rpc(&program, "Users", "list", &json!({"limit": 1}), &db).unwrap();
         assert_eq!(result.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn string_concatenation_works_in_runtime() {
+        let program = program_from(
+            r#"
+            service Greeter {
+                rpc greet(name: String) -> String {
+                    "hola, " + name
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "Greeter", "greet", &json!({"name": "Carlos"}), &db).unwrap();
+        assert_eq!(result, json!("hola, Carlos"));
     }
 
     #[test]

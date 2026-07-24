@@ -537,7 +537,23 @@ impl Checker {
     fn synth_binary(&self, op: BinaryOp, left: &Expr, right: &Expr, env: &Env) -> Result<Type, CheckError> {
         use BinaryOp::*;
         match op {
-            Add | Sub | Mul | Div | Rem => {
+            // '+' es el único aritmético que también sirve para concatenar
+            // strings -- resta/multiplicación/división sobre texto no
+            // tienen un significado razonable, así que quedan aparte.
+            Add => {
+                let l = self.synth_expr(left, env)?;
+                let r = self.synth_expr(right, env)?;
+                match (&l, &r) {
+                    (Type::Int, Type::Int) => Ok(Type::Int),
+                    (Type::Float, Type::Float) => Ok(Type::Float),
+                    (Type::String, Type::String) => Ok(Type::String),
+                    (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Dynamic),
+                    _ => Err(err(format!(
+                        "'+' requiere Int+Int, Float+Float o String+String sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
+                    ))),
+                }
+            }
+            Sub | Mul | Div | Rem => {
                 let l = self.synth_expr(left, env)?;
                 let r = self.synth_expr(right, env)?;
                 match (&l, &r) {
@@ -770,6 +786,12 @@ mod tests {
     fn arithmetic_ok_same_numeric_type() {
         assert!(check_source("fn add(a: Int, b: Int) -> Int { a + b * 2 - 1 }").is_ok());
         assert!(check_source("fn add(a: Float, b: Float) -> Float { a / b }").is_ok());
+    }
+
+    #[test]
+    fn plus_concatenates_strings_but_other_arithmetic_ops_reject_them() {
+        assert!(check_source(r#"fn greet(name: String) -> String { "hola, " + name }"#).is_ok());
+        assert!(check_source(r#"fn f(a: String, b: String) -> String { a - b }"#).is_err());
     }
 
     #[test]

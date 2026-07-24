@@ -334,7 +334,8 @@ Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos,
 
 | Operador | Regla | Resultado |
 |---|---|---|
-| `+ - * /` `%` | ambos operandos `Int`, o ambos `Float` (no mezclados) | mismo tipo que los operandos |
+| `+` | ambos `Int`, ambos `Float`, o ambos `String` (concatenación) | mismo tipo que los operandos |
+| `- * /` `%` | ambos operandos `Int`, o ambos `Float` (no mezclados) | mismo tipo que los operandos |
 | `- ` unario | operando `Int` o `Float` | mismo tipo |
 | `== !=` | operandos de tipos mutuamente compatibles (mismo primitivo, o mismo enum nominal) | `Bool` |
 | `< <= > >=` | ambos operandos `Int`, o ambos `Float` | `Bool` |
