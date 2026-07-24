@@ -791,6 +791,17 @@ impl Parser {
                         variant_name,
                         fields,
                     })
+                } else if self.check(&TokenKind::Colon) {
+                    // `nombre: Tipo` -- narrowing de uniones (GRAMMAR.md
+                    // §3.9). `parse_postfix_type`, NO `parse_type_expr`:
+                    // ese último consume `|` en loop para uniones y se
+                    // comería el `|` que en realidad separa esta alternativa
+                    // de la siguiente en un or-pattern (`i: Int | s: String`
+                    // tiene que quedar como Or([Type(i,Int), Type(s,String)]),
+                    // no fusionarse en un solo Type(i, Union([Int,String]))).
+                    self.advance();
+                    let ty = self.parse_postfix_type()?;
+                    Ok(Pattern::Type(name, ty))
                 } else {
                     Ok(Pattern::Bind(name))
                 }
@@ -1488,7 +1499,8 @@ mod tests {
             })
             .expect("se esperaba un service");
         assert_eq!(service.name, "Users");
-        // list, getById, create, update, listByRole, listEmails, watchAll (stream)
-        assert_eq!(service.members.len(), 7);
+        // list, getById, create, update, listByRole, listEmails,
+        // findByIdOrEmail, watchAll (stream)
+        assert_eq!(service.members.len(), 8);
     }
 }

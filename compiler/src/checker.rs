@@ -48,6 +48,12 @@ fn pattern_bindings(pattern: &Pattern) -> Vec<String> {
             .flat_map(|fp| pattern_bindings(&fp.pattern))
             .collect(),
         Pattern::Or(subs) => subs.iter().flat_map(pattern_bindings).collect(),
+        // A diferencia de `Literal` (que no liga nada), `Type` SÍ liga un
+        // nombre -- devolver `Vec::new()` acá dejaría pasar en silencio un
+        // `i: Int | s: String` dentro de un Or (que debería rechazarse
+        // igual que cualquier otro binding dentro de un Or, ver el doc de
+        // `Pattern::Or` en ast.rs).
+        Pattern::Type(name, _) => vec![name.clone()],
     }
 }
 
@@ -110,6 +116,60 @@ fn type_contains_function(ty: &Type) -> bool {
         Type::ResultOf(a, b) | Type::MapOf(a, b) => type_contains_function(a) || type_contains_function(b),
         Type::Struct { fields, .. } => fields.iter().any(|f| type_contains_function(&f.ty)),
         _ => false,
+    }
+}
+
+/// ¿Se puede PROBAR que dos miembros de una unión son distinguibles en
+/// runtime? "No" es la respuesta segura cuando el análisis no puede probar
+/// que sí (GRAMMAR.md §3.9, `check_exhaustive_union`) -- falla cerrado, no
+/// asume que está bien.
+///
+/// Un chequeo ingenuo de `is_subtype` mutuo entre los dos NO alcanza:
+/// `{x:Int,y:Int}` y `{x:Int,z:Int}` no son subtipo mutuo entre sí, pero un
+/// TERCER tipo más ancho (`{x:Int,y:Int,z:Int}`, construible por cualquier
+/// usuario vía subtipado estructural de ancho) satisface los campos
+/// requeridos de los DOS a la vez -- un valor de ese tercer tipo sería
+/// ambiguo para cualquiera de las dos reglas que solo miran nombres de
+/// campo. La condición real: existe al menos un campo REQUERIDO por ambos
+/// cuyos tipos declarados tengan discriminantes de `Value` (runtime/mod.rs)
+/// mutuamente excluyentes -- un valor real solo puede tener UNA forma
+/// concreta en ese campo (nunca ambas a la vez), así que ESE campo sí
+/// distingue de forma confiable, sin importar qué tan ancho sea el valor
+/// real que llegue. `value_matches_type` (runtime/mod.rs) chequea
+/// exactamente esto -- el tipo REAL del valor en cada campo requerido, no
+/// solo su presencia -- para que este argumento de solidez se sostenga.
+fn union_members_are_distinguishable(a: &Type, b: &Type) -> bool {
+    match (a, b) {
+        (Type::Struct { fields: fa, .. }, Type::Struct { fields: fb, .. }) => fa.iter().any(|field_a| {
+            !field_a.optional
+                && fb.iter().any(|field_b| {
+                    !field_b.optional && field_a.name == field_b.name && shallow_tag_conflict(&field_a.ty, &field_b.ty)
+                })
+        }),
+        _ => shallow_tag_conflict(a, b),
+    }
+}
+
+/// ¿`a` y `b` tienen discriminantes de `Value` mutuamente excluyentes? "No"
+/// (el lado seguro) para `Dynamic` emparejado con cualquier cosa (acepta
+/// cualquier forma en ambas direcciones, `is_subtype`), dos `List` (una
+/// lista vacía matchea cualquiera de los dos) y dos `Optional` (`null`
+/// matchea ambos) -- ninguno de estos tres tiene un discriminante de
+/// runtime que los distinga de forma confiable. Dos `Struct` siempre "no
+/// conflicto" ACÁ (nivel de campo, chequeo superficial no recursivo): la
+/// comparación real entre dos structs vive en
+/// `union_members_are_distinguishable`, que mira sus campos compartidos,
+/// no acá.
+fn shallow_tag_conflict(a: &Type, b: &Type) -> bool {
+    use Type::*;
+    match (a, b) {
+        (Dynamic, _) | (_, Dynamic) => false,
+        (List(_), List(_)) => false,
+        (Optional(_), _) | (_, Optional(_)) => false,
+        (Struct { .. }, Struct { .. }) => false,
+        (Enum(na), Enum(nb)) => na != nb,
+        _ if a == b => false,
+        _ => true,
     }
 }
 
@@ -845,9 +905,13 @@ impl Checker {
             Type::Int | Type::String | Type::Bool => {
                 self.check_exhaustive_literal(&scrutinee_ty, arms)?;
             }
+            // Narrowing de uniones (GRAMMAR.md §3.9): patrones `nombre: Tipo`.
+            Type::Union(members) => {
+                self.check_exhaustive_union(members, arms)?;
+            }
             other => {
                 return Err(err(format!(
-                    "'match' requiere un valor de tipo enum, Int, String o Bool; se encontró {other:?}"
+                    "'match' requiere un valor de tipo enum, Int, String, Bool o unión; se encontró {other:?}"
                 )))
             }
         }
@@ -932,6 +996,10 @@ impl Checker {
             Pattern::Literal(lit) => Err(err(format!(
                 "patrón literal {lit:?} no válido contra un escrutinio de tipo enum ('{enum_name}')"
             ))),
+            Pattern::Type(name, texpr) => Err(err(format!(
+                "patrón de tipo '{name}: {texpr:?}' no válido contra un escrutinio de tipo enum ('{enum_name}') -- \
+                 el narrowing de uniones (GRAMMAR.md §3.9) es solo para escrutinios Type::Union"
+            ))),
         }
     }
 
@@ -991,6 +1059,101 @@ impl Checker {
             }
             Pattern::Variant { enum_name, .. } => Err(err(format!(
                 "patrón de variante de enum ('{enum_name}') no válido contra un escrutinio de tipo {scrutinee_ty:?}"
+            ))),
+            Pattern::Type(name, texpr) => Err(err(format!(
+                "patrón de tipo '{name}: {texpr:?}' no válido contra un escrutinio de tipo {scrutinee_ty:?} -- \
+                 el narrowing de uniones (GRAMMAR.md §3.9) es solo para escrutinios Type::Union"
+            ))),
+        }
+    }
+
+    /// Narrowing de uniones (GRAMMAR.md §3.9): rechaza de entrada, ANTES de
+    /// mirar los arms siquiera, una unión cuyos miembros no se puedan
+    /// distinguir de forma demostrable (`union_members_are_distinguishable`)
+    /// -- es una propiedad de la unión en sí, no de cómo se la matchea, así
+    /// que corre una sola vez por par de miembros. Después, exhaustividad:
+    /// mismo algoritmo que enum/literal (un `Pattern::Bind` sin guard cubre
+    /// el resto; un arm con guard nunca descarta cobertura).
+    fn check_exhaustive_union(&self, members: &[Type], arms: &[MatchArm]) -> Result<(), CheckError> {
+        for i in 0..members.len() {
+            for j in (i + 1)..members.len() {
+                if !union_members_are_distinguishable(&members[i], &members[j]) {
+                    return Err(err(format!(
+                        "no se puede hacer 'match' sobre esta unión: los miembros {:?} y {:?} no se pueden \
+                         distinguir de forma demostrable en runtime (GRAMMAR.md §3.9) -- si hace falta \
+                         distinguirlos, modelá la alternancia como un 'enum' en vez de una unión estructural",
+                        members[i], members[j]
+                    )));
+                }
+            }
+        }
+
+        let mut wildcard = false;
+        let mut covered = vec![false; members.len()];
+        for arm in arms {
+            if arm.guard.is_some() {
+                continue;
+            }
+            self.collect_union_coverage(&arm.pattern, members, &mut wildcard, &mut covered)?;
+        }
+
+        if wildcard || covered.iter().all(|c| *c) {
+            Ok(())
+        } else {
+            let missing: Vec<&Type> = members.iter().zip(&covered).filter(|(_, c)| !**c).map(|(m, _)| m).collect();
+            Err(err(format!("match no exhaustivo sobre la unión: falta cubrir {missing:?} (GRAMMAR.md §3.9)")))
+        }
+    }
+
+    /// Análogo a `collect_variant_coverage`/`collect_literal_coverage`, mismo
+    /// patrón de "Or recursa, todo lo demás que no sea el patrón propio de
+    /// este escrutinio es un error". `Type` no deriva `Hash`/`Eq` (solo
+    /// `PartialEq`, y ese deriva es posicional sobre el `Vec<FieldType>` de
+    /// un struct -- dos structs estructuralmente idénticos con campos en
+    /// otro orden serían `==`-distintos), así que membership se decide por
+    /// `is_subtype` MUTUO, no `==`; y la cobertura se trackea por posición
+    /// (`Vec<bool>`), no `HashSet<Type>`.
+    fn collect_union_coverage(
+        &self,
+        pattern: &Pattern,
+        members: &[Type],
+        wildcard: &mut bool,
+        covered: &mut [bool],
+    ) -> Result<(), CheckError> {
+        match pattern {
+            Pattern::Bind(_) => {
+                *wildcard = true;
+                Ok(())
+            }
+            Pattern::Type(_, texpr) => {
+                let resolved = self.resolve_type(texpr)?;
+                let mut matched_any = false;
+                for (i, m) in members.iter().enumerate() {
+                    if is_subtype(&resolved, m) && is_subtype(m, &resolved) {
+                        covered[i] = true;
+                        matched_any = true;
+                    }
+                }
+                if matched_any {
+                    Ok(())
+                } else {
+                    Err(err(format!(
+                        "el patrón de tipo '{resolved:?}' no corresponde a ningún miembro de esta unión ({members:?})"
+                    )))
+                }
+            }
+            Pattern::Or(subs) => {
+                for s in subs {
+                    self.collect_union_coverage(s, members, wildcard, covered)?;
+                }
+                Ok(())
+            }
+            Pattern::Literal(lit) => Err(err(format!(
+                "patrón literal {lit:?} no válido contra un escrutinio de tipo unión -- usá 'nombre: Tipo' (GRAMMAR.md §3.9)"
+            ))),
+            Pattern::Variant { enum_name, .. } => Err(err(format!(
+                "patrón de variante de enum ('{enum_name}') no válido contra un escrutinio de tipo unión -- usá \
+                 'nombre: Tipo' (GRAMMAR.md §3.9)"
             ))),
         }
     }
@@ -1054,6 +1217,20 @@ impl Checker {
                     }
                     self.bind_pattern(s, ty, env)?;
                 }
+                Ok(())
+            }
+            // Genérico a propósito -- no valida membership contra ninguna
+            // lista de miembros de unión: para cuando el escrutinio es
+            // Type::Union, `check_exhaustive_union` ya validó eso ANTES de
+            // que el loop de arms llegue a bindear (checker.rs::check_match),
+            // así que acá alcanza con resolver y ligar. Escribirlo así,
+            // sin pedir una `Type::Union` en particular, es también lo que
+            // permite que un `Pattern::Type` funcione anidado dentro de un
+            // `FieldPattern` (`Enum.Variante { campo: p: Int }`), no solo
+            // como patrón de tope de un match sobre unión.
+            Pattern::Type(name, texpr) => {
+                let resolved = self.resolve_type(texpr)?;
+                env.insert(name.clone(), immutable(resolved));
                 Ok(())
             }
         }
@@ -2519,6 +2696,178 @@ mod tests {
             fn run(xs: Int[]) -> Int[][] {
                 xs.map(|x: Int| { xs.filter(|y: Int| { y > x }) })
             }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    // ---- narrowing de uniones (GRAMMAR.md §3.9) ----
+
+    #[test]
+    fn union_match_with_type_patterns_for_every_member_typechecks() {
+        let src = r#"
+            fn describe(v: Int | String) -> String {
+                match v {
+                    i: Int => "es un entero",
+                    s: String => "es un string",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn non_exhaustive_union_match_is_rejected() {
+        let src = r#"
+            fn describe(v: Int | String) -> String {
+                match v {
+                    i: Int => "es un entero",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn wildcard_covers_the_rest_of_a_union_match() {
+        let src = r#"
+            fn describe(v: Int | String) -> String {
+                match v {
+                    i: Int => "es un entero",
+                    _ => "otra cosa",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn matching_over_an_ambiguous_union_is_rejected() {
+        // {x,y} y {x,z} no comparten ningún campo con tipos en conflicto
+        // ('x' es Int en los dos) -- un tercer tipo más ancho {x,y,z},
+        // construible por cualquier usuario vía subtipado estructural,
+        // satisface los requisitos de los DOS a la vez. Un chequeo ingenuo
+        // de is_subtype mutuo los aceptaría (ninguno es subtipo del otro)
+        // -- exactamente el caso que el análisis real tiene que atrapar.
+        let src = r#"
+            type A = { x: Int, y: Int }
+            type B = { x: Int, z: Int }
+            fn describe(v: A | B) -> String {
+                match v {
+                    a: A => "es A",
+                    b: B => "es B",
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "una unión con miembros ambiguos no debería poder matchearse");
+    }
+
+    #[test]
+    fn matching_over_a_distinguishable_union_is_accepted() {
+        // x:Int vs x:String -- un valor real solo puede tener UNA forma
+        // concreta en 'x' a la vez, así que sí son distinguibles de forma
+        // confiable (a diferencia del caso ambiguo de arriba).
+        let src = r#"
+            type A = { x: Int }
+            type B = { x: String }
+            fn describe(v: A | B) -> String {
+                match v {
+                    a: A => "es A",
+                    b: B => "es B",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn union_of_two_optional_members_is_always_ambiguous() {
+        let src = r#"
+            type A = { x: Int }
+            type B = { y: Int }
+            fn describe(v: A? | B?) -> String {
+                match v {
+                    a: A? => "es A",
+                    b: B? => "es B",
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "dos miembros Optional siempre son ambiguos: null matchea a los dos");
+    }
+
+    #[test]
+    fn union_of_two_list_members_is_always_ambiguous() {
+        let src = r#"
+            fn describe(v: Int[] | String[]) -> String {
+                match v {
+                    xs: Int[] => "ints",
+                    ss: String[] => "strings",
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "dos miembros List siempre son ambiguos: una lista vacía matchea a las dos");
+    }
+
+    #[test]
+    fn guarded_union_arm_does_not_discharge_exhaustiveness() {
+        let src = r#"
+            fn describe(v: Int | String) -> String {
+                match v {
+                    i: Int if i > 0 => "positivo",
+                    s: String => "string",
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(
+            result.is_err(),
+            "un arm con guard no debería descartar exhaustividad -- falta cubrir Int sin guard"
+        );
+    }
+
+    #[test]
+    fn or_pattern_combining_two_type_patterns_is_rejected() {
+        // Un patrón de tipo LIGA un nombre, igual que cualquier otro binding
+        // -- prohibido dentro de un Or (mismo criterio que ya rechaza
+        // bindings de enum/literal ahí).
+        let src = r#"
+            fn describe(v: Int | String) -> String {
+                match v {
+                    i: Int | s: String => "algo",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn type_pattern_against_an_enum_scrutinee_is_rejected() {
+        let src = r#"
+            enum Status { Active, Paused }
+            fn describe(s: Status) -> String {
+                match s {
+                    x: Int => "no",
+                    Status.Active => "activo",
+                    Status.Paused => "pausado",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn union_typed_parameter_without_matching_still_works_even_if_members_would_be_ambiguous() {
+        // {x,y}|{x,z} sería ambiguo si se intentara matchear -- pero
+        // ACEPTAR-Y-PASAR (sin narrowing) no necesita distinguir nada, y no
+        // debería verse afectado: el chequeo de ambigüedad corre solo
+        // dentro de check_exhaustive_union (match), no en la resolución
+        // general de un tipo unión.
+        let src = r#"
+            type A = { x: Int, y: Int }
+            type B = { x: Int, z: Int }
+            fn accept(v: A | B) -> A | B { v }
         "#;
         assert!(check_source(src).is_ok());
     }

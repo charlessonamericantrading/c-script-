@@ -87,6 +87,19 @@ service Users {
     db.users.all().map(|u: User| { u.email })
   }
 
+  // Narrowing de uniones (GRAMMAR.md §3.9): la búsqueda flexible más común
+  // en una API real -- un mismo parámetro que puede ser un id (Int) o un
+  // email (String). Los dos miembros son distinguibles de forma real (un
+  // valor de query solo puede ser Int o String, nunca ambos), así que el
+  // match tipa. Ambos arms devuelven User[] (no User?) para no necesitar
+  // ninguna conversión Optional<->List que el lenguaje no tiene todavía.
+  rpc findByIdOrEmail(query: Int | String) -> User[] {
+    match query {
+      id: Int => db.users.all().filter(|u: User| { u.id == id }),
+      email: String => db.users.all().filter(|u: User| { u.email == email }),
+    }
+  }
+
   // "Streaming real" v0 (GRAMMAR.md §2.1): la firma declara el ELEMENTO
   // (User, igual que un rpc normal), pero el cuerpo tiene que devolver la
   // secuencia YA CALCULADA entera -- acá, la misma lista que ya arma

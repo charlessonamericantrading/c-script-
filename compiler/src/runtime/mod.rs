@@ -142,47 +142,62 @@ fn err(msg: impl Into<String>) -> RuntimeError {
 /// correctamente una variable exterior con el mismo nombre en vez de mutarla.
 type Env = HashMap<String, Rc<RefCell<Value>>>;
 type Fns<'a> = HashMap<String, &'a FnDecl>;
+type Types<'a> = HashMap<String, &'a TypeDecl>;
+type Enums<'a> = HashMap<String, &'a EnumDecl>;
+
+/// Las dos tablas de símbolos que el narrowing de uniones necesita en
+/// runtime (GRAMMAR.md §3.9) -- `value_matches_type` tiene que poder
+/// resolver un `TypeExpr::Named("User", [])` de un patrón `nombre: Tipo` a
+/// sus campos reales, y hasta esta ronda nada en este módulo conocía
+/// ningún `type`/`enum` declarado (`db`/`fns` eran las únicas tablas que
+/// ya existían). Empaquetadas juntas -- un solo parámetro nuevo enhebrado,
+/// en vez de duplicar el enhebrado de dos tablas sueltas en cada función
+/// que ya pasa `db`/`fns` explícitamente.
+pub(crate) struct Symbols<'a> {
+    types: Types<'a>,
+    enums: Enums<'a>,
+}
 
 fn cell(v: Value) -> Rc<RefCell<Value>> {
     Rc::new(RefCell::new(v))
 }
 
-pub fn eval_block(block: &Block, env: &Env, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
+pub(crate) fn eval_block(block: &Block, env: &Env, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Value, RuntimeError> {
     let mut local = env.clone();
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let { name, value, .. } => {
-                let v = eval_expr(value, &local, db, fns)?;
+                let v = eval_expr(value, &local, db, fns, symbols)?;
                 local.insert(name.clone(), cell(v));
             }
             Stmt::Assign { name, value } => {
-                let v = eval_expr(value, &local, db, fns)?;
+                let v = eval_expr(value, &local, db, fns, symbols)?;
                 let target = local
                     .get(name)
                     .ok_or_else(|| err(format!("variable no declarada en runtime: '{name}'")))?;
                 *target.borrow_mut() = v;
             }
-            Stmt::Return(Some(e)) => return eval_expr(e, &local, db, fns),
+            Stmt::Return(Some(e)) => return eval_expr(e, &local, db, fns, symbols),
             Stmt::Return(None) => return Ok(Value::Null),
             Stmt::Expr(e) => {
-                eval_expr(e, &local, db, fns)?;
+                eval_expr(e, &local, db, fns, symbols)?;
             }
         }
     }
     match &block.tail {
-        Some(e) => eval_expr(e, &local, db, fns),
+        Some(e) => eval_expr(e, &local, db, fns, symbols),
         None => Ok(Value::Null),
     }
 }
 
-pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
+pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Value, RuntimeError> {
     match e {
         Expr::Int(n) => Ok(Value::Int(*n)),
         Expr::Float(n) => Ok(Value::Float(*n)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
         Expr::Null => Ok(Value::Null),
-        Expr::Paren(inner) => eval_expr(inner, env, db, fns),
+        Expr::Paren(inner) => eval_expr(inner, env, db, fns, symbols),
         Expr::Ident(name) => {
             if name == "db" {
                 return Ok(Value::Db);
@@ -200,7 +215,7 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
             Err(err(format!("variable no declarada en runtime: '{name}'")))
         }
         Expr::FieldAccess { base, field } => {
-            let base_v = eval_expr(base, env, db, fns)?;
+            let base_v = eval_expr(base, env, db, fns, symbols)?;
             match base_v {
                 Value::Struct(fields) | Value::Variant { fields, .. } => fields
                     .into_iter()
@@ -223,14 +238,14 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
             // solo para volver a buscar el mismo nombre en `fns`.
             if let Expr::Ident(name) = &**callee {
                 if let Some(decl) = fns.get(name.as_str()) {
-                    let arg_vs = eval_args(args, env, db, fns)?;
-                    return call_fn_decl(decl, arg_vs, db, fns);
+                    let arg_vs = eval_args(args, env, db, fns, symbols)?;
+                    return call_fn_decl(decl, arg_vs, db, fns, symbols);
                 }
             }
-            let callee_v = eval_expr(callee, env, db, fns)?;
-            let arg_vs = eval_args(args, env, db, fns)?;
+            let callee_v = eval_expr(callee, env, db, fns, symbols)?;
+            let arg_vs = eval_args(args, env, db, fns, symbols)?;
             match callee_v {
-                Value::BoundMethod(receiver, method) => call_method(*receiver, &method, arg_vs, db, fns),
+                Value::BoundMethod(receiver, method) => call_method(*receiver, &method, arg_vs, db, fns, symbols),
                 // Llamada INDIRECTA: `callee` fue una variable/parámetro que
                 // contenía una referencia a función o un closure (GRAMMAR.md
                 // §3.10), no el nombre escrito ahí mismo -- ej. dentro de
@@ -239,13 +254,13 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                 // Closure. `call_callable` despacha ambos casos (y produce
                 // el mismo error de "no se puede llamar" para cualquier otra
                 // cosa, ver su propio fallback).
-                other => call_callable(other, arg_vs, db, fns),
+                other => call_callable(other, arg_vs, db, fns, symbols),
             }
         }
         Expr::StructLit { name, variant, fields } => {
             let evaluated = fields
                 .iter()
-                .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns)?)))
+                .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, symbols)?)))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             match variant {
                 Some(v) => {
@@ -255,13 +270,13 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
             }
         }
         Expr::Match { scrutinee, arms } => {
-            let v = eval_expr(scrutinee, env, db, fns)?;
+            let v = eval_expr(scrutinee, env, db, fns, symbols)?;
             for arm in arms {
-                if let Some(bindings) = try_match_pattern(&arm.pattern, &v) {
+                if let Some(bindings) = try_match_pattern(&arm.pattern, &v, symbols) {
                     let mut arm_env = env.clone();
                     arm_env.extend(bindings.into_iter().map(|(k, v)| (k, cell(v))));
                     if let Some(guard) = &arm.guard {
-                        match eval_expr(guard, &arm_env, db, fns)? {
+                        match eval_expr(guard, &arm_env, db, fns, symbols)? {
                             Value::Bool(true) => {}
                             // El patrón matcheó pero el guard no se cumplió --
                             // se sigue probando el resto de los arms, no se
@@ -271,8 +286,8 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
                         }
                     }
                     return match &arm.body {
-                        MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns),
-                        MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns),
+                        MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns, symbols),
+                        MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns, symbols),
                     };
                 }
             }
@@ -281,25 +296,25 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
             Err(err("ningún arm de match coincidió — el checker debería haber impedido esto"))
         }
         Expr::If { cond, then_block, else_block } => {
-            let c = eval_expr(cond, env, db, fns)?;
+            let c = eval_expr(cond, env, db, fns, symbols)?;
             match c {
-                Value::Bool(true) => eval_block(then_block, env, db, fns),
-                Value::Bool(false) => eval_block(else_block, env, db, fns),
+                Value::Bool(true) => eval_block(then_block, env, db, fns, symbols),
+                Value::Bool(false) => eval_block(else_block, env, db, fns, symbols),
                 other => Err(err(format!("la condición de 'if' no es Bool en runtime: {other:?}"))),
             }
         }
-        Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns),
-        Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns),
+        Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, symbols),
+        Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, symbols),
         Expr::ArrayLit(items) => {
             let vs = items
                 .iter()
-                .map(|e| eval_expr(e, env, db, fns))
+                .map(|e| eval_expr(e, env, db, fns, symbols))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             Ok(Value::List(vs))
         }
         Expr::Index { base, index } => {
-            let base_v = eval_expr(base, env, db, fns)?;
-            let idx = as_int(&eval_expr(index, env, db, fns)?)?;
+            let base_v = eval_expr(base, env, db, fns, symbols)?;
+            let idx = as_int(&eval_expr(index, env, db, fns, symbols)?)?;
             match base_v {
                 Value::List(items) => {
                     let i: usize = idx
@@ -316,12 +331,12 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
         Expr::TupleLit(items) => {
             let vs = items
                 .iter()
-                .map(|e| eval_expr(e, env, db, fns))
+                .map(|e| eval_expr(e, env, db, fns, symbols))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             Ok(Value::Tuple(vs))
         }
         Expr::TupleIndex { base, index } => {
-            let base_v = eval_expr(base, env, db, fns)?;
+            let base_v = eval_expr(base, env, db, fns, symbols)?;
             match base_v {
                 Value::Tuple(items) => items
                     .get(*index)
@@ -341,21 +356,29 @@ pub fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, Runti
     }
 }
 
-fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
+fn eval_binary(
+    op: BinaryOp,
+    left: &Expr,
+    right: &Expr,
+    env: &Env,
+    db: &Db,
+    fns: &Fns,
+    symbols: &Symbols,
+) -> Result<Value, RuntimeError> {
     use BinaryOp::*;
     // && / || cortocircuitan: el lado derecho no se evalúa si ya se sabe el
     // resultado, igual que en cualquier lenguaje con estos operadores.
     if matches!(op, And | Or) {
-        let l = as_bool(&eval_expr(left, env, db, fns)?)?;
+        let l = as_bool(&eval_expr(left, env, db, fns, symbols)?)?;
         return match (op, l) {
             (And, false) => Ok(Value::Bool(false)),
             (Or, true) => Ok(Value::Bool(true)),
-            _ => Ok(Value::Bool(as_bool(&eval_expr(right, env, db, fns)?)?)),
+            _ => Ok(Value::Bool(as_bool(&eval_expr(right, env, db, fns, symbols)?)?)),
         };
     }
 
-    let l = eval_expr(left, env, db, fns)?;
-    let r = eval_expr(right, env, db, fns)?;
+    let l = eval_expr(left, env, db, fns, symbols)?;
+    let r = eval_expr(right, env, db, fns, symbols)?;
     match op {
         // '+' concatena si ambos lados son String (checker.rs ya garantizó
         // que no llega acá un String mezclado con Int/Float).
@@ -377,8 +400,15 @@ fn eval_binary(op: BinaryOp, left: &Expr, right: &Expr, env: &Env, db: &Db, fns:
     }
 }
 
-fn eval_unary(op: UnaryOp, operand: &Expr, env: &Env, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
-    let v = eval_expr(operand, env, db, fns)?;
+fn eval_unary(
+    op: UnaryOp,
+    operand: &Expr,
+    env: &Env,
+    db: &Db,
+    fns: &Fns,
+    symbols: &Symbols,
+) -> Result<Value, RuntimeError> {
+    let v = eval_expr(operand, env, db, fns, symbols)?;
     match op {
         UnaryOp::Neg => match v {
             Value::Int(n) => Ok(Value::Int(-n)),
@@ -422,22 +452,22 @@ fn compare(l: Value, r: Value, accept: impl Fn(std::cmp::Ordering) -> bool) -> R
     Ok(Value::Bool(accept(ordering)))
 }
 
-fn eval_args(args: &[Expr], env: &Env, db: &Db, fns: &Fns) -> Result<Vec<Value>, RuntimeError> {
-    args.iter().map(|a| eval_expr(a, env, db, fns)).collect()
+fn eval_args(args: &[Expr], env: &Env, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Vec<Value>, RuntimeError> {
+    args.iter().map(|a| eval_expr(a, env, db, fns, symbols)).collect()
 }
 
 /// Invoca una `fn` de usuario ya resuelta con argumentos ya evaluados --
 /// compartido por la llamada directa (`f(x)`) y la indirecta a través de un
 /// `Value::FnRef` (`let g = f; g(x)`), para no duplicar el armado del scope.
-fn call_fn_decl(decl: &FnDecl, arg_vs: Vec<Value>, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
+fn call_fn_decl(decl: &FnDecl, arg_vs: Vec<Value>, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Value, RuntimeError> {
     let mut fn_env = Env::new();
     for (p, v) in decl.params.iter().zip(arg_vs) {
         fn_env.insert(p.name.clone(), cell(v));
     }
-    eval_block(&decl.body, &fn_env, db, fns)
+    eval_block(&decl.body, &fn_env, db, fns, symbols)
 }
 
-fn try_match_pattern(pattern: &Pattern, v: &Value) -> Option<Vec<(String, Value)>> {
+fn try_match_pattern(pattern: &Pattern, v: &Value, symbols: &Symbols) -> Option<Vec<(String, Value)>> {
     match pattern {
         Pattern::Bind(name) => Some(vec![(name.clone(), v.clone())]),
         Pattern::Literal(lit) => literal_matches(lit, v).then(Vec::new),
@@ -452,7 +482,7 @@ fn try_match_pattern(pattern: &Pattern, v: &Value) -> Option<Vec<(String, Value)
             if let Some(field_patterns) = fields {
                 for fp in field_patterns {
                     let field_v = value_fields.iter().find(|(n, _)| n == &fp.name).map(|(_, v)| v)?;
-                    bindings.extend(try_match_pattern(&fp.pattern, field_v)?);
+                    bindings.extend(try_match_pattern(&fp.pattern, field_v, symbols)?);
                 }
             }
             Some(bindings)
@@ -460,7 +490,15 @@ fn try_match_pattern(pattern: &Pattern, v: &Value) -> Option<Vec<(String, Value)
         // Ninguna alternativa liga nada (el checker ya lo garantizó, ver
         // bind_pattern), así que probar cada una hasta la primera que
         // matchee y devolver sus bindings (vacíos) alcanza.
-        Pattern::Or(subs) => subs.iter().find_map(|p| try_match_pattern(p, v)),
+        Pattern::Or(subs) => subs.iter().find_map(|p| try_match_pattern(p, v, symbols)),
+        // Narrowing de uniones (GRAMMAR.md §3.9): resuelve el texpr del
+        // patrón a un `Type` (con los mismos `types`/`enums` que el checker
+        // ya validó que existen -- `check_exhaustive_union` corrió antes
+        // que esto) y chequea el SHAPE real del valor contra él.
+        Pattern::Type(name, texpr) => {
+            let resolved = resolve_pattern_type(texpr, &symbols.types, &symbols.enums);
+            value_matches_type(v, &resolved).then(|| vec![(name.clone(), v.clone())])
+        }
     }
 }
 
@@ -469,6 +507,94 @@ fn literal_matches(lit: &LiteralPattern, v: &Value) -> bool {
         (LiteralPattern::Int(a), Value::Int(b)) => a == b,
         (LiteralPattern::Str(a), Value::Str(b)) => a == b,
         (LiteralPattern::Bool(a), Value::Bool(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Resuelve el `TypeExpr` de un patrón `nombre: Tipo` (GRAMMAR.md §3.9) al
+/// `Type` (types.rs -- se reusa tal cual, no se inventa un enum paralelo)
+/// que `value_matches_type` necesita. Deliberadamente más simple que
+/// `Checker::resolve_type` (checker.rs): no maneja genéricos ni
+/// type_params -- el checker YA validó (`check_exhaustive_union`) que este
+/// texpr corresponde a un miembro concreto real de la unión antes de que
+/// la ejecución llegue acá, así que alcanza con una resolución de struct/
+/// enum/primitivo/Optional/List de un solo nivel, recursiva solo en eso.
+fn resolve_pattern_type(texpr: &TypeExpr, types: &Types, enums: &Enums) -> crate::types::Type {
+    use crate::types::{FieldType, Type};
+    match texpr {
+        TypeExpr::Named(name, _) => match name.as_str() {
+            "Int" => Type::Int,
+            "Float" => Type::Float,
+            "String" => Type::String,
+            "Bool" => Type::Bool,
+            "Void" => Type::Void,
+            _ => {
+                if let Some(decl) = types.get(name.as_str()) {
+                    match &decl.ty {
+                        TypeExpr::Struct(fields) => Type::Struct {
+                            name: Some(name.clone()),
+                            fields: fields
+                                .iter()
+                                .map(|f| FieldType {
+                                    name: f.name.clone(),
+                                    optional: f.optional,
+                                    ty: resolve_pattern_type(&f.ty, types, enums),
+                                })
+                                .collect(),
+                        },
+                        // Alias a un tipo no-struct, ej. `type Id = Int`.
+                        other => resolve_pattern_type(other, types, enums),
+                    }
+                } else if enums.contains_key(name.as_str()) {
+                    Type::Enum(name.clone())
+                } else {
+                    // No debería pasar -- el checker ya validó este texpr
+                    // como miembro real de la unión antes de llegar acá.
+                    Type::Dynamic
+                }
+            }
+        },
+        TypeExpr::Optional(inner) => Type::Optional(Box::new(resolve_pattern_type(inner, types, enums))),
+        TypeExpr::List(inner) => Type::List(Box::new(resolve_pattern_type(inner, types, enums))),
+        // Tuple/Function/struct-anónimo/Map/Union anidados como miembro
+        // DIRECTO de un patrón de narrowing -- fuera de alcance v0 (no es
+        // el caso de uso que esta ronda apunta a cubrir); `Dynamic` hace
+        // que `value_matches_type` los trate de forma segura (nunca
+        // matchea nada por accidente).
+        _ => Type::Dynamic,
+    }
+}
+
+/// ¿El SHAPE real de `v` corresponde a `ty`? Superficial pero recursivo en
+/// los campos REQUERIDOS de un struct (no solo su presencia, también que el
+/// valor guardado ahí tenga a su vez el shape correcto) -- eso es lo que
+/// hace sound al análisis de ambigüedad del checker (`check_exhaustive_union`,
+/// checker.rs): dos miembros de una unión con un campo compartido de tipos
+/// mutuamente excluyentes (ej. `x: Int` vs `x: String`) se distinguen por el
+/// tipo REAL del valor guardado en ese campo, no por su mera presencia (que
+/// el subtipado estructural de ancho podría satisfacer para ambos a la vez
+/// con un tercer tipo más ancho).
+fn value_matches_type(v: &Value, ty: &crate::types::Type) -> bool {
+    use crate::types::Type;
+    match ty {
+        Type::Int => matches!(v, Value::Int(_)),
+        Type::Float => matches!(v, Value::Float(_)),
+        Type::String => matches!(v, Value::Str(_)),
+        Type::Bool => matches!(v, Value::Bool(_)),
+        Type::Optional(inner) => matches!(v, Value::Null) || value_matches_type(v, inner),
+        Type::List(_) => matches!(v, Value::List(_)),
+        Type::Enum(name) => matches!(v, Value::Variant { enum_name, .. } if enum_name == name),
+        Type::Struct { fields, .. } => match v {
+            Value::Struct(vfields) => fields.iter().filter(|f| !f.optional).all(|f| {
+                vfields
+                    .iter()
+                    .find(|(n, _)| n == &f.name)
+                    .is_some_and(|(_, fv)| value_matches_type(fv, &f.ty))
+            }),
+            _ => false,
+        },
+        // Dynamic/Function/etc -- no debería llegar acá como resultado de
+        // `resolve_pattern_type` para un texpr que el checker ya validó.
         _ => false,
     }
 }
@@ -486,12 +612,13 @@ fn call_closure(
     arg_vs: Vec<Value>,
     db: &Db,
     fns: &Fns,
+    symbols: &Symbols,
 ) -> Result<Value, RuntimeError> {
     let mut call_env = captured_env.clone();
     for (name, v) in param_names.iter().zip(arg_vs) {
         call_env.insert(name.clone(), cell(v));
     }
-    eval_block(body, &call_env, db, fns)
+    eval_block(body, &call_env, db, fns, symbols)
 }
 
 /// Cualquier `Value` invocable -- una referencia a `fn` por nombre o un
@@ -499,20 +626,29 @@ fn call_closure(
 /// indirecta de `Expr::Call` y por `.map`/`.filter` (más abajo), que
 /// necesitan invocar su callback sin que les importe cuál de las dos formas
 /// sea.
-fn call_callable(v: Value, arg_vs: Vec<Value>, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
+fn call_callable(v: Value, arg_vs: Vec<Value>, db: &Db, fns: &Fns, symbols: &Symbols) -> Result<Value, RuntimeError> {
     match v {
         Value::FnRef(name) => {
             let decl = fns
                 .get(name.as_str())
                 .ok_or_else(|| err(format!("fn desconocida: '{name}'")))?;
-            call_fn_decl(decl, arg_vs, db, fns)
+            call_fn_decl(decl, arg_vs, db, fns, symbols)
         }
-        Value::Closure(params, body, captured_env) => call_closure(&params, &body, &captured_env, arg_vs, db, fns),
+        Value::Closure(params, body, captured_env) => {
+            call_closure(&params, &body, &captured_env, arg_vs, db, fns, symbols)
+        }
         other => Err(err(format!("no se puede llamar un valor {other:?}"))),
     }
 }
 
-fn call_method(receiver: Value, method: &str, args: Vec<Value>, db: &Db, fns: &Fns) -> Result<Value, RuntimeError> {
+fn call_method(
+    receiver: Value,
+    method: &str,
+    args: Vec<Value>,
+    db: &Db,
+    fns: &Fns,
+    symbols: &Symbols,
+) -> Result<Value, RuntimeError> {
     match receiver {
         Value::DbCollection(coll) => db.call(&coll, method, args),
         Value::List(items) => match method {
@@ -524,7 +660,7 @@ fn call_method(receiver: Value, method: &str, args: Vec<Value>, db: &Db, fns: &F
                 let f = args.into_iter().next().ok_or_else(|| err("'filter' requiere 1 argumento"))?;
                 let mut kept = Vec::new();
                 for item in items {
-                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns)?)? {
+                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, symbols)?)? {
                         kept.push(item);
                     }
                 }
@@ -534,7 +670,7 @@ fn call_method(receiver: Value, method: &str, args: Vec<Value>, db: &Db, fns: &F
                 let f = args.into_iter().next().ok_or_else(|| err("'map' requiere 1 argumento"))?;
                 let mut mapped = Vec::with_capacity(items.len());
                 for item in items {
-                    mapped.push(call_callable(f.clone(), vec![item], db, fns)?);
+                    mapped.push(call_callable(f.clone(), vec![item], db, fns, symbols)?);
                 }
                 Ok(Value::List(mapped))
             }
@@ -608,6 +744,29 @@ pub fn invoke_rpc(
         })
         .collect();
 
+    // Narrowing de uniones (GRAMMAR.md §3.9): `value_matches_type` necesita
+    // poder resolver un `TypeExpr::Named("User", [])` de un patrón `nombre:
+    // Tipo` a sus campos reales -- mismo patrón que `fns` de arriba (y que
+    // `simple_enum_names` más abajo), armado UNA vez acá, no en cada
+    // llamada a `try_match_pattern`.
+    let types: Types = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Type(t) => Some((t.name.clone(), t)),
+            _ => None,
+        })
+        .collect();
+    let enums: Enums = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Enum(e) => Some((e.name.clone(), e)),
+            _ => None,
+        })
+        .collect();
+    let symbols = Symbols { types, enums };
+
     let empty = serde_json::Map::new();
     let args_obj = args_json.as_object().unwrap_or(&empty);
     let mut env = Env::new();
@@ -615,14 +774,14 @@ pub fn invoke_rpc(
         let v = match args_obj.get(&p.name) {
             Some(j) => json_to_value(j),
             None => match &p.default {
-                Some(default_expr) => eval_expr(default_expr, &Env::new(), db, &fns)?,
+                Some(default_expr) => eval_expr(default_expr, &Env::new(), db, &fns, &symbols)?,
                 None => Value::Null,
             },
         };
         env.insert(p.name.clone(), cell(v));
     }
 
-    let result = eval_block(&rpc.body, &env, db, &fns)?;
+    let result = eval_block(&rpc.body, &env, db, &fns, &symbols)?;
     let simple_enums = simple_enum_names(program);
     Ok(value_to_json(&result, &simple_enums))
 }
@@ -1289,5 +1448,59 @@ mod tests {
         );
         let result = invoke_rpc(&program, "S", "run", &json!({"n": 5}), &Db::seeded()).unwrap();
         assert_eq!(result, json!(120));
+    }
+
+    // ---- narrowing de uniones (GRAMMAR.md §3.9) ----
+
+    #[test]
+    fn union_narrowing_dispatches_correctly_and_binds_the_narrowed_type() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc describe(v: Int | String) -> Bool {
+                    match v {
+                        i: Int => i > 0,
+                        s: String => s.length() > 0,
+                    }
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"v": 5}), &db).unwrap(), json!(true));
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"v": -5}), &db).unwrap(), json!(false));
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"v": "hola"}), &db).unwrap(), json!(true));
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"v": ""}), &db).unwrap(), json!(false));
+    }
+
+    #[test]
+    fn union_narrowing_over_structs_dispatches_by_the_actual_field_value_type() {
+        // El test de solidez que de verdad importa: el checker aceptó esta
+        // unión porque 'x' tiene tipos en conflicto (Int vs String) en A/B
+        // -- eso solo es sound si el runtime de verdad chequea el tipo del
+        // VALOR guardado en 'x', no solo su presencia (que ambos comparten).
+        let program = program_from(
+            r#"
+            type A = { x: Int }
+            type B = { x: String }
+            service S {
+                rpc describe(v: A | B) -> String {
+                    match v {
+                        a: A => "A",
+                        b: B => "B",
+                    }
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(
+            invoke_rpc(&program, "S", "describe", &json!({"v": {"x": 5}}), &db).unwrap(),
+            json!("A")
+        );
+        assert_eq!(
+            invoke_rpc(&program, "S", "describe", &json!({"v": {"x": "hola"}}), &db).unwrap(),
+            json!("B")
+        );
     }
 }

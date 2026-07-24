@@ -304,6 +304,16 @@ pub enum Pattern {
     /// cubre el caso común (combinar variantes/literales con un mismo
     /// cuerpo) sin la complejidad de reconciliar bindings entre ramas.
     Or(Vec<Pattern>),
+    /// `nombre: Tipo` -- narrowing de un valor de tipo unión a su miembro
+    /// concreto (GRAMMAR.md §3.9), ej. `i: Int` o `u: User`. Reusa el `:`
+    /// que ya significa "nombre tiene este tipo declarado" en todos lados
+    /// (let, params, campos de struct) en vez de inventar puntuación nueva
+    /// (`is`/`as`). Nombre primero, tipo segundo -- mismo orden que
+    /// `Param`/`Field`/`FieldPattern`. El tipo se parsea como un tipo
+    /// POSTFIJO (parser.rs::parse_postfix_type), nunca uno con `|` de nivel
+    /// superior -- así un `|` que sigue queda para el propio or-pattern que
+    /// lo rodea (`i: Int | s: String`), no se lo come la anotación.
+    Type(String, TypeExpr),
 }
 
 #[derive(Debug, Clone, PartialEq)]
