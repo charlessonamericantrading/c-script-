@@ -1,0 +1,47 @@
+*[Read in English](README.md)*
+
+# Link
+
+Un lenguaje backend compilado cuyo diferenciador es la **type-safety de extremo a extremo con TypeScript**: cambiar un tipo en el backend rompe la compilación (`tsc`) del frontend, en vez de fallar en producción.
+
+Este repo es el **MVP de Fase 0** (ver [PLAN.md](PLAN.md) §4): prueba el killer feature completo, de punta a punta. No es un lenguaje de producción — es la prueba de que la idea funciona.
+
+## Qué hay acá
+
+| | |
+|---|---|
+| [`PLAN.md`](PLAN.md) | Propuesta, roadmap por fases, análisis de riesgos |
+| [`GRAMMAR.md`](GRAMMAR.md) | Especificación formal: EBNF, sistema de tipos, tabla de mapeo a TypeScript |
+| [`compiler/`](compiler/) | El compilador (`linkc`), en Rust, sin dependencias externas salvo `tiny_http`/`serde_json` para el runtime de la demo |
+| [`examples/users.link`](examples/users.link) | El programa de ejemplo: un CRUD de usuarios |
+| [`frontend/`](frontend/) | Un frontend TypeScript real que consume el contrato generado |
+| [`gen/`](gen/) | Salida de `linkc build` — `contract.d.ts` + `client.ts` (generado, no editar a mano) |
+
+## Probar el killer feature vos mismo
+
+```bash
+cd compiler
+cargo build
+
+# 1. Generar el contrato TypeScript desde el backend
+./target/debug/linkc build ../examples/users.link ../gen
+
+# 2. Confirmar que el frontend tipa limpio
+cd ../frontend && npm install && npx tsc --noEmit   # exit 0
+
+# 3. Levantar el servidor y correr el frontend de verdad
+cd ../compiler && ./target/debug/linkc serve ../examples/users.link 8787 &
+cd ../frontend && node src/main.ts                  # llama al server real, tipado end-to-end
+```
+
+Ahora rompé algo: en `examples/users.link`, renombrá `name` a `fullName` dentro de `type User`. Volvé a correr `linkc build` y `npx tsc --noEmit` **sin tocar `frontend/src/main.ts`**. `tsc` va a fallar en cada línea que usaba `.name` — exactamente el punto ciego que Link existe para eliminar (ver [PLAN.md](PLAN.md) §3).
+
+## Estado
+
+Completo (Fase 0): lexer, parser, type checker bidireccional (subtipado estructural/nominal, exhaustividad de `match`, `Result<T,E>` y `Patch<T>` como builtins, operadores aritmético-lógicos, `if/else`), emisor de contrato, runtime interpretado mínimo. 64 tests, todos pasando.
+
+Pendiente (Fase 1+, ver PLAN.md §4): backend de compilación real (Cranelift/WASM), LSP, package manager, streaming real por WebSocket/SSE, "DB tipada", genéricos definidos por el usuario, uniones de tipo.
+
+## Licencia
+
+MIT — ver [LICENSE](LICENSE).

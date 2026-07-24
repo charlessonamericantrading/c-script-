@@ -1,45 +1,55 @@
+*[Leer en español](README.es.md)*
+
 # Link
 
-Un lenguaje backend compilado cuyo diferenciador es la **type-safety de extremo a extremo con TypeScript**: cambiar un tipo en el backend rompe la compilación (`tsc`) del frontend, en vez de fallar en producción.
+A compiled backend language whose entire point is **end-to-end type safety with TypeScript**: rename a field in the backend, and the frontend fails to compile (`tsc`) instead of failing in production.
 
-Este repo es el **MVP de Fase 0** (ver [PLAN.md](PLAN.md) §4): prueba el killer feature completo, de punta a punta. No es un lenguaje de producción — es la prueba de que la idea funciona.
+This repo is the **Phase 0 MVP** (see [PLAN.md](PLAN.md) §4, currently Spanish-only): it proves the core mechanism end-to-end. It is not a production-ready language — it's proof the idea works.
 
-## Qué hay acá
+## What's here
 
 | | |
 |---|---|
-| [`PLAN.md`](PLAN.md) | Propuesta, roadmap por fases, análisis de riesgos |
-| [`GRAMMAR.md`](GRAMMAR.md) | Especificación formal: EBNF, sistema de tipos, tabla de mapeo a TypeScript |
-| [`compiler/`](compiler/) | El compilador (`linkc`), en Rust, sin dependencias externas salvo `tiny_http`/`serde_json` para el runtime de la demo |
-| [`examples/users.link`](examples/users.link) | El programa de ejemplo: un CRUD de usuarios |
-| [`frontend/`](frontend/) | Un frontend TypeScript real que consume el contrato generado |
-| [`gen/`](gen/) | Salida de `linkc build` — `contract.d.ts` + `client.ts` (generado, no editar a mano) |
+| [`PLAN.md`](PLAN.md) | Proposal, phased roadmap, risk analysis *(Spanish)* |
+| [`GRAMMAR.md`](GRAMMAR.md) | Formal spec: EBNF, type system, TypeScript mapping table *(Spanish)* |
+| [`compiler/`](compiler/) | The compiler (`linkc`), in Rust, no external deps beyond `tiny_http`/`serde_json` for the demo runtime |
+| [`examples/users.link`](examples/users.link) | The example program: a user CRUD service |
+| [`frontend/`](frontend/) | A real TypeScript frontend consuming the generated contract |
+| [`gen/`](gen/) | Output of `linkc build` — `contract.d.ts` + `client.ts` (generated, don't hand-edit) |
 
-## Probar el killer feature vos mismo
+## Try the killer feature yourself
 
 ```bash
 cd compiler
 cargo build
 
-# 1. Generar el contrato TypeScript desde el backend
+# 1. Generate the TypeScript contract from the backend
 ./target/debug/linkc build ../examples/users.link ../gen
 
-# 2. Confirmar que el frontend tipa limpio
+# 2. Confirm the frontend typechecks clean
 cd ../frontend && npm install && npx tsc --noEmit   # exit 0
 
-# 3. Levantar el servidor y correr el frontend de verdad
+# 3. Start the server and run the frontend for real
 cd ../compiler && ./target/debug/linkc serve ../examples/users.link 8787 &
-cd ../frontend && node src/main.ts                  # llama al server real, tipado end-to-end
+cd ../frontend && node src/main.ts                  # calls the real server, typed end-to-end
 ```
 
-Ahora rompé algo: en `examples/users.link`, renombrá `name` a `fullName` dentro de `type User`. Volvé a correr `linkc build` y `npx tsc --noEmit` **sin tocar `frontend/src/main.ts`**. `tsc` va a fallar en cada línea que usaba `.name` — exactamente el punto ciego que Link existe para eliminar (ver [PLAN.md](PLAN.md) §3).
+Now break something: in `examples/users.link`, rename `name` to `fullName` inside `type User`. Re-run `linkc build` and `npx tsc --noEmit` **without touching `frontend/src/main.ts`**. `tsc` fails on every line that used `.name` — exactly the blind spot Link exists to eliminate (see [PLAN.md](PLAN.md) §3).
 
-## Estado
+## Why not just tRPC / Bun / Deno?
 
-Completo (Fase 0): lexer, parser, type checker bidireccional (subtipado estructural/nominal, exhaustividad de `match`, `Result<T,E>` y `Patch<T>` como builtins), emisor de contrato, runtime interpretado mínimo. 45 tests, todos pasando.
+They solve adjacent but different problems:
 
-Pendiente (Fase 1+, ver PLAN.md §4): backend de compilación real (Cranelift/WASM), LSP, package manager, streaming real por WebSocket/SSE, "DB tipada".
+- **tRPC, Encore.ts, Convex** give you E2E type safety by having *no language boundary at all* — the backend already is TypeScript. Clever, but only works if your whole stack is TS.
+- **Bun, Deno** are faster, more modern JS/TS runtimes — but still JS/TS semantics under the hood, not systems-language performance.
+- **Rust+ts-rs, Go+tygo, gRPC/protobuf, OpenAPI codegen** are the actual comparison set: a non-TS backend bridged to a TS frontend. They require a separate IDL/schema you keep in sync by hand, or give you types without a full RPC client. Link's bet: the backend type declaration itself *is* the contract — no separate schema, automatic client, automatic wire validators.
 
-## Licencia
+## Status
 
-MIT — ver [LICENSE](LICENSE).
+Done (Phase 0): lexer, parser, bidirectional type checker (structural/nominal subtyping, `match` exhaustiveness, `Result<T,E>` and `Patch<T>` as builtins, arithmetic/comparison/logical operators, `if/else`), contract emitter, minimal interpreted runtime. 64 tests, all passing.
+
+Not done yet: a real compilation backend (Cranelift/WASM), an LSP, a package manager, real streaming over WebSocket/SSE, a typed DB layer, user-defined generics, union types.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
