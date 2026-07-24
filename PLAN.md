@@ -162,10 +162,12 @@ Tres candidatos, en orden de "rápido de construir" → "rápido de ejecutar":
 |---|---|---|---|
 | **Intérprete** (tree-walking / bytecode) | Baja–media | Bajo | **MVP (Fase 0)** — prueba el valor ya |
 | **Transpilar a Go/Rust** y usar su toolchain | Muy alta | Medio | Alternativa de Fase 1 con menos riesgo |
-| **Compilar a WASM** (Cranelift/LLVM) | Alta | Alto | Edge/serverless; Fase 1–2 |
+| **Compilar a WASM** (`wasm-encoder` directo, o recompilar el runtime a `wasm32-wasip1`) | Alta | Alto | Edge/serverless; Fase 1–2 |
 | **Compilar a nativo** (LLVM) | Máxima | Muy alto | Fase 2–3 |
 
-**Recomendación:** MVP interpretado o transpilado a Go. El backend de compilación "de verdad" (Cranelift → WASM) llega en Fase 1, **después** de haber probado el killer feature. No inviertas en LLVM hasta que la propuesta de valor esté validada.
+**Recomendación:** MVP interpretado o transpilado a Go. El backend de compilación "de verdad" hacia WASM llega en Fase 1, **después** de haber probado el killer feature. No inviertas en LLVM hasta que la propuesta de valor esté validada.
+
+**Corrección (post-Fase-0):** esta sección originalmente decía "Cranelift → WASM" como si fueran la misma cosa — no lo son. Cranelift solo genera código de máquina NATIVO (x86/arm/etc.); `cranelift-wasm` CONSUME bytes `.wasm` como entrada para traducirlos a Cranelift IR (así es como wasmtime hace JIT), no los produce. Para emitir un `.wasm` real hay dos caminos genuinos: `wasm-encoder` (autoría directa de bajo nivel, activamente mantenido, usado por 800+ crates) para codegen nativo hacia wasm; o, como v0 pragmático — y el que efectivamente se usó en Fase 1 — recompilar el runtime interpretado existente al target `wasm32-wasip1` y alimentarle el programa ya parseado como dato, el mismo camino que siguieron RustPython y Boa para su primera versión real en wasm. Cranelift sigue siendo la opción correcta si lo que se quiere es codegen nativo (vía `cranelift-jit`/`cranelift-object`), no como atajo hacia wasm.
 
 ---
 
@@ -207,7 +209,7 @@ La clave arquitectónica: **[4b] es un pass de primera clase**, no un añadido. 
 | Parser | recursivo descendente hand-written o `chumsky` | `lalrpop`, tree-sitter |
 | Representación | AST tipado propio + arena (`id-arena`) | — |
 | Type checker | propio (algoritmo bidireccional) | — |
-| Backend de código | **Cranelift** (compila rápido, WASM/nativo) | LLVM (más perf, más complejo), transpilar |
+| Backend de código | **Cranelift** (compila rápido, código NATIVO — no emite `.wasm` directamente, ver nota de §2.4) | LLVM (más perf, más complejo; sí tiene target `wasm32` real), transpilar |
 | Emisión `.d.ts` | pass propio sobre AST tipado | — |
 | Validadores runtime | generar TS estilo Zod/typia | — |
 | Serialización wire | JSON (MVP) → luego formato binario opcional | MessagePack, Protobuf |
@@ -240,7 +242,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 | Fase | Duración | Objetivo | Entregable clave | Equipo mínimo |
 |---|---|---|---|---|
 | **Fase 0 · MVP** | 2–4 meses | Probar el killer feature E2E | Lexer + parser + checker mínimo · emisor `.d.ts` + cliente · runtime interpretado o transpilado · **1 demo full-stack donde cambiar el backend rompe `tsc`** | 1–2 ing. de compiladores |
-| **Fase 1 · Alpha** | +4–6 meses | Compilar de verdad | Backend Cranelift→WASM · runtime RPC HTTP · std mínima · CLI (`link new/dev/build`) · LSP básico | 2–3 |
+| **Fase 1 · Alpha** | +4–6 meses | Compilar de verdad | Backend a WASM (v0: runtime recompilado a `wasm32-wasip1`; codegen directo vía `wasm-encoder` como evolución) · runtime RPC HTTP · std mínima (los builtins ya existentes en v0: `.length()`/`.contains()`/`.toFloat()`/`.toInt()`/`db.*`) · CLI (`link new/dev/build`) · LSP básico | 2–3 |
 | **Fase 2 · Beta** | +6–9 meses | Usable en proyectos reales | DB tipada · auth · WebSocket/SSE · validadores runtime · hot reload · LSP completo · package manager · observabilidad | 3–5 |
 | **Fase 3 · 1.0** | +6–12 meses | Producción | Estabilidad de sintaxis · ecosistema · docs · deploy edge/serverless · debugging con source maps | 4–6+ |
 
@@ -280,7 +282,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 | Riesgo | Prob. | Impacto | Mitigación |
 |---|---|---|---|
 | Adopción nula | Alta | Crítico | Empezar como framework/codegen sobre Rust; ganar usuarios **antes** del lenguaje |
-| Coste/tiempo subestimado 3–5× | Alta | Alto | MVP acotado; reutilizar Cranelift/serde; no reinventar |
+| Coste/tiempo subestimado 3–5× | Alta | Alto | MVP acotado; reutilizar crates existentes (`wasm-encoder`/`serde`) en vez de escribir un codegen o un parser JSON propios; no reinventar |
 | Type system no mapea 1:1 a TS | Media | Alto | Diseñar el sistema de tipos **partiendo de TS**; validadores generados; suite de tests de isomorfismo |
 | Ecosistema ausente (DB, auth) | Alta | Alto | Interop nativa con Rust/Go al inicio |
 | Mantenimiento a largo plazo | Media | Alto | Open source + gobernanza; foco en un nicho |

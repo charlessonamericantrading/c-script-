@@ -46,9 +46,9 @@ They solve adjacent but different problems:
 
 ## Status
 
-Done (Phase 0): lexer, parser, bidirectional type checker (structural/nominal subtyping, `Result<T,E>` and `Patch<T>` as builtins, arithmetic/comparison/logical operators, `if/else`, assignment and mutability, arrays, tuples, explicit numeric conversion, `Map<K,V>`, string builtin methods), user-defined generics via monomorphization, union types (`A | B`) with value-flow subtyping, functions as first-class values (named references, with real contravariant/covariant function subtyping), `match` exhaustiveness extended with literal patterns, or-patterns, and guards, contract emitter, minimal interpreted runtime. 129 tests, all passing.
+Done (Phase 0): lexer, parser, bidirectional type checker (structural/nominal subtyping, `Result<T,E>` and `Patch<T>` as builtins, arithmetic/comparison/logical operators, `if/else`, assignment and mutability, arrays, tuples, explicit numeric conversion, `Map<K,V>`, string builtin methods), user-defined generics via monomorphization, union types (`A | B`) with value-flow subtyping, functions as first-class values (named references, with real contravariant/covariant function subtyping), `match` exhaustiveness extended with literal patterns, or-patterns, and guards, `const` declarations, contract emitter, minimal interpreted runtime. 133 tests, all passing.
 
-Not done yet: a real compilation backend (Cranelift/WASM), an LSP, a package manager, real streaming over WebSocket/SSE, a typed DB layer, anonymous function literals / true lexical closures, higher-order `List` methods (`.map`/`.filter`), and narrowing a union-typed value back to a concrete member. See [GRAMMAR.md](GRAMMAR.md) §3.6, §3.9, §3.10 for exactly what each of those means and why.
+Not done yet: a real compilation backend (a `.wasm`-emitting one — not Cranelift, which only targets native code; see PLAN.md §2.4), an LSP, a network-backed package registry, real streaming over WebSocket/SSE, a typed DB layer, anonymous function literals / true lexical closures, higher-order `List` methods (`.map`/`.filter`), narrowing a union-typed value back to a concrete member, and multi-file imports (the `import` syntax parses but has no effect yet). See [GRAMMAR.md](GRAMMAR.md) §2.1, §3.6, §3.9, §3.10 for exactly what each of those means and why.
 
 ## License
 
