@@ -237,6 +237,12 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
             if let Some(c) = env.get(name) {
                 return Ok(c.borrow().clone());
             }
+            // Un `const` de nivel superior: su valor es siempre un literal
+            // (el checker lo exige), así que evaluarlo en un env vacío no
+            // depende de nada del scope actual.
+            if let Some(c) = checker.consts.get(name.as_str()) {
+                return eval_expr(&c.value, &Env::new(), db, fns, checker);
+            }
             // No es una variable local -- si es una `fn` de nivel superior,
             // referenciarla por nombre produce un FnRef (ver su doc en el
             // enum Value), no un error: el checker ya la trata como un valor
@@ -1987,6 +1993,29 @@ mod tests {
         )
         .expect_err("null en un campo no-nullable debería rechazarse");
         assert_eq!(e.kind, ErrorKind::BadRequest, "{e}");
+    }
+
+    #[test]
+    fn a_const_evaluates_to_its_value_at_runtime() {
+        let program = program_from(
+            r#"
+            const MAX: Int = 20;
+            enum Role { Admin, Member }
+            const DEF: Role = Role.Member {};
+            service S {
+                rpc limit() -> Int { MAX }
+                rpc capped(n: Int) -> Int { if n > MAX { MAX } else { n } }
+                rpc defaultRole() -> Role { DEF }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "limit", &json!({}), &db).unwrap(), json!(20));
+        assert_eq!(invoke_rpc(&program, "S", "capped", &json!({"n": 5}), &db).unwrap(), json!(5));
+        assert_eq!(invoke_rpc(&program, "S", "capped", &json!({"n": 99}), &db).unwrap(), json!(20));
+        // Y un const de enum simple serializa como string plano, igual que
+        // cualquier otro valor de ese enum.
+        assert_eq!(invoke_rpc(&program, "S", "defaultRole", &json!({}), &db).unwrap(), json!("Member"));
     }
 
     #[test]

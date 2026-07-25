@@ -232,6 +232,13 @@ pub struct Checker {
     /// ninguna `db` -- en ese caso `db` sigue existiendo como identificador
     /// (Type::Db), simplemente sin ninguna colección real.
     db_collections: HashMap<String, Type>,
+    /// `const X: T = v` de nivel superior. Se guarda la declaración ENTERA
+    /// (no solo el tipo) porque el runtime también la necesita: es el único
+    /// lugar donde vive el valor. Hasta la auditoría, un `const` se
+    /// declaraba, se chequeaba y se emitía a `client.ts`, pero era
+    /// inusable desde el propio lenguaje -- `MAX` dentro de un rpc daba
+    /// "variable no declarada". Una feature a medias.
+    pub(crate) consts: HashMap<String, ConstDecl>,
 }
 
 impl Checker {
@@ -245,6 +252,7 @@ impl Checker {
             enums: HashMap::new(),
             fns: HashMap::new(),
             db_collections: HashMap::new(),
+            consts: HashMap::new(),
         };
         let mut errors = Vec::new();
 
@@ -283,6 +291,16 @@ impl Checker {
                     }
                     Err(e) => errors.push(e),
                 }
+            }
+        }
+
+        for item in &program.items {
+            if let Item::Const(c) = item {
+                if checker.consts.contains_key(&c.name) {
+                    errors.push(err(format!("'{}' ya está declarado (const duplicado)", c.name)));
+                    continue;
+                }
+                checker.consts.insert(c.name.clone(), c.clone());
             }
         }
 
@@ -1386,6 +1404,12 @@ impl Checker {
                 }
                 if name == "db" {
                     return Ok(Type::Db);
+                }
+                // Un `const` de nivel superior es visible desde cualquier
+                // cuerpo, igual que una `fn`. Faltaba: se declaraba y se
+                // emitía, pero usarlo daba "variable no declarada".
+                if let Some(c) = self.consts.get(name) {
+                    return self.resolve_type(&c.ty);
                 }
                 if let Some((params, ret)) = self.fns.get(name) {
                     return Ok(Type::Function(params.clone(), Box::new(ret.clone())));
@@ -2778,6 +2802,43 @@ mod tests {
     }
 
     // ---- narrowing de uniones (GRAMMAR.md §3.9) ----
+
+    #[test]
+    fn a_const_is_usable_from_a_body() {
+        // Hallado en la auditoría: un `const` se declaraba, se chequeaba y
+        // se emitía a client.ts, pero usarlo daba "variable no declarada" --
+        // una feature a medias, visible desde afuera pero no desde adentro.
+        let src = r#"
+            const MAX: Int = 20;
+            enum Role { Admin, Member }
+            const DEF: Role = Role.Member {};
+            fn cap(n: Int) -> Int { if n > MAX { MAX } else { n } }
+            service S {
+                rpc limit() -> Int { MAX }
+                rpc capped(n: Int) -> Int { cap(n) }
+                rpc defaultRole() -> Role { DEF }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn a_local_binding_shadows_a_const_of_the_same_name() {
+        let src = r#"
+            const MAX: Int = 20;
+            fn f() -> String { let MAX = "texto"; MAX }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn a_duplicate_const_is_rejected() {
+        let src = r#"
+            const MAX: Int = 1;
+            const MAX: Int = 2;
+        "#;
+        assert!(check_source(src).is_err());
+    }
 
     #[test]
     fn a_function_type_cannot_cross_the_wire() {
