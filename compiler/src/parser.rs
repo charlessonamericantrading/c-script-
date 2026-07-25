@@ -39,6 +39,14 @@ pub fn parse(tokens: Vec<Token>) -> Result<Program, Vec<ParseError>> {
 /// acotar el caso patológico -- ver `parse_program`.
 const MAX_ERRORS: usize = 100;
 
+/// `start`/`end` de dos spans ya ordenados (izquierda a derecha) en uno solo
+/// que los cubre a ambos -- `line`/`col` siempre del lado IZQUIERDO (`Span`
+/// describe solo su inicio, ver token.rs), así que un span de varios tokens
+/// se arma acumulando desde el primero.
+fn merge(start: Span, end: Span) -> Span {
+    Span::new(start.start, end.end, start.line, start.col)
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -61,7 +69,16 @@ impl Parser {
         self.tokens[self.pos].span
     }
 
+    /// Span del ÚLTIMO token consumido -- para cerrar el span de un nodo
+    /// justo después de un `eat`/`advance` de cierre (`}`/`)`/`]`/etc.),
+    /// sin tener que guardar ese token en una variable aparte.
+    fn prev_span(&self) -> Span {
+        debug_assert!(self.pos > 0, "prev_span() antes de consumir ningún token");
+        self.tokens[self.pos - 1].span
+    }
+
     fn advance(&mut self) -> Token {
+        debug_assert!(!self.check(&TokenKind::Eof), "advance() en Eof");
         let t = self.tokens[self.pos].clone();
         if self.pos + 1 < self.tokens.len() {
             self.pos += 1;
@@ -193,14 +210,17 @@ impl Parser {
     }
 
     fn parse_db_decl(&mut self) -> Result<DbDecl, ParseError> {
+        let start = self.span();
         self.advance(); // "db"
         self.eat(&TokenKind::LBrace)?;
         let collections = self.parse_field_list()?;
         self.eat(&TokenKind::RBrace)?;
-        Ok(DbDecl { collections })
+        let span = merge(start, self.prev_span());
+        Ok(DbDecl { collections, span })
     }
 
     fn parse_import_decl(&mut self) -> Result<ImportDecl, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Import)?;
         self.eat(&TokenKind::LBrace)?;
         let mut names = vec![self.eat_ident()?];
@@ -211,8 +231,9 @@ impl Parser {
         self.eat(&TokenKind::RBrace)?;
         self.eat(&TokenKind::From)?;
         let from = self.eat_string()?;
+        let span = merge(start, self.prev_span());
         self.eat(&TokenKind::Semi)?;
-        Ok(ImportDecl { names, from })
+        Ok(ImportDecl { names, from, span })
     }
 
     fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
@@ -232,18 +253,21 @@ impl Parser {
     /// El `;` final es opcional (ver nota en GRAMMAR.md §2.1): `type X = {...}`
     /// ya termina en `}`, exigir además `;` es la incomodidad que Rust/Go evitan.
     fn parse_type_decl(&mut self) -> Result<TypeDecl, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Type)?;
         let name = self.eat_ident()?;
         let type_params = self.parse_type_params()?;
         self.eat(&TokenKind::Equals)?;
         let ty = self.parse_type_expr()?;
+        let span = merge(start, self.prev_span());
         if self.check(&TokenKind::Semi) {
             self.advance();
         }
-        Ok(TypeDecl { name, type_params, ty })
+        Ok(TypeDecl { name, type_params, ty, span })
     }
 
     fn parse_enum_decl(&mut self) -> Result<EnumDecl, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Enum)?;
         let name = self.eat_ident()?;
         let type_params = self.parse_type_params()?;
@@ -260,10 +284,12 @@ impl Parser {
             }
         }
         self.eat(&TokenKind::RBrace)?;
+        let span = merge(start, self.prev_span());
         Ok(EnumDecl {
             name,
             type_params,
             variants,
+            span,
         })
     }
 
@@ -310,17 +336,20 @@ impl Parser {
     }
 
     fn parse_const_decl(&mut self) -> Result<ConstDecl, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Const)?;
         let name = self.eat_ident()?;
         self.eat(&TokenKind::Colon)?;
         let ty = self.parse_type_expr()?;
         self.eat(&TokenKind::Equals)?;
         let value = self.parse_expr()?;
+        let span = merge(start, value.span);
         self.eat(&TokenKind::Semi)?;
-        Ok(ConstDecl { name, ty, value })
+        Ok(ConstDecl { name, ty, value, span })
     }
 
     fn parse_service_decl(&mut self) -> Result<ServiceDecl, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Service)?;
         let name = self.eat_ident()?;
         self.eat(&TokenKind::LBrace)?;
@@ -329,14 +358,19 @@ impl Parser {
             members.push(self.parse_member()?);
         }
         self.eat(&TokenKind::RBrace)?;
-        Ok(ServiceDecl { name, members })
+        let span = merge(start, self.prev_span());
+        Ok(ServiceDecl { name, members, span })
     }
 
     fn parse_member(&mut self) -> Result<Member, ParseError> {
+        // Capturado ANTES de la anotación opcional -- si `parse_rpc_like`
+        // tomara su propio inicio al entrar, `@authenticated`/`@requires`
+        // quedaría sistemáticamente AFUERA del span del rpc.
+        let start = self.span();
         let annotation = self.parse_optional_annotation()?;
         match self.peek().clone() {
-            TokenKind::Rpc => Ok(Member::Rpc(self.parse_rpc_like(TokenKind::Rpc, annotation)?)),
-            TokenKind::Stream => Ok(Member::Stream(self.parse_rpc_like(TokenKind::Stream, annotation)?)),
+            TokenKind::Rpc => Ok(Member::Rpc(self.parse_rpc_like(start, TokenKind::Rpc, annotation)?)),
+            TokenKind::Stream => Ok(Member::Stream(self.parse_rpc_like(start, TokenKind::Stream, annotation)?)),
             other => Err(self.error(format!("se esperaba 'rpc' o 'stream', se encontró {other:?}"))),
         }
     }
@@ -368,7 +402,11 @@ impl Parser {
         }
     }
 
-    fn parse_rpc_like(&mut self, kw: TokenKind, annotation: Option<Annotation>) -> Result<RpcDecl, ParseError> {
+    /// `start` viene de `parse_member` (capturado antes de la anotación
+    /// opcional, ver ahí). El span de la declaración cubre la FIRMA hasta el
+    /// return type -- se calcula ANTES de parsear `body`, a propósito (el
+    /// cuerpo tiene sus propios spans precisos, ver ast.rs::RpcDecl).
+    fn parse_rpc_like(&mut self, start: Span, kw: TokenKind, annotation: Option<Annotation>) -> Result<RpcDecl, ParseError> {
         self.eat(&kw)?;
         let name = self.eat_ident()?;
         self.eat(&TokenKind::LParen)?;
@@ -376,6 +414,7 @@ impl Parser {
         self.eat(&TokenKind::RParen)?;
         self.eat(&TokenKind::Arrow)?;
         let return_type = self.parse_type_expr()?;
+        let span = merge(start, self.prev_span());
         let body = self.parse_block()?;
         Ok(RpcDecl {
             name,
@@ -383,10 +422,12 @@ impl Parser {
             return_type,
             body,
             annotation,
+            span,
         })
     }
 
     fn parse_fn_decl(&mut self) -> Result<FnDecl, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Fn)?;
         let name = self.eat_ident()?;
         self.eat(&TokenKind::LParen)?;
@@ -394,12 +435,16 @@ impl Parser {
         self.eat(&TokenKind::RParen)?;
         self.eat(&TokenKind::Arrow)?;
         let return_type = self.parse_type_expr()?;
+        // Mismo criterio que parse_rpc_like: span de firma, calculado ANTES
+        // del cuerpo.
+        let span = merge(start, self.prev_span());
         let body = self.parse_block()?;
         Ok(FnDecl {
             name,
             params,
             return_type,
             body,
+            span,
         })
     }
 
@@ -543,6 +588,7 @@ impl Parser {
     // ---- §2.3 Expresiones, sentencias y patrones ----
 
     fn parse_block(&mut self) -> Result<Block, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::LBrace)?;
         let mut stmts = Vec::new();
         let mut tail = None;
@@ -555,11 +601,13 @@ impl Parser {
                 // caer al parseo genérico de expresión, igual que la
                 // desambiguación de struct_or_variant_lit (GRAMMAR.md §2.2).
                 TokenKind::Ident(name) if matches!(self.peek_at(1), TokenKind::Equals) => {
+                    let stmt_start = self.span();
                     self.advance();
                     self.advance(); // '='
                     let value = self.parse_expr()?;
+                    let span = merge(stmt_start, value.span);
                     self.eat(&TokenKind::Semi)?;
-                    stmts.push(Stmt::Assign { name, value });
+                    stmts.push(Spanned { node: Stmt::Assign { name, value }, span });
                 }
                 // `if`/`match` son "block-like": terminan en '}', así que no
                 // deberían necesitar un ';' para seguir siendo una sentencia
@@ -576,13 +624,15 @@ impl Parser {
                     if self.check(&TokenKind::Semi) {
                         self.advance(); // ';' opcional acá, no obligatorio
                     }
-                    stmts.push(Stmt::Expr(e));
+                    let span = e.span;
+                    stmts.push(Spanned { node: Stmt::Expr(e), span });
                 }
                 _ => {
                     let e = self.parse_expr()?;
                     if self.check(&TokenKind::Semi) {
                         self.advance();
-                        stmts.push(Stmt::Expr(e));
+                        let span = e.span;
+                        stmts.push(Spanned { node: Stmt::Expr(e), span });
                     } else {
                         tail = Some(Box::new(e));
                         break;
@@ -591,10 +641,12 @@ impl Parser {
             }
         }
         self.eat(&TokenKind::RBrace)?;
-        Ok(Block { stmts, tail })
+        let span = merge(start, self.prev_span());
+        Ok(Block { stmts, tail, span })
     }
 
-    fn parse_let_stmt(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_let_stmt(&mut self) -> Result<Spanned<Stmt>, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Let)?;
         let mutable = if self.check(&TokenKind::Mut) {
             self.advance();
@@ -611,27 +663,38 @@ impl Parser {
         };
         self.eat(&TokenKind::Equals)?;
         let value = self.parse_expr()?;
+        let span = merge(start, value.span);
         self.eat(&TokenKind::Semi)?;
-        Ok(Stmt::Let {
-            name,
-            mutable,
-            ty,
-            value,
+        Ok(Spanned {
+            node: Stmt::Let {
+                name,
+                mutable,
+                ty,
+                value,
+            },
+            span,
         })
     }
 
-    fn parse_return_stmt(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_return_stmt(&mut self) -> Result<Spanned<Stmt>, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Return)?;
         let value = if self.check(&TokenKind::Semi) {
             None
         } else {
             Some(self.parse_expr()?)
         };
+        // `return;` sin valor: el span es solo el propio token 'return' -- el
+        // ';' es terminador, nunca se incluye (regla de terminador).
+        let span = match &value {
+            Some(v) => merge(start, v.span),
+            None => start,
+        };
         self.eat(&TokenKind::Semi)?;
-        Ok(Stmt::Return(value))
+        Ok(Spanned { node: Stmt::Return(value), span })
     }
 
-    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
         self.parse_expr_ctx(false)
     }
 
@@ -643,7 +706,7 @@ impl Parser {
     /// Se propaga por TODA la cadena de precedencia (no solo el primer
     /// token) porque la ambigüedad puede aparecer en cualquier operando:
     /// `match a + Foo { x: 1 } { ... }` es tan ambiguo como `match Foo { ... }`.
-    fn parse_expr_ctx(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_expr_ctx(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         if self.check(&TokenKind::Match) {
             self.parse_match_expr()
         } else if self.check(&TokenKind::If) {
@@ -653,7 +716,8 @@ impl Parser {
         }
     }
 
-    fn parse_if_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_if_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::If)?;
         // La condición siempre restringe struct-lits, sin importar el
         // contexto exterior: `if x { ... }` es ambiguo igual que `match`.
@@ -665,36 +729,42 @@ impl Parser {
             // envuelve en un Block cuyo tail es el if anidado para que
             // Expr::If siempre tenga dos Block (ver ast.rs), no un Expr
             // suelto -- eval_block/check_block ya saben evaluar cualquier
-            // Expr como tail, así que esto no pierde generalidad.
+            // Expr como tail, así que esto no pierde generalidad. El Block
+            // sintético no tiene llaves propias -- su span es el del if
+            // anidado que envuelve.
             let nested = self.parse_if_expr()?;
-            Block { stmts: Vec::new(), tail: Some(Box::new(nested)) }
+            let span = nested.span;
+            Block { stmts: Vec::new(), tail: Some(Box::new(nested)), span }
         } else {
             self.parse_block()?
         };
-        Ok(Expr::If { cond, then_block, else_block })
+        let span = merge(start, self.prev_span());
+        Ok(Spanned { node: Expr::If { cond, then_block, else_block }, span })
     }
 
-    fn parse_or_expr(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_or_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         let mut left = self.parse_and_expr(no_struct_lit)?;
         while self.check(&TokenKind::PipePipe) {
             self.advance();
             let right = self.parse_and_expr(no_struct_lit)?;
-            left = Expr::Binary { op: BinaryOp::Or, left: Box::new(left), right: Box::new(right) };
+            let span = merge(left.span, right.span);
+            left = Spanned { node: Expr::Binary { op: BinaryOp::Or, left: Box::new(left), right: Box::new(right) }, span };
         }
         Ok(left)
     }
 
-    fn parse_and_expr(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_and_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         let mut left = self.parse_equality_expr(no_struct_lit)?;
         while self.check(&TokenKind::AmpAmp) {
             self.advance();
             let right = self.parse_equality_expr(no_struct_lit)?;
-            left = Expr::Binary { op: BinaryOp::And, left: Box::new(left), right: Box::new(right) };
+            let span = merge(left.span, right.span);
+            left = Spanned { node: Expr::Binary { op: BinaryOp::And, left: Box::new(left), right: Box::new(right) }, span };
         }
         Ok(left)
     }
 
-    fn parse_equality_expr(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_equality_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         let mut left = self.parse_relational_expr(no_struct_lit)?;
         loop {
             let op = match self.peek() {
@@ -704,12 +774,13 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_relational_expr(no_struct_lit)?;
-            left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
+            let span = merge(left.span, right.span);
+            left = Spanned { node: Expr::Binary { op, left: Box::new(left), right: Box::new(right) }, span };
         }
         Ok(left)
     }
 
-    fn parse_relational_expr(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_relational_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         let mut left = self.parse_additive_expr(no_struct_lit)?;
         loop {
             let op = match self.peek() {
@@ -721,12 +792,13 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_additive_expr(no_struct_lit)?;
-            left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
+            let span = merge(left.span, right.span);
+            left = Spanned { node: Expr::Binary { op, left: Box::new(left), right: Box::new(right) }, span };
         }
         Ok(left)
     }
 
-    fn parse_additive_expr(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_additive_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         let mut left = self.parse_multiplicative_expr(no_struct_lit)?;
         loop {
             let op = match self.peek() {
@@ -736,12 +808,13 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_multiplicative_expr(no_struct_lit)?;
-            left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
+            let span = merge(left.span, right.span);
+            left = Spanned { node: Expr::Binary { op, left: Box::new(left), right: Box::new(right) }, span };
         }
         Ok(left)
     }
 
-    fn parse_multiplicative_expr(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_multiplicative_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         let mut left = self.parse_unary_expr(no_struct_lit)?;
         loop {
             let op = match self.peek() {
@@ -752,12 +825,13 @@ impl Parser {
             };
             self.advance();
             let right = self.parse_unary_expr(no_struct_lit)?;
-            left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
+            let span = merge(left.span, right.span);
+            left = Spanned { node: Expr::Binary { op, left: Box::new(left), right: Box::new(right) }, span };
         }
         Ok(left)
     }
 
-    fn parse_unary_expr(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_unary_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         let op = match self.peek() {
             TokenKind::Bang => Some(UnaryOp::Not),
             TokenKind::Minus => Some(UnaryOp::Neg),
@@ -765,15 +839,18 @@ impl Parser {
         };
         match op {
             Some(op) => {
+                let start = self.span();
                 self.advance();
                 let operand = self.parse_unary_expr(no_struct_lit)?;
-                Ok(Expr::Unary { op, operand: Box::new(operand) })
+                let span = merge(start, operand.span);
+                Ok(Spanned { node: Expr::Unary { op, operand: Box::new(operand) }, span })
             }
             None => self.parse_postfix_expr(no_struct_lit),
         }
     }
 
-    fn parse_match_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_match_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Match)?;
         let scrutinee = Box::new(self.parse_expr_ctx(true)?);
         self.eat(&TokenKind::LBrace)?;
@@ -782,10 +859,12 @@ impl Parser {
             arms.push(self.parse_match_arm()?);
         }
         self.eat(&TokenKind::RBrace)?;
-        Ok(Expr::Match { scrutinee, arms })
+        let span = merge(start, self.prev_span());
+        Ok(Spanned { node: Expr::Match { scrutinee, arms }, span })
     }
 
     fn parse_match_arm(&mut self) -> Result<MatchArm, ParseError> {
+        let start = self.span();
         let pattern = self.parse_pattern()?;
         let guard = if self.check(&TokenKind::If) {
             self.advance();
@@ -798,21 +877,26 @@ impl Parser {
             None
         };
         self.eat(&TokenKind::FatArrow)?;
-        let body = if self.check(&TokenKind::LBrace) {
-            MatchArmBody::Block(self.parse_block()?)
+        let (body, span) = if self.check(&TokenKind::LBrace) {
+            let block = self.parse_block()?;
+            let span = merge(start, block.span);
+            (MatchArmBody::Block(block), span)
         } else {
             let e = self.parse_expr()?;
+            let span = merge(start, e.span);
             // La coma separa un arm-expr del siguiente (GRAMMAR.md §2.3),
             // pero en el ÚLTIMO arm no hay nada que separar: exigirla ahí
             // rechazaba `match x { A => 1, B => 2 }` con un críptico "se
             // esperaba Comma, se encontró RBrace". Es opcional justo antes
-            // del `}` de cierre, igual que en Rust.
+            // del `}` de cierre, igual que en Rust. Se consume DESPUÉS de
+            // computar el span (regla de terminador): la coma no es parte
+            // del arm.
             if !self.check(&TokenKind::RBrace) {
                 self.eat(&TokenKind::Comma)?;
             }
-            MatchArmBody::Expr(e)
+            (MatchArmBody::Expr(e), span)
         };
-        Ok(MatchArm { pattern, guard, body })
+        Ok(MatchArm { pattern, guard, body, span })
     }
 
     /// `pattern_atom , { "|" , pattern_atom }` (GRAMMAR.md §3.3) -- un solo
@@ -923,7 +1007,7 @@ impl Parser {
         Ok(FieldPattern { name, pattern })
     }
 
-    fn parse_postfix_expr(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_postfix_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         let mut e = self.parse_primary_expr(no_struct_lit)?;
         loop {
             match self.peek().clone() {
@@ -938,14 +1022,13 @@ impl Parser {
                             let index: usize = n
                                 .try_into()
                                 .map_err(|_| self.error("índice de tupla inválido (negativo)"))?;
-                            e = Expr::TupleIndex { base: Box::new(e), index };
+                            let span = merge(e.span, self.prev_span());
+                            e = Spanned { node: Expr::TupleIndex { base: Box::new(e), index }, span };
                         }
                         _ => {
                             let field = self.eat_ident()?;
-                            e = Expr::FieldAccess {
-                                base: Box::new(e),
-                                field,
-                            };
+                            let span = merge(e.span, self.prev_span());
+                            e = Spanned { node: Expr::FieldAccess { base: Box::new(e), field }, span };
                         }
                     }
                 }
@@ -960,19 +1043,15 @@ impl Parser {
                         }
                     }
                     self.eat(&TokenKind::RParen)?;
-                    e = Expr::Call {
-                        callee: Box::new(e),
-                        args,
-                    };
+                    let span = merge(e.span, self.prev_span());
+                    e = Spanned { node: Expr::Call { callee: Box::new(e), args }, span };
                 }
                 TokenKind::LBracket => {
                     self.advance();
                     let index = self.parse_expr()?; // dentro de [], struct lit permitido de nuevo
                     self.eat(&TokenKind::RBracket)?;
-                    e = Expr::Index {
-                        base: Box::new(e),
-                        index: Box::new(index),
-                    };
+                    let span = merge(e.span, self.prev_span());
+                    e = Spanned { node: Expr::Index { base: Box::new(e), index: Box::new(index) }, span };
                 }
                 _ => break,
             }
@@ -980,33 +1059,34 @@ impl Parser {
         Ok(e)
     }
 
-    fn parse_primary_expr(&mut self, no_struct_lit: bool) -> Result<Expr, ParseError> {
+    fn parse_primary_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         match self.peek().clone() {
             TokenKind::Int(n) => {
-                self.advance();
-                Ok(Expr::Int(n))
+                let t = self.advance();
+                Ok(Spanned { node: Expr::Int(n), span: t.span })
             }
             TokenKind::Float(n) => {
-                self.advance();
-                Ok(Expr::Float(n))
+                let t = self.advance();
+                Ok(Spanned { node: Expr::Float(n), span: t.span })
             }
             TokenKind::Str(s) => {
-                self.advance();
-                Ok(Expr::Str(s))
+                let t = self.advance();
+                Ok(Spanned { node: Expr::Str(s), span: t.span })
             }
             TokenKind::True => {
-                self.advance();
-                Ok(Expr::Bool(true))
+                let t = self.advance();
+                Ok(Spanned { node: Expr::Bool(true), span: t.span })
             }
             TokenKind::False => {
-                self.advance();
-                Ok(Expr::Bool(false))
+                let t = self.advance();
+                Ok(Spanned { node: Expr::Bool(false), span: t.span })
             }
             TokenKind::Null => {
-                self.advance();
-                Ok(Expr::Null)
+                let t = self.advance();
+                Ok(Spanned { node: Expr::Null, span: t.span })
             }
             TokenKind::LBracket => {
+                let start = self.span();
                 self.advance();
                 let mut items = Vec::new();
                 if !self.check(&TokenKind::RBracket) {
@@ -1020,9 +1100,11 @@ impl Parser {
                     }
                 }
                 self.eat(&TokenKind::RBracket)?;
-                Ok(Expr::ArrayLit(items))
+                let span = merge(start, self.prev_span());
+                Ok(Spanned { node: Expr::ArrayLit(items), span })
             }
             TokenKind::LParen => {
+                let start = self.span();
                 self.advance();
                 // Misma ambigüedad que a nivel de tipos (§2.2): (a) es
                 // agrupación, (a,) es tupla de 1, (a,b) es tupla de 2+.
@@ -1037,13 +1119,15 @@ impl Parser {
                     items.push(self.parse_expr()?);
                 }
                 self.eat(&TokenKind::RParen)?;
+                let span = merge(start, self.prev_span());
                 if items.len() == 1 && !had_comma {
-                    Ok(Expr::Paren(Box::new(items.into_iter().next().unwrap())))
+                    Ok(Spanned { node: Expr::Paren(Box::new(items.into_iter().next().unwrap())), span })
                 } else {
-                    Ok(Expr::TupleLit(items))
+                    Ok(Spanned { node: Expr::TupleLit(items), span })
                 }
             }
             TokenKind::Ident(name) => {
+                let start = self.span();
                 self.advance();
                 if !no_struct_lit {
                     // Lookahead de hasta 2 tokens: Nombre['.'Nombre] '{' -> literal.
@@ -1054,22 +1138,16 @@ impl Parser {
                         self.advance(); // '.'
                         let variant_name = self.eat_ident()?;
                         let fields = self.parse_field_init_list()?;
-                        return Ok(Expr::StructLit {
-                            name,
-                            variant: Some(variant_name),
-                            fields,
-                        });
+                        let span = merge(start, self.prev_span());
+                        return Ok(Spanned { node: Expr::StructLit { name, variant: Some(variant_name), fields }, span });
                     }
                     if self.check(&TokenKind::LBrace) {
                         let fields = self.parse_field_init_list()?;
-                        return Ok(Expr::StructLit {
-                            name,
-                            variant: None,
-                            fields,
-                        });
+                        let span = merge(start, self.prev_span());
+                        return Ok(Spanned { node: Expr::StructLit { name, variant: None, fields }, span });
                     }
                 }
-                Ok(Expr::Ident(name))
+                Ok(Spanned { node: Expr::Ident(name), span: start })
             }
             TokenKind::Pipe => self.parse_closure_expr(),
             other => Err(self.error(format!("se esperaba una expresión, se encontró {other:?}"))),
@@ -1081,7 +1159,8 @@ impl Parser {
     /// `| |` (con espacio) sigue siendo dos `Pipe` separados, de ahí el
     /// chequeo explícito de "al menos 1 param" más abajo en vez de confiar
     /// en que el token ya lo descarta.
-    fn parse_closure_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_closure_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
+        let start = self.span();
         self.eat(&TokenKind::Pipe)?;
         let mut params = Vec::new();
         if !self.check(&TokenKind::Pipe) {
@@ -1101,7 +1180,8 @@ impl Parser {
             ));
         }
         let body = self.parse_block()?;
-        Ok(Expr::Closure { params, body })
+        let span = merge(start, self.prev_span());
+        Ok(Spanned { node: Expr::Closure { params, body }, span })
     }
 
     /// `nombre (":" tipo)?` -- a diferencia de `parse_param` (fn/rpc), la
@@ -1122,7 +1202,7 @@ impl Parser {
         Ok(ClosureParam { name, ty })
     }
 
-    fn parse_field_init_list(&mut self) -> Result<Vec<(String, Expr)>, ParseError> {
+    fn parse_field_init_list(&mut self) -> Result<Vec<(String, Spanned<Expr>)>, ParseError> {
         self.eat(&TokenKind::LBrace)?;
         let mut fields = Vec::new();
         if !self.check(&TokenKind::RBrace) {
@@ -1139,7 +1219,7 @@ impl Parser {
         Ok(fields)
     }
 
-    fn parse_field_init(&mut self) -> Result<(String, Expr), ParseError> {
+    fn parse_field_init(&mut self) -> Result<(String, Spanned<Expr>), ParseError> {
         let name = self.eat_ident()?;
         self.eat(&TokenKind::Colon)?;
         let value = self.parse_expr()?;
@@ -1155,6 +1235,14 @@ mod tests {
     fn parse_source(src: &str) -> Program {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         parse(tokens).unwrap_or_else(|e| panic!("{e:?}"))
+    }
+
+    /// Envuelve un nodo en `Spanned` con un span dummy -- para construir un
+    /// `Expr`/`Stmt` literal del lado derecho de un `assert_eq!` en los
+    /// tests de acá abajo. `Spanned::eq` ignora el span (ast.rs), así que el
+    /// valor exacto acá no importa, solo hace falta que el tipo cierre.
+    fn sp<T>(node: T) -> Spanned<T> {
+        Spanned { node, span: Span::new(0, 0, 0, 0) }
     }
 
     #[test]
@@ -1251,10 +1339,10 @@ mod tests {
         let Member::Rpc(RpcDecl { body, .. }) = &members[0] else { panic!() };
         // db.users.all().take(1) — debe ser Call(FieldAccess(Call(FieldAccess(FieldAccess(db,users),all)),take),[1])
         let tail = body.tail.as_ref().expect("se esperaba tail expr");
-        match &**tail {
+        match &tail.node {
             Expr::Call { callee, args } => {
                 assert_eq!(args.len(), 1);
-                match &**callee {
+                match &callee.node {
                     Expr::FieldAccess { field, .. } => assert_eq!(field, "take"),
                     other => panic!("se esperaba FieldAccess, fue {other:?}"),
                 }
@@ -1278,7 +1366,7 @@ mod tests {
         let Item::Service(ServiceDecl { members, .. }) = &prog.items[0] else { panic!() };
         let Member::Rpc(RpcDecl { body, .. }) = &members[0] else { panic!() };
         let tail = body.tail.as_ref().unwrap();
-        match &**tail {
+        match &tail.node {
             Expr::Match { arms, .. } => {
                 assert_eq!(arms.len(), 2);
                 match &arms[0].pattern {
@@ -1312,7 +1400,7 @@ mod tests {
         );
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
         let tail = body.tail.as_deref().unwrap();
-        match tail {
+        match &tail.node {
             Expr::Match { arms, .. } => {
                 assert_eq!(arms.len(), 3);
                 assert_eq!(
@@ -1341,7 +1429,7 @@ mod tests {
         );
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
         let tail = body.tail.as_deref().unwrap();
-        match tail {
+        match &tail.node {
             Expr::Match { arms, .. } => {
                 assert_eq!(arms[0].pattern, Pattern::Bind("x".into()));
                 assert!(arms[0].guard.is_some());
@@ -1366,9 +1454,9 @@ mod tests {
         );
         let Item::Service(ServiceDecl { members, .. }) = &prog.items[0] else { panic!() };
         let Member::Rpc(RpcDecl { body, .. }) = &members[0] else { panic!() };
-        match body.tail.as_deref().unwrap() {
+        match &body.tail.as_deref().unwrap().node {
             Expr::Match { scrutinee, arms } => {
-                assert_eq!(**scrutinee, Expr::Ident("x".into()));
+                assert_eq!(scrutinee.node, Expr::Ident("x".into()));
                 assert_eq!(arms.len(), 1);
             }
             other => panic!("se esperaba Match, fue {other:?}"),
@@ -1381,10 +1469,10 @@ mod tests {
         let prog = parse_source("fn f() -> Int { a + b * c }");
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
         let tail = body.tail.as_deref().unwrap();
-        match tail {
+        match &tail.node {
             Expr::Binary { op: BinaryOp::Add, left, right } => {
-                assert_eq!(**left, Expr::Ident("a".into()));
-                match &**right {
+                assert_eq!(left.node, Expr::Ident("a".into()));
+                match &right.node {
                     Expr::Binary { op: BinaryOp::Mul, .. } => {}
                     other => panic!("el lado derecho de '+' debería ser 'b * c', fue {other:?}"),
                 }
@@ -1398,10 +1486,10 @@ mod tests {
         // a + 1 < b && c  ==  ((a + 1) < b) && c
         let prog = parse_source("fn f() -> Bool { a + 1 < b && c }");
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
-        match body.tail.as_deref().unwrap() {
-            Expr::Binary { op: BinaryOp::And, left, .. } => match &**left {
+        match &body.tail.as_deref().unwrap().node {
+            Expr::Binary { op: BinaryOp::And, left, .. } => match &left.node {
                 Expr::Binary { op: BinaryOp::Lt, left, .. } => {
-                    assert!(matches!(**left, Expr::Binary { op: BinaryOp::Add, .. }));
+                    assert!(matches!(left.node, Expr::Binary { op: BinaryOp::Add, .. }));
                 }
                 other => panic!("se esperaba Lt del lado izquierdo del &&, fue {other:?}"),
             },
@@ -1413,9 +1501,9 @@ mod tests {
     fn unary_minus_and_not_parse_right_associatively() {
         let prog = parse_source("fn f() -> Int { --a }"); // -(-a)
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
-        match body.tail.as_deref().unwrap() {
+        match &body.tail.as_deref().unwrap().node {
             Expr::Unary { op: UnaryOp::Neg, operand } => {
-                assert!(matches!(**operand, Expr::Unary { op: UnaryOp::Neg, .. }));
+                assert!(matches!(operand.node, Expr::Unary { op: UnaryOp::Neg, .. }));
             }
             other => panic!("se esperaba Neg(Neg(a)), fue {other:?}"),
         }
@@ -1423,7 +1511,7 @@ mod tests {
         let prog2 = parse_source("fn f() -> Bool { !ok }");
         let Item::Fn(FnDecl { body, .. }) = &prog2.items[0] else { panic!() };
         assert!(matches!(
-            body.tail.as_deref().unwrap(),
+            body.tail.as_deref().unwrap().node,
             Expr::Unary { op: UnaryOp::Not, .. }
         ));
     }
@@ -1432,11 +1520,11 @@ mod tests {
     fn if_else_requires_else_and_parses_both_blocks() {
         let prog = parse_source("fn f(x: Int) -> Int { if x > 0 { x } else { 0 } }");
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
-        match body.tail.as_deref().unwrap() {
+        match &body.tail.as_deref().unwrap().node {
             Expr::If { cond, then_block, else_block } => {
-                assert!(matches!(**cond, Expr::Binary { op: BinaryOp::Gt, .. }));
-                assert_eq!(then_block.tail.as_deref(), Some(&Expr::Ident("x".into())));
-                assert_eq!(else_block.tail.as_deref(), Some(&Expr::Int(0)));
+                assert!(matches!(cond.node, Expr::Binary { op: BinaryOp::Gt, .. }));
+                assert_eq!(then_block.tail.as_deref().map(|s| &s.node), Some(&Expr::Ident("x".into())));
+                assert_eq!(else_block.tail.as_deref().map(|s| &s.node), Some(&Expr::Int(0)));
             }
             other => panic!("se esperaba If, fue {other:?}"),
         }
@@ -1454,10 +1542,10 @@ mod tests {
         let src = "fn f(x: Int) -> Int { if x > 0 { 1 } else if x < 0 { -1 } else { 0 } }";
         let prog = parse_source(src);
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
-        match body.tail.as_deref().unwrap() {
+        match &body.tail.as_deref().unwrap().node {
             Expr::If { else_block, .. } => {
                 // else_block.tail debe ser el If anidado (else if), no un valor simple
-                assert!(matches!(else_block.tail.as_deref(), Some(Expr::If { .. })));
+                assert!(matches!(else_block.tail.as_deref().map(|s| &s.node), Some(Expr::If { .. })));
             }
             other => panic!("se esperaba If, fue {other:?}"),
         }
@@ -1478,9 +1566,9 @@ mod tests {
         );
         let Item::Service(ServiceDecl { members, .. }) = &prog.items[0] else { panic!() };
         let Member::Rpc(RpcDecl { body, .. }) = &members[0] else { panic!() };
-        match body.tail.as_deref().unwrap() {
+        match &body.tail.as_deref().unwrap().node {
             Expr::Match { scrutinee, .. } => {
-                assert!(matches!(**scrutinee, Expr::Binary { op: BinaryOp::Add, .. }));
+                assert!(matches!(scrutinee.node, Expr::Binary { op: BinaryOp::Add, .. }));
             }
             other => panic!("se esperaba Match, fue {other:?}"),
         }
@@ -1496,8 +1584,8 @@ mod tests {
         );
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
         assert_eq!(body.stmts.len(), 1); // el if/else es la única sentencia; `r` es el tail
-        assert!(matches!(body.stmts[0], Stmt::Expr(Expr::If { .. })));
-        assert_eq!(body.tail.as_deref(), Some(&Expr::Ident("r".into())));
+        assert!(matches!(&body.stmts[0].node, Stmt::Expr(e) if matches!(e.node, Expr::If { .. })));
+        assert_eq!(body.tail.as_deref().map(|s| &s.node), Some(&Expr::Ident("r".into())));
     }
 
     #[test]
@@ -1505,10 +1593,10 @@ mod tests {
         let prog = parse_source("fn f() -> Int { let mut x = 1; x = 2; x }");
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
         assert_eq!(body.stmts.len(), 2);
-        match &body.stmts[1] {
+        match &body.stmts[1].node {
             Stmt::Assign { name, value } => {
                 assert_eq!(name, "x");
-                assert_eq!(*value, Expr::Int(2));
+                assert_eq!(value.node, Expr::Int(2));
             }
             other => panic!("se esperaba Stmt::Assign, fue {other:?}"),
         }
@@ -1518,16 +1606,19 @@ mod tests {
     fn array_literal_and_indexing_parse() {
         let prog = parse_source("fn f() -> Int { let xs = [1, 2, 3]; xs[0] }");
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
-        match &body.stmts[0] {
+        match &body.stmts[0].node {
             Stmt::Let { value, .. } => {
-                assert_eq!(*value, Expr::ArrayLit(vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)]));
+                assert_eq!(
+                    value.node,
+                    Expr::ArrayLit(vec![sp(Expr::Int(1)), sp(Expr::Int(2)), sp(Expr::Int(3))])
+                );
             }
             other => panic!("se esperaba Stmt::Let, fue {other:?}"),
         }
-        match body.tail.as_deref().unwrap() {
+        match &body.tail.as_deref().unwrap().node {
             Expr::Index { base, index } => {
-                assert_eq!(**base, Expr::Ident("xs".into()));
-                assert_eq!(**index, Expr::Int(0));
+                assert_eq!(base.node, Expr::Ident("xs".into()));
+                assert_eq!(index.node, Expr::Int(0));
             }
             other => panic!("se esperaba Index, fue {other:?}"),
         }
@@ -1541,9 +1632,9 @@ mod tests {
         );
         let prog = parse_source("fn f() -> Int { let xs = [1, 2,]; 0 }"); // coma final
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
-        match &body.stmts[0] {
+        match &body.stmts[0].node {
             Stmt::Let { value, .. } => {
-                assert_eq!(*value, Expr::ArrayLit(vec![Expr::Int(1), Expr::Int(2)]));
+                assert_eq!(value.node, Expr::ArrayLit(vec![sp(Expr::Int(1)), sp(Expr::Int(2))]));
             }
             other => panic!("se esperaba Stmt::Let, fue {other:?}"),
         }
@@ -1554,29 +1645,35 @@ mod tests {
         // (a) sigue siendo agrupación -- misma regla que a nivel de tipos.
         let prog = parse_source("fn f() -> Int { (1) }");
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
-        assert_eq!(body.tail.as_deref(), Some(&Expr::Paren(Box::new(Expr::Int(1)))));
+        assert_eq!(
+            body.tail.as_deref().map(|s| &s.node),
+            Some(&Expr::Paren(Box::new(sp(Expr::Int(1)))))
+        );
 
         // (a, b) es TupleLit de 2.
         let prog2 = parse_source(r#"fn f() -> Int { (1, "a") }"#);
         let Item::Fn(FnDecl { body, .. }) = &prog2.items[0] else { panic!() };
         assert_eq!(
-            body.tail.as_deref(),
-            Some(&Expr::TupleLit(vec![Expr::Int(1), Expr::Str("a".into())]))
+            body.tail.as_deref().map(|s| &s.node),
+            Some(&Expr::TupleLit(vec![sp(Expr::Int(1)), sp(Expr::Str("a".into()))]))
         );
 
         // (a,) con coma final es TupleLit de 1, no agrupación.
         let prog3 = parse_source("fn f() -> Int { (1,) }");
         let Item::Fn(FnDecl { body, .. }) = &prog3.items[0] else { panic!() };
-        assert_eq!(body.tail.as_deref(), Some(&Expr::TupleLit(vec![Expr::Int(1)])));
+        assert_eq!(
+            body.tail.as_deref().map(|s| &s.node),
+            Some(&Expr::TupleLit(vec![sp(Expr::Int(1))]))
+        );
     }
 
     #[test]
     fn tuple_positional_access_parses() {
         let prog = parse_source(r#"fn f() -> Int { let t = (1, "a"); t.0 }"#);
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
-        match body.tail.as_deref().unwrap() {
+        match &body.tail.as_deref().unwrap().node {
             Expr::TupleIndex { base, index } => {
-                assert_eq!(**base, Expr::Ident("t".into()));
+                assert_eq!(base.node, Expr::Ident("t".into()));
                 assert_eq!(*index, 0);
             }
             other => panic!("se esperaba TupleIndex, fue {other:?}"),
@@ -1661,5 +1758,36 @@ mod tests {
         let errors = parse_errors("fn a(*) -> Int { 1 }");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].span.line >= 1);
+    }
+
+    // ---- spans en el AST (LSP prerrequisito 3/3, Ronda A) ----
+
+    #[test]
+    fn binary_expr_span_covers_from_left_operand_to_right_operand() {
+        let src = "fn f() -> Int { a + b }";
+        let prog = parse_source(src);
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        let tail = body.tail.as_deref().unwrap();
+        let a_pos = src.find('a').unwrap();
+        let b_pos = src.find('b').unwrap();
+        assert_eq!(tail.span.start, a_pos, "el span de 'a + b' debería empezar en 'a'");
+        assert_eq!(tail.span.end, b_pos + 1, "el span de 'a + b' debería terminar justo después de 'b'");
+    }
+
+    #[test]
+    fn rpc_decl_span_includes_the_leading_annotation() {
+        // Bug real encontrado por el review antes de implementar esto: si
+        // parse_rpc_like capturara su propio inicio al entrar (la regla
+        // "mecánica" ingenua), el span quedaría sistemáticamente AFUERA de
+        // la @annotation, porque parse_optional_annotation ya la consumió
+        // antes de que parse_rpc_like arranque. Ver parse_member.
+        let src = "enum Role { Admin }\nservice S { @requires(Role.Admin) rpc f() -> Int { 1 } }";
+        let prog = parse_source(src);
+        let Item::Service(ServiceDecl { members, .. }) = &prog.items[1] else { panic!() };
+        let Member::Rpc(rpc) = &members[0] else { panic!() };
+        let at_pos = src.find('@').unwrap();
+        let int_end = src.find("Int").unwrap() + "Int".len();
+        assert_eq!(rpc.span.start, at_pos, "el span del rpc debería empezar en su propia @annotation");
+        assert_eq!(rpc.span.end, int_end, "el span del rpc debería terminar en el return type, sin incluir el cuerpo");
     }
 }

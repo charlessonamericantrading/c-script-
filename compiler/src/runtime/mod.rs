@@ -213,7 +213,7 @@ pub(crate) fn eval_block(
 ) -> Result<Value, RuntimeError> {
     let mut local = env.clone();
     for stmt in &block.stmts {
-        match stmt {
+        match &stmt.node {
             Stmt::Let { name, value, .. } => {
                 let v = eval_expr(value, &local, db, fns, checker, sessions, current_token)?;
                 local.insert(name.clone(), cell(v));
@@ -240,7 +240,7 @@ pub(crate) fn eval_block(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_expr(
-    e: &Expr,
+    e: &Spanned<Expr>,
     env: &Env,
     db: &Db,
     fns: &Fns,
@@ -248,7 +248,7 @@ pub(crate) fn eval_expr(
     sessions: &SessionStore,
     current_token: Option<&str>,
 ) -> Result<Value, RuntimeError> {
-    match e {
+    match &e.node {
         Expr::Int(n) => Ok(Value::Int(*n)),
         Expr::Float(n) => Ok(Value::Float(*n)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
@@ -320,7 +320,7 @@ pub(crate) fn eval_expr(
             // Llamada directa a una `fn` de usuario por nombre -- atajo
             // frecuente que evita pasar por FnRef (ver Expr::Ident arriba)
             // solo para volver a buscar el mismo nombre en `fns`.
-            if let Expr::Ident(name) = &**callee {
+            if let Expr::Ident(name) = &callee.node {
                 if let Some(decl) = fns.get(name.as_str()) {
                     let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token)?;
                     return call_fn_decl(decl, arg_vs, db, fns, checker, sessions, current_token);
@@ -449,8 +449,8 @@ pub(crate) fn eval_expr(
 #[allow(clippy::too_many_arguments)]
 fn eval_binary(
     op: BinaryOp,
-    left: &Expr,
-    right: &Expr,
+    left: &Spanned<Expr>,
+    right: &Spanned<Expr>,
     env: &Env,
     db: &Db,
     fns: &Fns,
@@ -496,7 +496,7 @@ fn eval_binary(
 #[allow(clippy::too_many_arguments)]
 fn eval_unary(
     op: UnaryOp,
-    operand: &Expr,
+    operand: &Spanned<Expr>,
     env: &Env,
     db: &Db,
     fns: &Fns,
@@ -550,7 +550,7 @@ fn compare(l: Value, r: Value, accept: impl Fn(std::cmp::Ordering) -> bool) -> R
 
 #[allow(clippy::too_many_arguments)]
 fn eval_args(
-    args: &[Expr],
+    args: &[Spanned<Expr>],
     env: &Env,
     db: &Db,
     fns: &Fns,

@@ -55,7 +55,7 @@ pub fn emit_contract(program: &Program) -> Result<String, String> {
 /// módulo real -- de ahí que se emita acá.
 fn emit_const_decl(out: &mut String, c: &ConstDecl, checker: &Checker) -> Result<(), String> {
     let ty = checker.resolve_type(&c.ty).map_err(|e| e.to_string())?;
-    let value = render_const_value(&c.value, checker)?;
+    let value = render_const_value(&c.value.node, checker)?;
     out.push_str(&format!("export const {}: {} = {};\n\n", c.name, render_type(&ty), value));
     Ok(())
 }
@@ -75,12 +75,12 @@ fn render_const_value(e: &Expr, checker: &Checker) -> Result<String, String> {
         Expr::Null => Ok("null".to_string()),
         Expr::ArrayLit(items) => {
             let parts: Vec<String> =
-                items.iter().map(|i| render_const_value(i, checker)).collect::<Result<_, _>>()?;
+                items.iter().map(|i| render_const_value(&i.node, checker)).collect::<Result<_, _>>()?;
             Ok(format!("[{}]", parts.join(", ")))
         }
         Expr::TupleLit(items) => {
             let parts: Vec<String> =
-                items.iter().map(|i| render_const_value(i, checker)).collect::<Result<_, _>>()?;
+                items.iter().map(|i| render_const_value(&i.node, checker)).collect::<Result<_, _>>()?;
             Ok(format!("[{}]", parts.join(", ")))
         }
         Expr::StructLit { name, variant, fields } => {
@@ -100,7 +100,7 @@ fn render_const_value(e: &Expr, checker: &Checker) -> Result<String, String> {
                 parts.push(format!("type: {v:?}"));
             }
             for (k, fe) in fields {
-                parts.push(format!("{k}: {}", render_const_value(fe, checker)?));
+                parts.push(format!("{k}: {}", render_const_value(&fe.node, checker)?));
             }
             Ok(format!("{{ {} }}", parts.join(", ")))
         }

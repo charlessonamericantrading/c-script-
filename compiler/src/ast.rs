@@ -1,9 +1,33 @@
 // Árbol de sintaxis abstracta — refleja 1:1 las producciones de GRAMMAR.md §2.
 //
-// No se trackean Spans por nodo en esta iteración (deliberado, no descuido):
-// los errores de parseo ya referencian el span del token donde fallaron, que
-// alcanza para el MVP. Si hace falta señalar errores del type checker sobre
-// un nodo ya construido, se añade entonces — no antes.
+// Cada `Expr`/`Stmt` viaja envuelto en `Spanned<T>` (definido debajo), y una
+// decena de tipos de declaración (`TypeDecl`, `FnDecl`, `RpcDecl`, `Block`,
+// `MatchArm`, etc.) cargan además un campo `span: Span` plano -- lo que hace
+// falta para que un error del type checker señale una posición real del
+// código fuente, no solo los de sintaxis (que ya podían antes, vía el span
+// de cada `Token`). `Pattern`/`TypeExpr`/`Param`/`Field`/`Variant` quedan
+// deliberadamente SIN span propio por ahora.
+
+use crate::token::Span;
+
+/// Envoltorio genérico que asocia un `Span` a un nodo del AST. La igualdad
+/// (implementada A MANO, no derivada) ignora el span a propósito: dos
+/// expresiones son "la misma" si representan el mismo árbol, sin importar de
+/// dónde del archivo vinieron. Esto es lo que deja a los sitios que ya
+/// comparan `Expr`/`Stmt` a mano (tests) sin cambios de comportamiento, y es
+/// lo correcto de cara a un LSP real futuro (reanálisis incremental: "¿esta
+/// declaración cambió?").
+#[derive(Debug, Clone)]
+pub struct Spanned<T> {
+    pub node: T,
+    pub span: Span,
+}
+
+impl<T: PartialEq> PartialEq for Spanned<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.node == other.node
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
@@ -29,29 +53,57 @@ pub enum Item {
 /// sin gramática nueva para el tipo de cada colección, el checker exige
 /// que cada uno resuelva a un struct con un campo `id: Int` (no la
 /// gramática, ver checker.rs).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct DbDecl {
     pub collections: Vec<Field>,
+    pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl PartialEq for DbDecl {
+    fn eq(&self, other: &Self) -> bool {
+        self.collections == other.collections
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ImportDecl {
     pub names: Vec<String>,
     pub from: String,
+    pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl PartialEq for ImportDecl {
+    fn eq(&self, other: &Self) -> bool {
+        self.names == other.names && self.from == other.from
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct TypeDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub ty: TypeExpr,
+    pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl PartialEq for TypeDecl {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.type_params == other.type_params && self.ty == other.ty
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct EnumDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub variants: Vec<Variant>,
+    pub span: Span,
+}
+
+impl PartialEq for EnumDecl {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.type_params == other.type_params && self.variants == other.variants
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -69,17 +121,31 @@ pub struct Field {
     pub ty: TypeExpr,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ConstDecl {
     pub name: String,
     pub ty: TypeExpr,
-    pub value: Expr,
+    pub value: Spanned<Expr>,
+    pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl PartialEq for ConstDecl {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.ty == other.ty && self.value == other.value
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ServiceDecl {
     pub name: String,
     pub members: Vec<Member>,
+    pub span: Span,
+}
+
+impl PartialEq for ServiceDecl {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.members == other.members
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,13 +154,29 @@ pub enum Member {
     Stream(RpcDecl),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// El span cubre la FIRMA (desde el nombre hasta el return type, incluyendo
+/// la `@annotation` si hay una -- ver `parse_member`/`parse_rpc_like` en
+/// parser.rs), NO el cuerpo: `body` (un `Block`) ya carga su propio span
+/// preciso por statement/expresión, así que un error DENTRO del cuerpo nunca
+/// necesita caer de vuelta al span de todo el rpc.
+#[derive(Debug, Clone)]
 pub struct RpcDecl {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: TypeExpr,
     pub body: Block,
     pub annotation: Option<Annotation>,
+    pub span: Span,
+}
+
+impl PartialEq for RpcDecl {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.params == other.params
+            && self.return_type == other.return_type
+            && self.body == other.body
+            && self.annotation == other.annotation
+    }
 }
 
 /// Auth v0 (GRAMMAR.md §3.14): a lo sumo UNA anotación por rpc/stream --
@@ -110,15 +192,26 @@ pub enum Annotation {
 pub struct Param {
     pub name: String,
     pub ty: TypeExpr,
-    pub default: Option<Expr>,
+    pub default: Option<Spanned<Expr>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Mismo criterio que `RpcDecl`: el span cubre la firma, no `body`.
+#[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
     pub params: Vec<Param>,
     pub return_type: TypeExpr,
     pub body: Block,
+    pub span: Span,
+}
+
+impl PartialEq for FnDecl {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.params == other.params
+            && self.return_type == other.return_type
+            && self.body == other.body
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -142,10 +235,17 @@ pub enum TypeExpr {
     Union(Vec<TypeExpr>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Block {
-    pub stmts: Vec<Stmt>,
-    pub tail: Option<Box<Expr>>,
+    pub stmts: Vec<Spanned<Stmt>>,
+    pub tail: Option<Box<Spanned<Expr>>>,
+    pub span: Span,
+}
+
+impl PartialEq for Block {
+    fn eq(&self, other: &Self) -> bool {
+        self.stmts == other.stmts && self.tail == other.tail
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -154,16 +254,16 @@ pub enum Stmt {
         name: String,
         mutable: bool,
         ty: Option<TypeExpr>,
-        value: Expr,
+        value: Spanned<Expr>,
     },
-    Return(Option<Expr>),
-    Expr(Expr),
+    Return(Option<Spanned<Expr>>),
+    Expr(Spanned<Expr>),
     /// `x = expr;` -- solo variables simples (no `obj.field = ...` ni
     /// `arr[i] = ...` todavía). El checker exige que `x` haya sido
     /// declarada con `mut` (GRAMMAR.md §2.3).
     Assign {
         name: String,
-        value: Expr,
+        value: Spanned<Expr>,
     },
 }
 
@@ -176,56 +276,56 @@ pub enum Expr {
     Null,
     Ident(String),
     FieldAccess {
-        base: Box<Expr>,
+        base: Box<Spanned<Expr>>,
         field: String,
     },
     Call {
-        callee: Box<Expr>,
-        args: Vec<Expr>,
+        callee: Box<Spanned<Expr>>,
+        args: Vec<Spanned<Expr>>,
     },
     /// `[e1, e2, ...]` -- vacío (`[]`) solo es válido en modo chequeo,
     /// ver checker.rs (no se puede sintetizar un elemento de la nada).
-    ArrayLit(Vec<Expr>),
+    ArrayLit(Vec<Spanned<Expr>>),
     /// `base[index]` -- postfix, ver GRAMMAR.md §2.3.
     Index {
-        base: Box<Expr>,
-        index: Box<Expr>,
+        base: Box<Spanned<Expr>>,
+        index: Box<Spanned<Expr>>,
     },
     /// `(e1, e2, ...)` -- distinto de `Paren` (agrupación) por la misma
     /// regla de la coma obligatoria que ya usa el nivel de tipos (§2.2).
-    TupleLit(Vec<Expr>),
+    TupleLit(Vec<Spanned<Expr>>),
     /// `base.0`, `base.1`, ... -- acceso posicional. Un solo nivel: `t.0.1`
     /// NO encadena (ver nota del lexer en GRAMMAR.md §2.3), es una
     /// limitación conocida, no un error silencioso.
     TupleIndex {
-        base: Box<Expr>,
+        base: Box<Spanned<Expr>>,
         index: usize,
     },
     /// `Nombre { campos }` o `Enum.Variante { campos }` (GRAMMAR.md §2.3 struct_or_variant_lit).
     StructLit {
         name: String,
         variant: Option<String>,
-        fields: Vec<(String, Expr)>,
+        fields: Vec<(String, Spanned<Expr>)>,
     },
     Match {
-        scrutinee: Box<Expr>,
+        scrutinee: Box<Spanned<Expr>>,
         arms: Vec<MatchArm>,
     },
     If {
-        cond: Box<Expr>,
+        cond: Box<Spanned<Expr>>,
         then_block: Block,
         else_block: Block,
     },
     Binary {
         op: BinaryOp,
-        left: Box<Expr>,
-        right: Box<Expr>,
+        left: Box<Spanned<Expr>>,
+        right: Box<Spanned<Expr>>,
     },
     Unary {
         op: UnaryOp,
-        operand: Box<Expr>,
+        operand: Box<Spanned<Expr>>,
     },
-    Paren(Box<Expr>),
+    Paren(Box<Spanned<Expr>>),
     /// `|params| { block }` (GRAMMAR.md §3.10) -- SIEMPRE un bloque con
     /// llaves, nunca una expresión suelta (no existe "bloque como
     /// expresión general" en el lenguaje; esto reusa `Block` tal cual, sin
@@ -273,19 +373,26 @@ pub enum UnaryOp {
     Not,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct MatchArm {
     pub pattern: Pattern,
     /// `pattern if guard => body` (GRAMMAR.md §3.3). Un arm con guard NUNCA
     /// descarta exhaustividad por sí solo -- la condición podría ser falsa
     /// en runtime, así que el checker lo trata como si no cubriera nada.
-    pub guard: Option<Expr>,
+    pub guard: Option<Spanned<Expr>>,
     pub body: MatchArmBody,
+    pub span: Span,
+}
+
+impl PartialEq for MatchArm {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern && self.guard == other.guard && self.body == other.body
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchArmBody {
-    Expr(Expr),
+    Expr(Spanned<Expr>),
     Block(Block),
 }
 

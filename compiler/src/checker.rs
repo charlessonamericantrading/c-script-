@@ -67,22 +67,22 @@ fn pattern_bindings(pattern: &Pattern) -> Vec<String> {
 /// `if`/`match` cuyo cuerpo es, a su vez, otro `Block`; por eso alcanza con
 /// recursar exactamente en esos dos casos.
 fn block_has_return(block: &Block) -> bool {
-    block.stmts.iter().any(|s| match s {
+    block.stmts.iter().any(|s| match &s.node {
         Stmt::Return(_) => true,
-        Stmt::Let { value, .. } | Stmt::Assign { value, .. } => expr_has_return(value),
-        Stmt::Expr(e) => expr_has_return(e),
-    }) || block.tail.as_deref().is_some_and(expr_has_return)
+        Stmt::Let { value, .. } | Stmt::Assign { value, .. } => expr_has_return(&value.node),
+        Stmt::Expr(e) => expr_has_return(&e.node),
+    }) || block.tail.as_deref().is_some_and(|e| expr_has_return(&e.node))
 }
 
 fn expr_has_return(e: &Expr) -> bool {
     match e {
         Expr::If { cond, then_block, else_block } => {
-            expr_has_return(cond) || block_has_return(then_block) || block_has_return(else_block)
+            expr_has_return(&cond.node) || block_has_return(then_block) || block_has_return(else_block)
         }
         Expr::Match { scrutinee, arms } => {
-            expr_has_return(scrutinee)
+            expr_has_return(&scrutinee.node)
                 || arms.iter().any(|arm| match &arm.body {
-                    MatchArmBody::Expr(e) => expr_has_return(e),
+                    MatchArmBody::Expr(e) => expr_has_return(&e.node),
                     MatchArmBody::Block(b) => block_has_return(b),
                 })
         }
@@ -177,8 +177,8 @@ fn check_wire_safe(ty: &Type, position: &str, top_level_ret: bool) -> Result<(),
 fn is_const_literal_shape(e: &Expr) -> bool {
     match e {
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
-        Expr::ArrayLit(items) | Expr::TupleLit(items) => items.iter().all(is_const_literal_shape),
-        Expr::StructLit { fields, .. } => fields.iter().all(|(_, fe)| is_const_literal_shape(fe)),
+        Expr::ArrayLit(items) | Expr::TupleLit(items) => items.iter().all(|it| is_const_literal_shape(&it.node)),
+        Expr::StructLit { fields, .. } => fields.iter().all(|(_, fe)| is_const_literal_shape(&fe.node)),
         _ => false,
     }
 }
@@ -652,7 +652,7 @@ impl Checker {
     /// nadie la pidiera ni forma de limpiarla -- ya era una rareza inocua con
     /// `db` (releer la colección en cada uso), pero con `auth` deja de serlo.
     fn check_const(&self, c: &ConstDecl) -> Result<(), CheckError> {
-        if !is_const_literal_shape(&c.value) {
+        if !is_const_literal_shape(&c.value.node) {
             return Err(err(format!(
                 "el valor de un 'const' tiene que ser un literal (número, string, bool, null, array, tupla \
                  o struct/variant literal) -- '{}' no lo es (es una computación en runtime, no un valor fijo)",
@@ -692,7 +692,7 @@ impl Checker {
     fn check_block(&self, block: &Block, expected: &Type, env: &Env) -> Result<(), CheckError> {
         let mut local = env.clone();
         for stmt in &block.stmts {
-            match stmt {
+            match &stmt.node {
                 Stmt::Let { name, mutable, ty, value } => {
                     let value_ty = match ty {
                         Some(t) => {
@@ -727,8 +727,11 @@ impl Checker {
                 // práctica exige que cada rama sea puro efecto (sin tail),
                 // igual que exigir `if cond { ... } else { ... }` sin usar
                 // el resultado. synth_expr no sirve acá: if/match nunca
-                // sintetizan (§3.1/§3.7, son de modo chequeo).
-                Stmt::Expr(e @ (Expr::If { .. } | Expr::Match { .. })) => {
+                // sintetizan (§3.1/§3.7, son de modo chequeo). Guard en vez
+                // de un binding-pattern con or-pattern anidado: `Spanned<Expr>`
+                // no se puede matchear como si fuera el enum `Expr` un nivel
+                // más abajo.
+                Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. }) => {
                     self.check_expr(e, &Type::Void, &local)?;
                 }
                 Stmt::Expr(e) => {
@@ -828,7 +831,7 @@ impl Checker {
         }
         let mut local = env.clone();
         for stmt in &block.stmts {
-            match stmt {
+            match &stmt.node {
                 Stmt::Let { name, mutable, ty, value } => {
                     let value_ty = match ty {
                         Some(t) => {
@@ -853,7 +856,7 @@ impl Checker {
                     self.check_expr(value, &binding.ty, &local)?;
                 }
                 Stmt::Return(_) => unreachable!("descartado por block_has_return arriba"),
-                Stmt::Expr(e @ (Expr::If { .. } | Expr::Match { .. })) => {
+                Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. }) => {
                     self.check_expr(e, &Type::Void, &local)?;
                 }
                 Stmt::Expr(e) => {
@@ -869,8 +872,8 @@ impl Checker {
 
     // ---- chequeo (modo ⇐): match y la construcción de Result<T,E> ----
 
-    fn check_expr(&self, e: &Expr, expected: &Type, env: &Env) -> Result<(), CheckError> {
-        match e {
+    fn check_expr(&self, e: &Spanned<Expr>, expected: &Type, env: &Env) -> Result<(), CheckError> {
+        match &e.node {
             Expr::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expected, env),
             // if/else es de modo chequeo, igual que match (GRAMMAR.md §3.7):
             // no tiene un tipo propio, necesita el esperado para verificar
@@ -968,7 +971,7 @@ impl Checker {
     fn check_result_lit(
         &self,
         variant: &str,
-        fields: &[(String, Expr)],
+        fields: &[(String, Spanned<Expr>)],
         expected: &Type,
         env: &Env,
     ) -> Result<(), CheckError> {
@@ -986,7 +989,7 @@ impl Checker {
 
     fn check_single_field(
         &self,
-        fields: &[(String, Expr)],
+        fields: &[(String, Spanned<Expr>)],
         expected_name: &str,
         ty: &Type,
         env: &Env,
@@ -1010,7 +1013,7 @@ impl Checker {
         &self,
         name: &str,
         variant: Option<&str>,
-        fields: &[(String, Expr)],
+        fields: &[(String, Spanned<Expr>)],
         expected: &Type,
         env: &Env,
     ) -> Result<(), CheckError> {
@@ -1035,7 +1038,7 @@ impl Checker {
 
     fn check_match(
         &self,
-        scrutinee: &Expr,
+        scrutinee: &Spanned<Expr>,
         arms: &[MatchArm],
         expected: &Type,
         env: &Env,
@@ -1446,8 +1449,8 @@ impl Checker {
 
     // ---- síntesis (modo ⇒) ----
 
-    fn synth_expr(&self, e: &Expr, env: &Env) -> Result<Type, CheckError> {
-        match e {
+    fn synth_expr(&self, e: &Spanned<Expr>, env: &Env) -> Result<Type, CheckError> {
+        match &e.node {
             Expr::Int(_) => Ok(Type::Int),
             Expr::Float(_) => Ok(Type::Float),
             Expr::Str(_) => Ok(Type::String),
@@ -1617,7 +1620,7 @@ impl Checker {
     /// mezclados. `Dynamic` (el escape hatch de `db`, ver types.rs) sigue
     /// siendo compatible con cualquier operando, igual que en el resto del
     /// checker.
-    fn synth_binary(&self, op: BinaryOp, left: &Expr, right: &Expr, env: &Env) -> Result<Type, CheckError> {
+    fn synth_binary(&self, op: BinaryOp, left: &Spanned<Expr>, right: &Spanned<Expr>, env: &Env) -> Result<Type, CheckError> {
         use BinaryOp::*;
         match op {
             // '+' es el único aritmético que también sirve para concatenar
@@ -1687,7 +1690,7 @@ impl Checker {
         }
     }
 
-    fn synth_unary(&self, op: UnaryOp, operand: &Expr, env: &Env) -> Result<Type, CheckError> {
+    fn synth_unary(&self, op: UnaryOp, operand: &Spanned<Expr>, env: &Env) -> Result<Type, CheckError> {
         match op {
             UnaryOp::Neg => {
                 let t = self.synth_expr(operand, env)?;
@@ -1708,8 +1711,8 @@ impl Checker {
     /// `callee` como FieldAccess normal (que fallaría: Int/Float/String no
     /// son Struct ni Dynamic). `Ok(None)` = no es un builtin conocido, seguí
     /// con el camino genérico de Call sin tocar nada.
-    fn try_builtin_method(&self, callee: &Expr, args: &[Expr], env: &Env) -> Result<Option<Type>, CheckError> {
-        let Expr::FieldAccess { base, field } = callee else {
+    fn try_builtin_method(&self, callee: &Spanned<Expr>, args: &[Spanned<Expr>], env: &Env) -> Result<Option<Type>, CheckError> {
+        let Expr::FieldAccess { base, field } = &callee.node else {
             return Ok(None);
         };
         let base_ty = self.synth_expr(base, env)?;
@@ -1813,8 +1816,8 @@ impl Checker {
     ///   sintetiza un `Type::Function` completo por su cuenta -- se verifica
     ///   que acepte `param_ty` como argumento (subtipado normal, igual que
     ///   cualquier otro argumento de una llamada) y se devuelve su retorno.
-    fn synth_callback_result(&self, callback: &Expr, param_ty: &Type, env: &Env) -> Result<Type, CheckError> {
-        if let Expr::Closure { params, body } = callback {
+    fn synth_callback_result(&self, callback: &Spanned<Expr>, param_ty: &Type, env: &Env) -> Result<Type, CheckError> {
+        if let Expr::Closure { params, body } = &callback.node {
             let [p] = params.as_slice() else {
                 return Err(err(format!(
                     "el callback de 'map' necesita exactamente 1 parámetro, se encontraron {}",
@@ -1862,7 +1865,7 @@ impl Checker {
     /// §2.1) -- resueltos contra `element_ty` de verdad, así que un método
     /// desconocido ya es un error de tipos acá, no algo que se descubre en
     /// runtime (`Type::Dynamic` dejaba pasar cualquier nombre antes).
-    fn check_db_method(&self, element_ty: &Type, method: &str, args: &[Expr], env: &Env) -> Result<Type, CheckError> {
+    fn check_db_method(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
         match method {
             "all" => {
                 self.expect_no_args(args, "all")?;
@@ -1912,7 +1915,7 @@ impl Checker {
     /// token como parámetro, cualquiera podría destruir la sesión de
     /// cualquier otro con solo adivinar/conocer ese string (hallado en el
     /// review adversarial de esta ronda).
-    fn check_auth_method(&self, method: &str, args: &[Expr], env: &Env) -> Result<Type, CheckError> {
+    fn check_auth_method(&self, method: &str, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
         match method {
             "createSession" => {
                 let [role_arg] = args else {
@@ -1951,7 +1954,7 @@ impl Checker {
         Ok(Type::Struct { name: None, fields: without_id })
     }
 
-    fn expect_no_args(&self, args: &[Expr], method: &str) -> Result<(), CheckError> {
+    fn expect_no_args(&self, args: &[Spanned<Expr>], method: &str) -> Result<(), CheckError> {
         if !args.is_empty() {
             return Err(err(format!("'{method}' no toma argumentos")));
         }
@@ -1962,7 +1965,7 @@ impl Checker {
         &self,
         name: &str,
         variant: Option<&str>,
-        fields: &[(String, Expr)],
+        fields: &[(String, Spanned<Expr>)],
         env: &Env,
     ) -> Result<Type, CheckError> {
         if name == "Result" {
@@ -2006,7 +2009,7 @@ impl Checker {
     fn check_fields_against(
         &self,
         decl_fields: &[Field],
-        given: &[(String, Expr)],
+        given: &[(String, Spanned<Expr>)],
         env: &Env,
     ) -> Result<(), CheckError> {
         let resolved = decl_fields
@@ -2029,7 +2032,7 @@ impl Checker {
     fn check_fields_against_resolved(
         &self,
         decl_fields: &[FieldType],
-        given: &[(String, Expr)],
+        given: &[(String, Spanned<Expr>)],
         env: &Env,
     ) -> Result<(), CheckError> {
         for (fname, fexpr) in given {
