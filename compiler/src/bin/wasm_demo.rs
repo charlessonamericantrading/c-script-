@@ -27,7 +27,12 @@ const SOURCE: &str = include_str!("../../../examples/users.link");
 
 fn main() {
     let tokens = tokenize(SOURCE).unwrap_or_else(|e| panic!("{e}"));
-    let program = parse(tokens).unwrap_or_else(|e| panic!("{e}"));
+    let program = parse(tokens).unwrap_or_else(|errors| {
+        for e in &errors {
+            eprintln!("{e}");
+        }
+        std::process::exit(1);
+    });
     if let Err(errors) = Checker::check_program(&program) {
         for e in &errors {
             eprintln!("{e}");

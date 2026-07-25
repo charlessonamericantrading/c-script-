@@ -478,7 +478,7 @@ mod tests {
 
     fn emit(src: &str) -> String {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
-        let program = parse(tokens).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
         emit_validators(&program).unwrap_or_else(|e| panic!("{e}"))
     }
 

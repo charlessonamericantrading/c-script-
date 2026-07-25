@@ -2056,7 +2056,7 @@ mod tests {
 
     fn check_source(src: &str) -> Result<(), Vec<CheckError>> {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
-        let program = parse(tokens).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
         Checker::check_program(&program)
     }
 

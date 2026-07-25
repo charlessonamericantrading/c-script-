@@ -620,7 +620,7 @@ mod tests {
 
     fn emit_both(src: &str) -> (String, String) {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
-        let program = parse(tokens).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
         let contract = emit_contract(&program).unwrap_or_else(|e| panic!("{e}"));
         let client = emit_client(&program).unwrap_or_else(|e| panic!("{e}"));
         (contract, client)
@@ -788,7 +788,7 @@ mod tests {
             service S { rpc ping() -> Int { 1 } }
         "#;
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
-        let program = parse(tokens).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
         let result = emit_client(&program);
         assert!(result.is_err(), "un const cuyo valor es una llamada no tiene forma de literal TS");
     }

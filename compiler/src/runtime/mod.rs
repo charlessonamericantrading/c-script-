@@ -1372,7 +1372,7 @@ mod tests {
 
     fn program_from(src: &str) -> Program {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
-        parse(tokens).unwrap_or_else(|e| panic!("{e}"))
+        parse(tokens).unwrap_or_else(|e| panic!("{e:?}"))
     }
 
     fn users_demo() -> Program {

@@ -87,7 +87,7 @@ mod tests {
         let files = project_files("my-app");
         let main_link = &files.iter().find(|(rel, _)| *rel == "main.link").unwrap().1;
         let tokens = tokenize(main_link).unwrap_or_else(|e| panic!("{e}"));
-        let program = parse(tokens).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
         assert!(
             crate::checker::Checker::check_program(&program).is_ok(),
             "la plantilla de main.link debería tipar limpio"

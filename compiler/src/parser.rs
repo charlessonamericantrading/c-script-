@@ -18,13 +18,31 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-pub fn parse(tokens: Vec<Token>) -> Result<Program, ParseError> {
-    Parser { tokens, pos: 0 }.parse_program()
+/// Recuperación de errores (GRAMMAR.md/README: prerrequisito 2/3 para un
+/// LSP): antes, el primer error de sintaxis abortaba TODO el parseo -- acá
+/// se intenta seguir después de cada error, acumulando todos los que
+/// encuentre en una sola pasada, en vez de que el usuario los vea de a uno
+/// por vez. Nunca devuelve un `Program` parcial: o parsea TODO sin
+/// errores, o devuelve la lista completa (espejo exacto del
+/// `Result<(), Vec<CheckError>>` que ya usa `Checker::check_program`).
+pub fn parse(tokens: Vec<Token>) -> Result<Program, Vec<ParseError>> {
+    let mut parser = Parser { tokens, pos: 0, errors: Vec::new() };
+    let program = parser.parse_program();
+    if parser.errors.is_empty() {
+        Ok(program)
+    } else {
+        Err(parser.errors)
+    }
 }
+
+/// Cota simple (no deduplicación heurística de errores en cascada) para
+/// acotar el caso patológico -- ver `parse_program`.
+const MAX_ERRORS: usize = 100;
 
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    errors: Vec<ParseError>,
 }
 
 impl Parser {
@@ -95,12 +113,54 @@ impl Parser {
 
     // ---- §2.1 Programa e ítems de nivel superior ----
 
-    fn parse_program(&mut self) -> Result<Program, ParseError> {
+    fn parse_program(&mut self) -> Program {
         let mut items = Vec::new();
         while !self.check(&TokenKind::Eof) {
-            items.push(self.parse_item()?);
+            if self.errors.len() >= MAX_ERRORS {
+                break;
+            }
+            match self.parse_item() {
+                Ok(item) => items.push(item),
+                Err(e) => {
+                    self.errors.push(e);
+                    self.synchronize();
+                }
+            }
         }
-        Ok(Program { items })
+        Program { items }
+    }
+
+    /// EXACTAMENTE la misma condición que `parse_item` usa para despachar --
+    /// única fuente de verdad, co-ubicada físicamente al lado para que
+    /// nunca diverjan (la clase de bug "dos lugares que tienen que
+    /// coincidir y no coinciden" ya pasó varias veces en este proyecto).
+    fn at_item_start(&self) -> bool {
+        matches!(
+            self.peek(),
+            TokenKind::Import | TokenKind::Type | TokenKind::Enum | TokenKind::Service | TokenKind::Const | TokenKind::Fn
+        ) || matches!(self.peek(), TokenKind::Ident(name) if name == "db" && *self.peek_at(1) == TokenKind::LBrace)
+    }
+
+    /// Modo pánico, granularidad de ÍTEM DE NIVEL SUPERIOR únicamente
+    /// (alcance v0 deliberado -- no por miembro de `service` ni por
+    /// sentencia dentro de un bloque; bajar la granularidad es un fast-
+    /// follow futuro, no esta ronda). Salta tokens hasta encontrar algo que
+    /// parezca el inicio de un ítem nuevo, o EOF.
+    ///
+    /// A propósito NO avanza incondicionalmente antes de chequear: los 6
+    /// keywords de `at_item_start` son reservados y solo aparecen ahí en
+    /// toda la gramática de hoy, así que una falla de 0 tokens consumidos
+    /// de `parse_item` nunca puede coincidir con `at_item_start()==true` --
+    /// avanzar de más ahí SE COME el primer token del próximo ítem real
+    /// cada vez que el error ocurre anidado (el caso más común: una llave
+    /// sin cerrar dentro de un `service` dejaría el error justo en el token
+    /// que en realidad es el inicio del siguiente `fn`/`type`/etc., y
+    /// avanzar de más lo descartaría en silencio sin reportar su propio
+    /// error). Bug real encontrado por review antes de implementar esto.
+    fn synchronize(&mut self) {
+        while !self.check(&TokenKind::Eof) && !self.at_item_start() {
+            self.advance();
+        }
     }
 
     fn parse_item(&mut self) -> Result<Item, ParseError> {
@@ -115,7 +175,14 @@ impl Parser {
             // reconoce por texto solo acá, en posición de ítem de nivel
             // superior, seguido de `{`. En cualquier otro contexto (una
             // expresión, un patrón, un nombre de campo) "db" sigue siendo
-            // un identificador común y corriente.
+            // un identificador común y corriente. (Límite conocido: como
+            // "db" no es reservado, un fragmento de basura que por
+            // casualidad contenga `db {` durante `synchronize` puede parar
+            // ahí y hacer que esto se intente sobre basura -- autocorrectivo,
+            // `parse_db_decl` fallaría con su propio error si el contenido
+            // no tiene forma de campo:tipo, pero puede sumar un error de
+            // ruido en ese caso específico. Los otros 6 keywords no tienen
+            // este problema: son reservados, nunca aparecen en otra posición.)
             TokenKind::Ident(name) if name == "db" && *self.peek_at(1) == TokenKind::LBrace => {
                 Ok(Item::Db(self.parse_db_decl()?))
             }
@@ -1087,7 +1154,7 @@ mod tests {
 
     fn parse_source(src: &str) -> Program {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
-        parse(tokens).unwrap_or_else(|e| panic!("{e}"))
+        parse(tokens).unwrap_or_else(|e| panic!("{e:?}"))
     }
 
     #[test]
@@ -1538,5 +1605,61 @@ mod tests {
         // list, getById, create, update, login, logout, listByRole,
         // listEmails, findByIdOrEmail, watchAll (stream)
         assert_eq!(service.members.len(), 10);
+    }
+
+    // ---- recuperación de errores (LSP prerrequisito 2/3) ----
+
+    fn parse_errors(src: &str) -> Vec<ParseError> {
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        parse(tokens).expect_err("se esperaban errores de sintaxis")
+    }
+
+    #[test]
+    fn well_formed_source_still_parses_with_no_errors() {
+        // Recuperación no debería cambiar el camino feliz -- Ok, no Err([]).
+        let tokens = tokenize("type P = { x: Int }").unwrap();
+        assert!(parse(tokens).is_ok());
+    }
+
+    #[test]
+    fn missing_closing_brace_does_not_swallow_the_next_item_error() {
+        // Bug real encontrado por el review antes de implementar esto: una
+        // versión de `synchronize()` que avanza un token incondicionalmente
+        // ANTES de chequear se come el primer token del próximo ítem real
+        // cada vez que el error ocurre anidado -- acá, la llave sin cerrar
+        // de `service S` deja el error en el token `fn`, que en realidad es
+        // el inicio de `ok`. La versión corregida (chequear ANTES de
+        // avanzar) da 2 errores; la buggeada daba 1 (se comía `ok` entero).
+        let src = "service S { rpc bad() -> Int { 1 }\nfn ok(*) -> Int { 2 }";
+        let errors = parse_errors(src);
+        assert_eq!(errors.len(), 2, "errores: {errors:?}");
+    }
+
+    #[test]
+    fn parse_reports_multiple_independent_errors_in_one_pass() {
+        let src = "fn a(*) -> Int { 1 } fn b(*) -> Int { 2 }";
+        let errors = parse_errors(src);
+        assert_eq!(errors.len(), 2, "errores: {errors:?}");
+    }
+
+    #[test]
+    fn three_unrelated_top_level_errors_are_all_reported() {
+        let src = r#"
+            fn a(*) -> Int { 1 }
+            enum E { }
+            fn b(*) -> Int { 2 }
+        "#;
+        // `enum E { }` (sin variantes) no es en sí un error de sintaxis --
+        // este test es sobre los 2 `fn` rotos, con un ítem BIEN formado en
+        // el medio, confirmando que la recuperación no se confunde con eso.
+        let errors = parse_errors(src);
+        assert_eq!(errors.len(), 2, "errores: {errors:?}");
+    }
+
+    #[test]
+    fn each_reported_error_carries_a_real_span() {
+        let errors = parse_errors("fn a(*) -> Int { 1 }");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].span.line >= 1);
     }
 }

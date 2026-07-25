@@ -127,9 +127,9 @@ impl Loader {
             path: canon.to_path_buf(),
             errors: vec![(e.span, e.message)],
         })?;
-        let program = parser::parse(tokens).map_err(|e| LoadError::Syntax {
+        let program = parser::parse(tokens).map_err(|errs| LoadError::Syntax {
             path: canon.to_path_buf(),
-            errors: vec![(e.span, e.message)],
+            errors: errs.into_iter().map(|e| (e.span, e.message)).collect(),
         })?;
         self.touched.push(canon.to_path_buf());
         self.native_items.insert(canon.to_path_buf(), program.items.clone());
@@ -367,6 +367,24 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("b.link"), "el mensaje debería nombrar el archivo con el error: {msg}");
         assert!(msg.contains(':'), "debería incluir línea:columna: {msg}");
+    }
+
+    #[test]
+    fn multiple_syntax_errors_in_an_imported_file_are_all_surfaced() {
+        // Confirma que las dos rondas componen: `LoadError::Syntax.errors`
+        // se diseñó como Vec en la ronda anterior específicamente para que
+        // la recuperación de errores del parser (esta ronda) no necesitara
+        // rediseñarlo -- acá el archivo importado tiene 2 errores reales de
+        // sintaxis, independientes entre sí, y ambos tienen que aparecer.
+        let dir = TempDir::new("multi_syntax_error_named_file");
+        dir.write("b.link", "fn a(*) -> Int { 1 } fn b(*) -> Int { 2 }");
+        dir.write("a.link", r#"import { a } from "./b.link";"#);
+        let result = load_program(&dir.path("a.link"));
+        let err = result.unwrap_err();
+        let LoadError::Syntax { errors, .. } = &err else {
+            panic!("se esperaba LoadError::Syntax, fue {err:?}");
+        };
+        assert_eq!(errors.len(), 2, "{err}");
     }
 
     #[test]
