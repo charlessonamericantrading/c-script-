@@ -27,6 +27,43 @@ fn report_load_error(e: &modules::LoadError) {
     }
 }
 
+/// Reporta los errores de `check_program` (LSP prerrequisito 3/3), con
+/// snippet+caret cuando es seguro hacerlo. `Span` no tiene identidad de
+/// archivo (token.rs), y `modules::load_program` funde TODOS los archivos
+/// importados transitivamente en un solo `Program` sin etiquetar de qué
+/// archivo vino cada ítem -- así que releer ingenuamente el archivo de
+/// ENTRADA para renderizar un error que en realidad vino de un archivo
+/// IMPORTADO sería activamente engañoso (un snippet plausible, pero de la
+/// línea equivocada). Gate de seguridad: solo se renderiza con snippet
+/// cuando `touched.len() == 1` -- si el programa vino de más de un archivo,
+/// cae al `Display` plano de siempre para TODOS los errores, no solo los
+/// dudosos. Proveniencia real por archivo (para levantar este límite)
+/// queda para una ronda futura, no bloqueante acá.
+///
+/// Orden de reporte: `build_symbols` hace 4 scans secuenciales (types+enums,
+/// fns, consts, db) que respetan el orden del archivo DENTRO de cada scan,
+/// pero no ENTRE scans -- se ordena acá por posición antes de imprimir, con
+/// los errores sin span (algunos de `build_symbols` no son "sobre" un nodo
+/// puntual) consistentemente al final.
+fn report_check_errors(mut errors: Vec<checker::CheckError>, touched: &[PathBuf]) {
+    errors.sort_by_key(|e| match e.span {
+        Some(s) => (0, s.line, s.col),
+        None => (1, 0, 0),
+    });
+    let single_file = match touched {
+        [only] => fs::read_to_string(only).ok().map(|src| (only.display().to_string(), src)),
+        _ => None,
+    };
+    for e in &errors {
+        match (&single_file, e.span) {
+            (Some((label, source)), Some(span)) => {
+                eprintln!("{}", diagnostics::render_diagnostic(source, label, span, &e.message));
+            }
+            _ => eprintln!("{e}"),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -55,15 +92,13 @@ fn cmd_new(args: &[String]) -> ExitCode {
 }
 
 fn load_and_check(path: &str) -> Result<Program, ExitCode> {
-    let (program, _touched) = modules::load_program(Path::new(path)).map_err(|e| {
+    let (program, touched) = modules::load_program(Path::new(path)).map_err(|e| {
         report_load_error(&e);
         ExitCode::FAILURE
     })?;
 
     checker::Checker::check_program(&program).map_err(|errors| {
-        for e in &errors {
-            eprintln!("{e}");
-        }
+        report_check_errors(errors, &touched);
         ExitCode::FAILURE
     })?;
 
@@ -106,9 +141,7 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
         }
     };
     if let Err(errors) = checker::Checker::check_program(&program) {
-        for e in &errors {
-            eprintln!("{e}");
-        }
+        report_check_errors(errors, &touched);
         return BuildResult { ok: false, touched };
     }
 

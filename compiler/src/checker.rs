@@ -3,12 +3,20 @@
 // tipo esperado (match, y la construcción de Result<T,E> — ver más abajo).
 
 use crate::ast::*;
+use crate::token::Span;
 use crate::types::{is_subtype, FieldType, Type};
 use std::collections::{HashMap, HashSet};
 
+/// `span` es `Option` (no obligatorio) -- algunos errores no son cleanly
+/// "sobre" un nodo puntual (ej. un nombre duplicado detectado entre DOS
+/// declaraciones en `build_symbols`). `err(...)` sigue sin tocarse: produce
+/// `span: None`, y los ~113 call sites existentes no necesitan saber nada de
+/// esto -- el span se estampa DESPUÉS, en un puñado de puntos de frontera
+/// (`with_span`, más abajo), no en cada sitio de error.
 #[derive(Debug)]
 pub struct CheckError {
     pub message: String,
+    pub span: Option<Span>,
 }
 
 impl std::fmt::Display for CheckError {
@@ -18,7 +26,20 @@ impl std::fmt::Display for CheckError {
 }
 
 fn err(msg: impl Into<String>) -> CheckError {
-    CheckError { message: msg.into() }
+    CheckError { message: msg.into(), span: None }
+}
+
+impl CheckError {
+    /// El PRIMER stamp gana: a medida que un error burbujea desde adentro
+    /// hacia afuera (ej. de una sub-expresión hasta la sentencia que la
+    /// contiene), el span más profundo -- el más específico -- es el que
+    /// queda, nunca uno más externo lo pisa.
+    fn with_span(mut self, span: Span) -> Self {
+        if self.span.is_none() {
+            self.span = Some(span);
+        }
+        self
+    }
 }
 
 /// Cada binding rastrea su tipo Y si se declaró `mut` -- lo segundo es lo
@@ -278,13 +299,18 @@ impl Checker {
                 // Con un solo archivo ya era un gap real; con imports,
                 // colisiones entre archivos se vuelven mucho más probables.
                 Item::Type(t) if checker.types.contains_key(&t.name) => {
-                    errors.push(err(format!("'{}' ya está declarado (type duplicado)", t.name)));
+                    // Estampado con la SEGUNDA declaración (la que se está
+                    // procesando cuando se detecta el choque), no la
+                    // primera -- límite de v0 documentado: no hay forma de
+                    // un "note: previous definition here" con un solo Span
+                    // por error.
+                    errors.push(err(format!("'{}' ya está declarado (type duplicado)", t.name)).with_span(t.span));
                 }
                 Item::Type(t) => {
                     checker.types.insert(t.name.clone(), t.clone());
                 }
                 Item::Enum(e) if checker.enums.contains_key(&e.name) => {
-                    errors.push(err(format!("'{}' ya está declarado (enum duplicado)", e.name)));
+                    errors.push(err(format!("'{}' ya está declarado (enum duplicado)", e.name)).with_span(e.span));
                 }
                 Item::Enum(e) => {
                     checker.enums.insert(e.name.clone(), e.clone());
@@ -296,14 +322,14 @@ impl Checker {
         for item in &program.items {
             if let Item::Fn(f) = item {
                 if checker.fns.contains_key(&f.name) {
-                    errors.push(err(format!("'{}' ya está declarado (fn duplicada)", f.name)));
+                    errors.push(err(format!("'{}' ya está declarado (fn duplicada)", f.name)).with_span(f.span));
                     continue;
                 }
                 match checker.resolve_fn_signature(f) {
                     Ok(sig) => {
                         checker.fns.insert(f.name.clone(), sig);
                     }
-                    Err(e) => errors.push(e),
+                    Err(e) => errors.push(e.with_span(f.span)),
                 }
             }
         }
@@ -311,7 +337,7 @@ impl Checker {
         for item in &program.items {
             if let Item::Const(c) = item {
                 if checker.consts.contains_key(&c.name) {
-                    errors.push(err(format!("'{}' ya está declarado (const duplicado)", c.name)));
+                    errors.push(err(format!("'{}' ya está declarado (const duplicado)", c.name)).with_span(c.span));
                     continue;
                 }
                 checker.consts.insert(c.name.clone(), c.clone());
@@ -326,23 +352,30 @@ impl Checker {
         for item in &program.items {
             if let Item::Db(db) = item {
                 if db_decl_seen {
-                    errors.push(err("ya hay un 'db { ... }' declarado en este programa (duplicado)"));
+                    errors.push(err("ya hay un 'db { ... }' declarado en este programa (duplicado)").with_span(db.span));
                     continue;
                 }
                 db_decl_seen = true;
                 for coll in &db.collections {
+                    // `coll` es un `Field` -- fuera de alcance para tener su
+                    // propio span (ver ast.rs) -- así que el mejor span
+                    // disponible es el de todo el `db { ... }` que lo
+                    // contiene.
                     match checker.resolve_type(&coll.ty) {
                         Ok(Type::List(element_ty)) => match checker.validate_db_element_type(&element_ty) {
                             Ok(()) => {
                                 checker.db_collections.insert(coll.name.clone(), *element_ty);
                             }
-                            Err(e) => errors.push(e),
+                            Err(e) => errors.push(e.with_span(db.span)),
                         },
-                        Ok(other) => errors.push(err(format!(
-                            "la colección '{}' de 'db' tiene que ser una lista de structs (T[]), se encontró {other:?}",
-                            coll.name
-                        ))),
-                        Err(e) => errors.push(e),
+                        Ok(other) => errors.push(
+                            err(format!(
+                                "la colección '{}' de 'db' tiene que ser una lista de structs (T[]), se encontró {other:?}",
+                                coll.name
+                            ))
+                            .with_span(db.span),
+                        ),
+                        Err(e) => errors.push(e.with_span(db.span)),
                     }
                 }
             }
@@ -370,6 +403,13 @@ impl Checker {
         Ok(())
     }
 
+    /// Estampa el span de LA DECLARACIÓN en cada uno de los 5 puntos de
+    /// entrada de abajo -- de último recurso: si el error ya viene con un
+    /// span más preciso desde adentro (una sub-expresión que falló primero,
+    /// vía `check_expr`/`synth_expr`), `with_span` no lo pisa (primer stamp
+    /// gana). Esto solo importa para errores que se originan en la firma
+    /// misma (ej. `resolve_type` sobre un tipo desconocido) y nunca pasan
+    /// por ningún `Expr`.
     pub fn check_program(program: &Program) -> Result<(), Vec<CheckError>> {
         let (checker, mut errors) = Self::build_symbols(program);
 
@@ -377,7 +417,7 @@ impl Checker {
             match item {
                 Item::Fn(f) => {
                     if let Err(e) = checker.check_fn(f) {
-                        errors.push(e);
+                        errors.push(e.with_span(f.span));
                     }
                 }
                 Item::Service(s) => {
@@ -387,19 +427,19 @@ impl Checker {
                             Member::Stream(r) => (r, true),
                         };
                         if let Err(e) = checker.check_rpc(rpc, is_stream) {
-                            errors.push(e);
+                            errors.push(e.with_span(rpc.span));
                         }
                         if let Err(e) = checker.check_rpc_crosses_the_wire(rpc) {
-                            errors.push(e);
+                            errors.push(e.with_span(rpc.span));
                         }
                         if let Err(e) = checker.check_rpc_annotation(rpc) {
-                            errors.push(e);
+                            errors.push(e.with_span(rpc.span));
                         }
                     }
                 }
                 Item::Const(c) => {
                     if let Err(e) = checker.check_const(c) {
-                        errors.push(e);
+                        errors.push(e.with_span(c.span));
                     }
                 }
                 _ => {}
@@ -692,52 +732,7 @@ impl Checker {
     fn check_block(&self, block: &Block, expected: &Type, env: &Env) -> Result<(), CheckError> {
         let mut local = env.clone();
         for stmt in &block.stmts {
-            match &stmt.node {
-                Stmt::Let { name, mutable, ty, value } => {
-                    let value_ty = match ty {
-                        Some(t) => {
-                            let resolved = self.resolve_type(t)?;
-                            self.check_expr(value, &resolved, &local)?;
-                            resolved
-                        }
-                        None => self.synth_expr(value, &local)?,
-                    };
-                    local.insert(name.clone(), Binding { ty: value_ty, mutable: *mutable });
-                }
-                Stmt::Assign { name, value } => {
-                    let binding = local
-                        .get(name)
-                        .ok_or_else(|| err(format!("variable no declarada: '{name}'")))?
-                        .clone();
-                    if !binding.mutable {
-                        return Err(err(format!(
-                            "no se puede asignar a '{name}': no fue declarada con 'mut' (GRAMMAR.md §2.3)"
-                        )));
-                    }
-                    self.check_expr(value, &binding.ty, &local)?;
-                }
-                Stmt::Return(Some(e)) => self.check_expr(e, expected, &local)?,
-                Stmt::Return(None) => {
-                    if !is_subtype(&Type::Void, expected) {
-                        return Err(err("'return' sin valor en una función que no devuelve Void"));
-                    }
-                }
-                // if/match en posición de sentencia no tienen valor que
-                // alguien use -- se chequean contra Void, lo que en la
-                // práctica exige que cada rama sea puro efecto (sin tail),
-                // igual que exigir `if cond { ... } else { ... }` sin usar
-                // el resultado. synth_expr no sirve acá: if/match nunca
-                // sintetizan (§3.1/§3.7, son de modo chequeo). Guard en vez
-                // de un binding-pattern con or-pattern anidado: `Spanned<Expr>`
-                // no se puede matchear como si fuera el enum `Expr` un nivel
-                // más abajo.
-                Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. }) => {
-                    self.check_expr(e, &Type::Void, &local)?;
-                }
-                Stmt::Expr(e) => {
-                    self.synth_expr(e, &local)?;
-                }
-            }
+            self.check_stmt(stmt, expected, &mut local).map_err(|ce| ce.with_span(stmt.span))?;
         }
         match &block.tail {
             Some(e) => self.check_expr(e, expected, &local),
@@ -750,6 +745,60 @@ impl Checker {
                     )))
                 }
             }
+        }
+    }
+
+    /// Chequea UNA sentencia de `check_block`, mutando `local` con cualquier
+    /// binding que introduzca (`let`). Separada de `check_block` para que su
+    /// loop pueda estampar el span DE LA SENTENCIA en cualquier error que no
+    /// traiga ya uno más preciso puesto desde una sub-expresión --
+    /// `check_expr`/`synth_expr` ya se ocupan de eso solos (`with_span`,
+    /// primer stamp gana, nunca pisa uno más profundo).
+    fn check_stmt(&self, stmt: &Spanned<Stmt>, expected: &Type, local: &mut Env) -> Result<(), CheckError> {
+        match &stmt.node {
+            Stmt::Let { name, mutable, ty, value } => {
+                let value_ty = match ty {
+                    Some(t) => {
+                        let resolved = self.resolve_type(t)?;
+                        self.check_expr(value, &resolved, local)?;
+                        resolved
+                    }
+                    None => self.synth_expr(value, local)?,
+                };
+                local.insert(name.clone(), Binding { ty: value_ty, mutable: *mutable });
+                Ok(())
+            }
+            Stmt::Assign { name, value } => {
+                let binding = local
+                    .get(name)
+                    .ok_or_else(|| err(format!("variable no declarada: '{name}'")))?
+                    .clone();
+                if !binding.mutable {
+                    return Err(err(format!(
+                        "no se puede asignar a '{name}': no fue declarada con 'mut' (GRAMMAR.md §2.3)"
+                    )));
+                }
+                self.check_expr(value, &binding.ty, local)
+            }
+            Stmt::Return(Some(e)) => self.check_expr(e, expected, local),
+            Stmt::Return(None) => {
+                if !is_subtype(&Type::Void, expected) {
+                    return Err(err("'return' sin valor en una función que no devuelve Void"));
+                }
+                Ok(())
+            }
+            // if/match en posición de sentencia no tienen valor que alguien
+            // use -- se chequean contra Void, lo que en la práctica exige
+            // que cada rama sea puro efecto (sin tail), igual que exigir
+            // `if cond { ... } else { ... }` sin usar el resultado.
+            // synth_expr no sirve acá: if/match nunca sintetizan (§3.1/§3.7,
+            // son de modo chequeo). Guard en vez de un binding-pattern con
+            // or-pattern anidado: `Spanned<Expr>` no se puede matchear como
+            // si fuera el enum `Expr` un nivel más abajo.
+            Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. }) => {
+                self.check_expr(e, &Type::Void, local)
+            }
+            Stmt::Expr(e) => self.synth_expr(e, local).map(|_| ()),
         }
     }
 
@@ -831,38 +880,7 @@ impl Checker {
         }
         let mut local = env.clone();
         for stmt in &block.stmts {
-            match &stmt.node {
-                Stmt::Let { name, mutable, ty, value } => {
-                    let value_ty = match ty {
-                        Some(t) => {
-                            let resolved = self.resolve_type(t)?;
-                            self.check_expr(value, &resolved, &local)?;
-                            resolved
-                        }
-                        None => self.synth_expr(value, &local)?,
-                    };
-                    local.insert(name.clone(), Binding { ty: value_ty, mutable: *mutable });
-                }
-                Stmt::Assign { name, value } => {
-                    let binding = local
-                        .get(name)
-                        .ok_or_else(|| err(format!("variable no declarada: '{name}'")))?
-                        .clone();
-                    if !binding.mutable {
-                        return Err(err(format!(
-                            "no se puede asignar a '{name}': no fue declarada con 'mut' (GRAMMAR.md §2.3)"
-                        )));
-                    }
-                    self.check_expr(value, &binding.ty, &local)?;
-                }
-                Stmt::Return(_) => unreachable!("descartado por block_has_return arriba"),
-                Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. }) => {
-                    self.check_expr(e, &Type::Void, &local)?;
-                }
-                Stmt::Expr(e) => {
-                    self.synth_expr(e, &local)?;
-                }
-            }
+            self.synth_stmt(stmt, &mut local).map_err(|ce| ce.with_span(stmt.span))?;
         }
         match &block.tail {
             Some(e) => self.synth_expr(e, &local),
@@ -870,10 +888,57 @@ impl Checker {
         }
     }
 
+    /// Análogo a `check_stmt`, para `synth_block` -- sin `expected` (acá no
+    /// hay ninguno: `Return` ya fue descartado arriba por `block_has_return`,
+    /// así que no hace falta el parámetro que `check_stmt` sí necesita solo
+    /// para esa rama).
+    fn synth_stmt(&self, stmt: &Spanned<Stmt>, local: &mut Env) -> Result<(), CheckError> {
+        match &stmt.node {
+            Stmt::Let { name, mutable, ty, value } => {
+                let value_ty = match ty {
+                    Some(t) => {
+                        let resolved = self.resolve_type(t)?;
+                        self.check_expr(value, &resolved, local)?;
+                        resolved
+                    }
+                    None => self.synth_expr(value, local)?,
+                };
+                local.insert(name.clone(), Binding { ty: value_ty, mutable: *mutable });
+                Ok(())
+            }
+            Stmt::Assign { name, value } => {
+                let binding = local
+                    .get(name)
+                    .ok_or_else(|| err(format!("variable no declarada: '{name}'")))?
+                    .clone();
+                if !binding.mutable {
+                    return Err(err(format!(
+                        "no se puede asignar a '{name}': no fue declarada con 'mut' (GRAMMAR.md §2.3)"
+                    )));
+                }
+                self.check_expr(value, &binding.ty, local)
+            }
+            Stmt::Return(_) => unreachable!("descartado por block_has_return arriba"),
+            Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. }) => {
+                self.check_expr(e, &Type::Void, local)
+            }
+            Stmt::Expr(e) => self.synth_expr(e, local).map(|_| ()),
+        }
+    }
+
     // ---- chequeo (modo ⇐): match y la construcción de Result<T,E> ----
 
+    /// Wrapper delgado: `check_expr_inner` hace todo el trabajo real, esto
+    /// solo estampa el `Span` de `e` en cualquier error que suba SIN span
+    /// propio ya puesto -- un error que ya viene estampado desde más adentro
+    /// (una sub-expresión que falló primero) queda con SU span, más preciso,
+    /// nunca lo pisa este nivel más externo (`with_span`, primer stamp gana).
     fn check_expr(&self, e: &Spanned<Expr>, expected: &Type, env: &Env) -> Result<(), CheckError> {
-        match &e.node {
+        self.check_expr_inner(&e.node, expected, env).map_err(|ce| ce.with_span(e.span))
+    }
+
+    fn check_expr_inner(&self, e: &Expr, expected: &Type, env: &Env) -> Result<(), CheckError> {
+        match e {
             Expr::Match { scrutinee, arms } => self.check_match(scrutinee, arms, expected, env),
             // if/else es de modo chequeo, igual que match (GRAMMAR.md §3.7):
             // no tiene un tipo propio, necesita el esperado para verificar
@@ -910,8 +975,16 @@ impl Checker {
             // de chequear (⇐) un closure contra un `Type::Function` ya
             // conocido (GRAMMAR.md §3.10, ej. el callback de `.filter`).
             Expr::Closure { params, body } => self.check_closure(params, body, expected, env),
+            // Fallback genérico: sintetiza y verifica subtipado. Llama a
+            // `synth_expr_inner` DIRECTAMENTE, no al wrapper público
+            // `synth_expr` -- acá `e` ya es el `&Expr` desenvuelto (esto es
+            // una RE-ENTRADA sobre el MISMO nodo, en el otro modo, no un
+            // descenso a un hijo), así que no hay ningún `Spanned<Expr>` del
+            // que sacarlo. Bug real encontrado por el review antes de
+            // implementar esto: llamar al wrapper público acá ni siquiera
+            // compila.
             _ => {
-                let t = self.synth_expr(e, env)?;
+                let t = self.synth_expr_inner(e, env)?;
                 if is_subtype(&t, expected) {
                     Ok(())
                 } else {
@@ -1449,8 +1522,15 @@ impl Checker {
 
     // ---- síntesis (modo ⇒) ----
 
+    /// Wrapper delgado -- mismo criterio que `check_expr`/`check_expr_inner`:
+    /// estampa el span de `e` en cualquier error sin span propio, sin pisar
+    /// uno más profundo que ya haya estampado una sub-expresión.
     fn synth_expr(&self, e: &Spanned<Expr>, env: &Env) -> Result<Type, CheckError> {
-        match &e.node {
+        self.synth_expr_inner(&e.node, env).map_err(|ce| ce.with_span(e.span))
+    }
+
+    fn synth_expr_inner(&self, e: &Expr, env: &Env) -> Result<Type, CheckError> {
+        match e {
             Expr::Int(_) => Ok(Type::Int),
             Expr::Float(_) => Ok(Type::Float),
             Expr::Str(_) => Ok(Type::String),
@@ -3359,5 +3439,52 @@ mod tests {
             fn count(xs: Int[]) -> Int { xs.length() }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    // ---- spans en errores de TIPOS (LSP prerrequisito 3/3, Ronda B) ----
+
+    #[test]
+    fn binary_type_mismatch_span_covers_the_whole_binary_expression() {
+        // Sin frontera propia dentro de synth_binary -- el error sube sin
+        // span hasta el wrapper de synth_expr, que lo estampa con el span
+        // de TODA la expresión binaria (no solo el operando problemático).
+        let src = r#"fn f() -> Int { 1 + "texto" }"#;
+        let errors = check_source(src).unwrap_err();
+        assert_eq!(errors.len(), 1, "errores: {errors:?}");
+        let span = errors[0].span.expect("se esperaba un span");
+        let start = src.find('1').unwrap();
+        let end = src.find("\"texto\"").unwrap() + "\"texto\"".len();
+        assert_eq!(span.start, start, "el span debería empezar en el '1'");
+        assert_eq!(span.end, end, "el span debería terminar al cierre de la comilla de 'texto'");
+    }
+
+    #[test]
+    fn missing_field_error_span_covers_the_struct_literal() {
+        let src = "type Point = { x: Int, y: Int }\nfn origin() -> Point { Point { x: 0 } }";
+        let errors = check_source(src).unwrap_err();
+        assert_eq!(errors.len(), 1, "errores: {errors:?}");
+        let span = errors[0].span.expect("se esperaba un span");
+        let start = src.find("Point { x: 0 }").unwrap();
+        let end = start + "Point { x: 0 }".len();
+        assert_eq!(span.start, start, "el span debería empezar en el literal de struct");
+        assert_eq!(span.end, end, "el span debería terminar en la llave de cierre del literal");
+    }
+
+    #[test]
+    fn rpc_crosses_the_wire_error_span_covers_the_signature_not_the_body() {
+        // check_rpc_crosses_the_wire no estampa nada por su cuenta -- lo
+        // hace check_program, con el span (de firma, sin el cuerpo) del
+        // propio RpcDecl.
+        let src = "type Weird = { h: (Int) -> String }\nservice S { rpc bad() -> Weird { 1 } }";
+        let errors = check_source(src).unwrap_err();
+        let wire_error = errors
+            .iter()
+            .find(|e| e.message.contains("no puede viajar por la red"))
+            .unwrap_or_else(|| panic!("se esperaba el error de check_rpc_crosses_the_wire: {errors:?}"));
+        let span = wire_error.span.expect("se esperaba un span");
+        let start = src.find("rpc bad").unwrap();
+        let end = src.find("-> Weird").unwrap() + "-> Weird".len();
+        assert_eq!(span.start, start, "el span debería empezar en 'rpc'");
+        assert_eq!(span.end, end, "el span debería terminar en el return type, sin incluir el cuerpo");
     }
 }
