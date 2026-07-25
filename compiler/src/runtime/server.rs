@@ -18,7 +18,9 @@
 // sobra) más el propio `Request` (`Send` por diseño de tiny_http).
 
 use super::db::Db;
-use super::{invoke_rpc, is_stream_member};
+use super::session::SessionStore;
+use super::{invoke_rpc_with_sessions, is_stream_member, required_auth};
+use crate::ast::Annotation;
 use crate::ast::Program;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,6 +45,9 @@ pub fn serve(program: Program, port: u16) {
     // pero con otra forma recibía los campos del `User` del demo, que su
     // propio tipo no tiene.
     let db = Db::new(&program);
+    // Auth v0 (GRAMMAR.md §3.14): vive mientras el proceso corre, igual que
+    // `db` -- sin expiración, sin persistencia entre reinicios.
+    let sessions = SessionStore::new();
     println!("c-script server escuchando en http://localhost:{port}  (Ctrl+C para detener)");
 
     for mut request in server.incoming_requests() {
@@ -64,6 +69,18 @@ pub fn serve(program: Program, port: u16) {
             continue;
         };
 
+        // El gate de autorización corre ACÁ, antes de `parse_args`/
+        // `json_to_typed_value` en cualquiera de las dos ramas de abajo --
+        // un rpc protegido rechaza la request sin filtrar el shape de sus
+        // parámetros a través de un 400 detallado antes de que el caller
+        // pruebe estar autorizado (GRAMMAR.md §3.14).
+        let token = extract_bearer_token(&request);
+        if let Err((status, msg)) = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name) {
+            let _ = request.respond(cors_response(status, error_json(msg)));
+            println!("[req {req_id}] {status}");
+            continue;
+        }
+
         if is_stream_member(&program, service_name, rpc_name) {
             let args_json = match parse_args(&body) {
                 Ok(v) => v,
@@ -73,10 +90,11 @@ pub fn serve(program: Program, port: u16) {
                     continue;
                 }
             };
-            // invoke_rpc corre ACÁ, en el hilo principal -- ver el porqué en
-            // el comentario de arriba del módulo. Lo único que cruza al
-            // hilo de escritura es `elements` (ya JSON puro) y `request`.
-            let elements = match invoke_rpc(&program, service_name, rpc_name, &args_json, &db) {
+            // invoke_rpc_with_sessions corre ACÁ, en el hilo principal --
+            // ver el porqué en el comentario de arriba del módulo. Lo único
+            // que cruza al hilo de escritura es `elements` (ya JSON puro) y
+            // `request`.
+            let elements = match invoke_rpc_with_sessions(&program, service_name, rpc_name, &args_json, &db, &sessions, token.as_deref()) {
                 Ok(json) => json.as_array().cloned().expect(
                     "check_rpc (checker.rs) exige que el cuerpo de un stream sea List<T> -- invoke_rpc no puede devolver otra cosa acá",
                 ),
@@ -91,7 +109,8 @@ pub fn serve(program: Program, port: u16) {
             continue;
         }
 
-        let (status, response_body) = handle_rpc(&program, &db, service_name, rpc_name, &body);
+        let (status, response_body) =
+            handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, &body);
         let _ = request.respond(cors_response(status, response_body));
         println!("[req {req_id}] {status}");
     }
@@ -113,12 +132,75 @@ fn parse_args(body: &str) -> Result<serde_json::Value, String> {
     }
 }
 
-fn handle_rpc(program: &Program, db: &Db, service_name: &str, rpc_name: &str, body: &str) -> (u16, String) {
+/// El header `Authorization: Bearer <token>`, si vino -- `None` para
+/// "faltaba", "el prefijo 'Bearer ' no estaba", o "había más de un header
+/// Authorization" (ambigüedad de smuggling entre proxy/origin, tratada como
+/// anónima en vez de elegir una arbitrariamente). Nunca panica con un header
+/// malformado: cualquier caso raro simplemente cae a `None` (anónimo), que
+/// `check_auth_gate` ya sabe traducir a 401 si el rpc lo requiere.
+fn extract_bearer_token(request: &tiny_http::Request) -> Option<String> {
+    let matches: Vec<&str> =
+        request.headers().iter().filter(|h| h.field.equiv("Authorization")).map(|h| h.value.as_str()).collect();
+    let [raw] = matches[..] else { return None };
+    raw.strip_prefix("Bearer ").map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
+}
+
+/// ¿Puede ESTA request llamar a `{service_name}.{rpc_name}`? La ÚNICA
+/// decisión de autorización de todo el servidor -- vive acá, no en el
+/// intérprete (`runtime/mod.rs`), que solo recibe `sessions`/`token` ya
+/// resueltos para que `auth.createSession`/`destroySession` funcionen
+/// dentro de un cuerpo. Nunca construye ningún `Value` del intérprete: solo
+/// compara strings contra lo que `SessionStore` ya guarda.
+fn check_auth_gate(
+    program: &Program,
+    sessions: &SessionStore,
+    token: Option<&str>,
+    service_name: &str,
+    rpc_name: &str,
+) -> Result<(), (u16, &'static str)> {
+    // `None` cubre "sin anotación" Y "rpc desconocido" -- ese segundo caso
+    // lo detecta con el error real `invoke_rpc_with_sessions` más abajo.
+    let Some(annotation) = required_auth(program, service_name, rpc_name) else {
+        return Ok(());
+    };
+    let Some(tok) = token else {
+        return Err((401, "se requiere autenticación"));
+    };
+    let Some((role_enum, role_variant)) = sessions.role_for(tok) else {
+        return Err((401, "se requiere autenticación"));
+    };
+    match annotation {
+        Annotation::Authenticated => Ok(()),
+        Annotation::Requires { enum_name, variant_name }
+            if &role_enum == enum_name && &role_variant == variant_name =>
+        {
+            Ok(())
+        }
+        // A propósito NO nombra el rol exigido en el mensaje -- a
+        // diferencia del nombre del rpc (ya público vía el client.ts/
+        // contract.d.ts generado), qué rol hace falta para cada operación
+        // es política interna del server; regalarla en el body le daría a
+        // cualquiera con un token de bajo privilegio un mapeo completo
+        // endpoint->rol gratis (hallado en el review adversarial).
+        Annotation::Requires { .. } => Err((403, "no tenés permiso para esta operación")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_rpc(
+    program: &Program,
+    db: &Db,
+    sessions: &SessionStore,
+    token: Option<&str>,
+    service_name: &str,
+    rpc_name: &str,
+    body: &str,
+) -> (u16, String) {
     let args_json = match parse_args(body) {
         Ok(v) => v,
         Err(e) => return (400, error_json(&e)),
     };
-    match invoke_rpc(program, service_name, rpc_name, &args_json, db) {
+    match invoke_rpc_with_sessions(program, service_name, rpc_name, &args_json, db, sessions, token) {
         Ok(result) => (200, result.to_string()),
         Err(e) => (status_for(&e), error_json(&e.to_string())),
     }
@@ -240,8 +322,14 @@ fn cors_response(status: u16, body: String) -> tiny_http::Response<std::io::Curs
     let allow_origin = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
     let allow_methods =
         tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, OPTIONS"[..]).unwrap();
+    // "Authorization" agregado para auth v0 (GRAMMAR.md §3.14): sin esto,
+    // cualquier browser real rechaza el preflight OPTIONS apenas el cliente
+    // generado manda ese header (ver push_fetch_call en ts_emit.rs), y la
+    // request real nunca llega a salir -- ni siquiera es que el servidor la
+    // rechace, el propio browser la bloquea antes de intentarla.
     let allow_headers =
-        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type"[..]).unwrap();
+        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, Authorization"[..])
+            .unwrap();
     tiny_http::Response::from_string(body)
         .with_status_code(status)
         .with_header(content_type)

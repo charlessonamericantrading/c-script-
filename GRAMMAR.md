@@ -56,7 +56,9 @@ field        = identifier , [ "?" ] , ":" , type_expr ;
 const_decl   = "const" , identifier , ":" , type_expr , "=" , expr , ";" ;
 
 service_decl = "service" , identifier , "{" , { member_decl } , "}" ;
-member_decl  = rpc_decl | stream_decl ;
+member_decl  = [ annotation ] , ( rpc_decl | stream_decl ) ;
+(* auth v0, §3.14 -- a lo sumo UNA por rpc/stream, nunca una lista *)
+annotation   = "@authenticated" | "@requires" , "(" , identifier , "." , identifier , ")" ;
 rpc_decl     = "rpc" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 stream_decl  = "stream" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 param_list   = param , { "," , param } ;
@@ -471,6 +473,9 @@ Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos,
 | `.take(n: Int)` | `T[]` | `T[]` | los primeros `n`; si la lista tiene menos, la devuelve entera (no falla) |
 | `.filter(p: (T) -> Bool)` | `T[]` | `T[]` | ver §3.10 |
 | `.map(f: (T) -> U)` | `T[]` | `U[]` | ver §3.10 |
+| `.length()` | `T[]` | `Int` | cantidad de elementos -- faltaba (solo existía para `String`) hasta que `login` (§3.14) necesitó "¿matcheó algún usuario?" |
+| `.createSession(role: R)` | `auth` | `String` | ver §3.14 -- `R` debe ser un enum declarado |
+| `.destroySession()` | `auth` | `Void` | ver §3.14 -- sin argumentos, opera sobre la sesión de la request actual |
 
 No hay coerción implícita en ningún operador (§3.7) — `.toFloat()`/`.toInt()` son las únicas conversiones numéricas, y son siempre explícitas. `.length()`/`.contains()` son método, no propiedad (`x.length`, sin paréntesis) — consistencia con `.toFloat()`/`.toInt()` importó más acá que imitar la convención de propiedad de JS/TS.
 
@@ -682,6 +687,60 @@ stream watchAll() -> User {
 **Cliente generado: `fetch()` + parseo manual del framing SSE, no `EventSource`.** `EventSource` es GET-only y sin body — pero el resto del contrato ya asume POST+JSON body para argumentos (igual que cualquier otro rpc), y un `stream` puede tener parámetros. En cambio, `async *m(): AsyncIterable<T>` lee `res.body` (un `ReadableStream` nativo de `fetch`) a mano: acumula en un buffer, corta en `\n\n`, valida cada `data: ...` con el mismo `isX` que un rpc normal, y hace `yield` recién si pasa. Cero dependencias nuevas (`TextDecoder`/`ReadableStream` son nativos de Node y del browser).
 
 **De paso: un log mínimo de request-id.** Un `AtomicU64` incremental (`server.rs`) y dos líneas por request (inicio + status/resultado) — lo mínimo que el cambio a multi-hilo hace necesario para poder correlacionar logs concurrentes, no una iniciativa de observabilidad aparte.
+
+### 3.14 Auth v0 (sesión opaca en memoria + roles) — RESUELTO
+
+Hasta acá no existía NINGÚN mecanismo de guard/autorización en el lenguaje — cualquiera podía invocar cualquier `rpc`. Alcance elegido para v0, explícitamente: sesión opaca en memoria + roles, **sin JWT y sin ninguna dependencia nueva** (el proyecto sigue dependiendo solo de `tiny_http` + `serde_json`). Verificar contraseña/hash de credenciales queda **fuera de alcance a propósito** — es su propio problema de seguridad, no algo para meter de paso acá.
+
+```
+service Users {
+  @authenticated
+  rpc me() -> User { ... }
+
+  @requires(Role.Admin)
+  rpc update(id: Int, patch: Patch<User>) -> User { db.users.applyPatch(id, patch) }
+
+  rpc list() -> User[] { ... }   // sin anotación = sin restricción, como siempre
+}
+```
+
+`@authenticated` exige una sesión válida, cualquier rol. `@requires(Enum.Variante)` exige además que el rol de esa sesión sea exactamente esa variante. **A lo sumo una anotación por rpc/stream** (`RpcDecl.annotation: Option<Annotation>`, nunca una lista) y **un solo rol por `@requires`** (sin OR de roles) — límites deliberados de v0, no descuidos.
+
+**`@requires(Role.Admin)` reusa el mecanismo de `Enum.Variante` que YA existía para nombrar una variante en un patrón de `match`** (`parse_pattern_atom`, `ident "." ident`, SIN llaves) — no se inventó una tercera sintaxis. Esto es a propósito ASIMÉTRICO con `Role.Admin {}` (que sí hace falta para *construir* un valor real, ej. al llamar `auth.createSession(Role.Admin {})`): una anotación nombra un TAG a comparar, una expresión construye un VALOR — dos reglas correctas por separado, pero que un usuario puede confundir la primera vez que las ve una al lado de la otra.
+
+**El enum de `@requires`/`createSession` NO necesita ser "simple" (todas las variantes unitarias).** La comparación en runtime es solo por tag (`enum_name` + nombre de variante), nunca mira campos — así que `enum Role { Admin, Member, ServiceAccount { scopes: String[] } }` puede usar `@requires(Role.Admin)` sin problema, aunque `ServiceAccount` (una variante HERMANA) sí tenga datos.
+
+**Dos builtins nuevos sobre el identificador `auth`** (mismo mecanismo que `db`: `Type::Auth`/`Value::Auth`, identificador especial resuelto en `synth_expr`/`eval_expr` DESPUÉS del lookup de variables locales — ver el hallazgo de abajo sobre por qué ese orden importa):
+- `auth.createSession(role: R) -> String` — `R` debe sintetizar a un enum declarado; devuelve un token opaco.
+- `auth.destroySession() -> Void` — **CERO argumentos**, a propósito (ver "hallazgo de seguridad" más abajo).
+
+```
+rpc login(email: String) -> String? {
+  let matches = db.users.all().filter(|u: User| { u.email == email });
+  if matches.length() > 0 { auth.createSession(matches[0].role) } else { null }
+}
+
+@authenticated
+rpc logout() -> Void { auth.destroySession() }
+```
+
+**La decisión de autorización (401/403) vive en `server.rs`, no en el intérprete.** `runtime/mod.rs` solo recibe `sessions: &SessionStore` (para que los dos builtins de arriba funcionen) y `current_token: Option<&str>` (para que `destroySession()` sepa cuál es "la propia" sesión) — ninguno de los dos es una decisión, son datos ya resueltos por el caller. El gate real (`server.rs::check_auth_gate`) corre ANTES de `parse_args`/`json_to_typed_value`, usando solo `program` (para mirar la anotación vía `required_auth`, hermana de `is_stream_member`) + `sessions` (para resolver el token a un rol) — nunca construye ningún `Value` del intérprete. Corre para `rpc` Y `stream` por igual (ambos pasan por el mismo punto en `serve()`). `invoke_rpc` (la firma pública de siempre, ~70 call sites — tests + `wasm_demo.rs`) queda intacta como wrapper de una línea sobre `invoke_rpc_with_sessions`, que es la que de verdad recibe `sessions`/`current_token`.
+
+**401 vs. 403, y qué NO se revela.** Sin token, o token que no resuelve a ninguna sesión → 401 genérico ("se requiere autenticación"), sin distinguir los dos casos (no ayuda a ningún cliente legítimo, y sí le da a un atacante una forma barata de validar el formato de un guess). Sesión válida pero rol incorrecto → 403, con un mensaje genérico que **no nombra el rol exigido** — a diferencia del nombre del rpc (ya público vía `client.ts`/`contract.d.ts`), qué rol hace falta para cada operación es política interna del servidor; regalarla le daría a cualquiera con un token de bajo privilegio un mapeo completo endpoint→rol gratis.
+
+**Hallazgo de seguridad central de esta ronda: el generador de tokens original estaba roto, no solo "no revisado".** La primera versión generaba el token con `RandomState::new().build_hasher().finish()`, llamado dos veces, asumiendo ~128 bits frescos por token. Dos revisores adversariales en paralelo llegaron, cada uno por su cuenta, a la misma causa raíz: `std` cachea las keys `(k0,k1)` de `RandomState` **por hilo** — la primera vez que se pide en un hilo dado, lee del SO; cada llamada SUBSIGUIENTE en ESE MISMO hilo solo incrementa `k0` en 1, `k1` nunca cambia. Como el intérprete corre siempre en el hilo principal (single-threaded por diseño, §3.13), esto no daba "un secreto nuevo por token" sino **un único secreto de 128 bits fijado una vez al arrancar el proceso**, reusado con un contador chico encima — insuficiente para lo único que hace segura a una sesión bearer ("poseer el string ES la sesión"). Fix real, sin agregar ninguna dependencia: un hilo RECIÉN CREADO nunca inicializó ese cache thread-local, así que su PRIMER `RandomState::new()` sí pega contra el RNG real del SO (`BCryptGenRandom`/`ProcessPrng` en Windows). `SessionStore::fresh_128_bits` (`runtime/session.rs`) spawnea un hilo descartable y, DENTRO de él, deriva 2 hashes de 64 bits de la MISMA `RandomState` (sin volver a llamar `::new()`, que reincidiría en el problema). **Esto sigue sin ser un CSPRNG auditado** — alcanza para v0/demo; una implementación real necesitaría el crate `rand`/`getrandom`.
+
+**Segundo hallazgo real: `destroySession(token)` como parámetro ordinario es una vulnerabilidad, no un detalle de API.** La propuesta original tomaba el token a destruir como argumento, simétrico a `createSession`. Un revisor adversarial lo marcó como el hallazgo más concreto de su ronda: **cualquiera que conozca o adivine el token de otra sesión podría destruirla sin poseerla ni haber pasado ningún chequeo de `@requires`** — un primitivo de "logout ajeno"/DoS dirigido, sin ningún segundo factor (a diferencia de RFC 7009, revocación OAuth, que sí exige credenciales del client que revoca). Fix: `destroySession()` sin argumentos, operando implícitamente sobre `current_token` — la sesión que ya autenticó la request actual. Por eso `logout` necesita `@authenticated`: sin sesión válida no hay nada que destruir, y sin la anotación el intérprete no sabría cuál token es "el propio".
+
+**Bug preexistente encontrado de paso, no introducido por esta ronda: `eval_expr` no respetaba el orden de shadowing que `synth_expr` (checker) ya respetaba.** Al agregar el identificador especial `"auth"` a `eval_expr::Ident`, se encontró que esa función chequeaba `if name == "db"` **ANTES** de `env.get(name)` — al revés que el checker, que hace `env` primero desde que se corrigió el mismo bug para "DB tipada" (con un comentario explícito documentándolo). Consecuencia real, sin tocar nada de esta ronda: `fn f(db: Int) -> Int { db + 1 }` tipaba perfecto y **crasheaba en runtime**, porque `eval_expr` devolvía `Value::Db` ignorando el parámetro real. El único test relacionado solo verificaba que tipara, nunca lo ejecutaba. Corregido en el mismo lugar que hacía falta tocar para `auth`, con un test de runtime nuevo (antes no existía ninguno que ejecutara este caso).
+
+**Otro hallazgo de paso: `const` no estaba restringido a literales fuera de `linkc build`.** `check_const` aceptaba cualquier expresión que tipara — la restricción real de forma-literal vivía solo en `ts_emit.rs::render_const_value`, o sea que `linkc serve` (que nunca llama a los emisores) nunca la exigía. Ya era una rareza inocua con `db` (`const X: User[] = db.users.all();` "funciona" en `serve`, releyendo la colección en cada uso). Con `auth.createSession(...)` deja de ser inocuo: un `const` así crearía una sesión Admin nueva cada vez que se lo referencia (los `const` no se memoizan en runtime), sin que nadie la pidiera ni forma de limpiarla. `check_const` ahora exige la misma forma-literal en `check_program` (por lo tanto en `serve` también), cerrando el agujero para los dos casos con una sola regla.
+
+**CORS: `Access-Control-Allow-Headers` no dejaba pasar `Authorization`.** Confirmado por los dos reviews como necesario para que la feature sea alcanzable en absoluto: sin agregarlo, el preflight `OPTIONS` de cualquier browser real rechaza la request ANTES de que salga — ni siquiera es que el servidor la rechace, el browser no la intenta. Un solo cambio (`"Content-Type, Authorization"`) cubre `rpc` y `stream` por igual. `Access-Control-Allow-Origin: *` + un header `Authorization` manual no es el caso que la spec de CORS prohíbe combinar con `*` (eso aplica a `credentials: 'include'`/cookies, que este cliente nunca usa).
+
+**Cliente generado: `token` es estado MUTABLE de instancia, no un parámetro por-llamada.** `{Service}ClientImpl` gana `private token: string | null` + `setToken(token)`, parte de la interfaz pública (`{Service}Client`) para que algo tipado como tal también pueda llamarlo. `push_fetch_call` adjunta `Authorization: Bearer ${token}` en TODO rpc si hay token seteado (el servidor decide caso por caso si lo exige). Correcto para "una instancia de cliente = un usuario/sesión activa" (mismo patrón que la mayoría de SDKs generados reales) — pero una instancia COMPARTIDA entre requests concurrentes de usuarios DISTINTOS (ej. un backend-for-frontend Node reusando un cliente módulo-level) puede pisarse el token entre requests. Documentado como límite v0 explícito; la alternativa (token por-llamada) cambiaría la forma pública de TODOS los métodos generados, no solo los protegidos.
+
+**Fuera de alcance, a propósito:** verificación de contraseña/credenciales; expiración de sesión (vive hasta `destroySession()` o hasta reiniciar el proceso — no hay temporizadores ni loop en el lenguaje para expresar otra cosa); múltiples roles por `@requires` o múltiples anotaciones por rpc; exponer la identidad del caller dentro de un cuerpo (`ctx.user`/similar — solo el ROL viaja en la sesión, nunca una referencia al `User` completo); un CSPRNG auditado (ver el hallazgo de arriba).
 
 ---
 

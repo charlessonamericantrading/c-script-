@@ -5,9 +5,11 @@
 
 pub mod db;
 pub mod server;
+pub mod session;
 
 use crate::ast::*;
 use db::Db;
+use session::SessionStore;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -46,6 +48,9 @@ pub enum Value {
     /// (`recv.metodo`) a la espera de ser invocado, ej. `db.users.find`.
     Db,
     DbCollection(String),
+    /// Marcador interno del identificador `auth` (GRAMMAR.md §3.14, auth
+    /// v0) -- mismo trato que `Db`: nunca llega a `value_to_json`.
+    Auth,
     BoundMethod(Box<Value>, String),
     /// Una `fn` de nivel superior referenciada POR NOMBRE, ej. `let g = add_one;`
     /// (GRAMMAR.md §3.10). Es una REFERENCIA a función (como un `fn` pointer
@@ -78,6 +83,7 @@ impl PartialEq for Value {
             (Tuple(a), Tuple(b)) => a == b,
             (Db, Db) => true,
             (DbCollection(a), DbCollection(b)) => a == b,
+            (Auth, Auth) => true,
             (BoundMethod(a, m1), BoundMethod(b, m2)) => a == b && m1 == m2,
             (FnRef(a), FnRef(b)) => a == b,
             // Nunca iguales, ni siquiera el mismo closure consigo mismo --
@@ -109,6 +115,7 @@ impl std::fmt::Debug for Value {
             Value::Tuple(items) => f.debug_tuple("Tuple").field(items).finish(),
             Value::Db => write!(f, "Db"),
             Value::DbCollection(name) => f.debug_tuple("DbCollection").field(name).finish(),
+            Value::Auth => write!(f, "Auth"),
             Value::BoundMethod(recv, method) => f.debug_tuple("BoundMethod").field(recv).field(method).finish(),
             Value::FnRef(name) => f.debug_tuple("FnRef").field(name).finish(),
             // A propósito NO imprime `captured_env` -- podría ser cíclico
@@ -194,54 +201,84 @@ fn cell(v: Value) -> Rc<RefCell<Value>> {
     Rc::new(RefCell::new(v))
 }
 
-pub(crate) fn eval_block(block: &Block, env: &Env, db: &Db, fns: &Fns, checker: &Checker) -> Result<Value, RuntimeError> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eval_block(
+    block: &Block,
+    env: &Env,
+    db: &Db,
+    fns: &Fns,
+    checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
+) -> Result<Value, RuntimeError> {
     let mut local = env.clone();
     for stmt in &block.stmts {
         match stmt {
             Stmt::Let { name, value, .. } => {
-                let v = eval_expr(value, &local, db, fns, checker)?;
+                let v = eval_expr(value, &local, db, fns, checker, sessions, current_token)?;
                 local.insert(name.clone(), cell(v));
             }
             Stmt::Assign { name, value } => {
-                let v = eval_expr(value, &local, db, fns, checker)?;
+                let v = eval_expr(value, &local, db, fns, checker, sessions, current_token)?;
                 let target = local
                     .get(name)
                     .ok_or_else(|| err(format!("variable no declarada en runtime: '{name}'")))?;
                 *target.borrow_mut() = v;
             }
-            Stmt::Return(Some(e)) => return eval_expr(e, &local, db, fns, checker),
+            Stmt::Return(Some(e)) => return eval_expr(e, &local, db, fns, checker, sessions, current_token),
             Stmt::Return(None) => return Ok(Value::Null),
             Stmt::Expr(e) => {
-                eval_expr(e, &local, db, fns, checker)?;
+                eval_expr(e, &local, db, fns, checker, sessions, current_token)?;
             }
         }
     }
     match &block.tail {
-        Some(e) => eval_expr(e, &local, db, fns, checker),
+        Some(e) => eval_expr(e, &local, db, fns, checker, sessions, current_token),
         None => Ok(Value::Null),
     }
 }
 
-pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Checker) -> Result<Value, RuntimeError> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn eval_expr(
+    e: &Expr,
+    env: &Env,
+    db: &Db,
+    fns: &Fns,
+    checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
+) -> Result<Value, RuntimeError> {
     match e {
         Expr::Int(n) => Ok(Value::Int(*n)),
         Expr::Float(n) => Ok(Value::Float(*n)),
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
         Expr::Null => Ok(Value::Null),
-        Expr::Paren(inner) => eval_expr(inner, env, db, fns, checker),
+        Expr::Paren(inner) => eval_expr(inner, env, db, fns, checker, sessions, current_token),
         Expr::Ident(name) => {
+            // El lookup de variables va PRIMERO -- antes, "db" se chequeaba
+            // acá arriba de todo (bug preexistente, encontrado en el review
+            // de esta ronda al agregar "auth" al lado: `synth_expr` del
+            // checker YA ponía `env` primero, con este mismo comentario, pero
+            // el fix nunca se aplicó acá. Consecuencia real: `fn f(db: Int)
+            // -> Int { db + 1 }` tipaba perfecto y crasheaba en runtime,
+            // porque esta rama devolvía `Value::Db` ignorando el parámetro
+            // real. El único test relacionado solo verificaba que tipara,
+            // nunca lo ejecutaba -- por eso no se había notado).
+            if let Some(c) = env.get(name) {
+                return Ok(c.borrow().clone());
+            }
             if name == "db" {
                 return Ok(Value::Db);
             }
-            if let Some(c) = env.get(name) {
-                return Ok(c.borrow().clone());
+            if name == "auth" {
+                return Ok(Value::Auth);
             }
             // Un `const` de nivel superior: su valor es siempre un literal
             // (el checker lo exige), así que evaluarlo en un env vacío no
             // depende de nada del scope actual.
             if let Some(c) = checker.consts.get(name.as_str()) {
-                return eval_expr(&c.value, &Env::new(), db, fns, checker);
+                return eval_expr(&c.value, &Env::new(), db, fns, checker, sessions, current_token);
             }
             // No es una variable local -- si es una `fn` de nivel superior,
             // referenciarla por nombre produce un FnRef (ver su doc en el
@@ -253,7 +290,7 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
             Err(err(format!("variable no declarada en runtime: '{name}'")))
         }
         Expr::FieldAccess { base, field } => {
-            let base_v = eval_expr(base, env, db, fns, checker)?;
+            let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token)?;
             match base_v {
                 // Un campo ausente da `null`, no un error. El checker ya
                 // rechaza leer un campo que el tipo no declara, así que
@@ -271,9 +308,9 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
                 // Métodos builtin sobre primitivos (GRAMMAR.md §3.8, ej.
-                // `x.toFloat()`) usan el mismo BoundMethod que db/listas --
+                // `x.toFloat()`) usan el mismo BoundMethod que db/listas/auth --
                 // el checker ya validó que el nombre existe para este tipo.
-                Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) => {
+                Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Auth => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -285,14 +322,16 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
             // solo para volver a buscar el mismo nombre en `fns`.
             if let Expr::Ident(name) = &**callee {
                 if let Some(decl) = fns.get(name.as_str()) {
-                    let arg_vs = eval_args(args, env, db, fns, checker)?;
-                    return call_fn_decl(decl, arg_vs, db, fns, checker);
+                    let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token)?;
+                    return call_fn_decl(decl, arg_vs, db, fns, checker, sessions, current_token);
                 }
             }
-            let callee_v = eval_expr(callee, env, db, fns, checker)?;
-            let arg_vs = eval_args(args, env, db, fns, checker)?;
+            let callee_v = eval_expr(callee, env, db, fns, checker, sessions, current_token)?;
+            let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token)?;
             match callee_v {
-                Value::BoundMethod(receiver, method) => call_method(*receiver, &method, arg_vs, db, fns, checker),
+                Value::BoundMethod(receiver, method) => {
+                    call_method(*receiver, &method, arg_vs, db, fns, checker, sessions, current_token)
+                }
                 // Llamada INDIRECTA: `callee` fue una variable/parámetro que
                 // contenía una referencia a función o un closure (GRAMMAR.md
                 // §3.10), no el nombre escrito ahí mismo -- ej. dentro de
@@ -301,13 +340,13 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
                 // Closure. `call_callable` despacha ambos casos (y produce
                 // el mismo error de "no se puede llamar" para cualquier otra
                 // cosa, ver su propio fallback).
-                other => call_callable(other, arg_vs, db, fns, checker),
+                other => call_callable(other, arg_vs, db, fns, checker, sessions, current_token),
             }
         }
         Expr::StructLit { name, variant, fields } => {
             let evaluated = fields
                 .iter()
-                .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, checker)?)))
+                .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, checker, sessions, current_token)?)))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             match variant {
                 Some(v) => {
@@ -317,13 +356,13 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
             }
         }
         Expr::Match { scrutinee, arms } => {
-            let v = eval_expr(scrutinee, env, db, fns, checker)?;
+            let v = eval_expr(scrutinee, env, db, fns, checker, sessions, current_token)?;
             for arm in arms {
                 if let Some(bindings) = try_match_pattern(&arm.pattern, &v, checker) {
                     let mut arm_env = env.clone();
                     arm_env.extend(bindings.into_iter().map(|(k, v)| (k, cell(v))));
                     if let Some(guard) = &arm.guard {
-                        match eval_expr(guard, &arm_env, db, fns, checker)? {
+                        match eval_expr(guard, &arm_env, db, fns, checker, sessions, current_token)? {
                             Value::Bool(true) => {}
                             // El patrón matcheó pero el guard no se cumplió --
                             // se sigue probando el resto de los arms, no se
@@ -333,8 +372,8 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
                         }
                     }
                     return match &arm.body {
-                        MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns, checker),
-                        MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns, checker),
+                        MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns, checker, sessions, current_token),
+                        MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns, checker, sessions, current_token),
                     };
                 }
             }
@@ -343,25 +382,25 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
             Err(err("ningún arm de match coincidió — el checker debería haber impedido esto"))
         }
         Expr::If { cond, then_block, else_block } => {
-            let c = eval_expr(cond, env, db, fns, checker)?;
+            let c = eval_expr(cond, env, db, fns, checker, sessions, current_token)?;
             match c {
-                Value::Bool(true) => eval_block(then_block, env, db, fns, checker),
-                Value::Bool(false) => eval_block(else_block, env, db, fns, checker),
+                Value::Bool(true) => eval_block(then_block, env, db, fns, checker, sessions, current_token),
+                Value::Bool(false) => eval_block(else_block, env, db, fns, checker, sessions, current_token),
                 other => Err(err(format!("la condición de 'if' no es Bool en runtime: {other:?}"))),
             }
         }
-        Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, checker),
-        Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, checker),
+        Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, checker, sessions, current_token),
+        Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, checker, sessions, current_token),
         Expr::ArrayLit(items) => {
             let vs = items
                 .iter()
-                .map(|e| eval_expr(e, env, db, fns, checker))
+                .map(|e| eval_expr(e, env, db, fns, checker, sessions, current_token))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             Ok(Value::List(vs))
         }
         Expr::Index { base, index } => {
-            let base_v = eval_expr(base, env, db, fns, checker)?;
-            let idx = as_int(&eval_expr(index, env, db, fns, checker)?)?;
+            let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token)?;
+            let idx = as_int(&eval_expr(index, env, db, fns, checker, sessions, current_token)?)?;
             match base_v {
                 Value::List(items) => {
                     let i: usize = idx
@@ -378,12 +417,12 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
         Expr::TupleLit(items) => {
             let vs = items
                 .iter()
-                .map(|e| eval_expr(e, env, db, fns, checker))
+                .map(|e| eval_expr(e, env, db, fns, checker, sessions, current_token))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             Ok(Value::Tuple(vs))
         }
         Expr::TupleIndex { base, index } => {
-            let base_v = eval_expr(base, env, db, fns, checker)?;
+            let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token)?;
             match base_v {
                 Value::Tuple(items) => items
                     .get(*index)
@@ -416,21 +455,23 @@ fn eval_binary(
     db: &Db,
     fns: &Fns,
     checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
 ) -> Result<Value, RuntimeError> {
     use BinaryOp::*;
     // && / || cortocircuitan: el lado derecho no se evalúa si ya se sabe el
     // resultado, igual que en cualquier lenguaje con estos operadores.
     if matches!(op, And | Or) {
-        let l = as_bool(&eval_expr(left, env, db, fns, checker)?)?;
+        let l = as_bool(&eval_expr(left, env, db, fns, checker, sessions, current_token)?)?;
         return match (op, l) {
             (And, false) => Ok(Value::Bool(false)),
             (Or, true) => Ok(Value::Bool(true)),
-            _ => Ok(Value::Bool(as_bool(&eval_expr(right, env, db, fns, checker)?)?)),
+            _ => Ok(Value::Bool(as_bool(&eval_expr(right, env, db, fns, checker, sessions, current_token)?)?)),
         };
     }
 
-    let l = eval_expr(left, env, db, fns, checker)?;
-    let r = eval_expr(right, env, db, fns, checker)?;
+    let l = eval_expr(left, env, db, fns, checker, sessions, current_token)?;
+    let r = eval_expr(right, env, db, fns, checker, sessions, current_token)?;
     match op {
         // '+' concatena si ambos lados son String (checker.rs ya garantizó
         // que no llega acá un String mezclado con Int/Float).
@@ -452,6 +493,7 @@ fn eval_binary(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_unary(
     op: UnaryOp,
     operand: &Expr,
@@ -459,8 +501,10 @@ fn eval_unary(
     db: &Db,
     fns: &Fns,
     checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
 ) -> Result<Value, RuntimeError> {
-    let v = eval_expr(operand, env, db, fns, checker)?;
+    let v = eval_expr(operand, env, db, fns, checker, sessions, current_token)?;
     match op {
         UnaryOp::Neg => match v {
             Value::Int(n) => Ok(Value::Int(-n)),
@@ -504,19 +548,37 @@ fn compare(l: Value, r: Value, accept: impl Fn(std::cmp::Ordering) -> bool) -> R
     Ok(Value::Bool(accept(ordering)))
 }
 
-fn eval_args(args: &[Expr], env: &Env, db: &Db, fns: &Fns, checker: &Checker) -> Result<Vec<Value>, RuntimeError> {
-    args.iter().map(|a| eval_expr(a, env, db, fns, checker)).collect()
+#[allow(clippy::too_many_arguments)]
+fn eval_args(
+    args: &[Expr],
+    env: &Env,
+    db: &Db,
+    fns: &Fns,
+    checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
+) -> Result<Vec<Value>, RuntimeError> {
+    args.iter().map(|a| eval_expr(a, env, db, fns, checker, sessions, current_token)).collect()
 }
 
 /// Invoca una `fn` de usuario ya resuelta con argumentos ya evaluados --
 /// compartido por la llamada directa (`f(x)`) y la indirecta a través de un
 /// `Value::FnRef` (`let g = f; g(x)`), para no duplicar el armado del scope.
-fn call_fn_decl(decl: &FnDecl, arg_vs: Vec<Value>, db: &Db, fns: &Fns, checker: &Checker) -> Result<Value, RuntimeError> {
+#[allow(clippy::too_many_arguments)]
+fn call_fn_decl(
+    decl: &FnDecl,
+    arg_vs: Vec<Value>,
+    db: &Db,
+    fns: &Fns,
+    checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
+) -> Result<Value, RuntimeError> {
     let mut fn_env = Env::new();
     for (p, v) in decl.params.iter().zip(arg_vs) {
         fn_env.insert(p.name.clone(), cell(v));
     }
-    eval_block(&decl.body, &fn_env, db, fns, checker)
+    eval_block(&decl.body, &fn_env, db, fns, checker, sessions, current_token)
 }
 
 fn try_match_pattern(pattern: &Pattern, v: &Value, checker: &Checker) -> Option<Vec<(String, Value)>> {
@@ -651,6 +713,7 @@ fn struct_matches_fields(v: &Value, fields: &[crate::types::FieldType], checker:
 /// `captured_env` que el closure guardó al construirse (GRAMMAR.md §3.10)
 /// -- ESA es la captura léxica real. Los parámetros se ligan encima,
 /// sombreando cualquier variable capturada con el mismo nombre.
+#[allow(clippy::too_many_arguments)]
 fn call_closure(
     param_names: &[String],
     body: &Block,
@@ -659,12 +722,14 @@ fn call_closure(
     db: &Db,
     fns: &Fns,
     checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
 ) -> Result<Value, RuntimeError> {
     let mut call_env = captured_env.clone();
     for (name, v) in param_names.iter().zip(arg_vs) {
         call_env.insert(name.clone(), cell(v));
     }
-    eval_block(body, &call_env, db, fns, checker)
+    eval_block(body, &call_env, db, fns, checker, sessions, current_token)
 }
 
 /// Cualquier `Value` invocable -- una referencia a `fn` por nombre o un
@@ -672,21 +737,31 @@ fn call_closure(
 /// indirecta de `Expr::Call` y por `.map`/`.filter` (más abajo), que
 /// necesitan invocar su callback sin que les importe cuál de las dos formas
 /// sea.
-fn call_callable(v: Value, arg_vs: Vec<Value>, db: &Db, fns: &Fns, checker: &Checker) -> Result<Value, RuntimeError> {
+#[allow(clippy::too_many_arguments)]
+fn call_callable(
+    v: Value,
+    arg_vs: Vec<Value>,
+    db: &Db,
+    fns: &Fns,
+    checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
+) -> Result<Value, RuntimeError> {
     match v {
         Value::FnRef(name) => {
             let decl = fns
                 .get(name.as_str())
                 .ok_or_else(|| err(format!("fn desconocida: '{name}'")))?;
-            call_fn_decl(decl, arg_vs, db, fns, checker)
+            call_fn_decl(decl, arg_vs, db, fns, checker, sessions, current_token)
         }
         Value::Closure(params, body, captured_env) => {
-            call_closure(&params, &body, &captured_env, arg_vs, db, fns, checker)
+            call_closure(&params, &body, &captured_env, arg_vs, db, fns, checker, sessions, current_token)
         }
         other => Err(err(format!("no se puede llamar un valor {other:?}"))),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn call_method(
     receiver: Value,
     method: &str,
@@ -694,6 +769,8 @@ fn call_method(
     db: &Db,
     fns: &Fns,
     checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
 ) -> Result<Value, RuntimeError> {
     match receiver {
         Value::DbCollection(coll) => db.call(&coll, method, args),
@@ -702,11 +779,12 @@ fn call_method(
                 let n = as_int(args.first().ok_or_else(|| err("take requiere 1 argumento"))?)? as usize;
                 Ok(Value::List(items.into_iter().take(n).collect()))
             }
+            "length" => Ok(Value::Int(items.len() as i64)),
             "filter" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'filter' requiere 1 argumento"))?;
                 let mut kept = Vec::new();
                 for item in items {
-                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker)?)? {
+                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token)?)? {
                         kept.push(item);
                     }
                 }
@@ -716,7 +794,7 @@ fn call_method(
                 let f = args.into_iter().next().ok_or_else(|| err("'map' requiere 1 argumento"))?;
                 let mut mapped = Vec::with_capacity(items.len());
                 for item in items {
-                    mapped.push(call_callable(f.clone(), vec![item], db, fns, checker)?);
+                    mapped.push(call_callable(f.clone(), vec![item], db, fns, checker, sessions, current_token)?);
                 }
                 Ok(Value::List(mapped))
             }
@@ -743,6 +821,31 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre String: '{other}'"))),
         },
+        // Auth v0 (GRAMMAR.md §3.14). `createSession` extrae (enum_name,
+        // variant) del `Value::Variant` recibido -- el checker ya garantizó
+        // que el argumento sintetiza a `Type::Enum(_)`, y la sesión solo
+        // guarda el TAG, nunca los campos (ver SessionStore). `destroySession`
+        // opera sobre `current_token` (la sesión que ya autenticó ESTA
+        // request, resuelta en server.rs), NUNCA sobre un token que el
+        // caller nombre como argumento -- si tomara un token como parámetro,
+        // cualquiera podría destruir la sesión de cualquier otro con solo
+        // conocer/adivinar ese string (hallado en el review adversarial).
+        Value::Auth => match method {
+            "createSession" => {
+                let role = args.into_iter().next().ok_or_else(|| err("createSession requiere 1 argumento"))?;
+                let Value::Variant { enum_name, variant, .. } = role else {
+                    return Err(err("createSession requiere un valor de un enum declarado"));
+                };
+                Ok(Value::Str(sessions.create(enum_name, variant)))
+            }
+            "destroySession" => {
+                if let Some(tok) = current_token {
+                    sessions.destroy(tok);
+                }
+                Ok(Value::Null)
+            }
+            other => Err(err(format!("método desconocido sobre auth: '{other}'"))),
+        },
         other => Err(err(format!("no se puede invocar '{method}' sobre {other:?}"))),
     }
 }
@@ -756,12 +859,45 @@ pub(crate) fn as_int(v: &Value) -> Result<i64, RuntimeError> {
 
 /// Punto de entrada: ejecuta `{service_name}.{rpc_name}` con argumentos JSON
 /// (el mismo shape que emite client.ts: `{ paramName: valor, ... }`).
+/// Wrapper que preserva la firma pública de siempre -- ~70 call sites
+/// existentes (la enorme mayoría tests de este mismo archivo, más
+/// `bin/wasm_demo.rs`) no necesitan saber nada de auth. Usa un
+/// `SessionStore` descartable y ningún token: equivalente a una request
+/// anónima sin ninguna sesión activa, que es exactamente lo que corresponde
+/// para un rpc sin `@authenticated`/`@requires` (los únicos que estos call
+/// sites ejercitan). El servidor real (`runtime/server.rs`) llama
+/// `invoke_rpc_with_sessions` directamente, con el `SessionStore` que vive
+/// mientras el proceso corre y el token que trajo la request.
 pub fn invoke_rpc(
     program: &Program,
     service_name: &str,
     rpc_name: &str,
     args_json: &serde_json::Value,
     db: &Db,
+) -> Result<serde_json::Value, RuntimeError> {
+    invoke_rpc_with_sessions(program, service_name, rpc_name, args_json, db, &SessionStore::new(), None)
+}
+
+/// Punto de entrada real: ejecuta `{service_name}.{rpc_name}` con
+/// argumentos JSON (el mismo shape que emite client.ts: `{ paramName: valor,
+/// ... }`).
+///
+/// La decisión de autorización (¿puede ESTA request llamar a ESTE rpc?) NO
+/// se toma acá -- vive en `server.rs::check_auth_gate`, que corre ANTES y
+/// nunca llega a invocar esto si el gate no pasa. Lo que SÍ cruza hacia acá
+/// es `sessions` (para que `auth.createSession`/`destroySession` funcionen
+/// dentro del cuerpo) y `current_token` (para que `destroySession()` sepa
+/// cuál es "la propia" sesión) -- ninguno de los dos es una decisión, son
+/// datos ya resueltos por el caller.
+#[allow(clippy::too_many_arguments)]
+pub fn invoke_rpc_with_sessions(
+    program: &Program,
+    service_name: &str,
+    rpc_name: &str,
+    args_json: &serde_json::Value,
+    db: &Db,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
 ) -> Result<serde_json::Value, RuntimeError> {
     let service = program
         .items
@@ -814,7 +950,9 @@ pub fn invoke_rpc(
             // Str/Struct suelto). Ver `json_to_typed_value`.
             Some(j) => json_to_typed_value(j, &declared, &checker, &p.name)?,
             None => match &p.default {
-                Some(default_expr) => eval_expr(default_expr, &Env::new(), db, &fns, &checker)?,
+                Some(default_expr) => {
+                    eval_expr(default_expr, &Env::new(), db, &fns, &checker, sessions, current_token)?
+                }
                 // Antes esto era `Value::Null` en silencio -- un parámetro
                 // requerido que no venía en el body producía un fallo
                 // confuso mucho más adentro (o ninguno).
@@ -831,7 +969,7 @@ pub fn invoke_rpc(
         env.insert(p.name.clone(), cell(v));
     }
 
-    let result = eval_block(&rpc.body, &env, db, &fns, &checker)?;
+    let result = eval_block(&rpc.body, &env, db, &fns, &checker, sessions, current_token)?;
     let simple_enums = simple_enum_names(program);
     Ok(value_to_json(&result, &simple_enums))
 }
@@ -1128,6 +1266,22 @@ pub fn is_stream_member(program: &Program, service_name: &str, rpc_name: &str) -
     })
 }
 
+/// Anotación `@authenticated`/`@requires(...)` de `{service_name}.{rpc_name}`,
+/// si tiene una -- hermana de `is_stream_member` (mismo archivo/patrón, ya
+/// usada por `server.rs` antes de invocar nada). `None` cubre tanto "sin
+/// anotación" como "el service/rpc no existe": ese segundo caso lo detecta
+/// (con el error real) `invoke_rpc_with_sessions` cuando de verdad se llega
+/// a invocar -- acá solo hace falta saber si HAY que exigir algo antes.
+pub fn required_auth<'a>(program: &'a Program, service_name: &str, rpc_name: &str) -> Option<&'a Annotation> {
+    program.items.iter().find_map(|i| match i {
+        Item::Service(s) if s.name == service_name => s.members.iter().find_map(|m| match m {
+            Member::Rpc(r) | Member::Stream(r) if r.name == rpc_name => r.annotation.as_ref(),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
 /// Nombres de los enums "simples" (todas sus variantes son unitarias) de
 /// todo el programa -- calculado UNA vez acá, no en cada `value_to_json`
 /// recursivo. Mismo chequeo `all_unit` que ya usa `emit_enum_decl`
@@ -1184,7 +1338,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -2033,5 +2187,133 @@ mod tests {
         );
         let db = Db::new(&program);
         assert_eq!(invoke_rpc(&program, "S", "all", &json!({}), &db).unwrap(), json!([]));
+    }
+
+    // ---- auth v0 (GRAMMAR.md §3.14) ----
+
+    #[test]
+    fn regression_a_parameter_named_db_is_not_shadowed_by_the_builtin() {
+        // Bug preexistente encontrado en el review de esta ronda: esta
+        // función tipaba perfecto (synth_expr del checker ya ponía `env`
+        // antes que el chequeo de "db"), pero CRASHEABA en runtime porque
+        // esta misma función chequeaba "db" ANTES de `env.get`. Ejecutado
+        // de verdad (no solo `check_source(..).is_ok()`), que es como se
+        // encontró que el fix anterior nunca se había aplicado acá.
+        let program = program_from(
+            r#"
+            service S {
+                rpc f(db: Int) -> Int { db + 1 }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "f", &json!({"db": 41}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(42));
+    }
+
+    #[test]
+    fn regression_a_parameter_named_auth_is_not_shadowed_by_the_builtin() {
+        // Mismo bug, para el identificador nuevo de esta ronda -- probado
+        // aparte para que una regresión futura en cualquiera de los dos no
+        // dependa de que el otro test lo cubra.
+        let program = program_from(
+            r#"
+            service S {
+                rpc f(auth: Int) -> Int { auth + 1 }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "f", &json!({"auth": 41}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(42));
+    }
+
+    #[test]
+    fn create_session_then_role_for_round_trips_through_the_store() {
+        let program = program_from(
+            r#"
+            enum Role { Admin, Member }
+            service S {
+                rpc login() -> String { auth.createSession(Role.Admin {}) }
+            }
+        "#,
+        );
+        let sessions = SessionStore::new();
+        let result =
+            invoke_rpc_with_sessions(&program, "S", "login", &json!({}), &Db::seeded(), &sessions, None).unwrap();
+        let token = result.as_str().expect("login debería devolver un String").to_string();
+        assert_eq!(sessions.role_for(&token), Some(("Role".to_string(), "Admin".to_string())));
+    }
+
+    #[test]
+    fn destroy_session_removes_the_current_token_from_the_store() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc logout() -> Void { auth.destroySession() }
+            }
+        "#,
+        );
+        let sessions = SessionStore::new();
+        let token = sessions.create("Role".to_string(), "Admin".to_string());
+        invoke_rpc_with_sessions(&program, "S", "logout", &json!({}), &Db::seeded(), &sessions, Some(&token))
+            .unwrap();
+        assert_eq!(sessions.role_for(&token), None);
+    }
+
+    #[test]
+    fn destroy_session_without_a_current_token_does_not_panic() {
+        // No debería pasar en la práctica (cualquier rpc que llame
+        // destroySession de forma útil va a estar @authenticated), pero no
+        // es un error real si pasa -- no-op silencioso.
+        let program = program_from(
+            r#"
+            service S {
+                rpc logout() -> Void { auth.destroySession() }
+            }
+        "#,
+        );
+        let sessions = SessionStore::new();
+        let result =
+            invoke_rpc_with_sessions(&program, "S", "logout", &json!({}), &Db::seeded(), &sessions, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn required_auth_reflects_the_annotation_on_each_rpc() {
+        let program = program_from(
+            r#"
+            enum Role { Admin, Member }
+            service S {
+                @authenticated
+                rpc me() -> Int { 1 }
+
+                @requires(Role.Admin)
+                rpc deleteThing(id: Int) -> Void { }
+
+                rpc list() -> Int[] { [] }
+            }
+        "#,
+        );
+        assert_eq!(required_auth(&program, "S", "me"), Some(&Annotation::Authenticated));
+        assert_eq!(
+            required_auth(&program, "S", "deleteThing"),
+            Some(&Annotation::Requires { enum_name: "Role".to_string(), variant_name: "Admin".to_string() })
+        );
+        assert_eq!(required_auth(&program, "S", "list"), None);
+        assert_eq!(required_auth(&program, "S", "noExiste"), None);
+        assert_eq!(required_auth(&program, "NoExiste", "list"), None);
+    }
+
+    #[test]
+    fn list_length_counts_elements() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc count(xs: Int[]) -> Int { xs.length() }
+            }
+        "#,
+        );
+        let result =
+            invoke_rpc(&program, "S", "count", &json!({"xs": [1, 2, 3]}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(3));
     }
 }

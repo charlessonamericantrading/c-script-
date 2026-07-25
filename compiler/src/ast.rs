@@ -94,6 +94,16 @@ pub struct RpcDecl {
     pub params: Vec<Param>,
     pub return_type: TypeExpr,
     pub body: Block,
+    pub annotation: Option<Annotation>,
+}
+
+/// Auth v0 (GRAMMAR.md §3.14): a lo sumo UNA anotación por rpc/stream --
+/// nunca una lista. `@requires` implica autenticado (además del rol); no hay
+/// forma de pedir "cualquiera de estos N roles" en v0.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Annotation {
+    Authenticated,
+    Requires { enum_name: String, variant_name: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]

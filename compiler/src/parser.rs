@@ -266,14 +266,42 @@ impl Parser {
     }
 
     fn parse_member(&mut self) -> Result<Member, ParseError> {
+        let annotation = self.parse_optional_annotation()?;
         match self.peek().clone() {
-            TokenKind::Rpc => Ok(Member::Rpc(self.parse_rpc_like(TokenKind::Rpc)?)),
-            TokenKind::Stream => Ok(Member::Stream(self.parse_rpc_like(TokenKind::Stream)?)),
+            TokenKind::Rpc => Ok(Member::Rpc(self.parse_rpc_like(TokenKind::Rpc, annotation)?)),
+            TokenKind::Stream => Ok(Member::Stream(self.parse_rpc_like(TokenKind::Stream, annotation)?)),
             other => Err(self.error(format!("se esperaba 'rpc' o 'stream', se encontró {other:?}"))),
         }
     }
 
-    fn parse_rpc_like(&mut self, kw: TokenKind) -> Result<RpcDecl, ParseError> {
+    /// Auth v0 (GRAMMAR.md §3.14): `@authenticated` o `@requires(Enum.Variante)`
+    /// antes de `rpc`/`stream`. A propósito NO reusa `parse_pattern_atom`
+    /// completo -- ese acepta opcionalmente `{ campos }` (destructuración),
+    /// algo que acá nunca corresponde: `@requires` solo compara el tag de la
+    /// variante, nunca mira campos.
+    fn parse_optional_annotation(&mut self) -> Result<Option<Annotation>, ParseError> {
+        if !self.check(&TokenKind::At) {
+            return Ok(None);
+        }
+        self.advance();
+        let name = self.eat_ident()?;
+        match name.as_str() {
+            "authenticated" => Ok(Some(Annotation::Authenticated)),
+            "requires" => {
+                self.eat(&TokenKind::LParen)?;
+                let enum_name = self.eat_ident()?;
+                self.eat(&TokenKind::Dot)?;
+                let variant_name = self.eat_ident()?;
+                self.eat(&TokenKind::RParen)?;
+                Ok(Some(Annotation::Requires { enum_name, variant_name }))
+            }
+            other => Err(self.error(format!(
+                "anotación desconocida '@{other}' (se esperaba '@authenticated' o '@requires(Enum.Variante)')"
+            ))),
+        }
+    }
+
+    fn parse_rpc_like(&mut self, kw: TokenKind, annotation: Option<Annotation>) -> Result<RpcDecl, ParseError> {
         self.eat(&kw)?;
         let name = self.eat_ident()?;
         self.eat(&TokenKind::LParen)?;
@@ -287,6 +315,7 @@ impl Parser {
             params,
             return_type,
             body,
+            annotation,
         })
     }
 
@@ -1506,8 +1535,8 @@ mod tests {
             })
             .expect("se esperaba un service");
         assert_eq!(service.name, "Users");
-        // list, getById, create, update, listByRole, listEmails,
-        // findByIdOrEmail, watchAll (stream)
-        assert_eq!(service.members.len(), 8);
+        // list, getById, create, update, login, logout, listByRole,
+        // listEmails, findByIdOrEmail, watchAll (stream)
+        assert_eq!(service.members.len(), 10);
     }
 }

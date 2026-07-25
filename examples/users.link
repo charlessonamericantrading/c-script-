@@ -50,7 +50,15 @@ fn validate(input: NewUser) -> ValidateResult {
   } else if input.name.length() < 2 {
     ValidateResult.Err { error: ValidationError.TooShort { field: "name", min: 2 } }
   } else {
-    ValidateResult.Ok { value: NewUserRecord { name: input.name, email: input.email, role: Role.Member {}, deletedAt: null } }
+    // El primer usuario creado es Admin, el resto Member -- sin esto, con
+    // `db.new` arrancando SIEMPRE vacío (sin seed), nadie podría llegar
+    // nunca a `Role.Admin` para ejercer el `update` gateado más abajo (auth
+    // v0, GRAMMAR.md §3.14). Bootstrapping realista y chico: una migración
+    // real resolvería esto sembrando un admin aparte, pero el lenguaje hoy
+    // no tiene ningún mecanismo de seed/migración -- esto es lo mínimo que
+    // hace el demo usable de punta a punta sin inventar uno.
+    let role: Role = if db.users.all().length() == 0 { Role.Admin {} } else { Role.Member {} };
+    ValidateResult.Ok { value: NewUserRecord { name: input.name, email: input.email, role: role, deletedAt: null } }
   }
 }
 
@@ -70,8 +78,35 @@ service Users {
     }
   }
 
+  // Auth v0 (GRAMMAR.md §3.14): solo un Admin puede editar registros ajenos.
+  // Sin este decorator, cualquiera podría reescribir cualquier campo de
+  // cualquier usuario -- el mismo rpc de siempre, ahora con un guard real.
+  @requires(Role.Admin)
   rpc update(id: Int, patch: Patch<User>) -> User {
     db.users.applyPatch(id, patch)
+  }
+
+  // Login v0 (GRAMMAR.md §3.14): busca por email SOLAMENTE -- verificar
+  // contraseña/hash de credenciales queda fuera de esta ronda a propósito,
+  // es su propio problema de seguridad, no algo para meter de paso. Emite
+  // un token opaco de sesión con el ROL real del usuario encontrado (no un
+  // rol elegido por el caller); `null` si no hay match, nunca un error.
+  rpc login(email: String) -> String? {
+    let matches = db.users.all().filter(|u: User| { u.email == email });
+    if matches.length() > 0 {
+      auth.createSession(matches[0].role)
+    } else {
+      null
+    }
+  }
+
+  // logout necesita @authenticated: sin sesión válida no hay NADA que
+  // destruir, y sin la anotación `auth.destroySession()` no sabría cuál es
+  // "la propia" sesión (a propósito no toma un token como argumento -- ver
+  // GRAMMAR.md §3.14, hallazgo del review adversarial de esta ronda).
+  @authenticated
+  rpc logout() -> Void {
+    auth.destroySession()
   }
 
   // Closures reales (GRAMMAR.md §3.10): `role` viene del parámetro de ESTE

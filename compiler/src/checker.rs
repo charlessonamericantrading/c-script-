@@ -169,6 +169,20 @@ fn check_wire_safe(ty: &Type, position: &str, top_level_ret: bool) -> Result<(),
     }
 }
 
+/// Forma de literal permitida para el valor de un `const` (GRAMMAR.md §2.1) --
+/// misma lista de casos que `ts_emit.rs::render_const_value`, pero acá solo
+/// para VALIDAR la forma (no para renderizar), así que corre en `check_const`
+/// y por lo tanto también en `linkc serve`, no solo en `linkc build`. Ver el
+/// porqué completo en el doc-comment de `check_const`.
+fn is_const_literal_shape(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
+        Expr::ArrayLit(items) | Expr::TupleLit(items) => items.iter().all(is_const_literal_shape),
+        Expr::StructLit { fields, .. } => fields.iter().all(|(_, fe)| is_const_literal_shape(fe)),
+        _ => false,
+    }
+}
+
 /// ¿Se puede PROBAR que dos miembros de una unión son distinguibles en
 /// runtime? "No" es la respuesta segura cuando el análisis no puede probar
 /// que sí (GRAMMAR.md §3.9, `check_exhaustive_union`) -- falla cerrado, no
@@ -376,6 +390,9 @@ impl Checker {
                             errors.push(e);
                         }
                         if let Err(e) = checker.check_rpc_crosses_the_wire(rpc) {
+                            errors.push(e);
+                        }
+                        if let Err(e) = checker.check_rpc_annotation(rpc) {
                             errors.push(e);
                         }
                     }
@@ -624,7 +641,24 @@ impl Checker {
     /// durante la auditoría final: se parseaba, pero `check_program` lo
     /// ignoraba del todo (`_ => {}`) y el emisor nunca lo tocaba. Ahora se
     /// valida `v ⇐ T` igual que cualquier otro valor con tipo esperado.
+    ///
+    /// La restricción de forma-literal (hallada al diseñar auth v0, GRAMMAR.md
+    /// §3.14) va ACÁ y no solo en `ts_emit.rs::render_const_value`: esa
+    /// función solo corre en `linkc build`, nunca en `linkc serve`
+    /// (`main.rs::cmd_serve` no llama a ningún emisor). Sin este chequeo acá,
+    /// `const X: String = auth.createSession(Role.Admin {});` tipaba en
+    /// `serve` igual que en `build`, y en runtime cada referencia a `X`
+    /// recreaba una sesión Admin nueva (los `const` no se memoizan) sin que
+    /// nadie la pidiera ni forma de limpiarla -- ya era una rareza inocua con
+    /// `db` (releer la colección en cada uso), pero con `auth` deja de serlo.
     fn check_const(&self, c: &ConstDecl) -> Result<(), CheckError> {
+        if !is_const_literal_shape(&c.value) {
+            return Err(err(format!(
+                "el valor de un 'const' tiene que ser un literal (número, string, bool, null, array, tupla \
+                 o struct/variant literal) -- '{}' no lo es (es una computación en runtime, no un valor fijo)",
+                c.name
+            )));
+        }
         let ty = self.resolve_type(&c.ty)?;
         self.check_expr(&c.value, &ty, &Env::new())
     }
@@ -738,6 +772,31 @@ impl Checker {
         }
         let ret = self.resolve_type(&r.return_type)?;
         check_wire_safe(&ret, &format!("el retorno de '{}'", r.name), true)
+    }
+
+    /// `@requires(Enum.Variante)` (GRAMMAR.md §3.14, auth v0) tiene que
+    /// nombrar un enum de verdad y una variante que de verdad exista en él --
+    /// si no, el error aparece acá, en tiempo de compilación, no como un 403
+    /// que nunca se puede satisfacer en runtime. Sin restricción de "enum
+    /// simple" (ver `check_auth_method`): la comparación en runtime es solo
+    /// por tag, nunca mira campos.
+    fn check_rpc_annotation(&self, r: &RpcDecl) -> Result<(), CheckError> {
+        let Some(Annotation::Requires { enum_name, variant_name }) = &r.annotation else {
+            return Ok(());
+        };
+        let decl = self.enums.get(enum_name).ok_or_else(|| {
+            err(format!(
+                "@requires({enum_name}.{variant_name}) en '{}': '{enum_name}' no es un enum declarado",
+                r.name
+            ))
+        })?;
+        if !decl.variants.iter().any(|v| &v.name == variant_name) {
+            return Err(err(format!(
+                "@requires({enum_name}.{variant_name}) en '{}': '{enum_name}' no tiene una variante '{variant_name}'",
+                r.name
+            )));
+        }
+        Ok(())
     }
 
     /// Sintetiza el tipo de la cola de un bloque SIN ningún tipo esperado
@@ -1405,6 +1464,9 @@ impl Checker {
                 if name == "db" {
                     return Ok(Type::Db);
                 }
+                if name == "auth" {
+                    return Ok(Type::Auth);
+                }
                 // Un `const` de nivel superior es visible desde cualquier
                 // cuerpo, igual que una `fn`. Faltaba: se declaraba y se
                 // emitía, pero usarlo daba "variable no declarada".
@@ -1658,6 +1720,12 @@ impl Checker {
         if let Type::DbCollection(element_ty) = &base_ty {
             return self.check_db_method(element_ty, field, args, env).map(Some);
         }
+        // `auth.<metodo>(...)` (GRAMMAR.md §3.14, auth v0) -- mismo trato que
+        // `db.<coleccion>.<metodo>`: un nombre de método desconocido acá es
+        // siempre un error, nunca `Ok(None)`.
+        if let Type::Auth = &base_ty {
+            return self.check_auth_method(field, args, env).map(Some);
+        }
         let ty = match (&base_ty, field.as_str()) {
             (Type::Int, "toFloat") => {
                 self.expect_no_args(args, "toFloat")?;
@@ -1690,6 +1758,14 @@ impl Checker {
                 };
                 self.check_expr(n_arg, &Type::Int, env)?;
                 Some(Type::List(inner.clone()))
+            }
+            // Mismo nombre que String.length() (GRAMMAR.md §3.8) -- faltaba
+            // por la misma razón que .take() faltó en su momento: nada lo
+            // había necesitado todavía. Encontrado al escribir `login` para
+            // auth v0 (necesita "¿matcheó algún usuario?").
+            (Type::List(_), "length") => {
+                self.expect_no_args(args, "length")?;
+                Some(Type::Int)
             }
             // El caso FÁCIL de los dos métodos de orden superior (GRAMMAR.md
             // §3.10): el tipo del callback (T) -> Bool ya se conoce ENTERO
@@ -1820,6 +1896,41 @@ impl Checker {
             }
             other => Err(err(format!(
                 "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch)"
+            ))),
+        }
+    }
+
+    /// `auth.createSession(role)` / `auth.destroySession()` (GRAMMAR.md
+    /// §3.14, auth v0). El enum de `role` NO necesita ser "simple" (todas
+    /// las variantes unitarias) -- la sesión solo guarda el TAG
+    /// (enum_name+variant_name, nunca campos), así que un enum con una
+    /// variante con datos (ej. `Role.ServiceAccount{scopes:[...]}`) puede
+    /// tener otra variante unitaria (`Role.Admin`) usada acá sin problema.
+    /// `destroySession` toma CERO argumentos a propósito: opera sobre la
+    /// sesión que ya autenticó la request actual (extraída del header en
+    /// server.rs), no sobre un token que el caller nombre -- si tomara un
+    /// token como parámetro, cualquiera podría destruir la sesión de
+    /// cualquier otro con solo adivinar/conocer ese string (hallado en el
+    /// review adversarial de esta ronda).
+    fn check_auth_method(&self, method: &str, args: &[Expr], env: &Env) -> Result<Type, CheckError> {
+        match method {
+            "createSession" => {
+                let [role_arg] = args else {
+                    return Err(err("'createSession' toma exactamente 1 argumento (role: un valor de un enum declarado)"));
+                };
+                match self.synth_expr(role_arg, env)? {
+                    Type::Enum(_) => Ok(Type::String),
+                    other => Err(err(format!(
+                        "'createSession' espera un valor de un enum declarado (ej. Role.Admin {{}}), se encontró {other:?}"
+                    ))),
+                }
+            }
+            "destroySession" => {
+                self.expect_no_args(args, "destroySession")?;
+                Ok(Type::Void)
+            }
+            other => Err(err(format!(
+                "'{other}' no es un método conocido de 'auth' (createSession/destroySession)"
             ))),
         }
     }
@@ -3105,5 +3216,145 @@ mod tests {
             fn accept(v: A | B) -> A | B { v }
         "#;
         assert!(check_source(src).is_ok());
+    }
+
+    // ---- auth v0 (GRAMMAR.md §3.14) ----
+
+    #[test]
+    fn authenticated_and_requires_annotations_type_check() {
+        let src = r#"
+            enum Role { Admin, Member }
+            service S {
+                @authenticated
+                rpc me() -> Int { 1 }
+
+                @requires(Role.Admin)
+                rpc deleteThing(id: Int) -> Void { }
+
+                rpc list() -> Int[] { [] }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn requires_with_unknown_enum_is_rejected() {
+        let src = r#"
+            service S {
+                @requires(NoExiste.Admin)
+                rpc deleteThing(id: Int) -> Void { }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("NoExiste"), "debería señalar el enum inexistente: {msg}");
+    }
+
+    #[test]
+    fn requires_with_unknown_variant_is_rejected() {
+        let src = r#"
+            enum Role { Admin, Member }
+            service S {
+                @requires(Role.SuperAdmin)
+                rpc deleteThing(id: Int) -> Void { }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("SuperAdmin"), "debería señalar la variante inexistente: {msg}");
+    }
+
+    #[test]
+    fn requires_does_not_need_the_whole_enum_to_be_all_unit() {
+        // Hallazgo del review adversarial: la comparación en runtime es solo
+        // por tag (enum_name+variant_name), nunca mira campos -- así que una
+        // variante HERMANA con datos (ServiceAccount) no debería impedir
+        // usar @requires sobre la variante unitaria (Admin).
+        let src = r#"
+            enum Role { Admin, Member, ServiceAccount { scopes: String[] } }
+            service S {
+                @requires(Role.Admin)
+                rpc deleteThing(id: Int) -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn create_session_requires_an_enum_typed_argument() {
+        let src = r#"
+            enum Role { Admin, Member }
+            service S {
+                rpc login() -> String { auth.createSession(Role.Admin {}) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        let bad = r#"
+            service S {
+                rpc login() -> String { auth.createSession(1) }
+            }
+        "#;
+        let result = check_source(bad);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("createSession"), "debería mencionar 'createSession': {msg}");
+    }
+
+    #[test]
+    fn destroy_session_takes_zero_arguments() {
+        let src = r#"
+            service S {
+                @authenticated
+                rpc logout() -> Void { auth.destroySession() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        // Tomar un token como argumento dejaría destruir la sesión de
+        // cualquier otro con solo nombrarla -- ver check_auth_method.
+        let bad = r#"
+            service S {
+                @authenticated
+                rpc logout(token: String) -> Void { auth.destroySession(token) }
+            }
+        "#;
+        assert!(check_source(bad).is_err());
+    }
+
+    #[test]
+    fn const_calling_create_session_is_rejected_not_just_at_build_time() {
+        // Un const no es un literal si invoca auth.createSession -- si esto
+        // tipara, cada referencia al const crearía una sesión Admin nueva
+        // (los const no se memoizan en runtime), sin que nadie la pidiera.
+        let src = r#"
+            enum Role { Admin, Member }
+            const TOKEN: String = auth.createSession(Role.Admin {});
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("literal"), "debería señalar la restricción de forma-literal: {msg}");
+    }
+
+    #[test]
+    fn const_with_plain_literal_value_still_works() {
+        let src = r#"
+            enum Role { Admin, Member }
+            const DEFAULT_ROLE: Role = Role.Member {};
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_length_returns_int() {
+        // Faltaba (solo String.length() existía) -- encontrado al escribir
+        // `login` para auth v0, que necesita "¿matcheó algún usuario?".
+        let src = r#"
+            fn count(xs: Int[]) -> Int { xs.length() }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 }

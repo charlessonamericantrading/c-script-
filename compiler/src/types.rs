@@ -78,6 +78,12 @@ pub enum Type {
     /// colección o de método desconocido ya es un error de tipos, no algo
     /// que se descubre recién en runtime.
     DbCollection(Box<Type>),
+    /// Tipo interno SOLO del identificador `auth` (GRAMMAR.md §3.14, auth v0)
+    /// -- mismo trato que `Type::Db`: nunca aparece en una firma escrita por
+    /// el usuario, ni cruza a `TypeExpr`, así que `check_wire_safe` no
+    /// necesita ningún caso explícito para excluirlo (inalcanzable desde una
+    /// firma de rpc por construcción, igual que `Db`).
+    Auth,
 }
 
 #[derive(Debug, Clone, PartialEq)]

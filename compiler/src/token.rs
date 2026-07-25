@@ -51,6 +51,7 @@ pub enum TokenKind {
     Semi,     // ;
     Colon,    // :
     Question, // ?
+    At,       // @   (anotaciones sobre rpc/stream: @authenticated, @requires(...))
     Pipe,     // |   (union de tipos: A | B)
     Lt,       // <
     Gt,       // >

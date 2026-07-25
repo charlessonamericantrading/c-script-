@@ -215,7 +215,17 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     // (soporte nativo de Node, esbuild en modo transform), y el código
     // generado debería ser legible por el mayor número posible de toolchains.
     out.push_str("  private baseUrl: string;\n");
+    // Auth v0 (GRAMMAR.md §3.14): estado MUTABLE de instancia, no un
+    // parámetro por-llamada -- correcto para "una instancia de cliente = un
+    // usuario/sesión activa" (igual que la mayoría de SDKs generados
+    // reales), pero significa que una única instancia COMPARTIDA entre
+    // requests concurrentes de usuarios DISTINTOS (ej. un backend-for-
+    // frontend Node reusando un solo cliente módulo-level) puede pisarse el
+    // token entre requests. Para ese caso: instanciar un cliente por
+    // request/usuario, no compartir uno mutable.
+    out.push_str("  private token: string | null = null;\n");
     out.push_str("  constructor(baseUrl: string) {\n    this.baseUrl = baseUrl;\n  }\n\n");
+    out.push_str("  setToken(token: string | null): void {\n    this.token = token;\n  }\n\n");
 
     for (rpc, is_stream, param_tys, ret_ty) in &resolved {
         let params: Vec<String> = rpc
@@ -310,7 +320,14 @@ fn push_fetch_call(out: &mut String, service_name: &str, rpc_name: &str, arg_nam
         "    const res = await fetch(`${{this.baseUrl}}/{service_name}/{rpc_name}`, {{\n"
     ));
     out.push_str("      method: \"POST\",\n");
-    out.push_str("      headers: { \"Content-Type\": \"application/json\" },\n");
+    // Auth v0 (GRAMMAR.md §3.14): el header Bearer se agrega SOLO si hay un
+    // token seteado -- el server decide caso por caso (vía @authenticated/
+    // @requires) si lo exige; el cliente lo manda siempre que lo tenga,
+    // para cualquier rpc, sin necesidad de que el codegen sepa cuáles
+    // realmente lo necesitan.
+    out.push_str(
+        "      headers: { \"Content-Type\": \"application/json\", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },\n",
+    );
     out.push_str(&format!("      body: JSON.stringify({{ {} }}),\n", arg_names.join(", ")));
     out.push_str("    });\n");
     out.push_str("    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);\n");
@@ -436,6 +453,11 @@ fn emit_service_interface(out: &mut String, s: &ServiceDecl, checker: &Checker) 
         };
         out.push_str(&format!("  {}({}): {};\n", rpc.name, params.join(", "), ret_str));
     }
+    // Auth v0 (GRAMMAR.md §3.14): parte de la interfaz pública, no solo de
+    // `{Service}ClientImpl` -- sin esto, algo tipado como `{Service}Client`
+    // (lo que devuelve `create{Service}Client`) no podría llamar
+    // `.setToken(...)`, solo la clase concreta podría.
+    out.push_str("  setToken(token: string | null): void;\n");
     out.push_str("}\n\n");
     Ok(())
 }
@@ -505,11 +527,12 @@ pub(crate) fn render_type(ty: &Type) -> String {
             .map(render_type_atom)
             .collect::<Vec<_>>()
             .join(" | "),
-        // `db`/`db.<coleccion>` son internos del checker (GRAMMAR.md §2.1,
-        // DbDecl) -- nunca aparecen en un TypeExpr escrito por el usuario,
-        // así que jamás llegan a resolverse en una firma real de rpc/type.
-        Type::Db | Type::DbCollection(_) => {
-            unreachable!("Type::Db/DbCollection nunca aparece en un TypeExpr real")
+        // `db`/`db.<coleccion>`/`auth` son internos del checker (GRAMMAR.md
+        // §2.1 DbDecl, §3.14 auth v0) -- nunca aparecen en un TypeExpr
+        // escrito por el usuario, así que jamás llegan a resolverse en una
+        // firma real de rpc/type.
+        Type::Db | Type::DbCollection(_) | Type::Auth => {
+            unreachable!("Type::Db/DbCollection/Auth nunca aparece en un TypeExpr real")
         }
     }
 }
@@ -573,8 +596,8 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
             }
         }
         Type::Int | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
-        Type::Db | Type::DbCollection(_) => {
-            unreachable!("Type::Db/DbCollection nunca aparece en un TypeExpr real")
+        Type::Db | Type::DbCollection(_) | Type::Auth => {
+            unreachable!("Type::Db/DbCollection/Auth nunca aparece en un TypeExpr real")
         }
     }
 }
@@ -817,5 +840,46 @@ mod tests {
         assert!(contract.contains("export type Option<T> ="));
         assert!(contract.contains("| { type: \"Some\"; value: T }"));
         assert!(contract.contains("get(): Promise<Option<string>>;"));
+    }
+
+    // ---- auth v0 (GRAMMAR.md §3.14) ----
+
+    #[test]
+    fn client_interface_and_impl_both_expose_set_token() {
+        // `setToken` tiene que estar en la INTERFAZ (contract.d.ts), no
+        // solo en la clase concreta -- si no, algo tipado como
+        // `{Service}Client` (lo que devuelve `create{Service}Client`) no
+        // podría llamarlo.
+        let src = r#"
+            enum Role { Admin, Member }
+            service S {
+                @authenticated
+                rpc me() -> Int { 1 }
+            }
+        "#;
+        let (contract, client) = emit_both(src);
+        assert!(contract.contains("setToken(token: string | null): void;"), "{contract}");
+        assert!(client.contains("private token: string | null = null;"), "{client}");
+        assert!(client.contains("setToken(token: string | null): void {"), "{client}");
+    }
+
+    #[test]
+    fn every_fetch_call_conditionally_attaches_the_bearer_header() {
+        // El cliente manda el header si tiene token seteado para
+        // CUALQUIER rpc, sin importar si tiene @authenticated/@requires --
+        // es el server el que decide caso por caso si lo exige.
+        let src = r#"
+            enum Role { Admin }
+            service S {
+                @requires(Role.Admin)
+                rpc deleteThing(id: Int) -> Void { }
+
+                stream watch() -> Int { [] }
+            }
+        "#;
+        let (_, client) = emit_both(src);
+        let auth_header = "...(this.token ? { Authorization: `Bearer ${this.token}` } : {})";
+        let count = client.matches(auth_header).count();
+        assert_eq!(count, 2, "esperaba el header condicional en el rpc normal Y en el stream: {client}");
     }
 }

@@ -235,6 +235,7 @@ impl Lexer {
             ';' => TokenKind::Semi,
             ':' => TokenKind::Colon,
             '?' => TokenKind::Question,
+            '@' => TokenKind::At,
             '.' => TokenKind::Dot,
             '+' => TokenKind::Plus,
             '*' => TokenKind::Star,
@@ -461,6 +462,23 @@ mod tests {
                 TokenKind::LBracket,
                 TokenKind::RBracket,
                 TokenKind::Eof
+            ]
+        );
+    }
+
+    #[test]
+    fn at_sign_lexes_as_its_own_token() {
+        assert_eq!(
+            kinds("@requires(Role.Admin)"),
+            vec![
+                TokenKind::At,
+                TokenKind::Ident("requires".into()),
+                TokenKind::LParen,
+                TokenKind::Ident("Role".into()),
+                TokenKind::Dot,
+                TokenKind::Ident("Admin".into()),
+                TokenKind::RParen,
+                TokenKind::Eof,
             ]
         );
     }
