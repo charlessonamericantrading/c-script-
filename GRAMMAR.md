@@ -67,7 +67,7 @@ fn_decl      = "fn" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr
 db_decl      = "db" , "{" , field_list , "}" ;   (* "db" NO es keyword -- ver §3.12 *)
 ```
 
-**El `;` de `type_decl` es opcional.** Un `type X = { ... }` termina en `}`; exigir además un `;` es la misma incomodidad que Rust/Go evitan después de un `struct`. `const_decl`/`let_stmt`/`return_stmt` sí exigen `;` — su valor no siempre termina en `}` (`const MAX: Int = 100`) y v0 no tiene todavía operadores infijos que hicieran innecesaria la marca de fin de sentencia.
+**El `;` de `type_decl` es opcional.** Un `type X = { ... }` termina en `}`; exigir además un `;` es la misma incomodidad que Rust/Go evitan después de un `struct`. `const_decl`/`let_stmt`/`return_stmt` sí exigen `;` — su valor no siempre termina en `}` (`const MAX: Int = 100`), así que hace falta una marca explícita de fin de sentencia.
 
 **`fn` — funciones libres, no expuestas como RPC.** A diferencia de `rpc`/`stream`, no vive dentro de un `service` y no entra al contrato `.d.ts` — es lógica interna del backend (p. ej. `validate` llamada desde un `rpc`). Misma forma que `rpc_decl` porque comparten `param_list`/`block`; la diferencia es de visibilidad, no de sintaxis.
 
@@ -154,9 +154,19 @@ arg_list     = expr , { "," , expr } ;
 primary_expr = struct_or_variant_lit
              | array_lit
              | tuple_lit
+             | closure_lit
              | identifier
              | int_lit | float_lit | string_lit | bool_lit | "null"
              | "(" , expr , ")" ;
+
+(* Closure (§3.10). El cuerpo es SIEMPRE un block -- no hay "block como
+   expresión" en el lenguaje, así que esto lo reusa tal cual. Mínimo 1
+   parámetro: "||" lexea como un solo token (or lógico), no como dos "|".
+   El tipo de un parámetro se parsea como postfix_type, NO type_expr: un
+   "|" de nivel superior pertenece al cierre del closure, así que un tipo
+   unión necesita paréntesis (|x: (Int | String)| { ... }). *)
+closure_lit       = "|" , closure_param , { "," , closure_param } , [ "," ] , "|" , block ;
+closure_param     = identifier , [ ":" , postfix_type ] ;
 
 struct_or_variant_lit = identifier , [ "." , identifier ] , "{" , [ field_init_list ] , "}" ;
 field_init_list        = field_init , { "," , field_init } ;
@@ -169,13 +179,21 @@ array_lit = "[" , [ expr , { "," , expr } , [ "," ] ] , "]" ;
 tuple_lit = "(" , expr , "," , [ expr , { "," , expr } ] , ")" ;
 
 match_expr   = "match" , expr , "{" , { match_arm } , "}" ;
-match_arm    = pattern , [ "if" , expr ] , "=>" , ( expr , "," | block ) ;
+(* La coma SEPARA un arm-expr del siguiente, así que es opcional en el
+   último (justo antes del "}"), igual que en Rust. Un arm cuyo cuerpo es
+   un block nunca la lleva. *)
+match_arm    = pattern , [ "if" , expr ] , "=>" , ( expr , [ "," ] | block ) ;
 
 pattern      = pattern_atom , { "|" , pattern_atom } ;        (* or-pattern *)
 pattern_atom = identifier                                    (* binding, incl. "_" *)
              | identifier , "." , identifier ,
                [ "{" , field_pattern_list , "}" ]             (* Enum.Variant { .. } *)
+             | type_pattern
              | literal_pattern ;
+(* Narrowing de una unión a su miembro concreto (§3.9). El tipo se parsea
+   como postfix_type, no type_expr: un "|" que siga pertenece al or-pattern
+   que lo rodea (i: Int | s: String son DOS alternativas, no un tipo unión). *)
+type_pattern = identifier , ":" , postfix_type ;
 literal_pattern = int_lit | "-" , int_lit | str_lit | "true" | "false" ;
 field_pattern_list = field_pattern , { "," , field_pattern } ;
 field_pattern       = identifier , [ ":" , pattern ] ;        (* shorthand: `x` ≡ `x: x` *)
@@ -440,9 +458,9 @@ Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos,
 
 `if cond { A } else { B }` es de **modo chequeo**, igual que `match` (§3.1): no tiene un tipo propio que sintetizar, necesita el tipo esperado del contexto para verificar que `cond ⇐ Bool` y que tanto `A` como `B` chequean contra ese mismo tipo esperado. Es la misma familia de regla que `match` — control de flujo condicional siempre se chequea top-down, nunca se infiere bottom-up.
 
-### 3.8 Métodos builtin sobre primitivos
+### 3.8 Métodos builtin
 
-`x.metodo()` sobre un valor primitivo (no un struct/enum declarado) no es acceso a un campo real — es azúcar reconocida por nombre y tipo del receptor, resuelta ANTES de intentar el `FieldAccess` genérico (que fallaría: `Int`/`Float`/`String` no son `Struct` ni `Dynamic`). Es el mismo mecanismo que ya resolvía `db.users.find(...)` (`checker.rs`/`runtime/mod.rs`, `BoundMethod`), generalizado a primitivos.
+`x.metodo()` sobre un valor que no es un struct/enum declarado no es acceso a un campo real — es azúcar reconocida por nombre y tipo del receptor, resuelta ANTES de intentar el `FieldAccess` genérico (que fallaría: `Int`/`Float`/`String`/`List` no son `Struct` ni `Dynamic`). Es el mismo mecanismo que ya resolvía `db.users.find(...)` (`checker.rs`/`runtime/mod.rs`, `BoundMethod`), generalizado.
 
 | Método | Receptor | Resultado | Nota |
 |---|---|---|---|
@@ -450,8 +468,11 @@ Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos,
 | `.toInt()` | `Float` | `Int` | trunca hacia cero (`3.9`→`3`, `-3.9`→`-3`), igual que `as` en Rust — no redondea |
 | `.length()` | `String` | `Int` | cantidad de caracteres |
 | `.contains(s: String)` | `String` | `Bool` | substring, no regex |
+| `.take(n: Int)` | `T[]` | `T[]` | los primeros `n`; si la lista tiene menos, la devuelve entera (no falla) |
+| `.filter(p: (T) -> Bool)` | `T[]` | `T[]` | ver §3.10 |
+| `.map(f: (T) -> U)` | `T[]` | `U[]` | ver §3.10 |
 
-No hay coerción implícita en ningún operador (§3.7) — estas son las únicas conversiones numéricas, y son siempre explícitas. `.length()`/`.contains()` son método, no propiedad (`x.length`, sin paréntesis) — consistencia con `.toFloat()`/`.toInt()` importó más acá que imitar la convención de propiedad de JS/TS.
+No hay coerción implícita en ningún operador (§3.7) — `.toFloat()`/`.toInt()` son las únicas conversiones numéricas, y son siempre explícitas. `.length()`/`.contains()` son método, no propiedad (`x.length`, sin paréntesis) — consistencia con `.toFloat()`/`.toInt()` importó más acá que imitar la convención de propiedad de JS/TS.
 
 ### 3.9 Uniones de tipo (`A | B`) — RESUELTO (subtipado de flujo de valor Y narrowing)
 
@@ -540,8 +561,10 @@ Esa comparación de params vive en su propia función con nombre (`types::params
 ```
 list.filter(|u: User| { u.active })      // predicado -- siempre List<T>
 list.map(|u: User| { u.name })           // transforma -- puede cambiar List<T> a List<U>
-let contador = 0;
-let sumar = |x: Int| { total = total + x; x };  // captura 'total' del scope que lo rodea
+
+// captura 'total' del scope que lo rodea, y lo MUTA -- de ahí el `mut`
+let mut total = 0;
+let sumar = |x: Int| { total = total + x; x };
 ```
 
 Estilo Rust, delimitado por `|`. El cuerpo es SIEMPRE un bloque con llaves -- nunca una expresión suelta (`|x| x + 1` no se soporta; hace falta `|x| { x + 1 }`) porque el lenguaje no tiene ningún concepto de "bloque como expresión general" y esto reutiliza `Block` tal cual en vez de inventarlo. Cada parámetro es `nombre (: tipo)?` -- la anotación es opcional cuando el closure se chequea (⇐) contra un `Type::Function` ya conocido (el callback de `.filter`/`.map`, o un `let` con el tipo declarado), y obligatoria cuando no hay ningún contexto del que inferirla (`synth_expr`, ej. `let f = |x| {...}` sin anotar el `let`).
@@ -669,12 +692,12 @@ stream watchAll() -> User {
 | `Int`, `Float` | `number` | número | — |
 | `String` | `string` | string | — |
 | `Bool` | `boolean` | bool | — |
-| `Void` | `void` | — (sin cuerpo) | Solo válido como retorno de `rpc` |
+| `Void` | `void` | `null` en el cuerpo | Solo válido como retorno COMPLETO de un `rpc` -- como campo o parámetro es un error del checker (§4.1) |
 | `T[]` | `T[]` | array | — |
 | `Map<K, V>` | `Record<K, V>` | objeto | `K` limitado a `String`/`Int` (claves JSON); `{K: V}` como literal de tipo NO se parsea, ver §2.2 |
 | `(A, B)` | `[A, B]` | array de longitud fija | tupla, ver §2.2 sobre ambigüedad de paréntesis |
-| `(A) -> B` | `(a: A) => B` | — | solo como campo de tipo función local; no cruza el wire |
-| `A \| B` | `A \| B` | valor tal cual, con la forma de cualquiera de los miembros | subtipado de flujo de valor, sin angosto — resuelto en §3.9 |
+| `(A) -> B` | `(arg0: A) => B` | — | solo dentro del backend; usarlo en la firma de un `rpc` (o en un tipo que esa firma alcance) es un error del checker (§4.1) |
+| `A \| B` | `A \| B` | valor tal cual, con la forma de cualquiera de los miembros | subtipado de flujo de valor Y narrowing vía `match` — resuelto en §3.9 |
 | `type X = {...}` | `interface X {...}` (structural) | objeto | subtipado estructural, §3.2 |
 | `type X<T> = {...}` | `interface X<T> {...}` | objeto | monomorfizado en el backend, genérico en TS, §3.6 |
 | `enum E { A, B }` | `type E = "A" \| "B"` | string | enum simple = unión de literales |
@@ -686,12 +709,32 @@ stream watchAll() -> User {
 | `rpc f(...) -> Result<T, E>` | `{type:"Ok",value:T} \| {type:"Err",error:E}` | objeto con tag `type` | resuelto en §3.5 — nunca lanza para errores declarados |
 | `stream f(...) -> T` | `AsyncIterable<T>` | eventos SSE reales (`data: ...\n\n`), uno por `T` serializado, sobre chunked transfer | resuelto en §3.13 -- repite una lista ya calculada, no suscribe a eventos futuros |
 | `service S { ... }` | `interface SClient { ... }` + instancia concreta generada | — | el cliente real es un thin wrapper sobre `fetch`/WS |
-| `const X: T = v` | `export const X: T = v` | — | solo tipos serializables (mismo universo que campos de struct) |
+| `const X: T = v` | `export const X: T = v` **en `client.ts`**, no en `contract.d.ts` | — | un `.d.ts` es ambiental y TS rechaza inicializadores ahí (TS1039); un `const` es un valor, así que vive en el módulo real |
+
+### 4.1 Qué puede aparecer en la firma de un `rpc`
+
+Todo lo que aparece en la firma de un `rpc`/`stream` viaja de verdad por la red, así que tiene que ser expresable como JSON. Dos tipos de la tabla de arriba NO lo son, y el checker los rechaza en esa posición:
+
+- **Tipos función** (`(A) -> B`) en cualquier lado de la firma, incluso anidados dentro de un struct que la firma alcance. Dentro del backend siguen siendo válidos (pasar una `fn` a otra, §3.10) -- lo que no puede es cruzar.
+- **`Void`** en cualquier posición que no sea el retorno COMPLETO de un `rpc`. Como campo de struct o parámetro no significa nada.
+
+Esta regla existía como afirmación en la tabla desde el principio, pero nada la hacía cumplir: hasta la auditoría, un `type T = { h: (Int) -> String }` usado como retorno tipaba, emitía `h: (arg0: number) => string` al contrato, y generaba un validador con `typeof x.h === "function"` -- una condición que ningún payload JSON puede satisfacer, así que el cliente rechazaba SIEMPRE la respuesta. Un error de compilación claro es mejor que un contrato imposible de cumplir.
+
+### 4.2 Validación en los dos extremos
+
+El contrato no es solo una promesa de tipos en tiempo de compilación: los dos extremos lo verifican en runtime, con errores de categorías distintas.
+
+| Dirección | Quién valida | Qué pasa si no matchea |
+|---|---|---|
+| Respuesta (servidor → cliente) | `validators.ts`, llamado desde `client.ts` (§3.11) | `LinkValidationError` en el cliente |
+| Petición (cliente → servidor) | el servidor, contra el tipo declarado de cada parámetro | HTTP **400** con la ruta exacta del campo que falló |
+
+La segunda mitad faltaba por completo hasta la auditoría: el servidor convertía el JSON entrante con una función puramente sintáctica, sin mirar ningún tipo. Las consecuencias reales están documentadas en el commit que lo arregló; la más visible era que un enum recibido por el wire nunca llegaba a ser un enum de verdad adentro, así que `match` sobre cualquier parámetro de tipo enum fallaba siempre. Un campo de más en la petición se acepta (subtipado de ancho, §3.2) pero se descarta: el valor que entra al backend tiene EXACTAMENTE la forma declarada.
 
 ---
 
-## 5. Estado y próximos pasos
+## 5. Estado
 
 `T?` (§3.4) y el manejo de errores (§3.5) quedaron resueltos con los defaults recomendados en `PLAN.md` §8.3 — ver `examples/decision-nullability.ts` y `examples/decision-errors.ts` para el resultado aplicado. Son reemplazables: si el criterio real termina siendo otro, es un cambio acotado a esas dos secciones y al emisor, no un rediseño del lenguaje.
 
-Con el sistema de tipos sin huecos, el siguiente entregable es la implementación real (MVP Fase 0 de `PLAN.md` §4): lexer → parser → type checker → emisor `.d.ts`/`client.ts` → runtime mínimo → demo E2E donde cambiar un tipo en el backend rompe `tsc` en el frontend sin tocarlo. Ese trabajo vive en `compiler/` (Rust, sin dependencias externas para no depender de acceso a red del sandbox).
+El compilador está construido y vive en `compiler/` (Rust; las únicas dependencias son `tiny_http`/`serde_json`, para el runtime del demo). Para el estado real y actualizado de qué está hecho y qué no, ver la sección "Estado" del [README](README.md) — este documento describe el LENGUAJE, no el avance del proyecto. Cada gap de diseño que se fue cerrando tiene su propia sección `§3.X — RESUELTO` acá arriba, incluyendo lo que quedó deliberadamente afuera y por qué.

@@ -706,7 +706,14 @@ impl Parser {
             MatchArmBody::Block(self.parse_block()?)
         } else {
             let e = self.parse_expr()?;
-            self.eat(&TokenKind::Comma)?; // obligatoria tras un arm-expr (GRAMMAR.md §2.3)
+            // La coma separa un arm-expr del siguiente (GRAMMAR.md §2.3),
+            // pero en el ÚLTIMO arm no hay nada que separar: exigirla ahí
+            // rechazaba `match x { A => 1, B => 2 }` con un críptico "se
+            // esperaba Comma, se encontró RBrace". Es opcional justo antes
+            // del `}` de cierre, igual que en Rust.
+            if !self.check(&TokenKind::RBrace) {
+                self.eat(&TokenKind::Comma)?;
+            }
             MatchArmBody::Expr(e)
         };
         Ok(MatchArm { pattern, guard, body })

@@ -15,7 +15,7 @@ Este repo es el **MVP de Fase 0** (ver [PLAN.md](PLAN.md) §4): prueba el killer
 | [`compiler/`](compiler/) | El compilador (`linkc`), en Rust, sin dependencias externas salvo `tiny_http`/`serde_json` para el runtime de la demo |
 | [`examples/users.link`](examples/users.link) | El programa de ejemplo: un CRUD de usuarios |
 | [`frontend/`](frontend/) | Un frontend TypeScript real que consume el contrato generado |
-| [`gen/`](gen/) | Salida de `linkc build` — `contract.d.ts` + `client.ts` (generado, no editar a mano) |
+| [`gen/`](gen/) | Salida de `linkc build` — `contract.d.ts` + `client.ts` + `validators.ts` (generado, no editar a mano) |
 
 ## Probar el killer feature vos mismo
 
@@ -34,6 +34,8 @@ cd ../compiler && ./target/debug/linkc serve ../examples/users.link 8787 &
 cd ../frontend && node src/main.ts                  # llama al server real, tipado end-to-end
 ```
 
+El servidor arranca con la base **vacía** — crea una colección vacía por cada una que tu programa declare en `db { ... }`, y nada más. Por eso la primera corrida del demo crea su propio usuario y después lo lee: que el runtime de un lenguaje invente filas que nunca escribiste sería mentir sobre lo que tu programa hace.
+
 Ahora rompé algo: en `examples/users.link`, renombrá `name` a `fullName` dentro de `type User`. Volvé a correr `linkc build` y `npx tsc --noEmit` **sin tocar `frontend/src/main.ts`**. `tsc` va a fallar en cada línea que usaba `.name` — exactamente el punto ciego que c-script existe para eliminar (ver [PLAN.md](PLAN.md) §3).
 
 Arrancar un proyecto de cero es más rápido: `linkc new mi-app` scaffoldea un `.link` mínimo más un `frontend/` a juego; `linkc dev mi-app/main.link mi-app/gen` lo observa (y a todo lo que importe) y regenera el contrato en cada guardado, en vez de correr `build` a mano cada vez.
@@ -44,9 +46,9 @@ Completo (Fase 0): lexer, parser, type checker bidireccional (subtipado estructu
 
 Completo (Fase 1, parcial): CLI `linkc new`/`linkc dev`, imports multi-archivo con un package manager mínimo por rutas locales (sin lockfile, sin registro en red todavía — ver GRAMMAR.md §2.1), y un v0 de target WASM -- el intérprete existente recompilado a `wasm32-wasip1`, probado corriendo una llamada RPC real dentro de `wasmtime` de punta a punta (`compiler/src/bin/wasm_demo.rs`; ver PLAN.md §2.4 para el detalle exacto de qué prueba esto y qué no).
 
-Completo (Fase 2, parcial): validadores runtime (`validators.ts` -- el tercer output del emisor planeado desde el primer borrador de `PLAN.md`; cada respuesta de un rpc se valida contra el contrato declarado antes de que el cliente la devuelva, lanzando `LinkValidationError` si no matchea en vez de devolver silenciosamente un dato malformado), un v0 de `db` tipada (`db { users: User[] }` reemplaza a `Type::Dynamic` -- `all/find/insert/applyPatch` ahora se chequean contra el tipo de elemento real, sigue siendo enteramente en memoria, sin ningún driver SQL), y streaming real por SSE para `stream` (framing de verdad -- `Transfer-Encoding: chunked` con flush por evento, no un solo JSON -- para repetir una secuencia ya calculada; el cliente generado la consume como `AsyncIterable<T>` real, validando cada evento). 200 tests, todos pasando.
+Completo (Fase 2, parcial): validadores runtime (`validators.ts` -- el tercer output del emisor planeado desde el primer borrador de `PLAN.md`; cada respuesta de un rpc se valida contra el contrato declarado antes de que el cliente la devuelva, lanzando `LinkValidationError` si no matchea en vez de devolver silenciosamente un dato malformado), un v0 de `db` tipada (`db { users: User[] }` reemplaza a `Type::Dynamic` -- `all/find/insert/applyPatch` ahora se chequean contra el tipo de elemento real, sigue siendo enteramente en memoria, sin ningún driver SQL), y streaming real por SSE para `stream` (framing de verdad -- `Transfer-Encoding: chunked` con flush por evento, no un solo JSON -- para repetir una secuencia ya calculada; el cliente generado la consume como `AsyncIterable<T>` real, validando cada evento). 218 tests, todos pasando.
 
-Pendiente (ver PLAN.md §4): un backend de codegen que emita `.wasm` de verdad (el target WASM de hoy recompila el intérprete tree-walking en vez de generar instrucciones wasm nativas), un LSP (necesita spans + recuperación de errores del parser primero -- ninguno de los dos existe hoy), push real (WebSocket, o SSE de larga duración) para que un `stream` avise de eventos FUTUROS -- hoy solo repite una secuencia ya calculada, suscribirse a cambios necesitaría una capa de pub-sub sobre `db` que no existe, y un generador perezoso de verdad necesitaría además un constructo de loop, que el lenguaje todavía no tiene (la recursión vía una `fn` con nombre o un closure autorreferenciado ya funciona hoy, pero no hay sintaxis `for`/`while`) --, y una DB real con SQL detrás. Ver [GRAMMAR.md](GRAMMAR.md) §2.1, §3.6, §3.9, §3.10, §3.12, §3.13 para el detalle exacto de cada uno y por qué.
+Pendiente (ver PLAN.md §4): un backend de codegen que emita `.wasm` de verdad (el target WASM de hoy recompila el intérprete tree-walking en vez de generar instrucciones wasm nativas), un LSP (necesita spans + recuperación de errores del parser primero -- ninguno de los dos existe hoy), push real (WebSocket, o SSE de larga duración) para que un `stream` avise de eventos FUTUROS -- hoy solo repite una secuencia ya calculada, suscribirse a cambios necesitaría una capa de pub-sub sobre `db` que no existe, y un generador perezoso de verdad necesitaría además un constructo de loop, que el lenguaje todavía no tiene (la recursión vía una `fn` con nombre o un closure autorreferenciado ya funciona hoy, pero no hay sintaxis `for`/`while`) --, y una DB real con SQL detrás. Ver [GRAMMAR.md](GRAMMAR.md) §2.1 (imports/package manager), §3.12 (`db`) y §3.13 (streaming) para el detalle exacto de cada uno y por qué.
 
 ## Licencia
 

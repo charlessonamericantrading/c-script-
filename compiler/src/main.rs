@@ -17,7 +17,7 @@ fn main() -> ExitCode {
         None => {
             eprintln!("uso: linkc <archivo.link>                  (lexea, parsea y tipa)");
             eprintln!("     linkc new <nombre>                     (crea un proyecto nuevo)");
-            eprintln!("     linkc build <archivo.link> <outdir>    (+ emite contract.d.ts y client.ts)");
+            eprintln!("     linkc build <archivo.link> <outdir>    (+ emite contract.d.ts, client.ts y validators.ts)");
             eprintln!("     linkc dev <archivo.link> <outdir>      (+ observa y reconstruye solo)");
             eprintln!("     linkc serve <archivo.link> <puerto>    (+ sirve los rpc por HTTP)");
             ExitCode::FAILURE

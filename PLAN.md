@@ -119,22 +119,28 @@ service Users {
 
 ### 2.3 Sistema de tipos — el mapeo 1:1 a TypeScript (el corazón del proyecto)
 
-| Tipo en c-script | Tipo en TypeScript | Forma JSON |
-|---|---|---|
-| `Int`, `Float` | `number` | número |
-| `Int64`, `BigInt` | `bigint` \| `string`* | string (para no perder precisión) |
-| `String` | `string` | string |
-| `Bool` | `boolean` | bool |
-| `[T]` | `T[]` | array |
-| `{K: V}` (map) | `Record<K, V>` | objeto |
-| `(A, B)` (tupla) | `[A, B]` | array |
-| `type X = { ... }` | `type X = { ... }` (estructural) | objeto |
-| `enum E { A, B }` | `type E = "A" \| "B"` | string |
-| `enum` con datos | unión discriminada con `type` tag | objeto etiquetado |
-| `T?` | `T \| null` **(decisión, ver abajo)** | `null` presente |
-| `field?: T` | `field?: T` (clave ausente) | clave omitida |
-| `Timestamp` | `string` (ISO-8601) \| branded | string |
-| `Void` / `Unit` | `void` | — |
+> **Esta tabla es el borrador original de la propuesta, no el estado real.**
+> La tabla de mapeo vigente y exhaustiva vive en [GRAMMAR.md §4](GRAMMAR.md);
+> ahí está lo que el compilador de verdad emite. Se conservan acá las filas
+> tal como se propusieron, marcando cuáles no se construyeron -- borrarlas
+> escondería qué se prometió al principio y qué no llegó.
+
+| Tipo en c-script | Tipo en TypeScript | Forma JSON | ¿Existe? |
+|---|---|---|---|
+| `Int`, `Float` | `number` | número | sí |
+| `Int64`, `BigInt` | `bigint` \| `string`* | string (para no perder precisión) | **no** — nunca se implementó; `Int` es i64 y se emite como `number` |
+| `String` | `string` | string | sí |
+| `Bool` | `boolean` | bool | sí |
+| `[T]` | `T[]` | array | la sintaxis real es postfija: `T[]` |
+| `{K: V}` (map) | `Record<K, V>` | objeto | la sintaxis real es `Map<K, V>` — `{K: V}` como literal de tipo se descartó por ambigüedad con un struct de un campo (GRAMMAR.md §2.2) |
+| `(A, B)` (tupla) | `[A, B]` | array | sí |
+| `type X = { ... }` | `type X = { ... }` (estructural) | objeto | sí (se emite como `interface`) |
+| `enum E { A, B }` | `type E = "A" \| "B"` | string | sí |
+| `enum` con datos | unión discriminada con `type` tag | objeto etiquetado | sí |
+| `T?` | `T \| null` **(decisión, ver abajo)** | `null` presente | sí |
+| `field?: T` | `field?: T` (clave ausente) | clave omitida | sí |
+| `Timestamp` | `string` (ISO-8601) \| branded | string | **no** — nunca se implementó |
+| `Void` / `Unit` | `void` | — | `Void` sí; solo como retorno completo de un rpc (GRAMMAR.md §4.1) |
 
 **\* La decisión de diseño más importante y con más matices** es cómo representar **ausencia**. TypeScript distingue tres cosas que JSON no distingue bien:
 
@@ -244,7 +250,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 | Fase | Duración | Objetivo | Entregable clave | Equipo mínimo |
 |---|---|---|---|---|
 | **Fase 0 · MVP** | 2–4 meses | Probar el killer feature E2E | Lexer + parser + checker mínimo · emisor `.d.ts` + cliente · runtime interpretado o transpilado · **1 demo full-stack donde cambiar el backend rompe `tsc`** | 1–2 ing. de compiladores |
-| **Fase 1 · Alpha** | +4–6 meses | Compilar de verdad | Backend a WASM (v0: runtime recompilado a `wasm32-wasip1`; codegen directo vía `wasm-encoder` como evolución) · runtime RPC HTTP · std mínima (los builtins ya existentes en v0: `.length()`/`.contains()`/`.toFloat()`/`.toInt()`/`db.*`) · CLI (`link new/dev/build`) · LSP básico | 2–3 |
+| **Fase 1 · Alpha** | +4–6 meses | Compilar de verdad | Backend a WASM (v0: runtime recompilado a `wasm32-wasip1`; codegen directo vía `wasm-encoder` como evolución) · runtime RPC HTTP · std mínima (los builtins ya existentes en v0: `.length()`/`.contains()`/`.toFloat()`/`.toInt()`/`db.*`) · CLI (`linkc new/dev/build`) · LSP básico | 2–3 |
 | **Fase 2 · Beta** | +6–9 meses | Usable en proyectos reales | DB tipada · auth · WebSocket/SSE · validadores runtime · hot reload · LSP completo · package manager · observabilidad | 3–5 |
 | **Fase 3 · 1.0** | +6–12 meses | Producción | Estabilidad de sintaxis · ecosistema · docs · deploy edge/serverless · debugging con source maps | 4–6+ |
 
@@ -263,8 +269,8 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 ## 5. Ecosistema y Herramientas
 
-- **Package manager** (`link add`): resolución de dependencias, lockfile. *Aprende de Cargo; no reinventes npm.*
-- **CLI**: `link new`, `link dev` (hot reload + regenera contrato), `link build`, `link deploy`, `link gen` (solo contrato).
+- **Package manager** (`linkc add`): resolución de dependencias, lockfile. *Aprende de Cargo; no reinventes npm.*
+- **CLI**: `linkc new`, `linkc dev` (hot reload + regenera contrato), `linkc build`, `linkc deploy`, `linkc gen` (solo contrato).
 - **LSP**: autocompletado, diagnósticos, go-to-def. **Imprescindible desde Alpha** — sin buen editor, no hay adopción.
 - **Testing**: runner integrado + tests de contrato (que el `.d.ts` generado no rompa sin querer).
 - **Debugging / observabilidad**: source maps, OpenTelemetry, logs estructurados desde Beta.

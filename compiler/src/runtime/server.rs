@@ -218,10 +218,12 @@ fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, r
 }
 
 /// Un chunk de HTTP chunked transfer encoding: tamaño en hex + CRLF + datos
-/// + CRLF (RFC 7230 §4.1). `write_all` + `flush` en la MISMA llamada (no
-/// solo al final del stream) es lo que hace que esto llegue de verdad
-/// incremental al cliente -- ver el comentario más arriba sobre por qué
-/// into_writer() en vez de Response::respond().
+/// + CRLF (RFC 7230 §4.1).
+///
+/// `write_all` + `flush` en la MISMA llamada (no solo al final del stream)
+/// es lo que hace que esto llegue de verdad incremental al cliente -- ver
+/// el comentario más arriba sobre por qué into_writer() en vez de
+/// Response::respond().
 fn write_chunk(writer: &mut dyn Write, data: &[u8]) -> std::io::Result<()> {
     write!(writer, "{:x}\r\n", data.len())?;
     writer.write_all(data)?;

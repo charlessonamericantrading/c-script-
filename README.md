@@ -15,7 +15,7 @@ This repo is the **Phase 0 MVP** (see [PLAN.md](PLAN.md) §4, currently Spanish-
 | [`compiler/`](compiler/) | The compiler (`linkc`), in Rust, no external deps beyond `tiny_http`/`serde_json` for the demo runtime |
 | [`examples/users.link`](examples/users.link) | The example program: a user CRUD service |
 | [`frontend/`](frontend/) | A real TypeScript frontend consuming the generated contract |
-| [`gen/`](gen/) | Output of `linkc build` — `contract.d.ts` + `client.ts` (generated, don't hand-edit) |
+| [`gen/`](gen/) | Output of `linkc build` — `contract.d.ts` + `client.ts` + `validators.ts` (generated, don't hand-edit) |
 
 ## Try the killer feature yourself
 
@@ -33,6 +33,8 @@ cd ../frontend && npm install && npx tsc --noEmit   # exit 0
 cd ../compiler && ./target/debug/linkc serve ../examples/users.link 8787 &
 cd ../frontend && node src/main.ts                  # calls the real server, typed end-to-end
 ```
+
+The server starts with an **empty** database — it creates one empty collection per `db { ... }` declaration in your program and nothing else. The demo's first run therefore creates its own user and then reads it back; a language runtime inventing rows you never wrote would be a lie about what your program does.
 
 Now break something: in `examples/users.link`, rename `name` to `fullName` inside `type User`. Re-run `linkc build` and `npx tsc --noEmit` **without touching `frontend/src/main.ts`**. `tsc` fails on every line that used `.name` — exactly the blind spot c-script exists to eliminate (see [PLAN.md](PLAN.md) §3).
 
@@ -52,9 +54,9 @@ Done (Phase 0): lexer, parser, bidirectional type checker (structural/nominal su
 
 Done (Phase 1, partial): `linkc new`/`linkc dev` CLI, multi-file imports with a minimal path-based package manager (no lockfile, no network registry yet — see GRAMMAR.md §2.1), and a v0 WASM target — the existing interpreter recompiled to `wasm32-wasip1`, proven by running a real RPC call inside `wasmtime` end to end (`compiler/src/bin/wasm_demo.rs`; see PLAN.md §2.4 for exactly what that does and doesn't prove).
 
-Done (Phase 2, partial): runtime validators (`validators.ts` — the third emitter output planned since PLAN.md's first draft; every RPC response is checked against the declared contract before the client hands it back, throwing `LinkValidationError` on a mismatch instead of silently returning malformed data), a v0 typed `db` (`db { users: User[] }` replaces `Type::Dynamic` — `all/find/insert/applyPatch` are now checked against the real element type, still fully in-memory, no SQL driver), and real SSE streaming for `stream` (genuine wire framing — `Transfer-Encoding: chunked` with a flush per event, not one buffered JSON blob — replaying an already-computed sequence; the generated client consumes it as a real `AsyncIterable<T>`, validating each event). 200 tests, all passing.
+Done (Phase 2, partial): runtime validators (`validators.ts` — the third emitter output planned since PLAN.md's first draft; every RPC response is checked against the declared contract before the client hands it back, throwing `LinkValidationError` on a mismatch instead of silently returning malformed data), a v0 typed `db` (`db { users: User[] }` replaces `Type::Dynamic` — `all/find/insert/applyPatch` are now checked against the real element type, still fully in-memory, no SQL driver), and real SSE streaming for `stream` (genuine wire framing — `Transfer-Encoding: chunked` with a flush per event, not one buffered JSON blob — replaying an already-computed sequence; the generated client consumes it as a real `AsyncIterable<T>`, validating each event). 218 tests, all passing.
 
-Not done yet: a `.wasm`-emitting codegen backend (today's WASM target recompiles the tree-walking interpreter rather than generating native wasm instructions), an LSP (needs span-tracking and parser error-recovery first — neither exists today), real push (WebSocket, or long-lived SSE) so a `stream` can announce FUTURE events — today it only replays an already-computed sequence; subscribing to changes would need a pub-sub layer over `db` that doesn't exist, and a genuinely lazy generator would additionally need a loop construct, which the language still doesn't have (recursion through a named `fn` or a self-referencing closure works today, but there's no `for`/`while` syntax) —, and a real SQL-backed DB. See [GRAMMAR.md](GRAMMAR.md) §2.1, §3.6, §3.9, §3.10, §3.12, §3.13 for exactly what each of those means and why.
+Not done yet: a `.wasm`-emitting codegen backend (today's WASM target recompiles the tree-walking interpreter rather than generating native wasm instructions), an LSP (needs span-tracking and parser error-recovery first — neither exists today), real push (WebSocket, or long-lived SSE) so a `stream` can announce FUTURE events — today it only replays an already-computed sequence; subscribing to changes would need a pub-sub layer over `db` that doesn't exist, and a genuinely lazy generator would additionally need a loop construct, which the language still doesn't have (recursion through a named `fn` or a self-referencing closure works today, but there's no `for`/`while` syntax) —, and a real SQL-backed DB. See [GRAMMAR.md](GRAMMAR.md) §2.1 (imports/package manager), §3.12 (`db`) and §3.13 (streaming) for exactly what each of those means and why.
 
 ## License
 

@@ -140,6 +140,35 @@ fn field_access_ty(f: &FieldType) -> Type {
     }
 }
 
+/// Recorre `ty` rechazando lo que no puede viajar como JSON. `top_level_ret`
+/// solo habilita `Void` en la posición donde sí tiene sentido: el retorno
+/// entero de un rpc que no devuelve nada.
+fn check_wire_safe(ty: &Type, position: &str, top_level_ret: bool) -> Result<(), CheckError> {
+    match ty {
+        Type::Function(..) => Err(err(format!(
+            "{position} incluye un tipo función, que no puede viajar por la red (GRAMMAR.md §4) -- \
+             una función solo existe dentro del backend"
+        ))),
+        Type::Void if !top_level_ret => Err(err(format!(
+            "{position} usa 'Void', que solo es válido como el retorno completo de un rpc (GRAMMAR.md §4)"
+        ))),
+        Type::Void => Ok(()),
+        Type::Optional(inner) | Type::List(inner) | Type::PatchOf(inner) => {
+            check_wire_safe(inner, position, false)
+        }
+        Type::Tuple(items) | Type::Union(items) => {
+            items.iter().try_for_each(|t| check_wire_safe(t, position, false))
+        }
+        Type::ResultOf(a, b) | Type::MapOf(a, b) => {
+            check_wire_safe(a, position, false)?;
+            check_wire_safe(b, position, false)
+        }
+        Type::Struct { fields, .. } => fields.iter().try_for_each(|f| check_wire_safe(&f.ty, position, false)),
+        Type::Generic(_, args) => args.iter().try_for_each(|t| check_wire_safe(t, position, false)),
+        _ => Ok(()),
+    }
+}
+
 /// ¿Se puede PROBAR que dos miembros de una unión son distinguibles en
 /// runtime? "No" es la respuesta segura cuando el análisis no puede probar
 /// que sí (GRAMMAR.md §3.9, `check_exhaustive_union`) -- falla cerrado, no
@@ -326,6 +355,9 @@ impl Checker {
                             Member::Stream(r) => (r, true),
                         };
                         if let Err(e) = checker.check_rpc(rpc, is_stream) {
+                            errors.push(e);
+                        }
+                        if let Err(e) = checker.check_rpc_crosses_the_wire(rpc) {
                             errors.push(e);
                         }
                     }
@@ -664,6 +696,30 @@ impl Checker {
                 }
             }
         }
+    }
+
+    /// Todo lo que aparece en la firma de un `rpc`/`stream` viaja de verdad
+    /// por la red, así que tiene que ser expresable como JSON.
+    ///
+    /// La tabla de mapeo (GRAMMAR.md §4) ya decía que un tipo función "no
+    /// cruza el wire" y que `Void` es "solo válido como retorno de rpc",
+    /// pero nada lo hacía cumplir: `type T = { h: (Int) -> String }` usado
+    /// como retorno tipaba, emitía `h: (arg0: number) => string` al
+    /// contrato, y generaba un validador con `typeof x.h === "function"` --
+    /// una condición que ningún payload JSON puede satisfacer, así que el
+    /// cliente rechazaba siempre. Mejor un error claro acá que un contrato
+    /// imposible de cumplir.
+    ///
+    /// `Void` sí es válido como retorno de nivel superior (un rpc que no
+    /// devuelve nada), pero no como parámetro ni anidado dentro de otro
+    /// tipo, donde no significa nada.
+    fn check_rpc_crosses_the_wire(&self, r: &RpcDecl) -> Result<(), CheckError> {
+        for p in &r.params {
+            let ty = self.resolve_type(&p.ty)?;
+            check_wire_safe(&ty, &format!("el parámetro '{}' de '{}'", p.name, r.name), false)?;
+        }
+        let ret = self.resolve_type(&r.return_type)?;
+        check_wire_safe(&ret, &format!("el retorno de '{}'", r.name), true)
     }
 
     /// Sintetiza el tipo de la cola de un bloque SIN ningún tipo esperado
@@ -2722,6 +2778,58 @@ mod tests {
     }
 
     // ---- narrowing de uniones (GRAMMAR.md §3.9) ----
+
+    #[test]
+    fn a_function_type_cannot_cross_the_wire() {
+        // §4 ya lo decía ("no cruza el wire") pero nada lo hacía cumplir:
+        // el contrato emitía `h: (arg0: number) => string` y el validador
+        // generado exigía `typeof x.h === "function"`, imposible de
+        // satisfacer con JSON -- el cliente rechazaba SIEMPRE.
+        let nested = r#"
+            type T = { id: Int, h: (Int) -> String }
+            service S { rpc get() -> T { T { id: 1, h: f } } }
+            fn f(x: Int) -> String { "x" }
+        "#;
+        assert!(check_source(nested).is_err(), "un campo función dentro de un tipo de retorno debe rechazarse");
+
+        let param = r#"
+            service S { rpc go(f: (Int) -> Int) -> Int { f(1) } }
+        "#;
+        assert!(check_source(param).is_err(), "un parámetro de tipo función debe rechazarse");
+
+        // Pero DENTRO del backend sigue siendo perfectamente válido.
+        let internal = r#"
+            fn add_one(x: Int) -> Int { x + 1 }
+            fn apply(f: (Int) -> Int, x: Int) -> Int { f(x) }
+            service S { rpc go(x: Int) -> Int { apply(add_one, x) } }
+        "#;
+        assert!(check_source(internal).is_ok());
+    }
+
+    #[test]
+    fn void_is_only_valid_as_a_whole_rpc_return() {
+        let ok = "service S { rpc ping() -> Void { } }";
+        assert!(check_source(ok).is_ok());
+
+        let as_field = r#"
+            type T = { id: Int, v: Void }
+            service S { rpc get() -> T? { null } }
+        "#;
+        assert!(check_source(as_field).is_err(), "Void como campo de struct debe rechazarse");
+
+        let as_param = "service S { rpc go(v: Void) -> Int { 1 } }";
+        assert!(check_source(as_param).is_err(), "Void como parámetro debe rechazarse");
+    }
+
+    #[test]
+    fn a_match_does_not_need_a_trailing_comma_on_its_last_arm() {
+        // Exigirla rechazaba `match x { A => 1, B => 2 }` con un críptico
+        // "se esperaba Comma, se encontró RBrace".
+        let src = r#"
+            fn describe(n: Int) -> String { match n { 1 => "uno", _ => "otro" } }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
 
     #[test]
     fn reading_an_optional_key_field_yields_an_optional_type() {

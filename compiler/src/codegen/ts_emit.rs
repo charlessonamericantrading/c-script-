@@ -235,7 +235,7 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         let check = validators_emit::render_check_expr(ret_ty, "json");
 
         if *is_stream {
-            // Alcance v0 explícito (GRAMMAR.md §2.1): el servidor manda la
+            // Alcance v0 explícito (GRAMMAR.md §3.13): el servidor manda la
             // secuencia YA CALCULADA entera como eventos SSE (server.rs,
             // `serve_stream`); acá del lado del cliente sólo hace falta
             // parsear ese framing (`data: ...\n\n`) e ir devolviendo cada

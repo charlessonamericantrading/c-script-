@@ -9,7 +9,7 @@ type User = {
 
 enum Role { Admin, Member, Guest }
 
-// "DB tipada" v0 (GRAMMAR.md §2.1): toda colección necesita un campo
+// "DB tipada" v0 (GRAMMAR.md §3.12): toda colección necesita un campo
 // `id: Int` -- es lo que hace posible que `insert` pida Omit<User,"id">
 // en vez del struct completo, sin romper la creación de abajo.
 db {
@@ -100,7 +100,7 @@ service Users {
     }
   }
 
-  // "Streaming real" v0 (GRAMMAR.md §2.1): la firma declara el ELEMENTO
+  // "Streaming real" v0 (GRAMMAR.md §3.13): la firma declara el ELEMENTO
   // (User, igual que un rpc normal), pero el cuerpo tiene que devolver la
   // secuencia YA CALCULADA entera -- acá, la misma lista que ya arma
   // `list` de arriba. El servidor la manda como eventos SSE reales, uno

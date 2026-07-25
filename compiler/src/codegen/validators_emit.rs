@@ -281,14 +281,19 @@ fn render_check(ty: &Type, expr: &str, worklist: &mut Vec<Type>, seen: &mut Vec<
         Type::Struct { fields, .. } => render_struct_fields_check(fields, expr, worklist, seen),
         Type::MapOf(k, v) => {
             // Claves de un objeto JS siempre son string -- Int como clave
-            // (GRAMMAR.md §4, K limitado a String/Int) se valida parseando
-            // el string de vuelta, no con `typeof`.
+            // (GRAMMAR.md §4, K limitado a String/Int) se valida contra la
+            // forma textual de un entero, NO con `Number.isInteger(Number(k))`:
+            // `Number("")`, `Number(" ")`, `Number("1e3")` y `Number("0x10")`
+            // dan enteros perfectamente válidos, así que ese chequeo aceptaba
+            // claves que no son enteros escritos como tales.
             let key_check = match k.as_ref() {
-                Type::Int => "Number.isInteger(Number(k))".to_string(),
+                Type::Int => "/^-?\\d+$/.test(k)".to_string(),
                 _ => render_check(k, "k", worklist, seen),
             };
+            // `!Array.isArray` porque `typeof [] === "object"`: sin eso, un
+            // array pasaba como si fuera un Record.
             format!(
-                "(typeof {expr} === \"object\" && {expr} !== null && Object.entries({expr}).every(([k, v]: [string, unknown]) => {key_check} && {}))",
+                "(typeof {expr} === \"object\" && {expr} !== null && !Array.isArray({expr}) && !Array.isArray({expr}) && Object.entries({expr}).every(([k, v]: [string, unknown]) => {key_check} && {}))",
                 render_check(v, "v", worklist, seen)
             )
         }
@@ -331,7 +336,7 @@ fn render_struct_fields_check(
         })
         .collect();
     let body = if checks.is_empty() { "true".to_string() } else { checks.join(" && ") };
-    format!("(typeof {expr} === \"object\" && {expr} !== null && {body})")
+    format!("(typeof {expr} === \"object\" && {expr} !== null && !Array.isArray({expr}) && {body})")
 }
 
 /// Igual que `render_struct_fields_check`, pero TODOS los campos vuelven
@@ -351,7 +356,7 @@ fn render_patch_fields_check(
         })
         .collect();
     let body = if checks.is_empty() { "true".to_string() } else { checks.join(" && ") };
-    format!("(typeof {expr} === \"object\" && {expr} !== null && {body})")
+    format!("(typeof {expr} === \"object\" && {expr} !== null && !Array.isArray({expr}) && {body})")
 }
 
 /// Cuerpo de un enum (simple o con datos) -- `variants` ya trae los nombres
@@ -359,6 +364,7 @@ fn render_patch_fields_check(
 /// en ts_emit.rs) y `scrutinee_ty` es lo que se le pasa a
 /// `Checker::variant_field_types` para resolver los campos de cada variante
 /// (maneja Result/enum genérico/enum plano de forma uniforme).
+#[allow(clippy::too_many_arguments)]
 fn render_enum_check(
     checker: &Checker,
     scrutinee_ty: &Type,
@@ -385,7 +391,7 @@ fn render_enum_check(
         arms.push(format!("(({expr} as any).type === \"{v}\" && {field_checks})"));
     }
     Ok(format!(
-        "(typeof {expr} === \"object\" && {expr} !== null && ({}))",
+        "(typeof {expr} === \"object\" && {expr} !== null && !Array.isArray({expr}) && ({}))",
         arms.join(" || ")
     ))
 }
@@ -419,7 +425,7 @@ fn emit_named_validator(
             let ok_check = render_struct_fields_check(&ok_fields, "x", worklist, seen);
             let err_check = render_struct_fields_check(&err_fields, "x", worklist, seen);
             out.push_str(&format!(
-                "export function {fn_name}(x: unknown): x is Result<{}, {}> {{\n  return (typeof x === \"object\" && x !== null && ((((x as any).type === \"Ok\") && {ok_check}) || (((x as any).type === \"Err\") && {err_check})));\n}}\n\n",
+                "export function {fn_name}(x: unknown): x is Result<{}, {}> {{\n  return (typeof x === \"object\" && x !== null && !Array.isArray(x) && ((((x as any).type === \"Ok\") && {ok_check}) || (((x as any).type === \"Err\") && {err_check})));\n}}\n\n",
                 ts_emit::render_type(ok_ty), ts_emit::render_type(err_ty)
             ));
         }
@@ -545,13 +551,33 @@ mod tests {
     }
 
     #[test]
-    fn map_of_int_keys_validates_by_parsing_not_typeof() {
+    fn map_of_int_keys_validates_the_textual_form_of_an_integer() {
+        // Las claves de un objeto JS son siempre string, así que un
+        // Map<Int,_> se valida contra la FORMA del string. No sirve
+        // `Number.isInteger(Number(k))` (lo que había): `Number("")`,
+        // `Number(" ")`, `Number("1e3")` y `Number("0x10")` son todos
+        // enteros válidos, así que aceptaba claves que no son enteros
+        // escritos como tales.
         let src = r#"
             type Config = { counts: Map<Int, String> }
             service S { rpc get() -> Config { db.thing.get() } }
         "#;
         let out = emit(src);
-        assert!(out.contains("Number.isInteger(Number(k))"));
+        assert!(out.contains(r"/^-?\d+$/.test(k)"), "{out}");
+        assert!(!out.contains("Number.isInteger(Number(k))"));
+    }
+
+    #[test]
+    fn object_guards_reject_arrays() {
+        // `typeof [] === "object"`, así que sin un !Array.isArray explícito
+        // un array pasaba como si fuera un struct o un Record.
+        let src = r#"
+            type Config = { counts: Map<Int, String> }
+            service S { rpc get() -> Config { db.thing.get() } }
+        "#;
+        let out = emit(src);
+        // Una vez para el struct Config, otra para el Map de adentro.
+        assert!(out.matches("!Array.isArray(").count() >= 2, "{out}");
     }
 
     #[test]

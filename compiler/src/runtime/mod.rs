@@ -397,6 +397,11 @@ pub(crate) fn eval_expr(e: &Expr, env: &Env, db: &Db, fns: &Fns, checker: &Check
     }
 }
 
+// El intérprete enhebra su contexto (env/db/fns/checker) explícitamente en
+// vez de guardarlo en un struct: mantiene visible en cada firma qué necesita
+// de verdad cada función, que es justo lo que hizo evidente que `call_method`
+// no tenía acceso a `fns` cuando hicieron falta `.map`/`.filter`.
+#[allow(clippy::too_many_arguments)]
 fn eval_binary(
     op: BinaryOp,
     left: &Expr,
