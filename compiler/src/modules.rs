@@ -28,22 +28,54 @@
 use crate::ast::{Item, Program};
 use crate::lexer;
 use crate::parser;
+use crate::token::Span;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Antes, un error de lexer/parser en un archivo importado se envolvía con
+/// `.map_err(|e| err(e.to_string()))` -- perdía el `Span` estructurado
+/// (`e.to_string()` ya lo había renderizado a texto) Y no anteponía el
+/// archivo, a diferencia de los demás mensajes de este módulo (que sí usan
+/// `canon.display()`). Con imports multi-archivo, un typo en un archivo
+/// importado no decía en cuál.
+///
+/// `Syntax.errors` es un `Vec` a propósito, aunque hoy SIEMPRE tenga
+/// exactamente 1 elemento (lexer y parser todavía devuelven un solo error
+/// cada uno) -- cuando el parser gane recuperación de errores (varios
+/// errores en una sola pasada), este archivo solo necesita empujar más
+/// elementos al mismo `Vec`, sin volver a rediseñar esta forma.
 #[derive(Debug)]
-pub struct LoadError(String);
+pub enum LoadError {
+    /// IO, ciclos de imports, dependencia desconocida, manifest inválido --
+    /// sin posición en un archivo fuente, se muestran como antes.
+    Other(String),
+    /// Error léxico o de sintaxis en un archivo concreto del cierre
+    /// transitivo. `path` es la ruta CANONICALIZADA (misma convención que
+    /// ya usan los demás mensajes de este archivo).
+    Syntax { path: PathBuf, errors: Vec<(Span, String)> },
+}
 
 impl fmt::Display for LoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "error de módulos: {}", self.0)
+        match self {
+            LoadError::Other(msg) => write!(f, "error de módulos: {msg}"),
+            LoadError::Syntax { path, errors } => {
+                for (i, (span, message)) in errors.iter().enumerate() {
+                    if i > 0 {
+                        writeln!(f)?;
+                    }
+                    write!(f, "error de módulos: '{}':{}:{}: {message}", path.display(), span.line, span.col)?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
 fn err(msg: impl Into<String>) -> LoadError {
-    LoadError(msg.into())
+    LoadError::Other(msg.into())
 }
 
 fn canonicalize(path: &Path) -> Result<PathBuf, LoadError> {
@@ -91,8 +123,14 @@ impl Loader {
         }
         let source =
             fs::read_to_string(canon).map_err(|e| err(format!("no se pudo leer '{}': {e}", canon.display())))?;
-        let tokens = lexer::tokenize(&source).map_err(|e| err(e.to_string()))?;
-        let program = parser::parse(tokens).map_err(|e| err(e.to_string()))?;
+        let tokens = lexer::tokenize(&source).map_err(|e| LoadError::Syntax {
+            path: canon.to_path_buf(),
+            errors: vec![(e.span, e.message)],
+        })?;
+        let program = parser::parse(tokens).map_err(|e| LoadError::Syntax {
+            path: canon.to_path_buf(),
+            errors: vec![(e.span, e.message)],
+        })?;
         self.touched.push(canon.to_path_buf());
         self.native_items.insert(canon.to_path_buf(), program.items.clone());
         Ok(program.items)
@@ -313,6 +351,22 @@ mod tests {
         let result = load_program(&dir.path("a.link"));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("NoExiste"));
+    }
+
+    #[test]
+    fn syntax_error_in_an_imported_file_names_that_file() {
+        // Bug real (antes de esta ronda): un error de sintaxis en un
+        // archivo IMPORTADO se reportaba sin decir en cuál -- `.to_string()`
+        // ya había perdido el Span estructurado y el mensaje no anteponía
+        // ningún path, a diferencia de los demás errores de este módulo.
+        let dir = TempDir::new("syntax_error_named_file");
+        dir.write("b.link", "type Point = { x Int }"); // falta ':' -- error de sintaxis real
+        dir.write("a.link", r#"import { Point } from "./b.link";"#);
+        let result = load_program(&dir.path("a.link"));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("b.link"), "el mensaje debería nombrar el archivo con el error: {msg}");
+        assert!(msg.contains(':'), "debería incluir línea:columna: {msg}");
     }
 
     #[test]

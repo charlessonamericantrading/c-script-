@@ -1,10 +1,31 @@
 use linkc::ast::Program;
-use linkc::{checker, codegen, modules, runtime, scaffold};
+use linkc::{checker, codegen, diagnostics, modules, runtime, scaffold};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
+
+/// `LoadError::Other` (IO, ciclos, etc.) se muestra como siempre. Para
+/// `LoadError::Syntax`, usa `diagnostics::render_diagnostic` -- snippet +
+/// caret en la línea/columna real -- en vez del `Display` plano de una
+/// línea. Si el archivo no se puede releer por algún motivo (borrado entre
+/// el error y este punto), cae de vuelta al `Display` plano en vez de
+/// fallar de una forma más confusa.
+fn report_load_error(e: &modules::LoadError) {
+    let modules::LoadError::Syntax { path, errors } = e else {
+        eprintln!("{e}");
+        return;
+    };
+    let Ok(source) = fs::read_to_string(path) else {
+        eprintln!("{e}");
+        return;
+    };
+    let file_label = path.display().to_string();
+    for (span, message) in errors {
+        eprintln!("{}", diagnostics::render_diagnostic(&source, &file_label, *span, message));
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
@@ -35,7 +56,7 @@ fn cmd_new(args: &[String]) -> ExitCode {
 
 fn load_and_check(path: &str) -> Result<Program, ExitCode> {
     let (program, _touched) = modules::load_program(Path::new(path)).map_err(|e| {
-        eprintln!("{e}");
+        report_load_error(&e);
         ExitCode::FAILURE
     })?;
 
@@ -80,7 +101,7 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
     let (program, touched) = match modules::load_program(Path::new(path)) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("{e}");
+            report_load_error(&e);
             return BuildResult { ok: false, touched: vec![PathBuf::from(path)] };
         }
     };

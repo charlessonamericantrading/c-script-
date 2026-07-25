@@ -14,7 +14,7 @@ pub struct ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "error de sintaxis en línea {}: {}", self.span.line, self.message)
+        write!(f, "error de sintaxis en línea {}, columna {}: {}", self.span.line, self.span.col, self.message)
     }
 }
 

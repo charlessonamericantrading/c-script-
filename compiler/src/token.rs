@@ -1,13 +1,23 @@
+/// Posición de un token/error en el código fuente. `start`/`end` son índices
+/// dentro del `Vec<char>` que arma el lexer -- NO son offsets de byte UTF-8
+/// ni UTF-16 code units (eso haría falta recién en el borde de un protocolo
+/// LSP real, que todavía no existe). `line`/`col` son 1-based (misma
+/// convención para los dos) y describen SIEMPRE el INICIO (`start`) del
+/// span -- no hay `end_line`/`end_col`. Un span que cubra varios tokens (ej.
+/// un `Expr` completo, cuando el AST tenga spans) se arma como
+/// `Span::new(primero.span.start, ultimo.span.end, primero.span.line, primero.span.col)`,
+/// gratis con esta forma.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
     pub line: usize,
+    pub col: usize,
 }
 
 impl Span {
-    pub fn new(start: usize, end: usize, line: usize) -> Self {
-        Span { start, end, line }
+    pub fn new(start: usize, end: usize, line: usize, col: usize) -> Self {
+        Span { start, end, line, col }
     }
 }
 
