@@ -1064,7 +1064,7 @@ pub fn invoke_rpc_with_sessions(
 /// valor con campos de más es un subtipo válido); descartarlos es lo que
 /// garantiza que el `Value` resultante tenga EXACTAMENTE la forma
 /// declarada, que es lo que corta la clase de bug (3).
-fn json_to_typed_value(
+pub(crate) fn json_to_typed_value(
     j: &serde_json::Value,
     ty: &crate::types::Type,
     checker: &Checker,
@@ -1811,7 +1811,7 @@ mod tests {
             }
         "#,
         );
-        let db = Db::new(&program);
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
 
         let post = invoke_rpc(&program, "S", "addPost", &json!({"title": "Hola"}), &db).unwrap();
         assert_eq!(post["id"], json!(1)); // primer id de ESTA colección, no compartido con comments
@@ -2261,7 +2261,7 @@ mod tests {
             }
         "#,
         );
-        let db = Db::new(&program);
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
         assert_eq!(invoke_rpc(&program, "S", "all", &json!({}), &db).unwrap(), json!([]));
     }
 
@@ -2485,7 +2485,7 @@ mod tests {
     #[test]
     fn subscribing_then_inserting_delivers_the_new_row_as_an_event() {
         let program = live_subscribe_program();
-        let db = Db::new(&program);
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
         let (snapshot, events) = db.subscribe("items").unwrap();
         assert!(snapshot.is_empty(), "una colección recién creada no debería tener filas todavía");
 
@@ -2507,7 +2507,7 @@ mod tests {
         // resto: `publish` sigue entregando a cualquier otro suscriptor
         // todavía vivo.
         let program = live_subscribe_program();
-        let db = Db::new(&program);
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
         let (_, dead_events) = db.subscribe("items").unwrap();
         let (_, alive_events) = db.subscribe("items").unwrap();
         drop(dead_events);
@@ -2523,7 +2523,112 @@ mod tests {
     #[test]
     fn subscribing_to_an_unknown_collection_is_a_runtime_error() {
         let program = live_subscribe_program();
-        let db = Db::new(&program);
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
         assert!(db.subscribe("noExiste").is_err());
+    }
+
+    // ---- persistencia real: SQLite (GRAMMAR.md §3.17) ----
+
+    fn optional_shapes_program() -> Program {
+        program_from(
+            r#"
+            type Item = {
+                id: Int,
+                name: String,
+                hint?: String,
+                note: String?,
+                tag?: String?,
+            }
+            type NewItem = { name: String, hint?: String, note: String?, tag?: String? }
+            db { items: Item[] }
+            service S {
+                rpc add(x: NewItem) -> Item { db.items.insert(x) }
+                rpc get(id: Int) -> Item? { db.items.find(id) }
+            }
+        "#,
+        )
+    }
+
+    #[test]
+    fn seeded_grace_hopper_has_no_bio_key_in_the_json_wire_shape() {
+        // Grace Hopper (Db::seeded()) omite 'bio' del todo -- opcional POR
+        // CLAVE (GRAMMAR.md §3.4), no nullable. Ningún test anterior a esta
+        // ronda llegaba a chequear esto de verdad contra el shape de wire --
+        // confirma que el round-trip por SQL preserva la distinción:
+        // ausente sigue siendo ausente, nunca se filtra como `null`.
+        let program = users_demo();
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "Users", "getById", &json!({"id": 2}), &db).unwrap();
+        assert_eq!(result["name"], json!("Grace Hopper"));
+        assert!(result.get("bio").is_none(), "se esperaba 'bio' AUSENTE, no presente: {result}");
+        assert_eq!(result["deletedAt"], serde_json::Value::Null, "'deletedAt' es nullable-por-tipo (x: T?), sigue presente con null");
+    }
+
+    #[test]
+    fn a_nullable_typed_field_round_trips_null_as_a_present_key_with_null_value() {
+        let program = optional_shapes_program();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "add", &json!({"x": {"name": "x", "note": null}}), &db).unwrap();
+        assert!(created.get("note").is_some(), "la clave 'note' siempre tiene que estar presente (x: T?, no x?: T)");
+        assert_eq!(created["note"], serde_json::Value::Null);
+
+        let fetched = invoke_rpc(&program, "S", "get", &json!({"id": created["id"]}), &db).unwrap();
+        assert_eq!(fetched["note"], serde_json::Value::Null, "el valor null tiene que sobrevivir un round-trip completo por SQL");
+    }
+
+    #[test]
+    fn a_field_that_is_both_optional_by_key_and_nullable_round_trips_all_three_states() {
+        let program = optional_shapes_program();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        let absent = invoke_rpc(&program, "S", "add", &json!({"x": {"name": "a", "note": null}}), &db).unwrap();
+        assert!(absent.get("tag").is_none(), "se esperaba 'tag' AUSENTE: {absent}");
+
+        let present_null = invoke_rpc(&program, "S", "add", &json!({"x": {"name": "b", "note": null, "tag": null}}), &db).unwrap();
+        assert!(present_null.get("tag").is_some(), "se esperaba 'tag' PRESENTE (con null): {present_null}");
+        assert_eq!(present_null["tag"], serde_json::Value::Null);
+
+        let present_value = invoke_rpc(&program, "S", "add", &json!({"x": {"name": "c", "note": null, "tag": "urgente"}}), &db).unwrap();
+        assert_eq!(present_value["tag"], json!("urgente"));
+
+        // Los 3 estados tienen que sobrevivir un SEGUNDO round-trip (releer
+        // de SQL, no solo la respuesta que ya devolvió el propio insert).
+        let refetched = invoke_rpc(&program, "S", "get", &json!({"id": absent["id"]}), &db).unwrap();
+        assert!(refetched.get("tag").is_none());
+        let refetched = invoke_rpc(&program, "S", "get", &json!({"id": present_null["id"]}), &db).unwrap();
+        assert_eq!(refetched["tag"], serde_json::Value::Null);
+        let refetched = invoke_rpc(&program, "S", "get", &json!({"id": present_value["id"]}), &db).unwrap();
+        assert_eq!(refetched["tag"], json!("urgente"));
+    }
+
+    #[test]
+    fn reopening_the_same_file_after_dropping_the_connection_still_has_the_previously_inserted_rows() {
+        let program = optional_shapes_program();
+        let path = std::env::temp_dir().join("c_script_test_reopen_persists.db");
+        let _ = std::fs::remove_file(&path); // por si quedó de una corrida anterior interrumpida
+
+        {
+            let db = Db::new(&program, &path);
+            invoke_rpc(&program, "S", "add", &json!({"x": {"name": "persistente", "note": null}}), &db).unwrap();
+        } // `db` (y con él la Connection real) se dropea acá
+
+        let db2 = Db::new(&program, &path);
+        let Value::List(rows) = db2.call("items", "all", vec![]).unwrap() else { panic!("se esperaba una lista") };
+        assert_eq!(rows.len(), 1, "la fila insertada en la conexión anterior tiene que seguir ahí al reabrir el mismo archivo");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "v0 no migra schemas automáticamente")]
+    fn reopening_with_an_incompatible_schema_panics_instead_of_silently_proceeding() {
+        let path = std::env::temp_dir().join("c_script_test_schema_mismatch.db");
+        let _ = std::fs::remove_file(&path);
+
+        let original = program_from("type Item = { id: Int, name: String } db { items: Item[] }");
+        drop(Db::new(&original, &path));
+
+        let changed = program_from("type Item = { id: Int, name: String, extra: Int } db { items: Item[] }");
+        let _ = Db::new(&changed, &path); // tiene que hacer panic acá, con el archivo ya dejado atrás para la próxima corrida
     }
 }

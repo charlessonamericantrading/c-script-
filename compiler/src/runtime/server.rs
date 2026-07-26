@@ -32,6 +32,7 @@ use super::{invoke_rpc_with_sessions, is_stream_member, live_subscribe_collectio
 use crate::ast::Annotation;
 use crate::ast::Program;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 
@@ -42,19 +43,20 @@ use std::sync::mpsc::Receiver;
 /// de escritura hace necesario, ver PLAN.md §4 (Fase 2).
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-pub fn serve(program: Program, port: u16) {
+pub fn serve(program: Program, port: u16, db_path: PathBuf) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
-    // Db::new(&program), NO Db::seeded(): una colección vacía por cada una
-    // que el programa DECLARA. `Db::seeded()` es un fixture de tests/demo
-    // que inserta una colección "users" hardcodeada e ignora el programa
-    // por completo -- que fuera lo que usaba el servidor real era un bug
+    // Db::new(&program, &db_path), NO Db::seeded(): una colección real
+    // (persistida en `db_path`, GRAMMAR.md §3.17) por cada una que el
+    // programa DECLARA. `Db::seeded()` es un fixture de tests/demo que
+    // inserta una colección "users" hardcodeada e ignora el programa por
+    // completo -- que fuera lo que usaba el servidor real era un bug
     // encontrado en la auditoría, con dos síntomas confirmados: un programa
     // con `db { items: Item[] }` tipaba y después daba 500 "colección
     // desconocida: 'items'" en cada rpc; y uno que sí declaraba `users`
     // pero con otra forma recibía los campos del `User` del demo, que su
     // propio tipo no tiene.
-    let db = Db::new(&program);
+    let db = Db::new(&program, &db_path);
     // Auth v0 (GRAMMAR.md §3.14): vive mientras el proceso corre, igual que
     // `db` -- sin expiración, sin persistencia entre reinicios.
     let sessions = SessionStore::new();

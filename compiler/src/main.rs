@@ -248,6 +248,10 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
 
-    runtime::server::serve(program, port);
+    // `myapp.link` -> `myapp.db`, al lado del archivo fuente (GRAMMAR.md
+    // §3.17) -- mismo patrón que `build_once` ya usa para nombrar
+    // contract.d.ts/client.ts/validators.ts, sin ninguna flag de CLI nueva.
+    let db_path = Path::new(path).with_extension("db");
+    runtime::server::serve(program, port, db_path);
     ExitCode::SUCCESS
 }

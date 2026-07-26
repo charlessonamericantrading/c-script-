@@ -390,6 +390,15 @@ impl Checker {
         (checker, errors)
     }
 
+    /// Nombre de colección -> tipo de elemento ya resuelto. Puramente
+    /// aditivo (cero cambio de comportamiento de chequeo) -- lo usa
+    /// `runtime::db::Db` para derivar el schema SQL de cada colección
+    /// (GRAMMAR.md §3.17), sin duplicar la resolución de tipos que este
+    /// `Checker` ya hizo al procesar `db { ... }`.
+    pub(crate) fn db_collections(&self) -> &HashMap<String, Type> {
+        &self.db_collections
+    }
+
     /// Toda colección de `db` necesita un campo `id: Int` requerido --
     /// es lo que hace posible `insert(x: Omit<T,"id">)` sin romper la
     /// forma completa de T (GRAMMAR.md §2.1): sin esta regla, `insert`

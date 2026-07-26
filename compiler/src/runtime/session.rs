@@ -1,6 +1,9 @@
-//! Auth v0 (GRAMMAR.md §3.14): sesión opaca en memoria + roles. Sin JWT, sin
-//! ninguna dependencia nueva -- el proyecto solo depende de tiny_http+serde_json
-//! y mantenerlo así es una restricción explícita.
+//! Auth v0 (GRAMMAR.md §3.14): sesión opaca en memoria + roles. Sin JWT, y
+//! sin ninguna dependencia nueva PARA ESTA FEATURE puntual -- el criterio de
+//! "sin agregar dependencias" no rige para todo el proyecto (la persistencia
+//! real de `db`, GRAMMAR.md §3.17, sí trajo una -- `rusqlite` -- a propósito
+//! y de forma explícita), pero auth v0 en particular se resolvió entero con
+//! lo que tiny_http+serde_json ya daban.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

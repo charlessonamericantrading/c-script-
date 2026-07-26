@@ -8,8 +8,11 @@
 // evita el problema de Type::Generic opaco (GRAMMAR.md §3.6): nunca hace
 // falta un validador para `Box<T>` abstracto, solo para instanciaciones
 // concretas (`Box<Int>`) que ya aparecen resueltas en cada firma de rpc.
-// Predicados TS a mano (`function isX(x): x is X`), no Zod/typia -- mismo
-// criterio de cero dependencias nuevas que el resto del proyecto.
+// Predicados TS a mano (`function isX(x): x is X`), no Zod/typia -- este
+// emisor en particular no necesitó ninguna dependencia nueva del lado TS
+// (la persistencia real de `db`, GRAMMAR.md §3.17, sí trajo una del lado
+// Rust -- `rusqlite` -- a propósito; "cero dependencias" nunca fue una
+// regla de todo el proyecto, solo lo que cada feature terminó necesitando).
 
 use super::ts_emit;
 use crate::ast::*;

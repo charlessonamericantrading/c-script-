@@ -1,7 +1,7 @@
 // Renderizado de diagnósticos estilo gcc/rustc (archivo:línea:columna +
-// snippet + caret) -- sin agregar ninguna dependencia (`ariadne`/
-// `codespan-reporting` quedan afuera a propósito, no hace falta una
-// librería para un span de una sola línea a la vez). Prerrequisito real
+// snippet + caret) -- sin agregar ninguna dependencia PARA ESTO puntual
+// (`ariadne`/`codespan-reporting` quedan afuera a propósito, no hace falta
+// una librería para un span de una sola línea a la vez). Prerrequisito real
 // para un LSP (GRAMMAR.md/README "needs span-tracking... first"), no el
 // LSP en sí -- ver PLAN.md para el resto de lo que falta.
 

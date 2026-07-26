@@ -2,3 +2,10 @@
 /frontend/node_modules/
 /gen/
 .claude/
+
+# Bases SQLite generadas al correr `linkc serve` localmente (GRAMMAR.md
+# §3.17) -- persistencia real, un archivo por cada `.link` que se sirvió.
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
