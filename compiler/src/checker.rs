@@ -82,16 +82,22 @@ fn pattern_bindings(pattern: &Pattern) -> Vec<String> {
 /// `synth_block` (GRAMMAR.md §3.10) para rechazar `return` de entrada en
 /// vez de heredar el bug preexistente de `check_block` (mismo `expected`
 /// para la cola y para un `return` anidado dentro de un if/match en
-/// posición de sentencia). `return` es siempre una SENTENCIA (ast.rs) --
-/// nunca aparece anidado dentro de una expresión -- así que la única forma
-/// de que esté "escondido" respecto de este bloque es a través de un
-/// `if`/`match` cuyo cuerpo es, a su vez, otro `Block`; por eso alcanza con
-/// recursar exactamente en esos dos casos.
+/// posición de sentencia), y por `check_stmt` (GRAMMAR.md §3.15) para
+/// rechazar `return` dentro de un cuerpo de `while` de entrada. `return` es
+/// siempre una SENTENCIA (ast.rs) -- nunca aparece anidado dentro de una
+/// expresión -- así que la única forma de que esté "escondido" respecto de
+/// este bloque es a través de un `if`/`match`/`while` cuyo cuerpo es, a su
+/// vez, otro `Block`; por eso alcanza con recursar exactamente en esos tres
+/// casos.
 fn block_has_return(block: &Block) -> bool {
     block.stmts.iter().any(|s| match &s.node {
         Stmt::Return(_) => true,
         Stmt::Let { value, .. } | Stmt::Assign { value, .. } => expr_has_return(&value.node),
         Stmt::Expr(e) => expr_has_return(&e.node),
+        // Tercera forma (además de if/match, ver expr_has_return) de
+        // "esconder" un return de este bloque -- mismo tratamiento
+        // (GRAMMAR.md §3.15).
+        Stmt::While { cond, body } => expr_has_return(&cond.node) || block_has_return(body),
     }) || block.tail.as_deref().is_some_and(|e| expr_has_return(&e.node))
 }
 
@@ -799,6 +805,26 @@ impl Checker {
                 self.check_expr(e, &Type::Void, local)
             }
             Stmt::Expr(e) => self.synth_expr(e, local).map(|_| ()),
+            // GRAMMAR.md §3.15: `cond` tiene que ser Bool; `body` corre por
+            // efecto solamente, se chequea contra Void igual que un
+            // if/match en posición de sentencia (mismo `check_block`, sin
+            // cambios -- ESO es lo que hace que `let mut i=0;` declarado
+            // ANTES del loop se pueda mutar adentro, gratis). `return`
+            // alcanzable desde `body` se rechaza de entrada: en vez de
+            // reescribir el mecanismo de señalización de control de flujo
+            // (un cambio mucho más grande), un `while` simplemente no deja
+            // usar `return` en su cuerpo -- sacá el valor final con una
+            // variable `mut` declarada antes del loop y un tail después.
+            Stmt::While { cond, body } => {
+                self.check_expr(cond, &Type::Bool, local)?;
+                if block_has_return(body) {
+                    return Err(err(
+                        "'return' no está permitido dentro del cuerpo de un 'while' en v0 (GRAMMAR.md §3.15) -- \
+                         usá una variable 'mut' declarada antes del loop y un valor de cola después de él",
+                    ));
+                }
+                self.check_block(body, &Type::Void, local)
+            }
         }
     }
 
@@ -923,6 +949,14 @@ impl Checker {
                 self.check_expr(e, &Type::Void, local)
             }
             Stmt::Expr(e) => self.synth_expr(e, local).map(|_| ()),
+            // Mismo brazo que check_stmt, sin la validación de `return`:
+            // el scan de `block_has_return` al principio de `synth_block`
+            // ya lo garantizó para TODO el bloque, incluido este `while`
+            // (block_has_return ya recursa a su cuerpo).
+            Stmt::While { cond, body } => {
+                self.check_expr(cond, &Type::Bool, local)?;
+                self.check_block(body, &Type::Void, local)
+            }
         }
     }
 
@@ -3486,5 +3520,60 @@ mod tests {
         let end = src.find("-> Weird").unwrap() + "-> Weird".len();
         assert_eq!(span.start, start, "el span debería empezar en 'rpc'");
         assert_eq!(span.end, end, "el span debería terminar en el return type, sin incluir el cuerpo");
+    }
+
+    // ---- constructo de loop: `while` (GRAMMAR.md §3.15) ----
+
+    #[test]
+    fn while_condition_must_be_bool() {
+        let result = check_source("fn f(x: Int) -> Void { while x { } }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn while_with_bool_condition_typechecks() {
+        let src = r#"
+            fn count_down(n: Int) -> Int {
+                let mut i = n;
+                while i > 0 {
+                    i = i - 1;
+                }
+                i
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn return_inside_a_while_body_is_rejected() {
+        let result = check_source("fn f() -> Int { while true { return 1; } 0 }");
+        assert!(result.is_err(), "un 'return' dentro de un 'while' debería rechazarse en v0");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("'return'"), "el error debería mencionar 'return': {msg}");
+    }
+
+    #[test]
+    fn return_nested_inside_an_if_inside_a_while_body_is_also_rejected() {
+        // block_has_return recursa a través de if/match, así que un return
+        // escondido más profundo también se rechaza, no solo el directo.
+        let result = check_source(
+            "fn f(x: Int) -> Int { while true { if x > 0 { return 1; } else { } } 0 }",
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn let_mut_declared_before_a_while_is_visible_and_assignable_inside() {
+        // Esto es lo que hace útil al loop: check_block/check_stmt no
+        // necesitaron ningún código nuevo para esto, es el mismo mecanismo
+        // que ya usa `if` (env clonado, Assign valida `mut`).
+        let src = "fn f() -> Int { let mut total = 0; while total < 3 { total = total + 1; } total }";
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn assigning_to_a_non_mut_variable_inside_a_while_body_is_rejected() {
+        let result = check_source("fn f() -> Int { let total = 0; while true { total = 1; } total }");
+        assert!(result.is_err());
     }
 }

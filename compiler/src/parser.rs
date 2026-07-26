@@ -596,6 +596,7 @@ impl Parser {
             match self.peek().clone() {
                 TokenKind::Let => stmts.push(self.parse_let_stmt()?),
                 TokenKind::Return => stmts.push(self.parse_return_stmt()?),
+                TokenKind::While => stmts.push(self.parse_while_stmt()?),
                 // `identifier =` (y no `==`, ya son tokens distintos) es una
                 // asignación -- se detecta con 1 token de lookahead antes de
                 // caer al parseo genérico de expresión, igual que la
@@ -692,6 +693,23 @@ impl Parser {
         };
         self.eat(&TokenKind::Semi)?;
         Ok(Spanned { node: Stmt::Return(value), span })
+    }
+
+    /// `while cond { body }` (GRAMMAR.md §3.15) -- más simple que
+    /// `parse_if_expr`: `while` nunca es "block-like ambiguo con tail"
+    /// (siempre va a `stmts`, nunca a `tail`), así que no hace falta
+    /// ninguna de las dos ramas extra que `parse_block` tiene para `if`/
+    /// `match`.
+    fn parse_while_stmt(&mut self) -> Result<Spanned<Stmt>, ParseError> {
+        let start = self.span();
+        self.eat(&TokenKind::While)?;
+        // Misma restricción que la condición de un `if` (parse_if_expr):
+        // sin esto, `while x { ... }` sería tan ambiguo con un struct-lit
+        // `x { ... }` como `if x { ... }` ya lo es.
+        let cond = self.parse_or_expr(true)?;
+        let body = self.parse_block()?;
+        let span = merge(start, self.prev_span());
+        Ok(Spanned { node: Stmt::While { cond, body }, span })
     }
 
     fn parse_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
@@ -1789,5 +1807,47 @@ mod tests {
         let int_end = src.find("Int").unwrap() + "Int".len();
         assert_eq!(rpc.span.start, at_pos, "el span del rpc debería empezar en su propia @annotation");
         assert_eq!(rpc.span.end, int_end, "el span del rpc debería terminar en el return type, sin incluir el cuerpo");
+    }
+
+    // ---- constructo de loop: `while` (GRAMMAR.md §3.15) ----
+
+    #[test]
+    fn while_stmt_parses_condition_and_body() {
+        let src = "fn f() -> Int { while a { b; } 0 }";
+        let prog = parse_source(src);
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        let Stmt::While { cond, body: while_body } = &body.stmts[0].node else {
+            panic!("se esperaba Stmt::While, fue {:?}", body.stmts[0].node)
+        };
+        assert_eq!(cond.node, Expr::Ident("a".into()));
+        assert_eq!(while_body.stmts.len(), 1);
+    }
+
+    #[test]
+    fn while_stmt_span_covers_from_the_keyword_to_its_own_closing_brace() {
+        let src = "fn f() -> Int { while a { b; } 0 }";
+        let prog = parse_source(src);
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        let while_pos = src.find("while").unwrap();
+        // "b; }" matchea solo la llave de cierre DEL WHILE (no la del fn,
+        // que cierra más adelante, después de "0 }") -- confirma que el
+        // span no se come de más ni se queda corto.
+        let while_close = src.find("b; }").unwrap() + "b; }".len();
+        assert_eq!(body.stmts[0].span.start, while_pos, "el span debería empezar en 'while'");
+        assert_eq!(body.stmts[0].span.end, while_close, "el span debería terminar en la llave de cierre del propio while");
+    }
+
+    #[test]
+    fn while_condition_does_not_swallow_the_body_brace_as_a_struct_literal() {
+        // Sin no_struct_lit=true en la condición (mismo mecanismo que ya
+        // usa `if`/`match`), "while x { 1; }" sería tan ambiguo con un
+        // struct-lit "x { 1; }" como "if x { ... }" ya lo es -- y como
+        // "1;" no es un campo válido de struct-lit, la ambigüedad
+        // resuelta mal haría que esto ni siquiera parseara.
+        let src = "fn f(x: Bool) -> Int { while x { 1; } 0 }";
+        let prog = parse_source(src);
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        let Stmt::While { cond, .. } = &body.stmts[0].node else { panic!("se esperaba Stmt::While") };
+        assert_eq!(cond.node, Expr::Ident("x".into()));
     }
 }

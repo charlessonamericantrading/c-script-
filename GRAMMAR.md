@@ -25,10 +25,10 @@ block_comment = "/*" , { ? cualquier carácter ? } , "*/" ;
 
 keyword      = "type" | "enum" | "service" | "rpc" | "stream" | "match"
              | "import" | "from" | "pub" | "const" | "fn" | "let" | "mut"
-             | "return" | "if" | "else" | "true" | "false" | "null" ;
+             | "return" | "if" | "else" | "while" | "true" | "false" | "null" ;
 ```
 
-**Reservado pero fuera del v0 de la gramática:** `async`, `await`, `trait`, `impl` — el modelo de concurrencia y de polimorfismo ad-hoc se diseña en una iteración posterior (ver PLAN.md §4, Fase 1).
+**Reservado pero fuera del v0 de la gramática:** `async`, `await`, `trait`, `impl` — el modelo de concurrencia y de polimorfismo ad-hoc se diseña en una iteración posterior (ver PLAN.md §4, Fase 1). `for`, `in`, `break`, `continue` — v0 de loops (§3.15) es solo `while`; ninguno de estos cuatro es todavía una palabra reservada de verdad (no aparecen en `keyword_from_str`, `compiler/src/token.rs`), esto es prosa preparatoria, no una reserva real.
 
 ---
 
@@ -125,11 +125,12 @@ Dos decisiones sutiles del diseño de gramática, no obvias hasta que las rompes
 
 ```ebnf
 block        = "{" , { stmt } , [ expr ] , "}" ;
-stmt         = let_stmt | assign_stmt | expr_stmt | return_stmt ;
+stmt         = let_stmt | assign_stmt | expr_stmt | return_stmt | while_stmt ;
 let_stmt     = "let" , [ "mut" ] , identifier , [ ":" , type_expr ] , "=" , expr , ";" ;
 assign_stmt  = identifier , "=" , expr , ";" ;
 return_stmt  = "return" , [ expr ] , ";" ;
 expr_stmt    = expr , ";" ;
+while_stmt   = "while" , or_expr , block ;          (* nunca produce un valor -- ver §3.15 *)
 
 expr         = match_expr | if_expr | or_expr ;
 
@@ -662,7 +663,7 @@ fn makeUser(input: NewUser) -> NewUserRecord {
 
 Antes, `Member::Rpc`/`Member::Stream` se colapsaban a lo mismo en todo el pipeline — pegarle a un `stream` por HTTP corría el cuerpo una vez y devolvía un solo JSON con 200, sin ningún indicio de que debía ser un stream. El stub del cliente generado ni siquiera lo intentaba (`throw new Error("streaming no implementado...")`).
 
-**Alcance explícito, de entrada: repite una secuencia YA CALCULADA, no suscribe a eventos futuros.** El ejemplo de `PLAN.md` (`stream watch(id) -> User { db.users.subscribe(id) }`) implica suscribirse a cambios que todavía no pasaron — eso necesitaría una capa de pub-sub sobre `db` que no existe. Un generador perezoso tampoco es posible hoy: el lenguaje no tiene NINGÚN constructo de loop (`token.rs` no tiene `for`/`while`/`loop`), así que "generador real" está bloqueado por algo más grande que esta ronda. Lo que sí es real y honesto: el cuerpo de un `stream` devuelve `List<T>` (una lista completa, ya en memoria) y el servidor la manda como eventos SSE genuinos en vez de un solo blob JSON — mejor time-to-first-byte del lado del cliente, y el wire protocol que `AsyncIterable<T>` promete de verdad.
+**Alcance explícito, de entrada: repite una secuencia YA CALCULADA, no suscribe a eventos futuros.** El ejemplo de `PLAN.md` (`stream watch(id) -> User { db.users.subscribe(id) }`) implica suscribirse a cambios que todavía no pasaron — eso necesitaría una capa de pub-sub sobre `db` que no existe. Lo que sí es real y honesto: el cuerpo de un `stream` devuelve `List<T>` (una lista completa, ya en memoria) y el servidor la manda como eventos SSE genuinos en vez de un solo blob JSON — mejor time-to-first-byte del lado del cliente, y el wire protocol que `AsyncIterable<T>` promete de verdad. **Actualización:** el lenguaje ya tiene un constructo de loop (`while`, §3.15) — necesario pero NO suficiente para push real: la capa de pub-sub sobre `db` sigue sin existir (ronda separada, en curso).
 
 ```
 // La firma declara el ELEMENTO (igual que un rpc normal) -- el cuerpo
@@ -740,7 +741,37 @@ rpc logout() -> Void { auth.destroySession() }
 
 **Cliente generado: `token` es estado MUTABLE de instancia, no un parámetro por-llamada.** `{Service}ClientImpl` gana `private token: string | null` + `setToken(token)`, parte de la interfaz pública (`{Service}Client`) para que algo tipado como tal también pueda llamarlo. `push_fetch_call` adjunta `Authorization: Bearer ${token}` en TODO rpc si hay token seteado (el servidor decide caso por caso si lo exige). Correcto para "una instancia de cliente = un usuario/sesión activa" (mismo patrón que la mayoría de SDKs generados reales) — pero una instancia COMPARTIDA entre requests concurrentes de usuarios DISTINTOS (ej. un backend-for-frontend Node reusando un cliente módulo-level) puede pisarse el token entre requests. Documentado como límite v0 explícito; la alternativa (token por-llamada) cambiaría la forma pública de TODOS los métodos generados, no solo los protegidos.
 
-**Fuera de alcance, a propósito:** verificación de contraseña/credenciales; expiración de sesión (vive hasta `destroySession()` o hasta reiniciar el proceso — no hay temporizadores ni loop en el lenguaje para expresar otra cosa); múltiples roles por `@requires` o múltiples anotaciones por rpc; exponer la identidad del caller dentro de un cuerpo (`ctx.user`/similar — solo el ROL viaja en la sesión, nunca una referencia al `User` completo); un CSPRNG auditado (ver el hallazgo de arriba).
+**Fuera de alcance, a propósito:** verificación de contraseña/credenciales; expiración de sesión (vive hasta `destroySession()` o hasta reiniciar el proceso — el lenguaje ya tiene un `while`, §3.15, pero sigue sin ningún temporizador/reloj, así que expresar "expirá en N minutos" sigue sin ser posible); múltiples roles por `@requires` o múltiples anotaciones por rpc; exponer la identidad del caller dentro de un cuerpo (`ctx.user`/similar — solo el ROL viaja en la sesión, nunca una referencia al `User` completo); un CSPRNG auditado (ver el hallazgo de arriba).
+
+---
+
+### 3.15 Constructo de loop: `while` — RESUELTO, alcance acotado
+
+Hasta acá el lenguaje no tenía NINGÚN constructo de loop — la única forma de repetir algo era recursión (una `fn` con nombre llamándose a sí misma, o un closure reasignado vía `mut` que se referencia a sí mismo, que además arma un ciclo real de `Rc`, ver §3.10). Elegido para v0, explícitamente: **`while` únicamente, `Stmt` (nunca `Expr`), sin `break`/`continue`, con una cota dura de iteraciones.**
+
+```
+fn sum(xs: Int[]) -> Int {
+  let mut total = 0;
+  let mut i = 0;
+  while i < xs.length() {
+    total = total + xs[i];
+    i = i + 1;
+  }
+  total
+}
+```
+
+**`while` NUNCA es una expresión.** `if`/`match` sí lo son porque necesitan unificar un valor entre ramas — eso exigiría diseñar `break <valor>`, un tipo para "el loop que nunca hace `break`" (el lenguaje no tiene ningún tipo `Never`/bottom) y unificación de tipos entre N sitios de `break`. Nada de eso hace falta para agregar sin recursión: el patrón es mutar un `let mut` declarado ANTES del loop, y usar un valor de cola DESPUÉS de él — el `while` en sí corre por puro efecto, se chequea contra `Type::Void` (mismo tratamiento que un `if`/`match` en posición de sentencia).
+
+**Sin `for`, a propósito.** No existe ningún concepto de rango/iterador en el lenguaje (`.take`/`.filter`/`.map`/`.length` siguen siendo los únicos métodos de `List`, sin `.reduce()`/`.forEach()`); todo lo que `for` daría ya es expresable con `while` + indexado manual (`arr[i]`, que ya existía). Agregarlo antes de que `while` se haya usado en programas reales sería azúcar prematuro — mismo criterio que ya dejó afuera closures de 0 parámetros y roles múltiples en `@requires`.
+
+**Sin `break`/`continue`, a propósito.** Implementarlos bien primero necesita resolver el hallazgo de abajo (un `break` anidado dentro de un `if`/`match` fallaría en silencio por la misma razón estructural que `return` ya falla) — deferido a una ronda futura si el uso real lo pide; la recursión sigue disponible mientras tanto para loops con salida temprana.
+
+**`return` dentro de un cuerpo de `while` se RECHAZA explícitamente en el checker — no es una limitación caprichosa, evita heredar un bug real y ya existente.** Encontrado leyendo el código vecino al diseñar esto, no introducido por esta ronda: un `return` anidado dentro de un `if`/`match` usado COMO SENTENCIA (no cola) no solo tipa mal hoy (se chequea contra `Void` en vez del tipo real de retorno, por cómo `check_stmt` trata `if`/`match`-como-sentencia) sino que en RUNTIME es un no-op silencioso — `eval_block` descarta el valor que produce ese `if`/`match` (incluido cualquier `return` de adentro, que solo corta el `eval_block` INTERNO de esa rama, no el que la contiene) y sigue con la sentencia siguiente como si nada. Ya es explotable hoy con un `return;` desnudo en una función `Void`. En vez de reescribir el mecanismo de señalización de control de flujo entero (un cambio mucho más grande y riesgoso que agregar un loop), `while` simplemente no deja usar `return` en su cuerpo — sacá el valor final con una variable `mut` declarada antes del loop y un tail después, como en el ejemplo de arriba. El bug preexistente en `if`/`match`-como-sentencia queda documentado pero sin arreglar, fuera de alcance de esta ronda.
+
+**Cota dura de iteraciones (`MAX_WHILE_ITERATIONS = 1_000_000`, `runtime/mod.rs`) — no opcional, agregada en la MISMA ronda que el loop.** El servidor (`server.rs::serve`) es un loop estrictamente single-threaded sin timeout ni scheduling cooperativo: un `while true { }` (o cualquier condición que el programa nunca vuelve falsa) congelaría PARA SIEMPRE el único hilo que atiende TODAS las requests, no solo la que lo disparó. Esto no es un límite v0 "honesto" en el mismo espíritu que otros (ej. "sin CSPRNG auditado") — es un footgun nuevo que la propia feature introduce, y este proyecto ya encontró y arregló footguns reales de ese calibre por review adversarial (el generador de tokens y `destroySession`, §3.14). La cota es deliberadamente generosa y NO configurable: un backstop contra el bug/loop-infinito más común, no un sistema fino de cuotas de recursos. Se cuenta una vez por invocación de rpc/fn (un `Cell<u64>` enhebrado por todo el árbol de evaluación, incluidos loops anidados y loops dentro de una fn/closure llamada desde el cuerpo), así que partir un loop grande en muchos chicos no lo esquiva.
+
+**Fuera de alcance, a propósito:** `for`, `break`/`continue`, `while` como expresión con `break <valor>`; el bug preexistente de `return` dentro de `if`/`match`-como-sentencia (documentado arriba, no arreglado); límite de profundidad de recursión (preexistente, no empeorado por esta ronda — barato de cerrar reusando el mismo `Cell<u64>` si hace falta más adelante).
 
 ---
 

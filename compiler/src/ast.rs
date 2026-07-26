@@ -265,6 +265,21 @@ pub enum Stmt {
         name: String,
         value: Spanned<Expr>,
     },
+    /// `while cond { body }` (GRAMMAR.md §3.15) -- a propósito NUNCA un
+    /// `Expr`: no hay `break <valor>` en v0 (ni tipo `Never`/bottom para lo
+    /// que valdría un loop que nunca hace break), así que un loop no tiene
+    /// ningún valor que producir. `cond` se re-evalúa en cada iteración;
+    /// `body` corre por efecto solamente -- se chequea contra `Type::Void`,
+    /// igual que un `if`/`match` en posición de sentencia (checker.rs::
+    /// check_stmt). Un `return` alcanzable desde `body` se RECHAZA
+    /// explícitamente en v0 (reusa `block_has_return`) en vez de heredar en
+    /// silencio el bug ya existente de `if`/`match` como sentencia (un
+    /// `return` ahí es un no-op silencioso en runtime, no solo mal tipado --
+    /// ver la nota extensa en checker.rs::check_stmt).
+    While {
+        cond: Spanned<Expr>,
+        body: Block,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

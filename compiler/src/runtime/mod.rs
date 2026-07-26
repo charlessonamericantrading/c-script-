@@ -10,9 +10,23 @@ pub mod session;
 use crate::ast::*;
 use db::Db;
 use session::SessionStore;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+
+/// Cota dura de iteraciones de `while` por invocación de rpc/fn (GRAMMAR.md
+/// §3.15). Sin esto, un `while true { }` (o cualquier condición que el
+/// programa nunca vuelve falsa) cuelga PARA SIEMPRE el único hilo que
+/// atiende TODAS las requests (`runtime/server.rs::serve` no tiene timeout
+/// ni scheduling cooperativo) -- no solo la request que lo disparó.
+/// Deliberadamente generoso y NO configurable en v0: es un backstop contra
+/// el bug/loop-infinito más común, no un sistema fino de cuotas de
+/// recursos. Se cuenta UNA vez por invocación de `invoke_rpc_with_sessions`
+/// (el `Cell` se crea ahí y se enhebra por TODO el árbol de evaluación,
+/// incluyendo loops anidados y loops dentro de una fn/closure llamada desde
+/// el cuerpo) -- así un programa no puede esquivar la cota partiendo un
+/// loop grande en muchos chicos.
+const MAX_WHILE_ITERATIONS: u64 = 1_000_000;
 
 /// `PartialEq`/`Debug` NO se derivan (ver los `impl` a mano más abajo) --
 /// `Value::Closure` guarda el `Env` que capturó, y un closure recursivo
@@ -210,30 +224,59 @@ pub(crate) fn eval_block(
     checker: &Checker,
     sessions: &SessionStore,
     current_token: Option<&str>,
+    step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
     let mut local = env.clone();
     for stmt in &block.stmts {
         match &stmt.node {
             Stmt::Let { name, value, .. } => {
-                let v = eval_expr(value, &local, db, fns, checker, sessions, current_token)?;
+                let v = eval_expr(value, &local, db, fns, checker, sessions, current_token, step_budget)?;
                 local.insert(name.clone(), cell(v));
             }
             Stmt::Assign { name, value } => {
-                let v = eval_expr(value, &local, db, fns, checker, sessions, current_token)?;
+                let v = eval_expr(value, &local, db, fns, checker, sessions, current_token, step_budget)?;
                 let target = local
                     .get(name)
                     .ok_or_else(|| err(format!("variable no declarada en runtime: '{name}'")))?;
                 *target.borrow_mut() = v;
             }
-            Stmt::Return(Some(e)) => return eval_expr(e, &local, db, fns, checker, sessions, current_token),
+            Stmt::Return(Some(e)) => return eval_expr(e, &local, db, fns, checker, sessions, current_token, step_budget),
             Stmt::Return(None) => return Ok(Value::Null),
             Stmt::Expr(e) => {
-                eval_expr(e, &local, db, fns, checker, sessions, current_token)?;
+                eval_expr(e, &local, db, fns, checker, sessions, current_token, step_budget)?;
             }
+            // Loop real de Rust re-evaluando `cond` contra el MISMO `local`
+            // que ya acumuló los `let`/`let mut` previos de este bloque --
+            // es lo que hace que `i = i + 1;` adentro del cuerpo mute la
+            // celda que ve `let mut i = 0;` de afuera (misma mecánica
+            // Rc<RefCell<Value>> que ya usa `if`, sin ningún scoping nuevo).
+            // El checker ya garantizó que `body` no contiene ningún
+            // `return` alcanzable (checker.rs::check_stmt), así que no hace
+            // falta ninguna señal de control nueva acá -- el valor de
+            // `eval_block(body, ...)` se descarta a propósito, igual que el
+            // de un if/match en posición de sentencia.
+            Stmt::While { cond, body } => loop {
+                match eval_expr(cond, &local, db, fns, checker, sessions, current_token, step_budget)? {
+                    Value::Bool(true) => {
+                        step_budget.set(step_budget.get() + 1);
+                        if step_budget.get() > MAX_WHILE_ITERATIONS {
+                            return Err(err(format!(
+                                "límite de {MAX_WHILE_ITERATIONS} iteraciones de 'while' excedido -- \
+                                 posible loop infinito (GRAMMAR.md §3.15)"
+                            )));
+                        }
+                        eval_block(body, &local, db, fns, checker, sessions, current_token, step_budget)?;
+                    }
+                    Value::Bool(false) => break,
+                    other => {
+                        return Err(err(format!("la condición de 'while' no es Bool en runtime: {other:?}")))
+                    }
+                }
+            },
         }
     }
     match &block.tail {
-        Some(e) => eval_expr(e, &local, db, fns, checker, sessions, current_token),
+        Some(e) => eval_expr(e, &local, db, fns, checker, sessions, current_token, step_budget),
         None => Ok(Value::Null),
     }
 }
@@ -247,6 +290,7 @@ pub(crate) fn eval_expr(
     checker: &Checker,
     sessions: &SessionStore,
     current_token: Option<&str>,
+    step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
     match &e.node {
         Expr::Int(n) => Ok(Value::Int(*n)),
@@ -254,7 +298,7 @@ pub(crate) fn eval_expr(
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
         Expr::Null => Ok(Value::Null),
-        Expr::Paren(inner) => eval_expr(inner, env, db, fns, checker, sessions, current_token),
+        Expr::Paren(inner) => eval_expr(inner, env, db, fns, checker, sessions, current_token, step_budget),
         Expr::Ident(name) => {
             // El lookup de variables va PRIMERO -- antes, "db" se chequeaba
             // acá arriba de todo (bug preexistente, encontrado en el review
@@ -278,7 +322,7 @@ pub(crate) fn eval_expr(
             // (el checker lo exige), así que evaluarlo en un env vacío no
             // depende de nada del scope actual.
             if let Some(c) = checker.consts.get(name.as_str()) {
-                return eval_expr(&c.value, &Env::new(), db, fns, checker, sessions, current_token);
+                return eval_expr(&c.value, &Env::new(), db, fns, checker, sessions, current_token, step_budget);
             }
             // No es una variable local -- si es una `fn` de nivel superior,
             // referenciarla por nombre produce un FnRef (ver su doc en el
@@ -290,7 +334,7 @@ pub(crate) fn eval_expr(
             Err(err(format!("variable no declarada en runtime: '{name}'")))
         }
         Expr::FieldAccess { base, field } => {
-            let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token)?;
+            let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token, step_budget)?;
             match base_v {
                 // Un campo ausente da `null`, no un error. El checker ya
                 // rechaza leer un campo que el tipo no declara, así que
@@ -322,15 +366,15 @@ pub(crate) fn eval_expr(
             // solo para volver a buscar el mismo nombre en `fns`.
             if let Expr::Ident(name) = &callee.node {
                 if let Some(decl) = fns.get(name.as_str()) {
-                    let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token)?;
-                    return call_fn_decl(decl, arg_vs, db, fns, checker, sessions, current_token);
+                    let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                    return call_fn_decl(decl, arg_vs, db, fns, checker, sessions, current_token, step_budget);
                 }
             }
-            let callee_v = eval_expr(callee, env, db, fns, checker, sessions, current_token)?;
-            let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token)?;
+            let callee_v = eval_expr(callee, env, db, fns, checker, sessions, current_token, step_budget)?;
+            let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
             match callee_v {
                 Value::BoundMethod(receiver, method) => {
-                    call_method(*receiver, &method, arg_vs, db, fns, checker, sessions, current_token)
+                    call_method(*receiver, &method, arg_vs, db, fns, checker, sessions, current_token, step_budget)
                 }
                 // Llamada INDIRECTA: `callee` fue una variable/parámetro que
                 // contenía una referencia a función o un closure (GRAMMAR.md
@@ -340,13 +384,13 @@ pub(crate) fn eval_expr(
                 // Closure. `call_callable` despacha ambos casos (y produce
                 // el mismo error de "no se puede llamar" para cualquier otra
                 // cosa, ver su propio fallback).
-                other => call_callable(other, arg_vs, db, fns, checker, sessions, current_token),
+                other => call_callable(other, arg_vs, db, fns, checker, sessions, current_token, step_budget),
             }
         }
         Expr::StructLit { name, variant, fields } => {
             let evaluated = fields
                 .iter()
-                .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, checker, sessions, current_token)?)))
+                .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, checker, sessions, current_token, step_budget)?)))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             match variant {
                 Some(v) => {
@@ -356,13 +400,13 @@ pub(crate) fn eval_expr(
             }
         }
         Expr::Match { scrutinee, arms } => {
-            let v = eval_expr(scrutinee, env, db, fns, checker, sessions, current_token)?;
+            let v = eval_expr(scrutinee, env, db, fns, checker, sessions, current_token, step_budget)?;
             for arm in arms {
                 if let Some(bindings) = try_match_pattern(&arm.pattern, &v, checker) {
                     let mut arm_env = env.clone();
                     arm_env.extend(bindings.into_iter().map(|(k, v)| (k, cell(v))));
                     if let Some(guard) = &arm.guard {
-                        match eval_expr(guard, &arm_env, db, fns, checker, sessions, current_token)? {
+                        match eval_expr(guard, &arm_env, db, fns, checker, sessions, current_token, step_budget)? {
                             Value::Bool(true) => {}
                             // El patrón matcheó pero el guard no se cumplió --
                             // se sigue probando el resto de los arms, no se
@@ -372,8 +416,8 @@ pub(crate) fn eval_expr(
                         }
                     }
                     return match &arm.body {
-                        MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns, checker, sessions, current_token),
-                        MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns, checker, sessions, current_token),
+                        MatchArmBody::Expr(e) => eval_expr(e, &arm_env, db, fns, checker, sessions, current_token, step_budget),
+                        MatchArmBody::Block(b) => eval_block(b, &arm_env, db, fns, checker, sessions, current_token, step_budget),
                     };
                 }
             }
@@ -382,25 +426,25 @@ pub(crate) fn eval_expr(
             Err(err("ningún arm de match coincidió — el checker debería haber impedido esto"))
         }
         Expr::If { cond, then_block, else_block } => {
-            let c = eval_expr(cond, env, db, fns, checker, sessions, current_token)?;
+            let c = eval_expr(cond, env, db, fns, checker, sessions, current_token, step_budget)?;
             match c {
-                Value::Bool(true) => eval_block(then_block, env, db, fns, checker, sessions, current_token),
-                Value::Bool(false) => eval_block(else_block, env, db, fns, checker, sessions, current_token),
+                Value::Bool(true) => eval_block(then_block, env, db, fns, checker, sessions, current_token, step_budget),
+                Value::Bool(false) => eval_block(else_block, env, db, fns, checker, sessions, current_token, step_budget),
                 other => Err(err(format!("la condición de 'if' no es Bool en runtime: {other:?}"))),
             }
         }
-        Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, checker, sessions, current_token),
-        Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, checker, sessions, current_token),
+        Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, checker, sessions, current_token, step_budget),
+        Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, checker, sessions, current_token, step_budget),
         Expr::ArrayLit(items) => {
             let vs = items
                 .iter()
-                .map(|e| eval_expr(e, env, db, fns, checker, sessions, current_token))
+                .map(|e| eval_expr(e, env, db, fns, checker, sessions, current_token, step_budget))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             Ok(Value::List(vs))
         }
         Expr::Index { base, index } => {
-            let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token)?;
-            let idx = as_int(&eval_expr(index, env, db, fns, checker, sessions, current_token)?)?;
+            let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token, step_budget)?;
+            let idx = as_int(&eval_expr(index, env, db, fns, checker, sessions, current_token, step_budget)?)?;
             match base_v {
                 Value::List(items) => {
                     let i: usize = idx
@@ -417,12 +461,12 @@ pub(crate) fn eval_expr(
         Expr::TupleLit(items) => {
             let vs = items
                 .iter()
-                .map(|e| eval_expr(e, env, db, fns, checker, sessions, current_token))
+                .map(|e| eval_expr(e, env, db, fns, checker, sessions, current_token, step_budget))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
             Ok(Value::Tuple(vs))
         }
         Expr::TupleIndex { base, index } => {
-            let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token)?;
+            let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token, step_budget)?;
             match base_v {
                 Value::Tuple(items) => items
                     .get(*index)
@@ -457,21 +501,22 @@ fn eval_binary(
     checker: &Checker,
     sessions: &SessionStore,
     current_token: Option<&str>,
+    step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
     use BinaryOp::*;
     // && / || cortocircuitan: el lado derecho no se evalúa si ya se sabe el
     // resultado, igual que en cualquier lenguaje con estos operadores.
     if matches!(op, And | Or) {
-        let l = as_bool(&eval_expr(left, env, db, fns, checker, sessions, current_token)?)?;
+        let l = as_bool(&eval_expr(left, env, db, fns, checker, sessions, current_token, step_budget)?)?;
         return match (op, l) {
             (And, false) => Ok(Value::Bool(false)),
             (Or, true) => Ok(Value::Bool(true)),
-            _ => Ok(Value::Bool(as_bool(&eval_expr(right, env, db, fns, checker, sessions, current_token)?)?)),
+            _ => Ok(Value::Bool(as_bool(&eval_expr(right, env, db, fns, checker, sessions, current_token, step_budget)?)?)),
         };
     }
 
-    let l = eval_expr(left, env, db, fns, checker, sessions, current_token)?;
-    let r = eval_expr(right, env, db, fns, checker, sessions, current_token)?;
+    let l = eval_expr(left, env, db, fns, checker, sessions, current_token, step_budget)?;
+    let r = eval_expr(right, env, db, fns, checker, sessions, current_token, step_budget)?;
     match op {
         // '+' concatena si ambos lados son String (checker.rs ya garantizó
         // que no llega acá un String mezclado con Int/Float).
@@ -503,8 +548,9 @@ fn eval_unary(
     checker: &Checker,
     sessions: &SessionStore,
     current_token: Option<&str>,
+    step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
-    let v = eval_expr(operand, env, db, fns, checker, sessions, current_token)?;
+    let v = eval_expr(operand, env, db, fns, checker, sessions, current_token, step_budget)?;
     match op {
         UnaryOp::Neg => match v {
             Value::Int(n) => Ok(Value::Int(-n)),
@@ -557,8 +603,9 @@ fn eval_args(
     checker: &Checker,
     sessions: &SessionStore,
     current_token: Option<&str>,
+    step_budget: &Cell<u64>,
 ) -> Result<Vec<Value>, RuntimeError> {
-    args.iter().map(|a| eval_expr(a, env, db, fns, checker, sessions, current_token)).collect()
+    args.iter().map(|a| eval_expr(a, env, db, fns, checker, sessions, current_token, step_budget)).collect()
 }
 
 /// Invoca una `fn` de usuario ya resuelta con argumentos ya evaluados --
@@ -573,12 +620,13 @@ fn call_fn_decl(
     checker: &Checker,
     sessions: &SessionStore,
     current_token: Option<&str>,
+    step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
     let mut fn_env = Env::new();
     for (p, v) in decl.params.iter().zip(arg_vs) {
         fn_env.insert(p.name.clone(), cell(v));
     }
-    eval_block(&decl.body, &fn_env, db, fns, checker, sessions, current_token)
+    eval_block(&decl.body, &fn_env, db, fns, checker, sessions, current_token, step_budget)
 }
 
 fn try_match_pattern(pattern: &Pattern, v: &Value, checker: &Checker) -> Option<Vec<(String, Value)>> {
@@ -724,12 +772,13 @@ fn call_closure(
     checker: &Checker,
     sessions: &SessionStore,
     current_token: Option<&str>,
+    step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
     let mut call_env = captured_env.clone();
     for (name, v) in param_names.iter().zip(arg_vs) {
         call_env.insert(name.clone(), cell(v));
     }
-    eval_block(body, &call_env, db, fns, checker, sessions, current_token)
+    eval_block(body, &call_env, db, fns, checker, sessions, current_token, step_budget)
 }
 
 /// Cualquier `Value` invocable -- una referencia a `fn` por nombre o un
@@ -746,16 +795,17 @@ fn call_callable(
     checker: &Checker,
     sessions: &SessionStore,
     current_token: Option<&str>,
+    step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
     match v {
         Value::FnRef(name) => {
             let decl = fns
                 .get(name.as_str())
                 .ok_or_else(|| err(format!("fn desconocida: '{name}'")))?;
-            call_fn_decl(decl, arg_vs, db, fns, checker, sessions, current_token)
+            call_fn_decl(decl, arg_vs, db, fns, checker, sessions, current_token, step_budget)
         }
         Value::Closure(params, body, captured_env) => {
-            call_closure(&params, &body, &captured_env, arg_vs, db, fns, checker, sessions, current_token)
+            call_closure(&params, &body, &captured_env, arg_vs, db, fns, checker, sessions, current_token, step_budget)
         }
         other => Err(err(format!("no se puede llamar un valor {other:?}"))),
     }
@@ -771,6 +821,7 @@ fn call_method(
     checker: &Checker,
     sessions: &SessionStore,
     current_token: Option<&str>,
+    step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
     match receiver {
         Value::DbCollection(coll) => db.call(&coll, method, args),
@@ -784,7 +835,7 @@ fn call_method(
                 let f = args.into_iter().next().ok_or_else(|| err("'filter' requiere 1 argumento"))?;
                 let mut kept = Vec::new();
                 for item in items {
-                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token)?)? {
+                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)? {
                         kept.push(item);
                     }
                 }
@@ -794,7 +845,7 @@ fn call_method(
                 let f = args.into_iter().next().ok_or_else(|| err("'map' requiere 1 argumento"))?;
                 let mut mapped = Vec::with_capacity(items.len());
                 for item in items {
-                    mapped.push(call_callable(f.clone(), vec![item], db, fns, checker, sessions, current_token)?);
+                    mapped.push(call_callable(f.clone(), vec![item], db, fns, checker, sessions, current_token, step_budget)?);
                 }
                 Ok(Value::List(mapped))
             }
@@ -939,6 +990,12 @@ pub fn invoke_rpc_with_sessions(
     let empty = serde_json::Map::new();
     let args_obj = args_json.as_object().unwrap_or(&empty);
     let mut env = Env::new();
+    // Una sola cota de iteraciones de `while` por invocación (GRAMMAR.md
+    // §3.15) -- creada acá, el ORIGEN, y enhebrada por todo el árbol de
+    // evaluación de abajo (incluida la de los valores por default de los
+    // parámetros). `Cell`, no `Mutex`/`Atomic*`: el intérprete corre
+    // siempre en este único hilo.
+    let step_budget = Cell::new(0u64);
     for p in &rpc.params {
         let declared = checker
             .resolve_type(&p.ty)
@@ -951,7 +1008,7 @@ pub fn invoke_rpc_with_sessions(
             Some(j) => json_to_typed_value(j, &declared, &checker, &p.name)?,
             None => match &p.default {
                 Some(default_expr) => {
-                    eval_expr(default_expr, &Env::new(), db, &fns, &checker, sessions, current_token)?
+                    eval_expr(default_expr, &Env::new(), db, &fns, &checker, sessions, current_token, &step_budget)?
                 }
                 // Antes esto era `Value::Null` en silencio -- un parámetro
                 // requerido que no venía en el body producía un fallo
@@ -969,7 +1026,7 @@ pub fn invoke_rpc_with_sessions(
         env.insert(p.name.clone(), cell(v));
     }
 
-    let result = eval_block(&rpc.body, &env, db, &fns, &checker, sessions, current_token)?;
+    let result = eval_block(&rpc.body, &env, db, &fns, &checker, sessions, current_token, &step_budget)?;
     let simple_enums = simple_enum_names(program);
     Ok(value_to_json(&result, &simple_enums))
 }
@@ -2315,5 +2372,79 @@ mod tests {
         let result =
             invoke_rpc(&program, "S", "count", &json!({"xs": [1, 2, 3]}), &Db::seeded()).unwrap();
         assert_eq!(result, json!(3));
+    }
+
+    // ---- constructo de loop: `while` (GRAMMAR.md §3.15) ----
+
+    #[test]
+    fn while_loop_aggregates_a_list_without_recursion() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc sum(xs: Int[]) -> Int {
+                    let mut total = 0;
+                    let mut i = 0;
+                    while i < xs.length() {
+                        total = total + xs[i];
+                        i = i + 1;
+                    }
+                    total
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "sum", &json!({"xs": [1, 2, 3, 4]}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(10));
+    }
+
+    #[test]
+    fn assignment_inside_a_while_body_propagates_across_iterations() {
+        // Análogo directo de assignment_inside_if_branch_propagates_to_outer_scope,
+        // pero para `while`: confirma que la mutación Rc<RefCell<Value>>
+        // persiste de una vuelta del loop a la siguiente, no que cada
+        // iteración vea su propia copia descartable de "i".
+        let program = program_from(
+            r#"
+            service S {
+                rpc count_to(n: Int) -> Int {
+                    let mut i = 0;
+                    while i < n {
+                        i = i + 1;
+                    }
+                    i
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "count_to", &json!({"n": 5}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(5));
+    }
+
+    #[test]
+    fn while_condition_that_is_not_bool_is_a_runtime_error() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc f() -> Int { while 1 { } 0 }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "f", &json!({}), &Db::seeded());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_while_loop_that_never_terminates_hits_the_iteration_cap_instead_of_hanging() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc f() -> Int { while true { } 0 }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "f", &json!({}), &Db::seeded());
+        assert!(result.is_err(), "un 'while true {{ }}' debería chocar contra la cota, no colgar el test");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("iteraciones"), "el error debería mencionar el límite de iteraciones: {msg}");
     }
 }
