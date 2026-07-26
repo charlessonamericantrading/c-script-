@@ -463,3 +463,42 @@ pub struct FieldPattern {
     /// la abreviatura — ya llega desugared.
     pub pattern: Pattern,
 }
+
+/// Reconoce el ÚNICO shape de cuerpo de un `stream` que dispara push real
+/// v0 (GRAMMAR.md §3.16): `while true { db.<coleccion>.subscribe() }`,
+/// nada más -- ni una sentencia antes, ni un tail después (`while` nunca
+/// produce uno, ver `Stmt::While` arriba, así que el cuerpo entero tiene
+/// que ser esa única sentencia). Cualquier otra forma (otro método,
+/// argumentos, sentencias de más, una condición que no sea el literal
+/// `true`) devuelve `None` -- ese `stream` sigue el camino de siempre
+/// (`List<T>` ya calculada).
+///
+/// Vive acá, no en checker.rs ni en runtime, para que ambos lo llamen sin
+/// que ninguno dependa del otro: `checker.rs::check_rpc` lo usa para
+/// decidir si valida este shape especial en vez del cuerpo normal, y
+/// `runtime::live_subscribe_collection` (sibling de `is_stream_member`)
+/// lo usa para que `server.rs` decida el routing ANTES de invocar
+/// `invoke_rpc_with_sessions` -- ese cuerpo nunca llega a `eval_block`.
+pub fn recognize_live_subscribe(body: &Block) -> Option<&str> {
+    let [stmt] = body.stmts.as_slice() else { return None };
+    if body.tail.is_some() {
+        return None;
+    }
+    let Stmt::While { cond, body: loop_body } = &stmt.node else { return None };
+    if !matches!(cond.node, Expr::Bool(true)) {
+        return None;
+    }
+    if !loop_body.stmts.is_empty() {
+        return None;
+    }
+    let Expr::Call { callee, args } = &loop_body.tail.as_ref()?.node else { return None };
+    if !args.is_empty() {
+        return None;
+    }
+    let Expr::FieldAccess { base, field } = &callee.node else { return None };
+    if field != "subscribe" {
+        return None;
+    }
+    let Expr::FieldAccess { base: db_ident, field: collection } = &base.node else { return None };
+    matches!(&db_ident.node, Expr::Ident(n) if n == "db").then(|| collection.as_str())
+}

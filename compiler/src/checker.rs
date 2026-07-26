@@ -713,14 +713,22 @@ impl Checker {
     /// declara el tipo de ELEMENTO (ej. `-> User`, igual que un rpc normal
     /// -- así `AsyncIterable<User>` en el contrato TS sale del mismo
     /// `resolve_type(&r.return_type)` sin ningún caso especial en
-    /// ts_emit.rs), pero el CUERPO tiene que producir la secuencia
-    /// COMPLETA ya calculada: `List<User>`, no `User` suelto. Alcance v0
-    /// explícito (PLAN.md §4, Fase 2): repetir una lista ya calculada por
-    /// SSE real, no generadores ni suscripción a eventos futuros -- el
-    /// lenguaje hoy no tiene ningún constructo de loop, así que "generador
-    /// real" queda fuera de alcance con o sin este cambio.
+    /// ts_emit.rs). Dos formas de cuerpo:
+    /// - El shape reconocido de push real v0 (`ast::recognize_live_subscribe`,
+    ///   GRAMMAR.md §3.16): se delega ENTERO a `check_live_subscribe`, que
+    ///   valida la colección y el tipo -- nunca llama a `check_block`, no
+    ///   hay ningún `Value` que el intérprete vaya a producir para ese
+    ///   cuerpo (`server.rs` lo intercepta antes de invocar, ver
+    ///   `runtime::live_subscribe_collection`).
+    /// - Cualquier otro cuerpo: el camino de siempre, tiene que producir la
+    ///   secuencia COMPLETA ya calculada (`List<User>`, no `User` suelto).
     fn check_rpc(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
         let ret = self.resolve_type(&r.return_type)?;
+        if is_stream {
+            if let Some(collection) = crate::ast::recognize_live_subscribe(&r.body) {
+                return self.check_live_subscribe(r, collection, &ret);
+            }
+        }
         let expected = if is_stream { Type::List(Box::new(ret)) } else { ret };
         let mut env = Env::new();
         for p in &r.params {
@@ -731,6 +739,32 @@ impl Checker {
             env.insert(p.name.clone(), immutable(pty));
         }
         self.check_block(&r.body, &expected, &env)
+    }
+
+    /// El cuerpo de `r` ya matcheó el shape reconocido de push real
+    /// (`while true { db.<coleccion>.subscribe() }`, GRAMMAR.md §3.16) --
+    /// acá solo queda confirmar que `collection` existe de verdad y que su
+    /// tipo de elemento es compatible con el retorno declarado.
+    fn check_live_subscribe(&self, r: &RpcDecl, collection: &str, ret: &Type) -> Result<(), CheckError> {
+        if !r.params.is_empty() {
+            return Err(err(format!(
+                "'{}': un stream de suscripción en vivo no toma parámetros en v0 (filtrar por id queda deliberadamente afuera de esta ronda)",
+                r.name
+            )));
+        }
+        let element_ty = self.db_collections.get(collection).ok_or_else(|| {
+            err(format!(
+                "'{}': 'db.{collection}' no es una colección declarada en 'db {{ ... }}'",
+                r.name
+            ))
+        })?;
+        if !is_subtype(element_ty, ret) {
+            return Err(err(format!(
+                "'{}': 'db.{collection}.subscribe()' produce {element_ty:?}, incompatible con el retorno declarado {ret:?}",
+                r.name
+            )));
+        }
+        Ok(())
     }
 
     // ---- bloques y sentencias ----
@@ -2011,8 +2045,22 @@ impl Checker {
                 self.check_expr(patch_arg, &Type::PatchOf(Box::new(element_ty.clone())), env)?;
                 Ok(element_ty.clone())
             }
+            // Deliberadamente SIEMPRE un error acá, nunca una firma normal
+            // y libremente componible como las de arriba (GRAMMAR.md
+            // §3.16): la única forma de que `subscribe()` tipe en TODO el
+            // programa es a través de `check_live_subscribe`, que corre
+            // ANTES (en `check_rpc`) y nunca llega a llamar a esta función
+            // para ese shape exacto. Si `subscribe` tuviera una firma
+            // normal acá, `rpc getOne() -> User { db.users.subscribe() }`
+            // (fuera del shape reconocido) tipiaría bien sin tener ningún
+            // comportamiento sensato en runtime -- ni bloquear el hilo
+            // principal para siempre, ni inventar un dato.
+            "subscribe" => Err(err(
+                "'subscribe' solo es válido como cuerpo COMPLETO de un stream, exactamente \
+                 `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
+            )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch/subscribe)"
             ))),
         }
     }
@@ -3575,5 +3623,143 @@ mod tests {
     fn assigning_to_a_non_mut_variable_inside_a_while_body_is_rejected() {
         let result = check_source("fn f() -> Int { let total = 0; while true { total = 1; } total }");
         assert!(result.is_err());
+    }
+
+    // ---- push real para `stream`: shape reconocido (GRAMMAR.md §3.16) ----
+
+    #[test]
+    fn the_recognized_live_subscribe_shape_typechecks() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                stream watchItems() -> Item {
+                    while true {
+                        db.items.subscribe()
+                    }
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn live_subscribe_return_type_must_match_the_collection_element_type() {
+        // `Other` pide un campo ("extra") que `Item` no tiene -- por más
+        // que el subtipado estructural de ancho acepte CAMPOS DE MÁS
+        // (GRAMMAR.md §3.2), acá falta uno requerido, así que Item NO es
+        // subtipo de Other.
+        let src = r#"
+            type Item = { id: Int, name: String }
+            type Other = { id: Int, extra: String }
+            db { items: Item[] }
+            service S {
+                stream watchItems() -> Other {
+                    while true {
+                        db.items.subscribe()
+                    }
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("incompatible"), "el error debería explicar el desajuste de tipos: {msg}");
+    }
+
+    #[test]
+    fn live_subscribe_rejects_an_unknown_collection() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                stream watchItems() -> Item {
+                    while true {
+                        db.noExiste.subscribe()
+                    }
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("no es una colección declarada"), "{msg}");
+    }
+
+    #[test]
+    fn live_subscribe_stream_cannot_take_parameters_in_v0() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                stream watchItems(id: Int) -> Item {
+                    while true {
+                        db.items.subscribe()
+                    }
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("no toma parámetros"), "{msg}");
+    }
+
+    #[test]
+    fn an_extra_statement_breaks_the_recognized_shape_and_falls_back_to_the_normal_list_check() {
+        // Cualquier cosa que NO matchee el shape exacto sigue el camino de
+        // siempre (List<T> ya calculada) -- acá el cuerpo ni siquiera
+        // termina en una expresión, así que falla, pero con el error
+        // GENÉRICO de bloque-sin-tail, no uno de push real.
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                stream watchItems() -> Item {
+                    let x = 1;
+                    while true {
+                        db.items.subscribe()
+                    }
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn subscribe_with_a_non_empty_argument_list_is_rejected_with_a_specific_message() {
+        // Cierra el hueco TOCTOU: fuera del shape reconocido, `subscribe`
+        // SIEMPRE falla en check_db_method (nunca una firma normal y
+        // libremente componible como all/find), así que esto da el mensaje
+        // específico de "cuerpo COMPLETO de un stream", no el genérico de
+        // "método desconocido".
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                stream watchItems() -> Item {
+                    while true {
+                        db.items.subscribe(1)
+                    }
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("cuerpo COMPLETO de un stream"), "{msg}");
+    }
+
+    #[test]
+    fn subscribe_used_outside_a_stream_body_is_rejected_with_the_same_specific_message() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            fn f() -> Item[] { db.items.subscribe() }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("cuerpo COMPLETO de un stream"), "{msg}");
     }
 }

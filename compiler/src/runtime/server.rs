@@ -16,14 +16,24 @@
 // el hilo principal, y el hilo de escritura reciba solamente el resultado
 // YA CONVERTIDO a `serde_json::Value` (sin ningún `Rc` adentro, `Send` de
 // sobra) más el propio `Request` (`Send` por diseño de tiny_http).
+//
+// Push real v0 (GRAMMAR.md §3.16): un `stream` cuyo cuerpo matchea el
+// shape reconocido (`ast::recognize_live_subscribe`) NUNCA pasa por
+// `invoke_rpc_with_sessions` -- `live_subscribe_collection` lo detecta
+// ANTES, y `Db::subscribe` (sincrónico, hilo principal) da la foto inicial
+// más un `Receiver<serde_json::Value>` que el hilo escritor
+// (`write_live_stream`) bloquea leyendo indefinidamente. Mismo respeto por
+// el límite de `Send` de arriba: lo único que cruza al hilo escritor es
+// JSON puro, nunca `Db`/`Value`.
 
 use super::db::Db;
 use super::session::SessionStore;
-use super::{invoke_rpc_with_sessions, is_stream_member, required_auth};
+use super::{invoke_rpc_with_sessions, is_stream_member, live_subscribe_collection, required_auth};
 use crate::ast::Annotation;
 use crate::ast::Program;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
 
 /// Un id incremental por request -- lo único que hace falta para poder
 /// correlacionar líneas de log una vez que hay más de un hilo escribiendo a
@@ -82,6 +92,27 @@ pub fn serve(program: Program, port: u16) {
         }
 
         if is_stream_member(&program, service_name, rpc_name) {
+            // Push real v0 (GRAMMAR.md §3.16): si el cuerpo matchea el
+            // shape reconocido (`ast::recognize_live_subscribe`), esto NUNCA
+            // llega a invocar `invoke_rpc_with_sessions` -- `Db::subscribe`
+            // (hilo principal, sincrónico) da la foto inicial + un
+            // `Receiver` que el hilo escritor bloquea leyendo para siempre.
+            // Cualquier otro stream sigue el camino de List<T> de siempre,
+            // sin cambios, más abajo.
+            if let Some(collection) = live_subscribe_collection(&program, service_name, rpc_name) {
+                match db.subscribe(collection) {
+                    Ok((snapshot, events)) => {
+                        std::thread::spawn(move || write_live_stream(request, snapshot, events, req_id));
+                    }
+                    Err(e) => {
+                        let status = status_for(&e);
+                        let _ = request.respond(cors_response(status, error_json(&e.to_string())));
+                        println!("[req {req_id}] {status}");
+                    }
+                }
+                continue;
+            }
+
             let args_json = match parse_args(&body) {
                 Ok(v) => v,
                 Err(e) => {
@@ -227,13 +258,13 @@ fn status_for(e: &super::RuntimeError) -> u16 {
 /// aparte (un cliente lento leyendo no debe bloquear al servidor de aceptar
 /// otras conexiones).
 ///
-/// Alcance v0 explícito (GRAMMAR.md §2.1, PLAN.md §4): `elements` es una
-/// secuencia YA CALCULADA -- invoke_rpc evaluó el cuerpo COMPLETO en el hilo
-/// principal antes de spawnear esto (el checker ya exige que ese cuerpo sea
-/// List<T>). No hay generación perezosa ni suscripción a cambios futuros --
-/// ninguna de las dos es posible todavía (el lenguaje no tiene ningún
-/// constructo de loop, y "suscribirse" necesitaría una capa de pub-sub sobre
-/// Db que no existe).
+/// Alcance v0 explícito (GRAMMAR.md §3.13): `elements` es una secuencia YA
+/// CALCULADA -- invoke_rpc evaluó el cuerpo COMPLETO en el hilo principal
+/// antes de spawnear esto (el checker ya exige que ese cuerpo sea `List<T>`).
+/// Esto es lo que sigue corriendo un `stream` que NO matchea el shape de
+/// push real reconocido por `live_subscribe_collection` -- ver
+/// `write_live_stream`, más abajo, para el caso que sí anuncia eventos
+/// futuros de verdad.
 fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, req_id: u64) {
     // Escrito a mano en vez de tiny_http::Response + request.respond(): ese
     // camino sólo llama flush() UNA vez, al final (request.rs::respond_impl),
@@ -297,6 +328,59 @@ fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, r
     // misma razón que el resto de este framing).
     let _ = writer.write_all(b"0\r\n\r\n").and_then(|_| writer.flush());
     println!("[req {req_id}] 200 (stream: {sent}/{total} eventos)");
+}
+
+/// Push real v0 (GRAMMAR.md §3.16): a diferencia de `write_stream`,
+/// `events` NO es una secuencia agotada -- es el extremo lector de un
+/// canal que `Db::publish` alimenta cada vez que `insert`/`applyPatch`
+/// mutan `collection`, desde el hilo PRINCIPAL (nunca desde acá). Este
+/// hilo corre `for event in &events` (`Receiver` implementa `Iterator`,
+/// bloqueando hasta el próximo mensaje) indefinidamente -- exactamente lo
+/// correcto para un "watch" que en efecto nunca termina por su cuenta,
+/// mientras el cliente siga conectado. `snapshot` sale primero, como
+/// eventos SSE comunes, para que un cliente recién conectado vea el
+/// estado actual antes de cualquier cambio futuro.
+///
+/// Ningún estado nuevo que limpiar al salir: `writer` y `events` se
+/// dropean acá (cierran el socket y el extremo lector del canal). Recién
+/// en la PRÓXIMA publicación a `collection` es cuando `Db::publish` nota
+/// que el `SyncSender` pareja ya no tiene receptor y lo poda -- lazy, no
+/// eager (ver `Db::publish`).
+fn write_live_stream(
+    request: tiny_http::Request,
+    snapshot: Vec<serde_json::Value>,
+    events: Receiver<serde_json::Value>,
+    req_id: u64,
+) {
+    let mut writer = request.into_writer();
+    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+    if writer.write_all(header).is_err() {
+        println!("[req {req_id}] cliente ya desconectado antes del primer byte (stream en vivo)");
+        return;
+    }
+    let _ = writer.flush();
+
+    let mut sent = 0usize;
+    for element in &snapshot {
+        if write_chunk(&mut writer, format!("data: {element}\n\n").as_bytes()).is_err() {
+            println!("[req {req_id}] cliente desconectado durante la foto inicial, {sent} eventos enviados");
+            return;
+        }
+        sent += 1;
+    }
+    // Bloquea ESTE hilo (nunca el principal) hasta el próximo evento --
+    // mismo manejo de desconexión que `write_stream`: el próximo write()
+    // sobre un socket cerrado falla de inmediato (BrokenPipe/etc.), nunca
+    // se queda esperando.
+    for event in &events {
+        if write_chunk(&mut writer, format!("data: {event}\n\n").as_bytes()).is_err() {
+            println!("[req {req_id}] cliente desconectado de un stream en vivo tras {sent} eventos");
+            return;
+        }
+        sent += 1;
+    }
+    let _ = writer.write_all(b"0\r\n\r\n").and_then(|_| writer.flush());
+    println!("[req {req_id}] stream en vivo cerrado ({sent} eventos)");
 }
 
 /// Un chunk de HTTP chunked transfer encoding: tamaño en hex + CRLF + datos

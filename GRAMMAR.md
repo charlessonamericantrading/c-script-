@@ -663,7 +663,7 @@ fn makeUser(input: NewUser) -> NewUserRecord {
 
 Antes, `Member::Rpc`/`Member::Stream` se colapsaban a lo mismo en todo el pipeline — pegarle a un `stream` por HTTP corría el cuerpo una vez y devolvía un solo JSON con 200, sin ningún indicio de que debía ser un stream. El stub del cliente generado ni siquiera lo intentaba (`throw new Error("streaming no implementado...")`).
 
-**Alcance explícito, de entrada: repite una secuencia YA CALCULADA, no suscribe a eventos futuros.** El ejemplo de `PLAN.md` (`stream watch(id) -> User { db.users.subscribe(id) }`) implica suscribirse a cambios que todavía no pasaron — eso necesitaría una capa de pub-sub sobre `db` que no existe. Lo que sí es real y honesto: el cuerpo de un `stream` devuelve `List<T>` (una lista completa, ya en memoria) y el servidor la manda como eventos SSE genuinos en vez de un solo blob JSON — mejor time-to-first-byte del lado del cliente, y el wire protocol que `AsyncIterable<T>` promete de verdad. **Actualización:** el lenguaje ya tiene un constructo de loop (`while`, §3.15) — necesario pero NO suficiente para push real: la capa de pub-sub sobre `db` sigue sin existir (ronda separada, en curso).
+**Alcance explícito, de entrada: repite una secuencia YA CALCULADA, no suscribe a eventos futuros.** El ejemplo de `PLAN.md` (`stream watch(id) -> User { db.users.subscribe(id) }`) implica suscribirse a cambios que todavía no pasaron — eso necesitaría una capa de pub-sub sobre `db` que no existe. Lo que sí es real y honesto: el cuerpo de un `stream` devuelve `List<T>` (una lista completa, ya en memoria) y el servidor la manda como eventos SSE genuinos en vez de un solo blob JSON — mejor time-to-first-byte del lado del cliente, y el wire protocol que `AsyncIterable<T>` promete de verdad. **Actualización: RESUELTO para un shape fijo.** El lenguaje ya tiene un constructo de loop (`while`, §3.15) y, sobre él, una capa real de pub-sub para `db` (§3.16) — un `stream` cuyo cuerpo es exactamente `while true { db.<coleccion>.subscribe() }` sí recibe eventos futuros de verdad, sin polling. Todo lo demás (un cuerpo con cualquier otra forma) sigue el camino `List<T>` descripto en esta sección, sin cambios.
 
 ```
 // La firma declara el ELEMENTO (igual que un rpc normal) -- el cuerpo
@@ -773,6 +773,43 @@ fn sum(xs: Int[]) -> Int {
 
 **Fuera de alcance, a propósito:** `for`, `break`/`continue`, `while` como expresión con `break <valor>`; el bug preexistente de `return` dentro de `if`/`match`-como-sentencia (documentado arriba, no arreglado); límite de profundidad de recursión (preexistente, no empeorado por esta ronda — barato de cerrar reusando el mismo `Cell<u64>` si hace falta más adelante).
 
+### 3.16 Push real: pub-sub sobre `db` para `stream` — RESUELTO, alcance acotado (shape fijo)
+
+Con `while` ya resuelto (§3.15), el segundo bloqueo que §3.13 dejaba pendiente para push real era la falta total de una capa de pub-sub sobre `db`. Elegido para v0, explícitamente (vía pregunta directa, no un default silencioso): en vez de un mecanismo general de corutinas/`yield` para lógica arbitraria por evento, el diseño reconoce en tiempo de compilación UN ÚNICO shape sintáctico fijo como cuerpo de un `stream` "en vivo":
+
+```
+stream watchItems() -> Item {
+  while true {
+    db.items.subscribe()
+  }
+}
+```
+
+Cualquier otra forma (otro método, argumentos, sentencias de más, otra condición) NO dispara push real — cae al camino `List<T>` de §3.13, o directamente no tipa, nunca a una ejecución silenciosamente distinta de lo que el código sugiere.
+
+**Por qué un shape fijo alcanza, en vez de corutinas de verdad.** El caso de uso real (anunciar mutaciones de `db` para siempre) no tiene ningún estado que se acarree entre iteraciones — cada vuelta hace exactamente lo mismo, "¿cuál es la próxima fila?". Bajo esa condición, "suspender el intérprete a mitad del loop y reanudarlo después" y "no dejar que el intérprete corra el loop en absoluto, y resolver todo con un registro de suscriptores en Rust puro" son observacionalmente idénticos — no hay nada que una corutina real preservaría que este atajo no dé gratis. Por eso `server.rs` intercepta el shape reconocido ANTES de invocar `invoke_rpc_with_sessions`: el cuerpo de un `stream` "en vivo" nunca llega a `eval_block`.
+
+**El reconocedor vive en `ast.rs`, no en el checker ni en el runtime.** `recognize_live_subscribe(body: &Block) -> Option<&str>` es sintáctico puro (sin tipos): devuelve el nombre de la colección si el cuerpo es exactamente ese `while true { db.<col>.subscribe() }`, o `None` para cualquier otra cosa. Vivir en `ast.rs` es lo que le permite tanto a `checker.rs` (`check_rpc`, para tipar) como a `runtime/mod.rs`/`server.rs` (`live_subscribe_collection`, para interceptar en tiempo de request) llamarlo sin que ninguno de los dos dependa del otro.
+
+**Hueco de TOCTOU cerrado a propósito, no dejado abierto.** Si `check_db_method` le diera a `"subscribe"` una firma normal y libremente componible (como `all`/`find`), entonces `rpc getOne() -> User { db.users.subscribe() }` -- fuera del shape reconocido -- tipiaría bien sin tener ningún comportamiento sensato en runtime. Fix: el brazo `"subscribe"` de `check_db_method` SIEMPRE falla, con un mensaje que apunta al shape exacto que sí funciona. La única forma de que `subscribe()` tipe en todo el programa es a través de `check_rpc` reconociendo el shape completo primero -- nunca a través del camino genérico de métodos de `db`.
+
+**`Db` gana un registro de suscriptores; `subscribe()` hace snapshot+registro en una sola llamada sincrónica.** `Db::subscribe(collection)` devuelve `(snapshot, Receiver)`: `snapshot` es el estado actual de la colección ya serializado a JSON (mismo `value_to_json` que cualquier respuesta normal), y `Receiver` es el lado de lectura de un `mpsc::sync_channel(1024)` recién registrado. Las dos partes (sacar la foto, registrarse) son las dos líneas de UNA sola llamada, sin ningún punto de suspensión entre ellas -- y la única otra cosa que podría "colarse" (una mutación, vía `insert`/`applyPatch`) solo pasa dentro de `Db::call`, en el mismo único hilo del servidor. Como el servidor entero procesa una request a la vez, no hay forma de que una mutación se intercale entre esas dos líneas: el single-threading del servidor ES el lock del pub-sub, no algo aparte que hubo que agregar. (Si `Db` alguna vez dejara de ser single-threaded, este argumento hay que revisarlo primero -- probablemente invirtiendo el orden a "registrarse, después sacar la foto, después descartar duplicados".)
+
+**`publish()` nunca bloquea, y un suscriptor lento o muerto no puede tirar abajo al servidor.** Cada `insert`/`applyPatch` exitoso llama `publish(collection, &row)` justo antes de devolver -- convierte la fila a JSON una vez y hace `try_send` (nunca bloqueante) a cada suscriptor de esa colección, podando (`retain`) cualquiera que devuelva `Full` (buffer de 1024 lleno, cliente no lee lo bastante rápido) o `Disconnected` (el hilo que escribía ya terminó). Un canal ilimitado hubiera sido un vector real de agotamiento de memoria; la política elegida es simple y explícita: mejor perder eventos para un suscriptor atascado que crecer sin límite.
+
+**La limpieza de un suscriptor desconectado es LAZY, a propósito -- no eager.** Nada en el servidor nota activamente que un socket se cerró; lo que pasa es que el hilo escritor de ESE stream (`write_live_stream`, spawneado por `server.rs`, nunca el hilo principal) intenta escribir el próximo evento que le llega por su `Receiver`, ese `write()` falla con `BrokenPipe`/`ConnectionReset` igual que en §3.13, el hilo loguea `"cliente desconectado de un stream en vivo tras N eventos"` y termina -- recién en la SIGUIENTE mutación a esa colección, `publish()` encuentra el `SyncSender` ya cerrado (`Disconnected`) y lo poda del registro con `retain`. Entre la desconexión real y esa próxima mutación, el suscriptor muerto sigue ocupando una entrada -- aceptado a propósito: una limpieza eager reabriría la misma pregunta de `Send`/`Sync` que todo este diseño evita (ver §3.10 sobre por qué `Value`, y por lo tanto `Db`, están confinados a un hilo).
+
+**Suscripción a la colección ENTERA, no por fila.** `subscribe(id: Int)` (recibir solo los cambios de una fila puntual) queda deliberadamente afuera de v0 -- whole-collection es un superset estrictamente más simple de reconocer (el shape fijo no necesita validar ningún argumento) y el cliente ya puede filtrar por `id` del lado TS sin ningún cambio de protocolo, gratis.
+
+**Verificado end-to-end con el `client.ts` generado de verdad, no con una llamada cruda.** Se ejecutó el flujo completo con el cliente TAL COMO lo genera `linkc build` (ningún cambio de codegen hizo falta -- confirma la premisa del diseño en §3.13, "el cliente ya lee de forma indefinida"): insertar una fila ANTES de abrir el stream y confirmar que el primer evento recibido es esa foto inicial; insertar una SEGUNDA fila mediante una request separada mientras el stream seguía abierto y confirmar que llega como evento nuevo por la MISMA conexión, sin que se corte; terminar el proceso cliente abruptamente (sin cerrar el stream de forma prolija) e insertar una tercera fila, confirmando que el hilo principal sigue respondiendo de inmediato (el stream muerto se poda recién ahí, con el log esperado) -- nada se cuelga ni crashea del lado del servidor.
+
+**Fuera de alcance de esta ronda, a propósito:**
+- Filtrado/transformación por evento DENTRO del cuerpo de un stream -- exigiría reentrada real del intérprete (insegura sin corutinas) o cómputo en el momento del `publish`; ninguna de las dos entra en el shape fijo de esta ronda.
+- Suscripción por fila (`subscribe(id)`) -- ver arriba.
+- `delete` sobre `db` (no existe hoy) y qué significaría publicar una fila "eliminada".
+- Re-autorización de una conexión en vivo de larga duración si la sesión que la abrió se revoca después -- `@authenticated`/`@requires` se valida una sola vez, al abrir: una conexión de horas de duración amplía ese hueco respecto de un rpc normal de vida corta.
+- Limpieza EAGER de suscriptores desconectados (ver arriba) -- lazy es la política elegida para no reabrir la pregunta de `Send`/`Sync`.
+
 ---
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
@@ -797,7 +834,7 @@ fn sum(xs: Int[]) -> Int {
 | `Patch<T>` | todos los campos `?:`, preserva nullability de cada uno | — | utilitario análogo a `Partial<T>`, resuelto en §3.4 |
 | `rpc f(x: T = v)` | parámetro con default → opcional en la firma TS del cliente | — | `f(x?: T)` en el cliente si se omite |
 | `rpc f(...) -> Result<T, E>` | `{type:"Ok",value:T} \| {type:"Err",error:E}` | objeto con tag `type` | resuelto en §3.5 — nunca lanza para errores declarados |
-| `stream f(...) -> T` | `AsyncIterable<T>` | eventos SSE reales (`data: ...\n\n`), uno por `T` serializado, sobre chunked transfer | resuelto en §3.13 -- repite una lista ya calculada, no suscribe a eventos futuros |
+| `stream f(...) -> T` | `AsyncIterable<T>` | eventos SSE reales (`data: ...\n\n`), uno por `T` serializado, sobre chunked transfer | §3.13: cuerpo genérico, repite una lista ya calculada. §3.16: cuerpo `while true { db.<col>.subscribe() }`, push real de eventos futuros |
 | `service S { ... }` | `interface SClient { ... }` + instancia concreta generada | — | el cliente real es un thin wrapper sobre `fetch`/WS |
 | `const X: T = v` | `export const X: T = v` **en `client.ts`**, no en `contract.d.ts` | — | un `.d.ts` es ambiental y TS rechaza inicializadores ahí (TS1039); un `const` es un valor, así que vive en el módulo real |
 

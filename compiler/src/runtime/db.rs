@@ -4,13 +4,35 @@
 // runtime sigue siendo puramente en memoria, sin ningún driver SQL real
 // -- eso queda fuera de alcance a propósito (ver PLAN.md §4, Fase 2).
 
-use super::{as_int, RuntimeError, Value};
+use super::{as_int, simple_enum_names, value_to_json, RuntimeError, Value};
 use crate::ast::{Item, Program};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Mutex;
+
+/// Cuántos eventos sin consumir tolera un suscriptor de push real
+/// (GRAMMAR.md §3.16) antes de ser desconectado. Un canal ILIMITADO sería
+/// un vector real de agotamiento de memoria si un cliente se queda lento
+/// (o la conexión se cuelga) sin cerrarse -- `try_send` (nunca bloqueante,
+/// ver `publish`) más este tope acotan el costo de un suscriptor colgado a
+/// una cantidad fija, a costa de desconectarlo si se atrasa demasiado (el
+/// mismo trade-off que la mayoría de sistemas de pub-sub/broadcast reales
+/// hacen). No es un número investigado a fondo, es un default razonable.
+const LIVE_STREAM_BUFFER: usize = 1024;
 
 pub struct Db {
     collections: HashMap<String, Mutex<Vec<Value>>>,
+    /// Para que un evento PUBLICADO (`publish`, más abajo) serialice
+    /// EXACTAMENTE igual que cualquier respuesta normal del mismo programa
+    /// (mismo `value_to_json` que usa `invoke_rpc_with_sessions`).
+    simple_enums: HashSet<String>,
+    /// Suscriptores activos por colección, para push real (GRAMMAR.md
+    /// §3.16). `RefCell`, no `Mutex` -- por la MISMA razón que ya vale para
+    /// `SessionStore`: esto solo se toca desde el hilo principal
+    /// (`Db::call`/`Db::subscribe`), nunca desde ningún hilo escritor (que
+    /// solo recibe el `Receiver`, ya extraído, nunca vuelve a tocar `Db`).
+    subscribers: RefCell<HashMap<String, Vec<SyncSender<serde_json::Value>>>>,
 }
 
 impl Db {
@@ -27,7 +49,11 @@ impl Db {
                 }
             }
         }
-        Db { collections }
+        Db {
+            collections,
+            simple_enums: simple_enum_names(program),
+            subscribers: RefCell::new(HashMap::new()),
+        }
     }
 
     /// Fixture SOLO para tests y para el demo -- **no** es lo que usa
@@ -77,7 +103,18 @@ impl Db {
                 ]),
             ]),
         );
-        Db { collections }
+        // `simple_enums` queda vacío a propósito: este fixture no tiene un
+        // `&Program` real del que derivarlo. Límite conocido: un test que
+        // ejercite `publish` (push real) contra datos sembrados acá vería
+        // un enum como `{"type":"Admin"}` en vez del string pelado que
+        // `linkc serve` produciría de verdad -- los tests de pub-sub de
+        // esta ronda usan `Db::new(&program)` con un programa real en vez
+        // de este fixture, precisamente para evitar ese hueco.
+        Db {
+            collections,
+            simple_enums: HashSet::new(),
+            subscribers: RefCell::new(HashMap::new()),
+        }
     }
 
     pub fn call(&self, collection: &str, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -118,6 +155,11 @@ impl Db {
                     fields.insert(0, ("id".to_string(), Value::Int(new_id)));
                 }
                 rows.push(v.clone());
+                // DESPUÉS de que la fila ya está firme en `rows`, nunca
+                // antes -- publicar una mutación que en realidad falló más
+                // adelante sería anunciar algo que no pasó. Todos los pasos
+                // falibles de este arm ya corrieron arriba.
+                self.publish(collection, &v);
                 Ok(v)
             }
             "applyPatch" => {
@@ -147,9 +189,59 @@ impl Db {
                         }
                     }
                 }
+                self.publish(collection, user);
                 Ok(user.clone())
             }
             other => Err(RuntimeError::new(format!("método desconocido: 'db.{collection}.{other}'"))),
+        }
+    }
+
+    /// Nuevo suscriptor de TODA mutación futura (`insert`/`applyPatch`) de
+    /// `collection`, más una foto de lo que ya hay ADENTRO en este mismo
+    /// instante (GRAMMAR.md §3.16, push real v0). Nunca lo llama el
+    /// intérprete -- solo `runtime/server.rs`, directo sobre el `&Db` que
+    /// ya tiene, ANTES de decidir si invoca `invoke_rpc_with_sessions` (ver
+    /// `ast::recognize_live_subscribe`).
+    ///
+    /// Sacar la foto y registrarse son las dos líneas de ESTA MISMA llamada
+    /// sincrónica, sin ningún punto de suspensión entre ellas -- y la única
+    /// otra cosa que podría "colarse" (una mutación) solo pasa dentro de
+    /// `Db::call`, en el mismo único hilo que corre esto. El servidor entero
+    /// procesa una request a la vez en ese hilo, así que no hay forma de
+    /// que una mutación se intercale entre las dos líneas de acá: el
+    /// single-threading del servidor ES el lock, no hace falta agregar uno.
+    pub fn subscribe(&self, collection: &str) -> Result<(Vec<serde_json::Value>, Receiver<serde_json::Value>), RuntimeError> {
+        let cell = self
+            .collections
+            .get(collection)
+            .ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let snapshot: Vec<serde_json::Value> = {
+            let rows = cell.lock().expect("lock de db envenenado");
+            rows.iter().map(|v| value_to_json(v, &self.simple_enums)).collect()
+        };
+        let (tx, rx) = mpsc::sync_channel(LIVE_STREAM_BUFFER);
+        self.subscribers.borrow_mut().entry(collection.to_string()).or_default().push(tx);
+        Ok((snapshot, rx))
+    }
+
+    /// Llamado SOLO desde el final de los arms `"insert"`/`"applyPatch"` de
+    /// `call`, DESPUÉS de que la fila ya está firme en `rows` -- nunca
+    /// antes, para no anunciar una mutación que en realidad falló más
+    /// adelante (ambos arms ya tienen todos sus pasos falibles ANTES de la
+    /// mutación real).
+    fn publish(&self, collection: &str, row: &Value) {
+        let json = value_to_json(row, &self.simple_enums);
+        let mut subs = self.subscribers.borrow_mut();
+        if let Some(list) = subs.get_mut(collection) {
+            // `try_send` -- NUNCA bloqueante: publicar no puede colgar el
+            // único hilo que atiende todas las requests, ni siquiera si un
+            // suscriptor está lento. `Full` (suscriptor demasiado atrasado,
+            // ver LIVE_STREAM_BUFFER) o `Disconnected` (el cliente ya se
+            // fue) se podan igual -- lazy, recién en la próxima publicación
+            // a esta colección, no eager (un mecanismo eager necesitaría un
+            // hilo aparte tocando `Db`, reabriendo la pregunta de Send/Sync
+            // que todo este diseño evita).
+            list.retain(|tx| tx.try_send(json.clone()).is_ok());
         }
     }
 }

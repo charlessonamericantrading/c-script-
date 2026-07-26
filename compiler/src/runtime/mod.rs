@@ -1339,6 +1339,25 @@ pub fn required_auth<'a>(program: &'a Program, service_name: &str, rpc_name: &st
     })
 }
 
+/// Si el CUERPO de `service_name.rpc_name` matchea el shape de push real
+/// v0 (GRAMMAR.md §3.16), el nombre de la colección a la que se suscribe.
+/// Otra hermana de `is_stream_member`/`required_auth`: `server.rs` la usa
+/// para decidir el routing ANTES de invocar `invoke_rpc_with_sessions` --
+/// ese cuerpo nunca llega a `eval_block` (ver `ast::recognize_live_subscribe`,
+/// y `Db::subscribe`, que es lo que de verdad atiende esta forma de
+/// stream). `None` cubre por igual "no es un stream", "es un stream
+/// clásico List<T>", y "rpc desconocido" -- ese último lo detecta
+/// `invoke_rpc_with_sessions` como siempre si de verdad se llega a invocar.
+pub fn live_subscribe_collection<'a>(program: &'a Program, service_name: &str, rpc_name: &str) -> Option<&'a str> {
+    program.items.iter().find_map(|i| match i {
+        Item::Service(s) if s.name == service_name => s.members.iter().find_map(|m| match m {
+            Member::Stream(r) if r.name == rpc_name => crate::ast::recognize_live_subscribe(&r.body),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
 /// Nombres de los enums "simples" (todas sus variantes son unitarias) de
 /// todo el programa -- calculado UNA vez acá, no en cada `value_to_json`
 /// recursivo. Mismo chequeo `all_unit` que ya usa `emit_enum_decl`
@@ -1346,7 +1365,7 @@ pub fn required_auth<'a>(program: &'a Program, service_name: &str, rpc_name: &st
 /// firma TS -- el runtime tiene que serializar EXACTAMENTE igual, o el
 /// valor real no matchea lo que el contrato promete (ni lo que
 /// `validators.ts` espera, GRAMMAR.md §3.11).
-fn simple_enum_names(program: &Program) -> std::collections::HashSet<String> {
+pub(crate) fn simple_enum_names(program: &Program) -> std::collections::HashSet<String> {
     program
         .items
         .iter()
@@ -2446,5 +2465,65 @@ mod tests {
         assert!(result.is_err(), "un 'while true {{ }}' debería chocar contra la cota, no colgar el test");
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("iteraciones"), "el error debería mencionar el límite de iteraciones: {msg}");
+    }
+
+    // ---- pub-sub sobre `db`: push real para `stream` (GRAMMAR.md §3.16) ----
+
+    fn live_subscribe_program() -> Program {
+        program_from(
+            r#"
+            type Item = { id: Int, name: String }
+            type NewItem = { name: String }
+            db { items: Item[] }
+            service S {
+                rpc add(name: String) -> Item { db.items.insert(NewItem { name: name }) }
+            }
+        "#,
+        )
+    }
+
+    #[test]
+    fn subscribing_then_inserting_delivers_the_new_row_as_an_event() {
+        let program = live_subscribe_program();
+        let db = Db::new(&program);
+        let (snapshot, events) = db.subscribe("items").unwrap();
+        assert!(snapshot.is_empty(), "una colección recién creada no debería tener filas todavía");
+
+        invoke_rpc(&program, "S", "add", &json!({"name": "primero"}), &db).unwrap();
+
+        let event = events
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("se esperaba un evento publicado tras el insert");
+        assert_eq!(event["name"], json!("primero"));
+        assert_eq!(event["id"], json!(1));
+    }
+
+    #[test]
+    fn a_disconnected_subscriber_does_not_stop_others_from_receiving_events() {
+        // No hay forma pública de observar que el Vec interno de
+        // suscriptores se podó (es privado a propósito) -- lo que sí es una
+        // garantía de comportamiento real, y lo que este test prueba, es
+        // que un suscriptor muerto no rompe ni salta la publicación al
+        // resto: `publish` sigue entregando a cualquier otro suscriptor
+        // todavía vivo.
+        let program = live_subscribe_program();
+        let db = Db::new(&program);
+        let (_, dead_events) = db.subscribe("items").unwrap();
+        let (_, alive_events) = db.subscribe("items").unwrap();
+        drop(dead_events);
+
+        invoke_rpc(&program, "S", "add", &json!({"name": "x"}), &db).unwrap();
+
+        let event = alive_events
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("el suscriptor vivo debería seguir recibiendo eventos aunque otro se haya desconectado");
+        assert_eq!(event["name"], json!("x"));
+    }
+
+    #[test]
+    fn subscribing_to_an_unknown_collection_is_a_runtime_error() {
+        let program = live_subscribe_program();
+        let db = Db::new(&program);
+        assert!(db.subscribe("noExiste").is_err());
     }
 }
