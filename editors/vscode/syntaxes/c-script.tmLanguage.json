@@ -1,0 +1,91 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "c-script",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#annotations" },
+    { "include": "#strings" },
+    { "include": "#numbers" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.link",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.link",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.link",
+          "match": "\\b(if|else|while|match|return)\\b"
+        },
+        {
+          "name": "keyword.other.declaration.link",
+          "match": "\\b(type|enum|service|rpc|stream|db|fn|let|mut|const|import|from|pub)\\b"
+        },
+        {
+          "name": "constant.language.link",
+          "match": "\\b(true|false|null)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "entity.name.type.primitive.link",
+          "match": "\\b(Int|Float|String|Bool|Void)\\b"
+        },
+        {
+          "name": "entity.name.type.builtin.link",
+          "match": "\\b(Result|Patch)\\b"
+        },
+        {
+          "name": "entity.name.type.custom.link",
+          "match": "\\b[A-Z][a-zA-Z0-9_]*\\b"
+        }
+      ]
+    },
+    "annotations": {
+      "patterns": [
+        {
+          "name": "entity.name.tag.annotation.link",
+          "match": "@(authenticated|requires)\\b"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.link",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.link",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.link",
+          "match": "\\b[0-9]+\\.[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.link",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    }
+  },
+  "scopeName": "source.link"
+}

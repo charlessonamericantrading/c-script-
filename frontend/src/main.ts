@@ -39,7 +39,12 @@ async function main() {
   // update -- Patch<User>: solo se manda lo que cambia (GRAMMAR.md §3.4)
   const updated = await users.update(1, { name: "Ada, Condesa de Lovelace" });
   console.log(`Actualizado: ${updated.name}`);
+
+  // remove -- elimina un usuario (requiere rol Admin)
+  const removed = await users.remove(999);
+  console.log(`Eliminado usuario no existente: ${removed}`);
 }
+
 
 main().catch((e) => {
   console.error(e);

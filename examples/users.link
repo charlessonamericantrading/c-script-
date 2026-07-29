@@ -86,6 +86,12 @@ service Users {
     db.users.applyPatch(id, patch)
   }
 
+  @requires(Role.Admin)
+  rpc remove(id: Int) -> Bool {
+    db.users.delete(id)
+  }
+
+
   // Login v0 (GRAMMAR.md §3.14): busca por email SOLAMENTE -- verificar
   // contraseña/hash de credenciales queda fuera de esta ronda a propósito,
   // es su propio problema de seguridad, no algo para meter de paso. Emite

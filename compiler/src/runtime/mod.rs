@@ -824,7 +824,41 @@ fn call_method(
     step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
     match receiver {
-        Value::DbCollection(coll) => db.call(&coll, method, args),
+        Value::DbCollection(coll) => match method {
+
+            "findWhere" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'findWhere' requiere 1 argumento"))?;
+                let all_val = db.call(&coll, "all", vec![])?;
+                let Value::List(items) = all_val else { return Ok(Value::List(vec![])); };
+                let mut kept = Vec::new();
+                for item in items {
+                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)? {
+                        kept.push(item);
+                    }
+                }
+                Ok(Value::List(kept))
+            }
+            "deleteWhere" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'deleteWhere' requiere 1 argumento"))?;
+                let all_val = db.call(&coll, "all", vec![])?;
+                let Value::List(items) = all_val else { return Ok(Value::Int(0)); };
+                let mut count = 0i64;
+                for item in items {
+                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)? {
+                        if let Value::Struct(fields) = &item {
+                            if let Some((_, Value::Int(id))) = fields.iter().find(|(n, _)| n == "id") {
+                                if let Ok(Value::Bool(true)) = db.call(&coll, "delete", vec![Value::Int(*id)]) {
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Int(count))
+            }
+            _ => db.call(&coll, method, args),
+        },
+
         Value::List(items) => match method {
             "take" => {
                 let n = as_int(args.first().ok_or_else(|| err("take requiere 1 argumento"))?)? as usize;
@@ -2597,8 +2631,52 @@ mod tests {
         assert!(refetched.get("tag").is_none());
         let refetched = invoke_rpc(&program, "S", "get", &json!({"id": present_null["id"]}), &db).unwrap();
         assert_eq!(refetched["tag"], serde_json::Value::Null);
-        let refetched = invoke_rpc(&program, "S", "get", &json!({"id": present_value["id"]}), &db).unwrap();
+                    let refetched = invoke_rpc(&program, "S", "get", &json!({"id": present_value["id"]}), &db).unwrap();
         assert_eq!(refetched["tag"], json!("urgente"));
+    }
+
+    #[test]
+    fn test_delete_where_and_find_where_respect_predicate() {
+        let code = r#"
+        enum Role { Admin, Guest }
+        type User = { id: Int, name: String, role: Role }
+        db { users: User[] }
+        service Users {
+          rpc seed() -> Void {
+            db.users.insert(User { id: 0, name: "AdminUser", role: Role.Admin {} });
+            db.users.insert(User { id: 0, name: "GuestUser1", role: Role.Guest {} });
+            db.users.insert(User { id: 0, name: "GuestUser2", role: Role.Guest {} });
+          }
+
+
+          rpc findGuests() -> User[] {
+            db.users.findWhere(|u: User| { u.role == Role.Guest {} })
+          }
+          rpc deleteGuests() -> Int {
+            db.users.deleteWhere(|u: User| { u.role == Role.Guest {} })
+          }
+
+
+          rpc remaining() -> User[] {
+            db.users.all()
+          }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Users", "seed", &json!({}), &db).unwrap();
+
+        let guests = invoke_rpc(&program, "Users", "findGuests", &json!({}), &db).unwrap();
+        assert_eq!(guests.as_array().unwrap().len(), 2, "findWhere debe devolver SOLAMENTE los 2 Guests");
+
+        let deleted_count = invoke_rpc(&program, "Users", "deleteGuests", &json!({}), &db).unwrap();
+        assert_eq!(deleted_count, json!(2), "deleteWhere debe eliminar exactamente 2 usuarios Guest");
+
+        let remaining = invoke_rpc(&program, "Users", "remaining", &json!({}), &db).unwrap();
+        let arr = remaining.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "deleteWhere NO debe tocar al usuario Admin");
+        assert_eq!(arr[0]["name"], json!("AdminUser"));
     }
 
     #[test]

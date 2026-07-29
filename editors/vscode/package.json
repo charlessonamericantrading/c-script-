@@ -1,0 +1,47 @@
+{
+  "name": "c-script-vscode",
+  "displayName": "c-script",
+  "description": "Soporte oficial del lenguaje c-script: sintaxis y LSP End-to-End Type Safety con TypeScript",
+  "version": "0.1.0",
+  "publisher": "antigravity",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:c-script"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "c-script",
+        "aliases": ["c-script", "link"],
+        "extensions": [".link"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "c-script",
+        "scopeName": "source.link",
+        "path": "./syntaxes/c-script.tmLanguage.json"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.75.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^8.1.0"
+  }
+}

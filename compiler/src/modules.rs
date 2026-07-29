@@ -88,6 +88,18 @@ fn canonicalize(path: &Path) -> Result<PathBuf, LoadError> {
 /// lista de archivos físicos tocados, en el orden en que se leyeron por
 /// primera vez (la reutiliza `link dev` para saber qué observar).
 pub fn load_program(entry: &Path) -> Result<(Program, Vec<PathBuf>), LoadError> {
+    load_program_with_overlay(entry, &HashMap::new())
+}
+
+/// Igual que `load_program`, pero cualquier archivo cuya ruta CANONICALIZADA
+/// aparezca en `overlay` se lee de ahí (el buffer en memoria de un editor,
+/// potencialmente con cambios sin guardar) en vez de `fs::read_to_string` --
+/// el seam que el LSP (GRAMMAR.md, protocolo LSP) necesita para chequear el
+/// contenido REAL de un documento abierto, no el de disco, que puede estar
+/// desactualizado. `load_program` es simplemente el caso `overlay` vacío,
+/// así que los 4 call sites existentes (`cmd_check`/`build_once`/`cmd_serve`/
+/// los tests de este archivo) no cambian ni de firma ni de comportamiento.
+pub fn load_program_with_overlay(entry: &Path, overlay: &HashMap<PathBuf, String>) -> Result<(Program, Vec<PathBuf>), LoadError> {
     let canon_entry = canonicalize(entry)?;
     let project_root = canon_entry.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
     let mut loader = Loader {
@@ -95,6 +107,7 @@ pub fn load_program(entry: &Path) -> Result<(Program, Vec<PathBuf>), LoadError> 
         touched: Vec::new(),
         project_root,
         manifest: None,
+        overlay,
     };
     let mut on_stack = HashSet::new();
     let mut done = HashSet::new();
@@ -103,7 +116,7 @@ pub fn load_program(entry: &Path) -> Result<(Program, Vec<PathBuf>), LoadError> 
     Ok((Program { items: merged }, loader.touched))
 }
 
-struct Loader {
+struct Loader<'a> {
     /// Ítems NATIVOS de cada archivo (los que declara él mismo, sin sus
     /// imports resueltos) -- cachea para no re-lexear/parsear el mismo
     /// archivo dos veces en un caso diamante (A y C importan D).
@@ -114,15 +127,23 @@ struct Loader {
     /// = todavía no se intentó leer; `Some(vacío)` = no hay link.json (o no
     /// declara nada), que es el caso común de un proyecto sin dependencias.
     manifest: Option<HashMap<String, String>>,
+    /// Ruta canonicalizada -> contenido en memoria, consultado ANTES que
+    /// disco (ver `load_program_with_overlay`). Prestado, no clonado -- el
+    /// LSP arma este mapa una vez por re-chequeo a partir de sus documentos
+    /// abiertos; clonarlo acá duplicaría el texto de cada archivo abierto
+    /// sin ninguna necesidad.
+    overlay: &'a HashMap<PathBuf, String>,
 }
 
-impl Loader {
+impl Loader<'_> {
     fn load_native(&mut self, canon: &Path) -> Result<Vec<Item>, LoadError> {
         if let Some(items) = self.native_items.get(canon) {
             return Ok(items.clone());
         }
-        let source =
-            fs::read_to_string(canon).map_err(|e| err(format!("no se pudo leer '{}': {e}", canon.display())))?;
+        let source = match self.overlay.get(canon) {
+            Some(text) => text.clone(),
+            None => fs::read_to_string(canon).map_err(|e| err(format!("no se pudo leer '{}': {e}", canon.display())))?,
+        };
         let tokens = lexer::tokenize(&source).map_err(|e| LoadError::Syntax {
             path: canon.to_path_buf(),
             errors: vec![(e.span, e.message)],

@@ -71,17 +71,61 @@ fn main() -> ExitCode {
         Some("serve") => cmd_serve(&args[2..]),
         Some("new") => cmd_new(&args[2..]),
         Some("dev") => cmd_dev(&args[2..]),
+        Some("lsp") => cmd_lsp(),
+        Some("wasm") => cmd_wasm(&args[2..]),
         Some(path) => cmd_check(path), // `linkc <archivo.link>` -- solo lex+parse+check
         None => {
-            eprintln!("uso: linkc <archivo.link>                  (lexea, parsea y tipa)");
-            eprintln!("     linkc new <nombre>                     (crea un proyecto nuevo)");
-            eprintln!("     linkc build <archivo.link> <outdir>    (+ emite contract.d.ts, client.ts y validators.ts)");
+            eprintln!("uso: linkc <subcomando> [opciones]");
+            eprintln!("subcomandos conocidos:");
+            eprintln!("     linkc build <archivo.link> <outdir>    (genera contract.d.ts, client.ts, validators.ts, main.wasm, link.lock)");
+            eprintln!("     linkc wasm <archivo.link> <out.wasm>   (emite binario WebAssembly nativo)");
             eprintln!("     linkc dev <archivo.link> <outdir>      (+ observa y reconstruye solo)");
             eprintln!("     linkc serve <archivo.link> <puerto>    (+ sirve los rpc por HTTP)");
+            eprintln!("     linkc lsp                              (inicia el servidor Language Server Protocol)");
             ExitCode::FAILURE
         }
     }
 }
+
+fn cmd_wasm(args: &[String]) -> ExitCode {
+    let (Some(path), Some(out_path)) = (args.first(), args.get(1)) else {
+        eprintln!("uso: linkc wasm <archivo.link> <outfile.wasm>");
+        return ExitCode::FAILURE;
+    };
+
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    let bytes = match codegen::wasm_emit::emit_wasm(&program) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("error al emitir bytecode WASM: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Err(e) = fs::write(out_path, bytes) {
+        eprintln!("no se pudo escribir {out_path}: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    println!("OK: binario WebAssembly emitido en {out_path}");
+    ExitCode::SUCCESS
+}
+
+
+fn cmd_lsp() -> ExitCode {
+    let mut server = linkc::lsp::LspServer::new();
+    if let Err(e) = server.run_stdio() {
+        eprintln!("Error en el servidor LSP: {e}");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 
 fn cmd_new(args: &[String]) -> ExitCode {
     let Some(name) = args.first() else {
@@ -187,9 +231,45 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
         return BuildResult { ok: false, touched };
     }
 
-    println!("OK: generado {contract_path}, {client_path} y {validators_path}");
+    let wasm_path = format!("{outdir}/main.wasm");
+    match codegen::wasm_emit::emit_wasm(&program) {
+        Ok(wasm_bytes) => {
+            if let Err(e) = fs::write(&wasm_path, wasm_bytes) {
+                eprintln!("advertencia: no se pudo escribir {wasm_path}: {e}");
+            }
+            println!("OK: generado {contract_path}, {client_path}, {validators_path} y {wasm_path}");
+        }
+        Err(e) => {
+            println!("OK: generado {contract_path}, {client_path}, {validators_path}");
+            eprintln!(
+                "advertencia: no se generó {wasm_path} -- el codegen wasm nativo (v0, solo Int/Bool y expresión final) no soporta este programa: {e}"
+            );
+        }
+    }
+
+    let root = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
+    let lock_path = root.join("link.lock");
+
+    if lock_path.exists() {
+        if let Ok(existing_lock) = linkc::lockfile::read_lockfile(&lock_path) {
+            if let Err(mismatches) = linkc::lockfile::verify_lockfile(&existing_lock, root) {
+                for m in mismatches {
+                    eprintln!("ADVERTENCIA [link.lock]: {m}");
+                }
+            }
+        }
+    }
+
+
+    let lock = linkc::lockfile::generate_lockfile(&touched, root);
+    if let Err(e) = linkc::lockfile::write_lockfile(&lock, &lock_path) {
+        eprintln!("advertencia: no se pudo escribir link.lock: {e}");
+    }
+
     BuildResult { ok: true, touched }
 }
+
+
 
 fn cmd_build(args: &[String]) -> ExitCode {
     let (Some(path), Some(outdir)) = (args.first(), args.get(1)) else {

@@ -426,6 +426,21 @@ impl Checker {
     /// misma (ej. `resolve_type` sobre un tipo desconocido) y nunca pasan
     /// por ningún `Expr`.
     pub fn check_program(program: &Program) -> Result<(), Vec<CheckError>> {
+        let (_, errors) = Self::check_program_full(program);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Igual que `check_program`, pero devuelve el `Checker` mismo en vez de
+    /// descartarlo -- el protocolo LSP lo necesita para hover/completion/
+    /// goto-def (`.types`/`.enums`/`.fns`/`.consts`, `resolve_type`) sin
+    /// tener que volver a chequear el programa entero para cada request.
+    /// `check_program` es simplemente el caso "no me importa el Checker",
+    /// así que sus call sites (`main.rs`, `wasm_demo.rs`) no cambian.
+    pub(crate) fn check_program_full(program: &Program) -> (Self, Vec<CheckError>) {
         let (checker, mut errors) = Self::build_symbols(program);
 
         for item in &program.items {
@@ -461,11 +476,7 @@ impl Checker {
             }
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        (checker, errors)
     }
 
     // ---- resolución de TypeExpr (sintáctico) -> Type (resuelto) ----
@@ -2054,6 +2065,32 @@ impl Checker {
                 self.check_expr(patch_arg, &Type::PatchOf(Box::new(element_ty.clone())), env)?;
                 Ok(element_ty.clone())
             }
+            "delete" => {
+                let [id_arg] = args else {
+                    return Err(err("'delete' toma exactamente 1 argumento (id: Int)"));
+                };
+                self.check_expr(id_arg, &Type::Int, env)?;
+                Ok(Type::Bool)
+            }
+            "deleteWhere" => {
+                let [pred_arg] = args else {
+                    return Err(err("'deleteWhere' toma exactamente 1 argumento (fn(T) -> Bool)"));
+                };
+                let pred_ty = Type::Function(vec![element_ty.clone()], Box::new(Type::Bool));
+                self.check_expr(pred_arg, &pred_ty, env)?;
+                Ok(Type::Int)
+            }
+            "findWhere" => {
+                let [pred_arg] = args else {
+                    return Err(err("'findWhere' toma exactamente 1 argumento (fn(T) -> Bool)"));
+                };
+                let pred_ty = Type::Function(vec![element_ty.clone()], Box::new(Type::Bool));
+                self.check_expr(pred_arg, &pred_ty, env)?;
+                Ok(Type::List(Box::new(element_ty.clone())))
+            }
+
+
+
             // Deliberadamente SIEMPRE un error acá, nunca una firma normal
             // y libremente componible como las de arriba (GRAMMAR.md
             // §3.16): la única forma de que `subscribe()` tipe en TODO el

@@ -90,7 +90,8 @@ fn native_sql_type(ty: &Type, simple_enums: &HashSet<String>) -> Option<&'static
 }
 
 fn create_table_sql(collection: &str, columns: &[ColumnPlan]) -> String {
-    let mut defs = vec!["\"id\" INTEGER PRIMARY KEY".to_string()];
+    let mut defs = vec!["\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
+
     for col in columns {
         let not_null = if col.not_null() { " NOT NULL" } else { "" };
         defs.push(format!("\"{}\" {}{}", col.field.name, col.sql_type, not_null));
@@ -342,6 +343,41 @@ db { users: User[] }
                 self.publish(collection, &updated);
                 Ok(updated)
             }
+            "delete" => {
+                let id = as_int(args.first().ok_or_else(|| RuntimeError::new("delete requiere 1 argumento"))?)?;
+                let existing = self.select_rows(collection, columns, Some(id))?.into_iter().next();
+                let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = ?");
+                let rows_affected = self
+                    .connection
+                    .execute(&sql, rusqlite::params![id])
+                    .map_err(|e| RuntimeError::new(format!("delete falló: {e}")))?;
+                if rows_affected > 0 {
+                    if let Some(deleted_row) = existing {
+                        self.publish(collection, &deleted_row);
+                    }
+                }
+                Ok(Value::Bool(rows_affected > 0))
+            }
+
+            // "deleteWhere"/"findWhere" NUNCA se implementan acá: evaluar un
+            // predicado por fila requiere invocar un closure de usuario
+            // (`call_callable`), que necesita `fns`/`checker`/`sessions`/
+            // `step_budget` -- ninguno de los cuales `Db::call` recibe (ver
+            // su firma arriba). La implementación real vive en
+            // `runtime::call_method`, que intercepta estos dos métodos
+            // ANTES de llegar acá y sí tiene ese contexto (mismo patrón que
+            // `List::filter`/`List::map`); `call_method` es el único camino
+            // que el intérprete usa para despachar un método de
+            // `Value::DbCollection`, así que en el uso normal este brazo
+            // nunca corre. Como `Db::call` es `pub fn` y queda alcanzable
+            // directo (tests, LSP, código futuro), antes devolvía un
+            // resultado SILENCIOSAMENTE INCORRECTO ignorando el predicado
+            // (deleteWhere borraba TODAS las filas; findWhere las
+            // devolvía TODAS) -- fallar con un mensaje claro es siempre
+            // mejor que una respuesta que parece válida y no lo es.
+            "deleteWhere" | "findWhere" => Err(RuntimeError::new(format!(
+                "'db.{collection}.{method}' solo se puede invocar a través del intérprete (evalúa un predicado por fila, y este método no tiene acceso a closures) -- llegó directo a Db::call, sin pasar por runtime::call_method"
+            ))),
             other => Err(RuntimeError::new(format!("método desconocido: 'db.{collection}.{other}'"))),
         }
     }
@@ -494,5 +530,82 @@ db { users: User[] }
             Value::Variant { variant, .. } => SqlValue::Text(variant.clone()),
             other => panic!("valor no representable en una columna nativa de SQL: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_db_delete_removes_row() {
+        let program = crate::parser::parse(crate::lexer::tokenize("type User = { id: Int, name: String }\ndb { users: User[] }").unwrap()).unwrap();
+        let db = Db::new(&program, Path::new(":memory:"));
+
+        let user = db.call("users", "insert", vec![Value::Struct(vec![("name".into(), Value::Str("Alice".into()))])]).unwrap();
+        let Value::Struct(fields) = &user else { panic!("se esperaba struct") };
+        let id = fields.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap();
+
+        let deleted = db.call("users", "delete", vec![Value::Int(id)]).unwrap();
+        assert_eq!(deleted, Value::Bool(true));
+
+        let find_res = db.call("users", "find", vec![Value::Int(id)]).unwrap();
+        assert_eq!(find_res, Value::Null);
+
+        let delete_again = db.call("users", "delete", vec![Value::Int(id)]).unwrap();
+        assert_eq!(delete_again, Value::Bool(false));
+    }
+
+    #[test]
+    fn test_db_autoincrement_does_not_reuse_ids() {
+        let program = crate::parser::parse(crate::lexer::tokenize("type User = { id: Int, name: String }\ndb { users: User[] }").unwrap()).unwrap();
+        let db = Db::new(&program, Path::new(":memory:"));
+
+        let u1 = db.call("users", "insert", vec![Value::Struct(vec![("name".into(), Value::Str("Alice".into()))])]).unwrap();
+        let u2 = db.call("users", "insert", vec![Value::Struct(vec![("name".into(), Value::Str("Bob".into()))])]).unwrap();
+
+        let Value::Struct(f1) = u1 else { panic!() };
+        let Value::Struct(f2) = u2 else { panic!() };
+
+        let id1 = f1.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap();
+        let id2 = f2.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        db.call("users", "delete", vec![Value::Int(id2)]).unwrap();
+
+        let u3 = db.call("users", "insert", vec![Value::Struct(vec![("name".into(), Value::Str("Charlie".into()))])]).unwrap();
+        let Value::Struct(f3) = u3 else { panic!() };
+        let id3 = f3.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap();
+        assert_eq!(id3, 3);
+    }
+
+    #[test]
+    fn test_delete_where_and_find_where_error_instead_of_ignoring_the_predicate() {
+        // `Db::call` no tiene acceso a `call_callable` (ver el comentario en
+        // el brazo `"deleteWhere" | "findWhere"`), así que NO puede evaluar
+        // un predicado de verdad -- antes, llamar estos dos métodos directo
+        // acá (en vez de a través de `runtime::call_method`, que sí
+        // intercepta y evalúa el predicado fila por fila) borraba/devolvía
+        // TODAS las filas en silencio, ignorando el predicado por completo.
+        // Ahora tiene que fallar con un mensaje claro en vez de dar un
+        // resultado que parece válido y no lo es.
+        let program = crate::parser::parse(crate::lexer::tokenize("type User = { id: Int, name: String }\ndb { users: User[] }").unwrap()).unwrap();
+        let db = Db::new(&program, Path::new(":memory:"));
+
+        db.call("users", "insert", vec![Value::Struct(vec![("name".into(), Value::Str("Alice".into()))])]).unwrap();
+        db.call("users", "insert", vec![Value::Struct(vec![("name".into(), Value::Str("Bob".into()))])]).unwrap();
+
+        let fake_predicate = Value::Bool(false);
+        let find_err = db.call("users", "findWhere", vec![fake_predicate.clone()]).unwrap_err();
+        assert!(find_err.to_string().contains("call_method"), "el error debe explicar que hay que pasar por el intérprete: {find_err}");
+
+        let delete_err = db.call("users", "deleteWhere", vec![fake_predicate]).unwrap_err();
+        assert!(delete_err.to_string().contains("call_method"));
+
+        // Ninguna de las dos llamadas (que fallaron) debe haber tocado las filas.
+        let remaining = db.call("users", "all", vec![]).unwrap();
+        let Value::List(rows) = remaining else { panic!("se esperaba lista") };
+        assert_eq!(rows.len(), 2, "un método que falla no debe borrar nada");
     }
 }

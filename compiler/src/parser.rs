@@ -1717,10 +1717,11 @@ mod tests {
             })
             .expect("se esperaba un service");
         assert_eq!(service.name, "Users");
-        // list, getById, create, update, login, logout, listByRole,
+        // list, getById, create, update, remove, login, logout, listByRole,
         // listEmails, findByIdOrEmail, watchAll (stream)
-        assert_eq!(service.members.len(), 10);
+        assert_eq!(service.members.len(), 11);
     }
+
 
     // ---- recuperación de errores (LSP prerrequisito 2/3) ----
 
