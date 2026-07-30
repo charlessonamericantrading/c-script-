@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
+use modules::display_path;
+
 /// `LoadError::Other` (IO, ciclos, etc.) se muestra como siempre. Para
 /// `LoadError::Syntax`, usa `diagnostics::render_diagnostic` -- snippet +
 /// caret en la línea/columna real -- en vez del `Display` plano de una
@@ -21,7 +23,7 @@ fn report_load_error(e: &modules::LoadError) {
         eprintln!("{e}");
         return;
     };
-    let file_label = path.display().to_string();
+    let file_label = display_path(path);
     for (span, message) in errors {
         eprintln!("{}", diagnostics::render_diagnostic(&source, &file_label, *span, message));
     }
@@ -51,7 +53,7 @@ fn report_check_errors(mut errors: Vec<checker::CheckError>, touched: &[PathBuf]
         None => (1, 0, 0),
     });
     let single_file = match touched {
-        [only] => fs::read_to_string(only).ok().map(|src| (only.display().to_string(), src)),
+        [only] => fs::read_to_string(only).ok().map(|src| (display_path(only), src)),
         _ => None,
     };
     for e in &errors {
@@ -77,8 +79,9 @@ fn main() -> ExitCode {
         None => {
             eprintln!("uso: linkc <subcomando> [opciones]");
             eprintln!("subcomandos conocidos:");
-            eprintln!("     linkc build <archivo.link> <outdir>    (genera contract.d.ts, client.ts, validators.ts, main.wasm, link.lock)");
-            eprintln!("     linkc wasm <archivo.link> <out.wasm>   (emite binario WebAssembly nativo)");
+            eprintln!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)");
+            eprintln!("     linkc build <archivo.link> <outdir>    (genera contract.d.ts, client.ts, validators.ts, link.lock, y main.wasm si el programa entra en el subconjunto soportado -- ver 'linkc wasm')");
+            eprintln!("     linkc wasm <archivo.link> <out.wasm>   (emite binario WebAssembly nativo -- v0: solo Int/Bool y una expresión final)");
             eprintln!("     linkc dev <archivo.link> <outdir>      (+ observa y reconstruye solo)");
             eprintln!("     linkc serve <archivo.link> <puerto>    (+ sirve los rpc por HTTP)");
             eprintln!("     linkc lsp                              (inicia el servidor Language Server Protocol)");

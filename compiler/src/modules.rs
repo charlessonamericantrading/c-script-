@@ -66,12 +66,28 @@ impl fmt::Display for LoadError {
                     if i > 0 {
                         writeln!(f)?;
                     }
-                    write!(f, "error de módulos: '{}':{}:{}: {message}", path.display(), span.line, span.col)?;
+                    write!(f, "error de módulos: '{}':{}:{}: {message}", display_path(path), span.line, span.col)?;
                 }
                 Ok(())
             }
         }
     }
+}
+
+/// `fs::canonicalize` en Windows antepone el prefijo extendido `\\?\`
+/// (`\\?\C:\...`, o `\\?\UNC\...` para una ruta de red) -- hace falta para
+/// soportar rutas de más de 260 caracteres, pero no es lo que nadie
+/// escribió en la terminal y no aporta nada en un mensaje de error. Se pela
+/// SOLO para texto que un humano lee (`Display` de `LoadError`, diagnósticos
+/// de `main.rs`) -- la ruta canónica en sí (clave de overlay, comparaciones)
+/// se deja intacta en todos los demás lugares. No-op en cualquier otro OS,
+/// ya que ahí `canonicalize` nunca produce este prefijo.
+pub fn display_path(path: &Path) -> String {
+    let s = path.display().to_string();
+    s.strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| s.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or(s)
 }
 
 fn err(msg: impl Into<String>) -> LoadError {

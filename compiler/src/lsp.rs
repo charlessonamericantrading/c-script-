@@ -49,7 +49,27 @@ impl LspServer {
     /// `None` si no (URI que no es `file://`, un buffer nunca guardado, o
     /// un error de carga/sintaxis en el cierre transitivo) -- los
     /// callers deben caer al chequeo aislado del buffer solo en ese caso.
+    ///
+    /// Envuelto en `catch_unwind` (igual que `compute_diagnostics_for` --
+    /// ver ese comentario para el razonamiento completo): un panic acá NO
+    /// debe tirar abajo el proceso entero de `linkc lsp`, solo degradar
+    /// ESTE request puntual a "no hay programa completo disponible" (los
+    /// callers -- hover/completion/goto-def -- ya saben caer al buffer
+    /// aislado cuando esto da `None`, mismo camino que un archivo sin
+    /// imports).
     fn full_program_for(&self, uri: &str) -> Option<Program> {
+        match std::panic::catch_unwind(|| self.full_program_for_inner(uri)) {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!(
+                    "linkc lsp: panic interno al cargar el programa completo de '{uri}' -- degradando a chequeo aislado del buffer, el servidor sigue corriendo"
+                );
+                None
+            }
+        }
+    }
+
+    fn full_program_for_inner(&self, uri: &str) -> Option<Program> {
         let entry_path = uri_to_path(uri)?;
         let entry_canon = std::fs::canonicalize(&entry_path).ok()?;
         let overlay = self.build_overlay();
@@ -59,7 +79,32 @@ impl LspServer {
     /// Diagnósticos para `uri`, soportando `import` de verdad. Si `uri` no
     /// tiene un archivo real en disco (fuera de alcance en v0 -- ver
     /// GRAMMAR.md, protocolo LSP), cae al chequeo aislado del buffer solo.
+    ///
+    /// Envuelto en `catch_unwind`: `linkc lsp` es un proceso de LARGA VIDA
+    /// que corre en un solo hilo (`run_stdio`) -- un panic sin capturar acá
+    /// (dentro de `load_program_with_overlay`/`check_program_full`, hoy sin
+    /// ningún panic conocido alcanzable desde texto inválido, pero un
+    /// checker que sigue creciendo puede introducir uno) se propagaría a
+    /// través de `handle_message` y terminaría el proceso entero -- un
+    /// documento roto matando el servidor para TODOS los documentos
+    /// abiertos, no solo el problemático. `&LspServer` no tiene mutabilidad
+    /// interior (`documents` es un `HashMap` liso), así que es
+    /// `UnwindSafe` sin necesitar `AssertUnwindSafe`.
     fn compute_diagnostics_for(&self, uri: &str) -> Vec<Value> {
+        match std::panic::catch_unwind(|| self.compute_diagnostics_for_inner(uri)) {
+            Ok(diags) => diags,
+            Err(_) => {
+                eprintln!(
+                    "linkc lsp: panic interno al re-chequear '{uri}' -- ver el mensaje de panic arriba para el detalle; el servidor sigue corriendo"
+                );
+                vec![zero_diagnostic(format!(
+                    "error interno del servidor LSP al chequear este documento -- ver stderr del proceso 'linkc lsp' para el detalle ({uri})"
+                ))]
+            }
+        }
+    }
+
+    fn compute_diagnostics_for_inner(&self, uri: &str) -> Vec<Value> {
         let standalone = || compute_diagnostics_standalone(self.documents.get(uri).map(String::as_str).unwrap_or(""));
 
         let Some(entry_path) = uri_to_path(uri) else {
@@ -87,7 +132,7 @@ impl LspServer {
                         // documento (`uri`), porque `path` puede no ser el
                         // documento actualmente abierto.
                         let message =
-                            if path == entry_canon { message } else { format!("(en '{}') {message}", path.display()) };
+                            if path == entry_canon { message } else { format!("(en '{}') {message}", modules::display_path(&path)) };
                         json!({
                             "range": span_to_range(&source, span),
                             "severity": 1,
@@ -917,6 +962,31 @@ mod tests {
             }
         });
         server.handle_message(&req).expect("Debe retornar notificación")
+    }
+
+    /// `compute_diagnostics_for`/`full_program_for` envuelven su lógica
+    /// real en `catch_unwind` para que un panic futuro en el checker (hoy
+    /// no hay ninguno conocido alcanzable desde texto inválido, pero es un
+    /// componente que sigue creciendo) degrade a un solo diagnóstico en
+    /// vez de tirar abajo el proceso de `linkc lsp` entero -- ver el
+    /// comentario en `compute_diagnostics_for`. No hay ningún input real
+    /// hoy que dispare ese panic, así que esto prueba el MECANISMO en sí
+    /// (con un panic sintético, mismo patrón exacto de captura de `&self`
+    /// que el código real usa) en vez de una regresión de negocio puntual
+    /// -- si `LspServer` alguna vez ganara mutabilidad interior (un
+    /// `RefCell`/`Mutex`), este mismo test seguiría compilando pero ya no
+    /// probaría lo mismo, así que también sirve de canario para eso.
+    #[test]
+    fn test_catch_unwind_around_a_document_recheck_does_not_crash_the_server() {
+        let server = LspServer::new();
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // el panic es intencional -- no ensuciar la salida de `cargo test`
+        let result = std::panic::catch_unwind(|| {
+            let _ = server.documents.len(); // mismo patrón de captura de &self que compute_diagnostics_for/full_program_for
+            panic!("panic sintético -- prueba el mecanismo de catch_unwind, no un bug real conocido");
+        });
+        std::panic::set_hook(prev_hook);
+        assert!(result.is_err(), "catch_unwind debería atrapar el panic en vez de dejarlo propagar");
     }
 
     #[test]

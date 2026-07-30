@@ -44,5 +44,5 @@ código .link
 - **`validators.ts`**: Validaciones en tiempo de ejecución para asegurar la integridad de los datos antes de ser consumidos por el frontend.
 
 ### 4. Servidor Language Server Protocol (LSP)
-- Módulo [`compiler/src/lsp.rs`](file:///c:/Users/repre/Desktop/c-script/compiler/src/lsp.rs) expuesto vía `linkc lsp`.
+- Módulo [`compiler/src/lsp.rs`](../compiler/src/lsp.rs) expuesto vía `linkc lsp`.
 - Protocolo JSON-RPC 2.0 sobre `stdio` con soporte para diagnósticos, autocompletado, hover e ir a la definición.
