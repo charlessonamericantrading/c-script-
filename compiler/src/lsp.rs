@@ -1,4 +1,4 @@
-use crate::ast::{self, Item, Program};
+use crate::ast::{self, Item, Program, TypeExpr};
 use crate::checker::Checker;
 use crate::lexer;
 use crate::modules;
@@ -58,6 +58,18 @@ impl LspServer {
     /// aislado cuando esto da `None`, mismo camino que un archivo sin
     /// imports).
     fn full_program_for(&self, uri: &str) -> Option<Program> {
+        self.full_program_for_with_touched(uri).map(|(program, _)| program)
+    }
+
+    /// Igual que `full_program_for`, pero además expone cuántos archivos
+    /// entraron en el cierre transitivo (`touched.len()`) -- goto-definición
+    /// lo necesita para el mismo gate de seguridad que
+    /// `compute_diagnostics_for_inner` ya usa para diagnósticos: con más de
+    /// un archivo tocado, un `Span` encontrado en el `Program` fusionado no
+    /// tiene identidad de archivo (podría ser de un `import`, no del
+    /// documento abierto), así que nunca se arriesga a devolver una
+    /// posición que puede estar en el archivo equivocado.
+    fn full_program_for_with_touched(&self, uri: &str) -> Option<(Program, usize)> {
         match std::panic::catch_unwind(|| self.full_program_for_inner(uri)) {
             Ok(result) => result,
             Err(_) => {
@@ -69,11 +81,11 @@ impl LspServer {
         }
     }
 
-    fn full_program_for_inner(&self, uri: &str) -> Option<Program> {
+    fn full_program_for_inner(&self, uri: &str) -> Option<(Program, usize)> {
         let entry_path = uri_to_path(uri)?;
         let entry_canon = std::fs::canonicalize(&entry_path).ok()?;
         let overlay = self.build_overlay();
-        modules::load_program_with_overlay(&entry_canon, &overlay).ok().map(|(program, _)| program)
+        modules::load_program_with_overlay(&entry_canon, &overlay).ok().map(|(program, touched)| (program, touched.len()))
     }
 
     /// Diagnósticos para `uri`, soportando `import` de verdad. Si `uri` no
@@ -375,9 +387,12 @@ impl LspServer {
                 let line = pos.get("line")?.as_u64()? as usize;
                 let character = pos.get("character")?.as_u64()? as usize;
 
-                let full_program = self.full_program_for(uri);
+                let (full_program, touched_len) = match self.full_program_for_with_touched(uri) {
+                    Some((program, len)) => (Some(program), len),
+                    None => (None, 1), // sin archivo real en disco -- chequeo aislado del buffer solo, un único "archivo" implícito
+                };
                 let loc = if let Some(source) = self.documents.get(uri) {
-                    get_definition(uri, source, line, character, full_program.as_ref()).unwrap_or(serde_json::Value::Null)
+                    get_definition(uri, source, line, character, full_program.as_ref(), touched_len).unwrap_or(serde_json::Value::Null)
                 } else {
                     serde_json::Value::Null
                 };
@@ -465,6 +480,37 @@ fn utf16_position(chars: &[char], idx: usize) -> (u64, u64) {
         }
     }
     (line, col_units)
+}
+
+/// Inversa de `utf16_position`: línea (0-indexada) + columna en unidades
+/// UTF-16 (lo que el wire de LSP manda, `Position.line`/`.character`) ->
+/// offset de char absoluto en `source`. Hace falta para comparar la
+/// posición del cursor contra un `Span` (offsets de char, ver token.rs) --
+/// a diferencia de `get_word_at_pos`/`get_line_prefix_at_pos`, que operan
+/// sobre una sola línea aislada y nunca calculan un offset del archivo
+/// completo. Si `target_col` cae más allá del fin real de la línea, o
+/// `target_line` más allá del fin del archivo, clampea al límite más
+/// cercano en vez de panicar -- mismo criterio de "defensa en profundidad,
+/// no comportamiento esperado" que ya usa `render_diagnostic`.
+fn char_offset_from_utf16_position(source: &str, target_line: usize, target_col: usize) -> usize {
+    let chars: Vec<char> = source.chars().collect();
+    let mut line = 0usize;
+    let mut col_units = 0usize;
+    for (idx, &c) in chars.iter().enumerate() {
+        if line == target_line && col_units >= target_col {
+            return idx;
+        }
+        if c == '\n' {
+            if line == target_line {
+                return idx; // la columna pedida cae más allá del fin de esta línea
+            }
+            line += 1;
+            col_units = 0;
+        } else {
+            col_units += c.len_utf16();
+        }
+    }
+    chars.len()
 }
 
 /// Convierte un `Span` (offsets de caracteres del lexer, sin ninguna
@@ -733,11 +779,121 @@ pub fn get_hover(source: &str, line0: usize, col0: usize, full_program: Option<&
     None
 }
 
-pub fn get_definition(uri: &str, source: &str, line0: usize, col0: usize, full_program: Option<&Program>) -> Option<Value> {
-    let word = get_word_at_pos(source, line0, col0)?;
+/// Busca el `TypeExpr::Named` cuyo span cubre `offset`, recorriendo
+/// exhaustivamente las 8 variantes de `TypeExpr` (sin brazo `_`, a
+/// propósito -- una variante nueva de `TypeExpr` rompe la compilación acá
+/// en vez de que esta búsqueda la ignore en silencio). Mira primero los
+/// `args` de un genérico, para que el cursor en `Line` dentro de
+/// `List<Line>` resuelva a `Line`, nunca al `List` que lo envuelve.
+fn find_named_type_at(texpr: &TypeExpr, offset: usize) -> Option<(String, Span)> {
+    match texpr {
+        TypeExpr::Named(name, args, span) => {
+            for arg in args {
+                if let Some(found) = find_named_type_at(arg, offset) {
+                    return Some(found);
+                }
+            }
+            if offset >= span.start && offset < span.end {
+                Some((name.clone(), *span))
+            } else {
+                None
+            }
+        }
+        TypeExpr::Struct(fields) => fields.iter().find_map(|f| find_named_type_at(&f.ty, offset)),
+        TypeExpr::Map(k, v) => find_named_type_at(k, offset).or_else(|| find_named_type_at(v, offset)),
+        TypeExpr::Tuple(items) => items.iter().find_map(|t| find_named_type_at(t, offset)),
+        TypeExpr::Function(params, ret) => {
+            params.iter().find_map(|p| find_named_type_at(p, offset)).or_else(|| find_named_type_at(ret, offset))
+        }
+        TypeExpr::Optional(inner) | TypeExpr::List(inner) => find_named_type_at(inner, offset),
+        TypeExpr::Union(members) => members.iter().find_map(|m| find_named_type_at(m, offset)),
+    }
+}
 
+/// Aplica `find_named_type_at` sobre todas las firmas del programa --
+/// `Field`s de `type`/`db`/variantes de `enum`, `Param`s + `return_type`
+/// de `fn`/`rpc`/`stream`, y el `ty` de un `const`. Exactamente los mismos
+/// spans de FIRMA que `FnDecl.span`/`RpcDecl.span` ya cubren hoy (firma
+/// completa, nunca el body) -- por eso esta búsqueda nunca se solapa con
+/// hover/completion de Nivel 2 (que solo miran nombres de declaración) ni
+/// con una futura búsqueda dentro de un body (Nivel 3, ítems 1/2,
+/// GRAMMAR.md §3.19).
+fn find_named_type_in_program(program: &Program, offset: usize) -> Option<(String, Span)> {
+    for item in &program.items {
+        let found = match item {
+            Item::Type(t) => find_named_type_at(&t.ty, offset),
+            Item::Enum(e) => e.variants.iter().find_map(|v| {
+                v.fields.as_ref().and_then(|fields| fields.iter().find_map(|f| find_named_type_at(&f.ty, offset)))
+            }),
+            Item::Service(s) => s.members.iter().find_map(|member| {
+                let rpc = match member {
+                    ast::Member::Rpc(r) | ast::Member::Stream(r) => r,
+                };
+                rpc.params
+                    .iter()
+                    .find_map(|p| find_named_type_at(&p.ty, offset))
+                    .or_else(|| find_named_type_at(&rpc.return_type, offset))
+            }),
+            Item::Fn(f) => f
+                .params
+                .iter()
+                .find_map(|p| find_named_type_at(&p.ty, offset))
+                .or_else(|| find_named_type_at(&f.return_type, offset)),
+            Item::Const(c) => find_named_type_at(&c.ty, offset),
+            Item::Db(d) => d.collections.iter().find_map(|f| find_named_type_at(&f.ty, offset)),
+            Item::Import(_) => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// Busca la DECLARACIÓN (`type`/`enum`) de nombre `name`, para resolver a
+/// dónde saltar una vez que `find_named_type_in_program` identificó que el
+/// cursor está sobre un USO de ese nombre. `None` para un tipo builtin
+/// (`Int`/`String`/...) o un parámetro de tipo genérico -- ninguno de los
+/// dos tiene una declaración de nivel superior a la que saltar.
+fn find_type_declaration(program: &Program, name: &str) -> Option<Span> {
+    program.items.iter().find_map(|item| match item {
+        Item::Type(t) if t.name == name => Some(t.span),
+        Item::Enum(e) if e.name == name => Some(e.span),
+        _ => None,
+    })
+}
+
+fn get_definition_inner(uri: &str, source: &str, line0: usize, col0: usize, full_program: Option<&Program>, touched_len: usize) -> Option<Value> {
     let mut owned = None;
     let program = resolve_program(source, full_program, &mut owned)?;
+
+    // Con más de un archivo en el cierre transitivo, un `Span` del
+    // `Program` fusionado no tiene identidad de archivo -- podría venir de
+    // un `import`, no del documento abierto. Mismo gate que
+    // `compute_diagnostics_for_inner` ya usa para diagnósticos: nunca se
+    // arriesga una posición que puede estar en el archivo equivocado, para
+    // NINGUNA de las dos búsquedas de acá abajo (ni la de tipo, ni la de
+    // nombre de declaración) -- ver GRAMMAR.md §3.21.
+    if touched_len > 1 {
+        return None;
+    }
+
+    // Nivel 3: goto-def de un nombre de TIPO escrito en una firma
+    // (GRAMMAR.md §3.21). Corre PRIMERO y es AUTORITATIVA: si el offset
+    // cae dentro de un `TypeExpr::Named`, la respuesta viene de acá o es
+    // `None` -- nunca cae al loop de coincidencia-por-palabra de abajo.
+    // Necesario para evitar un falso positivo real: un campo con el mismo
+    // nombre que un tipo (`type Point = {...}; type Shape = { Point: Int
+    // }`) haría que el loop de abajo saltara (mal) al `type Point` al
+    // pedir goto-def sobre el NOMBRE DE CAMPO `Point`, no sobre un uso del
+    // tipo.
+    let offset = char_offset_from_utf16_position(source, line0, col0);
+    if let Some((type_name, _)) = find_named_type_in_program(program, offset) {
+        return find_type_declaration(program, &type_name)
+            .map(|span| json!({ "uri": uri, "range": span_to_range(source, span) }));
+    }
+
+    let word = get_word_at_pos(source, line0, col0)?;
 
     for item in &program.items {
         let (name, span) = match item {
@@ -783,6 +939,21 @@ pub fn get_definition(uri: &str, source: &str, line0: usize, col0: usize, full_p
     }
 
     None
+}
+
+/// Envuelto en `catch_unwind` -- mismo patrón que `compute_diagnostics_for`/
+/// `full_program_for` (ver esos comentarios): un panic acá no debe tirar
+/// abajo el proceso entero de `linkc lsp`, solo esta respuesta puntual.
+/// Único caller de `get_definition_inner`; los tests llaman a esta función
+/// (el nombre público no cambia).
+pub fn get_definition(uri: &str, source: &str, line0: usize, col0: usize, full_program: Option<&Program>, touched_len: usize) -> Option<Value> {
+    match std::panic::catch_unwind(|| get_definition_inner(uri, source, line0, col0, full_program, touched_len)) {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!("linkc lsp: panic interno en goto-definición para '{uri}' -- el servidor sigue corriendo");
+            None
+        }
+    }
 }
 
 pub fn get_completions(source: &str, line0: usize, col0: usize, full_program: Option<&Program>) -> Vec<Value> {
@@ -1122,9 +1293,67 @@ mod tests {
     #[test]
     fn test_definition() {
         let code = "type User = { id: Int }\n";
-        let def = get_definition("file:///test.link", code, 0, 6, None).expect("Debe encontrar definición");
+        let def = get_definition("file:///test.link", code, 0, 6, None, 1).expect("Debe encontrar definición");
         assert_eq!(def["uri"], "file:///test.link");
         assert_eq!(def["range"]["start"]["line"], 0);
+    }
+
+    // ---- goto-def de un nombre de tipo en una firma (Nivel 3, GRAMMAR.md §3.21) ----
+
+    #[test]
+    fn test_goto_def_on_type_name_in_return_type() {
+        let code = "type Point = { x: Int, y: Int }\nfn origin() -> Point { Point { x: 0, y: 0 } }\n";
+        let line = code.lines().nth(1).unwrap();
+        let col = line.find("-> Point").unwrap() + 3; // 'P' de Point, no el '-' de '->'
+        let def = get_definition("file:///test.link", code, 1, col, None, 1).expect("debe encontrar la declaración de Point");
+        assert_eq!(def["range"]["start"]["line"], 0, "debe apuntar a 'type Point' (línea 0), no a la firma donde se usa");
+    }
+
+    #[test]
+    fn test_goto_def_on_type_name_in_param_type() {
+        let code = "type Point = { x: Int, y: Int }\nfn dist(a: Point, b: Point) -> Int { 0 }\n";
+        let line = code.lines().nth(1).unwrap();
+        let col = line.find("a: Point").unwrap() + 3; // 'P' de Point en el primer parámetro
+        let def = get_definition("file:///test.link", code, 1, col, None, 1).expect("debe encontrar la declaración de Point");
+        assert_eq!(def["range"]["start"]["line"], 0);
+    }
+
+    #[test]
+    fn test_goto_def_on_type_name_nested_inside_a_generic() {
+        let code = "type Line = { startX: Int, endX: Int }\ntype Box<T> = { value: T }\nfn f() -> Box<Line> { Box { value: Line { startX: 0, endX: 0 } } }\n";
+        let line = code.lines().nth(2).unwrap();
+        let col = line.find("Box<Line>").unwrap() + "Box<".len(); // 'L' de Line, no la 'B' de Box
+        let def = get_definition("file:///test.link", code, 2, col, None, 1).expect("debe encontrar Line, no Box");
+        assert_eq!(def["range"]["start"]["line"], 0, "debe apuntar a 'type Line' (línea 0), no a 'type Box' (línea 1)");
+    }
+
+    #[test]
+    fn test_goto_def_on_a_builtin_type_name_does_not_jump_to_an_unrelated_same_named_const() {
+        // "Int" es un tipo builtin sin declaración type/enum propia. Si
+        // además existe un `const Int = ...` (nombre coincidente, otro
+        // namespace), el viejo loop de coincidencia-por-palabra saltaría
+        // (mal) a ESE const al pedir goto-def sobre el "Int" del tipo de
+        // retorno -- la búsqueda nueva es autoritativa (offset dentro de un
+        // TypeExpr::Named): responde `None` ella misma y nunca cae al loop
+        // viejo.
+        let code = "const Int: Bool = true;\nfn f() -> Int { 0 }\n";
+        let line = code.lines().nth(1).unwrap();
+        let col = line.find("-> Int").unwrap() + 3;
+        let result = get_definition("file:///test.link", code, 1, col, None, 1);
+        assert!(result.is_none(), "'Int' es builtin, sin declaración type/enum -- no debe saltar al const homónimo: {result:?}");
+    }
+
+    #[test]
+    fn test_goto_def_returns_none_when_more_than_one_file_is_touched() {
+        // Con más de un archivo en el cierre transitivo, un span del
+        // Program fusionado no tiene identidad de archivo -- podría venir
+        // de un import, no del documento abierto. Mismo gate que
+        // `compute_diagnostics_for_inner` ya usa para diagnósticos.
+        let code = "type Point = { x: Int, y: Int }\nfn origin() -> Point { Point { x: 0, y: 0 } }\n";
+        let line = code.lines().nth(1).unwrap();
+        let col = line.find("-> Point").unwrap() + 3;
+        let result = get_definition("file:///test.link", code, 1, col, None, 2); // touched_len=2 fuerza el gate
+        assert!(result.is_none(), "con más de un archivo tocado, nunca se debe arriesgar una posición: {result:?}");
     }
 
     #[test]

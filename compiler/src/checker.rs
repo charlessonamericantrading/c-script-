@@ -507,7 +507,7 @@ impl Checker {
 
     fn resolve_type_subst(&self, texpr: &TypeExpr, subst: &HashMap<String, Type>) -> Result<Type, CheckError> {
         match texpr {
-            TypeExpr::Named(name, args) => self.resolve_named_type_subst(name, args, subst),
+            TypeExpr::Named(name, args, _) => self.resolve_named_type_subst(name, args, subst),
             TypeExpr::Struct(fields) => {
                 let mut ftys = Vec::new();
                 for f in fields {
@@ -2209,7 +2209,11 @@ impl Checker {
                     return Err(err(format!("'{name}' no es un tipo struct, no se puede construir con {{...}}")));
                 };
                 self.check_fields_against(decl_fields, fields, env)?;
-                self.resolve_type(&TypeExpr::Named(name.to_string(), vec![]))
+                // Construcción sintética (sin texto fuente real detrás) solo
+                // para reusar el dispatch de resolve_type -- mismo span
+                // placeholder que ya usa parser.rs:1264 para un Spanned
+                // sintético análogo.
+                self.resolve_type(&TypeExpr::Named(name.to_string(), vec![], Span::new(0, 0, 0, 0)))
             }
         }
     }

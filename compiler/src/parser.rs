@@ -519,6 +519,7 @@ impl Parser {
     fn parse_primary_type(&mut self) -> Result<TypeExpr, ParseError> {
         match self.peek().clone() {
             TokenKind::Ident(name) => {
+                let name_span = self.span(); // cubre solo el identificador, no los type_args -- ver ast.rs::TypeExpr::Named
                 self.advance();
                 let args = if self.check(&TokenKind::Lt) {
                     self.advance();
@@ -532,7 +533,7 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
-                Ok(TypeExpr::Named(name, args))
+                Ok(TypeExpr::Named(name, args, name_span))
             }
             TokenKind::LBrace => {
                 self.advance();
@@ -1279,6 +1280,10 @@ mod tests {
         }
     }
 
+    // Span placeholder para literales de test -- TypeExpr::PartialEq ignora
+    // el span de Named a propósito (ast.rs), así que cualquier valor sirve.
+    const NOSPAN: Span = Span { start: 0, end: 0, line: 0, col: 0 };
+
     #[test]
     fn postfix_order_changes_the_type() {
         // T[]? = Optional(List(T))
@@ -1288,7 +1293,8 @@ mod tests {
             *ty,
             TypeExpr::Optional(Box::new(TypeExpr::List(Box::new(TypeExpr::Named(
                 "User".into(),
-                vec![]
+                vec![],
+                NOSPAN
             )))))
         );
 
@@ -1299,7 +1305,8 @@ mod tests {
             *ty,
             TypeExpr::List(Box::new(TypeExpr::Optional(Box::new(TypeExpr::Named(
                 "User".into(),
-                vec![]
+                vec![],
+                NOSPAN
             )))))
         );
     }
@@ -1310,14 +1317,14 @@ mod tests {
             "type A = (Int); type B = (Int, String); type C = (Int, String) -> Bool;",
         );
         let Item::Type(TypeDecl { ty: a, .. }) = &prog.items[0] else { panic!() };
-        assert_eq!(*a, TypeExpr::Named("Int".into(), vec![])); // agrupación pura
+        assert_eq!(*a, TypeExpr::Named("Int".into(), vec![], NOSPAN)); // agrupación pura
 
         let Item::Type(TypeDecl { ty: b, .. }) = &prog.items[1] else { panic!() };
         assert_eq!(
             *b,
             TypeExpr::Tuple(vec![
-                TypeExpr::Named("Int".into(), vec![]),
-                TypeExpr::Named("String".into(), vec![])
+                TypeExpr::Named("Int".into(), vec![], NOSPAN),
+                TypeExpr::Named("String".into(), vec![], NOSPAN)
             ])
         );
 
@@ -1326,10 +1333,10 @@ mod tests {
             *c,
             TypeExpr::Function(
                 vec![
-                    TypeExpr::Named("Int".into(), vec![]),
-                    TypeExpr::Named("String".into(), vec![])
+                    TypeExpr::Named("Int".into(), vec![], NOSPAN),
+                    TypeExpr::Named("String".into(), vec![], NOSPAN)
                 ],
-                Box::new(TypeExpr::Named("Bool".into(), vec![]))
+                Box::new(TypeExpr::Named("Bool".into(), vec![], NOSPAN))
             )
         );
     }
@@ -1343,9 +1350,10 @@ mod tests {
             TypeExpr::Named(
                 "Result".into(),
                 vec![
-                    TypeExpr::Named("User".into(), vec![]),
-                    TypeExpr::Named("ValidationError".into(), vec![])
-                ]
+                    TypeExpr::Named("User".into(), vec![], NOSPAN),
+                    TypeExpr::Named("ValidationError".into(), vec![], NOSPAN)
+                ],
+                NOSPAN
             )
         );
     }

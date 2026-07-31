@@ -214,11 +214,17 @@ impl PartialEq for FnDecl {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum TypeExpr {
     /// `identifier [type_args]` — incluye tipos primitivos (Int, String, ...),
     /// nombres de type/enum declarados, y genéricos instanciados (Result<A,B>).
-    Named(String, Vec<TypeExpr>),
+    /// El `Span` cubre solo el identificador (no los `type_args`) -- es lo
+    /// que permite al LSP resolver goto-definición de un nombre de tipo
+    /// escrito en una firma (GRAMMAR.md §3.21). Ninguna otra variante lleva
+    /// span propio a propósito: son combinadores sintácticos sin un
+    /// identificador escrito al que alguien pediría saltar (el `Int` dentro
+    /// de `Int[]` ya es su propio `Named` anidado).
+    Named(String, Vec<TypeExpr>, Span),
     /// `{ field_list }`
     Struct(Vec<Field>),
     /// `{ K: V }`
@@ -233,6 +239,27 @@ pub enum TypeExpr {
     List(Box<TypeExpr>),
     /// `A | B | C`
     Union(Vec<TypeExpr>),
+}
+
+/// A mano, no derivado: el `Span` de `Named` se ignora a propósito (mismo
+/// criterio que `Spanned<T>`, arriba) -- dos `TypeExpr` que describen el
+/// mismo tipo siguen siendo iguales sin importar en qué offset del archivo
+/// se haya escrito cada uno.
+impl PartialEq for TypeExpr {
+    fn eq(&self, other: &Self) -> bool {
+        use TypeExpr::*;
+        match (self, other) {
+            (Named(n1, a1, _), Named(n2, a2, _)) => n1 == n2 && a1 == a2,
+            (Struct(f1), Struct(f2)) => f1 == f2,
+            (Map(k1, v1), Map(k2, v2)) => k1 == k2 && v1 == v2,
+            (Tuple(t1), Tuple(t2)) => t1 == t2,
+            (Function(p1, r1), Function(p2, r2)) => p1 == p2 && r1 == r2,
+            (Optional(a), Optional(b)) => a == b,
+            (List(a), List(b)) => a == b,
+            (Union(a), Union(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -20,7 +20,7 @@ use wasm_encoder::{
 /// un enum, `T?`, `T[]`, ...) no tiene una representación wasm en v0.
 fn wasm_scalar_type(ty: &ast::TypeExpr) -> Result<ValType, String> {
     match ty {
-        ast::TypeExpr::Named(name, args) if args.is_empty() && (name == "Int" || name == "Bool") => {
+        ast::TypeExpr::Named(name, args, _) if args.is_empty() && (name == "Int" || name == "Bool") => {
             Ok(ValType::I64)
         }
         other => Err(format!(

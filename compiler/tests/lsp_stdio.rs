@@ -75,6 +75,16 @@ impl LspProcess {
         self.recv()
     }
 
+    fn definition(&mut self, uri: &str, line: u64, character: u64) -> Value {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "textDocument/definition",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }
+        }));
+        self.recv()
+    }
+
     /// Cierra stdin (el servidor ve EOF en su loop de `run_stdio` y
     /// termina solo) y espera a que el proceso hijo salga -- no dejar
     /// ningún `linkc.exe` huérfano corriendo después de un test.
@@ -177,6 +187,58 @@ fn a_valid_import_across_two_real_files_produces_no_false_positive_over_a_real_s
     let diag_notif = proc.did_open(&uri_a, text_a);
     let diags = diag_notif["params"]["diagnostics"].as_array().expect("diagnostics debe ser un array");
     assert!(diags.is_empty(), "un import válido a un archivo real no debería dar ningún diagnóstico: {diags:?}");
+    proc.shutdown();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- goto-def de un nombre de tipo en una firma (Nivel 3, GRAMMAR.md §3.21) ----
+
+#[test]
+fn goto_def_across_files_returns_null_instead_of_a_false_position_over_a_real_subprocess() {
+    // Un tipo usado en la firma de un archivo, declarado en OTRO archivo
+    // real -- con el gate de más-de-un-archivo-tocado (mismo criterio que
+    // `compute_diagnostics_for_inner` ya usa para diagnósticos), debe dar
+    // `null` en vez de una posición falsa calculada sobre el archivo
+    // equivocado.
+    let dir = std::env::temp_dir().join(format!("cscript-lsp-integration-gotodef-crossfile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("crear directorio temporal");
+    std::fs::write(dir.join("b.link"), "type Point = { x: Int, y: Int }").expect("escribir b.link");
+    let path_a = dir.join("a.link");
+    let text_a = r#"import { Point } from "./b.link"; fn origin() -> Point { Point { x: 0, y: 0 } }"#;
+    std::fs::write(&path_a, text_a).expect("escribir a.link");
+    let canon_a = std::fs::canonicalize(&path_a).expect("canonicalizar a.link");
+    let uri_a = path_to_uri(&canon_a);
+
+    let mut proc = LspProcess::start();
+    proc.initialize();
+    proc.did_open(&uri_a, text_a);
+    let col = text_a.find("-> Point").expect("el texto de prueba debe contener '-> Point'") as u64 + 3;
+    let resp = proc.definition(&uri_a, 0, col);
+    assert!(resp["result"].is_null(), "cruzando archivos, nunca se debe arriesgar una posición: {resp:?}");
+    proc.shutdown();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn goto_def_on_a_type_name_within_the_same_file_returns_the_exact_range_over_a_real_subprocess() {
+    let dir = std::env::temp_dir().join(format!("cscript-lsp-integration-gotodef-samefile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("crear directorio temporal");
+    let path = dir.join("shapes.link");
+    let text = "type Point = { x: Int, y: Int }\nfn origin() -> Point { Point { x: 0, y: 0 } }\n";
+    std::fs::write(&path, text).expect("escribir shapes.link");
+    let canon = std::fs::canonicalize(&path).expect("canonicalizar shapes.link");
+    let uri = path_to_uri(&canon);
+
+    let mut proc = LspProcess::start();
+    proc.initialize();
+    proc.did_open(&uri, text);
+    let line1 = text.lines().nth(1).expect("el texto de prueba debe tener una segunda línea");
+    let col = line1.find("-> Point").expect("la segunda línea debe contener '-> Point'") as u64 + 3;
+    let resp = proc.definition(&uri, 1, col);
+    assert_eq!(resp["result"]["uri"], uri);
+    assert_eq!(resp["result"]["range"]["start"]["line"], 0, "debe apuntar a 'type Point' en la línea 0: {resp:?}");
     proc.shutdown();
 
     let _ = std::fs::remove_dir_all(&dir);
