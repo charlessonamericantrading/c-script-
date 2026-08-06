@@ -6,6 +6,7 @@ use crate::ast::*;
 use crate::token::Span;
 use crate::types::{is_subtype, FieldType, Type};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 /// `span` es `Option` (no obligatorio) -- algunos errores no son cleanly
 /// "sobre" un nodo puntual (ej. un nombre duplicado detectado entre DOS
@@ -13,10 +14,19 @@ use std::collections::{HashMap, HashSet};
 /// `span: None`, y los ~113 call sites existentes no necesitan saber nada de
 /// esto -- el span se estampa DESPUÉS, en un puñado de puntos de frontera
 /// (`with_span`, más abajo), no en cada sitio de error.
+///
+/// `file` (identidad de archivo, GRAMMAR.md §3.21 "Not done yet") sigue el
+/// mismo patrón que `span`: `None` por defecto, estampado en los mismos 5
+/// puntos de entrada de `check_program_full` cuando el caller le pasa
+/// `item_files` (ver ese método) -- `None` para cualquier caller que no
+/// tiene identidad de archivo (todos los tests existentes, que construyen
+/// un `Program` a mano sin pasar por `modules.rs`), preservando su
+/// comportamiento exacto de antes.
 #[derive(Debug)]
 pub struct CheckError {
     pub message: String,
     pub span: Option<Span>,
+    pub file: Option<PathBuf>,
 }
 
 impl std::fmt::Display for CheckError {
@@ -26,7 +36,7 @@ impl std::fmt::Display for CheckError {
 }
 
 fn err(msg: impl Into<String>) -> CheckError {
-    CheckError { message: msg.into(), span: None }
+    CheckError { message: msg.into(), span: None, file: None }
 }
 
 impl CheckError {
@@ -38,6 +48,18 @@ impl CheckError {
         if self.span.is_none() {
             self.span = Some(span);
         }
+        self
+    }
+
+    /// A diferencia de `with_span`, acá no hace falta "primer stamp gana":
+    /// el archivo es constante para TODO el subárbol que
+    /// `check_program_full` chequea en una misma iteración de su loop
+    /// top-level (un ítem nunca se parte entre dos archivos), así que
+    /// siempre es correcto pisarlo con el valor más reciente -- no hay
+    /// noción de "más específico" como con el span, que sí varía por
+    /// profundidad.
+    fn with_file(mut self, file: PathBuf) -> Self {
+        self.file = Some(file);
         self
     }
 }
@@ -426,7 +448,27 @@ impl Checker {
     /// misma (ej. `resolve_type` sobre un tipo desconocido) y nunca pasan
     /// por ningún `Expr`.
     pub fn check_program(program: &Program) -> Result<(), Vec<CheckError>> {
-        let (_, errors) = Self::check_program_full(program);
+        let (_, errors) = Self::check_program_full(program, &[]);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Igual que `check_program`, pero con identidad de archivo por error
+    /// (`CheckError.file`, ver `check_program_full`) -- lo que
+    /// `main.rs::report_check_errors` necesita para renderizar un snippet
+    /// real sobre un error de tipos que vino de un archivo IMPORTADO, no
+    /// solo del archivo de entrada (antes de esta ronda, `touched.len() ==
+    /// 1` era la única forma de saber que un snippet era seguro de
+    /// mostrar). `main.rs` no puede llamar a `check_program_full`
+    /// directamente porque es `pub(crate)` de la librería -- invisible
+    /// desde el crate binario, aunque compartan paquete Cargo -- así que
+    /// esta es la fachada pública equivalente, igual que `check_program`
+    /// ya es la fachada pública de "no me importa el `Checker`".
+    pub fn check_program_with_files(program: &Program, item_files: &[PathBuf]) -> Result<(), Vec<CheckError>> {
+        let (_, errors) = Self::check_program_full(program, item_files);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -438,16 +480,32 @@ impl Checker {
     /// descartarlo -- el protocolo LSP lo necesita para hover/completion/
     /// goto-def (`.types`/`.enums`/`.fns`/`.consts`, `resolve_type`) sin
     /// tener que volver a chequear el programa entero para cada request.
-    /// `check_program` es simplemente el caso "no me importa el Checker",
-    /// así que sus call sites (`main.rs`, `wasm_demo.rs`) no cambian.
-    pub(crate) fn check_program_full(program: &Program) -> (Self, Vec<CheckError>) {
+    /// `check_program` es simplemente el caso "no me importa el Checker
+    /// NI la identidad de archivo", así que sus call sites de un solo
+    /// archivo (tests que arman un `Program` a mano) no cambian.
+    ///
+    /// `item_files` es opcional en la práctica aunque no en el tipo: pasar
+    /// `&[]` (como hace `check_program`) desactiva el stamping de archivo
+    /// sin romper nada -- `item_files.get(i)` da `None` para cualquier
+    /// índice, así que `CheckError.file` queda en `None` exactamente como
+    /// antes de esta ronda. Cuando SÍ viene poblado (mismo largo y orden
+    /// que `program.items`, ver `modules::load_program_with_overlay`),
+    /// cada error sale con el archivo real de la declaración que lo
+    /// originó, sin importar a qué profundidad del item se generó (un
+    /// item nunca se parte entre dos archivos).
+    pub(crate) fn check_program_full(program: &Program, item_files: &[PathBuf]) -> (Self, Vec<CheckError>) {
         let (checker, mut errors) = Self::build_symbols(program);
+        let file_for = |index: usize| item_files.get(index).cloned();
 
-        for item in &program.items {
+        for (index, item) in program.items.iter().enumerate() {
             match item {
                 Item::Fn(f) => {
                     if let Err(e) = checker.check_fn(f) {
-                        errors.push(e.with_span(f.span));
+                        let mut e = e.with_span(f.span);
+                        if let Some(file) = file_for(index) {
+                            e = e.with_file(file);
+                        }
+                        errors.push(e);
                     }
                 }
                 Item::Service(s) => {
@@ -457,19 +515,35 @@ impl Checker {
                             Member::Stream(r) => (r, true),
                         };
                         if let Err(e) = checker.check_rpc(rpc, is_stream) {
-                            errors.push(e.with_span(rpc.span));
+                            let mut e = e.with_span(rpc.span);
+                            if let Some(file) = file_for(index) {
+                                e = e.with_file(file);
+                            }
+                            errors.push(e);
                         }
                         if let Err(e) = checker.check_rpc_crosses_the_wire(rpc) {
-                            errors.push(e.with_span(rpc.span));
+                            let mut e = e.with_span(rpc.span);
+                            if let Some(file) = file_for(index) {
+                                e = e.with_file(file);
+                            }
+                            errors.push(e);
                         }
                         if let Err(e) = checker.check_rpc_annotation(rpc) {
-                            errors.push(e.with_span(rpc.span));
+                            let mut e = e.with_span(rpc.span);
+                            if let Some(file) = file_for(index) {
+                                e = e.with_file(file);
+                            }
+                            errors.push(e);
                         }
                     }
                 }
                 Item::Const(c) => {
                     if let Err(e) = checker.check_const(c) {
-                        errors.push(e.with_span(c.span));
+                        let mut e = e.with_span(c.span);
+                        if let Some(file) = file_for(index) {
+                            e = e.with_file(file);
+                        }
+                        errors.push(e);
                     }
                 }
                 _ => {}

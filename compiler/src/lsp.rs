@@ -13,6 +13,18 @@ pub struct LspServer {
     documents: HashMap<String, String>,
 }
 
+/// El `Program` fusionado de un archivo + su cierre transitivo de imports,
+/// junto con la identidad de archivo que hace falta para no arriesgar una
+/// posición en el archivo equivocado (GRAMMAR.md §3.21) -- ver
+/// `LspServer::full_program_loaded`.
+struct LoadedProgram {
+    program: Program,
+    /// Mismo largo y orden que `program.items` -- `item_files[i]` es el
+    /// archivo canonicalizado del que vino `program.items[i]`. Ver
+    /// `modules::load_program_with_overlay` para el porqué de esta forma.
+    item_files: Vec<PathBuf>,
+}
+
 impl Default for LspServer {
     fn default() -> Self {
         Self::new()
@@ -58,18 +70,18 @@ impl LspServer {
     /// aislado cuando esto da `None`, mismo camino que un archivo sin
     /// imports).
     fn full_program_for(&self, uri: &str) -> Option<Program> {
-        self.full_program_for_with_touched(uri).map(|(program, _)| program)
+        self.full_program_loaded(uri).map(|lp| lp.program)
     }
 
-    /// Igual que `full_program_for`, pero además expone cuántos archivos
-    /// entraron en el cierre transitivo (`touched.len()`) -- goto-definición
-    /// lo necesita para el mismo gate de seguridad que
-    /// `compute_diagnostics_for_inner` ya usa para diagnósticos: con más de
-    /// un archivo tocado, un `Span` encontrado en el `Program` fusionado no
-    /// tiene identidad de archivo (podría ser de un `import`, no del
-    /// documento abierto), así que nunca se arriesga a devolver una
-    /// posición que puede estar en el archivo equivocado.
-    fn full_program_for_with_touched(&self, uri: &str) -> Option<(Program, usize)> {
+    /// Igual que `full_program_for`, pero además expone, por ítem, de qué
+    /// archivo real vino cada uno (`item_files` -- GRAMMAR.md §3.21, "Not
+    /// done yet", resuelto en esta ronda vía
+    /// `modules::load_program_with_overlay`). Antes, con más de un archivo
+    /// en el cierre transitivo, goto-definición se negaba en bloque porque
+    /// un `Span` no decía de qué archivo venía -- ahora `item_files`
+    /// alcanza para resolver a qué archivo real apuntar sin arriesgar una
+    /// posición en el archivo equivocado.
+    fn full_program_loaded(&self, uri: &str) -> Option<LoadedProgram> {
         match std::panic::catch_unwind(|| self.full_program_for_inner(uri)) {
             Ok(result) => result,
             Err(_) => {
@@ -81,11 +93,13 @@ impl LspServer {
         }
     }
 
-    fn full_program_for_inner(&self, uri: &str) -> Option<(Program, usize)> {
+    fn full_program_for_inner(&self, uri: &str) -> Option<LoadedProgram> {
         let entry_path = uri_to_path(uri)?;
         let entry_canon = std::fs::canonicalize(&entry_path).ok()?;
         let overlay = self.build_overlay();
-        modules::load_program_with_overlay(&entry_canon, &overlay).ok().map(|(program, touched)| (program, touched.len()))
+        modules::load_program_with_overlay(&entry_canon, &overlay)
+            .ok()
+            .map(|(program, _touched, item_files)| LoadedProgram { program, item_files })
     }
 
     /// Diagnósticos para `uri`, soportando `import` de verdad. Si `uri` no
@@ -155,40 +169,39 @@ impl LspServer {
                     .collect()
             }
             Err(modules::LoadError::Other(message)) => vec![zero_diagnostic(message)],
-            Ok((program, touched)) => {
-                let (_, errors) = Checker::check_program_full(&program);
-                if touched.len() <= 1 {
-                    // Un solo archivo en el cierre transitivo -- mismo
-                    // documento que `uri`, así que cada span se puede
-                    // convertir con precisión total.
-                    let source = self.documents.get(uri).cloned().unwrap_or_default();
-                    errors
-                        .into_iter()
-                        .map(|e| {
-                            let range = match e.span {
-                                Some(span) => span_to_range(&source, span),
-                                None => zero_range(),
-                            };
-                            json!({ "range": range, "severity": 1, "source": "c-script", "message": e.message })
-                        })
-                        .collect()
-                } else if errors.is_empty() {
-                    vec![]
-                } else {
-                    // Más de un archivo: un CheckError no tiene identidad
-                    // de archivo tras el merge (a diferencia de
-                    // LoadError::Syntax arriba), así que NUNCA se adivina
-                    // una posición -- mismo criterio que
-                    // `main.rs::report_check_errors`'s gate `touched.len()
-                    // == 1`. Se publican todos los mensajes igual (nunca
-                    // esconder que algo está mal), anclados en una
-                    // posición degradada que dice explícitamente por qué.
-                    let combined = errors.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join("; ");
-                    vec![zero_diagnostic(format!(
-                        "(la posición puede estar en uno de los {} archivos importados) {combined}",
-                        touched.len()
-                    ))]
-                }
+            Ok((program, _touched, item_files)) => {
+                let (_, errors) = Checker::check_program_full(&program, &item_files);
+                // Antes de esta ronda (GRAMMAR.md §3.21, "Not done yet"),
+                // un CheckError no tenía identidad de archivo tras el
+                // merge, así que CUALQUIER programa con más de un archivo
+                // degradaba TODOS sus errores a una posición cero -- aunque
+                // el 100% de ellos estuviera en el documento abierto. Ahora
+                // `e.file` (estampado por `check_program_full` a partir de
+                // `item_files`) dice de qué archivo real vino cada error
+                // INDIVIDUAL: si coincide con `entry_canon` (el documento
+                // que disparó este chequeo), el span se convierte con
+                // precisión total sobre SU contenido; si no (vino de un
+                // `import`), el protocolo LSP no da forma de apuntar una
+                // posición de OTRO archivo dentro de la respuesta de
+                // `uri` -- se nombra el archivo real en el mensaje (mismo
+                // criterio que `LoadError::Syntax` ya usa arriba) en vez
+                // de esconder cuál de los N archivos importados era.
+                let source = self.documents.get(uri).cloned().unwrap_or_default();
+                errors
+                    .into_iter()
+                    .map(|e| {
+                        let in_open_doc = e.file.as_deref() == Some(entry_canon.as_path());
+                        let range = match (in_open_doc, e.span) {
+                            (true, Some(span)) => span_to_range(&source, span),
+                            _ => zero_range(),
+                        };
+                        let message = match (&e.file, in_open_doc) {
+                            (Some(file), false) => format!("(en '{}') {}", modules::display_path(file), e.message),
+                            _ => e.message,
+                        };
+                        json!({ "range": range, "severity": 1, "source": "c-script", "message": message })
+                    })
+                    .collect()
             }
         }
     }
@@ -387,12 +400,13 @@ impl LspServer {
                 let line = pos.get("line")?.as_u64()? as usize;
                 let character = pos.get("character")?.as_u64()? as usize;
 
-                let (full_program, touched_len) = match self.full_program_for_with_touched(uri) {
-                    Some((program, len)) => (Some(program), len),
-                    None => (None, 1), // sin archivo real en disco -- chequeo aislado del buffer solo, un único "archivo" implícito
-                };
+                let loaded = self.full_program_loaded(uri);
+                let full_program = loaded.as_ref().map(|lp| &lp.program);
+                let no_files: Vec<PathBuf> = Vec::new();
+                let item_files = loaded.as_ref().map(|lp| &lp.item_files).unwrap_or(&no_files);
+                let overlay = self.build_overlay();
                 let loc = if let Some(source) = self.documents.get(uri) {
-                    get_definition(uri, source, line, character, full_program.as_ref(), touched_len).unwrap_or(serde_json::Value::Null)
+                    get_definition(uri, source, line, character, full_program, item_files, &overlay).unwrap_or(serde_json::Value::Null)
                 } else {
                     serde_json::Value::Null
                 };
@@ -854,29 +868,64 @@ fn find_named_type_in_program(program: &Program, offset: usize) -> Option<(Strin
 /// dónde saltar una vez que `find_named_type_in_program` identificó que el
 /// cursor está sobre un USO de ese nombre. `None` para un tipo builtin
 /// (`Int`/`String`/...) o un parámetro de tipo genérico -- ninguno de los
-/// dos tiene una declaración de nivel superior a la que saltar.
-fn find_type_declaration(program: &Program, name: &str) -> Option<Span> {
-    program.items.iter().find_map(|item| match item {
-        Item::Type(t) if t.name == name => Some(t.span),
-        Item::Enum(e) if e.name == name => Some(e.span),
+/// dos tiene una declaración de nivel superior a la que saltar. Devuelve
+/// también el ÍNDICE del ítem en `program.items` -- lo que `respond` (en
+/// `get_definition_inner`) necesita para mirar `item_files[index]` y saber
+/// de qué archivo real vino, ya que esta búsqueda puede cruzar a un `type`/
+/// `enum` declarado en un archivo IMPORTADO, no en el documento abierto.
+fn find_type_declaration(program: &Program, name: &str) -> Option<(usize, Span)> {
+    program.items.iter().enumerate().find_map(|(i, item)| match item {
+        Item::Type(t) if t.name == name => Some((i, t.span)),
+        Item::Enum(e) if e.name == name => Some((i, e.span)),
         _ => None,
     })
 }
 
-fn get_definition_inner(uri: &str, source: &str, line0: usize, col0: usize, full_program: Option<&Program>, touched_len: usize) -> Option<Value> {
+/// `item_files`/`overlay` resuelven la identidad de archivo (GRAMMAR.md
+/// §3.21, "Not done yet" hasta esta ronda): antes, con más de un archivo en
+/// el cierre transitivo, esta función se negaba en bloque, porque un
+/// `Span` del `Program` fusionado no decía de qué archivo venía (podía ser
+/// de un `import`, no del documento abierto) y devolver una posición
+/// adivinada sobre el archivo equivocado es peor que no devolver nada.
+/// Ahora cada ítem sabe
+/// su archivo real (`item_files[i]`, mismo orden que `program.items`,
+/// poblado por `modules::load_program_with_overlay`) -- `respond` la usa
+/// para apuntar al archivo correcto (potencialmente distinto de `uri`,
+/// exactamente el caso "cruzar a la declaración en el archivo importado")
+/// en vez de negarse. `item_files` vacío (el buffer aislado de un test o
+/// un documento sin resolver vía `modules.rs`) preserva el comportamiento
+/// de siempre: todo pertenece a `uri`/`source`.
+fn get_definition_inner(
+    uri: &str,
+    source: &str,
+    line0: usize,
+    col0: usize,
+    full_program: Option<&Program>,
+    item_files: &[PathBuf],
+    overlay: &HashMap<PathBuf, String>,
+) -> Option<Value> {
     let mut owned = None;
     let program = resolve_program(source, full_program, &mut owned)?;
 
-    // Con más de un archivo en el cierre transitivo, un `Span` del
-    // `Program` fusionado no tiene identidad de archivo -- podría venir de
-    // un `import`, no del documento abierto. Mismo gate que
-    // `compute_diagnostics_for_inner` ya usa para diagnósticos: nunca se
-    // arriesga una posición que puede estar en el archivo equivocado, para
-    // NINGUNA de las dos búsquedas de acá abajo (ni la de tipo, ni la de
-    // nombre de declaración) -- ver GRAMMAR.md §3.21.
-    if touched_len > 1 {
-        return None;
-    }
+    let file_aware = !item_files.is_empty() && item_files.len() == program.items.len();
+
+    // Arma la respuesta para el ítem `index` (con span `span`, dentro de
+    // SU PROPIO archivo) -- al documento abierto si coincide (rápido, sin
+    // tocar disco/overlay) o al archivo real en caso contrario. `None`
+    // solo si el archivo real no se puede leer ni desde el overlay ni
+    // desde disco (borrado entre el parse y este request).
+    let respond = |index: usize, span: Span| -> Option<Value> {
+        if !file_aware {
+            return Some(json!({ "uri": uri, "range": span_to_range(source, span) }));
+        }
+        let target_file = &item_files[index];
+        let target_uri = path_to_uri(target_file);
+        if target_uri == uri {
+            return Some(json!({ "uri": uri, "range": span_to_range(source, span) }));
+        }
+        let target_source = overlay.get(target_file).cloned().or_else(|| std::fs::read_to_string(target_file).ok())?;
+        Some(json!({ "uri": target_uri, "range": span_to_range(&target_source, span) }))
+    };
 
     // Nivel 3: goto-def de un nombre de TIPO escrito en una firma
     // (GRAMMAR.md §3.21). Corre PRIMERO y es AUTORITATIVA: si el offset
@@ -889,13 +938,12 @@ fn get_definition_inner(uri: &str, source: &str, line0: usize, col0: usize, full
     // tipo.
     let offset = char_offset_from_utf16_position(source, line0, col0);
     if let Some((type_name, _)) = find_named_type_in_program(program, offset) {
-        return find_type_declaration(program, &type_name)
-            .map(|span| json!({ "uri": uri, "range": span_to_range(source, span) }));
+        return find_type_declaration(program, &type_name).and_then(|(index, span)| respond(index, span));
     }
 
     let word = get_word_at_pos(source, line0, col0)?;
 
-    for item in &program.items {
+    for (index, item) in program.items.iter().enumerate() {
         let (name, span) = match item {
             Item::Type(t) => (&t.name, t.span),
             Item::Enum(e) => (&e.name, e.span),
@@ -905,10 +953,7 @@ fn get_definition_inner(uri: &str, source: &str, line0: usize, col0: usize, full
             Item::Db(d) => {
                 for col in &d.collections {
                     if col.name == word {
-                        return Some(json!({
-                            "uri": uri,
-                            "range": span_to_range(source, d.span)
-                        }));
+                        return respond(index, d.span);
                     }
                 }
                 continue;
@@ -917,10 +962,7 @@ fn get_definition_inner(uri: &str, source: &str, line0: usize, col0: usize, full
         };
 
         if name == &word {
-            return Some(json!({
-                "uri": uri,
-                "range": span_to_range(source, span)
-            }));
+            return respond(index, span);
         }
 
         if let Item::Service(s) = item {
@@ -929,10 +971,7 @@ fn get_definition_inner(uri: &str, source: &str, line0: usize, col0: usize, full
                     ast::Member::Rpc(r) | ast::Member::Stream(r) => r,
                 };
                 if rpc.name == word {
-                    return Some(json!({
-                        "uri": uri,
-                        "range": span_to_range(source, rpc.span)
-                    }));
+                    return respond(index, rpc.span);
                 }
             }
         }
@@ -946,8 +985,16 @@ fn get_definition_inner(uri: &str, source: &str, line0: usize, col0: usize, full
 /// abajo el proceso entero de `linkc lsp`, solo esta respuesta puntual.
 /// Único caller de `get_definition_inner`; los tests llaman a esta función
 /// (el nombre público no cambia).
-pub fn get_definition(uri: &str, source: &str, line0: usize, col0: usize, full_program: Option<&Program>, touched_len: usize) -> Option<Value> {
-    match std::panic::catch_unwind(|| get_definition_inner(uri, source, line0, col0, full_program, touched_len)) {
+pub fn get_definition(
+    uri: &str,
+    source: &str,
+    line0: usize,
+    col0: usize,
+    full_program: Option<&Program>,
+    item_files: &[PathBuf],
+    overlay: &HashMap<PathBuf, String>,
+) -> Option<Value> {
+    match std::panic::catch_unwind(|| get_definition_inner(uri, source, line0, col0, full_program, item_files, overlay)) {
         Ok(result) => result,
         Err(_) => {
             eprintln!("linkc lsp: panic interno en goto-definición para '{uri}' -- el servidor sigue corriendo");
@@ -1293,7 +1340,7 @@ mod tests {
     #[test]
     fn test_definition() {
         let code = "type User = { id: Int }\n";
-        let def = get_definition("file:///test.link", code, 0, 6, None, 1).expect("Debe encontrar definición");
+        let def = get_definition("file:///test.link", code, 0, 6, None, &[], &HashMap::new()).expect("Debe encontrar definición");
         assert_eq!(def["uri"], "file:///test.link");
         assert_eq!(def["range"]["start"]["line"], 0);
     }
@@ -1305,7 +1352,8 @@ mod tests {
         let code = "type Point = { x: Int, y: Int }\nfn origin() -> Point { Point { x: 0, y: 0 } }\n";
         let line = code.lines().nth(1).unwrap();
         let col = line.find("-> Point").unwrap() + 3; // 'P' de Point, no el '-' de '->'
-        let def = get_definition("file:///test.link", code, 1, col, None, 1).expect("debe encontrar la declaración de Point");
+        let def =
+            get_definition("file:///test.link", code, 1, col, None, &[], &HashMap::new()).expect("debe encontrar la declaración de Point");
         assert_eq!(def["range"]["start"]["line"], 0, "debe apuntar a 'type Point' (línea 0), no a la firma donde se usa");
     }
 
@@ -1314,7 +1362,8 @@ mod tests {
         let code = "type Point = { x: Int, y: Int }\nfn dist(a: Point, b: Point) -> Int { 0 }\n";
         let line = code.lines().nth(1).unwrap();
         let col = line.find("a: Point").unwrap() + 3; // 'P' de Point en el primer parámetro
-        let def = get_definition("file:///test.link", code, 1, col, None, 1).expect("debe encontrar la declaración de Point");
+        let def =
+            get_definition("file:///test.link", code, 1, col, None, &[], &HashMap::new()).expect("debe encontrar la declaración de Point");
         assert_eq!(def["range"]["start"]["line"], 0);
     }
 
@@ -1323,7 +1372,7 @@ mod tests {
         let code = "type Line = { startX: Int, endX: Int }\ntype Box<T> = { value: T }\nfn f() -> Box<Line> { Box { value: Line { startX: 0, endX: 0 } } }\n";
         let line = code.lines().nth(2).unwrap();
         let col = line.find("Box<Line>").unwrap() + "Box<".len(); // 'L' de Line, no la 'B' de Box
-        let def = get_definition("file:///test.link", code, 2, col, None, 1).expect("debe encontrar Line, no Box");
+        let def = get_definition("file:///test.link", code, 2, col, None, &[], &HashMap::new()).expect("debe encontrar Line, no Box");
         assert_eq!(def["range"]["start"]["line"], 0, "debe apuntar a 'type Line' (línea 0), no a 'type Box' (línea 1)");
     }
 
@@ -1339,21 +1388,52 @@ mod tests {
         let code = "const Int: Bool = true;\nfn f() -> Int { 0 }\n";
         let line = code.lines().nth(1).unwrap();
         let col = line.find("-> Int").unwrap() + 3;
-        let result = get_definition("file:///test.link", code, 1, col, None, 1);
+        let result = get_definition("file:///test.link", code, 1, col, None, &[], &HashMap::new());
         assert!(result.is_none(), "'Int' es builtin, sin declaración type/enum -- no debe saltar al const homónimo: {result:?}");
     }
 
     #[test]
-    fn test_goto_def_returns_none_when_more_than_one_file_is_touched() {
-        // Con más de un archivo en el cierre transitivo, un span del
-        // Program fusionado no tiene identidad de archivo -- podría venir
-        // de un import, no del documento abierto. Mismo gate que
-        // `compute_diagnostics_for_inner` ya usa para diagnósticos.
+    fn test_goto_def_without_item_files_treats_everything_as_the_open_document() {
+        // `item_files` vacío (el buffer aislado que estos mismos tests
+        // usan, sin pasar por `modules.rs`) es el modo "sin identidad de
+        // archivo real disponible" -- `file_aware` da `false` y todo
+        // resuelve contra `uri`/`source`, igual que ANTES de esta ronda
+        // (cuando `touched_len > 1` era el único criterio y este caso caía
+        // siempre en la rama de un solo archivo). El caso de verdad
+        // multi-archivo (con `item_files` real) se prueba más abajo, con
+        // archivos reales en disco -- acá no hay forma honesta de simular
+        // "más de un archivo" sin ellos.
         let code = "type Point = { x: Int, y: Int }\nfn origin() -> Point { Point { x: 0, y: 0 } }\n";
         let line = code.lines().nth(1).unwrap();
         let col = line.find("-> Point").unwrap() + 3;
-        let result = get_definition("file:///test.link", code, 1, col, None, 2); // touched_len=2 fuerza el gate
-        assert!(result.is_none(), "con más de un archivo tocado, nunca se debe arriesgar una posición: {result:?}");
+        let def = get_definition("file:///test.link", code, 1, col, None, &[], &HashMap::new())
+            .expect("sin item_files, debe resolver contra el propio documento como siempre");
+        assert_eq!(def["uri"], "file:///test.link");
+        assert_eq!(def["range"]["start"]["line"], 0);
+    }
+
+    #[test]
+    fn test_goto_def_resolves_to_the_real_imported_file_when_item_files_is_available() {
+        // El caso que GRAMMAR.md §3.21 dejaba pendiente ("Not done yet"):
+        // goto-def sobre un tipo declarado en un archivo IMPORTADO, con
+        // item_files real (mismo shape que `modules::load_program_with_
+        // overlay` produce) -- antes esto se negaba en bloque
+        // (`touched_len > 1 -> None`); ahora debe resolver al archivo Y
+        // rango reales de la declaración, no al documento que abrió la
+        // request.
+        let dir = TempDir::new("gotodef_cross_file_resolves");
+        let b_uri = dir.write("b.link", "type Point = { x: Int, y: Int }\n");
+        let a_text = "import { Point } from \"./b.link\";\nfn origin() -> Point { Point { x: 0, y: 0 } }\n";
+        let a_uri = dir.write("a.link", a_text);
+        let a_path = uri_to_path(&a_uri).expect("a_uri debe convertir de vuelta a un Path");
+
+        let (program, _touched, item_files) = modules::load_program(&a_path).expect("a.link debe cargar bien");
+        let col = a_text.lines().nth(1).unwrap().find("-> Point").unwrap() + 3;
+
+        let def = get_definition(&a_uri, a_text, 1, col, Some(&program), &item_files, &HashMap::new())
+            .expect("debe resolver la declaración de Point en b.link, no devolver null");
+        assert_eq!(def["uri"], b_uri, "debe apuntar a b.link, no al a.link que abrió la request: {def:?}");
+        assert_eq!(def["range"]["start"]["line"], 0, "'type Point' es la línea 0 de b.link: {def:?}");
     }
 
     #[test]

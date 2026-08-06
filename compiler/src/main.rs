@@ -29,39 +29,45 @@ fn report_load_error(e: &modules::LoadError) {
     }
 }
 
-/// Reporta los errores de `check_program` (LSP prerrequisito 3/3), con
-/// snippet+caret cuando es seguro hacerlo. `Span` no tiene identidad de
-/// archivo (token.rs), y `modules::load_program` funde TODOS los archivos
-/// importados transitivamente en un solo `Program` sin etiquetar de qué
-/// archivo vino cada ítem -- así que releer ingenuamente el archivo de
-/// ENTRADA para renderizar un error que en realidad vino de un archivo
-/// IMPORTADO sería activamente engañoso (un snippet plausible, pero de la
-/// línea equivocada). Gate de seguridad: solo se renderiza con snippet
-/// cuando `touched.len() == 1` -- si el programa vino de más de un archivo,
-/// cae al `Display` plano de siempre para TODOS los errores, no solo los
-/// dudosos. Proveniencia real por archivo (para levantar este límite)
-/// queda para una ronda futura, no bloqueante acá.
+/// Reporta los errores de `check_program_with_files`, con snippet+caret
+/// cuando es seguro hacerlo. Antes de esta ronda (GRAMMAR.md §3.21, "Not
+/// done yet"), `Span` no tenía identidad de archivo y el único gate posible
+/// era `touched.len() == 1` -- cualquier programa con imports caía al
+/// `Display` plano para TODOS sus errores, aunque el 100% de ellos
+/// estuvieran en el archivo de entrada. Ahora `CheckError.file` (estampado
+/// por `check_program_full` con `item_files`, ver checker.rs y
+/// modules::load_program_with_overlay) le dice a cada error de qué archivo
+/// real vino, así que el snippet se renderiza por error individual, no por
+/// el programa entero -- un error sin `file` (no debería pasar cuando el
+/// caller pasa `item_files` poblado, pero se maneja igual por si acaso)
+/// cae al `Display` plano de siempre, nunca a una posición adivinada.
+///
+/// `single_file` cachea las lecturas de disco (varios errores del mismo
+/// archivo no lo releen cada vez), poblado de forma perezosa a medida que
+/// aparecen archivos nuevos en los errores.
 ///
 /// Orden de reporte: `build_symbols` hace 4 scans secuenciales (types+enums,
 /// fns, consts, db) que respetan el orden del archivo DENTRO de cada scan,
 /// pero no ENTRE scans -- se ordena acá por posición antes de imprimir, con
 /// los errores sin span (algunos de `build_symbols` no son "sobre" un nodo
 /// puntual) consistentemente al final.
-fn report_check_errors(mut errors: Vec<checker::CheckError>, touched: &[PathBuf]) {
+fn report_check_errors(mut errors: Vec<checker::CheckError>) {
     errors.sort_by_key(|e| match e.span {
         Some(s) => (0, s.line, s.col),
         None => (1, 0, 0),
     });
-    let single_file = match touched {
-        [only] => fs::read_to_string(only).ok().map(|src| (display_path(only), src)),
-        _ => None,
-    };
+    let mut source_cache: std::collections::HashMap<PathBuf, Option<String>> = std::collections::HashMap::new();
     for e in &errors {
-        match (&single_file, e.span) {
-            (Some((label, source)), Some(span)) => {
-                eprintln!("{}", diagnostics::render_diagnostic(source, label, span, &e.message));
+        let rendered = match (&e.file, e.span) {
+            (Some(path), Some(span)) => {
+                let source = source_cache.entry(path.clone()).or_insert_with(|| fs::read_to_string(path).ok());
+                source.as_ref().map(|src| diagnostics::render_diagnostic(src, &display_path(path), span, &e.message))
             }
-            _ => eprintln!("{e}"),
+            _ => None,
+        };
+        match rendered {
+            Some(snippet) => eprintln!("{snippet}"),
+            None => eprintln!("{e}"),
         }
     }
 }
@@ -139,13 +145,13 @@ fn cmd_new(args: &[String]) -> ExitCode {
 }
 
 fn load_and_check(path: &str) -> Result<Program, ExitCode> {
-    let (program, touched) = modules::load_program(Path::new(path)).map_err(|e| {
+    let (program, _touched, item_files) = modules::load_program(Path::new(path)).map_err(|e| {
         report_load_error(&e);
         ExitCode::FAILURE
     })?;
 
-    checker::Checker::check_program(&program).map_err(|errors| {
-        report_check_errors(errors, &touched);
+    checker::Checker::check_program_with_files(&program, &item_files).map_err(|errors| {
+        report_check_errors(errors);
         ExitCode::FAILURE
     })?;
 
@@ -180,15 +186,15 @@ struct BuildResult {
 }
 
 fn build_once(path: &str, outdir: &str) -> BuildResult {
-    let (program, touched) = match modules::load_program(Path::new(path)) {
-        Ok(pair) => pair,
+    let (program, touched, item_files) = match modules::load_program(Path::new(path)) {
+        Ok(triple) => triple,
         Err(e) => {
             report_load_error(&e);
             return BuildResult { ok: false, touched: vec![PathBuf::from(path)] };
         }
     };
-    if let Err(errors) = checker::Checker::check_program(&program) {
-        report_check_errors(errors, &touched);
+    if let Err(errors) = checker::Checker::check_program_with_files(&program, &item_files) {
+        report_check_errors(errors);
         return BuildResult { ok: false, touched };
     }
 

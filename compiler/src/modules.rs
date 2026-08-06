@@ -100,10 +100,10 @@ fn canonicalize(path: &Path) -> Result<PathBuf, LoadError> {
 
 /// Carga `entry` y todo su cierre transitivo de imports, devolviendo un
 /// `Program` con los ítems de TODOS los archivos alcanzados (sin los
-/// `Item::Import` ya resueltos -- el checker no necesita verlos) más la
-/// lista de archivos físicos tocados, en el orden en que se leyeron por
-/// primera vez (la reutiliza `link dev` para saber qué observar).
-pub fn load_program(entry: &Path) -> Result<(Program, Vec<PathBuf>), LoadError> {
+/// `Item::Import` ya resueltos -- el checker no necesita verlos), la lista
+/// de archivos físicos tocados (la reutiliza `link dev` para saber qué
+/// observar), y `item_files` -- ver `load_program_with_overlay`.
+pub fn load_program(entry: &Path) -> Result<(Program, Vec<PathBuf>, Vec<PathBuf>), LoadError> {
     load_program_with_overlay(entry, &HashMap::new())
 }
 
@@ -112,10 +112,19 @@ pub fn load_program(entry: &Path) -> Result<(Program, Vec<PathBuf>), LoadError> 
 /// potencialmente con cambios sin guardar) en vez de `fs::read_to_string` --
 /// el seam que el LSP (GRAMMAR.md, protocolo LSP) necesita para chequear el
 /// contenido REAL de un documento abierto, no el de disco, que puede estar
-/// desactualizado. `load_program` es simplemente el caso `overlay` vacío,
-/// así que los 4 call sites existentes (`cmd_check`/`build_once`/`cmd_serve`/
-/// los tests de este archivo) no cambian ni de firma ni de comportamiento.
-pub fn load_program_with_overlay(entry: &Path, overlay: &HashMap<PathBuf, String>) -> Result<(Program, Vec<PathBuf>), LoadError> {
+/// desactualizado.
+///
+/// El tercer elemento del resultado, `item_files`, es la identidad de
+/// archivo por ítem (GRAMMAR.md §3.21, "Not done yet"): un `Vec<PathBuf>`
+/// del MISMO largo y orden que `Program.items` -- `item_files[i]` es el
+/// archivo canonicalizado del que vino `items[i]`. Un `Span` dentro de
+/// `items[i]` (a cualquier profundidad -- firma, body, una sub-expresión)
+/// SIEMPRE pertenece a ese mismo archivo, porque un ítem nunca se parte
+/// entre dos archivos; por eso alcanza con trackear el archivo por ÍTEM,
+/// no por span individual, para resolver la ambigüedad que antes obligaba
+/// a `lsp.rs`/`main.rs` a negarse en bloque (`touched.len() <= 1`) apenas
+/// un programa tocaba más de un archivo.
+pub fn load_program_with_overlay(entry: &Path, overlay: &HashMap<PathBuf, String>) -> Result<(Program, Vec<PathBuf>, Vec<PathBuf>), LoadError> {
     let canon_entry = canonicalize(entry)?;
     let project_root = canon_entry.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
     let mut loader = Loader {
@@ -128,8 +137,9 @@ pub fn load_program_with_overlay(entry: &Path, overlay: &HashMap<PathBuf, String
     let mut on_stack = HashSet::new();
     let mut done = HashSet::new();
     let mut merged = Vec::new();
-    loader.visit(&canon_entry, &mut on_stack, &mut done, &mut merged)?;
-    Ok((Program { items: merged }, loader.touched))
+    let mut merged_files = Vec::new();
+    loader.visit(&canon_entry, &mut on_stack, &mut done, &mut merged, &mut merged_files)?;
+    Ok((Program { items: merged }, loader.touched, merged_files))
 }
 
 struct Loader<'a> {
@@ -189,12 +199,14 @@ impl Loader<'_> {
         canonicalize(&self.project_root.join(dep_path))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         &mut self,
         canon: &Path,
         on_stack: &mut HashSet<PathBuf>,
         done: &mut HashSet<PathBuf>,
         merged: &mut Vec<Item>,
+        merged_files: &mut Vec<PathBuf>,
     ) -> Result<(), LoadError> {
         if done.contains(canon) {
             return Ok(()); // caso diamante: ya se procesó por otro camino
@@ -221,13 +233,17 @@ impl Loader<'_> {
                         )));
                     }
                 }
-                self.visit(&target, on_stack, done, merged)?;
+                self.visit(&target, on_stack, done, merged, merged_files)?;
             }
         }
 
         for item in items {
             if !matches!(item, Item::Import(_)) {
                 merged.push(item);
+                // Un ítem por push, en el MISMO orden -- `item_files[i]`
+                // queda alineado con `merged[i]` sin necesitar ningún
+                // índice explícito (ver doc de `load_program_with_overlay`).
+                merged_files.push(canon.to_path_buf());
             }
         }
         on_stack.remove(canon);
@@ -316,9 +332,15 @@ mod tests {
             fn origin() -> Point { Point { x: 0, y: 0 } }
         "#,
         );
-        let (program, touched) = load_program(&dir.path("a.link")).unwrap();
+        let (program, touched, item_files) = load_program(&dir.path("a.link")).unwrap();
         assert_eq!(program.items.len(), 2); // Point + origin, sin el Import
         assert_eq!(touched.len(), 2);
+        assert_eq!(item_files.len(), 2, "un archivo por ítem, mismo largo que program.items");
+        // Point vino de b.link, origin vino de a.link -- no del mismo
+        // archivo, aunque a.link sea el entry point de ambos.
+        assert_ne!(item_files[0], item_files[1]);
+        assert!(item_files[0].ends_with("b.link"));
+        assert!(item_files[1].ends_with("a.link"));
     }
 
     #[test]
@@ -360,11 +382,15 @@ mod tests {
             import { use_in_c } from "./c.link";
         "#,
         );
-        let (program, touched) = load_program(&dir.path("a.link")).unwrap();
+        let (program, touched, item_files) = load_program(&dir.path("a.link")).unwrap();
         // Shared (de d.link, una sola vez) + use_in_b + use_in_c = 3 ítems,
         // NO 4 (que sería Shared duplicado si d.link se cargara dos veces).
         assert_eq!(program.items.len(), 3);
         assert_eq!(touched.len(), 4); // a, b, c, d -- cada archivo físico, una vez
+        assert_eq!(item_files.len(), 3);
+        assert!(item_files[0].ends_with("d.link"), "Shared vino de d.link");
+        assert!(item_files[1].ends_with("b.link"), "use_in_b vino de b.link");
+        assert!(item_files[2].ends_with("c.link"), "use_in_c vino de c.link");
     }
 
     #[test]
@@ -436,7 +462,7 @@ mod tests {
             fn unit_circle() -> Circle { Circle { r: 1 } }
         "#,
         );
-        let (program, _) = load_program(&dir.path("a.link")).unwrap();
+        let (program, _, _) = load_program(&dir.path("a.link")).unwrap();
         assert_eq!(program.items.len(), 2);
     }
 }

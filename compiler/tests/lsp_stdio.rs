@@ -166,6 +166,42 @@ fn opening_a_file_with_a_real_syntax_error_reports_it_over_a_real_subprocess() {
 }
 
 #[test]
+fn a_type_error_in_the_open_document_that_also_imports_another_file_gets_a_real_range_over_a_real_subprocess() {
+    // El otro lado del bug de identidad de archivo (GRAMMAR.md §3.21, "Not
+    // done yet"): antes, CUALQUIER programa con más de un archivo tocado
+    // degradaba TODOS sus errores de tipos a un solo diagnóstico en la
+    // posición (0,0) con un mensaje genérico -- incluso cuando el error
+    // real estaba en el propio documento abierto, no en el archivo
+    // importado. Acá a.link importa b.link (import válido, sin error) Y
+    // tiene un error de tipos real (`x: Int` recibiendo un `String`) --
+    // debe dar un rango real sobre a.link, no la posición degradada.
+    let dir = std::env::temp_dir().join(format!("cscript-lsp-integration-typeerror-open-doc-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("crear directorio temporal");
+    std::fs::write(dir.join("b.link"), "type Unused = { n: Int }").expect("escribir b.link");
+    let path_a = dir.join("a.link");
+    let text_a =
+        "import { Unused } from \"./b.link\";\ntype Point = { x: Int, y: Int }\nfn origin() -> Point { Point { x: \"nope\", y: 0 } }\n";
+    std::fs::write(&path_a, text_a).expect("escribir a.link");
+    let canon_a = std::fs::canonicalize(&path_a).expect("canonicalizar a.link");
+    let uri_a = path_to_uri(&canon_a);
+
+    let mut proc = LspProcess::start();
+    proc.initialize();
+    let diag_notif = proc.did_open(&uri_a, text_a);
+    assert_eq!(diag_notif["params"]["uri"], uri_a);
+    let diags = diag_notif["params"]["diagnostics"].as_array().expect("diagnostics debe ser un array");
+    assert_eq!(diags.len(), 1, "debe haber exactamente el error de tipos de x: {diags:?}");
+    assert_eq!(diags[0]["range"]["start"]["line"], 2, "el error está en la línea 2 (0-indexed) de a.link: {diags:?}");
+    assert!(
+        !diags[0]["message"].as_str().unwrap_or("").contains("importados"),
+        "el error está en el documento ABIERTO, no debería usar el mensaje degradado de 'archivos importados': {diags:?}"
+    );
+    proc.shutdown();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_valid_import_across_two_real_files_produces_no_false_positive_over_a_real_subprocess() {
     // El bug concreto que esta ronda de trabajo arregló: antes de conectar
     // lsp.rs a modules::load_program_with_overlay, cualquier archivo con
@@ -195,15 +231,21 @@ fn a_valid_import_across_two_real_files_produces_no_false_positive_over_a_real_s
 // ---- goto-def de un nombre de tipo en una firma (Nivel 3, GRAMMAR.md §3.21) ----
 
 #[test]
-fn goto_def_across_files_returns_null_instead_of_a_false_position_over_a_real_subprocess() {
+fn goto_def_across_files_resolves_to_the_real_declaration_over_a_real_subprocess() {
     // Un tipo usado en la firma de un archivo, declarado en OTRO archivo
-    // real -- con el gate de más-de-un-archivo-tocado (mismo criterio que
-    // `compute_diagnostics_for_inner` ya usa para diagnósticos), debe dar
-    // `null` en vez de una posición falsa calculada sobre el archivo
-    // equivocado.
+    // real. Antes de la identidad de archivo en Span (GRAMMAR.md §3.21,
+    // "Not done yet"), esto se negaba en bloque devolviendo `null` --
+    // arriesgar una posición sin saber de qué archivo venía el span podía
+    // apuntar al archivo equivocado. Con `item_files` (ver
+    // `modules::load_program_with_overlay` y `lsp::get_definition`), ahora
+    // debe resolver al archivo Y rango reales de la declaración -- b.link,
+    // línea 0 -- no al a.link que abrió la request.
     let dir = std::env::temp_dir().join(format!("cscript-lsp-integration-gotodef-crossfile-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("crear directorio temporal");
-    std::fs::write(dir.join("b.link"), "type Point = { x: Int, y: Int }").expect("escribir b.link");
+    let path_b = dir.join("b.link");
+    std::fs::write(&path_b, "type Point = { x: Int, y: Int }").expect("escribir b.link");
+    let canon_b = std::fs::canonicalize(&path_b).expect("canonicalizar b.link");
+    let uri_b = path_to_uri(&canon_b);
     let path_a = dir.join("a.link");
     let text_a = r#"import { Point } from "./b.link"; fn origin() -> Point { Point { x: 0, y: 0 } }"#;
     std::fs::write(&path_a, text_a).expect("escribir a.link");
@@ -215,7 +257,8 @@ fn goto_def_across_files_returns_null_instead_of_a_false_position_over_a_real_su
     proc.did_open(&uri_a, text_a);
     let col = text_a.find("-> Point").expect("el texto de prueba debe contener '-> Point'") as u64 + 3;
     let resp = proc.definition(&uri_a, 0, col);
-    assert!(resp["result"].is_null(), "cruzando archivos, nunca se debe arriesgar una posición: {resp:?}");
+    assert_eq!(resp["result"]["uri"], uri_b, "debe apuntar a b.link, no al a.link que abrió la request: {resp:?}");
+    assert_eq!(resp["result"]["range"]["start"]["line"], 0, "'type Point' es la línea 0 de b.link: {resp:?}");
     proc.shutdown();
 
     let _ = std::fs::remove_dir_all(&dir);
