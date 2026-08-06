@@ -34,14 +34,31 @@ fn free_port() -> u16 {
     listener.local_addr().expect("local_addr").port()
 }
 
+/// No alcanza con que `TcpStream::connect` haya funcionado: el backlog de
+/// un socket en `listen()` puede aceptar la conexión a nivel de SO ANTES
+/// de que el proceso servidor haya llegado a llamar `accept()` de verdad
+/// (semántica POSIX estándar, no un bug de este servidor) -- confirmado
+/// como la causa real de un "Connection reset by peer" intermitente en CI
+/// (`ubuntu-latest`, bajo más carga que en desarrollo local) cuando un
+/// test mandaba su request real apenas `connect()` daba `Ok`. Un
+/// round-trip HTTP completo (mandar una request real, leer al menos un
+/// byte de respuesta) es la única señal confiable de que el servidor ya
+/// está listo para servir, así que eso es lo que se reintenta acá.
 fn wait_for_port(port: u16) {
+    let mut buf = [0u8; 1];
     for _ in 0..200 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return;
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            let ready = stream
+                .write_all(b"GET /Users/list HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .is_ok()
+                && matches!(stream.read(&mut buf), Ok(n) if n > 0);
+            if ready {
+                return;
+            }
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    panic!("'linkc serve' no abrió el puerto {port} a tiempo");
+    panic!("'linkc serve' no abrió el puerto {port} a tiempo (o nunca completó un round-trip HTTP real)");
 }
 
 struct ServeProcess {
