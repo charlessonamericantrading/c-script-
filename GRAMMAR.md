@@ -949,8 +949,33 @@ Distinto del target WASM que ya existía (`compiler/src/bin/wasm_demo.rs`, que r
 
 **Fuera de alcance, a propósito:**
 - `ClosureParam` (parámetros de closure) no ganó `name_span` -- el bug reportado en §3.21 solo mencionaba `Field`/`Param`; si aparece el mismo problema ahí, es una extensión de tamaño similar, no una consecuencia gratis de esta ronda.
-- Los ítems 1 y 2 de Nivel 3 (§3.21: hover de expresión arbitraria, completion sensible a `x.`) siguen sin empezar.
+- Los ítems 1 y 2 de Nivel 3 (§3.21: hover de expresión arbitraria, completion sensible a `x.`) siguen sin empezar -- resueltos/en curso en §3.24 y §3.25 respectivamente.
 - Publicar `publishDiagnostics` multi-URI (§3.22) sigue sin empezar.
+
+---
+
+### 3.24 Hover de expresión arbitraria — RESUELTO, LSP Nivel 3 ronda 2/3
+
+§3.21 dejó esta ronda como "la más cara" del Nivel 3 -- reconstruir el `Env` del checker en vez de una búsqueda puramente sintáctica como las rondas anteriores (§3.21, §3.23). Se investigó primero un diseño alternativo (reimplementar en `lsp.rs` el recorrido de scoping -- params, `let`, bloques de `if`/`match`/closures -- para reconstruir el `Env` activo en un offset "desde afuera") y se descartó: hubiera duplicado ~150-300 líneas de reglas que YA viven en `check_stmt`/`check_block`/`bind_pattern`, con el riesgo real de que diverjan con el tiempo (dos fuentes de verdad para las mismas reglas de scoping). El diseño elegido reusa el checker de verdad, sin reimplementar nada de scoping.
+
+**El "probe" vive en los DOS puntos de entrada unificados de expresión, no en cada `synth_*`/`check_*` interno.** Absolutamente toda expresión del programa pasa por `synth_expr` (modo síntesis, ⇒) o por `check_expr` (modo chequeo, ⇐) en algún momento -- son los dos wrappers públicos que `synth_expr_inner`/`check_expr_inner` (y los ~15 `synth_*`/`check_*` especializados que delegan en ellos) nunca bypasean. Instrumentar esos DOS puntos (no los ~15 internos) alcanza para cubrir el árbol completo: `Checker` gana `hover_target: Option<usize>` (el offset a buscar, `None` en cualquier chequeo normal) y `hover_result: RefCell<Option<(ancho_del_span, Type)>>` (interior mutability porque el checker entero opera con `&self`, nunca `&mut self` -- agregarlo hubiera tocado los ~40 call sites de `check_expr`/`synth_expr`). `synth_expr` guarda el tipo SINTETIZADO cuando su span contiene el offset; `check_expr` guarda `expected` (no hay tipo sintetizado propio en modo chequeo -- pero si el chequeo tuvo éxito, `expected` es por construcción un tipo válido para esa expresión, ej. un `if`/`match`/closure).
+
+**Bug real evitado ANTES de implementarlo, analizando el orden de recursión:** la primera versión de este diseño consideraba "última escritura gana" (sobreescribir sin guardas) -- INCORRECTO. Un nodo padre (ej. `x > 5`) siempre tiene un span que CONTIENE al de sus hijos (`x`, `5`), y el padre termina de procesarse DESPUÉS de que sus hijos ya retornaron (la recursión entra a los hijos antes de que el padre calcule su propio resultado) -- así que "última escritura" se hubiera quedado con el nodo MÁS EXTERNO que contiene el offset, no el más específico: hoverear sobre `x` en `x > 5` hubiera mostrado `Bool` (el tipo de toda la comparación), no `Int` (el tipo real de `x`). `probe_hover` en cambio compara ANCHOS de span -- solo reemplaza el resultado guardado si el nuevo span es más angosto que el mejor visto hasta ahora, sin importar el orden cronológico. Fijado con un test que prueba exactamente este caso (`checker::tests::hover_on_a_param_reference_inside_a_comparison_gives_the_param_type_not_the_comparisons_bool`) antes de dar la ronda por terminada.
+
+**`hover_type_at(program, offset) -> Option<Type>`, el único punto de entrada nuevo (`pub(crate)`).** Encuentra qué `fn`/`rpc`/`stream` tiene un `body.span` (`Block.span`, prerrequisito 3/3 del LSP -- ninguna esta ronda necesitó agregar ningún span nuevo) que contiene `offset`, y llama a `check_fn`/`check_rpc` TAL CUAL sobre ese ítem -- ni siquiera necesita saber cómo se arman los bindings de parámetros, esas funciones ya lo hacen. El resultado real (`Ok`/`Err`) se descarta a propósito: lo único que importa es el efecto colateral sobre `hover_result` vía las llamadas a `synth_expr`/`check_expr` que ese chequeo dispara por su cuenta.
+
+**`lsp::get_hover` reestructurado para no depender de estar sobre un identificador.** Antes, la función entera arrancaba con `let word = get_word_at_pos(...)?;` -- un `?` que cortaba TODO el hover (palabras clave, nombres de declaración, y ahora expresiones) apenas el cursor caía sobre un operador, un literal, o cualquier posición sin una palabra reconocible. La lógica de palabras clave/declaración (Nivel 1/2, sin cambios de comportamiento) se extrajo a `get_hover_for_word`: si no da resultado (incluyendo el caso "no hay ninguna palabra ahí"), `get_hover` sigue con el hover de expresión, que solo necesita un OFFSET, no una palabra -- así que hoverear sobre `>` en `x > 5`, o sobre un literal `5`, ahora también puede resolver, no solo sobre identificadores.
+
+**El tipo se renderiza con `ts_emit::render_type`, el MISMO renderer que emite el `.d.ts` real** (no un volcado de `Debug` de Rust) -- mismo criterio en los dos lugares para lo que un tipo "se ve": `Int` se muestra `number`, un struct declarado muestra su nombre real (`Point`, no una forma anónima), coherente con "el contrato es el código" (PLAN.md §2.1).
+
+**Límite honesto, documentado en el propio código de `hover_type_at`:** `check_fn`/`check_rpc` paran en el PRIMER error dentro de un body -- el checker no tiene recuperación de errores a nivel de SENTENCIA (el parser sí tiene, pero a nivel de ÍTEM completo, prerrequisito 2/3). Si el body tiene un error de tipos ANTES de la expresión que se está hovereando, esa expresión nunca se llega a chequear y esto devuelve `None` -- ausente, no una respuesta incorrecta, pero sí un hueco real. Cerrarlo necesitaría recuperación de errores a nivel de sentencia en el checker, una extensión propia y más grande que esta ronda (test que fija este límite: `checker::tests::hover_stops_at_an_earlier_error_in_the_same_body`).
+
+Verificado con 6 tests directos sobre `hover_type_at` en `checker.rs` (incluyendo el caso decisivo de más arriba), 3 tests sobre `get_hover` en `lsp.rs`, y un test de subproceso real contra el binario (`compiler/tests/lsp_stdio.rs`). 355 tests, todos pasando.
+
+**Fuera de alcance, a propósito:**
+- Statement-level error recovery en el checker (el límite documentado arriba) -- una extensión propia, más grande que esta ronda.
+- Hover sobre el NOMBRE de un parámetro en la FIRMA (antes del body) -- sigue sin cambios (Nivel 2, coincidencia por palabra, no llega a activar `hover_type_at` porque esa posición está fuera de `body.span`).
+- El ítem 3 de Nivel 3 (completion sensible a `x.`, §3.21/§3.25) -- ronda separada, reutiliza esta misma máquina.
 
 ---
 

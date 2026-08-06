@@ -302,6 +302,24 @@ pub struct Checker {
     /// inusable desde el propio lenguaje -- `MAX` dentro de un rpc daba
     /// "variable no declarada". Una feature a medias.
     pub(crate) consts: HashMap<String, ConstDecl>,
+    /// Hover de expresión arbitraria (GRAMMAR.md §3.24, LSP Nivel 3 ronda
+    /// 2/3): offset a buscar, `None` en cualquier chequeo NORMAL (`build`/
+    /// `serve`/diagnósticos del LSP) -- ver `hover_type_at`, el único
+    /// lugar que lo pone en `Some`. Interior mutability (`RefCell`, no
+    /// `&mut self`) porque el resto de `Checker` chequea con `&self` de
+    /// punta a punta -- agregar `&mut self` acá para un solo caso de uso
+    /// hubiera obligado a tocar los ~40 sitios que ya llaman
+    /// `check_expr`/`synth_expr` con `&self`.
+    hover_target: Option<usize>,
+    /// `(ancho_del_span, tipo)` del match más ESPECÍFICO visto hasta
+    /// ahora -- no "el último visto": un `Expr` padre siempre tiene un
+    /// span que CONTIENE al de sus hijos, y el padre se re-procesa
+    /// DESPUÉS de que sus hijos ya retornaron (la recursión entra a los
+    /// hijos ANTES de que el padre calcule su propio resultado), así que
+    /// "última escritura gana" terminaría quedándose con el nodo más
+    /// EXTERNO, no el más específico bajo el cursor. `probe_hover` compara
+    /// anchos en vez de simplemente sobreescribir.
+    hover_result: std::cell::RefCell<Option<(usize, Type)>>,
 }
 
 impl Checker {
@@ -316,6 +334,8 @@ impl Checker {
             fns: HashMap::new(),
             db_collections: HashMap::new(),
             consts: HashMap::new(),
+            hover_target: None,
+            hover_result: std::cell::RefCell::new(None),
         };
         let mut errors = Vec::new();
 
@@ -419,6 +439,42 @@ impl Checker {
     /// `Checker` ya hizo al procesar `db { ... }`.
     pub(crate) fn db_collections(&self) -> &HashMap<String, Type> {
         &self.db_collections
+    }
+
+    /// Único punto de instrumentación de hover (GRAMMAR.md §3.24, LSP
+    /// Nivel 3 ronda 2/3), llamado desde `synth_expr`/`check_expr` -- los
+    /// dos wrappers públicos por los que pasa CUALQUIER expresión del
+    /// programa, así que instrumentar acá alcanza para cubrir el árbol
+    /// entero sin tocar cada uno de los ~15 `synth_*`/`check_*` internos.
+    ///
+    /// No-op inmediato si `hover_target` es `None` (cualquier chequeo
+    /// NORMAL -- build/serve/diagnósticos del LSP) o si `span` no contiene
+    /// el offset -- `compute` (que puede clonar un `Type`) ni se evalúa en
+    /// ese caso.
+    ///
+    /// Cuando SÍ contiene el offset, solo reemplaza el resultado ya
+    /// guardado si `span` es MÁS ANGOSTO que el mejor visto hasta ahora --
+    /// no "el último visto" (ver el doc de `hover_result`). `compute`
+    /// devolviendo `None` (el chequeo de ESTE nodo falló) no borra un
+    /// resultado ya encontrado en un ancestro más externo -- best-effort:
+    /// si el nodo más específico no tipa, mostrar el tipo del contexto
+    /// que sí lo hizo es mejor que no mostrar nada.
+    fn probe_hover(&self, span: Span, compute: impl FnOnce() -> Option<Type>) {
+        let Some(target) = self.hover_target else { return };
+        if !(span.start <= target && target < span.end) {
+            return;
+        }
+        let width = span.end - span.start;
+        let mut best = self.hover_result.borrow_mut();
+        let is_more_specific = match &*best {
+            None => true,
+            Some((best_width, _)) => width < *best_width,
+        };
+        if is_more_specific {
+            if let Some(ty) = compute() {
+                *best = Some((width, ty));
+            }
+        }
     }
 
     /// Toda colección de `db` necesita un campo `id: Int` requerido --
@@ -551,6 +607,59 @@ impl Checker {
         }
 
         (checker, errors)
+    }
+
+    /// Hover de expresión arbitraria (GRAMMAR.md §3.24, LSP Nivel 3 ronda
+    /// 2/3): el tipo de la expresión MÁS ESPECÍFICA que contiene `offset`,
+    /// dentro del `fn`/`rpc`/`stream` cuyo BODY lo contiene -- `None` si
+    /// `offset` no cae dentro de ningún body, o si el chequeo de ese body
+    /// para antes de llegar a la expresión buscada (ver el límite abajo).
+    ///
+    /// Reusa `check_fn`/`check_rpc` TAL CUAL -- no reconstruye bindings de
+    /// parámetros ni reglas de scoping por su cuenta (evitaría una segunda
+    /// fuente de verdad para reglas que ya viven ahí); lo único nuevo es
+    /// `hover_target`/`probe_hover`, que esas mismas funciones ya activan
+    /// indirectamente a través de cada llamada a `synth_expr`/`check_expr`
+    /// dentro de su recorrido normal. `item.span`/`rpc.span` (firma
+    /// solamente, GRAMMAR.md §3.19) no sirven para esta búsqueda -- se usa
+    /// `body.span` (`Block.span`, cubre el body completo, prerrequisito
+    /// 3/3 del LSP), la única razón por la que esta ronda no necesitó
+    /// agregar ningún span nuevo.
+    ///
+    /// Límite honesto: `check_fn`/`check_rpc` paran en el PRIMER error
+    /// dentro del body -- el checker no tiene recuperación de errores a
+    /// nivel de SENTENCIA (el parser sí, pero a nivel de ítem completo,
+    /// GRAMMAR.md prerrequisito 2/3). Si el body tiene un error ANTES de
+    /// la expresión hovereada, esa expresión nunca se llega a chequear y
+    /// esto devuelve `None` -- ausente, no incorrecto, pero cerrar esto
+    /// necesitaría recuperación de errores a nivel de sentencia en el
+    /// checker, una extensión propia y más grande que esta ronda.
+    pub(crate) fn hover_type_at(program: &Program, offset: usize) -> Option<Type> {
+        let (mut checker, _) = Self::build_symbols(program);
+        checker.hover_target = Some(offset);
+
+        let in_body = |body: &Block| offset >= body.span.start && offset < body.span.end;
+        for item in &program.items {
+            match item {
+                Item::Fn(f) if in_body(&f.body) => {
+                    let _ = checker.check_fn(f);
+                }
+                Item::Service(s) => {
+                    for m in &s.members {
+                        let (rpc, is_stream) = match m {
+                            Member::Rpc(r) => (r, false),
+                            Member::Stream(r) => (r, true),
+                        };
+                        if in_body(&rpc.body) {
+                            let _ = checker.check_rpc(rpc, is_stream);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        checker.hover_result.into_inner().map(|(_, ty)| ty)
     }
 
     // ---- resolución de TypeExpr (sintáctico) -> Type (resuelto) ----
@@ -1096,7 +1205,15 @@ impl Checker {
     /// (una sub-expresión que falló primero) queda con SU span, más preciso,
     /// nunca lo pisa este nivel más externo (`with_span`, primer stamp gana).
     fn check_expr(&self, e: &Spanned<Expr>, expected: &Type, env: &Env) -> Result<(), CheckError> {
-        self.check_expr_inner(&e.node, expected, env).map_err(|ce| ce.with_span(e.span))
+        let result = self.check_expr_inner(&e.node, expected, env).map_err(|ce| ce.with_span(e.span));
+        // Hover (GRAMMAR.md §3.24): en modo CHEQUEO (if/match/closure/...,
+        // ver check_expr_inner) no hay un tipo SINTETIZADO propio -- pero
+        // si el chequeo tuvo éxito, `expected` es, por construcción, un
+        // tipo válido para esta expresión, así que es lo que se muestra.
+        // Ver `probe_hover` para el criterio de qué nodo gana cuando varios
+        // spans anidados contienen el offset.
+        self.probe_hover(e.span, || result.is_ok().then(|| expected.clone()));
+        result
     }
 
     fn check_expr_inner(&self, e: &Expr, expected: &Type, env: &Env) -> Result<(), CheckError> {
@@ -1688,7 +1805,11 @@ impl Checker {
     /// estampa el span de `e` en cualquier error sin span propio, sin pisar
     /// uno más profundo que ya haya estampado una sub-expresión.
     fn synth_expr(&self, e: &Spanned<Expr>, env: &Env) -> Result<Type, CheckError> {
-        self.synth_expr_inner(&e.node, env).map_err(|ce| ce.with_span(e.span))
+        let result = self.synth_expr_inner(&e.node, env).map_err(|ce| ce.with_span(e.span));
+        // Hover (GRAMMAR.md §3.24): ver `probe_hover` para el criterio de
+        // qué nodo gana cuando varios spans anidados contienen el offset.
+        self.probe_hover(e.span, || result.as_ref().ok().cloned());
+        result
     }
 
     fn synth_expr_inner(&self, e: &Expr, env: &Env) -> Result<Type, CheckError> {
@@ -2347,6 +2468,75 @@ mod tests {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
         Checker::check_program(&program)
+    }
+
+    /// Parsea `src` y llama a `hover_type_at` en el offset de la PRIMERA
+    /// aparición de `needle` -- suficientemente preciso para estos tests
+    /// (`needle` se elige para que no matchee antes de donde importa).
+    fn hover_at(src: &str, needle: &str) -> Option<Type> {
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        let offset = src.find(needle).unwrap_or_else(|| panic!("'{needle}' no aparece en el source de prueba: {src}"));
+        Checker::hover_type_at(&program, offset)
+    }
+
+    // ---- hover de expresión arbitraria (GRAMMAR.md §3.24) ----
+
+    #[test]
+    fn hover_on_a_param_reference_inside_a_comparison_gives_the_param_type_not_the_comparisons_bool() {
+        // El caso decisivo para "gana el span más específico" en
+        // `probe_hover`: `x > 5` sintetiza Bool, pero hoverear sobre `x`
+        // (el operando, un span más angosto) debe dar Int -- si
+        // "última escritura gana" en vez de "el span más chico gana",
+        // esto daría Bool (el bug real que el diseño de `probe_hover`
+        // evita, encontrado analizando el orden de recursión ANTES de
+        // implementarlo, no después).
+        let src = "fn f(x: Int) -> Bool { x > 5 }";
+        assert_eq!(hover_at(src, "x >"), Some(Type::Int));
+    }
+
+    #[test]
+    fn hover_on_the_whole_comparison_gives_bool() {
+        // El offset del operador '>' en sí -- no cubierto por el span de
+        // NINGUNO de los dos operandos (`x` termina antes, `5` empieza
+        // después), pero sí por el de la comparación completa. Apuntar a
+        // "x > 5" en cambio daría el offset de 'x' (Int), no de la
+        // comparación -- ver el test anterior para exactamente ese caso.
+        let src = "fn f(x: Int) -> Bool { x > 5 }";
+        assert_eq!(hover_at(src, "> 5"), Some(Type::Bool));
+    }
+
+    #[test]
+    fn hover_on_an_if_expression_gives_the_expected_type_from_checking_mode() {
+        // if/else no sintetiza un tipo propio -- se CHEQUEA contra
+        // `expected` (GRAMMAR.md §3.7, modo ⇐). Prueba que el gate de
+        // `check_expr` (no solo `synth_expr`) también alimenta el probe.
+        let src = "fn f() -> Int { if true { 1 } else { 2 } }";
+        assert_eq!(hover_at(src, "if true"), Some(Type::Int));
+    }
+
+    #[test]
+    fn hover_inside_an_rpc_body_works_too() {
+        let src = r#"service S { rpc f() -> Int { 1 + 1 } }"#;
+        assert_eq!(hover_at(src, "1 + 1"), Some(Type::Int));
+    }
+
+    #[test]
+    fn hover_outside_any_body_returns_none() {
+        let src = "fn f() -> Int { 1 }";
+        let tokens = tokenize(src).unwrap();
+        let program = parse(tokens).unwrap();
+        let offset = 0; // la 'f' de 'fn', fuera de cualquier body
+        assert_eq!(Checker::hover_type_at(&program, offset), None);
+    }
+
+    #[test]
+    fn hover_stops_at_an_earlier_error_in_the_same_body() {
+        // Límite honesto documentado en `hover_type_at`: `check_fn` para
+        // en el PRIMER error -- una expresión hovereada DESPUÉS de un
+        // error anterior en el mismo body nunca se llega a chequear.
+        let src = "fn f() -> Int { let x: Int = \"nope\"; 1 + 1 }";
+        assert_eq!(hover_at(src, "1 + 1"), None, "el error anterior en 'let x' para el chequeo antes de llegar acá");
     }
 
     #[test]

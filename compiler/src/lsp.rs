@@ -1,5 +1,6 @@
 use crate::ast::{self, Item, Program, TypeExpr};
 use crate::checker::Checker;
+use crate::codegen::ts_emit::render_type;
 use crate::lexer;
 use crate::modules;
 use crate::parser;
@@ -650,9 +651,41 @@ fn resolve_program<'a>(source: &str, full_program: Option<&'a Program>, owned: &
 }
 
 pub fn get_hover(source: &str, line0: usize, col0: usize, full_program: Option<&Program>) -> Option<Value> {
-    let word = get_word_at_pos(source, line0, col0)?;
+    if let Some(word) = get_word_at_pos(source, line0, col0) {
+        if let Some(hover) = get_hover_for_word(&word, source, full_program) {
+            return Some(hover);
+        }
+    }
 
-    let builtin_hover = match word.as_str() {
+    // Nivel 3, ronda 2/3 (GRAMMAR.md §3.24): hover de una expresión
+    // arbitraria dentro de un body -- a diferencia de todo lo de arriba
+    // (nombres de declaración, palabras clave), esto NO depende de estar
+    // sobre un identificador (`get_word_at_pos` no engancha operadores ni
+    // literales) -- por eso corre INCONDICIONALMENTE acá abajo, no dentro
+    // del `if let Some(word)`. `hover_type_at` hace todo el trabajo real
+    // (reusa `check_fn`/`check_rpc` tal cual); acá solo se resuelve el
+    // offset y se renderiza el `Type` encontrado con el mismo `render_type`
+    // que ya usa el emisor del contrato real (`ts_emit.rs`) -- mismo
+    // criterio en los dos lugares para lo que un tipo "se ve" en TS.
+    let mut owned = None;
+    let program = resolve_program(source, full_program, &mut owned)?;
+    let offset = char_offset_from_utf16_position(source, line0, col0);
+    let ty = Checker::hover_type_at(program, offset)?;
+    Some(json!({
+        "contents": {
+            "kind": "markdown",
+            "value": format!("```typescript\n{}\n```", render_type(&ty))
+        }
+    }))
+}
+
+/// Nivel 1/2 del LSP (palabras clave, builtins, hover a nivel de
+/// declaración) -- extraído de `get_hover` sin cambiar NINGÚN
+/// comportamiento existente, solo para poder correr el hover de Nivel 3
+/// (expresión arbitraria) incluso cuando `get_word_at_pos` no engancha
+/// nada (operadores, literales) sin duplicar esta lógica.
+fn get_hover_for_word(word: &str, source: &str, full_program: Option<&Program>) -> Option<Value> {
+    let builtin_hover = match word {
         "service" => Some("Keyword `service`\n\nDefines a service exposing RPC and stream endpoints."),
         "rpc" => Some("Keyword `rpc`\n\nDefines a Remote Procedure Call endpoint."),
         "stream" => Some("Keyword `stream`\n\nDefines a Server-Sent Events (SSE) streaming endpoint."),
@@ -1394,6 +1427,37 @@ mod tests {
         let hover = get_hover(code, 0, 6, None).expect("Hover debe retornar tipo");
         let markdown = hover["contents"]["value"].as_str().unwrap();
         assert!(markdown.contains("type User"));
+    }
+
+    // ---- hover de expresión arbitraria (Nivel 3 ronda 2/3, GRAMMAR.md §3.24) ----
+
+    #[test]
+    fn test_hover_on_a_param_reference_inside_a_body_shows_its_type() {
+        let code = "fn f(x: Int) -> Bool { x > 5 }\n";
+        let col = code.find("x > 5").unwrap(); // sobre la 'x'
+        let hover = get_hover(code, 0, col, None).expect("debe encontrar el tipo de x");
+        let markdown = hover["contents"]["value"].as_str().unwrap();
+        assert!(markdown.contains("number"), "x: Int se renderiza como TypeScript 'number': {markdown}");
+    }
+
+    #[test]
+    fn test_hover_on_a_struct_typed_expression_renders_the_real_type_name() {
+        // render_type (ts_emit.rs) es el MISMO renderer que ya usa el
+        // contrato real -- un struct nombrado muestra su nombre TS, no un
+        // volcado de Debug de Rust.
+        let code = "type Point = { x: Int, y: Int }\nfn origin() -> Point { let p: Point = Point { x: 0, y: 0 }; p }\n";
+        let line1 = code.lines().nth(1).unwrap();
+        let col = line1.rfind("p }").unwrap(); // la 'p' final, la expresión de retorno
+        let hover = get_hover(code, 1, col, None).expect("debe encontrar el tipo de p");
+        let markdown = hover["contents"]["value"].as_str().unwrap();
+        assert!(markdown.contains("Point"), "debe mostrar el nombre real del tipo, no una estructura anónima: {markdown}");
+    }
+
+    #[test]
+    fn test_hover_on_whitespace_outside_any_body_still_returns_none() {
+        let code = "type User = { id: Int }\n";
+        let hover = get_hover(code, 0, 11, None); // el espacio entre '=' y '{'
+        assert!(hover.is_none(), "no hay ninguna expresión ni palabra clave ahí: {hover:?}");
     }
 
     #[test]

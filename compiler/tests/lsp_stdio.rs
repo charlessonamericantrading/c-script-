@@ -85,6 +85,16 @@ impl LspProcess {
         self.recv()
     }
 
+    fn hover(&mut self, uri: &str, line: u64, character: u64) -> Value {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 98,
+            "method": "textDocument/hover",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }
+        }));
+        self.recv()
+    }
+
     /// Cierra stdin (el servidor ve EOF en su loop de `run_stdio` y
     /// termina solo) y espera a que el proceso hijo salga -- no dejar
     /// ningún `linkc.exe` huérfano corriendo después de un test.
@@ -282,6 +292,30 @@ fn goto_def_on_a_type_name_within_the_same_file_returns_the_exact_range_over_a_r
     let resp = proc.definition(&uri, 1, col);
     assert_eq!(resp["result"]["uri"], uri);
     assert_eq!(resp["result"]["range"]["start"]["line"], 0, "debe apuntar a 'type Point' en la línea 0: {resp:?}");
+    proc.shutdown();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- hover de expresión arbitraria (Nivel 3 ronda 2/3, GRAMMAR.md §3.24) ----
+
+#[test]
+fn hover_on_a_param_reference_inside_a_body_shows_its_inferred_type_over_a_real_subprocess() {
+    let dir = std::env::temp_dir().join(format!("cscript-lsp-integration-hover-expr-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("crear directorio temporal");
+    let path = dir.join("compare.link");
+    let text = "fn f(x: Int) -> Bool { x > 5 }\n";
+    std::fs::write(&path, text).expect("escribir compare.link");
+    let canon = std::fs::canonicalize(&path).expect("canonicalizar compare.link");
+    let uri = path_to_uri(&canon);
+
+    let mut proc = LspProcess::start();
+    proc.initialize();
+    proc.did_open(&uri, text);
+    let col = text.find("x > 5").expect("el texto de prueba debe contener 'x > 5'") as u64;
+    let resp = proc.hover(&uri, 0, col);
+    let markdown = resp["result"]["contents"]["value"].as_str().unwrap_or_default();
+    assert!(markdown.contains("number"), "x: Int debe mostrar 'number' (TypeScript), no Bool de la comparación completa: {resp:?}");
     proc.shutdown();
 
     let _ = std::fs::remove_dir_all(&dir);
