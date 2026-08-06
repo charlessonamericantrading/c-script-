@@ -95,6 +95,16 @@ impl LspProcess {
         self.recv()
     }
 
+    fn completion(&mut self, uri: &str, line: u64, character: u64) -> Value {
+        self.send(&json!({
+            "jsonrpc": "2.0",
+            "id": 97,
+            "method": "textDocument/completion",
+            "params": { "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }
+        }));
+        self.recv()
+    }
+
     /// Cierra stdin (el servidor ve EOF en su loop de `run_stdio` y
     /// termina solo) y espera a que el proceso hijo salga -- no dejar
     /// ningún `linkc.exe` huérfano corriendo después de un test.
@@ -316,6 +326,34 @@ fn hover_on_a_param_reference_inside_a_body_shows_its_inferred_type_over_a_real_
     let resp = proc.hover(&uri, 0, col);
     let markdown = resp["result"]["contents"]["value"].as_str().unwrap_or_default();
     assert!(markdown.contains("number"), "x: Int debe mostrar 'number' (TypeScript), no Bool de la comparación completa: {resp:?}");
+    proc.shutdown();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- completion sensible al tipo real del receptor (Nivel 3 ronda 3/3, GRAMMAR.md §3.25) ----
+
+#[test]
+fn completion_after_dot_on_a_struct_receiver_offers_its_real_field_names_over_a_real_subprocess() {
+    let dir = std::env::temp_dir().join(format!("cscript-lsp-integration-completion-fields-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("crear directorio temporal");
+    let path = dir.join("point.link");
+    let text = "type Point = { x: Int, y: Int }\nfn f(p: Point) -> Point { p. }\n";
+    std::fs::write(&path, text).expect("escribir point.link");
+    let canon = std::fs::canonicalize(&path).expect("canonicalizar point.link");
+    let uri = path_to_uri(&canon);
+
+    let mut proc = LspProcess::start();
+    proc.initialize();
+    proc.did_open(&uri, text);
+    let line1 = text.lines().nth(1).expect("el texto de prueba debe tener una segunda línea");
+    let col = line1.find("p.").expect("la segunda línea debe contener 'p.'") as u64 + 2;
+    let resp = proc.completion(&uri, 1, col);
+    let items = resp["result"].as_array().expect("completion debe devolver un array");
+    let labels: Vec<&str> = items.iter().filter_map(|i| i["label"].as_str()).collect();
+    assert!(labels.contains(&"x"), "debe ofrecer el campo 'x' de Point: {labels:?}");
+    assert!(labels.contains(&"y"), "debe ofrecer el campo 'y' de Point: {labels:?}");
+    assert!(!labels.contains(&"map(fn)"), "un struct no tiene métodos de lista -- la lista no debería estar sin tailorear: {labels:?}");
     proc.shutdown();
 
     let _ = std::fs::remove_dir_all(&dir);

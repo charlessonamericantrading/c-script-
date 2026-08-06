@@ -1210,9 +1210,26 @@ impl Checker {
         // ver check_expr_inner) no hay un tipo SINTETIZADO propio -- pero
         // si el chequeo tuvo éxito, `expected` es, por construcción, un
         // tipo válido para esta expresión, así que es lo que se muestra.
-        // Ver `probe_hover` para el criterio de qué nodo gana cuando varios
-        // spans anidados contienen el offset.
-        self.probe_hover(e.span, || result.is_ok().then(|| expected.clone()));
+        //
+        // Si el chequeo FALLÓ (ej. el tail de un fn no matchea su tipo de
+        // retorno declarado), `expected` NO es un tipo real de la
+        // expresión -- es justamente lo que no matcheó. Bug real
+        // encontrado escribiendo los tests de completion (§3.25, que
+        // reusa esta misma máquina): el fallback de `check_expr_inner`
+        // (más abajo) sintetiza `e` vía `synth_expr_inner` DIRECTO, no el
+        // wrapper `synth_expr` con el probe -- así que ese tipo
+        // (potencialmente el que el usuario quiere ver en el hover,
+        // "esto ES una List(Int), aunque no matchea el Int esperado")
+        // nunca llegaba a grabarse. Acá se reintenta la síntesis SOLO
+        // para el hover (nunca afecta `result`, el error real de
+        // chequeo sigue propagándose) -- redundante con la síntesis que
+        // ya corrió adentro de `check_expr_inner`, pero solo se paga
+        // cuando `hover_target` está activo (`probe_hover` es no-op
+        // inmediato si no), nunca en un chequeo normal.
+        self.probe_hover(e.span, || match &result {
+            Ok(()) => Some(expected.clone()),
+            Err(_) => self.synth_expr_inner(&e.node, env).ok(),
+        });
         result
     }
 
@@ -2537,6 +2554,23 @@ mod tests {
         // error anterior en el mismo body nunca se llega a chequear.
         let src = "fn f() -> Int { let x: Int = \"nope\"; 1 + 1 }";
         assert_eq!(hover_at(src, "1 + 1"), None, "el error anterior en 'let x' para el chequeo antes de llegar acá");
+    }
+
+    #[test]
+    fn hover_on_the_tail_expression_gives_its_real_type_even_when_it_mismatches_the_declared_return_type() {
+        // Bug real encontrado implementando completion (§3.25, que reusa
+        // hover_type_at): el TAIL de un body se chequea en modo ⇐ contra
+        // el tipo de retorno declarado (`check_expr`); si NO matchea
+        // (acá, List(Int) contra el Int declarado), el chequeo falla --
+        // pero la SÍNTESIS de esa misma expresión sí había tenido éxito
+        // (es justamente lo que el mensaje de error reporta: "se
+        // encontró List(Int)"). El hover debe mostrar ese tipo real
+        // (List(Int)), no quedarse sin nada solo porque el chequeo
+        // contra `expected` falló -- `check_expr`'s propio probe
+        // reintenta sintetizar cuando el chequeo no tuvo éxito,
+        // exactamente para este caso.
+        let src = "fn f(xs: Int[]) -> Int { xs }";
+        assert_eq!(hover_at(src, "xs }"), Some(Type::List(Box::new(Type::Int))));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use crate::lexer;
 use crate::modules;
 use crate::parser;
 use crate::token::Span;
+use crate::types::Type;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
@@ -1108,6 +1109,21 @@ pub fn get_completions(source: &str, line0: usize, col0: usize, full_program: Op
     let mut items = Vec::new();
 
     if prefix.trim_end().ends_with('.') {
+        // Nivel 3, ronda 3/3 (GRAMMAR.md §3.25): completion sensible al
+        // tipo REAL del receptor, reusando la misma máquina que el hover
+        // de expresión arbitraria (§3.24, `Checker::hover_type_at`) --
+        // reemplaza la lista de siempre (todos los métodos posibles a la
+        // vez, sin importar el receptor) cuando el tipo se puede
+        // resolver. `receiver_type_before_dot` degrada a `None` en
+        // cualquier caso no cubierto (receptor cuyo tipo depende de un
+        // archivo importado, expresión sin tipo conocido, etc.) -- nunca
+        // ofrece MENOS que antes de esta ronda.
+        if let Some(ty) = receiver_type_before_dot(source, line0, col0) {
+            if let Some(tailored) = completions_for_receiver_type(&ty) {
+                return tailored;
+            }
+        }
+
         let methods = [
             ("all()", "Get all records from a db collection", 2),
             ("find(id)", "Find record by ID in a db collection", 2),
@@ -1240,6 +1256,129 @@ pub fn get_completions(source: &str, line0: usize, col0: usize, full_program: Op
     }
 
     items
+}
+
+/// Igual que `char_offset_from_utf16_position`, pero contando CARACTERES
+/// en vez de unidades UTF-16 -- la convención que `get_word_at_pos`/
+/// `get_line_prefix_at_pos` ya usan para `col0` (mismo criterio en todo
+/// este archivo salvo esas dos conversiones UTF-16, que existen para el
+/// protocolo LSP en sí, no para reconstruir offsets a partir de un
+/// `String` ya recortado como acá).
+fn char_offset_from_char_position(source: &str, target_line: usize, target_col: usize) -> usize {
+    let chars: Vec<char> = source.chars().collect();
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (idx, &c) in chars.iter().enumerate() {
+        if line == target_line && col >= target_col {
+            return idx;
+        }
+        if c == '\n' {
+            if line == target_line {
+                return idx;
+            }
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    chars.len()
+}
+
+/// El `Type` real de la expresión receptora justo antes del `.` en
+/// `line0`/`col0` (GRAMMAR.md §3.25) -- `None` si no se puede determinar.
+///
+/// Mientras se escribe "x.", el buffer casi siempre NO PARSEA (un `.`
+/// colgante, sin nada después, es un error de sintaxis) -- así que en vez
+/// de tipar el buffer TAL CUAL, se tipa una COPIA con el `.` colgante (y
+/// cualquier espacio hasta el cursor) reemplazado por espacios en blanco
+/// de el MISMO largo. Todos los demás offsets del archivo (antes del `.`
+/// y después del cursor) quedan intactos -- el receptor (`x`) y el resto
+/// del archivo parsean normal, y el offset que se le pasa a
+/// `hover_type_at` sigue siendo válido contra el texto ORIGINAL para
+/// cualquier uso posterior.
+///
+/// Límite honesto: la copia se re-parsea de forma AISLADA (`parser::parse`
+/// directo, no `modules::load_program_with_overlay`) -- si el tipo del
+/// receptor depende de un `type`/`enum` declarado en un archivo
+/// IMPORTADO, la copia no lo resuelve y esto da `None` (cae al fallback
+/// de siempre en `get_completions`, nunca a una respuesta incorrecta).
+/// Cerrar esto necesitaría reconstruir el overlay completo del `LspServer`
+/// acá, que es un método de instancia, no de esta función libre.
+fn receiver_type_before_dot(source: &str, line0: usize, col0: usize) -> Option<Type> {
+    let prefix = get_line_prefix_at_pos(source, line0, col0);
+    let trimmed = prefix.trim_end();
+    if !trimmed.ends_with('.') {
+        return None;
+    }
+    let receiver = trimmed[..trimmed.len() - 1].trim_end();
+    if receiver.is_empty() {
+        return None;
+    }
+
+    let dot_col = trimmed.chars().count() - 1;
+    let dot_offset = char_offset_from_char_position(source, line0, dot_col);
+    let cursor_offset = char_offset_from_char_position(source, line0, col0).max(dot_offset);
+
+    let mut patched: Vec<char> = source.chars().collect();
+    for c in patched.get_mut(dot_offset..cursor_offset)? {
+        if *c != '\n' {
+            *c = ' ';
+        }
+    }
+    let patched_source: String = patched.into_iter().collect();
+
+    let tokens = lexer::tokenize(&patched_source).ok()?;
+    let program = parser::parse(tokens).ok()?;
+
+    let receiver_end_col = receiver.chars().count().saturating_sub(1);
+    let receiver_offset = char_offset_from_char_position(source, line0, receiver_end_col);
+    Checker::hover_type_at(&program, receiver_offset)
+}
+
+/// Lista de completions tailoreada al `Type` real de un receptor (GRAMMAR.md
+/// §3.25) -- `None` señala "este tipo no está cubierto acá todavía", para
+/// que el caller caiga a la lista genérica de siempre en vez de ofrecer
+/// MENOS que antes de esta ronda. `Type::Db` es un `None` a propósito: ya
+/// tiene su propio manejo en `get_completions` (nombres de colección, no
+/// métodos) que necesita el `Program` completo, no solo el `Type`.
+fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
+    let method = |label: &str, detail: &str| json!({ "label": label, "kind": 2, "detail": detail });
+    match ty {
+        Type::DbCollection(_) => Some(vec![
+            method("all()", "Get all records from this collection"),
+            method("find(id)", "Find a record by id in this collection"),
+            method("insert(record)", "Insert a new record into this collection"),
+            method("applyPatch(id, patch)", "Update a record in this collection"),
+            method("delete(id)", "Delete a record by id from this collection"),
+            method("deleteWhere(fn)", "Delete records matching a predicate"),
+            method("findWhere(fn)", "Find records matching a predicate"),
+            method("subscribe()", "Subscribe to live changes in a stream"),
+        ]),
+        Type::List(_) => Some(vec![
+            method("length()", "Get the length of this list"),
+            method("take(limit)", "Take the first N items"),
+            method("map(fn)", "Map this list's items"),
+            method("filter(fn)", "Filter this list's items"),
+        ]),
+        Type::String => Some(vec![
+            method("length()", "Get the length of this string"),
+            method("contains(sub)", "Check if this string contains a substring"),
+        ]),
+        Type::Int => Some(vec![method("toFloat()", "Convert this Int to Float")]),
+        Type::Float => Some(vec![method("toInt()", "Convert this Float to Int")]),
+        Type::Auth => Some(vec![
+            method("createSession(role)", "Create an opaque session token for the given Role"),
+            method("destroySession()", "Destroy the current session"),
+        ]),
+        Type::Struct { fields, .. } => Some(
+            fields
+                .iter()
+                .map(|f| json!({ "label": f.name, "kind": 5, "detail": format!("Field: {}", render_type(&f.ty)) }))
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1466,6 +1605,68 @@ mod tests {
         let completions = get_completions(code, 1, 0, None);
         assert!(completions.iter().any(|c| c["label"] == "service"));
         assert!(completions.iter().any(|c| c["label"] == "User"));
+    }
+
+    // ---- completion sensible al tipo real del receptor (Nivel 3 ronda 3/3, GRAMMAR.md §3.25) ----
+
+    #[test]
+    fn test_completion_after_dot_on_a_list_receiver_only_offers_list_methods() {
+        let code = "fn f(xs: Int[]) -> Int[] { xs. }\n";
+        let col = code.find("xs.").unwrap() + 3; // justo después del '.'
+        let completions = get_completions(code, 0, col, None);
+        assert!(completions.iter().any(|c| c["label"] == "map(fn)"), "{completions:?}");
+        assert!(
+            !completions.iter().any(|c| c["label"] == "contains(sub)"),
+            "una lista no tiene 'contains' (método de String) -- la lista no debería estar sin tailorear: {completions:?}"
+        );
+    }
+
+    #[test]
+    fn test_completion_after_dot_on_a_string_receiver_only_offers_string_methods() {
+        let code = "fn f(s: String) -> Int { s. }\n";
+        let col = code.find("s.").unwrap() + 2;
+        let completions = get_completions(code, 0, col, None);
+        assert!(completions.iter().any(|c| c["label"] == "contains(sub)"), "{completions:?}");
+        assert!(!completions.iter().any(|c| c["label"] == "map(fn)"), "un String no tiene 'map' (método de lista): {completions:?}");
+    }
+
+    #[test]
+    fn test_completion_after_dot_on_a_struct_receiver_offers_its_field_names() {
+        // Capacidad NUEVA de esta ronda: antes, ningún tipo de receptor
+        // ofrecía nombres de CAMPO como completion, solo métodos builtin.
+        let code = "type Point = { x: Int, y: Int }\nfn f(p: Point) -> Int { p. }\n";
+        let line1 = code.lines().nth(1).unwrap();
+        let col = line1.find("p.").unwrap() + 2;
+        let completions = get_completions(code, 1, col, None);
+        assert!(completions.iter().any(|c| c["label"] == "x"), "{completions:?}");
+        assert!(completions.iter().any(|c| c["label"] == "y"), "{completions:?}");
+        assert!(!completions.iter().any(|c| c["label"] == "map(fn)"), "un struct no tiene métodos de lista: {completions:?}");
+    }
+
+    #[test]
+    fn test_completion_after_dot_on_a_specific_db_collection_only_offers_collection_methods() {
+        let code = "db { users: User[] }\ntype User = { id: Int }\nfn f() -> Int { db.users. }\n";
+        let line2 = code.lines().nth(2).unwrap();
+        let col = line2.find("db.users.").unwrap() + "db.users.".len();
+        let completions = get_completions(code, 2, col, None);
+        assert!(completions.iter().any(|c| c["label"] == "insert(record)"), "{completions:?}");
+        assert!(
+            !completions.iter().any(|c| c["label"] == "map(fn)"),
+            "una colección específica no es una lista genérica -- no tiene 'map' directo: {completions:?}"
+        );
+    }
+
+    #[test]
+    fn test_completion_after_dot_falls_back_to_the_generic_list_when_the_type_is_unknown() {
+        // Regresión: si el tipo del receptor no se puede determinar (acá,
+        // un identificador que ni siquiera existe), la lista genérica de
+        // siempre sigue disponible -- nunca ofrecer MENOS que antes de
+        // esta ronda.
+        let code = "fn f() -> Int { unknownVar. }\n";
+        let col = code.find("unknownVar.").unwrap() + "unknownVar.".len();
+        let completions = get_completions(code, 0, col, None);
+        assert!(completions.iter().any(|c| c["label"] == "map(fn)"), "{completions:?}");
+        assert!(completions.iter().any(|c| c["label"] == "contains(sub)"), "{completions:?}");
     }
 
     #[test]
