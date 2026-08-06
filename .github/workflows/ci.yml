@@ -1,0 +1,92 @@
+name: CI
+
+# Auditoría post-push (integridad 2/2, ver README.md "Status"): la ronda
+# anterior encontró el demo insignia roto (frontend/src/main.ts llamaba a
+# rpc protegidos sin loguearse) sin que ningún test lo detectara, porque
+# nada corría el camino completo -- compilar, tipar el frontend contra el
+# contrato generado, Y correr el demo real contra un servidor real. Este
+# workflow es exactamente esos 3 pasos (los mismos que documenta el
+# README bajo "Try the killer feature yourself"), automatizados, para que
+# ese tipo de deriva falle en CI en vez de esperar a la próxima auditoría
+# manual.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu para velocidad/costo; windows porque el propio proyecto
+        # documenta bugs reales encontrados solo ahí (framing del LSP
+        # sobre pipes de Windows, GRAMMAR.md §3.19) -- no es precaución
+        # genérica, es un historial real de este código.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Rust estable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cachear cargo (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+
+      - name: cargo test (unitarios + subprocesos reales de LSP y servidor HTTP)
+        working-directory: compiler
+        # cargo test también compila target/debug/linkc como efecto
+        # colateral (los tests de integración lo referencian vía
+        # env!("CARGO_BIN_EXE_linkc")) -- no hace falta un `cargo build`
+        # aparte antes del demo E2E de más abajo.
+        run: cargo test --locked
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24" # native TS type-stripping sin flags (verificado localmente en 24.14.0); ver frontend/src/main.ts
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Instalar dependencias del frontend
+        working-directory: frontend
+        run: npm ci
+
+      - name: Regenerar el contrato desde el backend (linkc build)
+        run: |
+          BIN=compiler/target/debug/linkc
+          [ "$RUNNER_OS" = "Windows" ] && BIN="${BIN}.exe"
+          "$BIN" build examples/users.link gen
+
+      - name: Confirmar que el frontend tipa limpio contra el contrato generado
+        working-directory: frontend
+        run: npx tsc --noEmit
+
+      - name: Demo E2E real (servidor real + cliente generado real)
+        run: |
+          set -e
+          BIN=compiler/target/debug/linkc
+          [ "$RUNNER_OS" = "Windows" ] && BIN="${BIN}.exe"
+
+          "$BIN" serve examples/users.link 8787 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 100); do
+            curl -s -o /dev/null http://127.0.0.1:8787/Users/list && break
+            sleep 0.1
+          done
+
+          cd frontend
+          node src/main.ts
