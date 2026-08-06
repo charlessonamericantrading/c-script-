@@ -157,7 +157,7 @@ fn cmd_check(path: &str) -> ExitCode {
     // conocido -- si además no parece un archivo real, es casi seguro un
     // subcomando mal escrito, no un archivo que el usuario quiere tipar.
     if !path.ends_with(".link") && !Path::new(path).exists() {
-        eprintln!("'{path}' no es un subcomando conocido (build, serve, new, dev) ni un archivo .link existente");
+        eprintln!("'{path}' no es un subcomando conocido (build, serve, new, dev, lsp, wasm) ni un archivo .link existente");
         return ExitCode::FAILURE;
     }
     match load_and_check(path) {
