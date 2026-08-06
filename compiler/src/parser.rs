@@ -323,6 +323,7 @@ impl Parser {
     }
 
     fn parse_field(&mut self) -> Result<Field, ParseError> {
+        let name_span = self.span(); // cubre solo el identificador -- ver ast.rs::Field::name_span
         let name = self.eat_ident()?;
         let optional = if self.check(&TokenKind::Question) {
             self.advance();
@@ -332,7 +333,7 @@ impl Parser {
         };
         self.eat(&TokenKind::Colon)?;
         let ty = self.parse_type_expr()?;
-        Ok(Field { name, optional, ty })
+        Ok(Field { name, optional, ty, name_span })
     }
 
     fn parse_const_decl(&mut self) -> Result<ConstDecl, ParseError> {
@@ -464,6 +465,7 @@ impl Parser {
     }
 
     fn parse_param(&mut self) -> Result<Param, ParseError> {
+        let name_span = self.span(); // cubre solo el identificador -- ver ast.rs::Param::name_span
         let name = self.eat_ident()?;
         self.eat(&TokenKind::Colon)?;
         let ty = self.parse_type_expr()?;
@@ -473,7 +475,7 @@ impl Parser {
         } else {
             None
         };
-        Ok(Param { name, ty, default })
+        Ok(Param { name, ty, default, name_span })
     }
 
     // ---- §2.2 Expresiones de tipo ----

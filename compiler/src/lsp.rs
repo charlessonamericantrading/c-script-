@@ -864,6 +864,63 @@ fn find_named_type_in_program(program: &Program, offset: usize) -> Option<(Strin
     None
 }
 
+/// ¿Hay un `Field` con `name_span` en `offset`, en cualquier parte de
+/// `texpr`? Recorre las 8 variantes de `TypeExpr` sin brazo `_` (mismo
+/// criterio que `find_named_type_at`: agregar una variante nueva rompe la
+/// compilación acá en vez de que esta búsqueda la ignore en silencio).
+/// `Named` recursa en sus `args` (un genérico puede envolver un struct
+/// inline, ej. `Box<{ n: Int }>`) pero un `Named` no tiene campos propios.
+fn field_name_at_in_type(texpr: &TypeExpr, offset: usize) -> bool {
+    let in_span = |span: Span| offset >= span.start && offset < span.end;
+    match texpr {
+        TypeExpr::Named(_, args, _) => args.iter().any(|a| field_name_at_in_type(a, offset)),
+        TypeExpr::Struct(fields) => fields.iter().any(|f| in_span(f.name_span) || field_name_at_in_type(&f.ty, offset)),
+        TypeExpr::Map(k, v) => field_name_at_in_type(k, offset) || field_name_at_in_type(v, offset),
+        TypeExpr::Tuple(items) => items.iter().any(|t| field_name_at_in_type(t, offset)),
+        TypeExpr::Function(params, ret) => {
+            params.iter().any(|p| field_name_at_in_type(p, offset)) || field_name_at_in_type(ret, offset)
+        }
+        TypeExpr::Optional(inner) | TypeExpr::List(inner) => field_name_at_in_type(inner, offset),
+        TypeExpr::Union(members) => members.iter().any(|m| field_name_at_in_type(m, offset)),
+    }
+}
+
+/// ¿El offset cae sobre el NOMBRE de un `Field` o `Param` en cualquier
+/// firma del programa? (GRAMMAR.md §3.22, cierra el límite que §3.21 dejó
+/// documentado.) Recorre exactamente los mismos lugares que
+/// `find_named_type_in_program` -- si esto da `true`, `get_definition_inner`
+/// debe responder `None` de forma AUTORITATIVA en vez de dejar que el loop
+/// viejo de coincidencia-por-palabra salte a un `type`/`enum`/`fn`/`const`
+/// homónimo en otro namespace: el NOMBRE de un campo/parámetro no es una
+/// referencia a otro símbolo (a diferencia de su TIPO, que si el cursor
+/// cayera ahí ya lo resuelve `find_named_type_in_program` arriba) -- no hay
+/// ninguna declaración a la que saltar.
+fn is_field_or_param_name_at(program: &Program, offset: usize) -> bool {
+    let in_span = |span: Span| offset >= span.start && offset < span.end;
+    program.items.iter().any(|item| match item {
+        Item::Type(t) => field_name_at_in_type(&t.ty, offset),
+        Item::Enum(e) => e.variants.iter().any(|v| {
+            v.fields
+                .as_ref()
+                .is_some_and(|fields| fields.iter().any(|f| in_span(f.name_span) || field_name_at_in_type(&f.ty, offset)))
+        }),
+        Item::Service(s) => s.members.iter().any(|m| {
+            let rpc = match m {
+                ast::Member::Rpc(r) | ast::Member::Stream(r) => r,
+            };
+            rpc.params.iter().any(|p| in_span(p.name_span) || field_name_at_in_type(&p.ty, offset))
+                || field_name_at_in_type(&rpc.return_type, offset)
+        }),
+        Item::Fn(f) => {
+            f.params.iter().any(|p| in_span(p.name_span) || field_name_at_in_type(&p.ty, offset))
+                || field_name_at_in_type(&f.return_type, offset)
+        }
+        Item::Const(c) => field_name_at_in_type(&c.ty, offset),
+        Item::Db(d) => d.collections.iter().any(|f| in_span(f.name_span) || field_name_at_in_type(&f.ty, offset)),
+        Item::Import(_) => false,
+    })
+}
+
 /// Busca la DECLARACIÓN (`type`/`enum`) de nombre `name`, para resolver a
 /// dónde saltar una vez que `find_named_type_in_program` identificó que el
 /// cursor está sobre un USO de ese nombre. `None` para un tipo builtin
@@ -939,6 +996,16 @@ fn get_definition_inner(
     let offset = char_offset_from_utf16_position(source, line0, col0);
     if let Some((type_name, _)) = find_named_type_in_program(program, offset) {
         return find_type_declaration(program, &type_name).and_then(|(index, span)| respond(index, span));
+    }
+
+    // GRAMMAR.md §3.22: el límite que el comentario de arriba describía
+    // ("un campo con el mismo nombre que un tipo...") queda cerrado acá --
+    // `Field`/`Param` ahora tienen su propio `name_span` (antes no existía,
+    // así que este caso caía sin remedio al loop de abajo). También
+    // autoritativo: si el cursor está sobre el NOMBRE de un campo/
+    // parámetro, no hay ninguna declaración a la que saltar.
+    if is_field_or_param_name_at(program, offset) {
+        return None;
     }
 
     let word = get_word_at_pos(source, line0, col0)?;
@@ -1390,6 +1457,48 @@ mod tests {
         let col = line.find("-> Int").unwrap() + 3;
         let result = get_definition("file:///test.link", code, 1, col, None, &[], &HashMap::new());
         assert!(result.is_none(), "'Int' es builtin, sin declaración type/enum -- no debe saltar al const homónimo: {result:?}");
+    }
+
+    // ---- Field/Param ganan name_span (GRAMMAR.md §3.22) ----
+
+    #[test]
+    fn test_goto_def_on_a_field_name_that_collides_with_an_existing_type_name_does_not_jump() {
+        // El límite honesto que §3.21 dejó documentado, ahora cerrado:
+        // "Point" es tanto un `type` real COMO el nombre de un campo de
+        // `Shape`. Pedir goto-def sobre el NOMBRE DE CAMPO `Point` (no su
+        // tipo, que acá es `Int`) antes caía al loop viejo de
+        // coincidencia-por-palabra, que saltaba (mal) a `type Point` --
+        // `Field::name_span` (nuevo en esta ronda) permite distinguir
+        // ambos casos: acá debe responder `None`, no una posición.
+        let code = "type Point = { x: Int, y: Int }\ntype Shape = { Point: Int }\n";
+        let line = code.lines().nth(1).unwrap();
+        let col = line.find("Point").unwrap() + 1; // dentro del nombre de campo 'Point', no de su tipo 'Int'
+        let result = get_definition("file:///test.link", code, 1, col, None, &[], &HashMap::new());
+        assert!(result.is_none(), "el cursor está sobre el NOMBRE de un campo, no un uso de tipo -- no debe saltar: {result:?}");
+    }
+
+    #[test]
+    fn test_goto_def_on_the_field_type_still_jumps_when_the_field_name_collides_with_it() {
+        // Contraparte del test anterior, mismo código: pedir goto-def
+        // sobre el TIPO del campo (`Int`, después de los ':') sigue
+        // funcionando como siempre -- el gate nuevo no debe volverse
+        // sobre-amplio y tragarse casos que sí son un uso de tipo real.
+        let code = "type Marker = { x: Int }\ntype Shape = { Marker: Marker }\n";
+        let line = code.lines().nth(1).unwrap();
+        let col = line.rfind("Marker").unwrap() + 1; // el segundo 'Marker' (el tipo), no el primero (el nombre de campo)
+        let def = get_definition("file:///test.link", code, 1, col, None, &[], &HashMap::new())
+            .expect("el cursor está sobre el TIPO del campo -- debe resolver a 'type Marker'");
+        assert_eq!(def["range"]["start"]["line"], 0, "debe apuntar a 'type Marker' (línea 0): {def:?}");
+    }
+
+    #[test]
+    fn test_goto_def_on_a_param_name_that_collides_with_an_existing_type_name_does_not_jump() {
+        // Mismo bug, en un `Param` de `fn` en vez de un `Field` de `type`.
+        let code = "type Point = { x: Int, y: Int }\nfn f(Point: Int) -> Int { Point }\n";
+        let line = code.lines().nth(1).unwrap();
+        let col = line.find("Point").unwrap() + 1; // el nombre del parámetro, no su tipo Int
+        let result = get_definition("file:///test.link", code, 1, col, None, &[], &HashMap::new());
+        assert!(result.is_none(), "el cursor está sobre el NOMBRE de un parámetro, no un uso de tipo -- no debe saltar: {result:?}");
     }
 
     #[test]

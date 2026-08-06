@@ -931,7 +931,26 @@ Distinto del target WASM que ya existía (`compiler/src/bin/wasm_demo.rs`, que r
 **Fuera de alcance, a propósito:**
 - Publicar `publishDiagnostics` para múltiples URIs desde un solo re-chequeo (lo que daría rango real también para un error en un archivo importado, no solo el mensaje nombrándolo) -- requiere trackear y limpiar diagnósticos de archivos que dejan de estar en el cierre transitivo entre un chequeo y el siguiente; una ronda propia, más grande que "adjuntar identidad de archivo".
 - Los ítems 1 y 2 de Nivel 3 (§3.21) siguen sin empezar -- no dependen de esta ronda.
-- El límite de `Field`/`Param` sin span (§3.21) sigue igual -- no lo toca esta ronda.
+- El límite de `Field`/`Param` sin span (§3.21) sigue igual -- resuelto en la siguiente ronda (§3.23), no acá.
+
+---
+
+### 3.23 `Field`/`Param` ganan `name_span` — RESUELTO
+
+§3.21 dejó documentado, como límite honesto encontrado escribiendo sus propios tests: un campo o parámetro cuyo NOMBRE coincide textualmente con una declaración `type`/`enum` existente (`type Point = {...}; type Shape = { Point: Int }`) seguía cayendo al loop viejo de coincidencia-por-palabra al pedir goto-def sobre el nombre de CAMPO `Point` -- saltaba (mal) a `type Point`, porque el cursor ahí no caía dentro de ningún `TypeExpr::Named`. Esta ronda lo cierra.
+
+**Un solo campo nuevo por struct, verificado con grep: exactamente 2 sitios de producción.** `Field` y `Param` ganan `name_span: Span`, cubriendo SOLO el identificador del nombre (mismo criterio que `TypeExpr::Named`, §3.21). A diferencia de la migración `Spanned<Expr>`/`Spanned<Stmt>` (~155 sitios) o incluso `TypeExpr::Named` (~4 sitios), acá hubo literalmente UN sitio de producción real por tipo (`parser.rs::parse_field`, `parser.rs::parse_param`) -- `ClosureParam` (parámetros de un closure `|params| {...}`) queda deliberadamente afuera, es un tercer tipo de parámetro distinto y el bug reportado nunca lo mencionaba. Capturar el span es `let name_span = self.span();` inmediatamente ANTES de `self.eat_ident()` -- mismo patrón que `parse_primary_type` ya usaba para `TypeExpr::Named`, válido porque `eat_ident` no saltea nada antes del identificador.
+
+**`PartialEq` manual, mismo motivo que `TypeExpr` ya tenía.** `Field`/`Param` sacaron `PartialEq` del derive automático (que hubiera empezado a comparar `name_span`, rompiendo en silencio cualquier comparación estructural existente -- ej. `TypeExpr::Struct`'s propio `PartialEq` compara `Vec<Field>` elemento a elemento, y `FnDecl`/`RpcDecl` hacen lo mismo con `Vec<Param>`) y lo reimplementan a mano ignorando `name_span`, exactamente el mismo patrón que `TypeExpr::Named` ya resolvía para su propio span. Cero tests rotos por esto -- confirmado corriendo la suite completa antes y después: los tests existentes ya construían programas parseando texto fuente real, no armando `Field`/`Param` a mano, así que el nuevo campo no tocó ningún sitio de construcción fuera de los 2 de arriba.
+
+**LSP: `is_field_or_param_name_at` + `field_name_at_in_type`, mismo criterio de exhaustividad que `find_named_type_at`.** Dos funciones nuevas en `lsp.rs`, sin brazo `_` en ninguna (agregar una variante de `TypeExpr` rompe la compilación acá, no se ignora en silencio): `field_name_at_in_type` recorre las 8 variantes buscando un `TypeExpr::Struct` en cualquier profundidad (un genérico puede envolver un struct inline, `Box<{ n: Int }>`) y chequea el `name_span` de sus campos; `is_field_or_param_name_at` aplica eso sobre exactamente los mismos lugares que `find_named_type_in_program` ya recorre (`Field` de `type`/`db`/variantes de `enum`, `Param` de `fn`/`rpc`/`stream`). En `get_definition_inner`, corre como un SEGUNDO gate autoritativo, inmediatamente después del de `TypeExpr::Named` (§3.21) y antes del loop viejo: si el offset cae sobre el nombre de un campo/parámetro, responde `None` directamente -- un nombre de campo no es una referencia a otro símbolo (a diferencia de su TIPO, que el primer gate ya resuelve), así que no hay ninguna declaración a la que saltar.
+
+**Verificado que el gate nuevo no es sobre-amplio.** Además del caso que arregla (`test_goto_def_on_a_field_name_that_collides_with_an_existing_type_name_does_not_jump`, `test_goto_def_on_a_param_name_that_collides_with_an_existing_type_name_does_not_jump`), un test cubre la contraparte exacta con el MISMO código: pedir goto-def sobre el TIPO de un campo cuyo nombre coincide con ese mismo tipo (`type Marker = {...}; type Shape = { Marker: Marker }`, cursor sobre el segundo `Marker`) sigue resolviendo a `type Marker` como siempre -- el gate nuevo distingue nombre de campo vs. uso de tipo en vez de tragarse ambos. 345 tests, todos pasando.
+
+**Fuera de alcance, a propósito:**
+- `ClosureParam` (parámetros de closure) no ganó `name_span` -- el bug reportado en §3.21 solo mencionaba `Field`/`Param`; si aparece el mismo problema ahí, es una extensión de tamaño similar, no una consecuencia gratis de esta ronda.
+- Los ítems 1 y 2 de Nivel 3 (§3.21: hover de expresión arbitraria, completion sensible a `x.`) siguen sin empezar.
+- Publicar `publishDiagnostics` multi-URI (§3.22) sigue sin empezar.
 
 ---
 

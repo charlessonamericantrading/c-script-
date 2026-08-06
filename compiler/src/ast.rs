@@ -114,11 +114,29 @@ pub struct Variant {
     pub fields: Option<Vec<Field>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// `name_span` cubre SOLO el identificador del nombre del campo (GRAMMAR.md
+/// §3.22, cierra el límite que §3.21 dejó documentado) -- mismo criterio
+/// que `TypeExpr::Named`'s propio `Span`: es lo que le permite al LSP
+/// distinguir "el cursor está sobre el NOMBRE de un campo" de "está sobre
+/// un USO de tipo", que antes eran indistinguibles y hacían que un campo
+/// homónimo a un `type`/`enum` existente (`type Point = {...}; type Shape =
+/// { Point: Int }`) saltara mal al pedir goto-def sobre el nombre de campo.
+/// `PartialEq` es manual (no derive) para IGNORAR `name_span`, mismo motivo
+/// que `TypeExpr` ya no deriva `PartialEq`: dos `Field` estructuralmente
+/// iguales en offsets distintos deben seguir siendo `==` (lo usa, entre
+/// otros, `TypeExpr::Struct`'s propio `PartialEq` al comparar `Vec<Field>`).
+#[derive(Debug, Clone)]
 pub struct Field {
     pub name: String,
     pub optional: bool, // el `?` ANTES de `:` (x?: T) — distinto de Optional(T) en TypeExpr
     pub ty: TypeExpr,
+    pub name_span: Span,
+}
+
+impl PartialEq for Field {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.optional == other.optional && self.ty == other.ty
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -188,11 +206,24 @@ pub enum Annotation {
     Requires { enum_name: String, variant_name: String },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver
+/// su doc) -- distingue el NOMBRE de un parámetro de un USO de tipo para
+/// goto-def (GRAMMAR.md §3.22). `PartialEq` manual por la misma razón:
+/// ignora `name_span` para que dos `Param` estructuralmente iguales en
+/// offsets distintos sigan siendo `==` (lo usa `FnDecl`/`RpcDecl`'s propio
+/// `PartialEq` al comparar `Vec<Param>`).
+#[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
     pub ty: TypeExpr,
     pub default: Option<Spanned<Expr>>,
+    pub name_span: Span,
+}
+
+impl PartialEq for Param {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.ty == other.ty && self.default == other.default
+    }
 }
 
 /// Mismo criterio que `RpcDecl`: el span cubre la firma, no `body`.
