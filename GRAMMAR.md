@@ -1064,6 +1064,25 @@ PLAN.md §4 (Fase 2) lo nombraba junto a `LSP completo`/`package manager`/`obser
 
 ---
 
+### 3.28 Fase 3 (PLAN.md §4): política de estabilidad de sintaxis, y por qué source maps NO se persigue todavía
+
+Última pieza del backlog de la auditoría post-push que arrancó con la Ronda 0. PLAN.md §4 nombra, para Fase 3 (1.0, producción, "+6–12 meses, 4–6+ personas"), dos entregables puntuales: "estabilidad de sintaxis" y "debugging con source maps". Ninguno de los dos es una feature que se pueda "implementar" como las anteriores -- son, respectivamente, una DECISIÓN de política y una decisión de NO-hacer, y esta sección las deja explícitas en vez de dejarlas flotando sin resolución.
+
+**Congelar la sintaxis ahora sería prematuro -- decisión consciente, no un olvido.** El propio [README](README.md) sigue abriendo con "This repo is the **Phase 0 MVP** ... It is not a production-ready language". Comprometerse a una sintaxis inmutable ANTES de que exista un solo usuario externo real usándola sería fijar en piedra decisiones (§2.3 nullability, §3.5 manejo de errores, y cada `RESUELTO` de la sección 3 de arriba) que todavía no pasaron la prueba de fuego de un caso de uso ajeno -- exactamente el tipo de compromiso prematuro que PLAN.md §7 ya identifica como uno de los riesgos principales de un lenguaje nuevo.
+
+**Política aplicada en su lugar, efectiva desde esta ronda:** mientras la versión declarada en `compiler/Cargo.toml` sea `0.x` (hoy `0.1.0`), un cambio de sintaxis que rompa un `.link` existente se documenta en el `CHANGELOG` de su propio commit (mismo criterio que esta auditoría entera ya viene aplicando: cada ronda que cambió comportamiento lo dice explícitamente en README/GRAMMAR, nunca en silencio) pero NO requiere ningún proceso de deprecación ni compatibilidad hacia atrás. Recién en `1.0.0` esta libertad se cierra: un cambio incompatible pasa a requerir una migración documentada (o un nuevo mecanismo de edición/versión de lenguaje, al estilo `edition` de Rust, si para entonces hay motivo real de necesitarlo -- decisión que le corresponde a esa ronda futura, no a esta). Esto no es una promesa nueva inventada acá: es simplemente hacer explícito lo que SemVer ya dice sobre una versión `0.x`, para que quede escrito una vez en vez de asumido.
+
+**Source maps: valor genuinamente incierto con la arquitectura actual, no simplemente "no hubo tiempo".** La razón habitual para pedir source maps es mapear código GENERADO (JS transpilado, minificado) de vuelta al fuente original durante una sesión de debugging. Acá:
+- La lógica de negocio real (el cuerpo de cada `rpc`/`fn`) corre en el INTÉRPRETE de Rust (`runtime/mod.rs`), nunca se transpila a JS/TS -- no hay ningún paso de compilación de ESE código para el que un source map tenga sentido. Un error de runtime ahí ya sale con la posición real en el `.link` fuente (`diagnostics.rs`, GRAMMAR.md prerrequisitos 1-3 del LSP), sin necesitar ningún mapeo.
+- Lo único que SÍ se genera hacia TS (`contract.d.ts`/`client.ts`/`validators.ts`, `ts_emit.rs`/`validators_emit.rs`) es deliberadamente FINO -- interfaces y un cliente RPC que arma un `fetch()`, sin lógica propia que alguien necesite pisar con un breakpoint y "step into" hacia el `.link` original. Pisar un breakpoint DENTRO de `client.ts` ya te deja en TypeScript legible, generado pero no ofuscado ni minificado -- el caso de uso que un source map resuelve (código irreconocible) no se da acá.
+- El único lugar donde HOY se emite bytecode de verdad no legible por un humano es `linkc wasm` (§3.20) -- explícitamente congelado esta misma auditoría, alcance mínimo, no el camino de producción.
+
+Dado esto, la recomendación es NO perseguir source maps como una ronda propia hasta que la arquitectura cambie de forma que los vuelva necesarios (ej. si algún día existe un compilador real hacia JS del CUERPO de un `rpc`, no solo del cliente) -- perseguirlos ahora sería construir infraestructura para un problema que este diseño concreto no tiene todavía. Si aparece un caso real y concreto de "no puedo debuggear X" que un source map resolvería, esa necesidad puntual es la que debería disparar la ronda, no esta lista de tareas.
+
+**Con esto, el backlog completo de la auditoría post-push queda resuelto o explícitamente decidido: nada se dejó flotando sin una razón escrita.** Ver la sección "Estado" del [README](README.md) para el resumen de qué se hizo en cada ronda.
+
+---
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
