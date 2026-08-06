@@ -1017,6 +1017,28 @@ Con esto, el Nivel 3 del LSP completo queda resuelto: los 3 ítems que §3.19/§
 
 ---
 
+### 3.26 Observabilidad: tracing estructurado por RPC — RESUELTO, v0
+
+PLAN.md §4 (Fase 2) la nombraba junto al package manager como pendiente. `runtime/server.rs` ya tenía un `req_id` incremental (agregado como prerrequisito parcial para poder correlacionar líneas de log entre el hilo principal y los hilos de escritura de `stream`) -- esta ronda es lo que faltaba encima de eso.
+
+**Una línea por request COMPLETADA, formato `clave=valor` -- greppable sin parsear JSON.** `log_done(req_id, method, status, start, extra)` es el único punto de emisión: `[req {id}] method={service}.{rpc} status={code} duration_ms={ms}` (+ `{extra}` si no está vacío). Mismo espíritu que el formato de texto de `tracing`/los logs de Heroku -- no se suma la dependencia `tracing` para esto, `println!` con un formato consistente ya alcanza para un v0 (agregar salida JSON estructurada, o niveles de log configurables, sería la extensión natural si hiciera falta después).
+
+**Tres piezas nuevas sobre el log de "request recibida" que ya existía:**
+- **Duración real** (`duration_ms`), un `Instant::now()` capturado al entrar y restado en cada punto de salida -- incluyendo los hilos de escritura de `stream`/`stream` en vivo (`start` se les pasa junto con `req_id`), así que la duración de un stream cubre el envío completo, no solo el cómputo inicial en el hilo principal.
+- **El método real** (`method=Users.create`, no la ruta cruda) -- ya se conocía en cada rama existente (`service_name`/`rpc_name` de `parse_path`), esta ronda solo lo agrega al log de salida. `None` (`method=-`) para los pocos casos que nunca llegan a resolverlo (un 404 por URL mal formada).
+- **El mensaje de error en la propia línea de log**, no solo el código de status. Antes, un 401/400/500 solo mostraba el número -- para saber QUÉ pasó había que inspeccionar la respuesta por otro lado (un `curl -v`, ver el cliente generado fallar). Ahora `error="..."` va en la misma línea. Para el camino de `handle_rpc` (la mayoría de los rpc), el body de error es `{"error": "<mensaje>"}` -- se extrae el mensaje real en vez de loguear el JSON completo escapado adentro de otro string (`error="{\"error\":\"...\"}"`, técnicamente correcto pero feo de leer); si el body no tiene esa forma exacta por algún motivo, cae al body crudo en vez de esconder la falla.
+
+**Los casos de desconexión de un `stream` (antes texto libre) ahora usan el mismo formato**, con campos propios (`client_disconnected=true stage=snapshot sent=N`, etc.) en vez de una oración armada a mano -- consistente con el resto, aunque conceptualmente no sean "un error" (la respuesta 200 ya se había mandado; es el cliente el que se fue).
+
+Verificado con un servidor real: los 4 casos (éxito, 404 por ruta desconocida, 401 por auth, 500 por servicio desconocido) dan líneas limpias y completas -- confirmado leyendo el stdout real del proceso, no solo por inspección de código. El demo insignia completo (`frontend/src/main.ts` contra un servidor real) también se corrió de punta a punta para confirmar que el refactor de logging no cambió ningún comportamiento funcional. 371 tests, todos pasando (esta ronda no agregó tests nuevos -- el logging en sí no es una superficie que este proyecto testee con asserts, mismo criterio que ya regía para el `req_id`/formato de log anteriores; se verificó leyendo stdout real, el mismo método que ya usaba la auditoría original de este mismo módulo).
+
+**Fuera de alcance, a propósito:**
+- Salida estructurada en JSON (para ingestión por un colector de logs real) -- el formato `clave=valor` alcanza para un v0 de un solo proceso sin infraestructura de observabilidad detrás.
+- Niveles de log configurables (`--verbose`/`RUST_LOG`) -- hoy todo sale siempre, sin flag para silenciar ni para pedir más detalle.
+- Métricas agregadas (percentiles de latencia, tasa de error) -- esto es tracing por request individual, no una capa de métricas encima.
+
+---
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

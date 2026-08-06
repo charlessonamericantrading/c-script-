@@ -39,9 +39,28 @@ use std::sync::mpsc::Receiver;
 /// Un id incremental por request -- lo único que hace falta para poder
 /// correlacionar líneas de log una vez que hay más de un hilo escribiendo a
 /// stdout al mismo tiempo (cada `stream` corre en el suyo, para la escritura).
-/// No es una iniciativa de observabilidad aparte: es lo mínimo que el hilo
-/// de escritura hace necesario, ver PLAN.md §4 (Fase 2).
+/// Prerrequisito parcial de observabilidad real (PLAN.md §4, Fase 2) --
+/// ver `log_done` para el resto.
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Tracing estructurado por RPC (GRAMMAR.md §2.1, auditoría post-push):
+/// una sola línea por request COMPLETADA, formato `clave=valor` (greppable
+/// sin parsear JSON, mismo espíritu que el logging de texto de `tracing`/
+/// Heroku -- no se suma la dependencia `tracing` para esto, `println!` ya
+/// alcanza). `req_id` (existía desde antes, ver arriba) correlaciona esta
+/// línea con la de "request recibida"; `method` es `None` para los casos
+/// que nunca llegan a resolver `{service}.{rpc}` (ej. un 404 por URL mal
+/// formada). `extra` es libre -- `error="..."` en una falla,
+/// `sent=N total=M` en un stream, o simplemente vacío en un 200 normal.
+fn log_done(req_id: u64, method: Option<&str>, status: u16, start: std::time::Instant, extra: &str) {
+    let elapsed_ms = start.elapsed().as_millis();
+    let method_field = method.unwrap_or("-");
+    if extra.is_empty() {
+        println!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms}");
+    } else {
+        println!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms} {extra}");
+    }
+}
 
 pub fn serve(program: Program, port: u16, db_path: PathBuf) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
@@ -69,6 +88,7 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
         }
 
         let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        let start = std::time::Instant::now();
         let path = request.url().to_string();
         println!("[req {req_id}] {} {path}", request.method());
 
@@ -77,9 +97,10 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
 
         let Some((service_name, rpc_name)) = parse_path(&path) else {
             let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method")));
-            println!("[req {req_id}] 404");
+            log_done(req_id, None, 404, start, "");
             continue;
         };
+        let method = format!("{service_name}.{rpc_name}");
 
         // El gate de autorización corre ACÁ, antes de `parse_args`/
         // `json_to_typed_value` en cualquiera de las dos ramas de abajo --
@@ -89,7 +110,7 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
         let token = extract_bearer_token(&request);
         if let Err((status, msg)) = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name) {
             let _ = request.respond(cors_response(status, error_json(msg)));
-            println!("[req {req_id}] {status}");
+            log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
             continue;
         }
 
@@ -104,12 +125,13 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
             if let Some(collection) = live_subscribe_collection(&program, service_name, rpc_name) {
                 match db.subscribe(collection) {
                     Ok((snapshot, events)) => {
-                        std::thread::spawn(move || write_live_stream(request, snapshot, events, req_id));
+                        std::thread::spawn(move || write_live_stream(request, snapshot, events, req_id, method, start));
                     }
                     Err(e) => {
                         let status = status_for(&e);
-                        let _ = request.respond(cors_response(status, error_json(&e.to_string())));
-                        println!("[req {req_id}] {status}");
+                        let msg = e.to_string();
+                        let _ = request.respond(cors_response(status, error_json(&msg)));
+                        log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
                     }
                 }
                 continue;
@@ -119,7 +141,7 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
                 Ok(v) => v,
                 Err(e) => {
                     let _ = request.respond(cors_response(400, error_json(&e)));
-                    println!("[req {req_id}] 400");
+                    log_done(req_id, Some(&method), 400, start, &format!("error={e:?}"));
                     continue;
                 }
             };
@@ -133,19 +155,35 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
                 ),
                 Err(e) => {
                     let status = status_for(&e);
-                    let _ = request.respond(cors_response(status, error_json(&e.to_string())));
-                    println!("[req {req_id}] {status}");
+                    let msg = e.to_string();
+                    let _ = request.respond(cors_response(status, error_json(&msg)));
+                    log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
                     continue;
                 }
             };
-            std::thread::spawn(move || write_stream(request, elements, req_id));
+            std::thread::spawn(move || write_stream(request, elements, req_id, method, start));
             continue;
         }
 
         let (status, response_body) =
             handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, &body);
+        // `response_body` en una falla es `{"error": "<mensaje>"}`
+        // (`error_json`, más abajo) -- se extrae el mensaje solo para el
+        // log en vez de loguear el JSON completo escapado adentro de otro
+        // string (`error="{\"error\":\"...\"}"`, técnicamente correcto
+        // pero feo de leer); si el body no tiene esa forma exacta por
+        // algún motivo, cae al body crudo en vez de esconder la falla.
+        let extra = if status >= 400 {
+            let message = serde_json::from_str::<serde_json::Value>(&response_body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str().map(str::to_string)))
+                .unwrap_or_else(|| response_body.clone());
+            format!("error={message:?}")
+        } else {
+            String::new()
+        };
         let _ = request.respond(cors_response(status, response_body));
-        println!("[req {req_id}] {status}");
+        log_done(req_id, Some(&method), status, start, &extra);
     }
 }
 
@@ -267,7 +305,7 @@ fn status_for(e: &super::RuntimeError) -> u16 {
 /// push real reconocido por `live_subscribe_collection` -- ver
 /// `write_live_stream`, más abajo, para el caso que sí anuncia eventos
 /// futuros de verdad.
-fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, req_id: u64) {
+fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, req_id: u64, method: String, start: std::time::Instant) {
     // Escrito a mano en vez de tiny_http::Response + request.respond(): ese
     // camino sólo llama flush() UNA vez, al final (request.rs::respond_impl),
     // sobre un BufWriter::with_capacity(1024, ...) (client.rs) que envuelve
@@ -295,7 +333,7 @@ fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, r
     let mut writer = request.into_writer();
     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
     if writer.write_all(header).is_err() {
-        println!("[req {req_id}] cliente ya desconectado antes del primer byte");
+        log_done(req_id, Some(&method), 0, start, "client_disconnected=true stage=before_first_byte");
         return;
     }
     let _ = writer.flush();
@@ -316,9 +354,12 @@ fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, r
                 // conexión abandonada. No hay nada más que limpiar: la
                 // lista ya estaba completamente calculada en memoria de
                 // entrada.
-                println!(
-                    "[req {req_id}] cliente desconectado a mitad de stream (kind={:?}), {sent}/{total} eventos enviados",
-                    e.kind()
+                log_done(
+                    req_id,
+                    Some(&method),
+                    200,
+                    start,
+                    &format!("client_disconnected=true kind={:?} sent={sent} total={total}", e.kind()),
                 );
                 return;
             }
@@ -329,7 +370,7 @@ fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, r
     // chunked_transfer::Encoder internamente, acá escrito a mano por la
     // misma razón que el resto de este framing).
     let _ = writer.write_all(b"0\r\n\r\n").and_then(|_| writer.flush());
-    println!("[req {req_id}] 200 (stream: {sent}/{total} eventos)");
+    log_done(req_id, Some(&method), 200, start, &format!("sent={sent} total={total}"));
 }
 
 /// Push real v0 (GRAMMAR.md §3.16): a diferencia de `write_stream`,
@@ -348,16 +389,19 @@ fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, r
 /// en la PRÓXIMA publicación a `collection` es cuando `Db::publish` nota
 /// que el `SyncSender` pareja ya no tiene receptor y lo poda -- lazy, no
 /// eager (ver `Db::publish`).
+#[allow(clippy::too_many_arguments)]
 fn write_live_stream(
     request: tiny_http::Request,
     snapshot: Vec<serde_json::Value>,
     events: Receiver<serde_json::Value>,
     req_id: u64,
+    method: String,
+    start: std::time::Instant,
 ) {
     let mut writer = request.into_writer();
     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
     if writer.write_all(header).is_err() {
-        println!("[req {req_id}] cliente ya desconectado antes del primer byte (stream en vivo)");
+        log_done(req_id, Some(&method), 0, start, "client_disconnected=true stage=before_first_byte");
         return;
     }
     let _ = writer.flush();
@@ -365,7 +409,7 @@ fn write_live_stream(
     let mut sent = 0usize;
     for element in &snapshot {
         if write_chunk(&mut writer, format!("data: {element}\n\n").as_bytes()).is_err() {
-            println!("[req {req_id}] cliente desconectado durante la foto inicial, {sent} eventos enviados");
+            log_done(req_id, Some(&method), 200, start, &format!("client_disconnected=true stage=snapshot sent={sent}"));
             return;
         }
         sent += 1;
@@ -376,13 +420,13 @@ fn write_live_stream(
     // se queda esperando.
     for event in &events {
         if write_chunk(&mut writer, format!("data: {event}\n\n").as_bytes()).is_err() {
-            println!("[req {req_id}] cliente desconectado de un stream en vivo tras {sent} eventos");
+            log_done(req_id, Some(&method), 200, start, &format!("client_disconnected=true stage=live sent={sent}"));
             return;
         }
         sent += 1;
     }
     let _ = writer.write_all(b"0\r\n\r\n").and_then(|_| writer.flush());
-    println!("[req {req_id}] stream en vivo cerrado ({sent} eventos)");
+    log_done(req_id, Some(&method), 200, start, &format!("sent={sent}"));
 }
 
 /// Un chunk de HTTP chunked transfer encoding: tamaño en hex + CRLF + datos

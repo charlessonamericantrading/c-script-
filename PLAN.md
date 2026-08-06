@@ -262,7 +262,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 **`package manager` de esta fila: RESUELTO en su forma "Git-as-registry", no un registro en red centralizado.** `link.json` ahora acepta `git+<url>#<rev>` como dependencia real, además de una ruta local -- resuelto invocando el binario `git` real (clonar/fetch/checkout, GRAMMAR.md §2.1) contra un caché local por proyecto, con `link.lock` grabando el commit exacto resuelto. Sin un registro centralizado tipo npm/crates.io (decisión consciente, mismo espíritu que evitar infraestructura nueva sin necesidad real) -- la URL git ES el "registro", igual que en Go. Queda como límite de v0, no como brecha a cerrar de forma incremental: `link.lock` es informativo (no un pin real que sobreviva a un `rev` de rama que avanzó) y no hay locking entre procesos concurrentes -- ver GRAMMAR.md §2.1 para el detalle completo.
 
-`observabilidad` de fondo de esta misma fila sigue sin empezar -- ver el README para el detalle.
+**`observabilidad` de esta misma fila: RESUELTO, v0.** Tracing estructurado por RPC (`[req N] method=Users.create status=200 duration_ms=7`, GRAMMAR.md §3.26) sobre el `req_id` que ya existía como prerrequisito parcial -- formato `clave=valor` greppable, sin sumar `tracing`/OpenTelemetry todavía. Queda para una ronda futura: salida JSON, niveles de log configurables, y métricas agregadas -- ver GRAMMAR.md §3.26 para el detalle completo de qué falta.
 
 **Hitos "go / no-go":**
 - Fin de Fase 0: ¿la demo E2E convence a 5 devs externos? Si no, replantear.
