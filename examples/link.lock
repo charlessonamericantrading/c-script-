@@ -5,5 +5,6 @@
       "path": "users.link",
       "hash": "ab6abe62ba327e8ec09be39ff2f3afef1bc4803c574a808833f70dbe6d4bdf97"
     }
-  }
+  },
+  "git_dependencies": {}
 }

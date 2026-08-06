@@ -9,10 +9,33 @@ pub struct LockEntry {
     pub hash: String,
 }
 
+/// Dependencia `git+<url>#<rev>` de `link.json` ya resuelta (GRAMMAR.md
+/// §2.1, package manager real) -- `rev` es lo que el usuario pidió (un
+/// tag, una rama, o ya un commit), `resolved` es el commit SHA exacto al
+/// que resolvió esa vez. A diferencia de `LockEntry` (que SÍ se usa para
+/// detectar deriva -- `verify_lockfile` compara contra el hash actual),
+/// esta entrada es puramente informativa en v0: `modules::gitdep`
+/// siempre re-resuelve `rev` fresco en cada build (si es una rama/tag que
+/// se movió, el build lo sigue) en vez de forzar `resolved` como un pin
+/// que anule lo que dice `link.json` -- ver `gitdep.rs` para el porqué y
+/// qué haría falta para que sea un pin real.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct GitLockEntry {
+    pub url: String,
+    pub rev: String,
+    pub resolved: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct Lockfile {
     pub version: u32,
     pub entries: BTreeMap<String, LockEntry>,
+    /// Vacío para cualquier programa sin dependencias `git+` -- con
+    /// `#[serde(default)]`, un `link.lock` escrito ANTES de esta ronda
+    /// (sin este campo) sigue leyendo bien, con este mapa simplemente
+    /// vacío, en vez de fallar la deserialización.
+    #[serde(default)]
+    pub git_dependencies: BTreeMap<String, GitLockEntry>,
 }
 
 impl Default for Lockfile {
@@ -26,6 +49,7 @@ impl Lockfile {
         Self {
             version: 1,
             entries: BTreeMap::new(),
+            git_dependencies: BTreeMap::new(),
         }
     }
 }

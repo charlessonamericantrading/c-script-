@@ -29,7 +29,7 @@ use crate::ast::{Item, Program};
 use crate::lexer;
 use crate::parser;
 use crate::token::Span;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -124,7 +124,28 @@ pub fn load_program(entry: &Path) -> Result<(Program, Vec<PathBuf>, Vec<PathBuf>
 /// no por span individual, para resolver la ambigüedad que antes obligaba
 /// a `lsp.rs`/`main.rs` a negarse en bloque (`touched.len() <= 1`) apenas
 /// un programa tocaba más de un archivo.
+///
+/// Descarta el cuarto elemento de `load_program_full` (`git_dependencies`
+/// resueltas, GRAMMAR.md §2.1) -- ningún caller existente (LSP, tests)
+/// necesita esa información; solo `main.rs` la usa para escribir
+/// `link.lock`, vía `load_program_full` directo.
 pub fn load_program_with_overlay(entry: &Path, overlay: &HashMap<PathBuf, String>) -> Result<(Program, Vec<PathBuf>, Vec<PathBuf>), LoadError> {
+    let (program, touched, item_files, _git_dependencies) = load_program_full(entry, overlay)?;
+    Ok((program, touched, item_files))
+}
+
+/// Igual que `load_program_with_overlay`, pero además devuelve, por cada
+/// dependencia `git+<url>#<rev>` de `link.json` que se resolvió durante la
+/// carga, el `GitLockEntry` correspondiente (clave: el nombre de la
+/// dependencia tal como aparece en `link.json`) -- lo que `main.rs`
+/// necesita para grabar `link.lock` con las dependencias git reales
+/// (GRAMMAR.md §2.1). Separada de `load_program_with_overlay` (en vez de
+/// agregarle un cuarto elemento a SU tupla) para no tener que tocar los
+/// ~10 call sites existentes (lsp.rs, tests) que no les importa esto.
+pub fn load_program_full(
+    entry: &Path,
+    overlay: &HashMap<PathBuf, String>,
+) -> Result<(Program, Vec<PathBuf>, Vec<PathBuf>, BTreeMap<String, crate::lockfile::GitLockEntry>), LoadError> {
     let canon_entry = canonicalize(entry)?;
     let project_root = canon_entry.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
     let mut loader = Loader {
@@ -133,13 +154,14 @@ pub fn load_program_with_overlay(entry: &Path, overlay: &HashMap<PathBuf, String
         project_root,
         manifest: None,
         overlay,
+        git_dependencies: BTreeMap::new(),
     };
     let mut on_stack = HashSet::new();
     let mut done = HashSet::new();
     let mut merged = Vec::new();
     let mut merged_files = Vec::new();
     loader.visit(&canon_entry, &mut on_stack, &mut done, &mut merged, &mut merged_files)?;
-    Ok((Program { items: merged }, loader.touched, merged_files))
+    Ok((Program { items: merged }, loader.touched, merged_files, loader.git_dependencies))
 }
 
 struct Loader<'a> {
@@ -159,6 +181,10 @@ struct Loader<'a> {
     /// abiertos; clonarlo acá duplicaría el texto de cada archivo abierto
     /// sin ninguna necesidad.
     overlay: &'a HashMap<PathBuf, String>,
+    /// Nombre de dependencia (clave de `link.json`) -> resolución git real
+    /// (GRAMMAR.md §2.1) -- poblado por `resolve_import_target` a medida
+    /// que resuelve cada `git+<url>#<rev>`, expuesto por `load_program_full`.
+    git_dependencies: BTreeMap<String, crate::lockfile::GitLockEntry>,
 }
 
 impl Loader<'_> {
@@ -193,10 +219,25 @@ impl Loader<'_> {
             self.manifest = Some(deps);
         }
         let deps = self.manifest.as_ref().expect("se acaba de asignar arriba");
-        let dep_path = deps.get(from).ok_or_else(|| {
+        let dep_spec = deps.get(from).ok_or_else(|| {
             err(format!("'{from}' no es una ruta relativa ('./' o '../') ni una dependencia en link.json"))
         })?;
-        canonicalize(&self.project_root.join(dep_path))
+
+        // Dependencia git real (GRAMMAR.md §2.1, package manager):
+        // `git+<url>#<rev>` clona/actualiza un caché local vía `git`
+        // real (`gitdep::resolve`) y hace checkout del rev pedido -- el
+        // punto de entrada DENTRO del checkout es `main.link` en la raíz
+        // por convención, el mismo nombre que `linkc new` ya scaffoldea
+        // para un proyecto nuevo (ver `scaffold.rs`), no una ruta
+        // configurable en esta v0.
+        if dep_spec.starts_with("git+") {
+            let (checkout_dir, lock_entry) =
+                crate::gitdep::resolve(dep_spec, &self.project_root).map_err(|e| err(format!("'{from}': {e}")))?;
+            self.git_dependencies.insert(from.to_string(), lock_entry);
+            return canonicalize(&checkout_dir.join("main.link"));
+        }
+
+        canonicalize(&self.project_root.join(dep_spec))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -464,5 +505,53 @@ mod tests {
         );
         let (program, _, _) = load_program(&dir.path("a.link")).unwrap();
         assert_eq!(program.items.len(), 2);
+    }
+
+    // ---- dependencias git reales (GRAMMAR.md §2.1, package manager) ----
+
+    /// Repo git real y LOCAL usado como "remoto" -- ningún test de acá
+    /// toca la red; `git clone`/`fetch` contra una ruta local es el mismo
+    /// camino de código real de git, solo cambia el transporte. Mínimo a
+    /// propósito (no comparte código con `gitdep::tests::FixtureRemote`,
+    /// que es privado a ese módulo) -- un solo test lo necesita acá.
+    fn init_fixture_remote(dir: &Path) -> String {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git").args(args).current_dir(dir).status().unwrap();
+            assert!(status.success(), "git {args:?} falló");
+        };
+        fs::create_dir_all(dir).unwrap();
+        run(&["init", "--quiet", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        fs::write(dir.join("main.link"), "type Circle = { r: Int }").unwrap();
+        run(&["add", "main.link"]);
+        run(&["commit", "--quiet", "-m", "init"]);
+        run(&["tag", "v1.0.0"]);
+        dir.to_string_lossy().replace('\\', "/")
+    }
+
+    #[test]
+    fn bare_name_import_resolves_via_a_real_git_dependency() {
+        let remote_dir = std::env::temp_dir().join(format!("cscript-modules-git-remote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&remote_dir);
+        let remote_url = init_fixture_remote(&remote_dir);
+
+        let dir = TempDir::new("git-manifest");
+        dir.write("link.json", &format!(r#"{{ "dependencies": {{ "shapes": "git+{remote_url}#v1.0.0" }} }}"#));
+        dir.write(
+            "a.link",
+            r#"
+            import { Circle } from "shapes";
+            fn unit_circle() -> Circle { Circle { r: 1 } }
+        "#,
+        );
+        let (program, _touched, _item_files, git_deps) = load_program_full(&dir.path("a.link"), &HashMap::new()).unwrap();
+        assert_eq!(program.items.len(), 2, "Circle (del repo git) + unit_circle");
+        assert_eq!(git_deps.len(), 1);
+        let entry = git_deps.get("shapes").expect("debe registrar la resolución de 'shapes' en git_dependencies");
+        assert_eq!(entry.rev, "v1.0.0");
+        assert_eq!(entry.resolved.len(), 40, "un commit SHA completo de git: {}", entry.resolved);
+
+        let _ = fs::remove_dir_all(&remote_dir);
     }
 }

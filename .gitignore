@@ -9,3 +9,11 @@
 *.db-shm
 *.db-wal
 *.db-journal
+
+# Caché local de dependencias git (GRAMMAR.md §2.1, package manager real)
+# -- clones reales de `git+<url>#<rev>` en link.json, un directorio por
+# dependencia (relativo al directorio del .link raíz, no siempre la raíz
+# del repo -- ver examples/.linkc/). `link.lock` graba el commit
+# resuelto; el clon en sí es reproducible desde cero, no hace falta
+# versionarlo.
+.linkc/

@@ -8,6 +8,7 @@ pub mod ast;
 pub mod checker;
 pub mod codegen;
 pub mod diagnostics;
+pub mod gitdep;
 pub mod lexer;
 pub mod lockfile;
 pub mod modules;

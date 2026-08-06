@@ -1,5 +1,6 @@
 use linkc::ast::Program;
 use linkc::{checker, codegen, diagnostics, modules, runtime, scaffold};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -186,8 +187,14 @@ struct BuildResult {
 }
 
 fn build_once(path: &str, outdir: &str) -> BuildResult {
-    let (program, touched, item_files) = match modules::load_program(Path::new(path)) {
-        Ok(triple) => triple,
+    // `load_program_full`, no `load_program`: además del trío de
+    // siempre, necesita `git_dependencies` (GRAMMAR.md §2.1, package
+    // manager real) para grabar en `link.lock` más abajo -- `linkc
+    // check`/`serve`/`wasm` (que sí usan `load_program` vía
+    // `load_and_check`) no escriben ningún lockfile, así que no
+    // necesitan este cuarto valor.
+    let (program, touched, item_files, git_dependencies) = match modules::load_program_full(Path::new(path), &HashMap::new()) {
+        Ok(quad) => quad,
         Err(e) => {
             report_load_error(&e);
             return BuildResult { ok: false, touched: vec![PathBuf::from(path)] };
@@ -270,7 +277,8 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
     }
 
 
-    let lock = linkc::lockfile::generate_lockfile(&touched, root);
+    let mut lock = linkc::lockfile::generate_lockfile(&touched, root);
+    lock.git_dependencies = git_dependencies;
     if let Err(e) = linkc::lockfile::write_lockfile(&lock, &lock_path) {
         eprintln!("advertencia: no se pudo escribir link.lock: {e}");
     }
