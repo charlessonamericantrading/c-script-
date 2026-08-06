@@ -1039,6 +1039,31 @@ Verificado con un servidor real: los 4 casos (éxito, 404 por ruta desconocida, 
 
 ---
 
+### 3.27 Hot reload real en `linkc dev` — RESUELTO, v0
+
+PLAN.md §4 (Fase 2) lo nombraba junto a `LSP completo`/`package manager`/`observabilidad`. Antes, `linkc dev <archivo> <outdir>` observaba y reconstruía el contrato (`contract.d.ts`/`client.ts`/`validators.ts`/`link.lock`) pero nunca tocaba un servidor -- correr el backend en paralelo seguía siendo `linkc serve` aparte, sin ninguna conexión entre los dos.
+
+**`linkc dev <archivo> <outdir> [puerto]` -- el `[puerto]` es opcional y retrocompatible.** Sin él, comportamiento IDÉNTICO a antes de esta ronda. Con él, cada rebuild EXITOSO reinicia un `linkc serve` HIJO real con el programa actualizado.
+
+**Restart de proceso, no hot-swap en memoria -- decisión deliberada.** `spawn_serve_child` reinvoca el propio binario (`env::current_exe()`) con `serve <archivo> <puerto>`, reusando `cmd_serve`/`runtime::server::serve` TAL CUAL, sin ningún cambio. La alternativa (mutar el `Program` de un servidor YA CORRIENDO) hubiera necesitado tocar el modelo de threading que `runtime/server.rs` ya documenta con cuidado (`Value::Closure`/`Rc` no cruzan un borde de hilo, GRAMMAR.md §3.13) -- un restart de proceso es más simple de razonar y más robusto, al costo de perder las conexiones `stream` abiertas en cada reload (aceptable en modo desarrollo, no sería aceptable en producción, pero esto es explícitamente `linkc dev`, nunca `linkc serve` en frío).
+
+**Un rebuild FALLIDO nunca tira abajo el servidor.** Si el rebuild que sigue a un cambio de archivo falla (error de sintaxis/tipos mientras se edita), el hijo de la ÚLTIMA versión válida sigue sirviendo sin tocarse -- mismo criterio que un dev server de frontend real (Vite/webpack) que sigue sirviendo el último build bueno en vez de caerse por un typo a medio escribir. Solo un rebuild EXITOSO mata al hijo viejo (`kill_serve_child`, por su PID exacto -- nunca un kill por nombre de imagen, para no afectar otro `linkc serve` que el usuario tenga corriendo aparte) y levanta uno nuevo.
+
+**Persistencia de datos entre reloads: gratis, por diseño ya existente.** `db_path` se deriva de `<archivo>.db` (GRAMMAR.md §3.17) -- el mismo archivo en cada restart, así que los datos de la sesión de desarrollo sobreviven un hot reload sin ningún código nuevo. Si el reload además cambia la FORMA de `db { ... }`, el hijo nuevo falla fuerte con el mismo diff-y-remedio de siempre (§3.17) al reabrir un schema incompatible -- comportamiento heredado, no una brecha nueva de esta ronda.
+
+**Límite honesto sobre limpieza al salir.** Sin manejo de señales explícito: `Command::spawn()` sin `CREATE_NEW_PROCESS_GROUP` deja al hijo en el mismo grupo de proceso/consola que el padre en ambas plataformas, así que un Ctrl+C real en una terminal interactiva le llega TAMBIÉN al hijo -- el camino verificado manualmente. Un kill programático dirigido SOLO al PID del proceso padre (no un Ctrl+C real desde una terminal) es el caso que sí puede dejar al hijo huérfano sirviendo el puerto -- límite de v0 conocido, no manejado, mismo tipo de limitación que `gitdep::resolve` ya documenta para el locking entre procesos (§2.1).
+
+**Verificado manualmente de punta a punta contra el binario real** (no un test automatizado -- ver por qué abajo): `linkc dev` con un archivo mínimo (`service Ping { rpc version() -> Int { 1 } }`) y puerto, confirmando en cada paso contra el servidor real vía `curl`: (1) arranque inicial sirviendo `1`; (2) al editar el archivo a `2`, detección del cambio, rebuild, kill del PID viejo, spawn de un PID nuevo, y `curl` devolviendo `2`; (3) al introducir un error de tipos, el rebuild falla con el snippet real de siempre y el servidor del PID anterior sigue sirviendo `2` sin interrupción. 371 tests automatizados (sin cambios de este archivo -- ver la nota de alcance de tests abajo), todos pasando.
+
+**Por qué sin test automatizado:** `cmd_dev` es un loop infinito e interactivo (nunca antes tuvo cobertura automatizada, ni siquiera para su comportamiento de observar-y-reconstruir previo a esta ronda) que ahora además administra un PROCESO HIJO -- un test de subproceso real necesitaría descubrir el PID del hijo (parseando stdout) para limpiarlo aparte, porque matar solo al PID del padre programáticamente (a diferencia de un Ctrl+C real) no arrastra al hijo (ver el límite de arriba). Se prefirió verificación manual real y exhaustiva (3 escenarios, contra el binario real) antes que forzar un harness de test alrededor de una herramienta pensada para uso interactivo en primer plano.
+
+**Fuera de alcance, a propósito:**
+- Preservar conexiones `stream` abiertas a través de un reload -- se cortan y el cliente debe reconectar, igual que cualquier restart de servidor.
+- Limpieza del hijo ante un kill programático del padre (el límite de arriba).
+- Debounce de múltiples cambios de archivo muy seguidos -- cada mtime distinto dispara su propio rebuild+restart, como ya hacía el `linkc dev` sin servidor.
+
+---
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

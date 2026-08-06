@@ -264,6 +264,8 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 **`observabilidad` de esta misma fila: RESUELTO, v0.** Tracing estructurado por RPC (`[req N] method=Users.create status=200 duration_ms=7`, GRAMMAR.md §3.26) sobre el `req_id` que ya existía como prerrequisito parcial -- formato `clave=valor` greppable, sin sumar `tracing`/OpenTelemetry todavía. Queda para una ronda futura: salida JSON, niveles de log configurables, y métricas agregadas -- ver GRAMMAR.md §3.26 para el detalle completo de qué falta.
 
+**`hot reload` de esta misma fila: RESUELTO, v0.** `linkc dev <archivo> <outdir> [puerto]` (GRAMMAR.md §3.27) -- con el puerto opcional, cada rebuild exitoso reinicia un `linkc serve` hijo real con el programa actualizado (restart de proceso, no un hot-swap en memoria -- decisión deliberada para no tocar el modelo de threading de `runtime/server.rs`, ver §3.13). Un rebuild fallido nunca tira abajo el servidor. Con esto, los OCHO ítems de esta fila de Fase 2 (DB tipada, auth, WebSocket/SSE -- vía SSE real, no WebSocket, ver §3.13/§3.16 -- validadores runtime, hot reload, LSP completo, package manager, observabilidad) tienen al menos una v0 real y verificada -- cada uno con sus propios límites honestos documentados en su sección de GRAMMAR.md correspondiente, no pendientes de "empezar" en el sentido en que lo estaban al escribir este roadmap originalmente.
+
 **Hitos "go / no-go":**
 - Fin de Fase 0: ¿la demo E2E convence a 5 devs externos? Si no, replantear.
 - Fin de Fase 1: ¿alguien construye algo real sin abandonar? Si no, seguir como framework, no como lenguaje.

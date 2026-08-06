@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime};
 
 use modules::display_path;
@@ -89,7 +89,7 @@ fn main() -> ExitCode {
             eprintln!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)");
             eprintln!("     linkc build <archivo.link> <outdir>    (genera contract.d.ts, client.ts, validators.ts, link.lock, y main.wasm si el programa entra en el subconjunto soportado -- ver 'linkc wasm')");
             eprintln!("     linkc wasm <archivo.link> <out.wasm>   (emite binario WebAssembly nativo -- v0: solo Int/Bool y una expresión final)");
-            eprintln!("     linkc dev <archivo.link> <outdir>      (+ observa y reconstruye solo)");
+            eprintln!("     linkc dev <archivo.link> <outdir> [puerto]  (+ observa y reconstruye solo; con <puerto>, hot reload real de 'linkc serve')");
             eprintln!("     linkc serve <archivo.link> <puerto>    (+ sirve los rpc por HTTP)");
             eprintln!("     linkc lsp                              (inicia el servidor Language Server Protocol)");
             ExitCode::FAILURE
@@ -309,15 +309,92 @@ fn snapshot_mtimes(paths: &[PathBuf]) -> Vec<Option<SystemTime>> {
     paths.iter().map(|p| fs::metadata(p).and_then(|m| m.modified()).ok()).collect()
 }
 
+/// Lanza `linkc serve <path> <port>` como PROCESO HIJO real (reinvoca el
+/// propio binario vía `env::current_exe()`) -- reusa `cmd_serve`/
+/// `runtime::server::serve` TAL CUAL, sin ningún cambio, en vez de
+/// intentar un hot-swap del `Program` DENTRO del proceso servidor ya
+/// corriendo. Un restart de proceso es más simple de razonar y más
+/// robusto que un swap en memoria (que necesitaría tocar el modelo de
+/// threading que `runtime/server.rs` ya documenta con cuidado --
+/// `Value::Closure`/`Rc` no cruzan un borde de hilo, GRAMMAR.md §3.13) --
+/// el costo es perder las conexiones `stream` abiertas en cada reload, un
+/// trade-off razonable para modo desarrollo, no para producción.
+fn spawn_serve_child(exe: &Path, path: &str, port: u16) -> Option<std::process::Child> {
+    match Command::new(exe).arg("serve").arg(path).arg(port.to_string()).spawn() {
+        Ok(child) => {
+            println!("linkc dev: sirviendo en http://localhost:{port} (PID {})", child.id());
+            Some(child)
+        }
+        Err(e) => {
+            eprintln!("linkc dev: no se pudo iniciar 'linkc serve': {e}");
+            None
+        }
+    }
+}
+
+/// Termina el hijo por su PID exacto (`Child::kill`, nunca un kill por
+/// nombre de imagen -- si el usuario tiene OTRO `linkc serve` corriendo
+/// aparte, no debe verse afectado) y espera a que salga antes de devolver
+/// el control, para no arrancar el próximo hijo mientras el puerto
+/// todavía está ocupado por el anterior.
+fn kill_serve_child(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `linkc dev <archivo.link> <outdir> [puerto]` -- el `[puerto]` es
+/// hot reload real (GRAMMAR.md §2.1, auditoría post-push), opcional y
+/// retrocompatible: sin él, comportamiento idéntico a antes de esta
+/// ronda (observa y reconstruye, sin servidor). Con él, cada rebuild
+/// EXITOSO reinicia un `linkc serve` hijo con el programa actualizado.
+///
+/// Un rebuild FALLIDO (error de sintaxis/tipos mientras se edita) NUNCA
+/// tira abajo el servidor -- el hijo de la última versión válida sigue
+/// sirviendo tal cual hasta que el próximo rebuild exitoso lo reemplace,
+/// mismo criterio que un dev server de frontend (Vite/webpack) que sigue
+/// sirviendo el último build bueno en vez de caerse por un typo a medio
+/// escribir.
 fn cmd_dev(args: &[String]) -> ExitCode {
     let (Some(path), Some(outdir)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc dev <archivo.link> <outdir>");
+        eprintln!("uso: linkc dev <archivo.link> <outdir> [puerto]");
         return ExitCode::FAILURE;
     };
+    let serve_port: Option<u16> = match args.get(2) {
+        None => None,
+        Some(s) => match s.parse() {
+            Ok(p) => Some(p),
+            Err(_) => {
+                eprintln!("puerto inválido: '{s}'");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    // Se resuelve UNA vez, no en cada restart -- `current_exe()` es una
+    // syscall real (lee el link simbólico /proc/self/exe en Linux, el
+    // equivalente en cada plataforma), sin necesidad de repetirla por
+    // cada reload.
+    let exe = serve_port.and_then(|_| env::current_exe().ok());
+    if serve_port.is_some() && exe.is_none() {
+        eprintln!("linkc dev: no se pudo resolver la ruta del propio binario -- hot reload del servidor deshabilitado, solo se observará y reconstruirá");
+    }
 
+    // Sin manejo de señales explícito para limpiar el hijo al salir --
+    // `Command::spawn()` sin `CREATE_NEW_PROCESS_GROUP` deja al hijo en el
+    // mismo grupo de proceso/consola que este padre en ambas plataformas,
+    // así que un Ctrl+C real en una terminal interactiva ya le llega
+    // TAMBIÉN al hijo (ese es el camino verificado manualmente). Un kill
+    // programático dirigido SOLO al PID de este proceso padre (no un
+    // Ctrl+C real) es el caso que sí puede dejar al hijo huérfano
+    // sirviendo el puerto -- límite de v0 conocido, no manejado (mismo
+    // tipo de limitación que `gitdep::resolve` ya documenta para el
+    // locking entre procesos).
     println!("linkc dev: observando '{path}' y sus imports (Ctrl+C para detener)");
     let mut result = build_once(path, outdir);
     let mut mtimes = snapshot_mtimes(&result.touched);
+    let mut server_child = match (&exe, serve_port) {
+        (Some(exe), Some(port)) if result.ok => spawn_serve_child(exe, path, port),
+        _ => None,
+    };
 
     loop {
         std::thread::sleep(Duration::from_millis(400));
@@ -326,6 +403,18 @@ fn cmd_dev(args: &[String]) -> ExitCode {
             println!("cambio detectado, reconstruyendo...");
             result = build_once(path, outdir);
             mtimes = snapshot_mtimes(&result.touched);
+            if !result.ok {
+                if server_child.is_some() {
+                    eprintln!("linkc dev: el rebuild falló -- el servidor sigue sirviendo la última versión válida");
+                }
+                continue;
+            }
+            if let (Some(exe), Some(port)) = (&exe, serve_port) {
+                if let Some(child) = server_child.take() {
+                    kill_serve_child(child);
+                }
+                server_child = spawn_serve_child(exe, path, port);
+            }
         }
     }
 }
