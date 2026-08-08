@@ -69,6 +69,16 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && BIN="${BIN}.exe"
           "$BIN" build examples/users.link gen
 
+      - name: Contrato del demo insignia sin deriva sin querer (linkc test, GRAMMAR.md §3.29)
+        # Sin --update: si el contrato cambió de forma real, este paso
+        # falla a propósito -- la corrección es commitear el nuevo
+        # examples/users.link.snap en el mismo PR (`linkc test ... --update`),
+        # no que CI lo acepte solo.
+        run: |
+          BIN=compiler/target/debug/linkc
+          [ "$RUNNER_OS" = "Windows" ] && BIN="${BIN}.exe"
+          "$BIN" test examples/users.link examples/users.link.snap
+
       - name: Confirmar que el frontend tipa limpio contra el contrato generado
         working-directory: frontend
         run: npx tsc --noEmit

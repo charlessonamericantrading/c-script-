@@ -1,0 +1,267 @@
+=== contract.d.ts ===
+// Generado automáticamente por linkc — no editar a mano.
+
+export type Result<T, E> = { type: "Ok"; value: T } | { type: "Err"; error: E };
+export type Patch<T> = Partial<T>;
+
+export interface User {
+  id: number;
+  name: string;
+  email: string;
+  role: Role;
+  bio?: string;
+  deletedAt: string | null;
+}
+
+export type Role = "Admin" | "Member" | "Guest";
+
+export type ValidationError =
+  | { type: "InvalidEmail"; field: string }
+  | { type: "TooShort"; field: string; min: number }
+;
+
+export interface NewUser {
+  name: string;
+  email: string;
+}
+
+export interface NewUserRecord {
+  name: string;
+  email: string;
+  role: Role;
+  bio?: string;
+  deletedAt: string | null;
+}
+
+export type ValidateResult =
+  | { type: "Ok"; value: NewUserRecord }
+  | { type: "Err"; error: ValidationError }
+;
+
+export interface UsersClient {
+  list(limit?: number): Promise<User[]>;
+  getById(id: number): Promise<User | null>;
+  create(input: NewUser): Promise<Result<User, ValidationError>>;
+  update(id: number, patch: Patch<User>): Promise<User>;
+  remove(id: number): Promise<boolean>;
+  login(email: string): Promise<string | null>;
+  logout(): Promise<void>;
+  listByRole(role: Role): Promise<User[]>;
+  listEmails(): Promise<string[]>;
+  findByIdOrEmail(query: number | string): Promise<User[]>;
+  watchAll(): AsyncIterable<User>;
+  setToken(token: string | null): void;
+}
+
+
+=== client.ts ===
+// Generado automáticamente por linkc — no editar a mano.
+
+import type { NewUser, Patch, Result, Role, User, UsersClient, ValidationError } from "./contract";
+import { isResult_User_ValidationError, isUser } from "./validators.ts";
+
+export class LinkTransportError extends Error {}
+
+export class LinkValidationError extends Error {
+  rpcName: string;
+  received: unknown;
+  constructor(rpcName: string, received: unknown) {
+    super(`la respuesta de '${rpcName}' no matchea el contrato declarado`);
+    this.rpcName = rpcName;
+    this.received = received;
+  }
+}
+
+class UsersClientImpl implements UsersClient {
+  private baseUrl: string;
+  private token: string | null = null;
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl;
+  }
+
+  setToken(token: string | null): void {
+    this.token = token;
+  }
+
+  async list(limit?: number): Promise<User[]> {
+    const res = await fetch(`${this.baseUrl}/Users/list`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({ limit }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!((Array.isArray(json) && json.every((item: unknown) => isUser(item))))) throw new LinkValidationError("list", json);
+    return json as User[];
+  }
+
+  async getById(id: number): Promise<User | null> {
+    const res = await fetch(`${this.baseUrl}/Users/getById`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({ id }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!((json === null || isUser(json)))) throw new LinkValidationError("getById", json);
+    return json as User | null;
+  }
+
+  async create(input: NewUser): Promise<Result<User, ValidationError>> {
+    const res = await fetch(`${this.baseUrl}/Users/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({ input }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!(isResult_User_ValidationError(json))) throw new LinkValidationError("create", json);
+    return json as Result<User, ValidationError>;
+  }
+
+  async update(id: number, patch: Patch<User>): Promise<User> {
+    const res = await fetch(`${this.baseUrl}/Users/update`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({ id, patch }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!(isUser(json))) throw new LinkValidationError("update", json);
+    return json as User;
+  }
+
+  async remove(id: number): Promise<boolean> {
+    const res = await fetch(`${this.baseUrl}/Users/remove`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({ id }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!(typeof json === "boolean")) throw new LinkValidationError("remove", json);
+    return json as boolean;
+  }
+
+  async login(email: string): Promise<string | null> {
+    const res = await fetch(`${this.baseUrl}/Users/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({ email }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!((json === null || typeof json === "string"))) throw new LinkValidationError("login", json);
+    return json as string | null;
+  }
+
+  async logout(): Promise<void> {
+    const res = await fetch(`${this.baseUrl}/Users/logout`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({  }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!(true)) throw new LinkValidationError("logout", json);
+    return json as void;
+  }
+
+  async listByRole(role: Role): Promise<User[]> {
+    const res = await fetch(`${this.baseUrl}/Users/listByRole`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({ role }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!((Array.isArray(json) && json.every((item: unknown) => isUser(item))))) throw new LinkValidationError("listByRole", json);
+    return json as User[];
+  }
+
+  async listEmails(): Promise<string[]> {
+    const res = await fetch(`${this.baseUrl}/Users/listEmails`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({  }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!((Array.isArray(json) && json.every((item: unknown) => typeof item === "string")))) throw new LinkValidationError("listEmails", json);
+    return json as string[];
+  }
+
+  async findByIdOrEmail(query: number | string): Promise<User[]> {
+    const res = await fetch(`${this.baseUrl}/Users/findByIdOrEmail`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({ query }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    const json: unknown = await res.json();
+    if (!((Array.isArray(json) && json.every((item: unknown) => isUser(item))))) throw new LinkValidationError("findByIdOrEmail", json);
+    return json as User[];
+  }
+
+  async *watchAll(): AsyncIterable<User> {
+    const res = await fetch(`${this.baseUrl}/Users/watchAll`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({  }),
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    if (!res.body) throw new LinkTransportError("el servidor no devolvió un body de stream");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sep: number;
+      while ((sep = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        if (!frame.startsWith("data: ")) continue;
+        const json: unknown = JSON.parse(frame.slice(6));
+        if (!(isUser(json))) throw new LinkValidationError("watchAll", json);
+        yield json as User;
+      }
+    }
+  }
+
+}
+
+export function createUsersClient(baseUrl: string): UsersClient {
+  return new UsersClientImpl(baseUrl);
+}
+
+=== validators.ts ===
+// Generado automáticamente por linkc — no editar a mano.
+
+import type { NewUser, Patch, Result, Role, User, ValidationError } from "./contract";
+
+export function isRole(x: unknown): x is Role {
+  return (x === "Admin" || x === "Member" || x === "Guest");
+}
+
+export function isPatch_User(x: unknown): x is Patch<User> {
+  return (typeof x === "object" && x !== null && !Array.isArray(x) && ((x as any).id === undefined || (typeof (x as any).id === "number" && Number.isInteger((x as any).id))) && ((x as any).name === undefined || typeof (x as any).name === "string") && ((x as any).email === undefined || typeof (x as any).email === "string") && ((x as any).role === undefined || isRole((x as any).role)) && ((x as any).bio === undefined || typeof (x as any).bio === "string") && ((x as any).deletedAt === undefined || ((x as any).deletedAt === null || typeof (x as any).deletedAt === "string")));
+}
+
+export function isResult_User_ValidationError(x: unknown): x is Result<User, ValidationError> {
+  return (typeof x === "object" && x !== null && !Array.isArray(x) && ((((x as any).type === "Ok") && (typeof x === "object" && x !== null && !Array.isArray(x) && isUser((x as any).value))) || (((x as any).type === "Err") && (typeof x === "object" && x !== null && !Array.isArray(x) && isValidationError((x as any).error)))));
+}
+
+export function isValidationError(x: unknown): x is ValidationError {
+  return (typeof x === "object" && x !== null && !Array.isArray(x) && (((x as any).type === "InvalidEmail" && (typeof x === "object" && x !== null && !Array.isArray(x) && typeof (x as any).field === "string")) || ((x as any).type === "TooShort" && (typeof x === "object" && x !== null && !Array.isArray(x) && typeof (x as any).field === "string" && (typeof (x as any).min === "number" && Number.isInteger((x as any).min))))));
+}
+
+export function isNewUser(x: unknown): x is NewUser {
+  return (typeof x === "object" && x !== null && !Array.isArray(x) && typeof (x as any).name === "string" && typeof (x as any).email === "string");
+}
+
+export function isUser(x: unknown): x is User {
+  return (typeof x === "object" && x !== null && !Array.isArray(x) && (typeof (x as any).id === "number" && Number.isInteger((x as any).id)) && typeof (x as any).name === "string" && typeof (x as any).email === "string" && isRole((x as any).role) && ((x as any).bio === undefined || typeof (x as any).bio === "string") && ((x as any).deletedAt === null || typeof (x as any).deletedAt === "string"));
+}
+

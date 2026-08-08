@@ -108,6 +108,8 @@ Decided (post-push audit, closing item — GRAMMAR.md §3.28): no syntax freeze 
 
 With this, every item from the post-push audit's backlog is either done or explicitly decided, with the reasoning written down rather than left open.
 
+Done: `linkc test <file> <snapshot> [--update]` (GRAMMAR.md §3.29) — the "contract tests" half of PLAN.md §5's "Testing: integrated runner + contract tests (so the generated `.d.ts` doesn't break by accident)", the one ecosystem item from that list still without a v0. Generates the same `contract.d.ts`/`client.ts`/`validators.ts` trio `build` does and diffs it against a plain-text snapshot committed to git (deliberately outside `gen/`, which is gitignored and wouldn't survive between commits — a snapshot only works if it outlives the run that made it); a real change fails the command and prints a genuine line-level diff (LCS-based, hand-rolled — same reasoning as `lockfile.rs`'s own SHA-256, a small self-contained algorithm doesn't need a new crate) rather than silently accepting it, `--update` is the explicit "yes, on purpose" step. Dogfooded on the flagship demo: `examples/users.link.snap` is committed and CI now runs `linkc test` on every push/PR without `--update`, so a PR that silently changes the demo's contract fails the build with the real diff in the log. Honest scope: this covers the contract's *shape*, not an RPC's *behavior* — no in-language `test { }`/assertions yet, a genuinely separate and much larger feature; see GRAMMAR.md §3.29 for why that's out of scope for this round. 375 tests, all passing.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

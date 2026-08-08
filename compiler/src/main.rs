@@ -77,6 +77,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("build") => cmd_build(&args[2..]),
+        Some("test") => cmd_test(&args[2..]),
         Some("serve") => cmd_serve(&args[2..]),
         Some("new") => cmd_new(&args[2..]),
         Some("dev") => cmd_dev(&args[2..]),
@@ -88,6 +89,7 @@ fn main() -> ExitCode {
             eprintln!("subcomandos conocidos:");
             eprintln!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)");
             eprintln!("     linkc build <archivo.link> <outdir>    (genera contract.d.ts, client.ts, validators.ts, link.lock, y main.wasm si el programa entra en el subconjunto soportado -- ver 'linkc wasm')");
+            eprintln!("     linkc test <archivo.link> <archivo.snap> [--update]  (compara el contrato generado contra un snapshot commiteado; falla si cambió sin querer)");
             eprintln!("     linkc wasm <archivo.link> <out.wasm>   (emite binario WebAssembly nativo -- v0: solo Int/Bool y una expresión final)");
             eprintln!("     linkc dev <archivo.link> <outdir> [puerto]  (+ observa y reconstruye solo; con <puerto>, hot reload real de 'linkc serve')");
             eprintln!("     linkc serve <archivo.link> <puerto>    (+ sirve los rpc por HTTP)");
@@ -298,6 +300,160 @@ fn cmd_build(args: &[String]) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// `linkc test` -- PLAN.md §5 ("tests de contrato, que el .d.ts generado no
+/// rompa sin querer"). El snapshot es UN archivo de texto (no un directorio
+/// dentro de `outdir`, que casi siempre está en `.gitignore` -- ver
+/// `/gen/` -- y por lo tanto no sobreviviría entre commits, que es
+/// justamente lo que un snapshot necesita para servir de algo) con los tres
+/// outputs del emisor concatenados. Sin snapshot previo: lo crea y avisa
+/// que hay que commitearlo -- esa primera corrida establece la base, no
+/// hay "antes" con que compararla. Con snapshot previo que difiere: falla
+/// (`ExitCode::FAILURE`) y muestra el diff en vez de sobreescribir en
+/// silencio -- que el contrato haya cambiado de forma real (una ronda
+/// legítima) o accidental (el bug que esta feature existe para atrapar) lo
+/// decide una persona mirando el diff, nunca el comando solo. `--update`
+/// es ese "sí, es a propósito" explícito.
+fn cmd_test(args: &[String]) -> ExitCode {
+    let (Some(path), Some(snap_path)) = (args.first(), args.get(1)) else {
+        eprintln!("uso: linkc test <archivo.link> <archivo.snap> [--update]");
+        return ExitCode::FAILURE;
+    };
+    let update = args.iter().any(|a| a == "--update");
+
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    let contract = match codegen::ts_emit::emit_contract(&program) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error al emitir contract.d.ts: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let client = match codegen::ts_emit::emit_client(&program) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error al emitir client.ts: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let validators = match codegen::validators_emit::emit_validators(&program) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error al emitir validators.ts: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let current = format!(
+        "=== contract.d.ts ===\n{contract}\n=== client.ts ===\n{client}\n=== validators.ts ===\n{validators}"
+    );
+
+    let snap_file = Path::new(snap_path);
+    if !snap_file.exists() {
+        if let Some(parent) = snap_file.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Err(e) = fs::create_dir_all(parent) {
+                    eprintln!("no se pudo crear {}: {e}", parent.display());
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        if let Err(e) = fs::write(snap_file, &current) {
+            eprintln!("no se pudo escribir {snap_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("snapshot creado en {snap_path} -- revisalo y commitealo a git (es la base contra la que se compara desde ahora)");
+        return ExitCode::SUCCESS;
+    }
+
+    let previous = match fs::read_to_string(snap_file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("no se pudo leer {snap_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if previous == current {
+        println!("OK: el contrato de {path} coincide con el snapshot ({snap_path})");
+        return ExitCode::SUCCESS;
+    }
+
+    if update {
+        if let Err(e) = fs::write(snap_file, &current) {
+            eprintln!("no se pudo escribir {snap_path}: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("snapshot actualizado en {snap_path}");
+        return ExitCode::SUCCESS;
+    }
+
+    eprintln!("EL CONTRATO DE {path} CAMBIÓ respecto al snapshot ({snap_path}):");
+    eprintln!("{}", diff_lines(&previous, &current));
+    eprintln!("si el cambio es intencional: linkc test {path} {snap_path} --update");
+    ExitCode::FAILURE
+}
+
+/// Diff línea a línea vía LCS (programación dinámica) -- correcto de
+/// verdad (a diferencia de una comparación posición-a-posición, que
+/// "arrastra" como distinta cada línea siguiente a una sola inserción),
+/// sin sumar una dependencia nueva -- mismo espíritu que el SHA-256
+/// hand-rolled de `lockfile.rs`: un algoritmo chico, estable y
+/// autocontenido no necesita un crate aparte. `n*m` es memoria de la
+/// tabla LCS: trivial para un contrato generado (cientos de líneas), así
+/// que la guarda de tamaño de abajo es para no colgarse si algún día esto
+/// se aplica a un archivo gigante, no una ruta esperada hoy.
+fn diff_lines(old: &str, new: &str) -> String {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let n = old_lines.len();
+    let m = new_lines.len();
+
+    if n.saturating_mul(m) > 4_000_000 {
+        return format!(
+            "(archivos demasiado grandes para diff en línea -- {n} vs {m} líneas; comparalos con tu herramienta de diff preferida)"
+        );
+    }
+
+    let mut lcs = vec![vec![0usize; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if old_lines[i] == new_lines[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+
+    let mut out = String::new();
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if old_lines[i] == new_lines[j] {
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            out.push_str(&format!("- {}\n", old_lines[i]));
+            i += 1;
+        } else {
+            out.push_str(&format!("+ {}\n", new_lines[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        out.push_str(&format!("- {}\n", old_lines[i]));
+        i += 1;
+    }
+    while j < m {
+        out.push_str(&format!("+ {}\n", new_lines[j]));
+        j += 1;
+    }
+    out
 }
 
 /// Snapshot de mtimes de una lista de archivos, en el mismo orden -- `None`

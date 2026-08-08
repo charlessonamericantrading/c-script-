@@ -100,6 +100,8 @@ Decidido (auditoría post-push, ítem de cierre -- GRAMMAR.md §3.28): sin conge
 
 Con esto, cada ítem del backlog de la auditoría post-push queda hecho o explícitamente decidido, con el razonamiento por escrito en vez de dejado abierto.
 
+Completo: `linkc test <archivo> <snapshot> [--update]` (GRAMMAR.md §3.29) -- la mitad de "tests de contrato" de "Testing: runner integrado + tests de contrato (que el `.d.ts` generado no rompa sin querer)" de PLAN.md §5, el único ítem de esa lista de ecosistema que seguía sin una v0. Genera el mismo trío `contract.d.ts`/`client.ts`/`validators.ts` que `build` y lo compara contra un snapshot de texto plano commiteado a git (a propósito fuera de `gen/`, que está en `.gitignore` y no sobreviviría entre commits -- un snapshot solo sirve si sobrevive a la corrida que lo creó); un cambio real hace fallar el comando y muestra un diff de verdad a nivel de línea (LCS, hand-rolled -- mismo criterio que el propio SHA-256 de `lockfile.rs`: un algoritmo chico y autocontenido no necesita un crate nuevo) en vez de aceptarlo en silencio, `--update` es el paso explícito de "sí, a propósito". Dogfooded sobre el demo insignia: `examples/users.link.snap` está commiteado y CI ahora corre `linkc test` en cada push/PR sin `--update`, así que un PR que cambia el contrato del demo en silencio falla la build con el diff real en el log. Alcance honesto: esto cubre la FORMA del contrato, no el COMPORTAMIENTO de un rpc -- todavía no hay `test { }`/aserciones dentro del lenguaje, una feature genuinamente aparte y mucho más grande; ver GRAMMAR.md §3.29 para por qué queda fuera de esta ronda. 375 tests, todos pasando.
+
 ## Licencia
 
 MIT — ver [LICENSE](LICENSE).
