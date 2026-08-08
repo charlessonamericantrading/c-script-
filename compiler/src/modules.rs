@@ -240,7 +240,6 @@ impl Loader<'_> {
         canonicalize(&self.project_root.join(dep_spec))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn visit(
         &mut self,
         canon: &Path,

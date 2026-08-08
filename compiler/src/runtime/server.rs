@@ -257,7 +257,6 @@ fn check_auth_gate(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_rpc(
     program: &Program,
     db: &Db,
@@ -389,7 +388,6 @@ fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, r
 /// en la PRÓXIMA publicación a `collection` es cuando `Db::publish` nota
 /// que el `SyncSender` pareja ya no tiene receptor y lo poda -- lazy, no
 /// eager (ver `Db::publish`).
-#[allow(clippy::too_many_arguments)]
 fn write_live_stream(
     request: tiny_http::Request,
     snapshot: Vec<serde_json::Value>,

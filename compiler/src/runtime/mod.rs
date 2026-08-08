@@ -974,7 +974,6 @@ pub fn invoke_rpc(
 /// dentro del cuerpo) y `current_token` (para que `destroySession()` sepa
 /// cuál es "la propia" sesión) -- ninguno de los dos es una decisión, son
 /// datos ya resueltos por el caller.
-#[allow(clippy::too_many_arguments)]
 pub fn invoke_rpc_with_sessions(
     program: &Program,
     service_name: &str,
