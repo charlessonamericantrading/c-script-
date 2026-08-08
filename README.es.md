@@ -21,6 +21,8 @@ Este repo es el **MVP de Fase 0** (ver [PLAN.md](PLAN.md) §4): prueba el killer
 
 ## Probar el killer feature vos mismo
 
+Necesita Rust (stable) y **Node 23.6+** (se recomienda 24+ -- CI fija 24 y es lo que está verificado de verdad). El paso 4 corre el `frontend/src/main.ts` generado directo con `node`, apoyándose en el type-stripping de TypeScript nativo de Node, que recién se activó sin flag por defecto en la 23.6. En un Node más viejo (todavía común en LTS 18/20), ese paso falla directo con un error de sintaxis, sin ningún mensaje que ayude a entender por qué.
+
 ```bash
 cd compiler
 cargo build
@@ -46,7 +48,7 @@ cd frontend && node src/main.ts   # llama al server real, tipado end-to-end
 
 El servidor arranca con la base **vacía** — crea una colección vacía por cada una que tu programa declare en `db { ... }`, y nada más. Por eso la primera corrida del demo crea su propio usuario y después lo lee: que el runtime de un lenguaje invente filas que nunca escribiste sería mentir sobre lo que tu programa hace.
 
-Ahora rompé algo: en `examples/users.link`, renombrá `name` a `fullName` dentro de `type User`. Volvé a correr `linkc build` y `npx tsc --noEmit` **sin tocar `frontend/src/main.ts`**. `tsc` va a fallar en cada línea que usaba `.name` — exactamente el punto ciego que c-script existe para eliminar (ver [PLAN.md](PLAN.md) §3).
+Ahora rompé algo: en `examples/users.link`, renombrá `name` a `fullName` dentro de `type User`. Volvé a correr `linkc build` y `npx tsc --noEmit` **sin tocar `frontend/src/main.ts`**. `tsc` va a fallar en cada línea que usaba `.name` — exactamente el punto ciego que c-script existe para eliminar (ver [PLAN.md](PLAN.md) §1.2).
 
 Arrancar un proyecto de cero es más rápido: `linkc new mi-app` scaffoldea un `.link` mínimo más un `frontend/` a juego; `linkc dev mi-app/main.link mi-app/gen` lo observa (y a todo lo que importe) y regenera el contrato en cada guardado, en vez de correr `build` a mano cada vez.
 

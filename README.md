@@ -21,6 +21,8 @@ This repo is the **Phase 0 MVP** (see [PLAN.md](PLAN.md) §4, currently Spanish-
 
 ## Try the killer feature yourself
 
+Needs Rust (stable) and **Node 23.6+** (24+ recommended — CI pins 24 and this is what's actually verified) — step 4 runs the generated `frontend/src/main.ts` directly with `node`, relying on Node's built-in TypeScript type-stripping, which only became a no-flag default at 23.6. On an older Node (still common on LTS 18/20), that step fails outright with a syntax error, not a helpful message.
+
 ```bash
 cd compiler
 cargo build
@@ -46,7 +48,7 @@ cd frontend && node src/main.ts   # calls the real server, typed end-to-end
 
 The server starts with an **empty** database — it creates one empty collection per `db { ... }` declaration in your program and nothing else. The demo's first run therefore creates its own user and then reads it back; a language runtime inventing rows you never wrote would be a lie about what your program does.
 
-Now break something: in `examples/users.link`, rename `name` to `fullName` inside `type User`. Re-run `linkc build` and `npx tsc --noEmit` **without touching `frontend/src/main.ts`**. `tsc` fails on every line that used `.name` — exactly the blind spot c-script exists to eliminate (see [PLAN.md](PLAN.md) §3).
+Now break something: in `examples/users.link`, rename `name` to `fullName` inside `type User`. Re-run `linkc build` and `npx tsc --noEmit` **without touching `frontend/src/main.ts`**. `tsc` fails on every line that used `.name` — exactly the blind spot c-script exists to eliminate (see [PLAN.md](PLAN.md) §1.2).
 
 Starting a project from scratch is faster: `linkc new my-app` scaffolds a minimal `.link` file plus a matching `frontend/`; `linkc dev my-app/main.link my-app/gen` watches it (and anything it `import`s) and regenerates the contract on every save, instead of re-running `build` by hand.
 
