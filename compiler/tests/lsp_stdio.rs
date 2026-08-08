@@ -331,6 +331,62 @@ fn hover_on_a_param_reference_inside_a_body_shows_its_inferred_type_over_a_real_
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ---- framing corrupto no debe colgar la conexión (reparso, GRAMMAR.md §3.19) ----
+
+#[test]
+fn a_malformed_content_length_header_ends_the_connection_instead_of_hanging_forever() {
+    // Bug real encontrado en un reparso general (no vía uso normal): un
+    // header Content-Length faltante o no numérico hacía que `run_stdio`
+    // volviera al tope de su loop sin consumir el body del mensaje mal
+    // formado -- desync PERMANENTE y silencioso, el server dejaba de
+    // responder a TODO lo que viniera después, indistinguible de un
+    // proceso colgado desde el lado del cliente. El fix: eso ahora es un
+    // error fatal de conexión (código de salida distinto de cero), no un
+    // intento de "seguir como si nada". Este test manda un header roto a
+    // mano (sin pasar por `LspProcess::send`, que siempre manda uno
+    // válido) y espera la salida del proceso con un timeout PROPIO --
+    // si el bug reapareciera, un `child.wait()` sin cota colgaría este
+    // test para siempre junto con el server real.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("lsp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("no se pudo iniciar 'linkc lsp'");
+
+    {
+        let mut stdin = child.stdin.take().expect("stdin del proceso hijo");
+        write!(stdin, "Content-Length: no-es-un-numero\r\n\r\n").expect("escribir el header roto");
+        stdin.flush().expect("flush del stdin del hijo");
+        // `stdin` se dropea acá (cierra el pipe) -- si el fix fallara y el
+        // server quedara esperando MÁS headers en vez de salir, un EOF en
+        // stdin lo sacaría de ese loop igual, así que este test seguiría
+        // siendo válido incluso si algún día se decidiera resincronizar en
+        // vez de terminar la conexión.
+    }
+
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("consultar el estado del proceso hijo") {
+            break status;
+        }
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("'linkc lsp' no terminó {timeout:?} después de un Content-Length inválido -- el desync silencioso sigue ahí");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+
+    assert!(!status.success(), "un Content-Length inválido debe terminar la conexión con error, no salir en 0 como si nada hubiera pasado");
+
+    let mut stderr = String::new();
+    child.stderr.take().expect("stderr del proceso hijo").read_to_string(&mut stderr).expect("leer stderr del hijo");
+    assert!(stderr.contains("Content-Length"), "el mensaje de error debe nombrar la causa real: {stderr:?}");
+}
+
 // ---- completion sensible al tipo real del receptor (Nivel 3 ronda 3/3, GRAMMAR.md §3.25) ----
 
 #[test]

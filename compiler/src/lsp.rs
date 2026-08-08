@@ -234,8 +234,27 @@ impl LspServer {
                 }
             }
 
+            // Bug real encontrado en un reparso (no en uso real -- ver
+            // GRAMMAR.md §3.19 para la historia): un `continue` acá volvía
+            // al tope del loop SIN leer los bytes del body del mensaje mal
+            // formado, que seguían sin consumir en el stream. La próxima
+            // vuelta del loop de headers los interpretaba como si fueran
+            // líneas de header (nunca lo son, así que nunca encuentra un
+            // Content-Length válido) -- un desync PERMANENTE y silencioso:
+            // el server dejaba de responder a TODO lo que viniera después,
+            // sin ningún error visible, indistinguible de un server
+            // colgado desde el lado del cliente/editor. No hay forma
+            // confiable de "resincronizar" sin saber cuántos bytes saltar
+            // -- ese largo es exactamente el dato que falta o es inválido
+            // -- así que la conexión termina con un error real en vez de
+            // fingir que puede seguir. `cmd_lsp` (main.rs) ya traduce este
+            // `Err` a un mensaje en stderr + código de salida distinto de
+            // cero.
             let Some(len) = content_length else {
-                continue;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "framing LSP corrupto: encabezado Content-Length faltante o no numérico -- sin ese largo no hay forma confiable de saber dónde empieza el próximo mensaje",
+                ));
             };
 
             let mut body_buf = vec![0u8; len];
