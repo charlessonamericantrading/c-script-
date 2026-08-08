@@ -1,0 +1,11 @@
+# examples/users.link.snap (GRAMMAR.md §3.29, "linkc test") es un snapshot
+# de texto que linkc compara byte a byte contra lo que genera en el momento.
+# linkc siempre genera LF puro (Rust no traduce fin de línea); sin esto, un
+# checkout en Windows con core.autocrlf=true convierte el blob commiteado a
+# CRLF, y la comparación falla con un "cambió" falso en CADA corrida -- es
+# justo el bug que rompió CI en windows-latest la primera vez que este
+# archivo se commiteó. `linkc test` ahora normaliza \r\n -> \n antes de
+# comparar (no depende de esto para ser CORRECTO), pero fijar el fin de
+# línea acá igual evita que un checkout en otra plataforma ensucie el
+# archivo commiteado con un diff de solo-EOL en el próximo `git status`.
+*.snap text eol=lf

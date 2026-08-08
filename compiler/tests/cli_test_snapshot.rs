@@ -123,3 +123,33 @@ fn update_flag_accepts_the_new_contract_as_the_baseline() {
     // Y ahora vuelve a matchear sin --update, porque el snapshot ya es la nueva base.
     assert!(run_test(&entry, &snap, &[]).status.success());
 }
+
+#[test]
+fn a_crlf_checkout_of_the_snapshot_still_matches_an_unchanged_program() {
+    // Reproduce el bug real que rompió CI en windows-latest (GRAMMAR.md
+    // §3.29): un checkout de git con `core.autocrlf=true` convierte el
+    // `.snap` commiteado (siempre LF -- linkc nunca escribe `\r\n`) a
+    // CRLF en el disco del runner. Sin normalizar antes de comparar, eso
+    // reportaba "el contrato cambió" en TODA corrida sobre ese checkout,
+    // aunque el programa fuera bit a bit el mismo. Acá se simula ese
+    // checkout a mano (reescribiendo el snapshot con CRLF), sin depender
+    // de ninguna configuración real de git para que el test sea
+    // determinista en cualquier máquina que lo corra.
+    let project = TempDir::new("crlf-checkout");
+    let entry = project.write("a.link", "type Point = { x: Int, y: Int }\nfn origin() -> Point { Point { x: 0, y: 0 } }\n");
+    let snap = project.0.join("a.snap");
+    assert!(run_test(&entry, &snap, &[]).status.success());
+
+    let lf_content = std::fs::read_to_string(&snap).unwrap();
+    assert!(!lf_content.contains('\r'), "la base de este test debe ser LF puro, o no está probando lo que dice probar");
+    std::fs::write(&snap, lf_content.replace('\n', "\r\n")).unwrap();
+
+    let output = run_test(&entry, &snap, &[]);
+    assert!(
+        output.status.success(),
+        "un snapshot con CRLF (simulando un checkout de Windows) no debe reportar un cambio falso -- stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("OK"));
+}

@@ -349,9 +349,15 @@ fn cmd_test(args: &[String]) -> ExitCode {
         }
     };
 
+    // Normalizado a LF puro -- ver el mismo `.replace` sobre `previous` más
+    // abajo para el porqué (checkout de Windows con `core.autocrlf=true`
+    // convierte el `.snap` commiteado a CRLF; sin esto, la comparación de
+    // abajo falla con un "cambió" falso en TODA corrida sobre ese checkout,
+    // el bug real que rompió CI en windows-latest, GRAMMAR.md §3.29).
     let current = format!(
         "=== contract.d.ts ===\n{contract}\n=== client.ts ===\n{client}\n=== validators.ts ===\n{validators}"
-    );
+    )
+    .replace("\r\n", "\n");
 
     let snap_file = Path::new(snap_path);
     if !snap_file.exists() {
@@ -371,8 +377,18 @@ fn cmd_test(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // `.replace("\r\n", "\n")`: un checkout de git puede haber convertido
+    // el `.snap` commiteado (siempre LF -- ver `current` arriba) a CRLF
+    // según `core.autocrlf`/`.gitattributes` de la máquina que lo clonó.
+    // Sin esto, la comparación de abajo depende de una configuración de
+    // git ajena a este comando para ser correcta -- exactamente el tipo de
+    // supuesto frágil que ya rompió CI una vez (ver el fixture de este
+    // mismo bug en cli_test_snapshot.rs). `.gitattributes` fija `*.snap`
+    // como LF para que el archivo commiteado no le muestre un diff de
+    // solo-EOL a nadie, pero la corrección de este comando no depende de
+    // eso -- funciona igual si alguien lo abre y resave en CRLF a mano.
     let previous = match fs::read_to_string(snap_file) {
-        Ok(s) => s,
+        Ok(s) => s.replace("\r\n", "\n"),
         Err(e) => {
             eprintln!("no se pudo leer {snap_path}: {e}");
             return ExitCode::FAILURE;
