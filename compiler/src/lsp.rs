@@ -273,8 +273,26 @@ impl LspServer {
 
     /// Procesa un mensaje JSON-RPC entrante y devuelve la respuesta (si corresponde).
     pub fn handle_message(&mut self, req: &Value) -> Option<Value> {
-        let method = req.get("method")?.as_str()?;
         let id = req.get("id");
+        let Some(method) = req.get("method").and_then(|m| m.as_str()) else {
+            // Gap real encontrado en un reparso: esto antes era
+            // `req.get("method")?.as_str()?`, que devolvía `None` sin
+            // distinguir "es una notificación, no hay nada que
+            // responder" de "es un REQUEST (tiene 'id') que un cliente
+            // real está esperando responder". A diferencia del bug de
+            // framing de `run_stdio` (que desincroniza la conexión
+            // entera), esto no rompe nada más allá de ESTE id puntual --
+            // pero silencio ahí sigue siendo un cliente esperando para
+            // siempre una respuesta que nunca llega. JSON-RPC 2.0 pide
+            // un error explícito para un request inválido, no silencio.
+            return id.cloned().map(|id_val| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id_val,
+                    "error": { "code": -32600, "message": "Invalid Request: falta 'method' o no es un string" }
+                })
+            });
+        };
 
         match method {
             "initialize" => {
@@ -1480,6 +1498,30 @@ mod tests {
         assert_eq!(resp["result"]["capabilities"]["textDocumentSync"], 1);
         assert_eq!(resp["result"]["capabilities"]["hoverProvider"], true);
         assert_eq!(resp["result"]["capabilities"]["definitionProvider"], true);
+    }
+
+    #[test]
+    fn test_a_request_with_an_id_but_no_method_gets_an_explicit_error_not_silence() {
+        // Gap real encontrado en un reparso: antes, esto devolvía `None`
+        // -- un cliente real esperando una respuesta a ESE id se quedaba
+        // esperando para siempre, sin ningún indicio de qué pasó.
+        let mut server = LspServer::new();
+        let req = json!({ "jsonrpc": "2.0", "id": 42, "params": {} });
+
+        let resp = server.handle_message(&req).expect("un request con id debe recibir una respuesta, aunque sea un error");
+        assert_eq!(resp["id"], 42, "el error debe traer el mismo id que el request roto");
+        assert!(resp["error"]["code"].is_i64(), "debe ser un error JSON-RPC real, no un resultado inventado: {resp:?}");
+    }
+
+    #[test]
+    fn test_a_notification_with_no_method_and_no_id_is_silently_ignored() {
+        // Mismo input roto que el test de arriba, pero SIN "id" -- una
+        // notificación (no un request) no espera respuesta según el
+        // protocolo, así que `None` acá sigue siendo lo correcto, no una
+        // regresión del fix de arriba.
+        let mut server = LspServer::new();
+        let req = json!({ "jsonrpc": "2.0", "params": {} });
+        assert!(server.handle_message(&req).is_none());
     }
 
     #[test]
