@@ -250,4 +250,43 @@ mod tests {
         let (_, lock) = resolve(&spec_v2, &project.0).expect("debe fetchear el tag nuevo sobre el clon ya cacheado");
         assert_eq!(lock.resolved, v2_sha);
     }
+
+    /// Encontrado como gap real por un reparso: solo el camino feliz de
+    /// `resolve` tenía cobertura -- un rev inexistente nunca se había
+    /// probado. Importa que falle RUIDOSO (`Err`, mensaje real) en vez de,
+    /// por ejemplo, quedarse silenciosamente en el HEAD de la rama default
+    /// del clon (`checkout --force` sin `--detach` explícito ya haría
+    /// justamente eso si el argumento fuera inválido de otra forma) --
+    /// exactamente el tipo de "no reproducible" que `#<rev>` obligatorio
+    /// existe para prevenir.
+    #[test]
+    fn resolve_fails_loudly_on_a_nonexistent_rev() {
+        let remote = FixtureRemote::new("bad-rev");
+        remote.commit_file("main.link", "type Point = { x: Int }", "único commit");
+
+        let project = TempProject::new("bad-rev");
+        let spec = format!("git+{}#no-existe-este-tag", remote.url());
+        let result = resolve(&spec, &project.0);
+
+        let err = result.expect_err("un rev que no existe en el remoto debe fallar, nunca resolver silenciosamente a otra cosa");
+        assert!(!err.is_empty(), "el error debe traer un mensaje real, no una cadena vacía");
+    }
+
+    /// Mismo espíritu que arriba, pero para el clon en sí -- una URL que
+    /// `git clone` no puede alcanzar (acá, un directorio local que
+    /// directamente no existe, sin necesitar tocar la red para que el
+    /// test sea determinista) debe fallar en el paso de CLONE, con un
+    /// mensaje que lo diga, no colgarse ni devolver un directorio a medio
+    /// clonar como si hubiera funcionado.
+    #[test]
+    fn resolve_fails_loudly_when_the_remote_is_unreachable() {
+        let project = TempProject::new("unreachable-remote");
+        let nonexistent_remote = project.0.join("no-existe-ningun-repo-aca");
+        let spec = format!("git+{}#main", nonexistent_remote.to_string_lossy().replace('\\', "/"));
+
+        let result = resolve(&spec, &project.0);
+
+        let err = result.expect_err("un remoto inalcanzable debe fallar el clone, no resolver como si nada");
+        assert!(!err.is_empty(), "el error debe traer un mensaje real, no una cadena vacía");
+    }
 }
