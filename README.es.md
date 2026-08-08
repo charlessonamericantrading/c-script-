@@ -30,10 +30,18 @@ cargo build
 
 # 2. Confirmar que el frontend tipa limpio
 cd ../frontend && npm install && npx tsc --noEmit   # exit 0
+```
 
-# 3. Levantar el servidor y correr el frontend de verdad
-cd ../compiler && ./target/debug/linkc serve ../examples/users.link 8787 &
-cd ../frontend && node src/main.ts                  # llama al server real, tipado end-to-end
+El paso 1 también imprime una advertencia de que no se generó `main.wasm` — esperado acá, no es un fallo. El codegen WASM nativo (`linkc wasm`) solo soporta un subconjunto mínimo de `Int`/`Bool` a propósito (ver [GRAMMAR.md](GRAMMAR.md) §3.20); este demo corre sobre el intérprete, igual que `linkc serve` siempre corrió.
+
+```bash
+# 3. Levantar el servidor (dejalo corriendo)
+cd compiler && ./target/debug/linkc serve ../examples/users.link 8787
+```
+
+```bash
+# 4. En una segunda terminal: correr el frontend de verdad
+cd frontend && node src/main.ts   # llama al server real, tipado end-to-end
 ```
 
 El servidor arranca con la base **vacía** — crea una colección vacía por cada una que tu programa declare en `db { ... }`, y nada más. Por eso la primera corrida del demo crea su propio usuario y después lo lee: que el runtime de un lenguaje invente filas que nunca escribiste sería mentir sobre lo que tu programa hace.

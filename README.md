@@ -30,10 +30,18 @@ cargo build
 
 # 2. Confirm the frontend typechecks clean
 cd ../frontend && npm install && npx tsc --noEmit   # exit 0
+```
 
-# 3. Start the server and run the frontend for real
-cd ../compiler && ./target/debug/linkc serve ../examples/users.link 8787 &
-cd ../frontend && node src/main.ts                  # calls the real server, typed end-to-end
+Step 1 also prints a warning that `main.wasm` wasn't generated — expected here, not a failure. Native WASM codegen (`linkc wasm`) only supports a minimal `Int`/`Bool` subset by design (see [GRAMMAR.md](GRAMMAR.md) §3.20); this demo runs through the interpreter, same as `linkc serve` always has.
+
+```bash
+# 3. Start the server (leave this running)
+cd compiler && ./target/debug/linkc serve ../examples/users.link 8787
+```
+
+```bash
+# 4. In a second terminal: run the frontend for real
+cd frontend && node src/main.ts   # calls the real server, typed end-to-end
 ```
 
 The server starts with an **empty** database — it creates one empty collection per `db { ... }` declaration in your program and nothing else. The demo's first run therefore creates its own user and then reads it back; a language runtime inventing rows you never wrote would be a lie about what your program does.
