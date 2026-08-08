@@ -742,6 +742,7 @@ impl Checker {
         }
         match name {
             "Int" => Ok(Type::Int),
+            "Int64" => Ok(Type::Int64),
             "Float" => Ok(Type::Float),
             "String" => Ok(Type::String),
             "Bool" => Ok(Type::Bool),
@@ -1428,7 +1429,9 @@ impl Checker {
             // primitivo con patrones de literal. Deliberadamente sin Float
             // (igualdad exacta de floats) ni Optional/Null (matchear un `T?`
             // directamente queda para más adelante, ver Pattern::Literal).
-            Type::Int | Type::String | Type::Bool => {
+            // Int64 sí entra -- misma semántica de igualdad exacta que Int,
+            // a diferencia de Float (GRAMMAR.md §3.30).
+            Type::Int | Type::Int64 | Type::String | Type::Bool => {
                 self.check_exhaustive_literal(&scrutinee_ty, arms)?;
             }
             // Narrowing de uniones (GRAMMAR.md §3.9): patrones `nombre: Tipo`.
@@ -1687,7 +1690,11 @@ impl Checker {
     fn check_literal_matches_type(&self, lit: &LiteralPattern, ty: &Type) -> Result<(), CheckError> {
         let ok = matches!(
             (lit, ty),
-            (LiteralPattern::Int(_), Type::Int)
+            // Un patrón literal entero (`5 => ...`) vale contra un
+            // escrutinio Int64 igual que contra Int -- no hay una sintaxis
+            // de literal Int64 propia (GRAMMAR.md §3.30), así que el mismo
+            // LiteralPattern::Int sirve para ambos tipos de escrutinio.
+            (LiteralPattern::Int(_), Type::Int | Type::Int64)
                 | (LiteralPattern::Str(_), Type::String)
                 | (LiteralPattern::Bool(_), Type::Bool)
         );
@@ -2011,11 +2018,12 @@ impl Checker {
                 let r = self.synth_expr(right, env)?;
                 match (&l, &r) {
                     (Type::Int, Type::Int) => Ok(Type::Int),
+                    (Type::Int64, Type::Int64) => Ok(Type::Int64),
                     (Type::Float, Type::Float) => Ok(Type::Float),
                     (Type::String, Type::String) => Ok(Type::String),
                     (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Dynamic),
                     _ => Err(err(format!(
-                        "'+' requiere Int+Int, Float+Float o String+String sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
+                        "'+' requiere Int+Int, Int64+Int64, Float+Float o String+String sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
                     ))),
                 }
             }
@@ -2024,10 +2032,11 @@ impl Checker {
                 let r = self.synth_expr(right, env)?;
                 match (&l, &r) {
                     (Type::Int, Type::Int) => Ok(Type::Int),
+                    (Type::Int64, Type::Int64) => Ok(Type::Int64),
                     (Type::Float, Type::Float) => Ok(Type::Float),
                     (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Dynamic),
                     _ => Err(err(format!(
-                        "operador aritmético requiere Int+Int o Float+Float sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
+                        "operador aritmético requiere Int+Int, Int64+Int64 o Float+Float sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
                     ))),
                 }
             }
@@ -2055,10 +2064,10 @@ impl Checker {
                 let l = self.synth_expr(left, env)?;
                 let r = self.synth_expr(right, env)?;
                 match (&l, &r) {
-                    (Type::Int, Type::Int) | (Type::Float, Type::Float) => Ok(Type::Bool),
+                    (Type::Int, Type::Int) | (Type::Int64, Type::Int64) | (Type::Float, Type::Float) => Ok(Type::Bool),
                     (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Bool),
                     _ => Err(err(format!(
-                        "operador relacional requiere Int+Int o Float+Float; se encontró {l:?} y {r:?}"
+                        "operador relacional requiere Int+Int, Int64+Int64 o Float+Float; se encontró {l:?} y {r:?}"
                     ))),
                 }
             }
@@ -2075,8 +2084,8 @@ impl Checker {
             UnaryOp::Neg => {
                 let t = self.synth_expr(operand, env)?;
                 match t {
-                    Type::Int | Type::Float | Type::Dynamic => Ok(t),
-                    other => Err(err(format!("'-' unario requiere Int o Float, se encontró {other:?}"))),
+                    Type::Int | Type::Int64 | Type::Float | Type::Dynamic => Ok(t),
+                    other => Err(err(format!("'-' unario requiere Int, Int64 o Float, se encontró {other:?}"))),
                 }
             }
             UnaryOp::Not => {
@@ -2113,6 +2122,19 @@ impl Checker {
             (Type::Int, "toFloat") => {
                 self.expect_no_args(args, "toFloat")?;
                 Some(Type::Float)
+            }
+            // Ambas direcciones son exactas (mismo rango i64), nunca lossy
+            // -- a diferencia de toFloat/toInt entre Int y Float. Es la
+            // ÚNICA forma de obtener un Int64 desde código fuente en v0: un
+            // literal entero siempre sintetiza Type::Int (Expr::Int arriba),
+            // nunca Type::Int64 directamente (GRAMMAR.md §3.30).
+            (Type::Int, "toInt64") => {
+                self.expect_no_args(args, "toInt64")?;
+                Some(Type::Int64)
+            }
+            (Type::Int64, "toInt") => {
+                self.expect_no_args(args, "toInt")?;
+                Some(Type::Int)
             }
             (Type::Float, "toInt") => {
                 self.expect_no_args(args, "toInt")?;
@@ -2850,6 +2872,47 @@ mod tests {
     fn numeric_conversion_rejects_wrong_receiver_or_args() {
         assert!(check_source("fn f(n: Float) -> Float { n.toFloat() }").is_err()); // toFloat es de Int
         assert!(check_source("fn f(n: Int) -> Float { n.toFloat(1) }").is_err()); // no toma argumentos
+    }
+
+    // ---- Int64 (GRAMMAR.md §3.30) ----
+
+    #[test]
+    fn int64_round_trips_through_conversion_methods() {
+        assert!(check_source("fn f(n: Int) -> Int64 { n.toInt64() }").is_ok());
+        assert!(check_source("fn f(n: Int64) -> Int { n.toInt() }").is_ok());
+    }
+
+    #[test]
+    fn int64_conversion_rejects_wrong_receiver_or_args() {
+        assert!(check_source("fn f(n: Int64) -> Int64 { n.toInt64() }").is_err()); // toInt64 es de Int
+        assert!(check_source("fn f(n: Int) -> Int64 { n.toInt64(1) }").is_err()); // no toma argumentos
+    }
+
+    #[test]
+    fn int64_does_not_mix_implicitly_with_int_in_arithmetic_or_comparisons() {
+        assert!(check_source("fn f(a: Int64, b: Int) -> Int64 { a + b }").is_err());
+        assert!(check_source("fn f(a: Int64, b: Int) -> Bool { a < b }").is_err());
+    }
+
+    #[test]
+    fn int64_supports_arithmetic_and_comparisons_between_two_int64() {
+        assert!(check_source("fn f(a: Int64, b: Int64) -> Int64 { a + b }").is_ok());
+        assert!(check_source("fn f(a: Int64, b: Int64) -> Int64 { a - b }").is_ok());
+        assert!(check_source("fn f(a: Int64, b: Int64) -> Int64 { a * b }").is_ok());
+        assert!(check_source("fn f(a: Int64, b: Int64) -> Bool { a < b }").is_ok());
+        assert!(check_source("fn f(a: Int64, b: Int64) -> Bool { a == b }").is_ok());
+        assert!(check_source("fn f(a: Int64) -> Int64 { -a }").is_ok());
+    }
+
+    #[test]
+    fn int64_is_a_valid_match_scrutinee_with_literal_patterns() {
+        assert!(check_source(
+            "fn f(n: Int64) -> String { match n { 0 => \"zero\", other => \"other\" } }"
+        )
+        .is_ok());
+        // Sin arm final que capture el resto: no exhaustivo, mismo criterio
+        // que Int/String (GRAMMAR.md §3.3).
+        assert!(check_source("fn f(n: Int64) -> String { match n { 0 => \"zero\" } }").is_err());
     }
 
     #[test]

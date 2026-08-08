@@ -81,6 +81,9 @@ impl ColumnPlan {
 fn native_sql_type(ty: &Type, simple_enums: &HashSet<String>) -> Option<&'static str> {
     match ty {
         Type::Int => Some("INTEGER"),
+        // Mismo rango i64 que Int -- SQLite/rusqlite ya son 64-bit nativos
+        // acá, sin columna especial (GRAMMAR.md §3.30).
+        Type::Int64 => Some("INTEGER"),
         Type::Float => Some("REAL"),
         Type::String => Some("TEXT"),
         Type::Bool => Some("INTEGER"),
@@ -485,6 +488,7 @@ db { users: User[] }
                 };
                 let value = match effective_ty {
                     Type::Int => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(Value::Int),
+                    Type::Int64 => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(Value::Int64),
                     Type::Float => row.get::<_, Option<f64>>(col.field.name.as_str())?.map(Value::Float),
                     Type::String => row.get::<_, Option<String>>(col.field.name.as_str())?.map(Value::Str),
                     Type::Bool => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(|n| Value::Bool(n != 0)),
@@ -524,6 +528,7 @@ db { users: User[] }
         match v {
             Value::Null => SqlValue::Null,
             Value::Int(n) => SqlValue::Integer(*n),
+            Value::Int64(n) => SqlValue::Integer(*n),
             Value::Float(f) => SqlValue::Real(*f),
             Value::Str(s) => SqlValue::Text(s.clone()),
             Value::Bool(b) => SqlValue::Integer(i64::from(*b)),
@@ -607,5 +612,32 @@ mod tests {
         let remaining = db.call("users", "all", vec![]).unwrap();
         let Value::List(rows) = remaining else { panic!("se esperaba lista") };
         assert_eq!(rows.len(), 2, "un método que falla no debe borrar nada");
+    }
+
+    #[test]
+    fn an_int64_column_survives_insert_and_read_back_exactly_at_i64_extremes() {
+        // Este es el test que agarraría un brazo unreachable!()/panic!()
+        // olvidado en native_sql_type/row_to_fields/write_param -- no solo
+        // que "algún" valor sobreviva, sino que los extremos reales de i64
+        // (donde una conversión a f64/otro tipo más angosto sí perdería
+        // datos) lo hagan exactos.
+        let program = crate::parser::parse(
+            crate::lexer::tokenize("type Item = { id: Int, big: Int64 }\ndb { items: Item[] }").unwrap(),
+        )
+        .unwrap();
+        let db = Db::new(&program, Path::new(":memory:"));
+
+        for extreme in [i64::MIN, i64::MAX, 0] {
+            let inserted = db
+                .call("items", "insert", vec![Value::Struct(vec![("big".into(), Value::Int64(extreme))])])
+                .unwrap();
+            let Value::Struct(fields) = &inserted else { panic!("se esperaba struct") };
+            let id = fields.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap();
+
+            let found = db.call("items", "find", vec![Value::Int(id)]).unwrap();
+            let Value::Struct(found_fields) = found else { panic!("se esperaba struct") };
+            let big = found_fields.iter().find(|(n, _)| n == "big").map(|(_, v)| v.clone()).unwrap();
+            assert_eq!(big, Value::Int64(extreme), "Int64 debe sobrevivir insert+find exacto en {extreme}");
+        }
     }
 }

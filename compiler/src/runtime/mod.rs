@@ -42,6 +42,11 @@ const MAX_WHILE_ITERATIONS: u64 = 1_000_000;
 #[derive(Clone)]
 pub enum Value {
     Int(i64),
+    /// Mismo rango que `Int` -- ver la doc de `Type::Int64` (types.rs) para
+    /// por qué existe como variante propia en vez de reusar `Int` (el borde
+    /// serializa cada uno distinto, y `value_to_json` no tiene contexto de
+    /// `Type` para decidirlo de otra forma).
+    Int64(i64),
     Float(f64),
     Str(String),
     Bool(bool),
@@ -84,6 +89,7 @@ impl PartialEq for Value {
         use Value::*;
         match (self, other) {
             (Int(a), Int(b)) => a == b,
+            (Int64(a), Int64(b)) => a == b,
             (Float(a), Float(b)) => a == b,
             (Str(a), Str(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
@@ -114,6 +120,7 @@ impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Value::Int(n) => f.debug_tuple("Int").field(n).finish(),
+            Value::Int64(n) => f.debug_tuple("Int64").field(n).finish(),
             Value::Float(n) => f.debug_tuple("Float").field(n).finish(),
             Value::Str(s) => f.debug_tuple("Str").field(s).finish(),
             Value::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
@@ -354,7 +361,7 @@ pub(crate) fn eval_expr(
                 // Métodos builtin sobre primitivos (GRAMMAR.md §3.8, ej.
                 // `x.toFloat()`) usan el mismo BoundMethod que db/listas/auth --
                 // el checker ya validó que el nombre existe para este tipo.
-                Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Float(_) | Value::Str(_) | Value::Auth => {
+                Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Auth => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -554,8 +561,9 @@ fn eval_unary(
     match op {
         UnaryOp::Neg => match v {
             Value::Int(n) => Ok(Value::Int(-n)),
+            Value::Int64(n) => Ok(Value::Int64(-n)),
             Value::Float(n) => Ok(Value::Float(-n)),
-            other => Err(err(format!("'-' unario requiere Int o Float en runtime: {other:?}"))),
+            other => Err(err(format!("'-' unario requiere Int, Int64 o Float en runtime: {other:?}"))),
         },
         UnaryOp::Not => Ok(Value::Bool(!as_bool(&v)?)),
     }
@@ -576,9 +584,10 @@ fn numeric_op(
 ) -> Result<Value, RuntimeError> {
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(int_op(a, b))),
+        (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64(int_op(a, b))),
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(float_op(a, b))),
         (l, r) => Err(err(format!(
-            "operador aritmético requiere Int+Int o Float+Float en runtime: {l:?} y {r:?}"
+            "operador aritmético requiere Int+Int, Int64+Int64 o Float+Float en runtime: {l:?} y {r:?}"
         ))),
     }
 }
@@ -586,10 +595,11 @@ fn numeric_op(
 fn compare(l: Value, r: Value, accept: impl Fn(std::cmp::Ordering) -> bool) -> Result<Value, RuntimeError> {
     let ordering = match (&l, &r) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
+        (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
         (Value::Float(a), Value::Float(b)) => {
             a.partial_cmp(b).ok_or_else(|| err("comparación con NaN"))?
         }
-        _ => return Err(err(format!("operador relacional requiere Int+Int o Float+Float: {l:?} y {r:?}"))),
+        _ => return Err(err(format!("operador relacional requiere Int+Int, Int64+Int64 o Float+Float: {l:?} y {r:?}"))),
     };
     Ok(Value::Bool(accept(ordering)))
 }
@@ -686,6 +696,7 @@ fn value_matches_type(v: &Value, ty: &crate::types::Type, checker: &Checker) -> 
     use crate::types::Type;
     match ty {
         Type::Int => matches!(v, Value::Int(_)),
+        Type::Int64 => matches!(v, Value::Int64(_)),
         Type::Float => matches!(v, Value::Float(_)),
         Type::String => matches!(v, Value::Str(_)),
         Type::Bool => matches!(v, Value::Bool(_)),
@@ -887,7 +898,12 @@ fn call_method(
         },
         Value::Int(n) => match method {
             "toFloat" => Ok(Value::Float(n as f64)),
+            "toInt64" => Ok(Value::Int64(n)),
             other => Err(err(format!("método desconocido sobre Int: '{other}'"))),
+        },
+        Value::Int64(n) => match method {
+            "toInt" => Ok(Value::Int(n)),
+            other => Err(err(format!("método desconocido sobre Int64: '{other}'"))),
         },
         Value::Float(n) => match method {
             "toInt" => Ok(Value::Int(n as i64)), // trunca hacia cero, no redondea (GRAMMAR.md §3.8)
@@ -1113,6 +1129,15 @@ pub(crate) fn json_to_typed_value(
     };
     match ty {
         Type::Int => j.as_i64().map(Value::Int).ok_or_else(mismatch),
+        // Siempre string en el wire, nunca un número JSON nativo -- eso es
+        // justo lo que evita la pérdida de precisión que Int64 existe para
+        // resolver (GRAMMAR.md §3.30): un número JSON grande ya perdió
+        // precisión del lado del cliente JS antes de llegar acá.
+        Type::Int64 => j
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(Value::Int64)
+            .ok_or_else(mismatch),
         Type::Float => j.as_f64().map(Value::Float).ok_or_else(mismatch),
         Type::String => j.as_str().map(|s| Value::Str(s.to_string())).ok_or_else(mismatch),
         Type::Bool => j.as_bool().map(Value::Bool).ok_or_else(mismatch),
@@ -1303,6 +1328,7 @@ fn describe_type(ty: &crate::types::Type) -> String {
     use crate::types::Type;
     match ty {
         Type::Int => "Int".into(),
+        Type::Int64 => "Int64".into(),
         Type::Float => "Float".into(),
         Type::String => "String".into(),
         Type::Bool => "Bool".into(),
@@ -1413,6 +1439,8 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
     use serde_json::json;
     match v {
         Value::Int(n) => json!(n),
+        // String, no número -- ver la nota simétrica en json_to_typed_value.
+        Value::Int64(n) => json!(n.to_string()),
         Value::Float(n) => json!(n),
         Value::Str(s) => json!(s),
         Value::Bool(b) => json!(b),
@@ -2176,6 +2204,48 @@ mod tests {
             let e = invoke_rpc(&program, "S", rpc, &args, &db)
                 .expect_err(&format!("{rpc} con {args} debería rechazarse"));
             assert_eq!(e.kind, ErrorKind::BadRequest, "{rpc} con {args}: {e}");
+        }
+    }
+
+    // ---- Int64 (GRAMMAR.md §3.30) ----
+
+    fn int64_demo() -> Program {
+        program_from(
+            r#"
+            service S {
+                rpc echoInt64(n: Int64) -> Int64 { n }
+            }
+        "#,
+        )
+    }
+
+    #[test]
+    fn int64_round_trips_exactly_at_i64_extremes_as_a_wire_string() {
+        let program = int64_demo();
+        let db = Db::seeded();
+        for extreme in [i64::MIN.to_string(), i64::MAX.to_string(), "0".to_string()] {
+            let result = invoke_rpc(&program, "S", "echoInt64", &json!({"n": extreme}), &db)
+                .unwrap_or_else(|e| panic!("echoInt64({extreme}) debería aceptarse: {e}"));
+            assert_eq!(result, json!(extreme), "Int64 debe viajar como string, exacto, ida y vuelta");
+        }
+    }
+
+    #[test]
+    fn int64_rejects_a_native_json_number_and_malformed_or_out_of_range_strings() {
+        // Un número JSON nativo se rechaza a propósito -- aceptarlo
+        // reabriría exactamente la pérdida de precisión que Int64 existe
+        // para evitar (un cliente ya mandó un f64 antes de llegar acá).
+        let program = int64_demo();
+        let db = Db::seeded();
+        for bad in [
+            json!({"n": 123}),                            // número JSON nativo, no string
+            json!({"n": "no es un entero"}),               // string no numérico
+            json!({"n": "1.5"}),                            // string numérico pero no entero
+            json!({"n": "99999999999999999999999999999"}), // string numérico, fuera de rango i64
+        ] {
+            let e = invoke_rpc(&program, "S", "echoInt64", &bad, &db)
+                .expect_err(&format!("echoInt64({bad}) debería rechazarse"));
+            assert_eq!(e.kind, ErrorKind::BadRequest, "echoInt64({bad}): {e}");
         }
     }
 

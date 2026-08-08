@@ -128,7 +128,7 @@ service Users {
 | Tipo en c-script | Tipo en TypeScript | Forma JSON | ¿Existe? |
 |---|---|---|---|
 | `Int`, `Float` | `number` | número | sí |
-| `Int64`, `BigInt` | `bigint` \| `string`* | string (para no perder precisión) | **no** — nunca se implementó; `Int` es i64 y se emite como `number` |
+| `Int64`, `BigInt` | `bigint` \| `string`* | string (para no perder precisión) | sí, como `Int64` — pero TS `string`, no `bigint` (GRAMMAR.md §3.30: el cliente generado no tiene hoy ningún punto de (de)serialización dirigido por tipo, y `string` no necesita ninguno; `bigint` real queda como ronda futura separada) |
 | `String` | `string` | string | sí |
 | `Bool` | `boolean` | bool | sí |
 | `[T]` | `T[]` | array | la sintaxis real es postfija: `T[]` |

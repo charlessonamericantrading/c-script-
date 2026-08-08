@@ -742,6 +742,7 @@ fn get_hover_for_word(word: &str, source: &str, full_program: Option<&Program>) 
         "from" => Some("Keyword `from`\n\nSpecifies the source module for imports."),
         "pub" => Some("Keyword `pub`\n\nExposes a module item."),
         "Int" => Some("Builtin Type `Int`\n\n64-bit signed integer."),
+        "Int64" => Some("Builtin Type `Int64`\n\nSame 64-bit range as `Int`, but serialized as a string on the wire (and typed as `string` in TS) to avoid precision loss above 2^53. Convert with `.toInt64()`/`.toInt()`."),
         "Float" => Some("Builtin Type `Float`\n\n64-bit floating point number."),
         "String" => Some("Builtin Type `String`\n\nUTF-8 string."),
         "Bool" => Some("Builtin Type `Bool`\n\nBoolean type (`true` or `false`)."),
@@ -1176,7 +1177,8 @@ pub fn get_completions(source: &str, line0: usize, col0: usize, full_program: Op
             ("map(fn)", "Map array items", 2),
             ("filter(fn)", "Filter array items", 2),
             ("toFloat()", "Convert Int to Float", 2),
-            ("toInt()", "Convert Float/String to Int", 2),
+            ("toInt()", "Convert Float/Int64 to Int", 2),
+            ("toInt64()", "Convert Int to Int64", 2),
         ];
         for (label, detail, kind) in methods {
             items.push(json!({
@@ -1232,7 +1234,7 @@ pub fn get_completions(source: &str, line0: usize, col0: usize, full_program: Op
         }));
     }
 
-    let builtins = ["Int", "Float", "String", "Bool", "Void", "Result", "Patch"];
+    let builtins = ["Int", "Int64", "Float", "String", "Bool", "Void", "Result", "Patch"];
     for b in builtins {
         items.push(json!({
             "label": b,
@@ -1402,7 +1404,11 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             method("length()", "Get the length of this string"),
             method("contains(sub)", "Check if this string contains a substring"),
         ]),
-        Type::Int => Some(vec![method("toFloat()", "Convert this Int to Float")]),
+        Type::Int => Some(vec![
+            method("toFloat()", "Convert this Int to Float"),
+            method("toInt64()", "Convert this Int to Int64"),
+        ]),
+        Type::Int64 => Some(vec![method("toInt()", "Convert this Int64 to Int")]),
         Type::Float => Some(vec![method("toInt()", "Convert this Float to Int")]),
         Type::Auth => Some(vec![
             method("createSession(role)", "Create an opaque session token for the given Role"),
@@ -1629,6 +1635,15 @@ mod tests {
         assert!(markdown.contains("type User"));
     }
 
+    #[test]
+    fn test_hover_builtin_type_int64() {
+        let code = "type Counter = { big: Int64 }\n";
+        let col = code.find("Int64").unwrap();
+        let hover = get_hover(code, 0, col, None).expect("Hover debe retornar resultado");
+        let markdown = hover["contents"]["value"].as_str().unwrap();
+        assert!(markdown.contains("Builtin Type `Int64`"), "{markdown}");
+    }
+
     // ---- hover de expresión arbitraria (Nivel 3 ronda 2/3, GRAMMAR.md §3.24) ----
 
     #[test]
@@ -1689,6 +1704,18 @@ mod tests {
         let completions = get_completions(code, 0, col, None);
         assert!(completions.iter().any(|c| c["label"] == "contains(sub)"), "{completions:?}");
         assert!(!completions.iter().any(|c| c["label"] == "map(fn)"), "un String no tiene 'map' (método de lista): {completions:?}");
+    }
+
+    #[test]
+    fn test_completion_after_dot_on_an_int64_receiver_offers_toint_not_tofloat() {
+        let code = "fn f(n: Int64) -> Int { n. }\n";
+        let col = code.find("n.").unwrap() + 2;
+        let completions = get_completions(code, 0, col, None);
+        assert!(completions.iter().any(|c| c["label"] == "toInt()"), "{completions:?}");
+        assert!(
+            !completions.iter().any(|c| c["label"] == "toFloat()"),
+            "Int64 no tiene toFloat (eso es de Int) -- el receptor no debería estar sin tailorear: {completions:?}"
+        );
     }
 
     #[test]

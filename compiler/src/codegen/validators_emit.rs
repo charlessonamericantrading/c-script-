@@ -209,6 +209,7 @@ fn validator_fn_name(ty: &Type) -> Option<String> {
 fn type_key(ty: &Type) -> String {
     match ty {
         Type::Int => "Int".into(),
+        Type::Int64 => "Int64".into(),
         Type::Float => "Float".into(),
         Type::String => "String".into(),
         Type::Bool => "Bool".into(),
@@ -248,6 +249,13 @@ fn render_check(ty: &Type, expr: &str, worklist: &mut Vec<Type>, seen: &mut Vec<
     }
     match ty {
         Type::Int => format!("(typeof {expr} === \"number\" && Number.isInteger({expr}))"),
+        // String en el wire (GRAMMAR.md §3.30), no número -- el chequeo
+        // real es que `BigInt(...)` no tire (rechaza "abc", "1.5", "") Y que
+        // el valor entre en el rango de un i64 real (rechaza un string
+        // numéricamente válido pero fuera de rango, ej. 2^100).
+        Type::Int64 => format!(
+            "(typeof {expr} === \"string\" && (() => {{ try {{ const n = BigInt({expr}); return n >= -9223372036854775808n && n <= 9223372036854775807n; }} catch {{ return false; }} }})())"
+        ),
         Type::Float => format!("typeof {expr} === \"number\""),
         Type::String => format!("typeof {expr} === \"string\""),
         Type::Bool => format!("typeof {expr} === \"boolean\""),
@@ -494,6 +502,18 @@ mod tests {
         let out = emit(src);
         assert!(out.contains("function isPoint(x: unknown): x is Point"));
         assert!(out.contains("Number.isInteger"));
+    }
+
+    #[test]
+    fn int64_check_requires_a_string_that_bigint_parses_within_i64_range() {
+        let src = r#"
+            type Counter = { big: Int64 }
+            service S { rpc get() -> Counter { db.thing.get() } }
+        "#;
+        let out = emit(src);
+        assert!(out.contains("typeof") && out.contains("=== \"string\""), "debe exigir string: {out}");
+        assert!(out.contains("BigInt("), "debe intentar BigInt(...) para validar de verdad: {out}");
+        assert!(out.contains("9223372036854775807"), "debe acotar al rango real de i64: {out}");
     }
 
     #[test]

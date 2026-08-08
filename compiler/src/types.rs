@@ -5,6 +5,13 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     Int,
+    /// Mismo rango que `Int` (`i64`) -- NO es un bignum de precisión
+    /// arbitraria. Existe aparte de `Int` únicamente por el borde: `Int` se
+    /// emite como `number` de TS (pierde precisión en silencio arriba de
+    /// 2^53), `Int64` se emite como `string` en el wire y en TS para
+    /// preservarla (GRAMMAR.md §3.30). Sin mezcla implícita con `Int` en
+    /// aritmética -- `.toInt64()`/`.toInt()` son la única conversión.
+    Int64,
     Float,
     String,
     Bool,
