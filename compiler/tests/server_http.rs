@@ -165,7 +165,7 @@ fn list_does_not_require_auth_over_a_real_subprocess() {
 fn first_user_created_in_an_empty_database_is_admin_over_a_real_subprocess() {
     let server = ServeProcess::start_with_flagship_example("first-user-admin");
     let (status, body) =
-        server.post("/Users/create", &json!({"input": {"name": "Ada", "email": "ada@example.com"}}), None);
+        server.post("/Users/create", &json!({"input": {"name": "Ada", "email": "ada@example.com", "createdAt": "2026-01-01T00:00:00.000Z"}}), None);
     assert_eq!(status, 200, "body: {body:?}");
     assert_eq!(body["type"], "Ok", "body: {body:?}");
     assert_eq!(
@@ -180,7 +180,7 @@ fn admin_gated_rpcs_reject_without_a_token_and_succeed_with_a_real_login_token_o
     let server = ServeProcess::start_with_flagship_example("admin-gate");
 
     let (status, created) =
-        server.post("/Users/create", &json!({"input": {"name": "Ada", "email": "ada@example.com"}}), None);
+        server.post("/Users/create", &json!({"input": {"name": "Ada", "email": "ada@example.com", "createdAt": "2026-01-01T00:00:00.000Z"}}), None);
     assert_eq!(status, 200, "body: {created:?}");
     let id = created["value"]["id"].as_i64().expect("el usuario creado debe tener id");
 

@@ -84,6 +84,12 @@ fn native_sql_type(ty: &Type, simple_enums: &HashSet<String>) -> Option<&'static
         // Mismo rango i64 que Int -- SQLite/rusqlite ya son 64-bit nativos
         // acá, sin columna especial (GRAMMAR.md §3.30).
         Type::Int64 => Some("INTEGER"),
+        // Milisegundos crudos, INTEGER nativo -- range queries indexadas
+        // correctas (`WHERE createdAt > ?`), más robusto que ordenar un
+        // string ISO-8601 por lexicografía (GRAMMAR.md §3.31). La
+        // conversión a/desde el string ISO-8601 solo pasa en el borde JSON
+        // (json_to_typed_value/value_to_json, runtime/mod.rs), nunca acá.
+        Type::Timestamp => Some("INTEGER"),
         Type::Float => Some("REAL"),
         Type::String => Some("TEXT"),
         Type::Bool => Some("INTEGER"),
@@ -489,6 +495,7 @@ db { users: User[] }
                 let value = match effective_ty {
                     Type::Int => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(Value::Int),
                     Type::Int64 => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(Value::Int64),
+                    Type::Timestamp => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(Value::Timestamp),
                     Type::Float => row.get::<_, Option<f64>>(col.field.name.as_str())?.map(Value::Float),
                     Type::String => row.get::<_, Option<String>>(col.field.name.as_str())?.map(Value::Str),
                     Type::Bool => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(|n| Value::Bool(n != 0)),
@@ -529,6 +536,7 @@ db { users: User[] }
             Value::Null => SqlValue::Null,
             Value::Int(n) => SqlValue::Integer(*n),
             Value::Int64(n) => SqlValue::Integer(*n),
+            Value::Timestamp(n) => SqlValue::Integer(*n),
             Value::Float(f) => SqlValue::Real(*f),
             Value::Str(s) => SqlValue::Text(s.clone()),
             Value::Bool(b) => SqlValue::Integer(i64::from(*b)),
@@ -638,6 +646,33 @@ mod tests {
             let Value::Struct(found_fields) = found else { panic!("se esperaba struct") };
             let big = found_fields.iter().find(|(n, _)| n == "big").map(|(_, v)| v.clone()).unwrap();
             assert_eq!(big, Value::Int64(extreme), "Int64 debe sobrevivir insert+find exacto en {extreme}");
+        }
+    }
+
+    #[test]
+    fn a_timestamp_column_survives_insert_and_read_back_exactly() {
+        // A diferencia de Int64 (string en el wire), acá la columna SQL
+        // guarda milisegundos crudos -- el round-trip que importa acá es
+        // Value::Timestamp(i64) -> INTEGER -> Value::Timestamp(i64), sin
+        // pasar por ningún formateo/parseo de ISO-8601 (eso es un borde
+        // distinto, ya cubierto en runtime/mod.rs).
+        let program = crate::parser::parse(
+            crate::lexer::tokenize("type Event = { id: Int, at: Timestamp }\ndb { events: Event[] }").unwrap(),
+        )
+        .unwrap();
+        let db = Db::new(&program, Path::new(":memory:"));
+
+        for ms in [0i64, -1, 1_700_000_000_000] {
+            let inserted = db
+                .call("events", "insert", vec![Value::Struct(vec![("at".into(), Value::Timestamp(ms))])])
+                .unwrap();
+            let Value::Struct(fields) = &inserted else { panic!("se esperaba struct") };
+            let id = fields.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap();
+
+            let found = db.call("events", "find", vec![Value::Int(id)]).unwrap();
+            let Value::Struct(found_fields) = found else { panic!("se esperaba struct") };
+            let at = found_fields.iter().find(|(n, _)| n == "at").map(|(_, v)| v.clone()).unwrap();
+            assert_eq!(at, Value::Timestamp(ms), "Timestamp debe sobrevivir insert+find exacto en {ms}");
         }
     }
 }

@@ -743,6 +743,7 @@ impl Checker {
         match name {
             "Int" => Ok(Type::Int),
             "Int64" => Ok(Type::Int64),
+            "Timestamp" => Ok(Type::Timestamp),
             "Float" => Ok(Type::Float),
             "String" => Ok(Type::String),
             "Bool" => Ok(Type::Bool),
@@ -2064,10 +2065,16 @@ impl Checker {
                 let l = self.synth_expr(left, env)?;
                 let r = self.synth_expr(right, env)?;
                 match (&l, &r) {
-                    (Type::Int, Type::Int) | (Type::Int64, Type::Int64) | (Type::Float, Type::Float) => Ok(Type::Bool),
+                    (Type::Int, Type::Int)
+                    | (Type::Int64, Type::Int64)
+                    | (Type::Float, Type::Float)
+                    // Timestamp SOLO entra acá (comparación/orden) -- sin
+                    // aritmética, sin Neg (GRAMMAR.md §3.31): no hay
+                    // arriba/abajo simétrico como con un número.
+                    | (Type::Timestamp, Type::Timestamp) => Ok(Type::Bool),
                     (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Bool),
                     _ => Err(err(format!(
-                        "operador relacional requiere Int+Int, Int64+Int64 o Float+Float; se encontró {l:?} y {r:?}"
+                        "operador relacional requiere Int+Int, Int64+Int64, Float+Float o Timestamp+Timestamp; se encontró {l:?} y {r:?}"
                     ))),
                 }
             }
@@ -2913,6 +2920,50 @@ mod tests {
         // Sin arm final que capture el resto: no exhaustivo, mismo criterio
         // que Int/String (GRAMMAR.md §3.3).
         assert!(check_source("fn f(n: Int64) -> String { match n { 0 => \"zero\" } }").is_err());
+    }
+
+    // ---- Timestamp (GRAMMAR.md §3.31) ----
+
+    #[test]
+    fn timestamp_supports_comparisons_between_two_timestamps() {
+        assert!(check_source("fn f(a: Timestamp, b: Timestamp) -> Bool { a < b }").is_ok());
+        assert!(check_source("fn f(a: Timestamp, b: Timestamp) -> Bool { a <= b }").is_ok());
+        assert!(check_source("fn f(a: Timestamp, b: Timestamp) -> Bool { a > b }").is_ok());
+        assert!(check_source("fn f(a: Timestamp, b: Timestamp) -> Bool { a >= b }").is_ok());
+        assert!(check_source("fn f(a: Timestamp, b: Timestamp) -> Bool { a == b }").is_ok());
+    }
+
+    #[test]
+    fn timestamp_rejects_arithmetic_and_unary_negation() {
+        // Sin tipo Duration -- sumar/restar/etc sobre Timestamp no tiene un
+        // significado definido en v0 (GRAMMAR.md §3.31). Pasarlo tal cual
+        // (sin operar) sigue siendo válido, por supuesto.
+        assert!(check_source("fn f(a: Timestamp, b: Timestamp) -> Timestamp { a }").is_ok());
+        assert!(check_source("fn f(a: Timestamp, b: Timestamp) -> Timestamp { a + b }").is_err());
+        assert!(check_source("fn f(a: Timestamp) -> Timestamp { -a }").is_err());
+    }
+
+    #[test]
+    fn timestamp_is_not_a_valid_match_scrutinee() {
+        // Mismo criterio que Float: sin igualdad exacta útil como base de
+        // exhaustividad (GRAMMAR.md §3.31).
+        assert!(check_source(
+            "fn f(t: Timestamp) -> String { match t { other => \"x\" } }"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn timestamp_has_no_conversion_methods() {
+        assert!(check_source("fn f(t: Timestamp) -> Int { t.toInt() }").is_err());
+    }
+
+    #[test]
+    fn timestamp_is_a_valid_rpc_param_and_field_type() {
+        assert!(check_source(
+            "type Event = { at: Timestamp }\nservice S { rpc log(at: Timestamp) -> Event { Event { at: at } } }"
+        )
+        .is_ok());
     }
 
     #[test]

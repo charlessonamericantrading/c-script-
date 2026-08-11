@@ -139,7 +139,7 @@ service Users {
 | `enum` con datos | unión discriminada con `type` tag | objeto etiquetado | sí |
 | `T?` | `T \| null` **(decisión, ver abajo)** | `null` presente | sí |
 | `field?: T` | `field?: T` (clave ausente) | clave omitida | sí |
-| `Timestamp` | `string` (ISO-8601) \| branded | string | **no** — nunca se implementó |
+| `Timestamp` | `string` (ISO-8601) \| branded | string | sí -- string plano, no branded (GRAMMAR.md §3.31: mismo criterio minimalista que el resto del proyecto, revisar si aparece un caso real que pida la distinción nominal) |
 | `Void` / `Unit` | `void` | — | `Void` sí; solo como retorno completo de un rpc (GRAMMAR.md §4.1) |
 
 **\* La decisión de diseño más importante y con más matices** es cómo representar **ausencia**. TypeScript distingue tres cosas que JSON no distingue bien:

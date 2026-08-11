@@ -743,6 +743,7 @@ fn get_hover_for_word(word: &str, source: &str, full_program: Option<&Program>) 
         "pub" => Some("Keyword `pub`\n\nExposes a module item."),
         "Int" => Some("Builtin Type `Int`\n\n64-bit signed integer."),
         "Int64" => Some("Builtin Type `Int64`\n\nSame 64-bit range as `Int`, but serialized as a string on the wire (and typed as `string` in TS) to avoid precision loss above 2^53. Convert with `.toInt64()`/`.toInt()`."),
+        "Timestamp" => Some("Builtin Type `Timestamp`\n\nUTC instant, serialized as a fixed-shape ISO-8601 string (`YYYY-MM-DDTHH:mm:ss.sssZ`) on the wire and typed as `string` in TS. Comparable (`< <= > >= == !=`) but no arithmetic; not constructible from source in v0 (arrives as an rpc param or from `db`)."),
         "Float" => Some("Builtin Type `Float`\n\n64-bit floating point number."),
         "String" => Some("Builtin Type `String`\n\nUTF-8 string."),
         "Bool" => Some("Builtin Type `Bool`\n\nBoolean type (`true` or `false`)."),
@@ -1234,7 +1235,7 @@ pub fn get_completions(source: &str, line0: usize, col0: usize, full_program: Op
         }));
     }
 
-    let builtins = ["Int", "Int64", "Float", "String", "Bool", "Void", "Result", "Patch"];
+    let builtins = ["Int", "Int64", "Timestamp", "Float", "String", "Bool", "Void", "Result", "Patch"];
     for b in builtins {
         items.push(json!({
             "label": b,
@@ -1409,6 +1410,10 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             method("toInt64()", "Convert this Int to Int64"),
         ]),
         Type::Int64 => Some(vec![method("toInt()", "Convert this Int64 to Int")]),
+        // Lista vacía EXPLÍCITA, no `None` -- v0 no tiene ningún método
+        // sobre Timestamp (GRAMMAR.md §3.31); caer al fallback genérico
+        // ofrecería métodos de otros tipos que acá no aplican.
+        Type::Timestamp => Some(vec![]),
         Type::Float => Some(vec![method("toInt()", "Convert this Float to Int")]),
         Type::Auth => Some(vec![
             method("createSession(role)", "Create an opaque session token for the given Role"),
@@ -1644,6 +1649,15 @@ mod tests {
         assert!(markdown.contains("Builtin Type `Int64`"), "{markdown}");
     }
 
+    #[test]
+    fn test_hover_builtin_type_timestamp() {
+        let code = "type Event = { at: Timestamp }\n";
+        let col = code.find("Timestamp").unwrap();
+        let hover = get_hover(code, 0, col, None).expect("Hover debe retornar resultado");
+        let markdown = hover["contents"]["value"].as_str().unwrap();
+        assert!(markdown.contains("Builtin Type `Timestamp`"), "{markdown}");
+    }
+
     // ---- hover de expresión arbitraria (Nivel 3 ronda 2/3, GRAMMAR.md §3.24) ----
 
     #[test]
@@ -1716,6 +1730,17 @@ mod tests {
             !completions.iter().any(|c| c["label"] == "toFloat()"),
             "Int64 no tiene toFloat (eso es de Int) -- el receptor no debería estar sin tailorear: {completions:?}"
         );
+    }
+
+    #[test]
+    fn test_completion_after_dot_on_a_timestamp_receiver_offers_nothing() {
+        // v0 no tiene ningún método sobre Timestamp (GRAMMAR.md §3.31) --
+        // lista vacía tailoreada, no el fallback genérico con métodos de
+        // otros tipos que acá no aplican.
+        let code = "fn f(t: Timestamp) -> Int { t. }\n";
+        let col = code.find("t.").unwrap() + 2;
+        let completions = get_completions(code, 0, col, None);
+        assert!(completions.is_empty(), "{completions:?}");
     }
 
     #[test]

@@ -5,6 +5,11 @@ type User = {
   role: Role,
   bio?: String,
   deletedAt: String?,
+  // Timestamp (GRAMMAR.md §3.31): v0 no tiene ningún mecanismo para
+  // construir uno DESDE el lenguaje (sin now(), sin auto-stamping en
+  // insert) -- así que quien lo provee es el cliente, en el momento de
+  // crear, no el servidor. Ver NewUser/validate más abajo.
+  createdAt: Timestamp,
 }
 
 enum Role { Admin, Member, Guest }
@@ -24,6 +29,7 @@ enum ValidationError {
 type NewUser = {
   name: String,
   email: String,
+  createdAt: Timestamp,
 }
 
 // Forma completa que espera `db.users.insert` (Omit<User,"id"> --
@@ -37,6 +43,7 @@ type NewUserRecord = {
   role: Role,
   bio?: String,
   deletedAt: String?,
+  createdAt: Timestamp,
 }
 
 enum ValidateResult {
@@ -58,7 +65,7 @@ fn validate(input: NewUser) -> ValidateResult {
     // no tiene ningún mecanismo de seed/migración -- esto es lo mínimo que
     // hace el demo usable de punta a punta sin inventar uno.
     let role: Role = if db.users.all().length() == 0 { Role.Admin {} } else { Role.Member {} };
-    ValidateResult.Ok { value: NewUserRecord { name: input.name, email: input.email, role: role, deletedAt: null } }
+    ValidateResult.Ok { value: NewUserRecord { name: input.name, email: input.email, role: role, deletedAt: null, createdAt: input.createdAt } }
   }
 }
 

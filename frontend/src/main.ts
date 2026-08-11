@@ -19,7 +19,14 @@ async function main() {
 
   // create devuelve Result<User, ValidationError> -- unión discriminada
   // exhaustiva (GRAMMAR.md §3.5): tsc conoce ambos casos por el tag "type".
-  const created = await users.create({ name: "Katherine Johnson", email: "katherine@example.com" });
+  // createdAt (GRAMMAR.md §3.31): v0 no tiene now() en el lenguaje, así que
+  // el CLIENTE provee el Timestamp de creación -- toISOString() ya produce
+  // exactamente la forma fija que el servidor exige (milisegundos + 'Z').
+  const created = await users.create({
+    name: "Katherine Johnson",
+    email: "katherine@example.com",
+    createdAt: new Date().toISOString(),
+  });
   if (created.type !== "Ok") {
     switch (created.error.type) {
       case "InvalidEmail":

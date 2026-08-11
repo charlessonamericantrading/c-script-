@@ -475,6 +475,10 @@ pub(crate) fn render_type(ty: &Type) -> String {
         // nueva, no una extensión del patrón de Int). Quien necesite
         // aritmética real hace `BigInt(x)` a mano.
         Type::Int64 => "string".to_string(),
+        // String ISO-8601 plano, no branded -- GRAMMAR.md §3.31: el mismo
+        // criterio minimalista que el resto del proyecto, revisar branding
+        // si aparece un caso real que lo pida.
+        Type::Timestamp => "string".to_string(),
         Type::String => "string".to_string(),
         Type::Bool => "boolean".to_string(),
         Type::Void => "void".to_string(),
@@ -604,7 +608,7 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
                 collect_type_names(m, names);
             }
         }
-        Type::Int | Type::Int64 | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
+        Type::Int | Type::Int64 | Type::Timestamp | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
         Type::Db | Type::DbCollection(_) | Type::Auth => {
             unreachable!("Type::Db/DbCollection/Auth nunca aparece en un TypeExpr real")
         }
@@ -663,6 +667,16 @@ mod tests {
         "#;
         let (contract, _) = emit_both(src);
         assert!(contract.contains("big: string;"), "contrato real: {contract}");
+    }
+
+    #[test]
+    fn timestamp_emits_as_plain_ts_string_not_branded() {
+        let src = r#"
+            type Event = { at: Timestamp }
+            service S { rpc get() -> Event { db.thing.get() } }
+        "#;
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("at: string;"), "contrato real: {contract}");
     }
 
     #[test]

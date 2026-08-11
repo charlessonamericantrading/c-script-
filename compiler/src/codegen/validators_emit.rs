@@ -210,6 +210,7 @@ fn type_key(ty: &Type) -> String {
     match ty {
         Type::Int => "Int".into(),
         Type::Int64 => "Int64".into(),
+        Type::Timestamp => "Timestamp".into(),
         Type::Float => "Float".into(),
         Type::String => "String".into(),
         Type::Bool => "Bool".into(),
@@ -255,6 +256,14 @@ fn render_check(ty: &Type, expr: &str, worklist: &mut Vec<Type>, seen: &mut Vec<
         // numéricamente válido pero fuera de rango, ej. 2^100).
         Type::Int64 => format!(
             "(typeof {expr} === \"string\" && (() => {{ try {{ const n = BigInt({expr}); return n >= -9223372036854775808n && n <= 9223372036854775807n; }} catch {{ return false; }} }})())"
+        ),
+        // Regex fija a la forma exacta que el servidor produce/acepta
+        // (GRAMMAR.md §3.31: sin offset de timezone, milisegundos siempre
+        // presentes) + Date.parse como red de seguridad barata contra una
+        // fecha de calendario inválida (`"2026-13-40..."`) sin duplicar acá
+        // la validación de calendario que ya hace parse_iso8601_millis en Rust.
+        Type::Timestamp => format!(
+            "(typeof {expr} === \"string\" && /^\\d{{4}}-\\d{{2}}-\\d{{2}}T\\d{{2}}:\\d{{2}}:\\d{{2}}\\.\\d{{3}}Z$/.test({expr}) && !isNaN(Date.parse({expr})))"
         ),
         Type::Float => format!("typeof {expr} === \"number\""),
         Type::String => format!("typeof {expr} === \"string\""),
@@ -514,6 +523,18 @@ mod tests {
         assert!(out.contains("typeof") && out.contains("=== \"string\""), "debe exigir string: {out}");
         assert!(out.contains("BigInt("), "debe intentar BigInt(...) para validar de verdad: {out}");
         assert!(out.contains("9223372036854775807"), "debe acotar al rango real de i64: {out}");
+    }
+
+    #[test]
+    fn timestamp_check_requires_the_exact_iso8601_shape() {
+        let src = r#"
+            type Event = { at: Timestamp }
+            service S { rpc get() -> Event { db.thing.get() } }
+        "#;
+        let out = emit(src);
+        assert!(out.contains("=== \"string\""), "debe exigir string: {out}");
+        assert!(out.contains("Date.parse("), "debe validar que sea una fecha real: {out}");
+        assert!(out.contains(r"\d{4}-\d{2}-\d{2}"), "debe exigir la forma fija ISO-8601: {out}");
     }
 
     #[test]

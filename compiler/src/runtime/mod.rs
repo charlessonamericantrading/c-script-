@@ -6,6 +6,7 @@
 pub mod db;
 pub mod server;
 pub mod session;
+mod timestamp;
 
 use crate::ast::*;
 use db::Db;
@@ -47,6 +48,9 @@ pub enum Value {
     /// serializa cada uno distinto, y `value_to_json` no tiene contexto de
     /// `Type` para decidirlo de otra forma).
     Int64(i64),
+    /// Milisegundos desde epoch UTC -- ver la doc de `Type::Timestamp`
+    /// (types.rs) para el resto del diseño (GRAMMAR.md §3.31).
+    Timestamp(i64),
     Float(f64),
     Str(String),
     Bool(bool),
@@ -90,6 +94,7 @@ impl PartialEq for Value {
         match (self, other) {
             (Int(a), Int(b)) => a == b,
             (Int64(a), Int64(b)) => a == b,
+            (Timestamp(a), Timestamp(b)) => a == b,
             (Float(a), Float(b)) => a == b,
             (Str(a), Str(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
@@ -121,6 +126,7 @@ impl std::fmt::Debug for Value {
         match self {
             Value::Int(n) => f.debug_tuple("Int").field(n).finish(),
             Value::Int64(n) => f.debug_tuple("Int64").field(n).finish(),
+            Value::Timestamp(n) => f.debug_tuple("Timestamp").field(n).finish(),
             Value::Float(n) => f.debug_tuple("Float").field(n).finish(),
             Value::Str(s) => f.debug_tuple("Str").field(s).finish(),
             Value::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
@@ -596,10 +602,11 @@ fn compare(l: Value, r: Value, accept: impl Fn(std::cmp::Ordering) -> bool) -> R
     let ordering = match (&l, &r) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
         (Value::Float(a), Value::Float(b)) => {
             a.partial_cmp(b).ok_or_else(|| err("comparación con NaN"))?
         }
-        _ => return Err(err(format!("operador relacional requiere Int+Int, Int64+Int64 o Float+Float: {l:?} y {r:?}"))),
+        _ => return Err(err(format!("operador relacional requiere Int+Int, Int64+Int64, Float+Float o Timestamp+Timestamp: {l:?} y {r:?}"))),
     };
     Ok(Value::Bool(accept(ordering)))
 }
@@ -697,6 +704,7 @@ fn value_matches_type(v: &Value, ty: &crate::types::Type, checker: &Checker) -> 
     match ty {
         Type::Int => matches!(v, Value::Int(_)),
         Type::Int64 => matches!(v, Value::Int64(_)),
+        Type::Timestamp => matches!(v, Value::Timestamp(_)),
         Type::Float => matches!(v, Value::Float(_)),
         Type::String => matches!(v, Value::Str(_)),
         Type::Bool => matches!(v, Value::Bool(_)),
@@ -1138,6 +1146,14 @@ pub(crate) fn json_to_typed_value(
             .and_then(|s| s.parse::<i64>().ok())
             .map(Value::Int64)
             .ok_or_else(mismatch),
+        // String ISO-8601 de forma fija (GRAMMAR.md §3.31) -- rechaza
+        // cualquier otra variante (offset de timezone, sin milisegundos,
+        // fecha de calendario inexistente) en vez de aceptarla a medias.
+        Type::Timestamp => j
+            .as_str()
+            .and_then(timestamp::parse_iso8601_millis)
+            .map(Value::Timestamp)
+            .ok_or_else(mismatch),
         Type::Float => j.as_f64().map(Value::Float).ok_or_else(mismatch),
         Type::String => j.as_str().map(|s| Value::Str(s.to_string())).ok_or_else(mismatch),
         Type::Bool => j.as_bool().map(Value::Bool).ok_or_else(mismatch),
@@ -1329,6 +1345,7 @@ fn describe_type(ty: &crate::types::Type) -> String {
     match ty {
         Type::Int => "Int".into(),
         Type::Int64 => "Int64".into(),
+        Type::Timestamp => "Timestamp".into(),
         Type::Float => "Float".into(),
         Type::String => "String".into(),
         Type::Bool => "Bool".into(),
@@ -1441,6 +1458,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         Value::Int(n) => json!(n),
         // String, no número -- ver la nota simétrica en json_to_typed_value.
         Value::Int64(n) => json!(n.to_string()),
+        Value::Timestamp(n) => json!(timestamp::format_iso8601_millis(*n)),
         Value::Float(n) => json!(n),
         Value::Str(s) => json!(s),
         Value::Bool(b) => json!(b),
@@ -1817,7 +1835,7 @@ mod tests {
             &program,
             "Users",
             "create",
-            &json!({"input": {"name": "Grace Hopper", "email": "grace@example.com"}}),
+            &json!({"input": {"name": "Grace Hopper", "email": "grace@example.com", "createdAt": "2026-01-01T00:00:00.000Z"}}),
             &db,
         )
         .unwrap();
@@ -1895,7 +1913,7 @@ mod tests {
             &program,
             "Users",
             "create",
-            &json!({"input": {"name": "Sin Email", "email": ""}}),
+            &json!({"input": {"name": "Sin Email", "email": "", "createdAt": "2026-01-01T00:00:00.000Z"}}),
             &db,
         )
         .unwrap();
@@ -1912,7 +1930,7 @@ mod tests {
             &program,
             "Users",
             "create",
-            &json!({"input": {"name": "", "email": "valido@example.com"}}),
+            &json!({"input": {"name": "", "email": "valido@example.com", "createdAt": "2026-01-01T00:00:00.000Z"}}),
             &db,
         )
         .unwrap();
@@ -2246,6 +2264,52 @@ mod tests {
             let e = invoke_rpc(&program, "S", "echoInt64", &bad, &db)
                 .expect_err(&format!("echoInt64({bad}) debería rechazarse"));
             assert_eq!(e.kind, ErrorKind::BadRequest, "echoInt64({bad}): {e}");
+        }
+    }
+
+    // ---- Timestamp (GRAMMAR.md §3.31) ----
+
+    fn timestamp_demo() -> Program {
+        program_from(
+            r#"
+            service S {
+                rpc echoTimestamp(t: Timestamp) -> Timestamp { t }
+            }
+        "#,
+        )
+    }
+
+    #[test]
+    fn timestamp_round_trips_exactly_through_the_wire() {
+        let program = timestamp_demo();
+        let db = Db::seeded();
+        for s in [
+            "1970-01-01T00:00:00.000Z",
+            "2024-02-29T12:00:00.000Z", // año bisiesto
+            "2000-02-29T00:00:00.000Z", // frontera de siglo SÍ bisiesto
+            "1969-12-31T23:59:59.999Z", // pre-1970, negativo internamente
+        ] {
+            let result = invoke_rpc(&program, "S", "echoTimestamp", &json!({"t": s}), &db)
+                .unwrap_or_else(|e| panic!("echoTimestamp({s}) debería aceptarse: {e}"));
+            assert_eq!(result, json!(s));
+        }
+    }
+
+    #[test]
+    fn timestamp_rejects_a_century_non_leap_date_and_other_malformed_or_wrong_shape_strings() {
+        let program = timestamp_demo();
+        let db = Db::seeded();
+        for bad in [
+            json!({"t": "1900-02-29T00:00:00.000Z"}), // 1900 NO es bisiesto -- el bug clásico "divisible por 4"
+            json!({"t": "2026-13-01T00:00:00.000Z"}), // mes inválido
+            json!({"t": "2026-08-08T10:00:00Z"}),      // sin milisegundos
+            json!({"t": "2026-08-08T10:00:00.000+02:00"}), // offset de timezone, no 'Z'
+            json!({"t": 1234567890}),                  // número JSON nativo, no string
+            json!({"t": "no es una fecha"}),
+        ] {
+            let e = invoke_rpc(&program, "S", "echoTimestamp", &bad, &db)
+                .expect_err(&format!("echoTimestamp({bad}) debería rechazarse"));
+            assert_eq!(e.kind, ErrorKind::BadRequest, "echoTimestamp({bad}): {e}");
         }
     }
 

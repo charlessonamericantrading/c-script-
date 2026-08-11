@@ -12,6 +12,15 @@ pub enum Type {
     /// preservarla (GRAMMAR.md §3.30). Sin mezcla implícita con `Int` en
     /// aritmética -- `.toInt64()`/`.toInt()` son la única conversión.
     Int64,
+    /// Milisegundos desde epoch UTC internamente; string ISO-8601
+    /// (`YYYY-MM-DDTHH:mm:ss.sssZ`) en el wire y en TS (GRAMMAR.md §3.31).
+    /// Solo comparable (`< <= > >= == !=`) -- sin aritmética (no hay tipo
+    /// `Duration`), sin scrutinee de `match` (mismo criterio que `Float`),
+    /// sin construcción desde código fuente en v0 (sin `now()`, que no
+    /// tiene dónde engancharse: el lenguaje no tiene función builtin sin
+    /// receptor todavía) -- solo llega como parámetro de un `rpc` o ya
+    /// guardado en `db`.
+    Timestamp,
     Float,
     String,
     Bool,
