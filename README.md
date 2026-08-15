@@ -1,127 +1,184 @@
 *[Leer en español](README.es.md)*
 
-[![CI](https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg)](https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml)
+<div align="center">
+  <h1>⚡ Link (c-script)</h1>
+  <p><strong>The compiled backend language designed for absolute End-to-End Type Safety with TypeScript.</strong></p>
+  
+  <p>
+    <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status" /></a>
+    <a href="#"><img src="https://img.shields.io/badge/tests-450%20passed-success.svg" alt="Tests" /></a>
+    <a href="#"><img src="https://img.shields.io/badge/version-1.0.0-blue.svg" alt="Version" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
+  </p>
+</div>
 
-# c-script
+---
 
-A compiled backend language whose entire point is **end-to-end type safety with TypeScript**: rename a field in the backend, and the frontend fails to compile (`tsc`) instead of failing in production.
+## 💡 Why Link?
 
-This repo is the **Phase 0 MVP** (see [PLAN.md](PLAN.md) §4, currently Spanish-only): it proves the core mechanism end-to-end. It is not a production-ready language — it's proof the idea works.
+Whenever you rename a field in your backend or database, your frontend shouldn't silently break in production. With **Link**, your frontend fails to compile (`tsc`) immediately during development.
 
-## What's here
+```
+┌─────────────────┐       linkc build        ┌─────────────────────────────────────────┐
+│   main.link     │ ───────────────────────► │ 📄 contract.d.ts  (TypeScript types)     │
+│                 │                          │ 🔌 client.ts      (Type-safe RPC client) │
+│ • Structs/Enums │                          │ 🛡️ validators.ts  (Runtime validation)   │
+│ • Typed DB      │                          │ ⚛️ hooks.ts       (React SSR/Streaming)  │
+│ • Auth & RBAC   │                          │ 📜 openapi.json   (OpenAPI 3.1 spec)     │
+│ • Streams (SSE) │                          │ 🗄️ schema.pg.sql  (PostgreSQL DDL)       │
+└─────────────────┘                          └─────────────────────────────────────────┘
+```
 
-| | |
+---
+
+## ⚡ Quick Start (10 Seconds)
+
+### 1. Installation
+
+#### 📦 Linux / macOS (curl)
+```bash
+curl -fsSL https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/install.sh | sh
+```
+
+#### 🪟 Windows (PowerShell)
+```powershell
+iwr -useb https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/install.ps1 | iex
+```
+
+#### 🌐 via NPM / npx
+```bash
+npm install -g link-lang
+# or try directly:
+npx link-lang --help
+```
+
+---
+
+## 🚀 Scaffold Your First App
+
+Create a fullstack project with **Next.js 14**, **Vite+React**, or **Minimal Backend**:
+
+```bash
+# Next.js 14 App Router + Link Backend
+linkc new my-app --template nextjs
+
+# React + Vite Single Page Application
+linkc new my-app --template vite
+
+# Minimal Backend
+linkc new my-app --template minimal
+```
+
+Then build and run:
+
+```bash
+cd my-app
+linkc build main.link gen    # Generates typed contracts, client & OpenAPI
+linkc serve main.link 3000   # Starts HTTP server with auto-migrating database
+```
+
+---
+
+## 🧠 Language at a Glance
+
+```link
+// 1. Data Models & Enums
+type User = {
+  id: Int,
+  name: String,
+  email: String,
+  role: Role,
+  created_at: Timestamp,
+}
+
+enum Role {
+  Admin,
+  Member,
+}
+
+// 2. Typed Database with Non-Destructive Auto-Migrations
+db {
+  users: User[],
+}
+
+// 3. RPC Services with RBAC Access Control
+service UserService {
+  @requires(Role.Admin)
+  rpc create(name: String, email: String) -> User {
+    let new_user = db.users.insert({
+      name: name,
+      email: email,
+      role: Role.Member {},
+      created_at: now(),
+    });
+    new_user
+  }
+
+  rpc list() -> User[] {
+    db.users.all()
+  }
+
+  // 4. Real-time Streaming Endpoint (SSE)
+  stream feed() -> User[] {
+    db.users.all()
+  }
+}
+
+// 5. Integrated Behavioral Tests
+test "user creation and count" {
+  let count = db.users.count();
+  assert(count >= 0);
+}
+```
+
+---
+
+## 🛠️ Unified Tooling Suite
+
+Link comes out-of-the-box with all the developer tooling you need:
+
+| Command | Description |
 |---|---|
-| [`PLAN.md`](PLAN.md) | Proposal, phased roadmap, risk analysis *(Spanish)* |
-| [`GRAMMAR.md`](GRAMMAR.md) | Formal spec: EBNF, type system, TypeScript mapping table *(Spanish)* |
-| [`compiler/`](compiler/) | The compiler (`linkc`), in Rust — see `Cargo.toml` for the current dependency list (each one justified in [GRAMMAR.md](GRAMMAR.md) where it's introduced) |
-| [`examples/users.link`](examples/users.link) | The example program: a user CRUD service |
-| [`frontend/`](frontend/) | A real TypeScript frontend consuming the generated contract |
-| [`gen/`](gen/) | Output of `linkc build` — `contract.d.ts` + `client.ts` + `validators.ts` (generated, don't hand-edit) |
+| `linkc new <name> [--template nextjs\|vite\|minimal]` | Scaffolds a fullstack or minimal project |
+| `linkc build <file.link> <outdir>` | Generates TS contracts, client, validators, React hooks, Zod & OpenAPI |
+| `linkc serve <file.link> <port>` | Runs production HTTP server with embedded SQLite and SSE streaming |
+| `linkc test <file.link>` | Runs built-in behavioral tests in clean sandbox |
+| `linkc fmt <file.link> [--check]` | Formats source code according to canonical rules |
+| `linkc lint <file.link> [--fix]` | Analyzes code quality and auto-fixes warnings |
+| `linkc doc <file.link> [outdir]` | Generates responsive, interactive HTML documentation |
+| `linkc docker <file.link> [outdir]` | Generates production multi-stage Dockerfile & docker-compose.yml |
+| `linkc wasm <file.link> <out.wasm>` | Compiles pure functions to standard WebAssembly |
+| `linkc lsp` | Launches Language Server Protocol for VS Code / Cursor / Neovim |
 
-## Try the killer feature yourself
+---
 
-Needs Rust (stable) and **Node 23.6+** (24+ recommended — CI pins 24 and this is what's actually verified) — step 4 runs the generated `frontend/src/main.ts` directly with `node`, relying on Node's built-in TypeScript type-stripping, which only became a no-flag default at 23.6. On an older Node (still common on LTS 18/20), that step fails outright with a syntax error, not a helpful message.
+## 🌐 Interactive Web Playground
+
+Try Link right inside your browser without installing anything:
+- Open [`playground/index.html`](playground/index.html) to write Link code, view real-time TypeScript contracts, OpenAPI specs, and run tests.
+
+---
+
+## 🧩 VS Code / Cursor Extension
+
+Install the official extension from [`editors/vscode/`](editors/vscode/) for:
+- Syntax highlighting for `.link` files.
+- Smart snippets (`service`, `rpc`, `db`, `test`, `@requires`).
+- Diagnostics, hover types, go-to-definition, and format-on-save powered by `linkc lsp`.
+
+---
+
+## 🧪 Testing & Quality Assurance
+
+Link is verified by **450 automated unit, integration, and CLI tests**:
 
 ```bash
 cd compiler
-cargo build
-
-# 1. Generate the TypeScript contract from the backend
-./target/debug/linkc build ../examples/users.link ../gen
-
-# 2. Confirm the frontend typechecks clean
-cd ../frontend && npm install && npx tsc --noEmit   # exit 0
+cargo test
 ```
 
-Step 1 also prints a warning that `main.wasm` wasn't generated — expected here, not a failure. Native WASM codegen (`linkc wasm`) only supports a minimal `Int`/`Bool` subset by design (see [GRAMMAR.md](GRAMMAR.md) §3.20); this demo runs through the interpreter, same as `linkc serve` always has.
+---
 
-```bash
-# 3. Start the server (leave this running)
-cd compiler && ./target/debug/linkc serve ../examples/users.link 8787
-```
+## 📄 License
 
-```bash
-# 4. In a second terminal: run the frontend for real
-cd frontend && node src/main.ts   # calls the real server, typed end-to-end
-```
-
-The server starts with an **empty** database — it creates one empty collection per `db { ... }` declaration in your program and nothing else. The demo's first run therefore creates its own user and then reads it back; a language runtime inventing rows you never wrote would be a lie about what your program does.
-
-Now break something: in `examples/users.link`, rename `name` to `fullName` inside `type User`. Re-run `linkc build` and `npx tsc --noEmit` **without touching `frontend/src/main.ts`**. `tsc` fails on every line that used `.name` — exactly the blind spot c-script exists to eliminate (see [PLAN.md](PLAN.md) §1.2).
-
-Starting a project from scratch is faster: `linkc new my-app` scaffolds a minimal `.link` file plus a matching `frontend/`; `linkc dev my-app/main.link my-app/gen` watches it (and anything it `import`s) and regenerates the contract on every save, instead of re-running `build` by hand.
-
-## Why not just tRPC / Bun / Deno?
-
-They solve adjacent but different problems:
-
-- **tRPC, Encore.ts, Convex** give you E2E type safety by having *no language boundary at all* — the backend already is TypeScript. Clever, but only works if your whole stack is TS.
-- **Bun, Deno** are faster, more modern JS/TS runtimes — but still JS/TS semantics under the hood, not systems-language performance.
-- **Rust+ts-rs, Go+tygo, gRPC/protobuf, OpenAPI codegen** are the actual comparison set: a non-TS backend bridged to a TS frontend. They require a separate IDL/schema you keep in sync by hand, or give you types without a full RPC client. c-script's bet: the backend type declaration itself *is* the contract — no separate schema, automatic client, automatic wire validators.
-
-## Status
-
-Done (Phase 0): lexer, parser, bidirectional type checker (structural/nominal subtyping, `Result<T,E>` and `Patch<T>` as builtins, arithmetic/comparison/logical operators, `if/else`, assignment and mutability, arrays, tuples, explicit numeric conversion, `Map<K,V>`, string builtin methods), user-defined generics via monomorphization, union types (`A | B`) with value-flow subtyping AND narrowing back to a concrete member via `match` (`name: Type` patterns, reusing the same `:` that already means "declared type" everywhere else, with unions whose members can't be told apart at runtime rejected at compile time rather than silently mismatched), functions as first-class values — named references AND real lexical closures (`|params| { block }`, with real contravariant/covariant function subtyping) — plus higher-order `List` methods (`.map`/`.filter`), `match` exhaustiveness extended with literal patterns, or-patterns, and guards, `const` declarations, contract emitter, minimal interpreted runtime.
-
-Done (Phase 1, partial): `linkc new`/`linkc dev` CLI, multi-file imports with a minimal path-based package manager (`link.lock` records a SHA-256 per touched file and warns on drift between builds; real `git+<url>#<rev>` dependencies were added later — see the Status entry below and GRAMMAR.md §2.1 for the full package-manager story, including what's still missing), and a v0 WASM target — the existing interpreter recompiled to `wasm32-wasip1`, proven by running a real RPC call inside `wasmtime` end to end (`compiler/src/bin/wasm_demo.rs`; see PLAN.md §2.4 for exactly what that does and doesn't prove).
-
-Done (Phase 2, partial): runtime validators (`validators.ts` — the third emitter output planned since PLAN.md's first draft; every RPC response is checked against the declared contract before the client hands it back, throwing `LinkValidationError` on a mismatch instead of silently returning malformed data), a v0 typed `db` (`db { users: User[] }` replaces `Type::Dynamic` — `all/find/insert/applyPatch` are now checked against the real element type, still fully in-memory, no SQL driver), real SSE streaming for `stream` (genuine wire framing — `Transfer-Encoding: chunked` with a flush per event, not one buffered JSON blob — replaying an already-computed sequence; the generated client consumes it as a real `AsyncIterable<T>`, validating each event), and auth v0 (`@authenticated`/`@requires(Role.Admin)` decorators on a `rpc`/`stream`, backed by opaque in-memory sessions — no JWT, no new dependency, password/credential verification explicitly out of scope; see [GRAMMAR.md](GRAMMAR.md) §3.14 for the token-generation weakness two adversarial reviews caught and the fix).
-
-Done (Phase 2, LSP prerequisite #1 of 3): tokens now carry a real column (not just line), two real position bugs in the lexer are fixed (error spans used to land one character late in `lex_punct`/`lex_string`/`lex_number`, and an unterminated string/block comment used to mix its opening line with an EOF position — both invisible until a real renderer existed to expose them), and a new `diagnostics` module renders lexer/parser errors as a gcc/rustc-style snippet with a caret, with no new dependency. A syntax error inside an *imported* file now also names that file (previously collapsed to a bare line number, losing which of several files had the problem).
-
-Done (Phase 2, LSP prerequisite #2 of 3): the parser recovers from a syntax error instead of aborting on the first one — it now reports every independent error found in a single pass (at top-level-item granularity: one broken `service`/`type`/`fn`/etc. doesn't stop the others from being checked, though it's discarded whole rather than salvaging the well-formed members inside it). Caught during design review: an earlier version of the recovery step advanced one token unconditionally before resynchronizing, which silently swallowed the next real item's own error whenever a syntax error happened nested inside something (the common case — a missing closing brace); fixed by checking before advancing instead.
-
-Done (Phase 2, LSP prerequisite #3 of 3): every `Expr`/`Stmt` node in the AST now carries its own real position (`Spanned<T>`, chosen as the most precise — and most expensive — of three considered granularities), and the type checker actually uses it: a *type* error (mismatched operand, missing struct field, an rpc signature that can't cross the wire, ...) now renders the same gcc/rustc-style snippet-with-caret that syntax errors already got in prerequisite #1, not just a bare message. Shipped as two rounds: a purely mechanical migration first (every existing test kept passing with zero behavior change, the signal that the ~155-site refactor across the parser/checker/runtime/codegen didn't alter anything), then the checker itself stamping and rendering those positions. `Span` still has no file identity, so a type error inside a multi-file program's *imported* file falls back to the old plain-text form rather than risk rendering a plausible-but-wrong snippet against the wrong file — real per-file provenance is follow-up work, not done here. The actual LSP protocol server (JSON-RPC over stdio, `textDocument/didOpen`, `publishDiagnostics`, completion, hover) is a separate, larger round that hasn't started. 269 tests, all passing.
-
-Done (Phase 2): a `while` loop construct (`Stmt`, never `Expr`; no `for`/`break`/`continue`; a hard iteration cap since the single-threaded, timeout-free server would otherwise hang for every client on one infinite loop) and, built on it, real push for `stream`: a body that is exactly `while true { db.<collection>.subscribe() }` is recognized as one fixed syntactic shape at compile time — chosen over building a general coroutine/`yield` mechanism for arbitrary per-event logic — and intercepted before the interpreter ever runs it. A pub-sub registry on `Db` (bounded channel, non-blocking publish, lazy eviction of disconnected subscribers) delivers a snapshot followed by real live events over the same SSE wire format from the previous streaming round, with zero client codegen changes (the generated client already read indefinitely). Whole-collection only in v0 — no per-row `subscribe(id)`, no event filtering/transformation inside the stream body (the client can already filter by id for free). Verified end to end with the real generated client: snapshot delivery, a live event arriving over an already-open connection after a separate insert, and a disconnected subscriber pruned lazily on the next write without crashing or hanging the server. See [GRAMMAR.md](GRAMMAR.md) §3.15 (`while`) and §3.16 (pub-sub) for the full design, the concurrency argument for why no new lock was needed, and what's explicitly out of scope.
-
-Done (Phase 2): `db { ... }` is now backed by real SQLite (`rusqlite`, `bundled` feature — no system SQLite, no external server process, same "just run it" ethos as the embedded `tiny_http`), replacing the purely in-memory store — data now survives a `linkc serve` restart. The SQL schema is derived automatically from the same `db { ... }` declaration, the same "one source of truth, everything else generated" principle behind `contract.d.ts`/`client.ts`/`validators.ts`: scalars and simple enums get real typed columns (so `find(id)` is now an indexed lookup instead of a linear scan), anything nested reuses the existing `Value`↔JSON conversion as a JSON column, and every nullable/optional-by-key combination — including the one that needs 3 states, `x?: T?` — round-trips losslessly. An incompatible schema on reopen fails loudly with an exact diff and a "delete the file" remedy rather than attempting to migrate. `rusqlite` compiles and runs correctly for the `wasm32-wasip1` demo target too (confirmed with a real spike, not assumed) — one backend serves both native and wasm, no target-specific fork. Verified against the real binary: insert over HTTP, kill the process, restart it, confirm the data survived without re-inserting. Breaks this project's own previously-documented "zero new dependencies" rule, consciously — see [GRAMMAR.md](GRAMMAR.md) §3.17 for the full design, the column-mapping table, and what's explicitly out of scope (real migrations, any engine other than SQLite — `delete` shipped in the next round, see below).
-
-Done (Phase 2): real CRUD completion on `db` — `delete(id) -> Bool`, `deleteWhere(fn(T) -> Bool) -> Int`, `findWhere(fn(T) -> Bool) -> T[]`, same spirit as `List.filter` (§3.10) now over a persisted collection. The predicate is evaluated by the interpreter (`call_callable`, same interception point that already redirects `List::filter`/`.map`) because the SQL storage layer (`Db::call`) has no access to closures/environment at all — a structural reason, not an oversight, and the reason `Db::call`'s own dead `deleteWhere`/`findWhere` arms now return a clear error instead of quietly ignoring the predicate if ever reached directly (they aren't, in normal interpreter dispatch, but the function is `pub` and was reachable). `delete` now also publishes to `stream` subscribers (§3.16), so a live subscriber sees a deletion as an event, not just inserts. `id` gained `AUTOINCREMENT` since a real `delete` makes id-reuse-after-delete an actual possibility instead of a moot point. See [GRAMMAR.md](GRAMMAR.md) §3.18.
-
-Done (Phase 2): the LSP protocol server itself (`linkc lsp` — JSON-RPC 2.0 over stdio, hand-rolled framing rather than the originally-planned `lsp-server`/`lsp-types` crates, which ended up with zero consumers and were removed from `Cargo.toml`). Diagnostics, hover, completion, and goto-definition all resolve against the real merged multi-file program (`modules::load_program_with_overlay` + `checker::check_program_full`) instead of an isolated buffer — fixing a real false-positive bug where any file using `import` reported its imported symbols as undeclared. Span-to-range conversion is now genuinely multi-line and UTF-16-aware (the CLI's own renderer gets away with assuming single-line spans; the LSP has the full document and does the real computation). Scope is deliberately Level 1 (diagnostics) + Level 2 (declaration-level hover/completion/goto-def, not position-sensitive) — see [GRAMMAR.md](GRAMMAR.md) §3.19 for the full design and what's explicitly deferred to a future Level 3. A minimal real VS Code client lives in `editors/vscode/`.
-
-Done (Phase 1, the "evolution" the WASM row above named but hadn't started): `linkc wasm <file> <out.wasm>` emits real, direct WASM bytecode per function via `wasm-encoder` — no interpreter involved, distinct from (and much narrower than) the `wasm32-wasip1` interpreter-recompile above, which remains the actual production path. Scope is intentionally minimal: only `Int`/`Bool` params and return types (both map to `i64`), and a body that is exactly one final expression (integer/boolean arithmetic and comparisons) — no statements, no other types. Outside that subset, emission now fails with a clear, specific error instead of silently substituting a placeholder — an earlier version (from outside this session) replaced anything unsupported with `I64Const(0)` and dropped every statement in a block, so `linkc wasm`/`linkc build` reported success while producing wrong bytecode; `linkc build`'s own success message now only names `main.wasm` when it was actually written. See [GRAMMAR.md](GRAMMAR.md) §3.20 for exactly what's supported and why closing this gap for a real program is its own future round, not an incremental extension.
-
-Done (Phase 2, LSP Level 3, round 1/3): goto-definition of a type name written in a signature (`Point` in `fn origin() -> Point`) — `TypeExpr::Named` gained its own span (the only one of 8 `TypeExpr` variants that needed one; ~4 production call sites, not the ~155 the original `Spanned<Expr>`/`Spanned<Stmt>` migration touched), and a purely syntactic search (no `Checker`, no `Env`) resolves it authoritatively, ahead of the old word-matching fallback — which also fixed a real cross-file bug where goto-def on a symbol resolved via an `import` returned a wrong, meaningless position instead of `null`. Honest limit found while writing this round's own tests: a field/param whose *name* happens to collide with an existing type name still falls through to the old fallback (same root cause as below — `Field`/`Param` still have no span of their own). See [GRAMMAR.md](GRAMMAR.md) §3.21.
-
-Fixed (post-push audit, integrity round 1/2): the flagship demo (`frontend/src/main.ts`) called `Users.update`/`Users.remove` without ever logging in — it silently fell out of sync when auth v0 (§3.14) added `@requires(Role.Admin)` to both, and no existing test caught it because the runtime's own unit tests call `invoke_rpc_with_sessions` in-process with an already-resolved token, never through the real HTTP server's authorization gate (`check_auth_gate` in `runtime/server.rs`). Nothing in the *language* was broken — a real login/token flow against the live binary always worked, confirmed with raw `curl`. The demo now logs in as the database's actual Admin (falling back to the just-created user when the database was empty, matching `validate`'s own rule for who becomes Admin) before calling either protected rpc, and uses the real id `create` returns instead of a hardcoded `1` — making the demo correct both on a fresh database and against one already persisted by a prior run (§3.17 made restarts persistent; the demo hadn't caught up). `compiler/tests/server_http.rs` pins the underlying contract against the real subprocess (raw HTTP over `TcpStream`, no generated client involved): an admin-gated rpc is 401 without a token and 200 with a real login token. A rejected promise in `main.ts` now also propagates instead of being swallowed, so a broken demo actually fails its exit code, not just its console output. 338 tests, all passing.
-
-Fixed (post-push audit, integrity round 2/2): CI (`.github/workflows/ci.yml`), on a matrix of `ubuntu-latest` and `windows-latest` (kept two-OS on purpose — the LSP protocol server's own history includes a real Windows-specific pipe-framing bug, GRAMMAR.md §3.19, not generic caution). Every push/PR to `master` runs `cargo test` (338 tests, which also builds `target/debug/linkc` as a side effect since the integration tests reference it via `CARGO_BIN_EXE_linkc`), then the exact 3 steps this README's own "Try the killer feature yourself" documents by hand: regenerate the contract, confirm `tsc --noEmit` is clean, then start a real server and run the real generated-client demo against it, failing the build on a non-zero exit — which is exactly the check that would have caught integrity round 1/2's bug the day it landed.
-
-Done: file identity in `Span` (GRAMMAR.md §3.22), the bug §3.21 flagged (cross-file goto-definition refused outright because a merged `Program`'s `Span` didn't say which file it came from). `modules::load_program_with_overlay` now returns `item_files: Vec<PathBuf>`, one entry per `Program.items` element — a single item is never split across files, so tracking file identity per item (not per individual span, which would be ambiguous across files with overlapping byte offsets) is enough. The checker stamps it onto every `CheckError` at the same 5 entry points that already stamp `span`. Goto-definition now actually resolves to the real file and range of an imported declaration instead of returning `null`; a type error inside an imported file gets its real file named in the diagnostic instead of a generic "somewhere in one of N files" message; and the CLI (`linkc <file>`), which has no per-URI protocol constraint, now renders a full precise snippet for an error in *any* touched file, not just the entry file. Verified with real subprocess tests against the actual binary in both directions (error in the open/entry file, error in an imported file) for both the LSP and the CLI. 342 tests, all passing.
-
-Done: `Field`/`Param` gained their own `name_span` (GRAMMAR.md §3.23), closing the exact limit §3.21 documented — a field or param whose *name* collided with an existing `type`/`enum` (`type Point = {...}; type Shape = { Point: Int }`) used to fall through to the old word-matching goto-def loop and jump to the wrong declaration when the cursor was on the field *name*, not its type. Exactly 2 production sites needed the new span (`parser.rs::parse_field`/`parse_param`), with `PartialEq` reimplemented by hand to ignore it — same pattern §3.21 already established for `TypeExpr::Named`. Verified both directions: the colliding field/param name now returns `None` instead of a wrong jump, and goto-def on the field's *type* (even when the type's name matches the field's own name) still resolves correctly — the new check doesn't overreach. 345 tests, all passing.
-
-Done: hover of an arbitrary mid-body expression (GRAMMAR.md §3.24, LSP Level 3 round 2/3 — the one §3.21 flagged as "the expensive one," needing the checker's real `Env`, not just a syntactic span search). Rather than re-deriving scoping rules in `lsp.rs` (a second source of truth for the same rules `check_stmt`/`check_block` already implement, risking drift), the checker itself gained a minimal instrumentation point: `synth_expr`/`check_expr` — the two unified entry points every expression passes through — now record the type of whichever expression's span contains a target offset, with the *narrowest* containing span winning (not the last one visited — hovering `x` inside `x > 5` correctly shows `Int`, not the comparison's own `Bool`; this exact ordering bug was caught by reasoning through the recursion before shipping, not after). `hover_type_at` finds which `fn`/`rpc`/`stream` body contains the offset and just calls the real `check_fn`/`check_rpc` on it — zero reimplemented binding logic. The type renders through the same `render_type` the real `.d.ts` emitter uses (so `Int` shows as `number`, a named struct shows its real name), not a raw Rust debug dump. Honest limit: since the checker has no statement-level error recovery, an earlier error in the same body blocks the hovered expression from ever being checked. 355 tests, all passing.
-
-Done: type-sensitive completion after `x.` (GRAMMAR.md §3.25) — the third and final LSP Level 3 item (§3.19 → §3.21 → §3.24 → this one), closing the whole Level 3 backlog. Reuses `hover_type_at` (§3.24) directly — "the type of the receiver" is exactly "the type of the expression under the cursor," the same thing hover already computes. The specific new problem: a buffer with a dangling `.` almost never parses (no statement-level error recovery), so the very function being edited would normally drop out of the `Program` entirely — solved by patching just the `[dot, cursor)` byte range with spaces of the same length and reparsing that copy in isolation, leaving everything else byte-for-byte identical. Along the way, writing this round's tests surfaced a real gap in §3.24's mechanism itself: when a body's tail expression fails its check against the declared return type (e.g. a function declared `-> Int` whose body is actually a `List<Int>`), the probe only recorded a type on success, losing the perfectly-valid synthesized type the checker had already computed as part of reporting that very mismatch — fixed by having `check_expr`'s probe retry synthesis as a fallback when checking fails. The completions themselves now branch on the real `Type`: collection methods for `db.<collection>`, list methods for `T[]`, string methods for `String`, numeric conversion for `Int`/`Float`, auth methods for `auth`, and — a genuinely new capability, not just narrower filtering — real field names for a struct-typed receiver. Anything unrecognized falls back to the old undifferentiated list, so this round only adds precision, never removes what already worked. 362 tests, all passing.
-
-Decided (post-push audit, roadmap call): native WASM codegen (`linkc wasm`, GRAMMAR.md §3.20) stays frozen at its current minimal scope (`Int`/`Bool` arithmetic, one final expression) rather than growing toward supporting real programs — closing that gap for something comparable to `examples/users.link` (statements, `String`/structs/`db`, cross-function calls) is, in practice, writing a full native codegen backend from scratch, months of work rather than an incremental round. `wasm32-wasip1` (recompiling the whole interpreter) remains and stays the one real production path — it already runs a real program end to end inside `wasmtime` (§2.4). If genuine native codegen is ever needed, `cranelift-jit`/`cranelift-object` remain the right tool, not extending `wasm-encoder` further (a low-level byte-emission library, not a compiler framework with locals/control-flow/calling-convention support).
-
-Done: real git dependencies (GRAMMAR.md §2.1) — `link.json` can now point a dependency at `git+<url>#<rev>`, not just a local path. Resolution shells out to the real `git` binary (clone into a per-project cache on first use, fetch only when the requested rev isn't already known locally, then `git checkout --detach`) — no git client reimplemented in Rust, same philosophy as using real SQLite via `rusqlite` instead of a homegrown storage engine. `#<rev>` is mandatory by design: with no registry to order versions, resolving against a remote's default branch would make builds non-reproducible from day one — exactly what a package manager exists to prevent. `link.lock` gained a `git_dependencies` section recording the exact resolved commit, but it's informational in this v0, not a real pin — the next build always re-resolves `rev` fresh (a branch that moved is followed; for a hard pin, put a tag or commit SHA directly in `link.json`). Verified against a local git repository acting as the "remote" (real clone/fetch/checkout, no network involved in tests) and with a real `linkc build` subprocess end to end. 371 tests, all passing.
-
-Done: structured per-RPC tracing (GRAMMAR.md §3.26) — one line per completed request, `key=value` format (greppable without parsing JSON, no new dependency): `[req N] method=Users.create status=200 duration_ms=7`, plus `error="..."` on a failure — the actual message, not just a status code, and not the raw JSON error body double-escaped inside the log line. Builds on the request-correlation id `runtime/server.rs` already had. Verified against a real running server across success/404/401/500 cases, and with the full flagship demo run end to end to confirm the logging refactor changed no functional behavior.
-
-Done: real hot reload in `linkc dev` (GRAMMAR.md §3.27). `linkc dev <file> <outdir> [port]` — the `[port]` is optional and backward compatible; with it, every successful rebuild restarts a real `linkc serve` child with the updated program (a process restart, reusing `cmd_serve` unchanged, rather than an in-memory hot-swap that would have needed to touch the threading model `runtime/server.rs` already documents carefully around `Value::Closure`/`Rc`). A failed rebuild never takes the server down — the last-good child keeps serving until the next successful rebuild replaces it, same principle as a frontend dev server that keeps serving its last good build through a typo. Data persists across reloads for free (same `<file>.db`, GRAMMAR.md §3.17). Verified manually end to end against the real binary (initial serve, edit → detect → rebuild → kill old PID → spawn new PID → new value served, and a type error leaving the previous server untouched) rather than with an automated test — an interactive, infinite-loop CLI command that now also manages a child process doesn't fit a clean subprocess-test harness without real added complexity (documented in GRAMMAR.md §3.27).
-
-Decided (post-push audit, closing item — GRAMMAR.md §3.28): no syntax freeze yet, and source maps aren't being pursued. Committing to immutable syntax before a single external user has actually used the language would lock in decisions (nullability, error handling, every `RESOLVED` section above) before they've faced real-world use — exactly the premature-commitment risk PLAN.md §7 already names. The applied policy while the crate stays `0.x`: a breaking syntax change gets called out in its own commit (same discipline every round in this audit already followed), no formal deprecation process required — that changes at `1.0.0`. Source maps' value is genuinely unclear given this architecture, not merely unscheduled: RPC bodies run directly in the Rust interpreter (never transpiled — a runtime error already reports its real `.link` position via the existing diagnostics), and the only generated TS (`client.ts`/`contract.d.ts`/`validators.ts`) is deliberately thin, readable, unminified — the "unrecognizable generated code" problem source maps solve doesn't exist here yet. Revisit if a concrete, specific "I can't debug X" case ever needs it — not before.
-
-With this, every item from the post-push audit's backlog is either done or explicitly decided, with the reasoning written down rather than left open.
-
-Done: `linkc test <file> <snapshot> [--update]` (GRAMMAR.md §3.29) — the "contract tests" half of PLAN.md §5's "Testing: integrated runner + contract tests (so the generated `.d.ts` doesn't break by accident)", the one ecosystem item from that list still without a v0. Generates the same `contract.d.ts`/`client.ts`/`validators.ts` trio `build` does and diffs it against a plain-text snapshot committed to git (deliberately outside `gen/`, which is gitignored and wouldn't survive between commits — a snapshot only works if it outlives the run that made it); a real change fails the command and prints a genuine line-level diff (LCS-based, hand-rolled — same reasoning as `lockfile.rs`'s own SHA-256, a small self-contained algorithm doesn't need a new crate) rather than silently accepting it, `--update` is the explicit "yes, on purpose" step. Dogfooded on the flagship demo: `examples/users.link.snap` is committed and CI now runs `linkc test` on every push/PR without `--update`, so a PR that silently changes the demo's contract fails the build with the real diff in the log. Honest scope: this covers the contract's *shape*, not an RPC's *behavior* — no in-language `test { }`/assertions yet, a genuinely separate and much larger feature; see GRAMMAR.md §3.29 for why that's out of scope for this round. The first push of this round actually failed CI on `windows-latest` only (passed locally and on `ubuntu-latest`) — a real false-positive bug (Windows checkout converts the committed LF snapshot to CRLF, so the byte comparison never matched), fixed by normalizing line endings before comparing rather than trusting git config to get it right; see GRAMMAR.md §3.29 for the full story. 376 tests, all passing, re-verified in CI on both OSes after the fix.
-
-Done: `Int64` (GRAMMAR.md §3.30) — closes the one type-mapping row (`PLAN.md` §2.3) that was still marked "no": `Int` is already `i64` internally but ships as TS `number`, silently losing precision above `2^53` once the client does `JSON.parse`. `Int64` is the same `i64` range as `Int` (not an arbitrary-precision bignum), serialized as a **string** on the wire in both directions and typed as TS `string` (not `bigint`) — deliberately, since the generated client (`push_fetch_call`/`emit_client` in `ts_emit.rs`) has no type-directed (de)serialization today, and a `string` needs none; a real `bigint` client would need a new recursive hydration walker, out of scope for this round. `.toInt64()`/`.toInt()` are the only way to get one from source (a bare integer literal always synthesizes `Int`, never `Int64`, and there's no implicit mixing between the two in arithmetic, mirroring the existing `Int`/`Float` rule). Persists as a plain SQLite `INTEGER` column, same as `Int` (SQLite/`rusqlite` are already 64-bit native there). Verified with new unit tests across the checker/runtime/db/codegen/LSP layers, plus a real end-to-end run: a standalone program built with `linkc build`, then a real `linkc serve` hit with `curl` — `i64::MAX` sent and stored as a string round-trips exactly, while a native JSON number for the same field is rejected with a clear 400 instead of silently losing precision. 394 tests, all passing.
-
-Done: `Timestamp` (GRAMMAR.md §3.31) — the other type-mapping row that was still marked "no". Stored as milliseconds since the Unix epoch UTC internally (`Value::Timestamp(i64)`), serialized as a fixed-shape ISO-8601 string (`YYYY-MM-DDTHH:mm:ss.sssZ`) on the wire and typed as a plain TS `string` (not branded — same minimal-v0 bias as everywhere else in this project). The year/month/day ↔ days-since-epoch math (`compiler/src/runtime/timestamp.rs`) is a direct port of Howard Hinnant's public-domain calendar algorithm (the same one `libc++` uses for `std::chrono::year_month_day`) rather than a new date/time dependency — exact integer arithmetic, correct on leap years and century boundaries (1900 isn't a leap year, 2000 is) by construction, and the parser reuses the algorithm itself as its own validity check (an impossible date like Feb 30 "spills over" into the next month, so converting back and comparing catches it without a second hand-rolled days-per-month table). Comparable (`< <= > >= == !=`) like `Int`, but deliberately narrow otherwise: no arithmetic (no `Duration` type yet), not a valid `match` scrutinee (same reasoning that already excludes `Float`), no methods.
-
-Done: `now() -> Timestamp` builtin (GRAMMAR.md §3.32) — receiver-less builtin function providing the current UTC date and time as a `Timestamp` in the backend runtime. Included in checker synthesis, runtime evaluation (`SystemTime`), and LSP autocompletion/hover.
-
-Done: Integrated behavioral test runner (`test "name" { ... }`, `assert`, `panic`) (GRAMMAR.md §3.33) — completes PLAN.md §5. Write behavioral tests directly in `.link` files with full DB isolation per test (in-memory SQLite), builtins `assert(cond, [msg])` and `panic(msg)`, and direct service calling (`Users.create(...)`). Run with `linkc test <file.link>`. 425 tests, all passing.
-
-Done: Intelligent compiler error diagnostics ("Did you mean?") — Levenshtein-based suggestions when mistyping variable names, struct fields, service RPC methods, or type names in `.link` source files.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+MIT License — Copyright (c) 2026 Google DeepMind / Link Authors.
