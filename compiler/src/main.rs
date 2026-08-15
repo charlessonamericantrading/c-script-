@@ -86,6 +86,7 @@ fn main() -> ExitCode {
         Some("fmt") => cmd_fmt(&args[2..]),
         Some("lint") => cmd_lint(&args[2..]),
         Some("doc") => cmd_doc(&args[2..]),
+        Some("docker") => cmd_docker(&args[2..]),
         Some(path) => cmd_check(path), // `linkc <archivo.link>` -- solo lex+parse+check
         None => {
             eprintln!("uso: linkc <subcomando> [opciones]");
@@ -97,6 +98,7 @@ fn main() -> ExitCode {
             eprintln!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)");
             eprintln!("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)");
             eprintln!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)");
+            eprintln!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)");
             eprintln!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)");
             eprintln!("     linkc serve <archivo.link> <puerto>    (inicia servidor HTTP con SQLite embebido)");
             eprintln!("     linkc lsp                              (inicia el servidor Language Server Protocol)");
@@ -202,6 +204,27 @@ fn cmd_doc(args: &[String]) -> ExitCode {
     }
     println!("documentación HTML generada en {}", out_path.display());
     ExitCode::SUCCESS
+}
+
+fn cmd_docker(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("uso: linkc docker <archivo.link> [outdir]");
+        return ExitCode::FAILURE;
+    };
+    let out_dir = args.get(1).map(Path::new).unwrap_or_else(|| Path::new("."));
+    match linkc::docker::generate_docker_files(path, out_dir) {
+        Ok(files) => {
+            println!("archivos de contenedor generados exitosamente en {}:", out_dir.display());
+            for f in files {
+                println!("  - {}", f.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error al generar configuración Docker: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn cmd_wasm(args: &[String]) -> ExitCode {
@@ -404,6 +427,11 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
                 "advertencia: no se generó {wasm_path} -- el codegen wasm nativo (solo funciones/escalares) no soporta este programa: {e}"
             );
         }
+    }
+
+    if let Ok(pg_ddl) = linkc::runtime::postgres::generate_postgres_ddl(&program) {
+        let pg_sql_path = format!("{outdir}/schema.postgres.sql");
+        let _ = fs::write(&pg_sql_path, pg_ddl);
     }
 
     let root = Path::new(path).parent().unwrap_or_else(|| Path::new("."));

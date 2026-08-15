@@ -4,6 +4,7 @@
 // (PLAN.md §4) — esto solo alcanza para que la demo E2E responda de verdad.
 
 pub mod db;
+pub mod postgres;
 pub mod server;
 pub mod session;
 mod timestamp;
