@@ -228,6 +228,13 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
             return BuildResult { ok: false, touched };
         }
     };
+    let hooks = match codegen::ts_emit::emit_hooks(&program) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error al emitir hooks.ts: {e}");
+            return BuildResult { ok: false, touched };
+        }
+    };
 
     if let Err(e) = fs::create_dir_all(outdir) {
         eprintln!("no se pudo crear {outdir}: {e}");
@@ -236,6 +243,7 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
     let contract_path = format!("{outdir}/contract.d.ts");
     let client_path = format!("{outdir}/client.ts");
     let validators_path = format!("{outdir}/validators.ts");
+    let hooks_path = format!("{outdir}/hooks.ts");
     if let Err(e) = fs::write(&contract_path, contract) {
         eprintln!("no se pudo escribir {contract_path}: {e}");
         return BuildResult { ok: false, touched };
@@ -248,6 +256,10 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
         eprintln!("no se pudo escribir {validators_path}: {e}");
         return BuildResult { ok: false, touched };
     }
+    if let Err(e) = fs::write(&hooks_path, hooks) {
+        eprintln!("no se pudo escribir {hooks_path}: {e}");
+        return BuildResult { ok: false, touched };
+    }
 
     let wasm_path = format!("{outdir}/main.wasm");
     match codegen::wasm_emit::emit_wasm(&program) {
@@ -255,10 +267,10 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
             if let Err(e) = fs::write(&wasm_path, wasm_bytes) {
                 eprintln!("advertencia: no se pudo escribir {wasm_path}: {e}");
             }
-            println!("OK: generado {contract_path}, {client_path}, {validators_path} y {wasm_path}");
+            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path} y {wasm_path}");
         }
         Err(e) => {
-            println!("OK: generado {contract_path}, {client_path}, {validators_path}");
+            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path}");
             eprintln!(
                 "advertencia: no se generó {wasm_path} -- el codegen wasm nativo (v0, solo Int/Bool y expresión final) no soporta este programa: {e}"
             );

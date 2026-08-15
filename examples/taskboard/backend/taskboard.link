@@ -1,0 +1,129 @@
+enum Role { Admin, Member, Guest }
+enum Priority { High, Medium, Low }
+enum ColumnId { Todo, InProgress, Done }
+
+type Task = {
+  id: Int,
+  title: String,
+  description: String?,
+  priority: Priority,
+  column: ColumnId,
+  assigneeEmail: String?,
+  createdAt: Timestamp,
+}
+
+type NewTask = {
+  title: String,
+  description: String?,
+  priority: Priority,
+  column: ColumnId,
+  assigneeEmail: String?,
+}
+
+type BoardStats = {
+  total: Int,
+  todoCount: Int,
+  inProgressCount: Int,
+  doneCount: Int,
+}
+
+db {
+  tasks: Task[],
+}
+
+service Tasks {
+  rpc list() -> Task[] {
+    db.tasks.all()
+  }
+
+  rpc getById(id: Int) -> Task? {
+    db.tasks.find(id)
+  }
+
+  rpc create(input: NewTask) -> Task {
+    db.tasks.insert(Task {
+      id: 0,
+      title: input.title,
+      description: input.description,
+      priority: input.priority,
+      column: input.column,
+      assigneeEmail: input.assigneeEmail,
+      createdAt: now(),
+    })
+  }
+
+  rpc update(id: Int, patch: Patch<Task>) -> Task {
+    db.tasks.applyPatch(id, patch)
+  }
+
+  rpc remove(id: Int) -> Bool {
+    db.tasks.delete(id)
+  }
+
+  rpc listByColumn(col: ColumnId) -> Task[] {
+    db.tasks.all().filter(|t: Task| { t.column == col })
+  }
+
+  rpc stats() -> BoardStats {
+    let all = db.tasks.all();
+    let todos = all.filter(|t: Task| { t.column == ColumnId.Todo {} });
+    let inProgress = all.filter(|t: Task| { t.column == ColumnId.InProgress {} });
+    let done = all.filter(|t: Task| { t.column == ColumnId.Done {} });
+
+    BoardStats {
+      total: all.length(),
+      todoCount: todos.length(),
+      inProgressCount: inProgress.length(),
+      doneCount: done.length(),
+    }
+  }
+
+  stream watchTasks() -> Task {
+    while true {
+      db.tasks.subscribe()
+    }
+  }
+}
+
+test "crear tarea y consultar tablero" {
+  let created = Tasks.create(NewTask {
+    title: "Implementar autenticación",
+    description: "Soporte de tokens Bearer",
+    priority: Priority.High {},
+    column: ColumnId.Todo {},
+    assigneeEmail: "dev@example.com",
+  });
+
+  assert(created.id > 0, "debe generar id incremental");
+  assert(created.title == "Implementar autenticación");
+  assert(created.column == ColumnId.Todo {});
+
+  let todoList = Tasks.listByColumn(ColumnId.Todo {});
+  assert(todoList.length() == 1);
+  assert(todoList[0].id == created.id);
+}
+
+test "estadisticas del tablero calculan totales correctamente" {
+  assert(Tasks.stats().total == 0);
+
+  Tasks.create(NewTask {
+    title: "Tarea 1",
+    description: null,
+    priority: Priority.Low {},
+    column: ColumnId.Todo {},
+    assigneeEmail: null,
+  });
+  Tasks.create(NewTask {
+    title: "Tarea 2",
+    description: null,
+    priority: Priority.Medium {},
+    column: ColumnId.Done {},
+    assigneeEmail: null,
+  });
+
+  let stats = Tasks.stats();
+  assert(stats.total == 2);
+  assert(stats.todoCount == 1);
+  assert(stats.doneCount == 1);
+  assert(stats.inProgressCount == 0);
+}

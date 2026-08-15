@@ -310,6 +310,232 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     Ok(out)
 }
 
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+pub fn emit_hooks(program: &Program) -> Result<String, String> {
+    let (checker, errors) = Checker::build_symbols(program);
+    if let Some(e) = errors.into_iter().next() {
+        return Err(e.to_string());
+    }
+
+    let mut imported_types = std::collections::BTreeSet::new();
+    let mut services = Vec::new();
+
+    for item in &program.items {
+        let Item::Service(service) = item else { continue };
+        let mut members = Vec::new();
+        for m in &service.members {
+            let (rpc, is_stream) = match m {
+                Member::Rpc(r) => (r, false),
+                Member::Stream(r) => (r, true),
+            };
+            let mut param_tys = Vec::new();
+            for p in &rpc.params {
+                let ty = checker.resolve_type(&p.ty).map_err(|e| e.to_string())?;
+                collect_type_names(&ty, &mut imported_types);
+                param_tys.push(ty);
+            }
+            let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
+            collect_type_names(&ret_ty, &mut imported_types);
+            members.push((rpc, is_stream, param_tys, ret_ty));
+        }
+        imported_types.insert(format!("{}Client", service.name));
+        services.push((service, members));
+    }
+
+    let mut out = String::new();
+    out.push_str("// Generado automáticamente por linkc — no editar a mano.\n\n");
+    out.push_str("import { useState, useEffect, useCallback } from \"react\";\n");
+    if !imported_types.is_empty() {
+        out.push_str(&format!(
+            "import type {{ {} }} from \"./contract\";\n\n",
+            imported_types.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    out.push_str("export interface QueryState<T> {\n");
+    out.push_str("  data: T | null;\n");
+    out.push_str("  loading: boolean;\n");
+    out.push_str("  error: Error | null;\n");
+    out.push_str("  refetch: () => Promise<T | null>;\n");
+    out.push_str("}\n\n");
+
+    out.push_str("export interface MutationState<T> {\n");
+    out.push_str("  data: T | null;\n");
+    out.push_str("  loading: boolean;\n");
+    out.push_str("  error: Error | null;\n");
+    out.push_str("  reset: () => void;\n");
+    out.push_str("}\n\n");
+
+    out.push_str("export interface SubscriptionState<T> {\n");
+    out.push_str("  data: T[];\n");
+    out.push_str("  latest: T | null;\n");
+    out.push_str("  isConnected: boolean;\n");
+    out.push_str("  error: Error | null;\n");
+    out.push_str("}\n\n");
+
+    for (service, members) in services {
+        for (rpc, is_stream, param_tys, ret_ty) in members {
+            let cap_rpc = capitalize(&rpc.name);
+            let ret_str = render_type(&ret_ty);
+            let params_typed: Vec<String> = rpc
+                .params
+                .iter()
+                .zip(&param_tys)
+                .map(|(p, ty)| {
+                    format!(
+                        "{}{}: {}",
+                        p.name,
+                        if p.default.is_some() { "?" } else { "" },
+                        render_type(ty)
+                    )
+                })
+                .collect();
+            let param_names: Vec<&str> = rpc.params.iter().map(|p| p.name.as_str()).collect();
+
+            if is_stream {
+                let params_sig = if params_typed.is_empty() {
+                    format!("client: {}Client", service.name)
+                } else {
+                    format!("client: {}Client, {}", service.name, params_typed.join(", "))
+                };
+                let deps = if param_names.is_empty() {
+                    "client".to_string()
+                } else {
+                    format!("client, {}", param_names.join(", "))
+                };
+
+                out.push_str(&format!(
+                    "export function use{service}{cap_rpc}({params_sig}): SubscriptionState<{ret_str}> {{\n",
+                    service = service.name
+                ));
+                out.push_str(&format!("  const [data, setData] = useState<{}[]>([]);\n", ret_str));
+                out.push_str(&format!("  const [latest, setLatest] = useState<{} | null>(null);\n", ret_str));
+                out.push_str("  const [isConnected, setIsConnected] = useState(false);\n");
+                out.push_str("  const [error, setError] = useState<Error | null>(null);\n\n");
+                out.push_str("  useEffect(() => {\n");
+                out.push_str("    let cancelled = false;\n");
+                out.push_str("    async function run() {\n");
+                out.push_str("      try {\n");
+                out.push_str("        setIsConnected(true);\n");
+                out.push_str("        setError(null);\n");
+                out.push_str(&format!("        for await (const item of client.{}({})) {{\n", rpc.name, param_names.join(", ")));
+                out.push_str("          if (cancelled) break;\n");
+                out.push_str("          setLatest(item);\n");
+                out.push_str("          setData((prev) => [...prev, item]);\n");
+                out.push_str("        }\n");
+                out.push_str("      } catch (err) {\n");
+                out.push_str("        if (!cancelled) setError(err instanceof Error ? err : new Error(String(err)));\n");
+                out.push_str("      } finally {\n");
+                out.push_str("        if (!cancelled) setIsConnected(false);\n");
+                out.push_str("      }\n");
+                out.push_str("    }\n");
+                out.push_str("    run();\n");
+                out.push_str("    return () => { cancelled = true; };\n");
+                out.push_str(&format!("  }}, [{}]);\n\n", deps));
+                out.push_str("  return { data, latest, isConnected, error };\n");
+                out.push_str("}\n\n");
+            } else {
+                let is_query = rpc.name.starts_with("get")
+                    || rpc.name.starts_with("list")
+                    || rpc.name.starts_with("find")
+                    || rpc.name.starts_with("search")
+                    || rpc.name.starts_with("read")
+                    || rpc.name.starts_with("fetch")
+                    || rpc.params.is_empty();
+
+                if is_query {
+                    let params_sig = if params_typed.is_empty() {
+                        format!("client: {}Client, options?: {{ enabled?: boolean }}", service.name)
+                    } else {
+                        format!("client: {}Client, {}, options?: {{ enabled?: boolean }}", service.name, params_typed.join(", "))
+                    };
+                    let deps = if param_names.is_empty() {
+                        "client".to_string()
+                    } else {
+                        format!("client, {}", param_names.join(", "))
+                    };
+
+                    out.push_str(&format!(
+                        "export function use{service}{cap_rpc}Query({params_sig}): QueryState<{ret_str}> {{\n",
+                        service = service.name
+                    ));
+                    out.push_str("  const enabled = options?.enabled ?? true;\n");
+                    out.push_str(&format!("  const [data, setData] = useState<{} | null>(null);\n", ret_str));
+                    out.push_str("  const [loading, setLoading] = useState(enabled);\n");
+                    out.push_str("  const [error, setError] = useState<Error | null>(null);\n\n");
+                    out.push_str(&format!("  const refetch = useCallback(async (): Promise<{} | null> => {{\n", ret_str));
+                    out.push_str("    setLoading(true);\n");
+                    out.push_str("    setError(null);\n");
+                    out.push_str("    try {\n");
+                    out.push_str(&format!("      const res = await client.{}({});\n", rpc.name, param_names.join(", ")));
+                    out.push_str("      setData(res);\n");
+                    out.push_str("      return res;\n");
+                    out.push_str("    } catch (err) {\n");
+                    out.push_str("      const e = err instanceof Error ? err : new Error(String(err));\n");
+                    out.push_str("      setError(e);\n");
+                    out.push_str("      return null;\n");
+                    out.push_str("    } finally {\n");
+                    out.push_str("      setLoading(false);\n");
+                    out.push_str("    }\n");
+                    out.push_str(&format!("  }}, [{}]);\n\n", deps));
+                    out.push_str("  useEffect(() => {\n");
+                    out.push_str("    if (enabled) {\n");
+                    out.push_str("      refetch();\n");
+                    out.push_str("    }\n");
+                    out.push_str("  }, [enabled, refetch]);\n\n");
+                    out.push_str("  return { data, loading, error, refetch };\n");
+                    out.push_str("}\n\n");
+                }
+
+                // Mutation hook
+                out.push_str(&format!(
+                    "export function use{service}{cap_rpc}Mutation(client: {service}Client): MutationState<{ret_str}> & {{\n  mutate: ({params}) => Promise<{ret_str}>;\n}} {{\n",
+                    service = service.name,
+                    params = params_typed.join(", ")
+                ));
+                out.push_str(&format!("  const [data, setData] = useState<{} | null>(null);\n", ret_str));
+                out.push_str("  const [loading, setLoading] = useState(false);\n");
+                out.push_str("  const [error, setError] = useState<Error | null>(null);\n\n");
+                out.push_str(&format!(
+                    "  const mutate = useCallback(async ({}): Promise<{}> => {{\n",
+                    params_typed.join(", "),
+                    ret_str
+                ));
+                out.push_str("    setLoading(true);\n");
+                out.push_str("    setError(null);\n");
+                out.push_str("    try {\n");
+                out.push_str(&format!("      const res = await client.{}({});\n", rpc.name, param_names.join(", ")));
+                out.push_str("      setData(res);\n");
+                out.push_str("      return res;\n");
+                out.push_str("    } catch (err) {\n");
+                out.push_str("      const e = err instanceof Error ? err : new Error(String(err));\n");
+                out.push_str("      setError(e);\n");
+                out.push_str("      throw e;\n");
+                out.push_str("    } finally {\n");
+                out.push_str("      setLoading(false);\n");
+                out.push_str("    }\n");
+                out.push_str("  }, [client]);\n\n");
+                out.push_str("  const reset = useCallback(() => {\n");
+                out.push_str("    setData(null);\n");
+                out.push_str("    setLoading(false);\n");
+                out.push_str("    setError(null);\n");
+                out.push_str("  }, []);\n\n");
+                out.push_str("  return { mutate, data, loading, error, reset };\n");
+                out.push_str("}\n\n");
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// El `fetch()` + chequeo de status es idéntico para un rpc normal y para
 /// un stream (ambos mandan los mismos args por POST+JSON body) -- lo único
 /// que difiere entre los dos es qué se hace DESPUÉS con `res` (un solo
@@ -918,5 +1144,23 @@ mod tests {
         let auth_header = "...(this.token ? { Authorization: `Bearer ${this.token}` } : {})";
         let count = client.matches(auth_header).count();
         assert_eq!(count, 2, "esperaba el header condicional en el rpc normal Y en el stream: {client}");
+    }
+
+    #[test]
+    fn emit_hooks_generates_queries_mutations_and_subscriptions() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            service Users {
+                rpc list() -> User[] { [] }
+                rpc create(name: String) -> User { User { id: 1, name: name } }
+                stream watch() -> User { [] }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(hooks.contains("export function useUsersListQuery"), "{hooks}");
+        assert!(hooks.contains("export function useUsersCreateMutation"), "{hooks}");
+        assert!(hooks.contains("export function useUsersWatch("), "{hooks}");
+        assert!(hooks.contains("for await (const item of client.watch())"), "{hooks}");
     }
 }

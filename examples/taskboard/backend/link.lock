@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "entries": {
+    "taskboard.link": {
+      "path": "taskboard.link",
+      "hash": "1585aa01c6df9784fb8b681272cbf7f07c4d6fb5540f4c57d321cc45a1935335"
+    }
+  },
+  "git_dependencies": {}
+}
