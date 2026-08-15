@@ -30,6 +30,12 @@
         "path": "./syntaxes/c-script.tmLanguage.json"
       }
     ],
+    "snippets": [
+      {
+        "language": "c-script",
+        "path": "./snippets/link.json"
+      }
+    ],
     "commands": [
       {
         "command": "c-script.runTests",

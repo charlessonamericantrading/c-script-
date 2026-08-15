@@ -268,11 +268,22 @@ fn cmd_lsp() -> ExitCode {
 
 
 fn cmd_new(args: &[String]) -> ExitCode {
-    let Some(name) = args.first() else {
-        eprintln!("uso: linkc new <nombre>");
+    let Some(name) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprintln!("uso: linkc new <nombre> [--template nextjs|vite|minimal]");
         return ExitCode::FAILURE;
     };
-    scaffold::new_project(name)
+    let mut template = scaffold::Template::Minimal;
+    if let Some(pos) = args.iter().position(|a| a == "--template") {
+        if let Some(t_str) = args.get(pos + 1) {
+            if let Some(t) = scaffold::Template::parse(t_str) {
+                template = t;
+            } else {
+                eprintln!("plantilla desconocida '{t_str}'. Opciones válidas: nextjs, vite, minimal");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    scaffold::new_project_with_template(name, template)
 }
 
 fn load_and_check(path: &str) -> Result<Program, ExitCode> {

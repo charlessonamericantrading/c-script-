@@ -1,0 +1,90 @@
+{
+  "Link Service": {
+    "prefix": "service",
+    "body": [
+      "service ${1:ServiceName} {",
+      "    rpc ${2:get}(id: Int) -> ${3:Type}? {",
+      "        ${0:null}",
+      "    }",
+      "}"
+    ],
+    "description": "Declara un servicio RPC en Link"
+  },
+  "Link RPC": {
+    "prefix": "rpc",
+    "body": [
+      "rpc ${1:methodName}(${2:param}: ${3:Type}) -> ${4:ReturnType} {",
+      "    ${0}",
+      "}"
+    ],
+    "description": "Declara un método RPC"
+  },
+  "Link Authenticated RPC": {
+    "prefix": "rpc-auth",
+    "body": [
+      "@authenticated",
+      "rpc ${1:methodName}(${2:param}: ${3:Type}) -> ${4:ReturnType} {",
+      "    ${0}",
+      "}"
+    ],
+    "description": "Declara un método RPC autenticado"
+  },
+  "Link Requires Role RPC": {
+    "prefix": "rpc-requires",
+    "body": [
+      "@requires(${1:Role}.${2:Admin})",
+      "rpc ${1:methodName}(${2:param}: ${3:Type}) -> ${4:ReturnType} {",
+      "    ${0}",
+      "}"
+    ],
+    "description": "Declara un método RPC con control de acceso RBAC por rol"
+  },
+  "Link Stream": {
+    "prefix": "stream",
+    "body": [
+      "stream ${1:feed}() -> ${2:Type}[] {",
+      "    db.${3:collection}.all()",
+      "}"
+    ],
+    "description": "Declara un endpoint de stream en tiempo real (SSE)"
+  },
+  "Link Type Struct": {
+    "prefix": "type",
+    "body": [
+      "type ${1:TypeName} = {",
+      "    id: Int,",
+      "    ${2:name}: ${3:String},",
+      "}"
+    ],
+    "description": "Declara un struct o tipo de datos en Link"
+  },
+  "Link Enum": {
+    "prefix": "enum",
+    "body": [
+      "enum ${1:Role} {",
+      "    ${2:Admin},",
+      "    ${3:Member},",
+      "}"
+    ],
+    "description": "Declara un enum en Link"
+  },
+  "Link Database": {
+    "prefix": "db",
+    "body": [
+      "db {",
+      "    ${1:users}: ${2:User}[],",
+      "}"
+    ],
+    "description": "Declara las colecciones de base de datos tipadas en Link"
+  },
+  "Link Test": {
+    "prefix": "test",
+    "body": [
+      "test \"${1:should perform expected behavior}\" {",
+      "    let ${2:val} = ${3:123};",
+      "    assert(${4:val == 123});",
+      "}"
+    ],
+    "description": "Declara un test de comportamiento integrado"
+  }
+}

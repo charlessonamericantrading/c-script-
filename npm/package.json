@@ -1,0 +1,28 @@
+{
+  "name": "link-lang",
+  "version": "1.0.0",
+  "description": "El compilador y runtime oficial para el lenguaje Link (End-to-End Type Safety con TypeScript)",
+  "bin": {
+    "linkc": "./bin/linkc.js",
+    "link": "./bin/linkc.js"
+  },
+  "scripts": {
+    "test": "node ./bin/linkc.js --help"
+  },
+  "keywords": [
+    "link",
+    "compiler",
+    "rpc",
+    "typescript",
+    "end-to-end-types",
+    "sqlite",
+    "postgres",
+    "wasm"
+  ],
+  "author": "Google DeepMind / Link Authors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/charlessonamericantrading/c-script-.git"
+  }
+}
