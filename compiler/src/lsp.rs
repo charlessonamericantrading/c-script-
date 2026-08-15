@@ -307,7 +307,8 @@ impl LspServer {
                             "completionProvider": {
                                 "triggerCharacters": [".", ":", "@", " "]
                             },
-                            "definitionProvider": true
+                            "definitionProvider": true,
+                            "documentFormattingProvider": true
                         },
                         "serverInfo": {
                             "name": "linkc-lsp",
@@ -454,6 +455,34 @@ impl LspServer {
                     "jsonrpc": "2.0",
                     "id": id_val,
                     "result": loc
+                }))
+            }
+            "textDocument/formatting" => {
+                let id_val = id?.clone();
+                let params = req.get("params")?;
+                let uri = params.get("textDocument")?.get("uri")?.as_str()?;
+                let edits = if let Some(source) = self.documents.get(uri) {
+                    match crate::fmt::format_source(source) {
+                        Ok(formatted) => {
+                            let line_count = source.lines().count();
+                            json!([{
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": line_count + 1, "character": 0 }
+                                },
+                                "newText": formatted
+                            }])
+                        }
+                        Err(_) => json!([]),
+                    }
+                } else {
+                    json!([])
+                };
+
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id_val,
+                    "result": edits
                 }))
             }
             _ => None,

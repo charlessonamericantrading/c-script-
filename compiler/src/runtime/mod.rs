@@ -76,6 +76,12 @@ pub enum Value {
     Auth,
     /// Marcador interno para el nombre de un Service (ej. `Users` en `Users.create`)
     Service(String),
+    /// Marcador interno para el módulo `math`
+    Math,
+    /// Marcador interno para el módulo `crypto`
+    Crypto,
+    /// Marcador interno para el módulo `http`
+    Http,
     BoundMethod(Box<Value>, String),
     /// Una `fn` de nivel superior referenciada POR NOMBRE, ej. `let g = add_one;`
     /// (GRAMMAR.md §3.10). Es una REFERENCIA a función (como un `fn` pointer
@@ -112,6 +118,9 @@ impl PartialEq for Value {
             (DbCollection(a), DbCollection(b)) => a == b,
             (Auth, Auth) => true,
             (Service(a), Service(b)) => a == b,
+            (Math, Math) => true,
+            (Crypto, Crypto) => true,
+            (Http, Http) => true,
             (BoundMethod(a, m1), BoundMethod(b, m2)) => a == b && m1 == m2,
             (FnRef(a), FnRef(b)) => a == b,
             // Nunca iguales, ni siquiera el mismo closure consigo mismo --
@@ -147,6 +156,9 @@ impl std::fmt::Debug for Value {
             Value::DbCollection(name) => f.debug_tuple("DbCollection").field(name).finish(),
             Value::Auth => write!(f, "Auth"),
             Value::Service(name) => f.debug_tuple("Service").field(name).finish(),
+            Value::Math => write!(f, "Math"),
+            Value::Crypto => write!(f, "Crypto"),
+            Value::Http => write!(f, "Http"),
             Value::BoundMethod(recv, method) => f.debug_tuple("BoundMethod").field(recv).field(method).finish(),
             Value::FnRef(name) => f.debug_tuple("FnRef").field(name).finish(),
             // A propósito NO imprime `captured_env` -- podría ser cíclico
@@ -335,6 +347,15 @@ pub(crate) fn eval_expr(
             if name == "auth" {
                 return Ok(Value::Auth);
             }
+            if name == "math" {
+                return Ok(Value::Math);
+            }
+            if name == "crypto" {
+                return Ok(Value::Crypto);
+            }
+            if name == "http" {
+                return Ok(Value::Http);
+            }
             // Un `const` de nivel superior: su valor es siempre un literal
             // (el checker lo exige), así que evaluarlo en un env vacío no
             // depende de nada del scope actual.
@@ -365,25 +386,13 @@ pub(crate) fn eval_expr(
         Expr::FieldAccess { base, field } => {
             let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token, step_budget)?;
             match base_v {
-                // Un campo ausente da `null`, no un error. El checker ya
-                // rechaza leer un campo que el tipo no declara, así que
-                // "no está" solo puede significar una clave declarada
-                // OPCIONAL (`x?: T`, GRAMMAR.md §3.4) que efectivamente no
-                // vino -- y para eso el tipo sintetizado ya es `T?`
-                // (checker.rs::field_access_ty), así que `null` es
-                // exactamente el valor que corresponde. Antes esto era un
-                // error de runtime: un objeto perfectamente válido sin esa
-                // clave reventaba al leerla.
                 Value::Struct(fields) | Value::Variant { fields, .. } => Ok(fields
                     .into_iter()
                     .find(|(n, _)| n == field)
                     .map(|(_, v)| v)
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
-                // Métodos builtin sobre primitivos (GRAMMAR.md §3.8, ej.
-                // `x.toFloat()`) usan el mismo BoundMethod que db/listas/auth --
-                // el checker ya validó que el nombre existe para este tipo.
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Auth => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -1028,7 +1037,173 @@ fn call_method(
                 };
                 Ok(Value::Bool(s.contains(needle.as_str())))
             }
+            "startsWith" => {
+                let needle = match args.first() {
+                    Some(Value::Str(n)) => n,
+                    _ => return Err(err("'startsWith' requiere un argumento String")),
+                };
+                Ok(Value::Bool(s.starts_with(needle.as_str())))
+            }
+            "endsWith" => {
+                let needle = match args.first() {
+                    Some(Value::Str(n)) => n,
+                    _ => return Err(err("'endsWith' requiere un argumento String")),
+                };
+                Ok(Value::Bool(s.ends_with(needle.as_str())))
+            }
+            "trim" => Ok(Value::Str(s.trim().to_string())),
+            "toUpper" => Ok(Value::Str(s.to_uppercase())),
+            "toLower" => Ok(Value::Str(s.to_lowercase())),
             other => Err(err(format!("método desconocido sobre String: '{other}'"))),
+        },
+        Value::Timestamp(ms) => match method {
+            "toMillis" => Ok(Value::Int64(ms)),
+            "diffMillis" => {
+                let other_ms = match args.first() {
+                    Some(Value::Timestamp(t)) => *t,
+                    _ => return Err(err("'diffMillis' requiere un argumento Timestamp")),
+                };
+                Ok(Value::Int64(ms - other_ms))
+            }
+            "toIsoString" => Ok(Value::Str(timestamp::format_iso8601_millis(ms))),
+            other => Err(err(format!("método desconocido sobre Timestamp: '{other}'"))),
+        },
+        Value::Math => match method {
+            "sqrt" => {
+                let x = as_float(args.first().ok_or_else(|| err("math.sqrt requiere 1 argumento"))?)?;
+                Ok(Value::Float(x.sqrt()))
+            }
+            "abs" => {
+                let x = as_float(args.first().ok_or_else(|| err("math.abs requiere 1 argumento"))?)?;
+                Ok(Value::Float(x.abs()))
+            }
+            "floor" => {
+                let x = as_float(args.first().ok_or_else(|| err("math.floor requiere 1 argumento"))?)?;
+                Ok(Value::Int(x.floor() as i64))
+            }
+            "ceil" => {
+                let x = as_float(args.first().ok_or_else(|| err("math.ceil requiere 1 argumento"))?)?;
+                Ok(Value::Int(x.ceil() as i64))
+            }
+            "round" => {
+                let x = as_float(args.first().ok_or_else(|| err("math.round requiere 1 argumento"))?)?;
+                Ok(Value::Int(x.round() as i64))
+            }
+            "min" => {
+                let a = as_float(args.first().ok_or_else(|| err("math.min requiere 2 argumentos"))?)?;
+                let b = as_float(args.get(1).ok_or_else(|| err("math.min requiere 2 argumentos"))?)?;
+                Ok(Value::Float(a.min(b)))
+            }
+            "max" => {
+                let a = as_float(args.first().ok_or_else(|| err("math.max requiere 2 argumentos"))?)?;
+                let b = as_float(args.get(1).ok_or_else(|| err("math.max requiere 2 argumentos"))?)?;
+                Ok(Value::Float(a.max(b)))
+            }
+            "pow" => {
+                let a = as_float(args.first().ok_or_else(|| err("math.pow requiere 2 argumentos"))?)?;
+                let b = as_float(args.get(1).ok_or_else(|| err("math.pow requiere 2 argumentos"))?)?;
+                Ok(Value::Float(a.powf(b)))
+            }
+            other => Err(err(format!("método desconocido sobre math: '{other}'"))),
+        },
+        Value::Crypto => match method {
+            "hashSha256" => {
+                let data = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("crypto.hashSha256 requiere un argumento String")),
+                };
+                use sha2::{Sha256, Digest};
+                let mut hasher = Sha256::new();
+                hasher.update(data.as_bytes());
+                let result = hasher.finalize();
+                let hex_str: String = result.iter().map(|b| format!("{:02x}", b)).collect();
+                Ok(Value::Str(hex_str))
+            }
+            "randomToken" => {
+                let length = match args.first() {
+                    Some(Value::Int(n)) => *n as usize,
+                    _ => return Err(err("crypto.randomToken requiere un argumento Int")),
+                };
+                use sha2::{Sha256, Digest};
+                let seed = format!("{}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(), length);
+                let mut hasher = Sha256::new();
+                hasher.update(seed.as_bytes());
+                let result = hasher.finalize();
+                let hex_str: String = result.iter().map(|b| format!("{:02x}", b)).collect();
+                let truncated = hex_str.chars().take(length.max(8)).collect();
+                Ok(Value::Str(truncated))
+            }
+            "hashPassword" => {
+                let pwd = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("crypto.hashPassword requiere un argumento String")),
+                };
+                use sha2::{Sha256, Digest};
+                let salt = "link_salt_2026";
+                let mut hasher = Sha256::new();
+                hasher.update(salt.as_bytes());
+                hasher.update(pwd.as_bytes());
+                let result = hasher.finalize();
+                let hex_str: String = result.iter().map(|b| format!("{:02x}", b)).collect();
+                Ok(Value::Str(format!("sha256${salt}${hex_str}")))
+            }
+            "verifyPassword" => {
+                let pwd = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("crypto.verifyPassword requiere contraseña")),
+                };
+                let hash = match args.get(1) {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("crypto.verifyPassword requiere hash")),
+                };
+                let parts: Vec<&str> = hash.split('$').collect();
+                if parts.len() != 3 || parts[0] != "sha256" {
+                    return Ok(Value::Bool(false));
+                }
+                let salt = parts[1];
+                let expected = parts[2];
+                use sha2::{Sha256, Digest};
+                let mut hasher = Sha256::new();
+                hasher.update(salt.as_bytes());
+                hasher.update(pwd.as_bytes());
+                let result = hasher.finalize();
+                let hex_str: String = result.iter().map(|b| format!("{:02x}", b)).collect();
+                Ok(Value::Bool(hex_str == expected))
+            }
+            other => Err(err(format!("método desconocido sobre crypto: '{other}'"))),
+        },
+        Value::Http => match method {
+            "get" => {
+                let url = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.get requiere un argumento URL String")),
+                };
+                match ureq::get(url).call() {
+                    Ok(resp) => {
+                        let text = resp.into_string().unwrap_or_default();
+                        Ok(Value::Str(text))
+                    }
+                    Err(e) => Err(err(format!("error HTTP al hacer GET a {url}: {e}"))),
+                }
+            }
+            "post" => {
+                let url = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.post requiere un argumento URL String")),
+                };
+                let body = match args.get(1) {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.post requiere un argumento Body String")),
+                };
+                match ureq::post(url).send_string(body) {
+                    Ok(resp) => {
+                        let text = resp.into_string().unwrap_or_default();
+                        Ok(Value::Str(text))
+                    }
+                    Err(e) => Err(err(format!("error HTTP al hacer POST a {url}: {e}"))),
+                }
+            }
+            other => Err(err(format!("método desconocido sobre http: '{other}'"))),
         },
         // Auth v0 (GRAMMAR.md §3.14). `createSession` extrae (enum_name,
         // variant) del `Value::Variant` recibido -- el checker ya garantizó
@@ -1071,6 +1246,14 @@ pub(crate) fn as_int(v: &Value) -> Result<i64, RuntimeError> {
     match v {
         Value::Int(n) => Ok(*n),
         other => Err(err(format!("se esperaba un entero, se encontró {other:?}"))),
+    }
+}
+
+pub(crate) fn as_float(v: &Value) -> Result<f64, RuntimeError> {
+    match v {
+        Value::Float(n) => Ok(*n),
+        Value::Int(n) => Ok(*n as f64),
+        other => Err(err(format!("se esperaba un Float, se encontró {other:?}"))),
     }
 }
 
@@ -1655,7 +1838,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -3079,5 +3262,49 @@ mod tests {
         assert!(summary.failed[0].1.contains("condicion esperada falsa"));
         assert_eq!(summary.failed[1].0, "test que falla por panic");
         assert!(summary.failed[1].1.contains("algo exploto"));
+    }
+
+    #[test]
+    fn math_and_crypto_and_string_methods_work_in_runtime() {
+        let code = r#"
+        test "stdlib builtins math, crypto and strings" {
+            // Math
+            assert(math.sqrt(16.0) == 4.0);
+            assert(math.abs(-5.5) == 5.5);
+            assert(math.floor(3.7) == 3);
+            assert(math.ceil(3.2) == 4);
+            assert(math.round(3.6) == 4);
+            assert(math.min(10.0, 20.0) == 10.0);
+            assert(math.max(10.0, 20.0) == 20.0);
+            assert(math.pow(2.0, 3.0) == 8.0);
+
+            // Crypto
+            let sha = crypto.hashSha256("hello");
+            assert(sha == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+            let pwd = "secret_password_123";
+            let hash = crypto.hashPassword(pwd);
+            assert(crypto.verifyPassword(pwd, hash) == true);
+            assert(crypto.verifyPassword("wrong", hash) == false);
+
+            // String
+            let s = "  Hola Mundo  ";
+            assert(s.trim() == "Hola Mundo");
+            assert(s.trim().toUpper() == "HOLA MUNDO");
+            assert(s.trim().toLower() == "hola mundo");
+            assert(s.trim().startsWith("Hola") == true);
+            assert(s.trim().endsWith("Mundo") == true);
+
+            // Timestamp
+            let t = now();
+            let ms = t.toMillis();
+            assert(ms.toInt() > 0);
+            assert(t.toIsoString().contains("T"));
+            assert(t.diffMillis(t).toInt() == 0);
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests stdlib");
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.passed, 1, "todos los asserts de stdlib debieron pasar");
     }
 }

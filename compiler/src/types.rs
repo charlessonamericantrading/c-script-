@@ -102,6 +102,12 @@ pub enum Type {
     Auth,
     /// Tipo interno para un Service por su nombre (permite invocar `Service.rpc`)
     Service(String),
+    /// Tipo interno para el módulo `math` builtin
+    Math,
+    /// Tipo interno para el módulo `crypto` builtin
+    Crypto,
+    /// Tipo interno para el módulo `http` builtin
+    Http,
 }
 
 #[derive(Debug, Clone, PartialEq)]

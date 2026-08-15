@@ -414,3 +414,28 @@ fn completion_after_dot_on_a_struct_receiver_offers_its_real_field_names_over_a_
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn formatting_reformats_code_over_a_real_subprocess() {
+    let mut proc = LspProcess::start();
+    proc.initialize();
+
+    let raw = "fn add(a:Int,b:Int)->Int{let sum=a+b;sum}\n";
+    proc.did_open("file:///test.link", raw);
+
+    proc.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "textDocument/formatting",
+        "params": {
+            "textDocument": { "uri": "file:///test.link" }
+        }
+    }));
+
+    let resp = proc.recv();
+    let edits = resp["result"].as_array().expect("debe devolver un array de TextEdit");
+    assert_eq!(edits.len(), 1);
+    let new_text = edits[0]["newText"].as_str().unwrap();
+    assert!(new_text.contains("fn add(a: Int, b: Int) -> Int {\n  let sum = a + b;\n  sum\n}"));
+    proc.shutdown();
+}

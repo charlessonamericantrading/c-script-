@@ -1963,6 +1963,15 @@ impl Checker {
                 if name == "auth" {
                     return Ok(Type::Auth);
                 }
+                if name == "math" {
+                    return Ok(Type::Math);
+                }
+                if name == "crypto" {
+                    return Ok(Type::Crypto);
+                }
+                if name == "http" {
+                    return Ok(Type::Http);
+                }
                 if name == "now" {
                     return Ok(Type::Function(vec![], Box::new(Type::Timestamp)));
                 }
@@ -2318,12 +2327,150 @@ impl Checker {
                 self.check_expr(needle, &Type::String, env)?;
                 Some(Type::Bool)
             }
-            // Ya tenía implementación real en runtime/mod.rs (call_method)
-            // desde antes -- lo que faltaba era la regla del checker. Nunca
-            // se notó porque `db.coleccion.all()` devolvía `Dynamic` (sin
-            // chequear nada) hasta esta misma tarea; recién ahora que
-            // devuelve `List<T>` de verdad hace falta esta regla para que
-            // `.take(n)` siga tipando.
+            (Type::String, "startsWith") => {
+                let [needle] = args else {
+                    return Err(err("'startsWith' toma exactamente 1 argumento"));
+                };
+                self.check_expr(needle, &Type::String, env)?;
+                Some(Type::Bool)
+            }
+            (Type::String, "endsWith") => {
+                let [needle] = args else {
+                    return Err(err("'endsWith' toma exactamente 1 argumento"));
+                };
+                self.check_expr(needle, &Type::String, env)?;
+                Some(Type::Bool)
+            }
+            (Type::String, "trim") => {
+                self.expect_no_args(args, "trim")?;
+                Some(Type::String)
+            }
+            (Type::String, "toUpper") => {
+                self.expect_no_args(args, "toUpper")?;
+                Some(Type::String)
+            }
+            (Type::String, "toLower") => {
+                self.expect_no_args(args, "toLower")?;
+                Some(Type::String)
+            }
+            (Type::Timestamp, "toMillis") => {
+                self.expect_no_args(args, "toMillis")?;
+                Some(Type::Int64)
+            }
+            (Type::Timestamp, "diffMillis") => {
+                let [other] = args else {
+                    return Err(err("'diffMillis' toma exactamente 1 argumento (other: Timestamp)"));
+                };
+                self.check_expr(other, &Type::Timestamp, env)?;
+                Some(Type::Int64)
+            }
+            (Type::Timestamp, "toIsoString") => {
+                self.expect_no_args(args, "toIsoString")?;
+                Some(Type::String)
+            }
+            (Type::Math, "sqrt") => {
+                let [arg] = args else {
+                    return Err(err("'math.sqrt' toma exactamente 1 argumento (x: Float)"));
+                };
+                self.check_expr(arg, &Type::Float, env)?;
+                Some(Type::Float)
+            }
+            (Type::Math, "abs") => {
+                let [arg] = args else {
+                    return Err(err("'math.abs' toma exactamente 1 argumento (x: Float)"));
+                };
+                self.check_expr(arg, &Type::Float, env)?;
+                Some(Type::Float)
+            }
+            (Type::Math, "floor") => {
+                let [arg] = args else {
+                    return Err(err("'math.floor' toma exactamente 1 argumento (x: Float)"));
+                };
+                self.check_expr(arg, &Type::Float, env)?;
+                Some(Type::Int)
+            }
+            (Type::Math, "ceil") => {
+                let [arg] = args else {
+                    return Err(err("'math.ceil' toma exactamente 1 argumento (x: Float)"));
+                };
+                self.check_expr(arg, &Type::Float, env)?;
+                Some(Type::Int)
+            }
+            (Type::Math, "round") => {
+                let [arg] = args else {
+                    return Err(err("'math.round' toma exactamente 1 argumento (x: Float)"));
+                };
+                self.check_expr(arg, &Type::Float, env)?;
+                Some(Type::Int)
+            }
+            (Type::Math, "min") => {
+                let [a, b] = args else {
+                    return Err(err("'math.min' toma exactamente 2 argumentos (a: Float, b: Float)"));
+                };
+                self.check_expr(a, &Type::Float, env)?;
+                self.check_expr(b, &Type::Float, env)?;
+                Some(Type::Float)
+            }
+            (Type::Math, "max") => {
+                let [a, b] = args else {
+                    return Err(err("'math.max' toma exactamente 2 argumentos (a: Float, b: Float)"));
+                };
+                self.check_expr(a, &Type::Float, env)?;
+                self.check_expr(b, &Type::Float, env)?;
+                Some(Type::Float)
+            }
+            (Type::Math, "pow") => {
+                let [a, b] = args else {
+                    return Err(err("'math.pow' toma exactamente 2 argumentos (base: Float, exp: Float)"));
+                };
+                self.check_expr(a, &Type::Float, env)?;
+                self.check_expr(b, &Type::Float, env)?;
+                Some(Type::Float)
+            }
+            (Type::Crypto, "hashSha256") => {
+                let [data] = args else {
+                    return Err(err("'crypto.hashSha256' toma exactamente 1 argumento (data: String)"));
+                };
+                self.check_expr(data, &Type::String, env)?;
+                Some(Type::String)
+            }
+            (Type::Crypto, "randomToken") => {
+                let [length] = args else {
+                    return Err(err("'crypto.randomToken' toma exactamente 1 argumento (length: Int)"));
+                };
+                self.check_expr(length, &Type::Int, env)?;
+                Some(Type::String)
+            }
+            (Type::Crypto, "hashPassword") => {
+                let [pwd] = args else {
+                    return Err(err("'crypto.hashPassword' toma exactamente 1 argumento (password: String)"));
+                };
+                self.check_expr(pwd, &Type::String, env)?;
+                Some(Type::String)
+            }
+            (Type::Crypto, "verifyPassword") => {
+                let [pwd, hash] = args else {
+                    return Err(err("'crypto.verifyPassword' toma exactamente 2 argumentos (password: String, hash: String)"));
+                };
+                self.check_expr(pwd, &Type::String, env)?;
+                self.check_expr(hash, &Type::String, env)?;
+                Some(Type::Bool)
+            }
+            (Type::Http, "get") => {
+                let [url] = args else {
+                    return Err(err("'http.get' toma exactamente 1 argumento (url: String)"));
+                };
+                self.check_expr(url, &Type::String, env)?;
+                Some(Type::String)
+            }
+            (Type::Http, "post") => {
+                let [url, body] = args else {
+                    return Err(err("'http.post' toma exactamente 2 argumentos (url: String, body: String)"));
+                };
+                self.check_expr(url, &Type::String, env)?;
+                self.check_expr(body, &Type::String, env)?;
+                Some(Type::String)
+            }
             (Type::List(inner), "take") => {
                 let [n_arg] = args else {
                     return Err(err("'take' toma exactamente 1 argumento (n: Int)"));

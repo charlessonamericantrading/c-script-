@@ -83,19 +83,87 @@ fn main() -> ExitCode {
         Some("dev") => cmd_dev(&args[2..]),
         Some("lsp") => cmd_lsp(),
         Some("wasm") => cmd_wasm(&args[2..]),
+        Some("fmt") => cmd_fmt(&args[2..]),
+        Some("lint") => cmd_lint(&args[2..]),
         Some(path) => cmd_check(path), // `linkc <archivo.link>` -- solo lex+parse+check
         None => {
             eprintln!("uso: linkc <subcomando> [opciones]");
             eprintln!("subcomandos conocidos:");
             eprintln!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)");
-            eprintln!("     linkc build <archivo.link> <outdir>    (genera contract.d.ts, client.ts, validators.ts, link.lock, y main.wasm si el programa entra en el subconjunto soportado -- ver 'linkc wasm')");
-            eprintln!("     linkc test <archivo.link> <archivo.snap> [--update]  (compara el contrato generado contra un snapshot commiteado; falla si cambió sin querer)");
-            eprintln!("     linkc wasm <archivo.link> <out.wasm>   (emite binario WebAssembly nativo -- v0: solo Int/Bool y una expresión final)");
-            eprintln!("     linkc dev <archivo.link> <outdir> [puerto]  (+ observa y reconstruye solo; con <puerto>, hot reload real de 'linkc serve')");
-            eprintln!("     linkc serve <archivo.link> <puerto>    (+ sirve los rpc por HTTP)");
+            eprintln!("     linkc build <archivo.link> <outdir>    (genera contratos TS, cliente, hooks, schemas Zod y OpenAPI)");
+            eprintln!("     linkc test <archivo.link>              (ejecuta pruebas de comportamiento integradas)");
+            eprintln!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)");
+            eprintln!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)");
+            eprintln!("     linkc lint <archivo.link>              (analiza calidad de código y detecta variables sin uso)");
+            eprintln!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)");
+            eprintln!("     linkc serve <archivo.link> <puerto>    (inicia servidor HTTP con SQLite embebido)");
             eprintln!("     linkc lsp                              (inicia el servidor Language Server Protocol)");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn cmd_fmt(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("uso: linkc fmt <archivo.link> [--check]");
+        return ExitCode::FAILURE;
+    };
+    let check_mode = args.iter().any(|a| a == "--check");
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("no se pudo leer {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let formatted = match linkc::fmt::format_source(&content) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("error de sintaxis al formatear {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if check_mode {
+        if content == formatted {
+            println!("OK: {path} está correctamente formateado");
+            ExitCode::SUCCESS
+        } else {
+            eprintln!("FALLO: {path} requiere formateo (ejecuta 'linkc fmt {path}')");
+            ExitCode::FAILURE
+        }
+    } else {
+        if content != formatted {
+            if let Err(e) = fs::write(path, formatted) {
+                eprintln!("no se pudo escribir {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+            println!("formateado {path}");
+        } else {
+            println!("{path} ya está formateado");
+        }
+        ExitCode::SUCCESS
+    }
+}
+
+fn cmd_lint(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("uso: linkc lint <archivo.link>");
+        return ExitCode::FAILURE;
+    };
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let warnings = linkc::lint::lint_program(&program);
+    if warnings.is_empty() {
+        println!("OK: {path} pasó el análisis de lint sin advertencias");
+        ExitCode::SUCCESS
+    } else {
+        println!("lint: {} advertencia(s) en {path}:", warnings.len());
+        for w in &warnings {
+            println!("  [{}] {}:{}:{}: {}", w.rule, path, w.line, w.col, w.message);
+        }
+        ExitCode::SUCCESS
     }
 }
 

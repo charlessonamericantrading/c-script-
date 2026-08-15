@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use crate::ast::{self, Item, Program};
 use wasm_encoder::{
-    BlockType, CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction, Module,
-    TypeSection, ValType,
+    BlockType, CodeSection, ExportKind, ExportSection, Function, FunctionSection, Instruction,
+    MemorySection, MemoryType, Module, TypeSection, ValType,
 };
 
 /// Mapeo de tipos escalares a WebAssembly ValType.
@@ -299,7 +299,6 @@ fn emit_expr(expr: &ast::Expr, ctx: &mut WasmFuncCtx, func: &mut Function) -> Re
             Ok(has_result)
         }
         ast::Expr::Call { callee, args } => {
-            // Check numeric conversion methods on primitive receivers
             if let ast::Expr::FieldAccess { base, field } = &callee.node {
                 if field == "toFloat" && args.is_empty() {
                     emit_expr(&base.node, ctx, func)?;
@@ -312,6 +311,54 @@ fn emit_expr(expr: &ast::Expr, ctx: &mut WasmFuncCtx, func: &mut Function) -> Re
                 } else if field == "toInt64" && args.is_empty() {
                     emit_expr(&base.node, ctx, func)?;
                     return Ok(true);
+                }
+
+                if let ast::Expr::Ident(base_name) = &base.node {
+                    if base_name == "math" {
+                        match field.as_str() {
+                            "sqrt" if args.len() == 1 => {
+                                emit_expr(&args[0].node, ctx, func)?;
+                                func.instruction(&Instruction::F64Sqrt);
+                                return Ok(true);
+                            }
+                            "abs" if args.len() == 1 => {
+                                emit_expr(&args[0].node, ctx, func)?;
+                                func.instruction(&Instruction::F64Abs);
+                                return Ok(true);
+                            }
+                            "floor" if args.len() == 1 => {
+                                emit_expr(&args[0].node, ctx, func)?;
+                                func.instruction(&Instruction::F64Floor);
+                                func.instruction(&Instruction::I64TruncF64S);
+                                return Ok(true);
+                            }
+                            "ceil" if args.len() == 1 => {
+                                emit_expr(&args[0].node, ctx, func)?;
+                                func.instruction(&Instruction::F64Ceil);
+                                func.instruction(&Instruction::I64TruncF64S);
+                                return Ok(true);
+                            }
+                            "round" if args.len() == 1 => {
+                                emit_expr(&args[0].node, ctx, func)?;
+                                func.instruction(&Instruction::F64Nearest);
+                                func.instruction(&Instruction::I64TruncF64S);
+                                return Ok(true);
+                            }
+                            "min" if args.len() == 2 => {
+                                emit_expr(&args[0].node, ctx, func)?;
+                                emit_expr(&args[1].node, ctx, func)?;
+                                func.instruction(&Instruction::F64Min);
+                                return Ok(true);
+                            }
+                            "max" if args.len() == 2 => {
+                                emit_expr(&args[0].node, ctx, func)?;
+                                emit_expr(&args[1].node, ctx, func)?;
+                                func.instruction(&Instruction::F64Max);
+                                return Ok(true);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
 
@@ -367,32 +414,31 @@ fn emit_block(
 
 pub fn emit_wasm(program: &Program) -> Result<Vec<u8>, String> {
     let mut module = Module::new();
-
     let mut types = TypeSection::new();
     let mut functions = FunctionSection::new();
     let mut exports = ExportSection::new();
     let mut codes = CodeSection::new();
 
-    let mut fn_indices = HashMap::new();
     let mut fn_declarations = Vec::new();
+    let mut fn_indices = HashMap::new();
 
-    let mut func_idx = 0u32;
     for item in &program.items {
         match item {
             Item::Fn(f) => {
-                fn_indices.insert(f.name.clone(), func_idx);
-                fn_declarations.push((f.name.clone(), f.params.clone(), f.return_type.clone(), f.body.clone(), f.name.clone()));
-                func_idx += 1;
+                let idx = fn_declarations.len() as u32;
+                fn_indices.insert(f.name.clone(), idx);
+                fn_declarations.push((f.name.clone(), &f.params, &f.return_type, &f.body, f.name.clone()));
             }
             Item::Service(s) => {
                 for member in &s.members {
                     let rpc = match member {
-                        ast::Member::Rpc(r) | ast::Member::Stream(r) => r,
+                        ast::Member::Rpc(r) => r,
+                        ast::Member::Stream(r) => r,
                     };
                     let full_name = format!("{}.{}", s.name, rpc.name);
-                    fn_indices.insert(full_name.clone(), func_idx);
-                    fn_declarations.push((full_name.clone(), rpc.params.clone(), rpc.return_type.clone(), rpc.body.clone(), full_name.clone()));
-                    func_idx += 1;
+                    let idx = fn_declarations.len() as u32;
+                    fn_indices.insert(full_name.clone(), idx);
+                    fn_declarations.push((full_name.clone(), &rpc.params, &rpc.return_type, &rpc.body, full_name));
                 }
             }
             _ => {}
@@ -403,9 +449,18 @@ pub fn emit_wasm(program: &Program) -> Result<Vec<u8>, String> {
         return Err("el programa no contiene ninguna función o RPC para compilar a WASM".to_string());
     }
 
+    let mut memories = MemorySection::new();
+    memories.memory(MemoryType {
+        minimum: 1,
+        maximum: None,
+        memory64: false,
+        shared: false,
+    });
+    exports.export("memory", ExportKind::Memory, 0);
+
     for (idx, (name, params, return_type, body, export_name)) in fn_declarations.iter().enumerate() {
         let mut wasm_params = Vec::with_capacity(params.len());
-        for p in params {
+        for p in *params {
             let vt = wasm_scalar_type(&p.ty).map_err(|e| format!("en '{name}', parámetro '{}': {e}", p.name))?;
             wasm_params.push(vt);
         }
@@ -438,6 +493,7 @@ pub fn emit_wasm(program: &Program) -> Result<Vec<u8>, String> {
 
     module.section(&types);
     module.section(&functions);
+    module.section(&memories);
     module.section(&exports);
     module.section(&codes);
 
@@ -525,5 +581,12 @@ mod tests {
     fn test_an_empty_body_fails_loudly_instead_of_defaulting_to_zero() {
         let code = "fn f() -> Int { }";
         assert!(compile(code).is_err());
+    }
+
+    #[test]
+    fn test_math_builtins_and_modulo_emission() {
+        let code = "fn hypotenuse(a: Float, b: Float) -> Float { math.sqrt(a * a + b * b) }\nfn modTen(n: Int) -> Int { n % 10 }";
+        let wasm_bytes = compile(code).unwrap();
+        assert!(wasm_bytes.len() > 8);
     }
 }

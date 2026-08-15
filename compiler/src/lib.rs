@@ -12,6 +12,8 @@ pub mod gitdep;
 pub mod lexer;
 pub mod lockfile;
 pub mod modules;
+pub mod fmt;
+pub mod lint;
 pub mod lsp;
 pub mod parser;
 pub mod runtime;
