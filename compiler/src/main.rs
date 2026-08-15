@@ -316,10 +316,12 @@ fn cmd_build(args: &[String]) -> ExitCode {
 /// decide una persona mirando el diff, nunca el comando solo. `--update`
 /// es ese "sí, es a propósito" explícito.
 fn cmd_test(args: &[String]) -> ExitCode {
-    let (Some(path), Some(snap_path)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc test <archivo.link> <archivo.snap> [--update]");
+    let Some(path) = args.first() else {
+        eprintln!("uso: linkc test <archivo.link> [archivo.snap] [--update]");
         return ExitCode::FAILURE;
     };
+
+    let snap_path = args.get(1).filter(|a| !a.starts_with("--"));
     let update = args.iter().any(|a| a == "--update");
 
     let program = match load_and_check(path) {
@@ -327,21 +329,55 @@ fn cmd_test(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
 
-    let contract = match codegen::ts_emit::emit_contract(&program) {
+    // Si se especificó un archivo snapshot, ejecutamos snapshot testing de contratos
+    if let Some(snap_path) = snap_path {
+        return run_snapshot_test(&program, path, snap_path, update);
+    }
+
+    // Si solo se pasó el archivo .link, ejecutamos los bloques test integrados
+    match runtime::run_program_tests(&program) {
+        Ok(summary) => {
+            println!("running {} tests", summary.total);
+            for (name, err) in &summary.failed {
+                println!("test \"{name}\" ... FAILED: {err}");
+            }
+            let passed_count = summary.passed;
+            let failed_count = summary.failed.len();
+            if summary.failed.is_empty() {
+                if summary.total > 0 {
+                    println!("\ntest result: ok. {passed_count} passed; 0 failed\n");
+                } else {
+                    println!("\ntest result: ok. 0 tests run\n");
+                }
+                ExitCode::SUCCESS
+            } else {
+                println!("\ntest result: FAILED. {passed_count} passed; {failed_count} failed\n");
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("error de ejecución: {}", e.message);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_snapshot_test(program: &Program, path: &str, snap_path: &str, update: bool) -> ExitCode {
+    let contract = match codegen::ts_emit::emit_contract(program) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error al emitir contract.d.ts: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let client = match codegen::ts_emit::emit_client(&program) {
+    let client = match codegen::ts_emit::emit_client(program) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error al emitir client.ts: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let validators = match codegen::validators_emit::emit_validators(&program) {
+    let validators = match codegen::validators_emit::emit_validators(program) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error al emitir validators.ts: {e}");

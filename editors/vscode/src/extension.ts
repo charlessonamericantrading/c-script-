@@ -1,5 +1,5 @@
 import * as path from 'path';
-import { ExtensionContext, workspace } from 'vscode';
+import { ExtensionContext, workspace, commands, window } from 'vscode';
 import {
   LanguageClient,
   LanguageClientOptions,
@@ -31,6 +31,29 @@ export function activate(context: ExtensionContext) {
   );
 
   client.start();
+
+  context.subscriptions.push(
+    commands.registerCommand('c-script.runTests', () => {
+      const activeDoc = window.activeTextEditor?.document;
+      if (!activeDoc || !activeDoc.fileName.endsWith('.link')) {
+        window.showWarningMessage('Abre un archivo .link para ejecutar sus pruebas.');
+        return;
+      }
+      const terminal = window.createTerminal('Link Tests');
+      terminal.show();
+      terminal.sendText(`${command} test "${activeDoc.fileName}"`);
+    }),
+    commands.registerCommand('c-script.build', () => {
+      const activeDoc = window.activeTextEditor?.document;
+      if (!activeDoc || !activeDoc.fileName.endsWith('.link')) {
+        window.showWarningMessage('Abre un archivo .link para generar el contrato.');
+        return;
+      }
+      const terminal = window.createTerminal('Link Build');
+      terminal.show();
+      terminal.sendText(`${command} build "${activeDoc.fileName}" ./gen`);
+    })
+  );
 }
 
 export function deactivate(): Thenable<void> | undefined {

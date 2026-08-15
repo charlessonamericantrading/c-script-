@@ -928,7 +928,7 @@ fn find_named_type_in_program(program: &Program, offset: usize) -> Option<(Strin
                 .or_else(|| find_named_type_at(&f.return_type, offset)),
             Item::Const(c) => find_named_type_at(&c.ty, offset),
             Item::Db(d) => d.collections.iter().find_map(|f| find_named_type_at(&f.ty, offset)),
-            Item::Import(_) => None,
+            Item::Import(_) | Item::Test(_) => None,
         };
         if found.is_some() {
             return found;
@@ -990,7 +990,7 @@ fn is_field_or_param_name_at(program: &Program, offset: usize) -> bool {
         }
         Item::Const(c) => field_name_at_in_type(&c.ty, offset),
         Item::Db(d) => d.collections.iter().any(|f| in_span(f.name_span) || field_name_at_in_type(&f.ty, offset)),
-        Item::Import(_) => false,
+        Item::Import(_) | Item::Test(_) => false,
     })
 }
 
@@ -1098,7 +1098,7 @@ fn get_definition_inner(
                 }
                 continue;
             }
-            Item::Import(_) => continue,
+            Item::Import(_) | Item::Test(_) => continue,
         };
 
         if name == &word {
@@ -1224,7 +1224,7 @@ pub fn get_completions(source: &str, line0: usize, col0: usize, full_program: Op
     }
 
     let keywords = [
-        "type", "enum", "service", "rpc", "stream", "match", "db", "fn",
+        "type", "enum", "service", "rpc", "stream", "match", "db", "fn", "test",
         "let", "mut", "const", "return", "if", "else", "while", "import", "from", "pub"
     ];
     for kw in keywords {
@@ -1241,6 +1241,19 @@ pub fn get_completions(source: &str, line0: usize, col0: usize, full_program: Op
             "label": b,
             "kind": 7, // Class/Type
             "detail": "Built-in Type",
+        }));
+    }
+
+    let builtin_fns = [
+        ("now", "Built-in: Get current Timestamp in UTC"),
+        ("assert", "Built-in: Assert condition assert(cond, [msg])"),
+        ("panic", "Built-in: Panic and terminate execution with message"),
+    ];
+    for (name, detail) in builtin_fns {
+        items.push(json!({
+            "label": format!("{name}()"),
+            "kind": 3, // Function
+            "detail": detail,
         }));
     }
 

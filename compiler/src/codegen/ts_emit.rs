@@ -540,12 +540,12 @@ pub(crate) fn render_type(ty: &Type) -> String {
             .map(render_type_atom)
             .collect::<Vec<_>>()
             .join(" | "),
-        // `db`/`db.<coleccion>`/`auth` son internos del checker (GRAMMAR.md
+        // `db`/`db.<coleccion>`/`auth`/`Service` son internos del checker (GRAMMAR.md
         // §2.1 DbDecl, §3.14 auth v0) -- nunca aparecen en un TypeExpr
         // escrito por el usuario, así que jamás llegan a resolverse en una
         // firma real de rpc/type.
-        Type::Db | Type::DbCollection(_) | Type::Auth => {
-            unreachable!("Type::Db/DbCollection/Auth nunca aparece en un TypeExpr real")
+        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) => {
+            unreachable!("Type::Db/DbCollection/Auth/Service nunca aparece en un TypeExpr real")
         }
     }
 }
@@ -609,8 +609,8 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
             }
         }
         Type::Int | Type::Int64 | Type::Timestamp | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
-        Type::Db | Type::DbCollection(_) | Type::Auth => {
-            unreachable!("Type::Db/DbCollection/Auth nunca aparece en un TypeExpr real")
+        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) => {
+            unreachable!("Type::Db/DbCollection/Auth/Service nunca aparece en un TypeExpr real")
         }
     }
 }

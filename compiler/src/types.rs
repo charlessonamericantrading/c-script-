@@ -100,6 +100,8 @@ pub enum Type {
     /// necesita ningún caso explícito para excluirlo (inalcanzable desde una
     /// firma de rpc por construcción, igual que `Db`).
     Auth,
+    /// Tipo interno para un Service por su nombre (permite invocar `Service.rpc`)
+    Service(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

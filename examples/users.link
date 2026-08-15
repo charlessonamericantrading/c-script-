@@ -159,3 +159,37 @@ service Users {
     db.users.all()
   }
 }
+
+test "crear usuario valido y validar campos" {
+  let res = Users.create(NewUser {
+    name: "Ada Lovelace",
+    email: "ada@example.com",
+    createdAt: now(),
+  });
+  match res {
+    Result.Ok { value } => {
+      assert(value.name == "Ada Lovelace");
+      assert(value.email == "ada@example.com");
+      assert(value.id > 0);
+    }
+    Result.Err { error } => {
+      panic("el usuario deberia ser valido");
+    }
+  }
+}
+
+test "crear usuario con email invalido es rechazado por validacion" {
+  let res = Users.create(NewUser {
+    name: "Bob",
+    email: "email-invalido-sin-arroba",
+    createdAt: now(),
+  });
+  match res {
+    Result.Ok { value } => {
+      panic("no debio pasar validacion");
+    }
+    Result.Err { error } => {
+      assert(true);
+    }
+  }
+}

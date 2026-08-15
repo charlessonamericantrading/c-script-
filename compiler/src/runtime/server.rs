@@ -446,10 +446,10 @@ fn error_json(message: &str) -> String {
 }
 
 fn cors_response(status: u16, body: String) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+    let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap();
     let allow_origin = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
     let allow_methods =
-        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, OPTIONS"[..]).unwrap();
+        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, GET, OPTIONS"[..]).unwrap();
     // "Authorization" agregado para auth v0 (GRAMMAR.md §3.14): sin esto,
     // cualquier browser real rechaza el preflight OPTIONS apenas el cliente
     // generado manda ese header (ver push_fetch_call en ts_emit.rs), y la

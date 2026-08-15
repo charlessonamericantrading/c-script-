@@ -2,8 +2,8 @@
   "name": "c-script-vscode",
   "displayName": "c-script",
   "description": "Soporte oficial del lenguaje c-script: sintaxis y LSP End-to-End Type Safety con TypeScript",
-  "version": "0.1.0",
-  "publisher": "antigravity",
+  "version": "1.0.0",
+  "publisher": "link-lang",
   "engines": {
     "vscode": "^1.75.0"
   },
@@ -18,7 +18,7 @@
     "languages": [
       {
         "id": "c-script",
-        "aliases": ["c-script", "link"],
+        "aliases": ["c-script", "link", "Link"],
         "extensions": [".link"],
         "configuration": "./language-configuration.json"
       }
@@ -29,7 +29,30 @@
         "scopeName": "source.link",
         "path": "./syntaxes/c-script.tmLanguage.json"
       }
-    ]
+    ],
+    "commands": [
+      {
+        "command": "c-script.runTests",
+        "title": "Link: Run Behavioral Tests",
+        "category": "Link"
+      },
+      {
+        "command": "c-script.build",
+        "title": "Link: Build TypeScript Contract",
+        "category": "Link"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Link Configuration",
+      "properties": {
+        "c-script.compilerPath": {
+          "type": "string",
+          "default": "linkc",
+          "description": "Path al binario de linkc / c-script"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

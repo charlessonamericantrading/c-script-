@@ -154,7 +154,7 @@ impl Parser {
     fn at_item_start(&self) -> bool {
         matches!(
             self.peek(),
-            TokenKind::Import | TokenKind::Type | TokenKind::Enum | TokenKind::Service | TokenKind::Const | TokenKind::Fn
+            TokenKind::Import | TokenKind::Type | TokenKind::Enum | TokenKind::Service | TokenKind::Const | TokenKind::Fn | TokenKind::Test
         ) || matches!(self.peek(), TokenKind::Ident(name) if name == "db" && *self.peek_at(1) == TokenKind::LBrace)
     }
 
@@ -188,6 +188,7 @@ impl Parser {
             TokenKind::Service => Ok(Item::Service(self.parse_service_decl()?)),
             TokenKind::Const => Ok(Item::Const(self.parse_const_decl()?)),
             TokenKind::Fn => Ok(Item::Fn(self.parse_fn_decl()?)),
+            TokenKind::Test => Ok(Item::Test(self.parse_test_decl()?)),
             // `db` NO es palabra reservada (ast.rs, doc de DbDecl) -- se
             // reconoce por texto solo acá, en posición de ítem de nivel
             // superior, seguido de `{`. En cualquier otro contexto (una
@@ -204,7 +205,7 @@ impl Parser {
                 Ok(Item::Db(self.parse_db_decl()?))
             }
             other => Err(self.error(format!(
-                "se esperaba un ítem de nivel superior (import/type/enum/service/const/fn/db), se encontró {other:?}"
+                "se esperaba un ítem de nivel superior (import/type/enum/service/const/fn/db/test), se encontró {other:?}"
             ))),
         }
     }
@@ -444,6 +445,35 @@ impl Parser {
             name,
             params,
             return_type,
+            body,
+            span,
+        })
+    }
+
+    fn parse_test_decl(&mut self) -> Result<TestDecl, ParseError> {
+        let start = self.span();
+        self.eat(&TokenKind::Test)?;
+        let name_span = Some(self.span());
+        let name = match self.peek().clone() {
+            TokenKind::Str(s) => {
+                self.advance();
+                s
+            }
+            TokenKind::Ident(s) => {
+                self.advance();
+                s
+            }
+            other => {
+                return Err(self.error(format!(
+                    "se esperaba el nombre del test (string o identificador), se encontró {other:?}"
+                )));
+            }
+        };
+        let body = self.parse_block()?;
+        let span = merge(start, body.span);
+        Ok(TestDecl {
+            name,
+            name_span,
             body,
             span,
         })
@@ -901,6 +931,9 @@ impl Parser {
         let (body, span) = if self.check(&TokenKind::LBrace) {
             let block = self.parse_block()?;
             let span = merge(start, block.span);
+            if self.check(&TokenKind::Comma) {
+                self.advance();
+            }
             (MatchArmBody::Block(block), span)
         } else {
             let e = self.parse_expr()?;
@@ -1716,8 +1749,8 @@ mod tests {
         .expect("no se pudo leer examples/users.link");
         let prog = parse_source(&src);
         // 3 type (User, NewUser, NewUserRecord) + 3 enum (Role,
-        // ValidationError, ValidateResult) + 1 db + 1 fn + 1 service = 9
-        assert_eq!(prog.items.len(), 9);
+        // ValidationError, ValidateResult) + 1 db + 1 fn + 1 service + 2 test = 11
+        assert_eq!(prog.items.len(), 11);
         let service = prog
             .items
             .iter()
@@ -1860,5 +1893,27 @@ mod tests {
         let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
         let Stmt::While { cond, .. } = &body.stmts[0].node else { panic!("se esperaba Stmt::While") };
         assert_eq!(cond.node, Expr::Ident("x".into()));
+    }
+
+    // ---- bloques test integrados (PLAN.md §5, Eje 2) ----
+
+    #[test]
+    fn parses_test_decl_with_string_name() {
+        let src = r#"test "crear usuario basico" { let x = 1; assert(x == 1); }"#;
+        let prog = parse_source(src);
+        assert_eq!(prog.items.len(), 1);
+        let Item::Test(t) = &prog.items[0] else { panic!("se esperaba Item::Test") };
+        assert_eq!(t.name, "crear usuario basico");
+        assert_eq!(t.body.stmts.len(), 2);
+    }
+
+    #[test]
+    fn parses_test_decl_with_identifier_name() {
+        let src = "test smoke_test { assert(true); }";
+        let prog = parse_source(src);
+        assert_eq!(prog.items.len(), 1);
+        let Item::Test(t) = &prog.items[0] else { panic!("se esperaba Item::Test") };
+        assert_eq!(t.name, "smoke_test");
+        assert_eq!(t.body.stmts.len(), 1);
     }
 }

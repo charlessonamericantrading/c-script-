@@ -25,7 +25,8 @@ block_comment = "/*" , { ? cualquier carácter ? } , "*/" ;
 
 keyword      = "type" | "enum" | "service" | "rpc" | "stream" | "match"
              | "import" | "from" | "pub" | "const" | "fn" | "let" | "mut"
-             | "return" | "if" | "else" | "while" | "true" | "false" | "null" ;
+             | "return" | "if" | "else" | "while" | "true" | "false" | "null"
+             | "test" ;
 ```
 
 **Reservado pero fuera del v0 de la gramática:** `async`, `await`, `trait`, `impl` — el modelo de concurrencia y de polimorfismo ad-hoc se diseña en una iteración posterior (ver PLAN.md §4, Fase 1). `for`, `in`, `break`, `continue` — v0 de loops (§3.15) es solo `while`; ninguno de estos cuatro es todavía una palabra reservada de verdad (no aparecen en `keyword_from_str`, `compiler/src/token.rs`), esto es prosa preparatoria, no una reserva real.
@@ -38,7 +39,7 @@ keyword      = "type" | "enum" | "service" | "rpc" | "stream" | "match"
 
 ```ebnf
 program      = { item } ;
-item         = import_decl | type_decl | enum_decl | service_decl | const_decl | fn_decl | db_decl ;
+item         = import_decl | type_decl | enum_decl | service_decl | const_decl | fn_decl | db_decl | test_decl ;
 
 import_decl  = "import" , "{" , ident_list , "}" , "from" , string_lit , ";" ;
 ident_list   = identifier , { "," , identifier } ;
@@ -65,6 +66,8 @@ param_list   = param , { "," , param } ;
 param        = identifier , ":" , type_expr , [ "=" , expr ] ;
 
 fn_decl      = "fn" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
+
+test_decl    = "test" , ( string_lit | identifier ) , block ;
 
 db_decl      = "db" , "{" , field_list , "}" ;   (* "db" NO es keyword -- ver §3.12 *)
 ```
@@ -1139,9 +1142,40 @@ La otra fila "no -- nunca se implementó" que quedaba en la tabla de tipos origi
 
 **Sin construcción desde código fuente en v0 -- límite real, documentado, no un olvido.** No hay `now()`: el lenguaje no tiene NINGÚN mecanismo de función builtin sin receptor (`Expr::Call` solo reconoce una `fn` de usuario por nombre, o un método vía `receptor.metodo(...)`) -- agregar uno sería territorio arquitectónico nuevo, no parte de "agregar un tipo". Tampoco hay auto-stamping de una columna tipo `createdAt` al hacer `insert` en `db` -- una decisión de diseño aparte, con sus propios trade-offs (¿es magia sorprendente o la conveniencia esperada?), que amerita su propia ronda si aparece la necesidad real. Un valor `Timestamp` en v0 solo puede: llegar como parámetro de un `rpc` desde el cliente, o ya estar guardado en `db`. Ninguno de los dos queda descartado para siempre, solo fuera de esta ronda.
 
-**Años limitados a 0000-9999.** Consecuencia directa del parseo de ancho fijo (4 dígitos para el año, sin signo, sin forma extendida de ISO-8601) -- cubre cualquier fecha real de una aplicación (incluyendo cualquier fecha antes de 1970, ver el test correspondiente), no cubre fechas astronómicas/históricas extremas. Restricción de v0 real, no un bug.
+### 3.32 Función builtin `now() -> Timestamp` — RESUELTO
 
-Verificado con tests unitarios nuevos en las mismas capas que §3.30 (checker: comparaciones, rechazo de aritmética/`match`/métodos; `runtime/mod.rs`: round-trip exacto vía `invoke_rpc` para un año bisiesto, una frontera de siglo bisiesta, y una fecha pre-1970 -- y rechazo de la frontera de siglo NO bisiesta, de un número JSON nativo, y de formas incompletas/con offset; `runtime/db.rs`: insert+find exacto incluyendo un valor negativo; `ts_emit.rs`/`validators_emit.rs`: forma emitida real; `lsp.rs`: hover y completion vacía) más 6 tests directos del algoritmo de calendario en `timestamp.rs` (epoch, día bisiesto, frontera de siglo en ambos sentidos -- 1900 rechazado, 2000 aceptado --, timestamp negativo pre-1970, día de calendario inexistente, forma de string incorrecta). Además, con el binario real: un programa `.link` con un campo `Timestamp` compilado de punta a punta, y un servidor real golpeado con `curl` -- una fecha bisiesta real viaja, se persiste, y vuelve exacta; `1900-02-29` (el mismo bug clásico de "divisible por 4" que `timestamp.rs` ya prueba a nivel de algoritmo) se rechaza con un 400 claro en el borde HTTP real, no solo en el test unitario; y una comparación `a > b` sobre dos parámetros `Timestamp` evalúa correctamente.
+Cierra el límite honesto documentado en §3.31 ("sin construcción desde código fuente en v0"). `now()` es una función builtin de primer nivel sin receptor que retorna un `Timestamp` con la fecha y hora actual en milisegundos desde el epoch UTC (formateado en ISO-8601 en el wire).
+
+- **Sintaxis y tipado:** `now()` sintetiza `Type::Function([], Type::Timestamp)`. No toma argumentos.
+- **Runtime:** Invoca el reloj del sistema (`SystemTime::now().duration_since(UNIX_EPOCH)`) devolviendo `Value::Timestamp(millis)`.
+- **LSP:** Incluido en la lista de autocompletado y hover de funciones built-in.
+
+### 3.33 Test runner de comportamiento integrado (`test "nombre" { ... }`, `assert`, `panic`) — RESUELTO
+
+Completa el objetivo de PLAN.md §5 ("Testing: runner integrado"). Permite escribir tests de integración y comportamiento directamente en archivos `.link`.
+
+```link
+type User = { id: Int, name: String }
+db { users: User[] }
+
+service Users {
+  rpc create(name: String) -> User {
+    db.users.insert(User { id: 0, name: name })
+  }
+}
+
+test "crear usuario incrementa id y persiste" {
+  let user = Users.create("Ada");
+  assert(user.name == "Ada", "el nombre debe coincidir");
+  assert(user.id > 0);
+}
+```
+
+- **Sintaxis:** `test <string_lit | identifier> { ... }`.
+- **Aislamiento total:** Cada bloque `test` corre con una base de datos SQLite en memoria (`:memory:`) fresca y aislada y un nuevo `SessionStore`, garantizando que las mutaciones de un test no contaminen a los demás.
+- **Llamada a servicios:** Dentro de los tests (y en el lenguaje en general), los servicios y sus RPCs pueden ser invocados directamente como `Service.rpc(args...)`.
+- **Builtins:** `assert(cond: Bool, [msg: String])` verifica condiciones y falla con el mensaje especificado; `panic(msg: String)` aborta la ejecución con un error explícito.
+- **CLI:** `linkc test <archivo.link>` ejecuta todos los tests de comportamiento y reporta el conteo de pasados/fallidos con exit code 0 o 1. Si se pasa un segundo argumento `.snap`, continúa ejecutando el test de snapshot de contratos.
 
 ---
 
@@ -1151,7 +1185,10 @@ Verificado con tests unitarios nuevos en las mismas capas que §3.30 (checker: c
 |---|---|---|---|
 | `Int`, `Float` | `number` | número | — |
 | `Int64` | `string` | string (decimal, ej. `"9223372036854775807"`) | mismo rango `i64` que `Int`, serializado como string para no perder precisión arriba de `2^53` -- ver §3.30. `.toInt64()`/`.toInt()` para convertir; sin mezcla implícita con `Int` |
-| `Timestamp` | `string` | string ISO-8601 de forma fija, ej. `"2026-08-08T14:30:00.000Z"` | milisegundos desde epoch UTC internamente -- ver §3.31. Solo comparable (`< <= > >= == !=`); sin aritmética, sin ser scrutinee de `match`, sin construcción desde código fuente en v0 (sin `now()`) |
+| `Timestamp` | `string` | string ISO-8601 de forma fija, ej. `"2026-08-08T14:30:00.000Z"` | milisegundos desde epoch UTC internamente -- ver §3.31. Obtenible con `now() -> Timestamp` (§3.32). Solo comparable (`< <= > >= == !=`); sin aritmética |
+| `now()` | `now(): Timestamp` | `"2026-08-15T12:00:00.000Z"` | función builtin de fecha y hora actual en UTC (§3.32) |
+| `assert`, `panic` | — | — | funciones builtin de aserción y control de tests en backend (§3.33) |
+| `test "nombre" { }` | — | — | bloques de test de comportamiento (§3.33), no cruzan a TS |
 | `String` | `string` | string | — |
 | `Bool` | `boolean` | bool | — |
 | `Void` | `void` | `null` en el cuerpo | Solo válido como retorno COMPLETO de un `rpc` -- como campo o parámetro es un error del checker (§4.1) |

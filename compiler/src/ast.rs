@@ -43,6 +43,16 @@ pub enum Item {
     Const(ConstDecl),
     Fn(FnDecl),
     Db(DbDecl),
+    Test(TestDecl),
+}
+
+/// Bloque de test integrado `test "nombre" { ... }` (PLAN.md §5, Eje 2)
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestDecl {
+    pub name: String,
+    pub name_span: Option<Span>,
+    pub body: Block,
+    pub span: Span,
 }
 
 /// `db { users: User[], posts: Post[] }` (GRAMMAR.md §2.1) -- "DB tipada"

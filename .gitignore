@@ -1,5 +1,7 @@
 /compiler/target/
 /frontend/node_modules/
+/editors/vscode/node_modules/
+/editors/vscode/out/
 /gen/
 .claude/
 

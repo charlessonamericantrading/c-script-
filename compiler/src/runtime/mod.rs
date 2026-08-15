@@ -74,6 +74,8 @@ pub enum Value {
     /// Marcador interno del identificador `auth` (GRAMMAR.md §3.14, auth
     /// v0) -- mismo trato que `Db`: nunca llega a `value_to_json`.
     Auth,
+    /// Marcador interno para el nombre de un Service (ej. `Users` en `Users.create`)
+    Service(String),
     BoundMethod(Box<Value>, String),
     /// Una `fn` de nivel superior referenciada POR NOMBRE, ej. `let g = add_one;`
     /// (GRAMMAR.md §3.10). Es una REFERENCIA a función (como un `fn` pointer
@@ -109,6 +111,7 @@ impl PartialEq for Value {
             (Db, Db) => true,
             (DbCollection(a), DbCollection(b)) => a == b,
             (Auth, Auth) => true,
+            (Service(a), Service(b)) => a == b,
             (BoundMethod(a, m1), BoundMethod(b, m2)) => a == b && m1 == m2,
             (FnRef(a), FnRef(b)) => a == b,
             // Nunca iguales, ni siquiera el mismo closure consigo mismo --
@@ -143,6 +146,7 @@ impl std::fmt::Debug for Value {
             Value::Db => write!(f, "Db"),
             Value::DbCollection(name) => f.debug_tuple("DbCollection").field(name).finish(),
             Value::Auth => write!(f, "Auth"),
+            Value::Service(name) => f.debug_tuple("Service").field(name).finish(),
             Value::BoundMethod(recv, method) => f.debug_tuple("BoundMethod").field(recv).field(method).finish(),
             Value::FnRef(name) => f.debug_tuple("FnRef").field(name).finish(),
             // A propósito NO imprime `captured_env` -- podría ser cíclico
@@ -344,6 +348,18 @@ pub(crate) fn eval_expr(
             if fns.contains_key(name.as_str()) {
                 return Ok(Value::FnRef(name.clone()));
             }
+            if name == "now" {
+                return Ok(Value::FnRef("now".to_string()));
+            }
+            if name == "assert" {
+                return Ok(Value::FnRef("assert".to_string()));
+            }
+            if name == "panic" {
+                return Ok(Value::FnRef("panic".to_string()));
+            }
+            if checker.services.contains_key(name.as_str()) {
+                return Ok(Value::Service(name.clone()));
+            }
             Err(err(format!("variable no declarada en runtime: '{name}'")))
         }
         Expr::FieldAccess { base, field } => {
@@ -367,7 +383,7 @@ pub(crate) fn eval_expr(
                 // Métodos builtin sobre primitivos (GRAMMAR.md §3.8, ej.
                 // `x.toFloat()`) usan el mismo BoundMethod que db/listas/auth --
                 // el checker ya validó que el nombre existe para este tipo.
-                Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Auth => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Auth => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -378,9 +394,44 @@ pub(crate) fn eval_expr(
             // frecuente que evita pasar por FnRef (ver Expr::Ident arriba)
             // solo para volver a buscar el mismo nombre en `fns`.
             if let Expr::Ident(name) = &callee.node {
-                if let Some(decl) = fns.get(name.as_str()) {
-                    let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
-                    return call_fn_decl(decl, arg_vs, db, fns, checker, sessions, current_token, step_budget);
+                if !env.contains_key(name.as_str()) {
+                    if let Some(decl) = fns.get(name.as_str()) {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_fn_decl(decl, arg_vs, db, fns, checker, sessions, current_token, step_budget);
+                    }
+                    if name == "now" {
+                        if !args.is_empty() {
+                            return Err(err("'now' no toma argumentos"));
+                        }
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        return Ok(Value::Timestamp(now_ms));
+                    }
+                    if name == "assert" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        let cond = match arg_vs.first() {
+                            Some(Value::Bool(b)) => *b,
+                            _ => return Err(err("'assert' requiere un primer argumento Bool")),
+                        };
+                        if !cond {
+                            let msg = match arg_vs.get(1) {
+                                Some(Value::Str(s)) => format!("asercion fallida: {s}"),
+                                _ => "asercion fallida".to_string(),
+                            };
+                            return Err(err(msg));
+                        }
+                        return Ok(Value::Null);
+                    }
+                    if name == "panic" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        let msg = match arg_vs.first() {
+                            Some(Value::Str(s)) => format!("panic: {s}"),
+                            _ => "panic".to_string(),
+                        };
+                        return Err(err(msg));
+                    }
                 }
             }
             let callee_v = eval_expr(callee, env, db, fns, checker, sessions, current_token, step_budget)?;
@@ -646,6 +697,24 @@ fn call_fn_decl(
     eval_block(&decl.body, &fn_env, db, fns, checker, sessions, current_token, step_budget)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn call_rpc_decl(
+    decl: &RpcDecl,
+    arg_vs: Vec<Value>,
+    db: &Db,
+    fns: &Fns,
+    checker: &Checker,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
+    step_budget: &Cell<u64>,
+) -> Result<Value, RuntimeError> {
+    let mut rpc_env = Env::new();
+    for (p, v) in decl.params.iter().zip(arg_vs) {
+        rpc_env.insert(p.name.clone(), cell(v));
+    }
+    eval_block(&decl.body, &rpc_env, db, fns, checker, sessions, current_token, step_budget)
+}
+
 fn try_match_pattern(pattern: &Pattern, v: &Value, checker: &Checker) -> Option<Vec<(String, Value)>> {
     match pattern {
         Pattern::Bind(name) => Some(vec![(name.clone(), v.clone())]),
@@ -818,6 +887,37 @@ fn call_callable(
 ) -> Result<Value, RuntimeError> {
     match v {
         Value::FnRef(name) => {
+            if name == "now" && !fns.contains_key("now") {
+                if !arg_vs.is_empty() {
+                    return Err(err("'now' no toma argumentos"));
+                }
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                return Ok(Value::Timestamp(now_ms));
+            }
+            if name == "assert" && !fns.contains_key("assert") {
+                let cond = match arg_vs.first() {
+                    Some(Value::Bool(b)) => *b,
+                    _ => return Err(err("'assert' requiere un primer argumento Bool")),
+                };
+                if !cond {
+                    let msg = match arg_vs.get(1) {
+                        Some(Value::Str(s)) => format!("asercion fallida: {s}"),
+                        _ => "asercion fallida".to_string(),
+                    };
+                    return Err(err(msg));
+                }
+                return Ok(Value::Null);
+            }
+            if name == "panic" && !fns.contains_key("panic") {
+                let msg = match arg_vs.first() {
+                    Some(Value::Str(s)) => format!("panic: {s}"),
+                    _ => "panic".to_string(),
+                };
+                return Err(err(msg));
+            }
             let decl = fns
                 .get(name.as_str())
                 .ok_or_else(|| err(format!("fn desconocida: '{name}'")))?;
@@ -955,6 +1055,14 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre auth: '{other}'"))),
         },
+        Value::Service(s_name) => {
+            let service = checker.service_decls.get(&s_name).ok_or_else(|| err(format!("service desconocido: '{s_name}'")))?;
+            let rpc = service.members.iter().find_map(|m| match m {
+                Member::Rpc(r) | Member::Stream(r) if r.name == method => Some(r),
+                _ => None,
+            }).ok_or_else(|| err(format!("rpc desconocido: '{s_name}.{method}'")))?;
+            call_rpc_decl(rpc, args, db, fns, checker, sessions, current_token, step_budget)
+        }
         other => Err(err(format!("no se puede invocar '{method}' sobre {other:?}"))),
     }
 }
@@ -977,6 +1085,60 @@ pub(crate) fn as_int(v: &Value) -> Result<i64, RuntimeError> {
 /// sites ejercitan). El servidor real (`runtime/server.rs`) llama
 /// `invoke_rpc_with_sessions` directamente, con el `SessionStore` que vive
 /// mientras el proceso corre y el token que trajo la request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TestSummary {
+    pub total: usize,
+    pub passed: usize,
+    pub failed: Vec<(String, String)>,
+}
+
+/// Ejecuta todos los bloques `test "nombre" { ... }` declarados en el programa
+/// (PLAN.md §5, Eje 2). Cada test corre con su propio entorno y base de datos
+/// SQLite en memoria (`:memory:`) aislada, asegurando independencia total.
+pub fn run_program_tests(program: &Program) -> Result<TestSummary, RuntimeError> {
+    let (checker, errors) = Checker::check_program_full(program, &[]);
+    if let Some(first) = errors.into_iter().next() {
+        return Err(RuntimeError::new(first.message));
+    }
+    let fns: Fns = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Fn(f) => Some((f.name.clone(), f)),
+            _ => None,
+        })
+        .collect();
+
+    let tests: Vec<&TestDecl> = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Test(t) => Some(t),
+            _ => None,
+        })
+        .collect();
+
+    let mut passed = 0;
+    let mut failed = Vec::new();
+
+    for test in &tests {
+        let db = Db::new(program, std::path::Path::new(":memory:"));
+        let sessions = SessionStore::new();
+        let step_budget = Cell::new(1_000_000);
+        let env = Env::new();
+        match eval_block(&test.body, &env, &db, &fns, &checker, &sessions, None, &step_budget) {
+            Ok(_) => passed += 1,
+            Err(e) => failed.push((test.name.clone(), e.message)),
+        }
+    }
+
+    Ok(TestSummary {
+        total: tests.len(),
+        passed,
+        failed,
+    })
+}
+
 pub fn invoke_rpc(
     program: &Program,
     service_name: &str,
@@ -1493,7 +1655,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -2314,6 +2476,19 @@ mod tests {
     }
 
     #[test]
+    fn now_returns_valid_iso8601_timestamp_in_runtime() {
+        let tokens = crate::lexer::tokenize("service S { rpc current() -> Timestamp { now() } }").unwrap();
+        let program = crate::parser::parse(tokens).unwrap();
+        let db = Db::seeded();
+        let res = invoke_rpc(&program, "S", "current", &json!({}), &db).unwrap();
+        let s = res.as_str().expect("now() debe devolver string ISO-8601");
+        let parsed = timestamp::parse_iso8601_millis(s);
+        assert!(parsed.is_some(), "now() devolvió un timestamp inválido: {s}");
+        // Debe ser posterior al año 2024 (milisegundos > 1_700_000_000_000)
+        assert!(parsed.unwrap() > 1_700_000_000_000);
+    }
+
+    #[test]
     fn extra_fields_are_accepted_but_dropped() {
         // Aceptarlos es coherente con el subtipado de ancho (GRAMMAR.md
         // §3.2); descartarlos es lo que evita que se persistan y salgan
@@ -2841,5 +3016,68 @@ mod tests {
 
         let changed = program_from("type Item = { id: Int, name: String, extra: Int } db { items: Item[] }");
         let _ = Db::new(&changed, &path); // tiene que hacer panic acá, con el archivo ya dejado atrás para la próxima corrida
+    }
+
+    // ---- test runner integrado y aislamiento (PLAN.md §5, Eje 2) ----
+
+    #[test]
+    fn run_program_tests_executes_tests_with_isolated_db_state() {
+        let code = r#"
+        type Item = { id: Int, name: String }
+        db { items: Item[] }
+
+        service ItemsService {
+            rpc create(name: String) -> Item {
+                db.items.insert(Item { id: 0, name: name })
+            }
+            rpc count() -> Int {
+                db.items.all().length()
+            }
+        }
+
+        test "primer test inserta y valida cuenta 1" {
+            let item = ItemsService.create("Primer Item");
+            assert(item.name == "Primer Item");
+            assert(ItemsService.count() == 1, "deberia haber 1 item");
+        }
+
+        test "segundo test empieza con base de datos limpia y aislada" {
+            // El estado de la DB anterior no debe contaminar este test
+            assert(ItemsService.count() == 0, "la base de datos debe estar limpia");
+            let item = ItemsService.create("Segundo Item");
+            assert(ItemsService.count() == 1);
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("los tests deberian correr");
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.passed, 2);
+        assert!(summary.failed.is_empty());
+    }
+
+    #[test]
+    fn run_program_tests_reports_assertion_and_panic_failures() {
+        let code = r#"
+        test "test que pasa" {
+            assert(1 + 1 == 2);
+        }
+
+        test "test que falla por asercion" {
+            assert(false, "condicion esperada falsa");
+        }
+
+        test "test que falla por panic" {
+            panic("algo exploto");
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests");
+        assert_eq!(summary.total, 3);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.failed.len(), 2);
+        assert_eq!(summary.failed[0].0, "test que falla por asercion");
+        assert!(summary.failed[0].1.contains("condicion esperada falsa"));
+        assert_eq!(summary.failed[1].0, "test que falla por panic");
+        assert!(summary.failed[1].1.contains("algo exploto"));
     }
 }

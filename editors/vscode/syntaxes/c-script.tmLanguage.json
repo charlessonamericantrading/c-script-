@@ -31,7 +31,11 @@
         },
         {
           "name": "keyword.other.declaration.link",
-          "match": "\\b(type|enum|service|rpc|stream|db|fn|let|mut|const|import|from|pub)\\b"
+          "match": "\\b(type|enum|service|rpc|stream|db|fn|let|mut|const|import|from|pub|test)\\b"
+        },
+        {
+          "name": "support.function.builtin.link",
+          "match": "\\b(assert|panic|now)\\b"
         },
         {
           "name": "constant.language.link",
@@ -43,11 +47,11 @@
       "patterns": [
         {
           "name": "entity.name.type.primitive.link",
-          "match": "\\b(Int|Float|String|Bool|Void)\\b"
+          "match": "\\b(Int|Int64|Float|String|Bool|Void|Timestamp)\\b"
         },
         {
           "name": "entity.name.type.builtin.link",
-          "match": "\\b(Result|Patch)\\b"
+          "match": "\\b(Result|Patch|Map)\\b"
         },
         {
           "name": "entity.name.type.custom.link",

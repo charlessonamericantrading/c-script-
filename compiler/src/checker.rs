@@ -64,6 +64,49 @@ impl CheckError {
     }
 }
 
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut dp = vec![vec![0; b_chars.len() + 1]; a_chars.len() + 1];
+
+    for i in 0..=a_chars.len() {
+        dp[i][0] = i;
+    }
+    for j in 0..=b_chars.len() {
+        dp[0][j] = j;
+    }
+
+    for (i, ca) in a_chars.iter().enumerate() {
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            dp[i + 1][j + 1] = std::cmp::min(
+                std::cmp::min(dp[i][j + 1] + 1, dp[i + 1][j] + 1),
+                dp[i][j] + cost,
+            );
+        }
+    }
+
+    dp[a_chars.len()][b_chars.len()]
+}
+
+pub(crate) fn find_best_suggestion<'a>(target: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut best: Option<(&'a str, usize)> = None;
+    for cand in candidates {
+        let dist = levenshtein_distance(target, cand);
+        let max_allowed = if target.len() <= 3 { 1 } else { 2 };
+        if dist <= max_allowed {
+            if let Some((_, best_dist)) = best {
+                if dist < best_dist {
+                    best = Some((cand, dist));
+                }
+            } else {
+                best = Some((cand, dist));
+            }
+        }
+    }
+    best.map(|(s, _)| s.to_string())
+}
+
 /// Cada binding rastrea su tipo Y si se declaró `mut` -- lo segundo es lo
 /// que `check_block` consulta al validar un `assign_stmt` (GRAMMAR.md §2.3).
 #[derive(Clone)]
@@ -290,6 +333,8 @@ pub struct Checker {
     pub(crate) types: HashMap<String, TypeDecl>,
     pub(crate) enums: HashMap<String, EnumDecl>,
     fns: HashMap<String, (Vec<Type>, Type)>,
+    pub(crate) services: HashMap<String, HashMap<String, (Vec<Type>, Type)>>,
+    pub(crate) service_decls: HashMap<String, ServiceDecl>,
     /// Nombre de colección -> tipo de elemento ya resuelto, desde `db {
     /// ... }` (GRAMMAR.md §2.1, DbDecl). Vacío si el programa no declara
     /// ninguna `db` -- en ese caso `db` sigue existiendo como identificador
@@ -332,6 +377,8 @@ impl Checker {
             types: HashMap::new(),
             enums: HashMap::new(),
             fns: HashMap::new(),
+            services: HashMap::new(),
+            service_decls: HashMap::new(),
             db_collections: HashMap::new(),
             consts: HashMap::new(),
             hover_target: None,
@@ -426,6 +473,22 @@ impl Checker {
                         Err(e) => errors.push(e.with_span(db.span)),
                     }
                 }
+            }
+        }
+
+        for item in &program.items {
+            if let Item::Service(s) = item {
+                let mut methods = HashMap::new();
+                for m in &s.members {
+                    let rpc = match m {
+                        Member::Rpc(r) | Member::Stream(r) => r,
+                    };
+                    if let Ok(sig) = checker.resolve_rpc_signature(rpc) {
+                        methods.insert(rpc.name.clone(), sig);
+                    }
+                }
+                checker.services.insert(s.name.clone(), methods);
+                checker.service_decls.insert(s.name.clone(), s.clone());
             }
         }
 
@@ -602,6 +665,15 @@ impl Checker {
                         errors.push(e);
                     }
                 }
+                Item::Test(t) => {
+                    if let Err(e) = checker.check_test(t) {
+                        let mut e = e.with_span(t.span);
+                        if let Some(file) = file_for(index) {
+                            e = e.with_file(file);
+                        }
+                        errors.push(e);
+                    }
+                }
                 _ => {}
             }
         }
@@ -643,6 +715,9 @@ impl Checker {
             match item {
                 Item::Fn(f) if in_body(&f.body) => {
                     let _ = checker.check_fn(f);
+                }
+                Item::Test(t) if in_body(&t.body) => {
+                    let _ = checker.check_test(t);
                 }
                 Item::Service(s) => {
                     for m in &s.members {
@@ -838,7 +913,14 @@ impl Checker {
                         Ok(Type::Generic(name.to_string(), resolved_args))
                     }
                 } else {
-                    Err(err(format!("tipo desconocido: '{name}'")))
+                    let mut candidates: Vec<&str> = vec!["Int", "Int64", "Timestamp", "Float", "String", "Bool", "Void", "Result", "Patch", "Map"];
+                    candidates.extend(self.types.keys().map(String::as_str));
+                    candidates.extend(self.enums.keys().map(String::as_str));
+                    if let Some(sug) = find_best_suggestion(name, candidates) {
+                        Err(err(format!("tipo desconocido: '{name}' -- ¿quisiste decir '{sug}'?")))
+                    } else {
+                        Err(err(format!("tipo desconocido: '{name}'")))
+                    }
                 }
             }
         }
@@ -875,7 +957,30 @@ impl Checker {
         Ok((params, self.resolve_type(&f.return_type)?))
     }
 
+    fn resolve_rpc_signature(&self, rpc: &RpcDecl) -> Result<(Vec<Type>, Type), CheckError> {
+        let mut params = Vec::new();
+        for p in &rpc.params {
+            params.push(self.resolve_type(&p.ty)?);
+        }
+        Ok((params, self.resolve_type(&rpc.return_type)?))
+    }
+
     // ---- ítems de nivel superior ----
+
+    fn check_test(&self, t: &TestDecl) -> Result<(), CheckError> {
+        let mut local = Env::new();
+        for stmt in &t.body.stmts {
+            self.check_stmt(stmt, &Type::Void, &mut local).map_err(|ce| ce.with_span(stmt.span))?;
+        }
+        if let Some(tail) = &t.body.tail {
+            if matches!(tail.node, Expr::If { .. } | Expr::Match { .. }) {
+                self.check_expr(tail, &Type::Void, &local)?;
+            } else {
+                self.synth_expr(tail, &local)?;
+            }
+        }
+        Ok(())
+    }
 
     fn check_fn(&self, f: &FnDecl) -> Result<(), CheckError> {
         let ret = self.resolve_type(&f.return_type)?;
@@ -1858,6 +1963,18 @@ impl Checker {
                 if name == "auth" {
                     return Ok(Type::Auth);
                 }
+                if name == "now" {
+                    return Ok(Type::Function(vec![], Box::new(Type::Timestamp)));
+                }
+                if name == "assert" {
+                    return Ok(Type::Function(vec![Type::Bool], Box::new(Type::Void)));
+                }
+                if name == "panic" {
+                    return Ok(Type::Function(vec![Type::String], Box::new(Type::Void)));
+                }
+                if self.services.contains_key(name) {
+                    return Ok(Type::Service(name.clone()));
+                }
                 // Un `const` de nivel superior es visible desde cualquier
                 // cuerpo, igual que una `fn`. Faltaba: se declaraba y se
                 // emitía, pero usarlo daba "variable no declarada".
@@ -1867,35 +1984,78 @@ impl Checker {
                 if let Some((params, ret)) = self.fns.get(name) {
                     return Ok(Type::Function(params.clone(), Box::new(ret.clone())));
                 }
-                Err(err(format!("variable no declarada: '{name}'")))
+                let mut candidates: Vec<&str> = vec!["db", "auth", "now", "assert", "panic"];
+                candidates.extend(env.keys().map(String::as_str));
+                candidates.extend(self.consts.keys().map(String::as_str));
+                candidates.extend(self.fns.keys().map(String::as_str));
+                candidates.extend(self.services.keys().map(String::as_str));
+                if let Some(sug) = find_best_suggestion(name, candidates) {
+                    Err(err(format!("variable no declarada: '{name}' -- ¿quisiste decir '{sug}'?")))
+                } else {
+                    Err(err(format!("variable no declarada: '{name}'")))
+                }
             }
             Expr::FieldAccess { base, field } => {
                 let base_ty = self.synth_expr(base, env)?;
                 match base_ty {
                     Type::Dynamic => Ok(Type::Dynamic),
-                    Type::Struct { fields, .. } => fields
-                        .iter()
-                        .find(|f| &f.name == field)
-                        .map(field_access_ty)
-                        .ok_or_else(|| err(format!("el struct no tiene campo '{field}'"))),
+                    Type::Service(s_name) => {
+                        let methods = self.services.get(&s_name).ok_or_else(|| err(format!("service desconocido: '{s_name}'")))?;
+                        if let Some((params, ret)) = methods.get(field.as_str()) {
+                            Ok(Type::Function(params.clone(), Box::new(ret.clone())))
+                        } else if let Some(sug) = find_best_suggestion(field, methods.keys().map(String::as_str)) {
+                            Err(err(format!("el service '{s_name}' no tiene ningún rpc '{field}' -- ¿quisiste decir '{sug}'?")))
+                        } else {
+                            Err(err(format!("el service '{s_name}' no tiene ningún rpc '{field}'")))
+                        }
+                    }
+                    Type::Struct { fields, .. } => {
+                        if let Some(f) = fields.iter().find(|f| &f.name == field) {
+                            Ok(field_access_ty(f))
+                        } else if let Some(sug) = find_best_suggestion(field, fields.iter().map(|f| f.name.as_str())) {
+                            Err(err(format!("el struct no tiene campo '{field}' -- ¿quisiste decir '{sug}'?")))
+                        } else {
+                            Err(err(format!("el struct no tiene campo '{field}'")))
+                        }
+                    }
                     // struct genérico instanciado, ej. una variable Box<Int>
-                    Type::Generic(name, args) => self
-                        .expand_generic_struct(&name, &args)?
-                        .iter()
-                        .find(|f| &f.name == field)
-                        .map(field_access_ty)
-                        .ok_or_else(|| err(format!("el struct no tiene campo '{field}'"))),
+                    Type::Generic(name, args) => {
+                        let s_fields = self.expand_generic_struct(&name, &args)?;
+                        if let Some(f) = s_fields.iter().find(|f| &f.name == field) {
+                            Ok(field_access_ty(f))
+                        } else if let Some(sug) = find_best_suggestion(field, s_fields.iter().map(|f| f.name.as_str())) {
+                            Err(err(format!("el struct no tiene campo '{field}' -- ¿quisiste decir '{sug}'?")))
+                        } else {
+                            Err(err(format!("el struct no tiene campo '{field}'")))
+                        }
+                    }
                     // `db.<coleccion>` -- nombre desconocido ya es un error
                     // acá mismo, no `Dynamic` dejando pasar cualquier cosa.
-                    Type::Db => self
-                        .db_collections
-                        .get(field.as_str())
-                        .map(|element_ty| Type::DbCollection(Box::new(element_ty.clone())))
-                        .ok_or_else(|| err(format!("'db' no tiene ninguna colección llamada '{field}'"))),
+                    Type::Db => {
+                        if let Some(element_ty) = self.db_collections.get(field.as_str()) {
+                            Ok(Type::DbCollection(Box::new(element_ty.clone())))
+                        } else if let Some(sug) = find_best_suggestion(field, self.db_collections.keys().map(String::as_str)) {
+                            Err(err(format!("'db' no tiene ninguna colección llamada '{field}' -- ¿quisiste decir '{sug}'?")))
+                        } else {
+                            Err(err(format!("'db' no tiene ninguna colección llamada '{field}'")))
+                        }
+                    }
                     other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
                 }
             }
             Expr::Call { callee, args } => {
+                if let Expr::Ident(name) = &callee.node {
+                    if name == "assert" && !env.contains_key("assert") && !self.fns.contains_key("assert") {
+                        if args.is_empty() || args.len() > 2 {
+                            return Err(err("'assert' toma 1 o 2 argumentos: assert(cond: Bool, [msg: String])"));
+                        }
+                        self.check_expr(&args[0], &Type::Bool, env)?;
+                        if let Some(msg) = args.get(1) {
+                            self.check_expr(msg, &Type::String, env)?;
+                        }
+                        return Ok(Type::Void);
+                    }
+                }
                 if let Some(ty) = self.try_builtin_method(callee, args, env)? {
                     return Ok(ty);
                 }
@@ -2964,6 +3124,14 @@ mod tests {
             "type Event = { at: Timestamp }\nservice S { rpc log(at: Timestamp) -> Event { Event { at: at } } }"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn now_builtin_returns_timestamp_and_rejects_arguments() {
+        assert!(check_source("fn current() -> Timestamp { now() }").is_ok());
+        assert!(check_source("fn current() -> Timestamp { let f = now; f() }").is_ok());
+        assert!(check_source("fn bad() -> Timestamp { now(123) }").is_err());
+        assert!(check_source("fn bad_ret() -> Int { now() }").is_err());
     }
 
     #[test]
@@ -4223,5 +4391,69 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("cuerpo COMPLETO de un stream"), "{msg}");
+    }
+
+    // ---- test blocks, assert, panic y service calls (Eje 2) ----
+
+    #[test]
+    fn test_block_typechecks_valid_statements() {
+        let src = r#"
+            service Users {
+                rpc list() -> Int { 42 }
+            }
+            test "invocar service y assert" {
+                let n = Users.list();
+                assert(n == 42);
+                assert(n > 0, "debe ser positivo");
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn test_assert_rejects_non_bool_condition() {
+        let src = r#"
+            test "condicion invalida" {
+                assert(123);
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_assert_rejects_non_string_message() {
+        let src = r#"
+            test "mensaje invalido" {
+                assert(true, 456);
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_panic_typechecks_string_message() {
+        let src = r#"
+            test "usar panic" {
+                panic("algo salio mal");
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn did_you_mean_suggests_similar_variable_and_type_names() {
+        let src_var = "fn f() -> Int { let count = 10; coutn + 1 }";
+        let err_var = check_source(src_var).unwrap_err();
+        assert!(err_var[0].message.contains("¿quisiste decir 'count'?"), "{}", err_var[0].message);
+
+        let src_type = "fn f(x: Sttring) -> Int { 0 }";
+        let err_type = check_source(src_type).unwrap_err();
+        assert!(err_type[0].message.contains("¿quisiste decir 'String'?"), "{}", err_type[0].message);
+
+        let src_field = "type User = { name: String } fn f(u: User) -> String { u.nmae }";
+        let err_field = check_source(src_field).unwrap_err();
+        assert!(err_field[0].message.contains("¿quisiste decir 'name'?"), "{}", err_field[0].message);
     }
 }
