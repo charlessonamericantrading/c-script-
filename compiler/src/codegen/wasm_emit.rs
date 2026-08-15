@@ -500,6 +500,57 @@ pub fn emit_wasm(program: &Program) -> Result<Vec<u8>, String> {
     Ok(module.finish())
 }
 
+/// Emite un loader TypeScript/JavaScript tipado (`wasm_runner.ts`) para ejecutar el módulo WASM compilado.
+pub fn emit_wasm_loader(program: &Program) -> String {
+    let mut methods_ts = Vec::new();
+    for item in &program.items {
+        match item {
+            Item::Fn(f) => {
+                let params: Vec<String> = f.params.iter().map(|p| format!("{}: number", p.name)).collect();
+                methods_ts.push(format!("  {}({}): number;", f.name, params.join(", ")));
+            }
+            Item::Service(s) => {
+                for m in &s.members {
+                    let rpc = match m {
+                        ast::Member::Rpc(r) | ast::Member::Stream(r) => r,
+                    };
+                    let params: Vec<String> = rpc.params.iter().map(|p| format!("{}: number", p.name)).collect();
+                    methods_ts.push(format!("  {}_{}({}): number;", s.name, rpc.name, params.join(", ")));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    format!(
+r#"// Loader TypeScript tipado para módulo WebAssembly generado por Link (`linkc wasm`).
+// Provee bindings automáticos y acceso a memoria lineal compartida.
+
+export interface LinkWasmExports {{
+  memory: WebAssembly.Memory;
+{}
+}}
+
+export async function instantiateLinkWasm(source: BufferSource | Response | Promise<Response>): Promise<LinkWasmExports> {{
+  let instance: WebAssembly.Instance;
+  const importObject = {{
+    env: {{
+      abort: () => {{ throw new Error("WASM execution aborted"); }}
+    }}
+  }};
+
+  if (source instanceof Response || source instanceof Promise) {{
+    const res = await WebAssembly.instantiateStreaming(source, importObject);
+    instance = res.instance;
+  }} else {{
+    const res = await WebAssembly.instantiate(source, importObject);
+    instance = res.instance;
+  }}
+
+  return instance.exports as unknown as LinkWasmExports;
+}}
+"#, methods_ts.join("\n"))
+}
 
 #[cfg(test)]
 mod tests {

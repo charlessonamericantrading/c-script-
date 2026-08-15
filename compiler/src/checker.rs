@@ -1972,6 +1972,12 @@ impl Checker {
                 if name == "http" {
                     return Ok(Type::Http);
                 }
+                if name == "json" {
+                    return Ok(Type::Json);
+                }
+                if name == "base64" {
+                    return Ok(Type::Base64);
+                }
                 if name == "now" {
                     return Ok(Type::Function(vec![], Box::new(Type::Timestamp)));
                 }
@@ -2456,6 +2462,10 @@ impl Checker {
                 self.check_expr(hash, &Type::String, env)?;
                 Some(Type::Bool)
             }
+            (Type::Crypto, "uuid") => {
+                self.expect_no_args(args, "uuid")?;
+                Some(Type::String)
+            }
             (Type::Http, "get") => {
                 let [url] = args else {
                     return Err(err("'http.get' toma exactamente 1 argumento (url: String)"));
@@ -2470,6 +2480,45 @@ impl Checker {
                 self.check_expr(url, &Type::String, env)?;
                 self.check_expr(body, &Type::String, env)?;
                 Some(Type::String)
+            }
+            (Type::Json, "parse") => {
+                let [str_arg] = args else {
+                    return Err(err("'json.parse' toma exactamente 1 argumento (text: String)"));
+                };
+                self.check_expr(str_arg, &Type::String, env)?;
+                Some(Type::Dynamic)
+            }
+            (Type::Json, "stringify") => {
+                let [val_arg] = args else {
+                    return Err(err("'json.stringify' toma exactamente 1 argumento (value: Dynamic)"));
+                };
+                self.synth_expr(val_arg, env)?;
+                Some(Type::String)
+            }
+            (Type::Base64, "encode") => {
+                let [str_arg] = args else {
+                    return Err(err("'base64.encode' toma exactamente 1 argumento (data: String)"));
+                };
+                self.check_expr(str_arg, &Type::String, env)?;
+                Some(Type::String)
+            }
+            (Type::Base64, "decode") => {
+                let [str_arg] = args else {
+                    return Err(err("'base64.decode' toma exactamente 1 argumento (base64_str: String)"));
+                };
+                self.check_expr(str_arg, &Type::String, env)?;
+                Some(Type::String)
+            }
+            (Type::List(_inner), "join") => {
+                let [sep_arg] = args else {
+                    return Err(err("'join' toma exactamente 1 argumento (sep: String)"));
+                };
+                self.check_expr(sep_arg, &Type::String, env)?;
+                Some(Type::String)
+            }
+            (Type::List(inner), "reverse") => {
+                self.expect_no_args(args, "reverse")?;
+                Some(Type::List(inner.clone()))
             }
             (Type::List(inner), "take") => {
                 let [n_arg] = args else {
@@ -2635,6 +2684,10 @@ impl Checker {
                 let pred_ty = Type::Function(vec![element_ty.clone()], Box::new(Type::Bool));
                 self.check_expr(pred_arg, &pred_ty, env)?;
                 Ok(Type::List(Box::new(element_ty.clone())))
+            }
+            "count" => {
+                self.expect_no_args(args, "count")?;
+                Ok(Type::Int)
             }
 
 

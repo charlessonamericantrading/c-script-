@@ -85,6 +85,7 @@ fn main() -> ExitCode {
         Some("wasm") => cmd_wasm(&args[2..]),
         Some("fmt") => cmd_fmt(&args[2..]),
         Some("lint") => cmd_lint(&args[2..]),
+        Some("doc") => cmd_doc(&args[2..]),
         Some(path) => cmd_check(path), // `linkc <archivo.link>` -- solo lex+parse+check
         None => {
             eprintln!("uso: linkc <subcomando> [opciones]");
@@ -94,7 +95,8 @@ fn main() -> ExitCode {
             eprintln!("     linkc test <archivo.link>              (ejecuta pruebas de comportamiento integradas)");
             eprintln!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)");
             eprintln!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)");
-            eprintln!("     linkc lint <archivo.link>              (analiza calidad de código y detecta variables sin uso)");
+            eprintln!("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)");
+            eprintln!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)");
             eprintln!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)");
             eprintln!("     linkc serve <archivo.link> <puerto>    (inicia servidor HTTP con SQLite embebido)");
             eprintln!("     linkc lsp                              (inicia el servidor Language Server Protocol)");
@@ -146,10 +148,11 @@ fn cmd_fmt(args: &[String]) -> ExitCode {
 }
 
 fn cmd_lint(args: &[String]) -> ExitCode {
-    let Some(path) = args.first() else {
-        eprintln!("uso: linkc lint <archivo.link>");
+    let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprintln!("uso: linkc lint <archivo.link> [--fix]");
         return ExitCode::FAILURE;
     };
+    let fix_mode = args.iter().any(|a| a == "--fix");
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
@@ -159,12 +162,46 @@ fn cmd_lint(args: &[String]) -> ExitCode {
         println!("OK: {path} pasó el análisis de lint sin advertencias");
         ExitCode::SUCCESS
     } else {
+        if fix_mode {
+            if let Ok(content) = fs::read_to_string(path) {
+                let fixed = linkc::lint::fix_source(&content, &warnings);
+                if fixed != content {
+                    let _ = fs::write(path, fixed);
+                    println!("lint --fix: correcciones automáticas aplicadas en {path}");
+                }
+            }
+        }
         println!("lint: {} advertencia(s) en {path}:", warnings.len());
         for w in &warnings {
             println!("  [{}] {}:{}:{}: {}", w.rule, path, w.line, w.col, w.message);
         }
         ExitCode::SUCCESS
     }
+}
+
+fn cmd_doc(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("uso: linkc doc <archivo.link> [outdir]");
+        return ExitCode::FAILURE;
+    };
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let html = linkc::doc::generate_html(&program, path);
+    let out_path = if let Some(dir) = args.get(1) {
+        let p = Path::new(dir);
+        let _ = fs::create_dir_all(p);
+        p.join("index.html")
+    } else {
+        Path::new(path).with_extension("html")
+    };
+    if let Err(e) = fs::write(&out_path, html) {
+        eprintln!("no se pudo escribir documentación en {}: {e}", out_path.display());
+        return ExitCode::FAILURE;
+    }
+    println!("documentación HTML generada en {}", out_path.display());
+    ExitCode::SUCCESS
 }
 
 fn cmd_wasm(args: &[String]) -> ExitCode {

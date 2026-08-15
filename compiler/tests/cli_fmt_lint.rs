@@ -104,3 +104,58 @@ fn linkc_lint_detects_unused_variables_and_empty_tests() {
     assert!(stdout.contains("unused-mut"), "{stdout}");
     assert!(stdout.contains("empty-test"), "{stdout}");
 }
+
+#[test]
+fn linkc_lint_fix_applies_autofixes_in_place() {
+    let temp = TempDir::new("lint-fix-test");
+    let src = "fn run(x: Int) -> Int {\n    let unused_val = 123;\n    let mut never_mutated = 456;\n    never_mutated + x\n}\n";
+    let file = temp.write("app.link", src);
+
+    let res = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("lint")
+        .arg(&file)
+        .arg("--fix")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(res.status.success());
+    let fixed = fs::read_to_string(&file).unwrap();
+    assert!(fixed.contains("let _unused_val = 123;"), "{fixed}");
+    assert!(fixed.contains("let never_mutated = 456;"), "{fixed}");
+}
+
+#[test]
+fn linkc_doc_generates_interactive_html() {
+    let temp = TempDir::new("doc-test");
+    let src = r#"
+    type User = { id: Int, name: String, email: String }
+    enum Role { Admin, Member }
+    service UserService {
+        @authenticated
+        rpc get(id: Int) -> User? { null }
+    }
+    "#;
+    let file = temp.write("api.link", src);
+    let out_dir = temp.0.join("apidocs");
+
+    let res = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("doc")
+        .arg(&file)
+        .arg(&out_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(res.status.success());
+    let html_file = out_dir.join("index.html");
+    assert!(html_file.exists());
+    let html = fs::read_to_string(&html_file).unwrap();
+    assert!(html.contains("UserService"));
+    assert!(html.contains("User"));
+    assert!(html.contains("Role"));
+    assert!(html.contains("@authenticated"));
+}
+

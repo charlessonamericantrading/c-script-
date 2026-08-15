@@ -180,6 +180,39 @@ fn expr_count_ident(expr: &Expr, target: &str) -> usize {
     }
 }
 
+/// Corrige automáticamente advertencias corregibles del linter (unused-mut y unused-var).
+pub fn fix_source(source: &str, _warnings: &[LintWarning]) -> String {
+    let mut fixed = source.to_string();
+    let Ok(tokens) = crate::lexer::tokenize(&fixed) else { return fixed; };
+    let Ok(program) = crate::parser::parse(tokens) else { return fixed; };
+    let warnings = lint_program(&program);
+
+    for w in warnings {
+        match w.rule {
+            "unused-mut" => {
+                if let Some(var_name) = w.message.split('\'').nth(1) {
+                    let target_mut = format!("let mut {var_name}");
+                    let repl = format!("let {var_name}");
+                    fixed = fixed.replace(&target_mut, &repl);
+                }
+            }
+            "unused-var" => {
+                if let Some(var_name) = w.message.split('\'').nth(1) {
+                    let target_let = format!("let {var_name}");
+                    let repl = format!("let _{var_name}");
+                    fixed = fixed.replace(&target_let, &repl);
+
+                    let target_mut = format!("let mut {var_name}");
+                    let repl_mut = format!("let _{var_name}");
+                    fixed = fixed.replace(&target_mut, &repl_mut);
+                }
+            }
+            _ => {}
+        }
+    }
+    fixed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +236,10 @@ mod tests {
         assert!(warnings.iter().any(|w| w.rule == "unused-var" && w.message.contains("unused")));
         assert!(warnings.iter().any(|w| w.rule == "unused-mut" && w.message.contains("never_changed")));
         assert!(warnings.iter().any(|w| w.rule == "empty-test"));
+
+        let fixed = fix_source(code, &warnings);
+        assert!(fixed.contains("let _unused = 42;"));
+        assert!(fixed.contains("let never_changed = 100;"));
     }
 }
+

@@ -232,8 +232,8 @@ fn type_key(ty: &Type) -> String {
         Type::Generic(name, args) => format!("{name}{}", args.iter().map(type_key).collect::<Vec<_>>().join("")),
         Type::TypeParam(name) => name.clone(),
         Type::Union(members) => format!("Union{}", members.iter().map(type_key).collect::<Vec<_>>().join("")),
-        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http => {
-            unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http nunca aparece en un TypeExpr real")
+        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 => {
+            unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64 nunca aparece en un TypeExpr real")
         }
     }
 }
@@ -332,8 +332,8 @@ fn render_check(ty: &Type, expr: &str, worklist: &mut Vec<Type>, seen: &mut Vec<
         Type::Enum(_) | Type::ResultOf(_, _) | Type::PatchOf(_) | Type::Generic(_, _) => {
             unreachable!("cubierto por validator_fn_name")
         }
-        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http => {
-            unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http nunca aparece en un TypeExpr real")
+        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 => {
+            unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64 nunca aparece en un TypeExpr real")
         }
     }
 }

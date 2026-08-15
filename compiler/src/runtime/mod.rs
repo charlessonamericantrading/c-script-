@@ -82,6 +82,10 @@ pub enum Value {
     Crypto,
     /// Marcador interno para el módulo `http`
     Http,
+    /// Marcador interno para el módulo `json`
+    Json,
+    /// Marcador interno para el módulo `base64`
+    Base64,
     BoundMethod(Box<Value>, String),
     /// Una `fn` de nivel superior referenciada POR NOMBRE, ej. `let g = add_one;`
     /// (GRAMMAR.md §3.10). Es una REFERENCIA a función (como un `fn` pointer
@@ -121,6 +125,8 @@ impl PartialEq for Value {
             (Math, Math) => true,
             (Crypto, Crypto) => true,
             (Http, Http) => true,
+            (Json, Json) => true,
+            (Base64, Base64) => true,
             (BoundMethod(a, m1), BoundMethod(b, m2)) => a == b && m1 == m2,
             (FnRef(a), FnRef(b)) => a == b,
             // Nunca iguales, ni siquiera el mismo closure consigo mismo --
@@ -159,6 +165,8 @@ impl std::fmt::Debug for Value {
             Value::Math => write!(f, "Math"),
             Value::Crypto => write!(f, "Crypto"),
             Value::Http => write!(f, "Http"),
+            Value::Json => write!(f, "Json"),
+            Value::Base64 => write!(f, "Base64"),
             Value::BoundMethod(recv, method) => f.debug_tuple("BoundMethod").field(recv).field(method).finish(),
             Value::FnRef(name) => f.debug_tuple("FnRef").field(name).finish(),
             // A propósito NO imprime `captured_env` -- podría ser cíclico
@@ -356,6 +364,12 @@ pub(crate) fn eval_expr(
             if name == "http" {
                 return Ok(Value::Http);
             }
+            if name == "json" {
+                return Ok(Value::Json);
+            }
+            if name == "base64" {
+                return Ok(Value::Base64);
+            }
             // Un `const` de nivel superior: su valor es siempre un literal
             // (el checker lo exige), así que evaluarlo en un env vacío no
             // depende de nada del scope actual.
@@ -392,7 +406,7 @@ pub(crate) fn eval_expr(
                     .map(|(_, v)| v)
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -1011,6 +1025,25 @@ fn call_method(
                 }
                 Ok(Value::List(mapped))
             }
+            "join" => {
+                let sep = match args.first() {
+                    Some(Value::Str(s)) => s.as_str(),
+                    _ => return Err(err("'join' requiere un separador String")),
+                };
+                let rendered: Vec<String> = items.iter().map(|item| match item {
+                    Value::Str(s) => s.clone(),
+                    Value::Int(n) => n.to_string(),
+                    Value::Float(f) => f.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    other => format!("{other:?}"),
+                }).collect();
+                Ok(Value::Str(rendered.join(sep)))
+            }
+            "reverse" => {
+                let mut rev = items;
+                rev.reverse();
+                Ok(Value::List(rev))
+            }
             other => Err(err(format!("método de lista desconocido: '{other}'"))),
         },
         Value::Int(n) => match method {
@@ -1170,7 +1203,65 @@ fn call_method(
                 let hex_str: String = result.iter().map(|b| format!("{:02x}", b)).collect();
                 Ok(Value::Bool(hex_str == expected))
             }
+            "uuid" => {
+                use sha2::{Sha256, Digest};
+                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+                let mut hasher = Sha256::new();
+                hasher.update(t.to_be_bytes());
+                let hash = hasher.finalize();
+                let s = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    hash[0], hash[1], hash[2], hash[3],
+                    hash[4], hash[5],
+                    (hash[6] & 0x0f), hash[7],
+                    (hash[8] & 0x3f) | 0x80, hash[9],
+                    hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]
+                );
+                Ok(Value::Str(s))
+            }
             other => Err(err(format!("método desconocido sobre crypto: '{other}'"))),
+        },
+        Value::Json => match method {
+            "parse" => {
+                let text = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("json.parse requiere un argumento String")),
+                };
+                let parsed: serde_json::Value = serde_json::from_str(text)
+                    .map_err(|e| err(format!("error al parsear JSON: {e}")))?;
+                Ok(json_to_value(&parsed))
+            }
+            "stringify" => {
+                let val = args.first().ok_or_else(|| err("json.stringify requiere 1 argumento"))?;
+                let json_v = value_to_json(val, &std::collections::HashSet::new());
+                let s = serde_json::to_string(&json_v)
+                    .map_err(|e| err(format!("error al serializar a JSON: {e}")))?;
+                Ok(Value::Str(s))
+            }
+            other => Err(err(format!("método desconocido sobre json: '{other}'"))),
+        },
+        Value::Base64 => match method {
+            "encode" => {
+                let data = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("base64.encode requiere un argumento String")),
+                };
+                use base64::Engine;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(data.as_bytes());
+                Ok(Value::Str(encoded))
+            }
+            "decode" => {
+                let data = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("base64.decode requiere un argumento String")),
+                };
+                use base64::Engine;
+                let decoded_bytes = base64::engine::general_purpose::STANDARD.decode(data.as_bytes())
+                    .map_err(|e| err(format!("error al decodificar base64: {e}")))?;
+                let s = String::from_utf8(decoded_bytes)
+                    .map_err(|e| err(format!("la secuencia decodificada no es UTF-8 válido: {e}")))?;
+                Ok(Value::Str(s))
+            }
+            other => Err(err(format!("método desconocido sobre base64: '{other}'"))),
         },
         Value::Http => match method {
             "get" => {
@@ -1838,7 +1929,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -3189,7 +3280,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "v0 no migra schemas automáticamente")]
+    #[should_panic(expected = "schema incompatible que no se puede migrar automáticamente")]
     fn reopening_with_an_incompatible_schema_panics_instead_of_silently_proceeding() {
         let path = std::env::temp_dir().join("c_script_test_schema_mismatch.db");
         let _ = std::fs::remove_file(&path);
@@ -3198,7 +3289,27 @@ mod tests {
         drop(Db::new(&original, &path));
 
         let changed = program_from("type Item = { id: Int, name: String, extra: Int } db { items: Item[] }");
-        let _ = Db::new(&changed, &path); // tiene que hacer panic acá, con el archivo ya dejado atrás para la próxima corrida
+        let _ = Db::new(&changed, &path); // tiene que hacer panic acá porque 'extra: Int' es NOT NULL sin default
+    }
+
+    #[test]
+    fn reopening_with_new_optional_field_auto_migrates_successfully() {
+        let path = std::env::temp_dir().join("c_script_test_schema_auto_migration.db");
+        let _ = std::fs::remove_file(&path);
+
+        let original = program_from("type Item = { id: Int, name: String } db { items: Item[] }");
+        {
+            let db = Db::new(&original, &path);
+            let _ = db.call("items", "insert", vec![Value::Struct(vec![("name".into(), Value::Str("Primer Item".into()))])]).unwrap();
+        }
+
+        // Abrir con un nuevo campo opcional: se auto-migra con ALTER TABLE ADD COLUMN sin error ni pérdida de datos
+        let evolved = program_from("type Item = { id: Int, name: String, note?: String } db { items: Item[] }");
+        let db_evolved = Db::new(&evolved, &path);
+        let items = db_evolved.call("items", "all", vec![]).unwrap();
+        let Value::List(rows) = items else { panic!("se esperaba lista"); };
+        assert_eq!(rows.len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     // ---- test runner integrado y aislamiento (PLAN.md §5, Eje 2) ----
@@ -3293,6 +3404,30 @@ mod tests {
             assert(s.trim().toLower() == "hola mundo");
             assert(s.trim().startsWith("Hola") == true);
             assert(s.trim().endsWith("Mundo") == true);
+
+            // UUID & Crypto
+            let u = crypto.uuid();
+            assert(u.length() == 36);
+            assert(u.contains("-"));
+
+            // JSON
+            let json_str = json.stringify("hola json");
+            assert(json_str == "\"hola json\"");
+            let parsed = json.parse("{\"status\": \"ok\", \"count\": 42}");
+            assert(parsed.status == "ok");
+            assert(parsed.count == 42);
+
+            // Base64
+            let encoded = base64.encode("Link Language");
+            assert(encoded == "TGluayBMYW5ndWFnZQ==");
+            let decoded = base64.decode(encoded);
+            assert(decoded == "Link Language");
+
+            // List utilities
+            let items: String[] = ["uno", "dos", "tres"];
+            assert(items.join(", ") == "uno, dos, tres");
+            let rev = items.reverse();
+            assert(rev.join("-") == "tres-dos-uno");
 
             // Timestamp
             let t = now();

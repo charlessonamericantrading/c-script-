@@ -320,6 +320,7 @@ dependencies = [
 name = "linkc"
 version = "1.0.0"
 dependencies = [
+ "base64",
  "rusqlite",
  "serde",
  "serde_json",

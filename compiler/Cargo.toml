@@ -24,3 +24,4 @@ wasm-encoder = "0.200"
 rusqlite = { version = "0.40", features = ["bundled"] }
 sha2 = "0.10"
 ureq = { version = "2.9", default-features = false }
+base64 = "0.22"

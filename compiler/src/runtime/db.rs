@@ -144,21 +144,36 @@ fn check_schema_matches(connection: &Connection, collection: &str, columns: &[Co
     for col in columns {
         expected.insert(col.field.name.clone(), (col.sql_type.to_string(), col.not_null()));
     }
-    let actual: HashMap<String, (String, bool)> =
+    let mut actual: HashMap<String, (String, bool)> =
         existing.into_iter().map(|(name, decl_type, notnull)| (name, (decl_type.to_uppercase(), notnull))).collect();
 
     if expected == actual {
         return Ok(());
     }
+
+    // Auto-migración no destructiva (Link 1.0): si hay columnas esperadas que no existen en la tabla física
+    // y son opcionales/nullable (no NOT NULL sin default), agregarlas con ALTER TABLE ADD COLUMN sin perder datos
+    for col in columns {
+        if !actual.contains_key(&col.field.name) && !col.not_null() {
+            let alter_sql = format!("ALTER TABLE \"{collection}\" ADD COLUMN \"{}\" {}", col.field.name, col.sql_type);
+            if connection.execute(&alter_sql, []).is_ok() {
+                actual.insert(col.field.name.clone(), (col.sql_type.to_string(), false));
+            }
+        }
+    }
+
+    if expected == actual {
+        return Ok(());
+    }
+
     let describe = |m: &HashMap<String, (String, bool)>| {
         let mut out: Vec<String> = m.iter().map(|(n, (t, nn))| format!("{n} {t}{}", if *nn { " NOT NULL" } else { "" })).collect();
         out.sort();
         out.join(", ")
     };
     Err(RuntimeError::new(format!(
-        "la colección '{collection}' en '{db_path}' ya existe pero con un schema distinto al que declara el programa ahora \
-         (esperado: [{}], encontrado: [{}]). v0 no migra schemas automáticamente: borrá '{db_path}' (se pierden los datos \
-         guardados) y volvé a intentar.",
+        "la colección '{collection}' en '{db_path}' ya existe pero con un schema incompatible que no se puede migrar automáticamente \
+         (esperado: [{}], encontrado: [{}]).",
         describe(&expected),
         describe(&actual),
     )))
@@ -366,6 +381,12 @@ db { users: User[] }
                     }
                 }
                 Ok(Value::Bool(rows_affected > 0))
+            }
+            "count" => {
+                let sql = format!("SELECT COUNT(*) FROM \"{collection}\"");
+                let mut stmt = self.connection.prepare(&sql).map_err(|e| RuntimeError::new(format!("error en count de '{collection}': {e}")))?;
+                let count: i64 = stmt.query_row([], |r| r.get(0)).map_err(|e| RuntimeError::new(format!("error en count de '{collection}': {e}")))?;
+                Ok(Value::Int(count))
             }
 
             // "deleteWhere"/"findWhere" NUNCA se implementan acá: evaluar un

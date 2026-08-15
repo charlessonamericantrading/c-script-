@@ -108,6 +108,10 @@ pub enum Type {
     Crypto,
     /// Tipo interno para el módulo `http` builtin
     Http,
+    /// Tipo interno para el módulo `json` builtin
+    Json,
+    /// Tipo interno para el módulo `base64` builtin
+    Base64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

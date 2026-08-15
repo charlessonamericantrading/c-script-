@@ -14,6 +14,7 @@ pub mod lockfile;
 pub mod modules;
 pub mod fmt;
 pub mod lint;
+pub mod doc;
 pub mod lsp;
 pub mod parser;
 pub mod runtime;
