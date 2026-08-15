@@ -1,0 +1,434 @@
+{
+  "components": {
+    "schemas": {
+      "BoardStats": {
+        "properties": {
+          "doneCount": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "inProgressCount": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "todoCount": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "total": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "total",
+          "todoCount",
+          "inProgressCount",
+          "doneCount"
+        ],
+        "type": "object"
+      },
+      "ColumnId": {
+        "enum": [
+          "Todo",
+          "InProgress",
+          "Done"
+        ],
+        "type": "string"
+      },
+      "NewTask": {
+        "properties": {
+          "assigneeEmail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "column": {
+            "$ref": "#/components/schemas/ColumnId"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "priority": {
+            "$ref": "#/components/schemas/Priority"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "description",
+          "priority",
+          "column",
+          "assigneeEmail"
+        ],
+        "type": "object"
+      },
+      "Priority": {
+        "enum": [
+          "High",
+          "Medium",
+          "Low"
+        ],
+        "type": "string"
+      },
+      "Role": {
+        "enum": [
+          "Admin",
+          "Member",
+          "Guest"
+        ],
+        "type": "string"
+      },
+      "Task": {
+        "properties": {
+          "assigneeEmail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "column": {
+            "$ref": "#/components/schemas/ColumnId"
+          },
+          "createdAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "priority": {
+            "$ref": "#/components/schemas/Priority"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "description",
+          "priority",
+          "column",
+          "assigneeEmail",
+          "createdAt"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "BearerAuth": {
+        "bearerFormat": "opaque",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "API generada automáticamente por Link (c-script)",
+    "title": "../examples/taskboard/backend/taskboard.link",
+    "version": "1.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/Tasks/create": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "input": {
+                    "$ref": "#/components/schemas/NewTask"
+                  }
+                },
+                "required": [
+                  "input"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Respuesta exitosa"
+          }
+        },
+        "summary": "Tasks::create",
+        "tags": [
+          "Tasks"
+        ]
+      }
+    },
+    "/Tasks/getById": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "format": "int32",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/Task"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Respuesta exitosa"
+          }
+        },
+        "summary": "Tasks::getById",
+        "tags": [
+          "Tasks"
+        ]
+      }
+    },
+    "/Tasks/list": {
+      "post": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Task"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Respuesta exitosa"
+          }
+        },
+        "summary": "Tasks::list",
+        "tags": [
+          "Tasks"
+        ]
+      }
+    },
+    "/Tasks/listByColumn": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "col": {
+                    "$ref": "#/components/schemas/ColumnId"
+                  }
+                },
+                "required": [
+                  "col"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Task"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Respuesta exitosa"
+          }
+        },
+        "summary": "Tasks::listByColumn",
+        "tags": [
+          "Tasks"
+        ]
+      }
+    },
+    "/Tasks/remove": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "format": "int32",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "description": "Respuesta exitosa"
+          }
+        },
+        "summary": "Tasks::remove",
+        "tags": [
+          "Tasks"
+        ]
+      }
+    },
+    "/Tasks/stats": {
+      "post": {
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BoardStats"
+                }
+              }
+            },
+            "description": "Respuesta exitosa"
+          }
+        },
+        "summary": "Tasks::stats",
+        "tags": [
+          "Tasks"
+        ]
+      }
+    },
+    "/Tasks/update": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "id": {
+                    "format": "int32",
+                    "type": "integer"
+                  },
+                  "patch": {
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "id",
+                  "patch"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Respuesta exitosa"
+          }
+        },
+        "summary": "Tasks::update",
+        "tags": [
+          "Tasks"
+        ]
+      }
+    },
+    "/Tasks/watchTasks": {
+      "post": {
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Server-Sent Events Stream"
+          }
+        },
+        "summary": "Tasks::watchTasks",
+        "tags": [
+          "Tasks"
+        ]
+      }
+    }
+  }
+}

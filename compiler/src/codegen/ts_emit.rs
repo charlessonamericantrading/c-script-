@@ -201,6 +201,13 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     out.push_str("  }\n");
     out.push_str("}\n\n");
 
+    out.push_str("export function isOk<T, E>(result: { ok: true; value: T } | { ok: false; error: E }): result is { ok: true; value: T } {\n");
+    out.push_str("  return result.ok === true;\n");
+    out.push_str("}\n\n");
+    out.push_str("export function isErr<T, E>(result: { ok: true; value: T } | { ok: false; error: E }): result is { ok: false; error: E } {\n");
+    out.push_str("  return result.ok === false;\n");
+    out.push_str("}\n\n");
+
     // Los `const` viven acá, no en contract.d.ts -- ver `emit_const_decl`:
     // un .d.ts es ambiental y TypeScript rechaza los inicializadores.
     for item in &program.items {

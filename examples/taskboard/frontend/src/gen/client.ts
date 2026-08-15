@@ -15,6 +15,14 @@ export class LinkValidationError extends Error {
   }
 }
 
+export function isOk<T, E>(result: { ok: true; value: T } | { ok: false; error: E }): result is { ok: true; value: T } {
+  return result.ok === true;
+}
+
+export function isErr<T, E>(result: { ok: true; value: T } | { ok: false; error: E }): result is { ok: false; error: E } {
+  return result.ok === false;
+}
+
 class TasksClientImpl implements TasksClient {
   private baseUrl: string;
   private token: string | null = null;

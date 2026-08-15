@@ -235,6 +235,20 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
             return BuildResult { ok: false, touched };
         }
     };
+    let schemas = match codegen::zod_emit::emit_zod_schemas(&program) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error al emitir schemas.ts: {e}");
+            return BuildResult { ok: false, touched };
+        }
+    };
+    let openapi = match codegen::openapi_emit::emit_openapi_json(&program, display_path(Path::new(path)).as_str()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error al emitir openapi.json: {e}");
+            return BuildResult { ok: false, touched };
+        }
+    };
 
     if let Err(e) = fs::create_dir_all(outdir) {
         eprintln!("no se pudo crear {outdir}: {e}");
@@ -244,6 +258,8 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
     let client_path = format!("{outdir}/client.ts");
     let validators_path = format!("{outdir}/validators.ts");
     let hooks_path = format!("{outdir}/hooks.ts");
+    let schemas_path = format!("{outdir}/schemas.ts");
+    let openapi_path = format!("{outdir}/openapi.json");
     if let Err(e) = fs::write(&contract_path, contract) {
         eprintln!("no se pudo escribir {contract_path}: {e}");
         return BuildResult { ok: false, touched };
@@ -260,6 +276,14 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
         eprintln!("no se pudo escribir {hooks_path}: {e}");
         return BuildResult { ok: false, touched };
     }
+    if let Err(e) = fs::write(&schemas_path, schemas) {
+        eprintln!("no se pudo escribir {schemas_path}: {e}");
+        return BuildResult { ok: false, touched };
+    }
+    if let Err(e) = fs::write(&openapi_path, openapi) {
+        eprintln!("no se pudo escribir {openapi_path}: {e}");
+        return BuildResult { ok: false, touched };
+    }
 
     let wasm_path = format!("{outdir}/main.wasm");
     match codegen::wasm_emit::emit_wasm(&program) {
@@ -267,12 +291,12 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
             if let Err(e) = fs::write(&wasm_path, wasm_bytes) {
                 eprintln!("advertencia: no se pudo escribir {wasm_path}: {e}");
             }
-            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path} y {wasm_path}");
+            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path}, {schemas_path}, {openapi_path} y {wasm_path}");
         }
         Err(e) => {
-            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path}");
+            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path}, {schemas_path}, {openapi_path}");
             eprintln!(
-                "advertencia: no se generó {wasm_path} -- el codegen wasm nativo (v0, solo Int/Bool y expresión final) no soporta este programa: {e}"
+                "advertencia: no se generó {wasm_path} -- el codegen wasm nativo (solo funciones/escalares) no soporta este programa: {e}"
             );
         }
     }
