@@ -1,0 +1,95 @@
+---
+description: Comprehensive rules, syntax guide and development standards for c-script / Link language (.link)
+globs: **/*.link, **/src/gen/**, **/link.json
+alwaysApply: false
+---
+
+# c-script / Link (.link) Developer Guide for AI & Cursor
+
+You are developing with **c-script** (file extension `.link`, CLI `linkc`), a high-performance backend language designed specifically for End-to-End Type Safety with TypeScript frontends.
+
+## Key Syntax Reference
+
+### 1. Types & Data Structures
+```rust
+// Basic types: Int, Float, Int64, String, Bool, Timestamp, Void
+// Postfix collections: T[] or Map<K, V> or Tuples (A, B)
+// Nullable: T? (maps to T | null)
+
+type User = {
+  id: Int,
+  name: String,
+  email: String,
+  role: Role,
+  createdAt: Timestamp,
+  avatar?: String,
+}
+
+enum Role {
+  Admin,
+  Member,
+  Guest,
+}
+
+enum Result<T, E> {
+  Ok { value: T },
+  Err { code: Int, message: E },
+}
+```
+
+### 2. Database Definition (`db { ... }`)
+```rust
+db {
+  users: User[],
+}
+// Operations: db.users.all(), db.users.find(id), db.users.insert(row),
+// db.users.applyPatch(id, patch), db.users.delete(id), db.users.findWhere(predicate)
+```
+
+### 3. Services & Streaming
+```rust
+service Users {
+  rpc list(limit: Int = 20) -> User[] {
+    db.users.all()
+  }
+
+  @authenticated
+  rpc me() -> User? {
+    db.users.find(1)
+  }
+
+  @requires(Role.Admin)
+  rpc remove(id: Int) -> Bool {
+    db.users.delete(id)
+  }
+
+  stream watch() -> User {
+    while true {
+      db.users.subscribe()
+    }
+  }
+}
+```
+
+### 4. Built-in Testing
+```rust
+test "insert and retrieve" {
+  let user = db.users.insert(User {
+    id: 0,
+    name: "John",
+    email: "john@example.com",
+    role: Role.Member,
+    createdAt: now(),
+  });
+  assert(user.id > 0, "ID assigned by SQLite");
+}
+```
+
+## CLI Commands
+- Build TS contracts: `linkc build <file.link> <outdir>`
+- Run test runner: `linkc test <file.link>`
+- Start server: `linkc serve <file.link> <port>`
+- Dev mode with hot reload: `linkc dev <file.link> <outdir> [port]`
+- Format code: `linkc fmt <file.link>`
+- Lint code: `linkc lint <file.link>`
+- Generate docs: `linkc doc <file.link>`

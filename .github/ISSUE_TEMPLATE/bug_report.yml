@@ -1,0 +1,31 @@
+name: 🐛 Reporte de Bug
+description: Reporta un error o comportamiento inesperado en el compilador o runtime de c-script (linkc)
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Gracias por tomarte el tiempo de reportar este problema. Asegúrate de incluir un fragmento de código mínimo reproducible en `.link`.
+  - type: textarea
+    id: description
+    attributes:
+      label: Descripción del problema
+      description: Explica qué ocurrió y qué esperabas que sucediera.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Código .link de reproducción mínima
+      description: Pega aquí el código que causa el error.
+      render: rust
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Versión de linkc y Sistema Operativo
+      placeholder: "linkc 1.0.0 en Windows 11 / Ubuntu 22.04 / macOS Sonoma"
+    validations:
+      required: true

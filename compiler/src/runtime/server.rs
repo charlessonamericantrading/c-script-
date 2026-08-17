@@ -95,6 +95,27 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
 
+        if path == "/" || path == "/health" || path == "/status" {
+            let services: Vec<String> = program
+                .items
+                .iter()
+                .filter_map(|it| match it {
+                    crate::ast::Item::Service(s) => Some(s.name.clone()),
+                    _ => None,
+                })
+                .collect();
+            let health_json = serde_json::json!({
+                "status": "ok",
+                "engine": "c-script",
+                "version": "1.0.0",
+                "services": services
+            })
+            .to_string();
+            let _ = request.respond(cors_response(200, health_json));
+            log_done(req_id, Some("health"), 200, start, "");
+            continue;
+        }
+
         let Some((service_name, rpc_name)) = parse_path(&path) else {
             let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method")));
             log_done(req_id, None, 404, start, "");

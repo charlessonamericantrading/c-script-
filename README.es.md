@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Estado de Build" /></a>
     <a href="#"><img src="https://img.shields.io/badge/tests-450%20passed-success.svg" alt="Tests" /></a>
-    <a href="#"><img src="https://img.shields.io/badge/versión-1.0.0-blue.svg" alt="Versión" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.0.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -35,22 +35,39 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 
 ### 1. Instalación
 
-#### 📦 Linux / macOS (curl)
+#### 📦 Linux / macOS (Instalador automático de 1 línea)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/install.sh | sh
 ```
 
 #### 🪟 Windows (PowerShell)
 ```powershell
-iwr -useb https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/install.ps1 | iex
+irm https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/install.ps1 | iex
 ```
 
 #### 🌐 Vía NPM / npx
 ```bash
 npm install -g link-lang
-# o probalo directamente:
+# o probalo directamente con npx:
 npx link-lang --help
 ```
+
+---
+
+## 🤖 Diseñado para Cursor y Agentes de IA (Grok, Claude, GPT)
+
+Link incluye estándares nativos para que puedas desarrollar aplicaciones completas con modelos de IA en Cursor o Windsurf con **cero alucinaciones**:
+
+- **`.cursorrules` y `.cursor/rules/c-script.mdc`**: Instrucciones precisas para que Grok, Claude y GPT-4 comprendan la sintaxis de Link, definición de servicios, tipos, decoradores y runner de pruebas.
+- **`llms.txt` y `llms-full.txt`**: Archivos estandarizados de contexto para motores de IA.
+- **Instalar la extensión del editor en 1 clic**:
+  ```bash
+  # Para Cursor
+  cursor --install-extension editors/vscode/c-script-vscode-1.0.0.vsix
+
+  # Para VS Code
+  code --install-extension editors/vscode/c-script-vscode-1.0.0.vsix
+  ```
 
 ---
 
@@ -81,7 +98,7 @@ linkc serve main.link 3000   # Inicia servidor HTTP con SQLite embebido y auto-m
 
 ## 🧠 El Lenguaje de un Vistazo
 
-```link
+```rust
 // 1. Modelos de Datos y Enums
 type User = {
   id: Int,
@@ -96,19 +113,20 @@ enum Role {
   Member,
 }
 
-// 2. Base de Datos Tipada con Auto-Migraciones No Destructivas
+// 2. Base de Datos Tipada con Esquemas SQLite Automáticos
 db {
   users: User[],
 }
 
-// 3. Servicios RPC con Control de Acceso por Roles (RBAC)
+// 3. Servicios RPC con Control de Acceso por Roles (RBAC) y Streaming SSE
 service UserService {
   @requires(Role.Admin)
   rpc create(name: String, email: String) -> User {
-    let new_user = db.users.insert({
+    let new_user = db.users.insert(User {
+      id: 0,
       name: name,
       email: email,
-      role: Role.Member {},
+      role: Role.Member,
       created_at: now(),
     });
     new_user
@@ -118,16 +136,18 @@ service UserService {
     db.users.all()
   }
 
-  // 4. Endpoint de Streaming en Tiempo Real (SSE)
-  stream feed() -> User[] {
-    db.users.all()
+  // 4. Endpoint de Streaming Push en Tiempo Real (SSE)
+  stream watchUsers() -> User {
+    while true {
+      db.users.subscribe()
+    }
   }
 }
 
 // 5. Pruebas de Comportamiento Integradas
 test "creacion y conteo de usuarios" {
-  let count = db.users.count();
-  assert(count >= 0);
+  let count = db.users.all().length();
+  assert(count >= 0, "conteo no negativo de usuarios");
 }
 ```
 
@@ -142,6 +162,7 @@ Link incluye de forma nativa todas las herramientas que necesitas:
 | `linkc new <nombre> [--template nextjs\|vite\|minimal]` | Scaffoldea proyectos fullstack o backend |
 | `linkc build <archivo.link> <outdir>` | Genera contratos TS, cliente, validadores, hooks React, Zod y OpenAPI |
 | `linkc serve <archivo.link> <puerto>` | Inicia servidor HTTP con SQLite embebido y SSE streams |
+| `linkc dev <archivo.link> <outdir> [puerto]` | Modo desarrollo interactivo con hot reload y reinicio de servidor |
 | `linkc test <archivo.link>` | Ejecuta pruebas de comportamiento integradas en entorno aislado |
 | `linkc fmt <archivo.link> [--check]` | Formatea el código fuente canónicamente |
 | `linkc lint <archivo.link> [--fix]` | Analiza calidad de código y auto-corrige advertencias |
@@ -156,15 +177,6 @@ Link incluye de forma nativa todas las herramientas que necesitas:
 
 Probá Link directamente en tu navegador sin instalar nada:
 - Abrí [`playground/index.html`](playground/index.html) para escribir código Link, ver la generación de contratos en tiempo real y ejecutar pruebas.
-
----
-
-## 🧩 Extensión para VS Code / Cursor
-
-Instalá la extensión oficial desde [`editors/vscode/`](editors/vscode/) para contar con:
-- Resaltado de sintaxis para archivos `.link`.
-- Snippets inteligentes (`service`, `rpc`, `db`, `test`, `@requires`).
-- Diagnósticos, tipos al pasar el cursor (hover), saltar a la definición y formateo al guardar.
 
 ---
 

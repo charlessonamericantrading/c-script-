@@ -1,0 +1,24 @@
+# Windsurf Rules for c-script / Link (.link)
+
+## Role & Goal
+You are a specialist in **c-script** (Link), a backend programming language with isomorphic, zero-overhead type safety for TypeScript frontends.
+
+## Language Reference (.link)
+- File extension: `.link`
+- CLI toolchain: `linkc` (build, test, serve, dev, fmt, lint, doc, docker, lsp)
+- Types: `Int`, `Float`, `Int64`, `String`, `Bool`, `Timestamp`, `Void`, `T[]`, `Map<K, V>`, Tuples `(A, B)`.
+- Nullability: `T?` becomes `T | null` in TypeScript. `field?: T` is an optional property.
+- Syntax elements:
+  - `type Name = { field: Type }`
+  - `enum Name { Variant1, Variant2 }`
+  - `db { collection: Type[] }`
+  - `service ServiceName { rpc methodName(args) -> ReturnType { ... } }`
+  - `@authenticated` and `@requires(Role.Variant)` on RPC methods
+  - `stream streamName() -> Type { while true { db.collection.subscribe() } }`
+  - `test "name" { assert(condition, "message"); }`
+
+## Common Commands
+- Build TypeScript contracts: `linkc build main.link gen`
+- Execute test runner: `linkc test main.link`
+- Launch server: `linkc serve main.link 3000`
+- Format file: `linkc fmt main.link`

@@ -1,0 +1,205 @@
+# c-script (Link Language) — Complete LLM Specification & Developer Reference
+
+This document is optimized for LLMs (Grok, Claude, GPT, DeepSeek) and developers using AI assistants like Cursor or Windsurf.
+
+---
+
+## 1. Syntax & Grammar Overview
+
+### File Extension and Binaries
+- Source files: `.link`
+- CLI binary: `linkc` (also available via `npx link-lang`)
+
+### Types and Primitives
+| c-script Type | TypeScript Type | JSON Wire Format | Notes |
+|---|---|---|---|
+| `Int` | `number` | integer number | 32-bit signed |
+| `Float` | `number` | float number | 64-bit IEEE 754 |
+| `Int64` | `string` | string | Safe 64-bit integer without precision loss |
+| `String` | `string` | string | UTF-8 |
+| `Bool` | `boolean` | boolean | `true` or `false` |
+| `Timestamp` | `string` | ISO-8601 string | Millisecond UTC timestamp (`now()`) |
+| `Void` | `void` | `null` / empty | Return type of non-returning RPCs |
+| `T[]` | `T[]` | JSON array | List/Array of items |
+| `Map<K, V>` | `Record<K, V>` | JSON object | Key-value map |
+| `(A, B)` | `[A, B]` | JSON tuple array | Heterogeneous tuple |
+| `T?` | `T \| null` | `null` or value | Nullable type |
+| `field?: T` | `field?: T` | key omitted | Optional object property |
+
+### Type Definitions & Enums
+```rust
+// Struct
+type User = {
+  id: Int,
+  name: String,
+  email: String,
+  role: Role,
+  createdAt: Timestamp,
+  avatar?: String,
+}
+
+// Simple Enum -> TypeScript String Union ("Admin" | "Member" | "Guest")
+enum Role {
+  Admin,
+  Member,
+  Guest,
+}
+
+// Discriminated / Tagged Union (ADT)
+enum ApiResult<T, E> {
+  Ok { data: T },
+  Err { code: Int, error: E },
+}
+```
+
+### Functions & Closures
+```rust
+// Internal helper function (not exposed as RPC)
+fn calculateDiscount(total: Float, vip: Bool) -> Float {
+  if vip {
+    total * 0.8
+  } else {
+    total
+  }
+}
+
+// Inline closure
+let isEven = |n: Int| -> Bool { n % 2 == 0 };
+```
+
+---
+
+## 2. Services, RPCs, and Streaming
+
+Services define public API endpoints. Each method in a `service` is automatically exposed as an HTTP POST RPC and mapped to TypeScript client methods.
+
+```rust
+service Products {
+  // RPC with default parameter value
+  rpc list(limit: Int = 50) -> Product[] {
+    db.products.all()
+  }
+
+  rpc get(id: Int) -> Product? {
+    db.products.find(id)
+  }
+
+  // Authentication & RBAC Decorators
+  @authenticated
+  rpc create(input: NewProduct) -> Product {
+    db.products.insert(Product {
+      id: 0,
+      title: input.title,
+      price: input.price,
+      createdAt: now(),
+    })
+  }
+
+  @requires(Role.Admin)
+  rpc delete(id: Int) -> Bool {
+    db.products.delete(id)
+  }
+
+  // Real-time Push Stream (Server-Sent Events)
+  stream watch() -> Product {
+    while true {
+      db.products.subscribe()
+    }
+  }
+}
+```
+
+---
+
+## 3. Database Persistence (`db { ... }`)
+
+Declaring a `db` block configures an embedded SQLite database with schema auto-generation.
+
+```rust
+db {
+  products: Product[],
+  users: User[],
+}
+```
+
+### Database Methods on `db.<collection>`
+- `db.<col>.all() -> T[]`
+- `db.<col>.find(id: Int) -> T?`
+- `db.<col>.insert(item: T) -> T` (Auto-increments `id`)
+- `db.<col>.applyPatch(id: Int, patch: Partial<T>) -> T?`
+- `db.<col>.delete(id: Int) -> Bool`
+- `db.<col>.findWhere(predicate: |item: T| -> Bool) -> T[]`
+- `db.<col>.deleteWhere(predicate: |item: T| -> Bool) -> Int`
+- `db.<col>.subscribe() -> T` (Yields when row is inserted, patched, or deleted)
+
+---
+
+## 4. Testing Framework (`test "..." { ... }`)
+
+The built-in test runner provides zero-dependency behavioral assertions and snapshot testing with isolated in-memory databases per test.
+
+```rust
+test "inserting and fetching product" {
+  let created = Products.create(NewProduct {
+    title: "Mechanical Keyboard",
+    price: 99.99,
+  });
+  assert(created.id > 0, "id generated");
+
+  let fetched = Products.get(created.id);
+  assert(fetched != null, "product exists");
+  assert(fetched.price == 99.99, "price matches");
+}
+```
+
+Commands:
+- `linkc test backend.link` (Runs behavioral tests)
+- `linkc test backend.link backend.link.snap [--update]` (Contract snapshot diff testing)
+
+---
+
+## 5. Generated TypeScript Client Consumption
+
+`linkc build backend.link src/gen` generates:
+- `contract.d.ts`: Exact TypeScript types.
+- `client.ts`: Typed RPC client with async iterables for streams.
+- `validators.ts`: Runtime payload validators.
+- `hooks.ts`: React hooks.
+- `openapi.json`: OpenAPI v3 specification.
+- `zod.ts`: Zod schemas for external tools.
+
+### Example TypeScript Usage:
+```typescript
+import { createClient } from './gen/client';
+import type { Product } from './gen/contract';
+
+const client = createClient({ baseUrl: 'http://localhost:8787' });
+
+// Set Bearer token for @authenticated / @requires endpoints
+client.setToken('session-token-128bit');
+
+// Call RPC
+const products = await client.Products.list({ limit: 10 });
+
+// Listen to Realtime SSE Stream
+for await (const product of client.Products.watch({})) {
+  console.log("Realtime product change:", product);
+}
+```
+
+---
+
+## 6. CLI Toolchain Summary
+
+| Subcommand | Syntax | Description |
+|---|---|---|
+| `build` | `linkc build <file.link> <outdir>` | Generates TS contracts, client, validators, and OpenAPI |
+| `test` | `linkc test <file.link>` | Executes integrated behavioral test runner |
+| `serve` | `linkc serve <file.link> [port]` | Starts HTTP API server with embedded SQLite |
+| `dev` | `linkc dev <file.link> <outdir> [port]` | Interactive watch mode with auto-rebuild & server restart |
+| `new` | `linkc new <name>` | Scaffolds a new c-script project |
+| `fmt` | `linkc fmt <file.link> [--check]` | Formats source code according to canonical style |
+| `lint` | `linkc lint <file.link> [--fix]` | Analyzes code quality and unused variables |
+| `doc` | `linkc doc <file.link> [outdir]` | Generates interactive HTML documentation |
+| `docker`| `linkc docker <file.link> [outdir]`| Generates production multi-stage Dockerfile and compose |
+| `lsp` | `linkc lsp` | Starts Language Server Protocol over stdio for VS Code / Cursor |

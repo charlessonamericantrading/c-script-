@@ -1,0 +1,94 @@
+# c-script (Link) — Backend Language with Native End-to-End Type Safety for TypeScript
+
+> c-script is a compiled backend programming language and toolchain with native, zero-IDL isomorphic type safety for TypeScript frontends, embedded SQLite database with live reactive push streaming, declarative RBAC authentication, and integrated testing.
+
+## Documentation & Spec
+- [Grammar & Specification](GRAMMAR.md): Complete EBNF grammar, bidirectional type checker, and TypeScript mapping table.
+- [Engineering Plan](PLAN.md): Architecture, trade-offs, and roadmap.
+- [VS Code Extension](editors/vscode): LSP client and syntax highlighting.
+- [Full LLM Reference](llms-full.txt): In-depth cheat sheet and API specification.
+
+## Core Language Features
+- **Isomorphic Types**: Structs, enums, unions (`A | B`), generics, closures, and nullable types (`T?`) map 1:1 to TypeScript interfaces, discriminated unions, and JSON.
+- **Embedded Database**: `db { collection: Type[] }` creates typed tables on disk in SQLite with `.all()`, `.find()`, `.insert()`, `.applyPatch()`, `.delete()`, `.findWhere()`, `.deleteWhere()`.
+- **Reactive Streaming**: `stream endpoint() -> T` over Server-Sent Events (SSE) with `db.<col>.subscribe()`. Consumed as `AsyncIterable<T>` in TypeScript.
+- **Declarative Auth**: `@authenticated` and `@requires(Role.Admin)` with 128-bit opaque session tokens.
+- **Integrated Test Runner**: `test "description" { ... }` blocks executed with in-memory DB isolation via `linkc test <file.link>`.
+- **Full Toolchain**: LSP 2.0 (`linkc lsp`), Formatter (`linkc fmt`), Linter (`linkc lint`), Docs (`linkc doc`), Containerizer (`linkc docker`).
+
+## CLI Quickstart
+```bash
+# Compile and emit TypeScript contracts, client, validators, and OpenAPI
+linkc build backend.link src/gen
+
+# Run built-in test suite
+linkc test backend.link
+
+# Start HTTP + SQLite backend server on port 8787
+linkc serve backend.link 8787
+
+# Interactive hot-reloading dev mode
+linkc dev backend.link src/gen 8787
+```
+
+## Example Program (`backend.link`)
+```rust
+type Todo = {
+  id: Int,
+  title: String,
+  completed: Bool,
+  createdAt: Timestamp,
+}
+
+enum Filter { All, Pending, Done }
+
+db {
+  todos: Todo[],
+}
+
+service Todos {
+  rpc list(filter: Filter = Filter.All) -> Todo[] {
+    match filter {
+      Filter.All => db.todos.all(),
+      Filter.Pending => db.todos.findWhere(|t: Todo| -> Bool { !t.completed }),
+      Filter.Done => db.todos.findWhere(|t: Todo| -> Bool { t.completed }),
+    }
+  }
+
+  rpc create(title: String) -> Todo {
+    db.todos.insert(Todo {
+      id: 0,
+      title: title,
+      completed: false,
+      createdAt: now(),
+    })
+  }
+
+  rpc toggle(id: Int) -> Todo? {
+    let existing = db.todos.find(id);
+    if existing != null {
+      db.todos.applyPatch(id, Todo {
+        id: id,
+        title: existing.title,
+        completed: !existing.completed,
+        createdAt: existing.createdAt,
+      })
+    } else {
+      null
+    }
+  }
+
+  stream watch() -> Todo {
+    while true {
+      db.todos.subscribe()
+    }
+  }
+}
+
+test "can create and toggle todo" {
+  let created = Todos.create("Learn c-script");
+  assert(created.id > 0, "ID assigned");
+  let toggled = Todos.toggle(created.id);
+  assert(toggled != null && toggled.completed == true, "Todo marked as completed");
+}
+```

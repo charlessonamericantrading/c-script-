@@ -1,0 +1,25 @@
+name: 💡 Solicitud de Función / RFC
+description: Propón una nueva sintaxis, tipo de dato, adaptador de base de datos o mejora de tooling
+title: "[RFC/Feature]: "
+labels: ["enhancement", "rfc"]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivación y Caso de Uso
+      description: ¿Qué problema estás intentando resolver con esta nueva funcionalidad?
+    validations:
+      required: true
+  - type: textarea
+    id: proposed-syntax
+    attributes:
+      label: Propuesta de Sintaxis o API
+      description: ¿Cómo se vería en un archivo `.link` o en el frontend de TypeScript?
+      render: rust
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternativas consideradas
+      description: ¿Qué otras soluciones o enfoques has evaluado?

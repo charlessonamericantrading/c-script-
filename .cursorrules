@@ -1,0 +1,140 @@
+# Cursor Rules for c-script / Link (.link)
+
+You are an expert full-stack engineer and compiler specialist for **c-script** (file extension `.link`, CLI binary `linkc`), a high-performance backend language with native, end-to-end type safety for TypeScript frontends.
+
+---
+
+## 1. Syntax & Language Essentials (.link files)
+
+### Types & Primitives
+- Primitive types: `Int`, `Float`, `Int64`, `String`, `Bool`, `Timestamp` (ISO-8601 UTC with `now()`), `Void`.
+- Collections: `T[]` (list), `Map<K, V>`, Tuples `(A, B)`.
+- Nullability: `T?` maps to `T | null` in TypeScript and JSON. Optional record fields: `field?: T`.
+- Structs:
+  ```rust
+  type User = {
+    id: Int,
+    name: String,
+    email: String,
+    role: Role,
+    createdAt: Timestamp,
+    bio?: String,
+  }
+  ```
+- Enums & ADTs (Algebraic Data Types):
+  ```rust
+  // Simple enum -> TypeScript string union: "Admin" | "Member" | "Guest"
+  enum Role { Admin, Member, Guest }
+
+  // Tagged / Discriminated union -> TypeScript discriminated union with { type: "Ok", value: ... }
+  enum Result<T, E> {
+    Ok  { value: T },
+    Err { code: Int, message: E },
+  }
+  ```
+- Unions: `A | B` with exhaustive pattern matching (`match`).
+- Closures & Functions: `|x: Int| -> Int { x * 2 }` or `fn helper(a: String) -> String { ... }`.
+
+---
+
+## 2. Declarations & Architecture
+
+### Service & RPCs
+Services expose HTTP endpoints and automatically generate typed TypeScript clients:
+```rust
+service Users {
+  // Simple RPC endpoint (POST /Users/getById)
+  rpc getById(id: Int) -> User? {
+    db.users.find(id)
+  }
+
+  // Auth annotations
+  @authenticated
+  rpc me() -> User? {
+    // Current session context
+    db.users.find(1)
+  }
+
+  @requires(Role.Admin)
+  rpc deleteUser(id: Int) -> Bool {
+    db.users.delete(id)
+  }
+
+  // Realtime Server-Sent Events (SSE) stream -> AsyncIterable in TS
+  stream watchUsers() -> User {
+    while true {
+      db.users.subscribe()
+    }
+  }
+}
+```
+
+### Embedded Database (`db { ... }`)
+Built-in zero-config SQLite persistence with compile-time type checking:
+```rust
+db {
+  users: User[],
+}
+```
+Available operations on `db.<collection>`:
+- `.all() -> T[]`
+- `.find(id: Int) -> T?`
+- `.insert(row: T) -> T`
+- `.applyPatch(id: Int, patch: Partial<T>) -> T?`
+- `.delete(id: Int) -> Bool`
+- `.findWhere(|row: T| -> Bool) -> T[]`
+- `.deleteWhere(|row: T| -> Bool) -> Int`
+- `.subscribe() -> T` (for live push streams)
+
+### Integrated Tests (`test "name" { ... }`)
+```rust
+test "can create and retrieve user" {
+  let u = db.users.insert(User {
+    id: 0,
+    name: "Alice",
+    email: "alice@example.com",
+    role: Role.Admin,
+    createdAt: now(),
+  });
+  assert(u.id > 0, "id should be auto-incremented");
+  let found = db.users.find(u.id);
+  assert(found != null, "user should exist");
+}
+```
+
+---
+
+## 3. CLI Workflow & Toolchain (`linkc`)
+
+When assisting the user with commands, use the official `linkc` CLI:
+- **Build Contracts & Client**: `linkc build <file.link> <outDir>` (generates `contract.d.ts`, `client.ts`, `validators.ts`, `hooks.ts`, `openapi.json`, `zod.ts`).
+- **Run Tests**: `linkc test <file.link>` (runs behavioral tests with isolated in-memory DB).
+- **Snapshot Tests**: `linkc test <file.link> <file.snap> [--update]` (verifies contract stability).
+- **Run Server**: `linkc serve <file.link> [port]` (starts high-performance HTTP + SQLite backend).
+- **Hot-Reload Dev Server**: `linkc dev <file.link> <outDir> [port]`.
+- **Code Formatter**: `linkc fmt <file.link> [--check]`.
+- **Linter**: `linkc lint <file.link> [--fix]`.
+- **Doc Generator**: `linkc doc <file.link> [outDir]`.
+- **Docker Scaffolding**: `linkc docker <file.link> [outDir]`.
+
+---
+
+## 4. Frontend Integration Guidelines
+
+When writing TypeScript frontend code that consumes a `c-script` backend:
+1. Import the generated client from the generated directory:
+   ```typescript
+   import { createClient } from './gen/client';
+   import type { User, Role } from './gen/contract';
+   
+   const client = createClient({ baseUrl: 'http://localhost:8787' });
+   
+   // Call RPC
+   const user = await client.Users.getById({ id: 1 });
+   
+   // Consume Realtime Stream
+   for await (const user of client.Users.watchUsers({})) {
+     console.log("Live user mutation:", user);
+   }
+   ```
+2. When using React, use the generated `hooks.ts` or React Query integrations for instant reactive updates.
