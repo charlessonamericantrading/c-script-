@@ -65,6 +65,7 @@
   - [3.41 CORS configurable y headers de seguridad — RESUELTO (alcance acotado)](#341-cors-configurable-y-headers-de-seguridad--resuelto-alcance-acotado)
   - [3.42 `@route` con múltiples parámetros — RESUELTO (alcance acotado)](#342-route-con-múltiples-parámetros--resuelto-alcance-acotado)
   - [3.43 `smtp.send`: mandar email — RESUELTO (alcance acotado)](#343-smtpsend-mandar-email--resuelto-alcance-acotado)
+  - [3.44 PostgreSQL LISTEN/NOTIFY: `stream` entre varias instancias — RESUELTO (alcance acotado)](#344-postgresql-listennotify-stream-entre-varias-instancias--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1514,7 +1515,7 @@ y volver a crear la tabla no es una opción.
   el proceso, así que dos instancias de `linkc serve` contra la misma base no se
   enteran de las escrituras de la otra. Con SQLite pasaba lo mismo; en
   PostgreSQL duele más, porque compartir la base entre instancias es
-  justamente para lo que uno la elige.
+  justamente para lo que uno la elige. **Resuelto en §3.44.**
 
 **Verificado** en `compiler/tests/pg_integration.rs` contra un PostgreSQL real
 (el job `postgres` de CI levanta un `postgres:16`): el CRUD completo por HTTP
@@ -2212,6 +2213,105 @@ RECIBIÓ son exactamente los que se mandaron -- más los cuatro caminos de
 error (falta `LINK_SMTP_URL`, falta `LINK_SMTP_FROM`, dirección inválida,
 relay inalcanzable), todos devolviendo un 500 con mensaje claro, nunca un
 panic.
+
+---
+
+### 3.44 PostgreSQL LISTEN/NOTIFY: `stream` entre varias instancias — RESUELTO (alcance acotado)
+
+Último límite honesto que quedaba de §3.36: dos instancias de `linkc serve`
+contra la misma base de Postgres no se enteraban de las escrituras de la
+otra en un `stream` -- cada una solo publicaba a sus PROPIOS suscriptores
+(`Db::subscribers`, en memoria de ESE proceso). Para SQLite esto es
+inherente (un archivo no tiene ningún mecanismo de notificación
+cross-proceso); para Postgres dolía más, porque compartir la base entre
+instancias es justamente para lo que uno la elige -- correr más de un
+`linkc serve` detrás de un balanceador, contra la misma base, es un patrón
+de despliegue real.
+
+**Lo que hay ahora:** con Postgres, cada `insert`/`applyPatch`/`delete`
+que ya se publicó LOCAL además manda `NOTIFY` -- cualquier otra instancia
+de `linkc serve` contra la misma base lo recibe y lo vuelve a publicar
+LOCAL en su propio proceso. Un suscriptor conectado a la instancia B ve una
+escritura que entró por la instancia A, sin ninguna diferencia respecto de
+si hubiera entrado por B misma. Sin configuración: si el backend es
+Postgres, esto está andando solo.
+
+**Cómo está armado, y por qué:**
+
+- **Una conexión SEPARADA, dedicada, solo para `LISTEN`.** La conexión de
+  queries normales (`Backend::Postgres`, §3.40) no puede a la vez bloquear
+  esperando notificaciones Y ejecutar SELECT/INSERT/UPDATE sincrónicos --
+  son dos usos que no comparten una sola conexión de la crate `postgres`.
+  Un hilo de fondo dedicado la abre al arrancar y hace `LISTEN
+  link_stream_changes` -- UN SOLO canal para TODAS las colecciones del
+  programa (el nombre de la colección va adentro del payload JSON, no en
+  el nombre del canal), así que hace falta un único `LISTEN` sin importar
+  cuántas colecciones declare `db { ... }`.
+- **El hilo de LISTEN se auto-repara**, mismo espíritu que la reconexión de
+  la conexión de queries (§3.40): si se corta, lo nota (`Ok(None)` del
+  iterador de notificaciones, o un error) y la reabre sola cada 5 segundos
+  -- un problema de red no deja la propagación cross-instancia rota para
+  siempre sin un reinicio manual.
+- **`NOTIFY` vía `pg_notify()` (forma de función), no la sentencia `NOTIFY
+  canal, 'texto'`.** El payload es un parámetro bindeado, no un literal SQL
+  armado a mano -- ni escapado manual, ni riesgo de inyección con datos que
+  vienen de una fila real.
+- **Cada instancia se reconoce a sí misma, para no duplicar su propio
+  evento.** El payload lleva un `instance` -- un id aleatorio del CSPRNG,
+  generado una vez por proceso al conectar. Cuando el hilo de LISTEN de una
+  instancia recibe un NOTIFY con SU PROPIO `instance`, lo descarta: ese
+  cambio ya se entregó local, en el momento de escribir (`Db::publish`), y
+  reinyectarlo de nuevo lo entregaría dos veces a los mismos suscriptores.
+  Un cambio de OTRA instancia sí se reinyecta local (`Db::publish_remote`)
+  -- y esa función nunca vuelve a hacer `NOTIFY`: si lo hiciera, cada
+  instancia reenviaría el cambio de las demás sin parar nunca.
+- **El loop principal del servidor pasó de bloquear en
+  `incoming_requests()` a `recv_timeout` con un intervalo corto (200 ms).**
+  Solo cuando hay un canal de cambios remotos que atender (Postgres); con
+  SQLite el loop bloqueante de siempre sigue igual, sin el overhead de
+  este polling. En cada vuelta, antes de esperar la próxima request, drena
+  lo que haya llegado por el canal y lo publica local -- así un cambio
+  remoto no queda esperando indefinidamente si el servidor está inactivo
+  (sin ninguna request HTTP nueva que "despierte" el loop por su cuenta).
+
+**Límites honestos de esta ronda:**
+
+- **El payload de `NOTIFY` tiene el límite de 8000 bytes que impone
+  Postgres mismo.** Un cambio cuyo JSON completo (con el envoltorio
+  `instance`/`collection`) supere ese tamaño simplemente no se propaga a
+  otras instancias -- se loguea un aviso, no se parte ni se comprime (eso
+  abriría su propia complejidad para un caso de borde). El cambio sigue
+  publicándose local en la instancia donde se escribió, como siempre.
+- **`NOTIFY` es best-effort, sin cola ni reintento.** Si falla (la conexión
+  de queries también está cortada en ese instante, por ejemplo), el
+  `insert`/`applyPatch`/`delete` en sí IGUAL tuvo éxito y se publicó local
+  -- solo la propagación cross-instancia de ESE cambio puntual no llegó.
+  No hay un mecanismo de "reintentar más tarde" ni de "avisar qué se
+  perdió".
+- **Latencia de hasta 200 ms cuando el servidor está inactivo.** Con
+  requests HTTP llegando seguido, el canal se drena en cada vuelta del
+  loop, así que la propagación es casi inmediata; sin ninguna request
+  nueva, el intervalo de `recv_timeout` es lo que determina cuánto puede
+  tardar en notarse un cambio remoto.
+- **Una conexión Postgres MÁS por instancia** (dos en total: queries +
+  LISTEN, en vez de una sola como hasta §3.40).
+- **Solo Postgres.** SQLite sigue sin ningún mecanismo de notificación
+  cross-proceso -- dos instancias de `linkc serve` sobre el MISMO archivo
+  SQLite (patrón de despliegue que este proyecto no recomienda de todos
+  modos, ver §3.17) siguen sin verse entre sí.
+
+**Verificado** en `compiler/tests/pg_integration.rs` contra un PostgreSQL
+real: DOS procesos `linkc serve` DISTINTOS (subprocesos reales, no dos
+hilos del mismo proceso) apuntando a la misma base, un `stream` conectado
+por un `TcpStream` crudo a la instancia A (leyendo los eventos SSE tal
+cual llegan, sin ningún cliente de por medio), un `insert` que entra por
+la instancia B vía su `/Service/rpc` normal, y la instancia A recibiendo
+ese cambio -- confirmando tanto el id como el resto de los campos --
+dentro de un plazo razonable, sin compartir memoria ni proceso con B. Unit
+tests del parseo del payload de NOTIFY (`parse_remote_notification`,
+`runtime/db.rs`): un payload bien formado de otra instancia se acepta, el
+propio eco se descarta, y un payload mal formado se ignora en vez de
+panickear.
 
 ---
 

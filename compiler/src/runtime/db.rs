@@ -281,6 +281,59 @@ pub struct Db {
     /// que sumar un campo acá es aditivo puro, sin tocar ninguna firma
     /// existente. `RefCell`, mismo criterio de siempre: un solo hilo.
     current_request: RefCell<Option<RequestContext>>,
+    /// Id aleatorio de ESTA instancia del proceso -- solo tiene sentido con
+    /// Postgres (GRAMMAR.md §3.44): va adentro de cada `NOTIFY` para que el
+    /// hilo de LISTEN de esta MISMA instancia pueda reconocer y descartar
+    /// su propio eco (el cambio ya se publicó local, en `publish`, antes de
+    /// mandar el NOTIFY). Con SQLite es un string que nunca se usa.
+    instance_id: String,
+}
+
+/// Un cambio anunciado por OTRA instancia de `linkc serve` contra la misma
+/// base (GRAMMAR.md §3.44), recibido vía LISTEN/NOTIFY -- `runtime/server.rs`
+/// lo drena del canal que devuelve `Db::connect_postgres` y lo vuelve a
+/// publicar LOCAL (`Db::publish_remote`), para que un suscriptor conectado a
+/// ESTA instancia también lo vea.
+pub(crate) struct RemoteChange {
+    pub collection: String,
+    pub event: serde_json::Value,
+}
+
+/// Un solo canal de Postgres para TODOS los cambios de TODAS las
+/// colecciones -- el nombre de la colección va DENTRO del payload JSON, no
+/// en el nombre del canal, así que hace falta un solo `LISTEN` sin importar
+/// cuántas colecciones declare el programa (GRAMMAR.md §3.44).
+const REMOTE_CHANGE_CHANNEL: &str = "link_stream_changes";
+
+/// Cuántos cambios remotos sin consumir tolera el canal antes de que el
+/// hilo de LISTEN se bloquee mandando el próximo -- mismo criterio y mismo
+/// motivo que `LIVE_STREAM_BUFFER`: una cota fija en vez de crecer sin
+/// límite si el hilo principal se atrasa procesándolos.
+const REMOTE_CHANGE_BUFFER: usize = 1024;
+
+/// Postgres rechaza un payload de `NOTIFY` de más de 8000 bytes -- con
+/// margen para el resto del JSON (`instance`/`collection`), no solo el
+/// evento. Un cambio más grande que esto simplemente no se propaga a otras
+/// instancias (límite honesto, GRAMMAR.md §3.44): partirlo o comprimirlo
+/// abriría su propia complejidad para un caso de borde.
+const MAX_NOTIFY_PAYLOAD_BYTES: usize = 7900;
+
+/// Un id de instancia nuevo, del CSPRNG del sistema -- mismo origen de
+/// entropía que `crypto.uuid()`/`crypto.randomToken` (GRAMMAR.md §3.34), acá
+/// sin formatear como UUID porque nunca sale del proceso hacia un humano:
+/// es un tag interno para que el hilo de LISTEN de una instancia reconozca
+/// (y descarte) su propio `NOTIFY`.
+fn random_instance_id() -> String {
+    let mut buf = [0u8; 16];
+    // Si el CSPRNG del sistema falla acá, algo más grave ya está roto (esta
+    // misma llamada nunca falló en `crypto.randomToken`/`crypto.uuid`,
+    // donde SÍ se propaga el error porque hay un caller de verdad
+    // esperando un `Result`) -- un id de instancia degradado a un patrón
+    // fijo en ese caso extremo no cambia la corrección de nada más.
+    match getrandom::getrandom(&mut buf) {
+        Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => "sin-csprng".to_string(),
+    }
 }
 
 /// Ver la doc de `Db::current_request`. Dos structs (no una tupla) porque
@@ -325,6 +378,83 @@ pub(crate) fn connect_postgres_client(url: &str) -> Result<postgres::Client, Str
         let tls = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
         postgres::Client::connect(url, tls).map_err(|e| format!("no se pudo conectar a PostgreSQL: {e}"))
     }
+}
+
+/// Arranca el hilo de LISTEN dedicado (GRAMMAR.md §3.44) y devuelve el
+/// extremo lector del canal por el que manda cada `RemoteChange` que
+/// reconoce como AJENO (no su propio eco -- ver `parse_remote_notification`).
+///
+/// Conexión SEPARADA de la de queries normales: bloquear esperando
+/// notificaciones y ejecutar SELECT/INSERT/UPDATE sincrónicos no pueden
+/// compartir una sola conexión de `postgres` (el mismo motivo por el que
+/// `store::with_reconnect` nunca toca esta conexión). Si la conexión de
+/// LISTEN se cae, este hilo la reabre solo cada 5 segundos -- mismo
+/// espíritu de auto-reparación que `with_reconnect` ya da a la conexión de
+/// queries (§3.40), para que un problema de red no deje la propagación
+/// cross-instancia rota para siempre sin un reinicio manual.
+fn spawn_remote_listener(url: String, instance_id: String) -> Receiver<RemoteChange> {
+    let (tx, rx) = mpsc::sync_channel::<RemoteChange>(REMOTE_CHANGE_BUFFER);
+    std::thread::spawn(move || {
+        use postgres::fallible_iterator::FallibleIterator;
+        loop {
+            let mut client = match connect_postgres_client(&url) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("LISTEN {REMOTE_CHANGE_CHANNEL}: no se pudo conectar ({e}), reintentando en 5s");
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    continue;
+                }
+            };
+            if let Err(e) = client.execute(&format!("LISTEN {REMOTE_CHANGE_CHANNEL}"), &[]) {
+                eprintln!("LISTEN {REMOTE_CHANGE_CHANNEL}: no se pudo suscribir ({e}), reintentando en 5s");
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                continue;
+            }
+            let mut notifications = client.notifications();
+            let mut iter = notifications.blocking_iter();
+            loop {
+                match iter.next() {
+                    Ok(Some(n)) => {
+                        let Some(change) = parse_remote_notification(n.payload(), &instance_id) else { continue };
+                        // `Err` acá significa que el `Receiver` ya no existe
+                        // -- `serve()` terminó (proceso cerrando). Nada más
+                        // que hacer: este hilo también termina.
+                        if tx.send(change).is_err() {
+                            return;
+                        }
+                    }
+                    // Conexión cerrada, o error de verdad -- los dos casos
+                    // se resuelven igual: reconectar desde el loop externo.
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("LISTEN {REMOTE_CHANGE_CHANNEL}: {e}, reconectando en 5s");
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    });
+    rx
+}
+
+/// El payload de un `NOTIFY` es siempre `{"instance": "...", "collection":
+/// "...", "event": ...}` (armado por `Db::notify_remote`) -- `None` si no
+/// parsea con esa forma (nunca debería pasar salvo que algo externo mande
+/// un NOTIFY al mismo canal por su cuenta, lo cual se ignora en vez de
+/// reventar) o si `instance` coincide con la propia: es el eco del NOTIFY
+/// que ESTA misma instancia mandó al escribir, y ese cambio ya se publicó
+/// local en el momento de escribir (`Db::publish`) -- reinyectarlo de
+/// nuevo acá lo entregaría DOS veces a los mismos suscriptores.
+fn parse_remote_notification(payload: &str, my_instance_id: &str) -> Option<RemoteChange> {
+    let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let instance = v.get("instance")?.as_str()?;
+    if instance == my_instance_id {
+        return None;
+    }
+    let collection = v.get("collection")?.as_str()?.to_string();
+    let event = v.get("event")?.clone();
+    Some(RemoteChange { collection, event })
 }
 
 impl Db {
@@ -374,6 +504,7 @@ impl Db {
             columns,
             subscribers: RefCell::new(HashMap::new()),
             current_request: RefCell::new(None),
+            instance_id: random_instance_id(),
         }
     }
 
@@ -386,7 +517,13 @@ impl Db {
     /// estar caída, tener otra contraseña o no existir todavía, y eso es una
     /// condición operativa normal que `linkc serve` tiene que poder reportar
     /// con un mensaje entendible.
-    pub fn connect_postgres(program: &Program, url: &str) -> Result<Self, String> {
+    ///
+    /// El `Receiver<RemoteChange>` que devuelve junto con `Db` es el otro
+    /// lado de LISTEN/NOTIFY (GRAMMAR.md §3.44): `runtime/server.rs` lo
+    /// drena en su loop principal y reinyecta cada cambio con
+    /// `Db::publish_remote`, para que un `stream` conectado a ESTA
+    /// instancia vea también lo que escribió OTRA contra la misma base.
+    pub(crate) fn connect_postgres(program: &Program, url: &str) -> Result<(Self, Receiver<RemoteChange>), String> {
         let (checker, symbol_errors) = Checker::build_symbols(program);
         if let Some(e) = symbol_errors.into_iter().next() {
             return Err(format!("programa inválido al abrir la base de datos: {e}"));
@@ -443,14 +580,21 @@ impl Db {
             columns.insert(name.clone(), cols);
         }
 
-        Ok(Db {
-            backend,
-            checker,
-            simple_enums,
-            columns,
-            subscribers: RefCell::new(HashMap::new()),
-            current_request: RefCell::new(None),
-        })
+        let instance_id = random_instance_id();
+        let remote_rx = spawn_remote_listener(url.to_string(), instance_id.clone());
+
+        Ok((
+            Db {
+                backend,
+                checker,
+                simple_enums,
+                columns,
+                subscribers: RefCell::new(HashMap::new()),
+                current_request: RefCell::new(None),
+                instance_id,
+            },
+            remote_rx,
+        ))
     }
 
     /// Fixture SOLO para tests y para el demo wasm (`bin/wasm_demo.rs`) --
@@ -700,8 +844,32 @@ db { users: User[] }
     /// antes, para no anunciar una mutación que en realidad falló más
     /// adelante (ambos arms ya tienen todos sus pasos falibles ANTES de
     /// esta llamada).
+    ///
+    /// Entrega LOCAL primero, siempre -- después, si el backend es
+    /// Postgres, además `NOTIFY` para que otras instancias contra la misma
+    /// base también se enteren (GRAMMAR.md §3.44). El NOTIFY es
+    /// best-effort: si falla, esta instancia YA entregó local (arriba), así
+    /// que no es pérdida de datos para nadie conectado acá -- solo una
+    /// propagación cross-instancia que no llegó esta vez.
     fn publish(&self, collection: &str, row: &Value) {
         let json = value_to_json(row, &self.simple_enums);
+        self.deliver_local(collection, &json);
+        if self.backend.is_postgres() {
+            self.notify_remote(collection, &json);
+        }
+    }
+
+    /// Reinyecta LOCAL un cambio que anunció OTRA instancia (drenado del
+    /// canal de `spawn_remote_listener`, GRAMMAR.md §3.44) -- mismo
+    /// mecanismo de entrega que `publish`, pero el evento YA es JSON (llegó
+    /// tal cual en el payload del NOTIFY) y esto NUNCA vuelve a notificar:
+    /// si lo hiciera, cada instancia reenviaría el cambio de las demás sin
+    /// parar nunca.
+    pub(crate) fn publish_remote(&self, collection: &str, event: serde_json::Value) {
+        self.deliver_local(collection, &event);
+    }
+
+    fn deliver_local(&self, collection: &str, json: &serde_json::Value) {
         let mut subs = self.subscribers.borrow_mut();
         if let Some(list) = subs.get_mut(collection) {
             // `try_send` -- NUNCA bloqueante: publicar no puede colgar el
@@ -713,6 +881,26 @@ db { users: User[] }
             // hilo aparte tocando `Db`, reabriendo la pregunta de Send/Sync
             // que todo este diseño evita).
             list.retain(|tx| tx.try_send(json.clone()).is_ok());
+        }
+    }
+
+    fn notify_remote(&self, collection: &str, json: &serde_json::Value) {
+        let payload = serde_json::json!({
+            "instance": self.instance_id,
+            "collection": collection,
+            "event": json,
+        })
+        .to_string();
+        if payload.len() > MAX_NOTIFY_PAYLOAD_BYTES {
+            eprintln!(
+                "aviso: un cambio en '{collection}' de {} bytes supera el límite de NOTIFY de PostgreSQL \
+                 ({MAX_NOTIFY_PAYLOAD_BYTES}) -- no se propaga a otras instancias (GRAMMAR.md §3.44)",
+                payload.len()
+            );
+            return;
+        }
+        if let Err(e) = self.backend.notify(REMOTE_CHANGE_CHANNEL, &payload) {
+            eprintln!("aviso: no se pudo notificar el cambio en '{collection}' a otras instancias: {e}");
         }
     }
 
@@ -845,6 +1033,40 @@ db { users: User[] }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_remote_notification_decodes_a_well_formed_payload_from_another_instance() {
+        let payload = serde_json::json!({
+            "instance": "otra-instancia",
+            "collection": "items",
+            "event": {"id": 1, "name": "hola"},
+        })
+        .to_string();
+        let change = parse_remote_notification(&payload, "mi-instancia").expect("debió parsear");
+        assert_eq!(change.collection, "items");
+        assert_eq!(change.event, serde_json::json!({"id": 1, "name": "hola"}));
+    }
+
+    #[test]
+    fn parse_remote_notification_discards_its_own_echo() {
+        let payload = serde_json::json!({
+            "instance": "mi-instancia",
+            "collection": "items",
+            "event": {"id": 1, "name": "hola"},
+        })
+        .to_string();
+        assert!(
+            parse_remote_notification(&payload, "mi-instancia").is_none(),
+            "un NOTIFY con el mismo instance_id es el propio eco -- ya se publicó local al escribir"
+        );
+    }
+
+    #[test]
+    fn parse_remote_notification_ignores_malformed_payloads_instead_of_panicking() {
+        assert!(parse_remote_notification("no es json", "cualquiera").is_none());
+        assert!(parse_remote_notification("{}", "cualquiera").is_none());
+        assert!(parse_remote_notification(r#"{"instance":"x"}"#, "cualquiera").is_none(), "falta collection/event");
+    }
 
     #[test]
     fn test_db_delete_removes_row() {

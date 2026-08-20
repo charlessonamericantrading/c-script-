@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-533-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.7.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-537-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.8.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -34,15 +34,15 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 ## 📊 Status — what works and what does not
 
 This section is the ground truth. If any other section of this README disagrees with it,
-this section wins. Verified on 2026-08-20 by running the compiler, not by reading it.
+this section wins. Verified on 2026-08-21 by running the compiler, not by reading it.
 
-**Works today**, covered by 533 automated tests:
+**Works today**, covered by 537 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
 - Live push over Server-Sent Events (`stream` + `db.<c>.subscribe()`)
 - Declarative auth: `@authenticated`, `@requires(Role.Admin)`, session tokens from the OS CSPRNG
-- PostgreSQL as the runtime database: `linkc serve app.link 8787 --db postgres://user:pass@host/db` (or `LINK_DATABASE_URL`), with non-destructive auto-migration, opportunistic TLS (pure-rustls, no OpenSSL — connects to managed providers like Supabase/Neon/RDS that require it), and automatic reconnection after a dropped connection. Same program, same generated contract — SQLite remains the default
+- PostgreSQL as the runtime database: `linkc serve app.link 8787 --db postgres://user:pass@host/db` (or `LINK_DATABASE_URL`), with non-destructive auto-migration, opportunistic TLS (pure-rustls, no OpenSSL — connects to managed providers like Supabase/Neon/RDS that require it), automatic reconnection after a dropped connection, and LISTEN/NOTIFY so a `stream` connected to one `linkc serve` instance sees a write that came in through another instance against the same database. Same program, same generated contract — SQLite remains the default
 - Non-JSON responses: `@content_type("text/html; charset=utf-8")` on an rpc returning `String` sends that body verbatim — HTML pages, XML sitemaps, CSV — and stacks with `@requires(Role.Admin)` for pages behind auth
 - Friendly URLs: `@route("/blog/:slug")` gives an rpc a clean, crawlable GET path alongside (never instead of) its normal `/Service/rpc` address — the generated client keeps using the latter. Any number of `:param` segments, in any position (`/blog/:category/:slug`), bound by name; a more specific route (more fixed segments) deterministically wins over a fully dynamic one that would also match
 - Verifying third-party webhooks: `env.get(name)`, `request.rawBody()` / `request.header(name)`, and `crypto.hmacSha256(secret, message)` give an rpc everything it needs to check a Stripe/GitHub/etc. signature before trusting a callback
@@ -59,11 +59,11 @@ this section wins. Verified on 2026-08-20 by running the compiler, not by readin
 |---|---|
 | No custom 404 page | Errors always come back as JSON, even for an HTML `@route`, so there is no way to render a branded error page. |
 | No HTML escaping | Pages are built by concatenating `String`; nothing escapes interpolated data for you. |
-| PostgreSQL has no LISTEN/NOTIFY | Two server instances against one database do not see each other's writes on `stream`. (TLS and automatic reconnection on a dropped connection are now supported — see below; a connection pool isn't meaningful here since the interpreter is single-threaded and only ever runs one query at a time.) |
 | `@rate_limit` is per-process, in-memory | No persistence across restarts, no coordination across replicas if the same `.link` runs on more than one process; the client IP comes from the real TCP connection, never `X-Forwarded-For` (no trusted-proxy config yet, so behind a proxy this limits by the proxy's IP). |
 | `request.rawBody()` needs a JSON body | Argument parsing runs before any rpc, regardless of how many parameters it declares, so a non-JSON body (form-encoded, XML) never reaches the rpc — a JSON webhook payload with extra fields works fine. |
 | No CSP or HSTS | CSP depends on each page's actual content (no way to get a safe default without it); HSTS only makes sense over a connection that's already HTTPS, which `linkc serve` itself never is — both belong at the reverse proxy that terminates TLS in front of it. CORS allowlist entries are exact-match only, no wildcard subdomains. |
 | `smtp.send` is plain text, one recipient, blocking | No HTML body, no attachments, no cc/bcc; sending to several people means one call per recipient. It's synchronous — a slow relay makes the whole (single-threaded) server slow for that request. |
+| Cross-instance `stream` push (LISTEN/NOTIFY) has real limits | A changed row over 8000 bytes (Postgres's own NOTIFY payload cap) doesn't propagate to other instances — it still publishes locally where it was written. NOTIFY is best-effort with no retry queue; an idle server can take up to 200ms to notice a remote change; each instance opens one extra Postgres connection just for LISTEN; SQLite doesn't participate at all. |
 | No npm package | `link-lang` is not on the npm registry yet. GitHub releases work — see Installation below. |
 | `linkc wasm` | Deliberately frozen at integer/boolean scalar functions; the production path is `wasm32-wasip1`. |
 | The web playground | A static mockup: it does not run the compiler. |
@@ -235,7 +235,7 @@ Link comes out-of-the-box with all the developer tooling you need:
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **533 automated unit, integration and CLI tests**, including tests that
+Link is verified by **537 automated unit, integration and CLI tests**, including tests that
 spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
 example published in this repository's documentation:
 

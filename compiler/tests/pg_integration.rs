@@ -18,7 +18,8 @@
 //   docker run --rm -e POSTGRES_PASSWORD=link -p 5432:5432 postgres:16
 //   LINK_TEST_PG_URL=postgres://postgres:link@localhost/postgres cargo test --test pg_integration
 
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::time::Duration;
@@ -122,6 +123,12 @@ impl TempDir {
     fn program(&self, collection: &str) -> PathBuf {
         let path = self.0.join("app.link");
         std::fs::write(&path, program_for(collection)).unwrap();
+        path
+    }
+
+    fn write(&self, name: &str, content: &str) -> PathBuf {
+        let path = self.0.join(name);
+        std::fs::write(&path, content).unwrap();
         path
     }
 }
@@ -678,4 +685,117 @@ fn a_dropped_connection_self_heals_without_a_process_restart() {
     let emails: Vec<&str> = all.as_array().expect("list debe devolver un array").iter().map(|l| l["email"].as_str().unwrap()).collect();
     assert!(emails.contains(&"before@example.com"), "la fila de antes del corte debe seguir ahí: {emails:?}");
     assert!(emails.contains(&"after@example.com"), "la fila de después de reconectar debe estar: {emails:?}");
+}
+
+// GRAMMAR.md §3.44: LISTEN/NOTIFY entre DOS instancias de `linkc serve`
+// contra la misma base -- un `stream` conectado a la instancia A tiene que
+// ver una escritura que llegó por la instancia B, no solo las propias.
+
+const PUSH_PROGRAM: &str = r#"
+type Item = { id: Int, name: String }
+
+db { COLLECTION: Item[], }
+
+service Items {
+  rpc create(name: String) -> Item {
+    db.COLLECTION.insert(Item { id: 0, name: name })
+  }
+
+  stream watchAll() -> Item {
+    while true {
+      db.COLLECTION.subscribe()
+    }
+  }
+}
+"#;
+
+/// Lee eventos SSE de un `stream` conectado a mano por un `TcpStream` --
+/// `linkc serve` los manda con `Transfer-Encoding: chunked`, y CADA chunk es
+/// EXACTAMENTE un evento (`write_chunk` en runtime/server.rs nunca parte un
+/// evento en dos chunks ni junta dos eventos en uno), así que alcanza con
+/// leer un chunk a la vez -- no hace falta un parser de SSE de verdad.
+struct StreamClient {
+    reader: BufReader<TcpStream>,
+}
+
+impl StreamClient {
+    fn connect(port: u16, path: &str) -> Self {
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("conectar al stream");
+        // Sin esto, una lectura sin eventos pendientes bloquearía para
+        // siempre -- `next_event` depende de que un timeout se resuelva
+        // como "no llegó nada", no como un cuelgue del test.
+        stream.set_read_timeout(Some(Duration::from_secs(10))).expect("fijar read timeout");
+        let body = "{}";
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = stream;
+        stream.write_all(request.as_bytes()).expect("escribir request");
+        stream.flush().ok();
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("línea de estado del stream");
+        assert!(status_line.contains("200"), "el stream no arrancó bien: {status_line}");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("header del stream");
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+        StreamClient { reader }
+    }
+
+    /// Un evento (ya parseado como JSON), o `None` si no llegó ninguno
+    /// dentro del `read_timeout` fijado en `connect`.
+    fn next_event(&mut self) -> Option<serde_json::Value> {
+        let mut size_line = String::new();
+        self.reader.read_line(&mut size_line).ok()?;
+        let size = usize::from_str_radix(size_line.trim(), 16).ok()?;
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        self.reader.read_exact(&mut buf).ok()?;
+        let mut crlf = [0u8; 2];
+        self.reader.read_exact(&mut crlf).ok()?;
+        let chunk = String::from_utf8_lossy(&buf);
+        let data = chunk.strip_prefix("data: ")?.trim_end_matches(['\n', '\r']);
+        serde_json::from_str(data).ok()
+    }
+}
+
+#[test]
+fn a_write_on_one_instance_pushes_to_a_stream_connected_to_another() {
+    const COLLECTION: &str = "items_cross_instance";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("cross-instance");
+    let src = temp.write("app.link", &PUSH_PROGRAM.replace("COLLECTION", COLLECTION));
+
+    // Dos procesos `linkc serve` DISTINTOS, mismo programa, misma base.
+    let instance_a = Serve::start(&src, &url);
+    let instance_b = Serve::start(&src, &url);
+
+    // Conectado a A -- tabla recién limpiada, así que la foto inicial (el
+    // primer evento que un `stream` manda siempre, GRAMMAR.md §3.16) está
+    // vacía y el próximo evento real que llegue es la escritura de abajo.
+    let mut watcher = StreamClient::connect(instance_a.port, "/Items/watchAll");
+
+    // La escritura entra por B.
+    let created = instance_b.rpc("Items/create", r#"{"name":"desde-B"}"#);
+    assert_eq!(created["name"], "desde-B", "body: {created:?}");
+
+    // A tiene que verla igual -- vía LISTEN/NOTIFY, no porque comparta
+    // memoria con B (son procesos separados).
+    let event = watcher.next_event().expect("la instancia A debió recibir el push de la instancia B");
+    assert_eq!(event["name"], "desde-B", "evento recibido: {event:?}");
+    assert_eq!(event["id"], created["id"], "evento recibido: {event:?}");
 }

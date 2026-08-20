@@ -175,6 +175,24 @@ impl Backend {
             }
         }
     }
+
+    /// `NOTIFY <channel>, <payload>` (GRAMMAR.md §3.44) -- no-op para
+    /// SQLite, que no tiene ningún mecanismo de notificación cross-proceso
+    /// (y cross-instancia solo importa cuando hay más de una instancia
+    /// compartiendo la base, que es justo el caso que Postgres cubre).
+    /// `channel` es un literal fijo del propio compilador (nunca viene de
+    /// afuera, así que interpolarlo en el SQL no es una inyección), pero
+    /// `payload` SÍ es un parámetro bindeado -- via `pg_notify()`, la forma
+    /// de función, en vez de la sentencia `NOTIFY canal, 'texto'`, que
+    /// exigiría escapar el payload a mano dentro de un literal SQL.
+    pub(crate) fn notify(&self, channel: &str, payload: &str) -> Result<(), String> {
+        match self {
+            Backend::Sqlite(_) => Ok(()),
+            Backend::Postgres { client, url } => {
+                with_reconnect(client, url, |c| c.execute("SELECT pg_notify($1, $2)", &[&channel, &payload])).map(|_| ())
+            }
+        }
+    }
 }
 
 /// Repara la conexión SOLA cuando se cortó, pero nunca reintenta la

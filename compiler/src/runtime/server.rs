@@ -142,14 +142,19 @@ pub fn serve(program: Program, port: u16, source: DbSource, cors: CorsConfig) {
     // desconocida: 'items'" en cada rpc; y uno que sí declaraba `users`
     // pero con otra forma recibía los campos del `User` del demo, que su
     // propio tipo no tiene.
-    let db = match source {
-        DbSource::SqliteFile(db_path) => Db::new(&program, &db_path),
+    // `remote_changes`: `Some` solo con Postgres (GRAMMAR.md §3.44) -- el
+    // otro lado de LISTEN/NOTIFY, drenado más abajo en el loop principal.
+    // SQLite no tiene ningún mecanismo de notificación cross-proceso, así
+    // que ahí es `None` y el loop se queda con el `incoming_requests()`
+    // bloqueante de siempre, sin overhead de polling.
+    let (db, remote_changes) = match source {
+        DbSource::SqliteFile(db_path) => (Db::new(&program, &db_path), None),
         // A diferencia de abrir un archivo local, conectarse a una base remota
         // falla por motivos operativos normales (está caída, la clave cambió,
         // la base no existe todavía). Eso merece un mensaje que se entienda y
         // un exit code, no el panic que usa el camino de SQLite.
         DbSource::Postgres(url) => match Db::connect_postgres(&program, &url) {
-            Ok(db) => db,
+            Ok((db, rx)) => (db, Some(rx)),
             Err(e) => {
                 eprintln!("error: {e}");
                 eprintln!("       revisá la URL de conexión (LINK_DATABASE_URL o --db) y que la base esté levantada");
@@ -171,180 +176,227 @@ pub fn serve(program: Program, port: u16, source: DbSource, cors: CorsConfig) {
     let mut rate_limiter = RateLimiter::new();
     println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
-    for mut request in server.incoming_requests() {
-        // Resuelto UNA vez por request, antes de cualquier otra cosa --
-        // hasta el preflight OPTIONS lo necesita (GRAMMAR.md §3.41).
-        let request_origin = request
-            .headers()
-            .iter()
-            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Origin"))
-            .map(|h| h.value.as_str().to_string());
-        let cors_headers = cors.headers_for(request_origin.as_deref());
-
-        if *request.method() == tiny_http::Method::Options {
-            let _ = request.respond(cors_response(204, String::new(), &cors_headers));
-            continue;
-        }
-
-        let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let start = std::time::Instant::now();
-        let path = request.url().to_string();
-        println!("[req {req_id}] {} {path}", request.method());
-
-        let mut body = String::new();
-        let _ = request.as_reader().read_to_string(&mut body);
-
-        // `request.rawBody()`/`request.header()` (GRAMMAR.md §3.38): fijado
-        // ACÁ, antes de cualquier dispatch, así que para cuando un rpc
-        // corre -- sea por `/Servicio/rpc` o por una `@route` -- el
-        // contexto siempre es el de ESTA request. La próxima iteración lo
-        // sobreescribe antes de que su propio dispatch corra, así que nunca
-        // hace falta limpiarlo a mano entre medio.
-        let headers: Vec<(String, String)> =
-            request.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect();
-        db.set_request_context(super::db::RequestContext { raw_body: body.clone(), headers });
-
-        if path == "/" || path == "/health" || path == "/status" {
-            let services: Vec<String> = program
-                .items
-                .iter()
-                .filter_map(|it| match it {
-                    crate::ast::Item::Service(s) => Some(s.name.clone()),
-                    _ => None,
-                })
-                .collect();
-            let health_json = serde_json::json!({
-                "status": "ok",
-                "engine": "c-script",
-                // Del Cargo.toml, no escrita a mano: la versión que reporta el
-                // servidor tiene que ser la del binario que está corriendo, y
-                // una constante suelta se queda vieja en el primer release.
-                "version": env!("CARGO_PKG_VERSION"),
-                "services": services
-            })
-            .to_string();
-            let _ = request.respond(cors_response(200, health_json, &cors_headers));
-            log_done(req_id, Some("health"), 200, start, "");
-            continue;
-        }
-
-        let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, &route_table) {
-            Ok(resolved) => resolved,
-            Err(None) => {
-                let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method"), &cors_headers));
-                log_done(req_id, None, 404, start, "");
-                continue;
-            }
-            Err(Some(msg)) => {
-                let _ = request.respond(cors_response(400, error_json(&msg), &cors_headers));
-                log_done(req_id, None, 400, start, &format!("error={msg:?}"));
-                continue;
-            }
-        };
-        let method = format!("{service_name}.{rpc_name}");
-
-        // `@rate_limit` (GRAMMAR.md §3.39): corre ANTES del gate de auth de
-        // abajo, a propósito -- si corriera después, un rpc protegido dejaría
-        // probar credenciales sin límite alguno (401 no cuesta nada). La IP
-        // sale de la conexión TCP real (`remote_addr`), nunca de un header
-        // que el cliente controla -- ver rate_limit.rs para el porqué.
-        if let Some(raw_spec) = required_rate_limit(&program, service_name, rpc_name) {
-            let spec = RateLimitSpec::parse(raw_spec)
-                .expect("check_rate_limit_annotation (checker.rs) ya validó este formato en compilación");
-            let client_ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "desconocida".to_string());
-            if !rate_limiter.check(&client_ip, service_name, rpc_name, spec) {
-                let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
-                log_done(req_id, Some(&method), 429, start, "");
-                continue;
+    match remote_changes {
+        None => {
+            for request in server.incoming_requests() {
+                handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, request);
             }
         }
-
-        // El gate de autorización corre ACÁ, antes de `parse_args`/
-        // `json_to_typed_value` en cualquiera de las dos ramas de abajo --
-        // un rpc protegido rechaza la request sin filtrar el shape de sus
-        // parámetros a través de un 400 detallado antes de que el caller
-        // pruebe estar autorizado (GRAMMAR.md §3.14).
-        let token = extract_bearer_token(&request);
-        if let Err((status, msg)) = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name) {
-            let _ = request.respond(cors_response(status, error_json(msg), &cors_headers));
-            log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
-            continue;
-        }
-
-        if is_stream_member(&program, service_name, rpc_name) {
-            // Push real v0 (GRAMMAR.md §3.16): si el cuerpo matchea el
-            // shape reconocido (`ast::recognize_live_subscribe`), esto NUNCA
-            // llega a invocar `invoke_rpc_with_sessions` -- `Db::subscribe`
-            // (hilo principal, sincrónico) da la foto inicial + un
-            // `Receiver` que el hilo escritor bloquea leyendo para siempre.
-            // Cualquier otro stream sigue el camino de List<T> de siempre,
-            // sin cambios, más abajo.
-            if let Some(collection) = live_subscribe_collection(&program, service_name, rpc_name) {
-                match db.subscribe(collection) {
-                    Ok((snapshot, events)) => {
-                        let cors_headers = cors_headers.clone();
-                        std::thread::spawn(move || write_live_stream(request, snapshot, events, cors_headers, req_id, method, start));
-                    }
-                    Err(e) => {
-                        let status = status_for(&e);
-                        let msg = e.to_string();
-                        let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
-                        log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
-                    }
+        Some(remote_rx) => {
+            // Además de aceptar requests, hay que drenar los cambios que
+            // anunciaron OTRAS instancias (GRAMMAR.md §3.44) -- por eso
+            // `recv_timeout` en vez del `incoming_requests()` bloqueante de
+            // siempre: sin esto, un cambio remoto podría quedar esperando
+            // indefinidamente si no llega ninguna request HTTP nueva que
+            // "despierte" al loop.
+            loop {
+                while let Ok(change) = remote_rx.try_recv() {
+                    db.publish_remote(&change.collection, change.event);
                 }
-                continue;
+                match server.recv_timeout(REMOTE_CHANGE_POLL_INTERVAL) {
+                    Ok(Some(request)) => handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, request),
+                    Ok(None) => {}
+                    Err(e) => eprintln!("error aceptando una conexión: {e}"),
+                }
             }
+        }
+    }
+}
 
-            // `args_json` ya viene resuelto de `resolve_route` de arriba (el
-            // mismo body-parseado-como-JSON de siempre: un `stream` nunca
-            // puede tener `@route`, el checker lo rechaza, así que la tabla
-            // de rutas nunca matchea acá -- no hace falta volver a parsear.
-            //
-            // invoke_rpc_with_sessions corre ACÁ, en el hilo principal --
-            // ver el porqué en el comentario de arriba del módulo. Lo único
-            // que cruza al hilo de escritura es `elements` (ya JSON puro) y
-            // `request`.
-            let elements = match invoke_rpc_with_sessions(&program, service_name, rpc_name, &args_json, &db, &sessions, token.as_deref()) {
-                Ok(json) => json.as_array().cloned().expect(
-                    "check_rpc (checker.rs) exige que el cuerpo de un stream sea List<T> -- invoke_rpc no puede devolver otra cosa acá",
-                ),
+/// Cada cuánto el loop principal vuelve a revisar el canal de cambios
+/// remotos cuando no llegó ninguna request HTTP nueva mientras tanto
+/// (GRAMMAR.md §3.44) -- lo bastante seguido para que la propagación
+/// cross-instancia no se sienta atrasada en un servidor inactivo, sin
+/// gastar CPU despertando el loop con más frecuencia de la que hace falta.
+const REMOTE_CHANGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// El cuerpo de siempre del loop principal, extraído a función para poder
+/// llamarse desde las dos formas de esperar la próxima request (bloqueante
+/// de siempre, o con timeout cuando además hay que drenar cambios remotos)
+/// sin duplicar esta lógica -- exactamente la clase de divergencia entre
+/// dos copias del mismo código que este proyecto viene evitando desde
+/// GRAMMAR.md §3.9.
+fn handle_request(
+    program: &Program,
+    db: &Db,
+    sessions: &SessionStore,
+    route_table: &[RouteEntry],
+    rate_limiter: &mut RateLimiter,
+    cors: &CorsConfig,
+    mut request: tiny_http::Request,
+) {
+    // Resuelto UNA vez por request, antes de cualquier otra cosa --
+    // hasta el preflight OPTIONS lo necesita (GRAMMAR.md §3.41).
+    let request_origin = request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Origin"))
+        .map(|h| h.value.as_str().to_string());
+    let cors_headers = cors.headers_for(request_origin.as_deref());
+
+    if *request.method() == tiny_http::Method::Options {
+        let _ = request.respond(cors_response(204, String::new(), &cors_headers));
+        return;
+    }
+
+    let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let start = std::time::Instant::now();
+    let path = request.url().to_string();
+    println!("[req {req_id}] {} {path}", request.method());
+
+    let mut body = String::new();
+    let _ = request.as_reader().read_to_string(&mut body);
+
+    // `request.rawBody()`/`request.header()` (GRAMMAR.md §3.38): fijado
+    // ACÁ, antes de cualquier dispatch, así que para cuando un rpc
+    // corre -- sea por `/Servicio/rpc` o por una `@route` -- el
+    // contexto siempre es el de ESTA request. La próxima iteración lo
+    // sobreescribe antes de que su propio dispatch corra, así que nunca
+    // hace falta limpiarlo a mano entre medio.
+    let headers: Vec<(String, String)> =
+        request.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect();
+    db.set_request_context(super::db::RequestContext { raw_body: body.clone(), headers });
+
+    if path == "/" || path == "/health" || path == "/status" {
+        let services: Vec<String> = program
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                crate::ast::Item::Service(s) => Some(s.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let health_json = serde_json::json!({
+            "status": "ok",
+            "engine": "c-script",
+            // Del Cargo.toml, no escrita a mano: la versión que reporta el
+            // servidor tiene que ser la del binario que está corriendo, y
+            // una constante suelta se queda vieja en el primer release.
+            "version": env!("CARGO_PKG_VERSION"),
+            "services": services
+        })
+        .to_string();
+        let _ = request.respond(cors_response(200, health_json, &cors_headers));
+        log_done(req_id, Some("health"), 200, start, "");
+        return;
+    }
+
+    let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, &route_table) {
+        Ok(resolved) => resolved,
+        Err(None) => {
+            let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method"), &cors_headers));
+            log_done(req_id, None, 404, start, "");
+            return;
+        }
+        Err(Some(msg)) => {
+            let _ = request.respond(cors_response(400, error_json(&msg), &cors_headers));
+            log_done(req_id, None, 400, start, &format!("error={msg:?}"));
+            return;
+        }
+    };
+    let method = format!("{service_name}.{rpc_name}");
+
+    // `@rate_limit` (GRAMMAR.md §3.39): corre ANTES del gate de auth de
+    // abajo, a propósito -- si corriera después, un rpc protegido dejaría
+    // probar credenciales sin límite alguno (401 no cuesta nada). La IP
+    // sale de la conexión TCP real (`remote_addr`), nunca de un header
+    // que el cliente controla -- ver rate_limit.rs para el porqué.
+    if let Some(raw_spec) = required_rate_limit(&program, service_name, rpc_name) {
+        let spec = RateLimitSpec::parse(raw_spec)
+            .expect("check_rate_limit_annotation (checker.rs) ya validó este formato en compilación");
+        let client_ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "desconocida".to_string());
+        if !rate_limiter.check(&client_ip, service_name, rpc_name, spec) {
+            let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
+            log_done(req_id, Some(&method), 429, start, "");
+            return;
+        }
+    }
+
+    // El gate de autorización corre ACÁ, antes de `parse_args`/
+    // `json_to_typed_value` en cualquiera de las dos ramas de abajo --
+    // un rpc protegido rechaza la request sin filtrar el shape de sus
+    // parámetros a través de un 400 detallado antes de que el caller
+    // pruebe estar autorizado (GRAMMAR.md §3.14).
+    let token = extract_bearer_token(&request);
+    if let Err((status, msg)) = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name) {
+        let _ = request.respond(cors_response(status, error_json(msg), &cors_headers));
+        log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
+        return;
+    }
+
+    if is_stream_member(&program, service_name, rpc_name) {
+        // Push real v0 (GRAMMAR.md §3.16): si el cuerpo matchea el
+        // shape reconocido (`ast::recognize_live_subscribe`), esto NUNCA
+        // llega a invocar `invoke_rpc_with_sessions` -- `Db::subscribe`
+        // (hilo principal, sincrónico) da la foto inicial + un
+        // `Receiver` que el hilo escritor bloquea leyendo para siempre.
+        // Cualquier otro stream sigue el camino de List<T> de siempre,
+        // sin cambios, más abajo.
+        if let Some(collection) = live_subscribe_collection(&program, service_name, rpc_name) {
+            match db.subscribe(collection) {
+                Ok((snapshot, events)) => {
+                    let cors_headers = cors_headers.clone();
+                    std::thread::spawn(move || write_live_stream(request, snapshot, events, cors_headers, req_id, method, start));
+                }
                 Err(e) => {
                     let status = status_for(&e);
                     let msg = e.to_string();
                     let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
                     log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
-                    continue;
                 }
-            };
-            std::thread::spawn(move || write_stream(request, elements, cors_headers, req_id, method, start));
-            continue;
+            }
+            return;
         }
 
-        let (status, response_body, response_type) =
-            handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, args_json);
-        // `response_body` en una falla es `{"error": "<mensaje>"}`
-        // (`error_json`, más abajo) -- se extrae el mensaje solo para el
-        // log en vez de loguear el JSON completo escapado adentro de otro
-        // string (`error="{\"error\":\"...\"}"`, técnicamente correcto
-        // pero feo de leer); si el body no tiene esa forma exacta por
-        // algún motivo, cae al body crudo en vez de esconder la falla.
-        let extra = if status >= 400 {
-            let message = serde_json::from_str::<serde_json::Value>(&response_body)
-                .ok()
-                .and_then(|v| v.get("error").and_then(|e| e.as_str().map(str::to_string)))
-                .unwrap_or_else(|| response_body.clone());
-            format!("error={message:?}")
-        } else {
-            String::new()
+        // `args_json` ya viene resuelto de `resolve_route` de arriba (el
+        // mismo body-parseado-como-JSON de siempre: un `stream` nunca
+        // puede tener `@route`, el checker lo rechaza, así que la tabla
+        // de rutas nunca matchea acá -- no hace falta volver a parsear.
+        //
+        // invoke_rpc_with_sessions corre ACÁ, en el hilo principal --
+        // ver el porqué en el comentario de arriba del módulo. Lo único
+        // que cruza al hilo de escritura es `elements` (ya JSON puro) y
+        // `request`.
+        let elements = match invoke_rpc_with_sessions(&program, service_name, rpc_name, &args_json, &db, &sessions, token.as_deref()) {
+            Ok(json) => json.as_array().cloned().expect(
+                "check_rpc (checker.rs) exige que el cuerpo de un stream sea List<T> -- invoke_rpc no puede devolver otra cosa acá",
+            ),
+            Err(e) => {
+                let status = status_for(&e);
+                let msg = e.to_string();
+                let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
+                log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
+                return;
+            }
         };
-        let _ = request.respond(cors_response_with_type(status, response_body, &response_type, &cors_headers));
-        log_done(req_id, Some(&method), status, start, &extra);
-        // Defensa en profundidad, no carga estructural: el `set_request_context`
-        // de arriba ya garantiza que la PRÓXIMA request nunca ve el contexto de
-        // esta. Limpiarlo acá además evita que sobreviva en memoria más de lo
-        // necesario entre el fin de esta request y el arranque de la próxima.
-        db.clear_request_context();
+        std::thread::spawn(move || write_stream(request, elements, cors_headers, req_id, method, start));
+        return;
     }
+
+    let (status, response_body, response_type) =
+        handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, args_json);
+    // `response_body` en una falla es `{"error": "<mensaje>"}`
+    // (`error_json`, más abajo) -- se extrae el mensaje solo para el
+    // log en vez de loguear el JSON completo escapado adentro de otro
+    // string (`error="{\"error\":\"...\"}"`, técnicamente correcto
+    // pero feo de leer); si el body no tiene esa forma exacta por
+    // algún motivo, cae al body crudo en vez de esconder la falla.
+    let extra = if status >= 400 {
+        let message = serde_json::from_str::<serde_json::Value>(&response_body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str().map(str::to_string)))
+            .unwrap_or_else(|| response_body.clone());
+        format!("error={message:?}")
+    } else {
+        String::new()
+    };
+    let _ = request.respond(cors_response_with_type(status, response_body, &response_type, &cors_headers));
+    log_done(req_id, Some(&method), status, start, &extra);
+    // Defensa en profundidad, no carga estructural: el `set_request_context`
+    // de arriba ya garantiza que la PRÓXIMA request nunca ve el contexto de
+    // esta. Limpiarlo acá además evita que sobreviva en memoria más de lo
+    // necesario entre el fin de esta request y el arranque de la próxima.
+    db.clear_request_context();
 }
 
 fn parse_path(path: &str) -> Option<(&str, &str)> {

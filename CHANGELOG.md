@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.8.0] - 2026-08-21
+
+### ✨ Nuevo
+- **PostgreSQL LISTEN/NOTIFY: `stream` entre varias instancias.** Último límite honesto que quedaba de v1.1.0 — dos instancias de `linkc serve` contra la misma base no se enteraban de las escrituras de la otra en un `stream`. Cambio real al modelo de concurrencia del intérprete: una conexión Postgres SEPARADA y dedicada solo a `LISTEN` (un único canal para todas las colecciones, el nombre va adentro del payload), corriendo en un hilo de fondo que se auto-repara igual que la conexión de queries (v1.4.0) si se corta. Cada `insert`/`applyPatch`/`delete` publica local primero y además hace `NOTIFY` vía `pg_notify()` (parámetro bindeado, no SQL armado a mano); cada instancia se reconoce a sí misma por un id de proceso en el payload, así que nunca duplica su propio eco. El loop principal del servidor pasó de bloquear en `incoming_requests()` a `recv_timeout` (200ms) cuando hay Postgres de por medio, para poder drenar el canal de cambios remotos sin dejar de atender requests HTTP; con SQLite el comportamiento no cambia. Límites honestos: el payload de NOTIFY tiene el tope de 8000 bytes de Postgres mismo (un cambio más grande no se propaga, pero sigue publicándose local donde se escribió), es best-effort sin cola de reintento, hasta 200ms de latencia en un servidor inactivo, una conexión Postgres más por instancia, y SQLite sigue sin participar. Verificado contra DOS procesos `linkc serve` reales apuntando a la misma base de Postgres: detalle completo en GRAMMAR.md §3.44.
+
 ## [1.7.0] - 2026-08-20
 
 ### ✨ Nuevo
