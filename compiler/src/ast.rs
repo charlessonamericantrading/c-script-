@@ -193,7 +193,7 @@ pub struct RpcDecl {
     pub params: Vec<Param>,
     pub return_type: TypeExpr,
     pub body: Block,
-    pub annotation: Option<Annotation>,
+    pub annotations: Vec<Annotation>,
     pub span: Span,
 }
 
@@ -203,17 +203,41 @@ impl PartialEq for RpcDecl {
             && self.params == other.params
             && self.return_type == other.return_type
             && self.body == other.body
-            && self.annotation == other.annotation
+            && self.annotations == other.annotations
     }
 }
 
-/// Auth v0 (GRAMMAR.md §3.14): a lo sumo UNA anotación por rpc/stream --
-/// nunca una lista. `@requires` implica autenticado (además del rol); no hay
-/// forma de pedir "cualquiera de estos N roles" en v0.
+impl RpcDecl {
+    /// La anotación de auth, si hay (GRAMMAR.md §3.14). Sigue siendo a lo sumo
+    /// UNA: `@requires` ya implica autenticado, y no hay forma de pedir
+    /// "cualquiera de estos N roles" -- lo que el checker permite combinar es
+    /// auth con `@content_type`, que es una dimensión distinta (§3.35).
+    pub fn auth(&self) -> Option<&Annotation> {
+        self.annotations
+            .iter()
+            .find(|a| matches!(a, Annotation::Authenticated | Annotation::Requires { .. }))
+    }
+
+    /// El Content-Type declarado con `@content_type("...")`, si hay. Cuando
+    /// está, la respuesta es el `String` que devuelve el rpc tal cual, no un
+    /// JSON (GRAMMAR.md §3.35).
+    pub fn content_type(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::ContentType(ct) => Some(ct.as_str()),
+            _ => None,
+        })
+    }
+}
+
+/// Anotaciones de un rpc/stream. Se permiten varias, pero no cualquier
+/// combinación: el checker rechaza dos de auth, dos de `@content_type`, y
+/// `@content_type` sobre un `stream` o sobre un rpc que no devuelve `String`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Annotation {
     Authenticated,
     Requires { enum_name: String, variant_name: String },
+    /// `@content_type("text/html; charset=utf-8")` -- ver GRAMMAR.md §3.35.
+    ContentType(String),
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

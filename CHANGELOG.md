@@ -12,6 +12,14 @@ El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1
 - **Los tokens de sesión piden entropía directo al SO** (`getrandom`), reemplazando el rodeo del hilo descartable sobre `RandomState` que documenta GRAMMAR.md §3.14.
 - Detalle completo, con los límites que quedan (parámetros de Argon2id no configurables desde el lenguaje, sin señal de re-hash, el hashing bloquea el hilo del servidor ~15 ms): GRAMMAR.md §3.34.
 
+### ✨ Nuevo
+- **`@content_type("...")`: respuestas que no son JSON.** Un rpc que devuelve `String` puede declarar el Content-Type de su respuesta, y entonces el cuerpo se escribe tal cual: HTML, sitemaps XML, CSV, texto plano. Antes el Content-Type estaba literal en el binario (`application/json` para rpcs, `text/event-stream` para streams) y un programa c-script no podía devolver una página, lo que dejaba fuera cualquier render en servidor y cualquier historia de SEO. Las tres capas cambiaron juntas: el servidor manda el header, el cliente TypeScript generado lee `res.text()` en vez de `res.json()`, y el spec OpenAPI declara el mismo tipo. Detalle y límites (sin rutas limpias, sin escapado de HTML, los errores siguen en JSON): GRAMMAR.md §3.35.
+- **Las anotaciones de un rpc pasaron a ser una lista.** `@requires(Role.Admin) @content_type("text/html")` es válido — auth y Content-Type son dimensiones distintas, y un panel de administración necesita las dos. El checker sigue rechazando dos anotaciones de la misma dimensión.
+
+### 🩺 Diagnósticos
+- **Los tipos en los errores del compilador se escriben como en c-script.** Interpolaban el `Debug` de Rust, así que un error sobre un `T?` mostraba `Optional(Struct { name: Some("Todo"), fields: [FieldType { name: "id", optional: false, ty: Int }, ...] })`. Ahora dice `Todo?`.
+- **El acceso a un campo sobre `T?` explica qué hacer**, no solo que no se puede: es el error más frecuente, porque en TypeScript `if (x != null)` sí angosta y en c-script no.
+
 ### 📚 Documentación
 - **Los ejemplos de la documentación ahora los compila el compilador.** `compiler/tests/docs_examples.rs` toma cada bloque de código c-script publicado en README, `llms.txt`, `llms-full.txt`, `AGENTS.md`, las reglas de Cursor/Copilot y `docs/`, lo compila con el binario real y, si declara un `test "..."`, lo ejecuta. Casi ninguno compilaba: el ejemplo insignia del README usaba `role: Role.Member` sin llaves, y `llms.txt` enseñaba closures con tipo de retorno y lectura de campos sobre un `T?`.
 - **Nuevo `AGENTS.md`**: mapa del repo, comandos reales, convenciones y la lista de lo que está roto a sabiendas, para Claude Code / Codex.

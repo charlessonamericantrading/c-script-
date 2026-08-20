@@ -1903,7 +1903,7 @@ pub fn is_stream_member(program: &Program, service_name: &str, rpc_name: &str) -
 pub fn required_auth<'a>(program: &'a Program, service_name: &str, rpc_name: &str) -> Option<&'a Annotation> {
     program.items.iter().find_map(|i| match i {
         Item::Service(s) if s.name == service_name => s.members.iter().find_map(|m| match m {
-            Member::Rpc(r) | Member::Stream(r) if r.name == rpc_name => r.annotation.as_ref(),
+            Member::Rpc(r) | Member::Stream(r) if r.name == rpc_name => r.auth(),
             _ => None,
         }),
         _ => None,

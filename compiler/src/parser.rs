@@ -369,10 +369,10 @@ impl Parser {
         // tomara su propio inicio al entrar, `@authenticated`/`@requires`
         // quedaría sistemáticamente AFUERA del span del rpc.
         let start = self.span();
-        let annotation = self.parse_optional_annotation()?;
+        let annotations = self.parse_optional_annotation()?;
         match self.peek().clone() {
-            TokenKind::Rpc => Ok(Member::Rpc(self.parse_rpc_like(start, TokenKind::Rpc, annotation)?)),
-            TokenKind::Stream => Ok(Member::Stream(self.parse_rpc_like(start, TokenKind::Stream, annotation)?)),
+            TokenKind::Rpc => Ok(Member::Rpc(self.parse_rpc_like(start, TokenKind::Rpc, annotations)?)),
+            TokenKind::Stream => Ok(Member::Stream(self.parse_rpc_like(start, TokenKind::Stream, annotations)?)),
             other => Err(self.error(format!("se esperaba 'rpc' o 'stream', se encontró {other:?}"))),
         }
     }
@@ -382,33 +382,46 @@ impl Parser {
     /// completo -- ese acepta opcionalmente `{ campos }` (destructuración),
     /// algo que acá nunca corresponde: `@requires` solo compara el tag de la
     /// variante, nunca mira campos.
-    fn parse_optional_annotation(&mut self) -> Result<Option<Annotation>, ParseError> {
-        if !self.check(&TokenKind::At) {
-            return Ok(None);
+    fn parse_optional_annotation(&mut self) -> Result<Vec<Annotation>, ParseError> {
+        let mut annotations = Vec::new();
+        // Varias anotaciones seguidas: `@requires(Role.Admin) @content_type("text/html")`.
+        // Qué combinaciones son legales lo decide el checker, no el parser --
+        // acá solo importa la forma.
+        while self.check(&TokenKind::At) {
+            self.advance();
+            let name = self.eat_ident()?;
+            let annotation = match name.as_str() {
+                "authenticated" => Annotation::Authenticated,
+                "requires" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let enum_name = self.eat_ident()?;
+                    self.eat(&TokenKind::Dot)?;
+                    let variant_name = self.eat_ident()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::Requires { enum_name, variant_name }
+                }
+                "content_type" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let value = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::ContentType(value)
+                }
+                other => {
+                    return Err(self.error(format!(
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)' o '@content_type(\"tipo/mime\")')"
+                    )))
+                }
+            };
+            annotations.push(annotation);
         }
-        self.advance();
-        let name = self.eat_ident()?;
-        match name.as_str() {
-            "authenticated" => Ok(Some(Annotation::Authenticated)),
-            "requires" => {
-                self.eat(&TokenKind::LParen)?;
-                let enum_name = self.eat_ident()?;
-                self.eat(&TokenKind::Dot)?;
-                let variant_name = self.eat_ident()?;
-                self.eat(&TokenKind::RParen)?;
-                Ok(Some(Annotation::Requires { enum_name, variant_name }))
-            }
-            other => Err(self.error(format!(
-                "anotación desconocida '@{other}' (se esperaba '@authenticated' o '@requires(Enum.Variante)')"
-            ))),
-        }
+        Ok(annotations)
     }
 
     /// `start` viene de `parse_member` (capturado antes de la anotación
     /// opcional, ver ahí). El span de la declaración cubre la FIRMA hasta el
     /// return type -- se calcula ANTES de parsear `body`, a propósito (el
     /// cuerpo tiene sus propios spans precisos, ver ast.rs::RpcDecl).
-    fn parse_rpc_like(&mut self, start: Span, kw: TokenKind, annotation: Option<Annotation>) -> Result<RpcDecl, ParseError> {
+    fn parse_rpc_like(&mut self, start: Span, kw: TokenKind, annotations: Vec<Annotation>) -> Result<RpcDecl, ParseError> {
         self.eat(&kw)?;
         let name = self.eat_ident()?;
         self.eat(&TokenKind::LParen)?;
@@ -423,7 +436,7 @@ impl Parser {
             params,
             return_type,
             body,
-            annotation,
+            annotations,
             span,
         })
     }

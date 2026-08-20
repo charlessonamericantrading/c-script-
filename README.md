@@ -6,7 +6,7 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-453-success.svg" alt="Tests" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-457-success.svg" alt="Tests" /></a>
     <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.0.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
@@ -36,12 +36,13 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-20 by running the compiler, not by reading it.
 
-**Works today**, covered by 453 automated tests:
+**Works today**, covered by 457 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
 - Live push over Server-Sent Events (`stream` + `db.<c>.subscribe()`)
 - Declarative auth: `@authenticated`, `@requires(Role.Admin)`, session tokens from the OS CSPRNG
+- Non-JSON responses: `@content_type("text/html; charset=utf-8")` on an rpc returning `String` sends that body verbatim — HTML pages, XML sitemaps, CSV — and stacks with `@requires(Role.Admin)` for pages behind auth
 - Real password hashing: `crypto.hashPassword` is Argon2id (RFC 9106) with a random per-password salt, in PHC format; `verifyPassword` compares in constant time and still accepts hashes written by the previous version so existing users are not locked out
 - Generated TypeScript contract, typed client, runtime validators, React hooks, Zod schemas, OpenAPI 3.1
 
@@ -49,7 +50,8 @@ this section wins. Verified on 2026-08-20 by running the compiler, not by readin
 
 | Limitation | Detail |
 |---|---|
-| No HTML responses | The response `Content-Type` is hardcoded (`application/json` for RPCs, `text/event-stream` for streams). There is no SSR and no SEO story; put a separate frontend in front. |
+| No clean URLs | Routing is always `/Service/rpc` — no path parameters, no custom routes. HTML itself works (see `@content_type`), but a blog at `/blog/my-post` needs a proxy in front. Errors always come back as JSON, so there is no custom 404 page. |
+| No HTML escaping | Pages are built by concatenating `String`; nothing escapes interpolated data for you. |
 | PostgreSQL is DDL-only | `linkc build` emits PostgreSQL schema SQL, but `linkc serve` always uses SQLite. There is no Postgres driver. |
 | `linkc fmt` is unsafe | It deletes comments and can emit source that no longer parses (fix pending in PR #2). |
 | `linkc --help` | Not a recognised argument; run `linkc` with no arguments (fix pending in PR #5). |
@@ -224,7 +226,7 @@ Link comes out-of-the-box with all the developer tooling you need:
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **453 automated unit, integration and CLI tests**, including tests that
+Link is verified by **457 automated unit, integration and CLI tests**, including tests that
 spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
 example published in this repository's documentation:
 

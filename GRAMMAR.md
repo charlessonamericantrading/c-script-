@@ -56,6 +56,7 @@
   - [3.32 Función builtin `now() -> Timestamp` — RESUELTO](#332-función-builtin-now---timestamp--resuelto)
   - [3.33 Test runner de comportamiento integrado (`test "nombre" { ... }`, `assert`, `panic`) — RESUELTO](#333-test-runner-de-comportamiento-integrado-test-nombre----assert-panic--resuelto)
   - [3.34 `crypto`: contraseñas y aleatoriedad — RESUELTO (Argon2id + CSPRNG del SO)](#334-crypto-contraseñas-y-aleatoriedad--resuelto-argon2id--csprng-del-so)
+  - [3.35 `@content_type`: respuestas que no son JSON — RESUELTO (alcance acotado)](#335-content_type-respuestas-que-no-son-json--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -114,9 +115,11 @@ field        = identifier , [ "?" ] , ":" , type_expr ;
 const_decl   = "const" , identifier , ":" , type_expr , "=" , expr , ";" ;
 
 service_decl = "service" , identifier , "{" , { member_decl } , "}" ;
-member_decl  = [ annotation ] , ( rpc_decl | stream_decl ) ;
+member_decl  = { annotation } , ( rpc_decl | stream_decl ) ;
 (* auth v0, §3.14 -- a lo sumo UNA por rpc/stream, nunca una lista *)
-annotation   = "@authenticated" | "@requires" , "(" , identifier , "." , identifier , ")" ;
+annotation   = "@authenticated"
+             | "@requires" , "(" , identifier , "." , identifier , ")"
+             | "@content_type" , "(" , string_lit , ")" ;
 rpc_decl     = "rpc" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 stream_decl  = "stream" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 param_list   = param , { "," , param } ;
@@ -782,7 +785,7 @@ service Users {
 }
 ```
 
-`@authenticated` exige una sesión válida, cualquier rol. `@requires(Enum.Variante)` exige además que el rol de esa sesión sea exactamente esa variante. **A lo sumo una anotación por rpc/stream** (`RpcDecl.annotation: Option<Annotation>`, nunca una lista) y **un solo rol por `@requires`** (sin OR de roles) — límites deliberados de v0, no descuidos.
+`@authenticated` exige una sesión válida, cualquier rol. `@requires(Enum.Variante)` exige además que el rol de esa sesión sea exactamente esa variante. **A lo sumo una anotación DE AUTH por rpc/stream** (`@requires` ya implica autenticado; el checker rechaza dos) y **un solo rol por `@requires`** (sin OR de roles) — límites deliberados de v0, no descuidos. Desde §3.35 la lista sí admite varias anotaciones (`RpcDecl.annotations: Vec<Annotation>`), porque `@content_type` es una dimensión distinta de la auth: una página de panel de administración es HTML *y* está protegida.
 
 **`@requires(Role.Admin)` reusa el mecanismo de `Enum.Variante` que YA existía para nombrar una variante en un patrón de `match`** (`parse_pattern_atom`, `ident "." ident`, SIN llaves) — no se inventó una tercera sintaxis. Esto es a propósito ASIMÉTRICO con `Role.Admin {}` (que sí hace falta para *construir* un valor real, ej. al llamar `auth.createSession(Role.Admin {})`): una anotación nombra un TAG a comparar, una expresión construye un VALOR — dos reglas correctas por separado, pero que un usuario puede confundir la primera vez que las ve una al lado de la otra.
 
@@ -1211,6 +1214,7 @@ Cierra el límite honesto documentado en §3.31 ("sin construcción desde códig
 
 Completa el objetivo de PLAN.md §5 ("Testing: runner integrado"). Permite escribir tests de integración y comportamiento directamente en archivos `.link`.
 
+<!-- linkc:check -->
 ```link
 type User = { id: Int, name: String }
 db { users: User[] }
@@ -1305,6 +1309,112 @@ hash declare `$argon2id$`, que un hash legado válido siga verificando y uno que
 no corresponde no, y que dos `randomToken`/`uuid` consecutivos sean distintos.
 Cada uno de esos asserts falla con la implementación anterior — que es la
 prueba de que testean la propiedad y no la firma.
+
+---
+
+### 3.35 `@content_type`: respuestas que no son JSON — RESUELTO (alcance acotado)
+
+El `Content-Type` de la respuesta estaba literal en el binario: `application/json`
+para todo rpc, `text/event-stream` para todo stream. No había una tercera vía, y
+eso no es un detalle de implementación — significa que un programa c-script **no
+puede devolver una página**. Sin HTML no hay render en servidor, y sin render en
+servidor no hay SEO: el hallazgo salió de un intento real de migrar un sitio con
+178 páginas públicas, que se frenó exactamente acá.
+
+**Lo que hay ahora:** un rpc que devuelve `String` puede declarar el
+Content-Type de su respuesta, y entonces el cuerpo es ese `String` **tal cual**,
+sin las comillas de JSON alrededor. Sirve igual para un sitemap XML, un CSV, un
+`robots.txt` o texto plano:
+
+<!-- linkc:check -->
+```link
+type Article = { id: Int, slug: String, title: String }
+type NewArticle = { slug: String, title: String }
+
+enum Role { Admin, Member }
+
+db { articles: Article[], }
+
+service Site {
+  @content_type("text/html; charset=utf-8")
+  rpc home() -> String {
+    "<!doctype html><html><head><title>Mi sitio</title></head><body><h1>Hola</h1></body></html>"
+  }
+
+  @content_type("application/xml; charset=utf-8")
+  rpc sitemap() -> String {
+    "<?xml version=\"1.0\"?><urlset><url><loc>https://ejemplo.com/</loc></url></urlset>"
+  }
+
+  // Una página protegida: auth y Content-Type son dimensiones distintas y se
+  // combinan. Sin token, la respuesta es un 401 en JSON, no una página.
+  @requires(Role.Admin)
+  @content_type("text/html; charset=utf-8")
+  rpc panel() -> String {
+    "<h1>Panel</h1>"
+  }
+
+  // Un rpc sin la anotación sigue respondiendo JSON, igual que siempre.
+  rpc list() -> Article[] {
+    db.articles.all()
+  }
+}
+
+test "la pagina se arma como String" {
+  assert(Site.home().contains("<h1>Hola</h1>"), "el html sale entero");
+  assert(Site.list().length() == 0, "y los rpc normales siguen devolviendo datos");
+}
+```
+
+**Las tres piezas tienen que coincidir, y por eso las tres cambiaron:**
+
+- `runtime/server.rs` manda el header declarado y escribe el String crudo.
+- `codegen/ts_emit.rs` genera `await res.text()` para ese rpc en vez de
+  `res.json()`. La primera versión no lo hacía, y el cliente generado moría con
+  un `SyntaxError` sobre el primer `<` del HTML — el mismo patrón de
+  "dos capas que discrepan" de §3.9: el servidor tenía razón y el cliente no se
+  había enterado.
+- `codegen/openapi_emit.rs` declara ese Content-Type en la respuesta 200. Si
+  siguiera diciendo `application/json`, cualquier cliente generado a partir del
+  spec parsearía mal.
+
+**Reglas que impone el checker** (con su error, en tiempo de compilación):
+
+| Caso | Por qué se rechaza |
+|---|---|
+| El rpc no devuelve `String` | El cuerpo se escribe tal cual; una lista de structs no es texto |
+| Sobre un `stream` | SSE define su propio Content-Type por protocolo (§3.13) |
+| `@content_type` dos veces | Una respuesta tiene un solo Content-Type |
+| Valor vacío | No es un tipo MIME |
+| Dos anotaciones de auth | `@requires` ya implica autenticado (§3.14) |
+
+**Las anotaciones pasaron de `Option<Annotation>` a `Vec<Annotation>`.** El
+modelo anterior ("a lo sumo una") hacía inexpresable justo el caso que motivó
+todo esto en su forma más útil: un panel de administración es HTML **y** está
+detrás de `@requires(Role.Admin)`. Combinar auth con `@content_type` ahora se
+puede; combinar dos anotaciones de la misma dimensión, no.
+
+**Límites honestos de esta ronda:**
+
+- **Los errores siguen saliendo en JSON**, aunque el rpc declare HTML. Es
+  deliberado: el cliente generado espera `{"error": ...}` para cualquier status
+  ≥ 400, y devolver una página de error rompería ese contrato justo cuando algo
+  ya salió mal. No hay forma de servir una página de error 404 propia.
+- **El ruteo no cambió**: la URL sigue siendo `/Servicio/rpc`. Para SEO de
+  verdad hacen falta rutas limpias (`/blog/mi-articulo`) y parámetros en el
+  path, que es una ronda aparte — hoy se resuelve con un proxy adelante.
+- **No hay helpers de plantillas.** El HTML se arma concatenando `String`, sin
+  escapado automático: quien interpole datos de la base tiene que escaparlos a
+  mano. Es una fuente real de XSS y hoy el lenguaje no ayuda.
+- **Sin `Cache-Control`, `ETag` ni compresión** — nada de la capa de caching
+  HTTP es configurable todavía.
+
+**Verificado** en `compiler/tests/cli_content_type.rs` contra el binario real:
+un servidor de verdad devolviendo HTML y XML con su header, un rpc normal
+respondiendo JSON igual que siempre, el cliente generado leyendo texto, el
+spec OpenAPI declarando lo mismo que manda el servidor, las cuatro
+combinaciones que el checker rechaza, y una página HTML detrás de
+`@requires(Role.Admin)` que sin token devuelve un 401 en JSON.
 
 ---
 

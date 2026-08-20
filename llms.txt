@@ -38,10 +38,12 @@ Works, verified by running it:
 - `linkc dev`, `linkc lint`, `linkc doc`, `linkc docker`, `linkc lsp`, `linkc new`.
 - Declarative auth: `@authenticated` and `@requires(Role.Admin)`, with session tokens drawn from the OS CSPRNG.
 - `crypto.hashPassword` / `verifyPassword` — Argon2id (RFC 9106) with a random per-password salt, PHC format, constant-time verification. `crypto.randomToken` and `crypto.uuid` also come from the OS CSPRNG.
+- Non-JSON responses: `@content_type("text/html; charset=utf-8")` on an rpc returning `String` sends that body verbatim with that header — HTML, XML sitemaps, CSV, plain text. Combines with `@authenticated` / `@requires`.
 
 Does NOT work today — do not propose designs that depend on these:
 
-- **Serving HTML.** The response `Content-Type` is hardcoded (`application/json` for RPCs, `text/event-stream` for streams) in `compiler/src/runtime/server.rs`. There is no way to render a page, so there is no SSR and no SEO story. Put a separate frontend in front of it.
+- **Clean URLs.** Routing is always `/Service/rpc`; there are no path parameters and no custom routes, so serving a blog at `/blog/my-post` needs a proxy in front. HTML itself works (see `@content_type`), and so does an error page — errors always come back as JSON.
+- **HTML escaping.** Pages are built by concatenating `String`; nothing escapes interpolated data for you. Escape anything that came from the database yourself.
 - **PostgreSQL at runtime.** `linkc build` can emit PostgreSQL DDL, but `linkc serve` always uses SQLite; there is no Postgres driver.
 - **`linkc fmt` is unsafe.** It currently deletes comments and can emit source that no longer parses. Do not run it on code you care about (fix pending in PR #2).
 - **`linkc --help`** is not a recognised argument. Run `linkc` with no arguments to list subcommands.
@@ -70,6 +72,11 @@ difference between code that compiles and code that does not.
    straight to `applyPatch(id, patch)`.
 7. **Default parameter values work** (`rpc list(limit: Int = 20)`), including enums — but
    the default obeys rule 1: `rpc list(f: Filter = Filter.All {})`.
+
+8. **`@content_type` only goes on an rpc returning `String`** — never on a `stream`
+   (SSE owns its content type), and at most once. Auth annotations stack with it:
+   `@requires(Role.Admin) @content_type("text/html")` is valid and is how an admin
+   page is written.
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `insert(Omit<T,"id">) -> T`, `applyPatch(id, patch) -> T`, `delete(id) -> Bool`,

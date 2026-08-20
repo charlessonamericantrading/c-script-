@@ -6,7 +6,7 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-453-success.svg" alt="Tests" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-457-success.svg" alt="Tests" /></a>
     <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.0.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
@@ -36,12 +36,13 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 20/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 453 pruebas automáticas:
+**Funciona hoy**, cubierto por 457 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - SQLite embebido con persistencia real entre reinicios y auto-migraciones no destructivas
 - Push en vivo sobre Server-Sent Events (`stream` + `db.<c>.subscribe()`)
 - Auth declarativa: `@authenticated`, `@requires(Role.Admin)`, tokens de sesión desde el CSPRNG del sistema
+- Respuestas que no son JSON: `@content_type("text/html; charset=utf-8")` sobre un rpc que devuelve `String` manda ese cuerpo tal cual — páginas HTML, sitemaps XML, CSV — y se combina con `@requires(Role.Admin)` para páginas detrás de auth
 - Hashing de contraseñas real: `crypto.hashPassword` es Argon2id (RFC 9106) con sal aleatoria por contraseña, en formato PHC; `verifyPassword` compara en tiempo constante y sigue aceptando los hashes de la versión anterior para no dejar afuera a los usuarios ya registrados
 - Contrato TypeScript, cliente tipado, validadores runtime, hooks de React, schemas Zod y OpenAPI 3.1 generados
 
@@ -49,7 +50,8 @@ gana esta. Verificado el 20/08/2026 corriendo el compilador, no leyéndolo.
 
 | Límite | Detalle |
 |---|---|
-| No devuelve HTML | El `Content-Type` de la respuesta está fijo en el binario (`application/json` para RPCs, `text/event-stream` para streams). No hay SSR ni historia de SEO; el frontend va aparte. |
+| Sin URLs limpias | El ruteo es siempre `/Servicio/rpc` — sin parámetros en el path ni rutas propias. El HTML sí funciona (ver `@content_type`), pero un blog en `/blog/mi-post` necesita un proxy adelante. Los errores siempre vuelven en JSON, así que no hay página 404 propia. |
+| Sin escapado de HTML | Las páginas se arman concatenando `String`; nada escapa por vos los datos que interpolás. |
 | PostgreSQL es solo DDL | `linkc build` emite el esquema SQL de PostgreSQL, pero `linkc serve` usa siempre SQLite. No hay driver de Postgres. |
 | `linkc fmt` no es seguro | Borra los comentarios y puede emitir código que ya no parsea (arreglo pendiente en el PR #2). |
 | `linkc --help` | No es un argumento reconocido; corré `linkc` sin argumentos (arreglo pendiente en el PR #5). |
@@ -221,7 +223,7 @@ Link incluye de forma nativa todas las herramientas que necesitas:
 
 ## 🧪 Pruebas y Control de Calidad
 
-El compilador y el runtime de Link están verificados por **453 pruebas automáticas** unitarias,
+El compilador y el runtime de Link están verificados por **457 pruebas automáticas** unitarias,
 de integración y de CLI, incluidas pruebas que levantan el binario real como subproceso, manejan
 un servidor HTTP real, y compilan cada ejemplo de c-script publicado en la documentación de este repo:
 
