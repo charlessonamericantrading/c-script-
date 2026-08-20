@@ -3,7 +3,12 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
-## [Sin publicar]
+## [1.1.0] - 2026-08-20
+
+Versión menor y no de parche porque hay features nuevas (PostgreSQL en runtime,
+`@content_type`), no solo correcciones. La única incompatibilidad práctica es
+para quien use `linkc` como biblioteca de Rust: `runtime::server::serve` ahora
+recibe un `DbSource` en vez de un `PathBuf`. Los programas `.link` no cambian.
 
 ### 🔐 Seguridad
 - **`crypto.hashPassword` ahora es Argon2id** (RFC 9106) con sal aleatoria por contraseña y salida en formato PHC. Antes era un solo SHA-256 sobre la constante `"link_salt_2026"` — la misma sal para toda aplicación escrita en el lenguaje, sin iteraciones: dos usuarios con la misma contraseña compartían hash y una sola rainbow table las rompía todas.

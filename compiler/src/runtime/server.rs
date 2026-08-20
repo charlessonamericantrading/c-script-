@@ -132,7 +132,10 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
             let health_json = serde_json::json!({
                 "status": "ok",
                 "engine": "c-script",
-                "version": "1.0.0",
+                // Del Cargo.toml, no escrita a mano: la versión que reporta el
+                // servidor tiene que ser la del binario que está corriendo, y
+                // una constante suelta se queda vieja en el primer release.
+                "version": env!("CARGO_PKG_VERSION"),
                 "services": services
             })
             .to_string();
