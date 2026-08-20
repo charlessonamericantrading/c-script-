@@ -28,7 +28,7 @@ is `linkc`. They are one project.
 | `compiler/src/lexer.rs`, `parser.rs`, `ast.rs` | Front end: source text → AST |
 | `compiler/src/checker.rs` | Bidirectional type checker (the largest file; start here for type errors) |
 | `compiler/src/codegen/` | TypeScript, Zod, validators, OpenAPI and WASM emitters |
-| `compiler/src/runtime/` | Interpreter (`mod.rs`), HTTP server, SQLite layer, sessions, Postgres DDL |
+| `compiler/src/runtime/` | Interpreter (`mod.rs`), HTTP server, database layer (`db.rs` + `store.rs`, SQLite and PostgreSQL), sessions |
 | `compiler/src/lsp.rs` | Language server (`linkc lsp`) |
 | `compiler/tests/` | Integration tests that spawn the real binary as a subprocess |
 | `examples/users.link` | The reference program. CI compiles it, snapshots its contract, serves it and drives it from a real client |

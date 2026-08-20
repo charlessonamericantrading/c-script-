@@ -57,6 +57,7 @@
   - [3.33 Test runner de comportamiento integrado (`test "nombre" { ... }`, `assert`, `panic`) — RESUELTO](#333-test-runner-de-comportamiento-integrado-test-nombre----assert-panic--resuelto)
   - [3.34 `crypto`: contraseñas y aleatoriedad — RESUELTO (Argon2id + CSPRNG del SO)](#334-crypto-contraseñas-y-aleatoriedad--resuelto-argon2id--csprng-del-so)
   - [3.35 `@content_type`: respuestas que no son JSON — RESUELTO (alcance acotado)](#335-content_type-respuestas-que-no-son-json--resuelto-alcance-acotado)
+  - [3.36 PostgreSQL en runtime — RESUELTO (alcance acotado)](#336-postgresql-en-runtime--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1415,6 +1416,103 @@ respondiendo JSON igual que siempre, el cliente generado leyendo texto, el
 spec OpenAPI declarando lo mismo que manda el servidor, las cuatro
 combinaciones que el checker rechaza, y una página HTML detrás de
 `@requires(Role.Admin)` que sin token devuelve un 401 en JSON.
+
+---
+
+### 3.36 PostgreSQL en runtime — RESUELTO (alcance acotado)
+
+`runtime/postgres.rs` existía desde v1.0 y generaba DDL: `linkc build` emitía un
+`schema.postgres.sql` correcto, con BIGINT/JSONB/DOUBLE PRECISION y todo. Lo que
+no existía era el otro extremo: **`linkc serve` usaba SQLite siempre, sin
+excepción**. No había forma de conectar un programa c-script a la base que un
+equipo ya administra, y el propio README hablaba de un "adaptador PostgreSQL
+enterprise" que en realidad era un generador de texto. Ningún test lo detectaba
+porque los tests de esa capa comparaban strings de SQL contra strings esperados
+-- nunca tocaron una base.
+
+**Lo que hay ahora:**
+
+```bash
+linkc serve app.link 8787 --db postgres://usuario:clave@host/base
+LINK_DATABASE_URL=postgres://... linkc serve app.link 8787
+```
+
+Sin `--db` ni variable de entorno, el default no cambió: `app.link` → `app.db`,
+SQLite al lado del fuente (§3.17). Un valor que empieza con `postgres://` o
+`postgresql://` es PostgreSQL; cualquier otro es la ruta de un archivo SQLite.
+
+**Lo que NO cambia según el backend:** nada del lenguaje. El mismo `.link`, los
+mismos `rpc`, el mismo contrato TypeScript generado, los mismos `test`. Un
+programa no se entera de qué motor tiene atrás.
+
+**Cómo está partido el código.** `runtime/store.rs` es la única capa que sabe de
+motores, y lo que contiene es exactamente lo que difiere entre los dos:
+
+| | SQLite | PostgreSQL |
+|---|---|---|
+| Placeholders | `?` | `$1`, `$2`, … |
+| Id recién insertado | `last_insert_rowid()` | `RETURNING "id"` |
+| Booleano | INTEGER 0/1 | BOOLEAN |
+| Compuestos | TEXT con JSON adentro | JSONB nativo |
+| Clave primaria | `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGSERIAL` |
+| Deriva de esquema | falla fuerte (§3.17) | `ALTER TABLE … ADD COLUMN IF NOT EXISTS` |
+
+Todo lo demás -- y es donde está lo difícil -- sigue siendo un solo código para
+los dos: `ColumnPlan` decide qué campo va a columna nativa y cuál a JSON, con el
+caso `campo?: T?` que necesita tres estados (ausente / null / valor) donde una
+columna SQL tiene un solo bit de NULL. Esa regla es del LENGUAJE, no del motor,
+y duplicarla por backend habría sido la forma más rápida de que los dos se
+separaran con el tiempo.
+
+Por el mismo motivo, el DDL que crea el runtime sale del MISMO
+`create_postgres_table_sql` que usa `linkc build` para emitir
+`schema.postgres.sql`. Si el runtime armara las tablas por su cuenta, el
+esquema que el proyecto documenta y el que la base realmente tiene podrían
+divergir, que es la familia de bugs que §3.9 viene registrando.
+
+**Lo legible desde SQL.** Un enum simple se guarda como el nombre de su variante
+en texto plano (`'Admin'`), no como un número; un struct anidado es JSONB de
+verdad, consultable con `->>` e indexable. La promesa de "es tu Postgres de
+siempre" solo vale si se puede abrir con `psql` y entender lo que hay, así que
+hay un test que consulta la tabla por fuera de c-script para fijarlo.
+
+**Migración no destructiva.** Al conectarse, el runtime hace `CREATE TABLE IF
+NOT EXISTS` y después un `ADD COLUMN IF NOT EXISTS` por campo. Una tabla escrita
+por una versión anterior del programa gana las columnas nuevas sin perder filas.
+Es distinto a propósito de lo que hace SQLite (§3.17), que ante cualquier deriva
+de esquema falla fuerte: PostgreSQL es el backend donde hay datos de producción
+y volver a crear la tabla no es una opción.
+
+**Límites honestos de esta ronda:**
+
+- **La columna migrada siempre queda nullable**, aunque el campo sea requerido:
+  `ADD COLUMN … NOT NULL` sobre una tabla con filas falla, porque no hay valor
+  que poner en las que ya están. No hay forma de dar un default todavía.
+- **Ninguna otra migración es automática**: renombrar un campo, cambiarle el
+  tipo o borrarlo no se detecta ni se aplica. La columna vieja queda ahí.
+- **Una sola conexión, sin pool.** El intérprete es single-threaded por diseño
+  (§3.13) y atiende una request a la vez, así que un pool no compraría nada
+  todavía -- pero tampoco hay reconexión: si la base se cae, el servidor no se
+  recupera solo.
+- **Sin TLS**: la conexión se abre con `NoTls`. Alcanza para una base en la
+  misma red privada; no para una remota sobre internet.
+- **Sin transacciones expuestas.** Cada operación va sola, igual que en SQLite;
+  el lenguaje no tiene todavía forma de agrupar varias en una transacción.
+- **`LISTEN`/`NOTIFY` no se usa.** Los `stream` (§3.16) siguen notificando desde
+  el proceso, así que dos instancias de `linkc serve` contra la misma base no se
+  enteran de las escrituras de la otra. Con SQLite pasaba lo mismo; en
+  PostgreSQL duele más, porque compartir la base entre instancias es
+  justamente para lo que uno la elige.
+
+**Verificado** en `compiler/tests/pg_integration.rs` contra un PostgreSQL real
+(el job `postgres` de CI levanta un `postgres:16`): el CRUD completo por HTTP
+contra un servidor real, las filas sobreviviendo al reinicio del proceso, la
+tabla leída desde SQL plano (incluido un `WHERE meta->>'source'`), el esquema
+real comparado columna por columna contra el `schema.postgres.sql` que emite
+`linkc build`, una migración que agrega un campo sin perder filas, y una URL
+inválida que falla con un mensaje en vez de un panic. Si la variable de entorno
+con la URL falta, el test **falla** en vez de saltearse: un test que se saltea en
+silencio pasa en verde sin haber probado nada.
 
 ---
 

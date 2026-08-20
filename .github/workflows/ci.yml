@@ -13,8 +13,10 @@ name: CI
 on:
   push:
     branches: [master]
+  # Sin filtro de rama a propósito: un PR apilado sobre otro (base != master)
+  # no disparaba NADA, así que el trabajo se podía revisar y mergear sin que
+  # ningún test hubiera corrido nunca sobre él.
   pull_request:
-    branches: [master]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -100,3 +102,69 @@ jobs:
 
           cd frontend
           node src/main.ts
+
+  # El backend PostgreSQL solo se puede probar contra un PostgreSQL. Sin este
+  # job, `runtime/store.rs` y `Db::connect_postgres` compilarian y nadie los
+  # correria nunca -- que es exactamente como el repo llego a tener un
+  # "adaptador PostgreSQL enterprise" que en realidad solo generaba texto SQL.
+  postgres:
+    name: Integración contra PostgreSQL real
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: link
+          POSTGRES_DB: linkc_test
+        ports:
+          - 5432:5432
+        # Sin el health-check, los tests arrancan antes de que la base acepte
+        # conexiones y fallan de forma intermitente por una razón que no tiene
+        # nada que ver con el código.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Instalar Rust estable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cachear cargo (registry + target)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: compiler
+
+      - name: Tests de integración contra PostgreSQL
+        working-directory: compiler
+        env:
+          LINK_TEST_PG_URL: postgres://postgres:link@localhost:5432/linkc_test
+          # Convierte "no hay base, me salteo" en una falla: sin esto el job
+          # pasaría en verde sin haberse conectado a nada.
+          LINK_TEST_PG_REQUIRED: "1"
+        run: cargo test --locked --test pg_integration
+
+      - name: El servidor sirve de verdad desde PostgreSQL (demo E2E)
+        working-directory: compiler
+        env:
+          LINK_DATABASE_URL: postgres://postgres:link@localhost:5432/linkc_test
+        run: |
+          set -e
+          cargo build --locked
+          ./target/debug/linkc serve ../examples/users.link 8788 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 100); do
+            curl -s -o /dev/null http://127.0.0.1:8788/health && break
+            sleep 0.1
+          done
+          # El mismo demo insignia que el job de arriba corre sobre SQLite,
+          # ahora contra PostgreSQL: si el backend nuevo rompiera el programa
+          # de referencia, se ve acá.
+          curl -sf -X POST http://127.0.0.1:8788/Users/create \
+            -H 'Content-Type: application/json' \
+            -d '{"input":{"name":"Ada","email":"ada@example.com","createdAt":"2026-08-20T10:00:00.000Z"}}' \
+            | tee /dev/stderr | grep -q '"type":"Ok"'
+          curl -sf http://127.0.0.1:8788/Users/list | tee /dev/stderr | grep -q 'ada@example.com'

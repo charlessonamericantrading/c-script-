@@ -13,7 +13,7 @@ use super::{as_int, json_to_typed_value, simple_enum_names, value_to_json, Runti
 use crate::ast::Program;
 use crate::checker::Checker;
 use crate::types::{FieldType, Type};
-use rusqlite::types::Value as SqlValue;
+use super::store::{Backend, Cell, ColumnKind};
 use rusqlite::Connection;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -69,6 +69,25 @@ impl ColumnPlan {
 
     fn not_null(&self) -> bool {
         !self.field.optional && !matches!(self.field.ty, Type::Optional(_))
+    }
+
+    /// Qué se lee de esta columna. Se deriva del MISMO plan que decide cómo se
+    /// escribe, así que lectura y escritura no pueden divergir.
+    fn kind(&self) -> ColumnKind {
+        if self.json {
+            return ColumnKind::Json;
+        }
+        let effective_ty: &Type = match &self.field.ty {
+            Type::Optional(inner) => inner.as_ref(),
+            other => other,
+        };
+        match effective_ty {
+            Type::Int | Type::Int64 | Type::Timestamp => ColumnKind::Int,
+            Type::Float => ColumnKind::Float,
+            Type::Bool => ColumnKind::Bool,
+            Type::String | Type::Enum(_) => ColumnKind::Text,
+            other => unreachable!("tipo nativo inesperado en una columna no-JSON: {other:?}"),
+        }
     }
 }
 
@@ -180,7 +199,7 @@ fn check_schema_matches(connection: &Connection, collection: &str, columns: &[Co
 }
 
 pub struct Db {
-    connection: Connection,
+    backend: Backend,
     /// Reconstruido UNA vez por vida del servidor (no por request, a
     /// diferencia de `invoke_rpc_with_sessions`) -- hace falta porque
     /// `json_to_typed_value` (usado para decodificar una columna JSON de
@@ -241,7 +260,72 @@ impl Db {
             columns.insert(name.clone(), cols);
         }
 
-        Db { connection, checker, simple_enums, columns, subscribers: RefCell::new(HashMap::new()) }
+        Db {
+            backend: Backend::Sqlite(connection),
+            checker,
+            simple_enums,
+            columns,
+            subscribers: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Lo mismo que `new`, contra un PostgreSQL real (GRAMMAR.md §3.36). Todo
+    /// lo de arriba de esta capa -- `call`, `subscribe`, el plan de columnas,
+    /// la codificación JSON -- es exactamente el mismo código: lo único que
+    /// cambia es quién ejecuta el SQL.
+    ///
+    /// Devuelve `Result` y no hace panic como `new`: una base remota puede
+    /// estar caída, tener otra contraseña o no existir todavía, y eso es una
+    /// condición operativa normal que `linkc serve` tiene que poder reportar
+    /// con un mensaje entendible.
+    pub fn connect_postgres(program: &Program, url: &str) -> Result<Self, String> {
+        let (checker, symbol_errors) = Checker::build_symbols(program);
+        if let Some(e) = symbol_errors.into_iter().next() {
+            return Err(format!("programa inválido al abrir la base de datos: {e}"));
+        }
+        let simple_enums = simple_enum_names(program);
+
+        let client = postgres::Client::connect(url, postgres::NoTls)
+            .map_err(|e| format!("no se pudo conectar a PostgreSQL: {e}"))?;
+        let backend = Backend::Postgres(std::cell::RefCell::new(client));
+
+        let mut columns = HashMap::new();
+        for (name, element_ty) in checker.db_collections() {
+            let Type::Struct { fields, .. } = element_ty else {
+                unreachable!("Checker::validate_db_element_type ya garantizó que el elemento sea un struct");
+            };
+            let cols: Vec<ColumnPlan> =
+                fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
+            let non_id: Vec<FieldType> = cols.iter().map(|c| c.field.clone()).collect();
+
+            // El DDL sale del MISMO generador que usa `linkc build` para
+            // emitir schema.pg.sql. Si el runtime creara las tablas por su
+            // cuenta, el esquema que el proyecto documenta y el que la base
+            // realmente tiene podrían divergir -- que es la clase de bug que
+            // este repo ya encontró varias veces (GRAMMAR.md §3.9).
+            backend
+                .execute_ddl(&super::postgres::create_postgres_table_sql(name, &non_id, &simple_enums))
+                .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
+
+            // Migración no destructiva: una tabla que ya existe de una versión
+            // anterior del programa gana las columnas nuevas. A diferencia de
+            // SQLite (que acá falla fuerte ante cualquier deriva de esquema,
+            // ver `check_schema_matches`), PostgreSQL es el backend donde ya
+            // hay datos de producción y volver a crear la tabla no es opción.
+            //
+            // La columna se agrega SIEMPRE nullable, aunque el tipo del campo
+            // sea requerido: `ADD COLUMN ... NOT NULL` sobre una tabla con
+            // filas fallaría, porque no hay valor que poner en las que ya
+            // están. Es un límite real y está documentado.
+            for field in &non_id {
+                backend
+                    .execute_ddl(&super::postgres::alter_table_add_column_postgres(name, field, &simple_enums))
+                    .map_err(|e| format!("no se pudo migrar la tabla '{name}': {e}"))?;
+            }
+            columns.insert(name.clone(), cols);
+        }
+
+        Ok(Db { backend, checker, simple_enums, columns, subscribers: RefCell::new(HashMap::new()) })
     }
 
     /// Fixture SOLO para tests y para el demo wasm (`bin/wasm_demo.rs`) --
@@ -295,6 +379,12 @@ db { users: User[] }
         db
     }
 
+    /// Qué motor está atrás. Solo para reportarlo al arrancar: ningún camino
+    /// del intérprete se ramifica por esto.
+    pub fn is_postgres(&self) -> bool {
+        self.backend.is_postgres()
+    }
+
     pub fn call(&self, collection: &str, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
         match method {
@@ -309,7 +399,7 @@ db { users: User[] }
                     return Err(RuntimeError::new("insert: el valor debe ser un struct"));
                 };
                 let mut col_names = Vec::with_capacity(columns.len());
-                let mut params = Vec::with_capacity(columns.len());
+                let mut params: Vec<Cell> = Vec::with_capacity(columns.len());
                 for col in columns {
                     let slot = fields.iter().find(|(n, _)| n == &col.field.name).map(|(_, v)| v);
                     col_names.push(format!("\"{}\"", col.field.name));
@@ -318,12 +408,13 @@ db { users: User[] }
                 let sql = if col_names.is_empty() {
                     format!("INSERT INTO \"{collection}\" DEFAULT VALUES")
                 } else {
-                    format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), vec!["?"; col_names.len()].join(", "))
+                    let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
+                    format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "))
                 };
-                self.connection
-                    .execute(&sql, rusqlite::params_from_iter(params.iter()))
+                let new_id = self
+                    .backend
+                    .insert_returning_id(&sql, &params)
                     .map_err(|e| RuntimeError::new(format!("insert falló: {e}")))?;
-                let new_id = self.connection.last_insert_rowid();
                 let inserted = self
                     .select_rows(collection, columns, Some(new_id))?
                     .into_iter()
@@ -340,19 +431,20 @@ db { users: User[] }
                     return Err(RuntimeError::new("applyPatch: el patch debe ser un objeto"));
                 };
                 let mut set_clauses = Vec::new();
-                let mut params = Vec::new();
+                let mut params: Vec<Cell> = Vec::new();
                 for (name, value) in &patch_fields {
                     // "id" nunca es escribible -- mismo criterio que insert,
                     // que también lo excluye de lo que el caller puede fijar.
                     let Some(col) = columns.iter().find(|c| name == &c.field.name) else { continue };
-                    set_clauses.push(format!("\"{name}\" = ?"));
+                    set_clauses.push(format!("\"{name}\" = {}", self.backend.placeholder(params.len() + 1)));
                     params.push(self.write_param(col, Some(value)));
                 }
                 if !set_clauses.is_empty() {
-                    params.push(SqlValue::Integer(id));
-                    let sql = format!("UPDATE \"{collection}\" SET {} WHERE \"id\" = ?", set_clauses.join(", "));
-                    self.connection
-                        .execute(&sql, rusqlite::params_from_iter(params.iter()))
+                    let id_placeholder = self.backend.placeholder(params.len() + 1);
+                    params.push(Cell::Int(id));
+                    let sql = format!("UPDATE \"{collection}\" SET {} WHERE \"id\" = {id_placeholder}", set_clauses.join(", "));
+                    self.backend
+                        .execute(&sql, &params)
                         .map_err(|e| RuntimeError::new(format!("applyPatch falló: {e}")))?;
                 }
                 // Reconsultar por id, tanto si hubo UPDATE como si el patch
@@ -370,10 +462,10 @@ db { users: User[] }
             "delete" => {
                 let id = as_int(args.first().ok_or_else(|| RuntimeError::new("delete requiere 1 argumento"))?)?;
                 let existing = self.select_rows(collection, columns, Some(id))?.into_iter().next();
-                let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = ?");
+                let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = {}", self.backend.placeholder(1));
                 let rows_affected = self
-                    .connection
-                    .execute(&sql, rusqlite::params![id])
+                    .backend
+                    .execute(&sql, &[Cell::Int(id)])
                     .map_err(|e| RuntimeError::new(format!("delete falló: {e}")))?;
                 if rows_affected > 0 {
                     if let Some(deleted_row) = existing {
@@ -384,9 +476,14 @@ db { users: User[] }
             }
             "count" => {
                 let sql = format!("SELECT COUNT(*) FROM \"{collection}\"");
-                let mut stmt = self.connection.prepare(&sql).map_err(|e| RuntimeError::new(format!("error en count de '{collection}': {e}")))?;
-                let count: i64 = stmt.query_row([], |r| r.get(0)).map_err(|e| RuntimeError::new(format!("error en count de '{collection}': {e}")))?;
-                Ok(Value::Int(count))
+                let rows = self
+                    .backend
+                    .query(&sql, &[], &[ColumnKind::Int])
+                    .map_err(|e| RuntimeError::new(format!("error en count de '{collection}': {e}")))?;
+                match rows.first().and_then(|r| r.first()) {
+                    Some(Cell::Int(count)) => Ok(Value::Int(*count)),
+                    other => Err(RuntimeError::new(format!("count de '{collection}' devolvió algo que no es un entero: {other:?}"))),
+                }
             }
 
             // "deleteWhere"/"findWhere" NUNCA se implementan acá: evaluar un
@@ -466,102 +563,120 @@ db { users: User[] }
         let mut col_list = vec!["\"id\"".to_string()];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
         let sql = match id {
-            Some(_) => format!("SELECT {} FROM \"{collection}\" WHERE \"id\" = ?", col_list.join(", ")),
+            Some(_) => format!("SELECT {} FROM \"{collection}\" WHERE \"id\" = {}", col_list.join(", "), self.backend.placeholder(1)),
             None => format!("SELECT {} FROM \"{collection}\" ORDER BY \"id\"", col_list.join(", ")),
         };
-        let mut stmt = self.connection.prepare(&sql).map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
-        let to_value = |row: &rusqlite::Row| -> rusqlite::Result<Value> { Ok(Value::Struct(self.row_to_fields(row, columns)?)) };
-        let rows = match id {
-            Some(id) => stmt.query_map([id], to_value).and_then(Iterator::collect),
-            None => stmt.query_map([], to_value).and_then(Iterator::collect),
-        };
-        rows.map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))
+        // El orden de `kinds` es el del SELECT: "id" primero, después las
+        // columnas declaradas, en el mismo orden que `columns`.
+        let mut kinds = vec![ColumnKind::Int];
+        kinds.extend(columns.iter().map(ColumnPlan::kind));
+        let params: Vec<Cell> = id.map(|i| vec![Cell::Int(i)]).unwrap_or_default();
+
+        let rows = self
+            .backend
+            .query(&sql, &params, &kinds)
+            .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+        Ok(rows.iter().map(|cells| Value::Struct(self.row_to_fields(cells, columns))).collect())
     }
 
-    /// Reconstruye una fila entera (`"id"` + cada columna declarada) como
-    /// los pares `(nombre, Value)` de un `Value::Struct` -- inversa de
-    /// `write_param`. El orden de columnas del SELECT (`select_rows`) y de
-    /// `columns` siempre coincide, así que se puede leer por NOMBRE sin
-    /// arriesgar un desajuste posicional.
-    fn row_to_fields(&self, row: &rusqlite::Row, columns: &[ColumnPlan]) -> rusqlite::Result<Vec<(String, Value)>> {
+    /// Reconstruye una fila entera (`"id"` + cada columna declarada) como los
+    /// pares `(nombre, Value)` de un `Value::Struct` -- inversa de
+    /// `write_param`. Las celdas llegan en el mismo orden que emitió el SELECT
+    /// (`select_rows`), que es el orden de `columns` con `"id"` adelante.
+    fn row_to_fields(&self, cells: &[Cell], columns: &[ColumnPlan]) -> Vec<(String, Value)> {
         let mut out = Vec::with_capacity(columns.len() + 1);
-        out.push(("id".to_string(), Value::Int(row.get::<_, i64>("id")?)));
-        for col in columns {
+        let Some(Cell::Int(id)) = cells.first() else {
+            panic!("la columna 'id' es la clave primaria: siempre es un entero no nulo, y llegó {:?}", cells.first());
+        };
+        out.push(("id".to_string(), Value::Int(*id)));
+
+        for (col, cell) in columns.iter().zip(cells.iter().skip(1)) {
             if col.json {
-                let raw: Option<String> = row.get(col.field.name.as_str())?;
-                match raw {
-                    // SQL NULL en una columna JSON SIEMPRE significa "clave
+                match cell {
+                    // NULL en una columna JSON SIEMPRE significa "clave
                     // ausente" -- solo alcanzable si `field.optional` (ver
-                    // `write_param`, nunca escribimos NULL acá si la clave
-                    // es requerida). El `Value::Null` defensivo de abajo no
+                    // `write_param`, nunca escribimos NULL acá si la clave es
+                    // requerida). El `Value::Null` defensivo de abajo no
                     // debería ser alcanzable en la práctica.
-                    None => {
+                    Cell::Null => {
                         if !col.field.optional {
                             out.push((col.field.name.clone(), Value::Null));
                         }
                     }
-                    Some(text) => {
-                        let parsed: serde_json::Value = serde_json::from_str(&text)
-                            .unwrap_or_else(|e| panic!("JSON guardado por nosotros mismos no puede ser inválido: {e}"));
-                        let decoded = json_to_typed_value(&parsed, &col.field.ty, &self.checker, &col.field.name)
+                    Cell::Json(parsed) => {
+                        let decoded = json_to_typed_value(parsed, &col.field.ty, &self.checker, &col.field.name)
                             .unwrap_or_else(|e| panic!("un valor que nosotros escribimos tiene que decodificar contra su propio tipo: {e}"));
                         out.push((col.field.name.clone(), decoded));
                     }
+                    other => panic!("la columna JSON '{}' devolvió {other:?}", col.field.name),
                 }
-            } else {
-                let effective_ty: &Type = match &col.field.ty {
-                    Type::Optional(inner) => inner.as_ref(),
-                    other => other,
-                };
-                let value = match effective_ty {
-                    Type::Int => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(Value::Int),
-                    Type::Int64 => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(Value::Int64),
-                    Type::Timestamp => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(Value::Timestamp),
-                    Type::Float => row.get::<_, Option<f64>>(col.field.name.as_str())?.map(Value::Float),
-                    Type::String => row.get::<_, Option<String>>(col.field.name.as_str())?.map(Value::Str),
-                    Type::Bool => row.get::<_, Option<i64>>(col.field.name.as_str())?.map(|n| Value::Bool(n != 0)),
-                    Type::Enum(name) => row
-                        .get::<_, Option<String>>(col.field.name.as_str())?
-                        .map(|variant| Value::Variant { enum_name: name.clone(), variant, fields: Vec::new() }),
-                    other => unreachable!("tipo nativo inesperado en una columna no-JSON: {other:?}"),
-                };
-                match value {
-                    Some(v) => out.push((col.field.name.clone(), v)),
-                    // SQL NULL en una columna nativa: "ausente" si la clave
-                    // es opcional, si no la columna es nullable-por-tipo
-                    // (`x: T?`) y NULL significa `Value::Null` con la clave
-                    // presente. `x?: T?` con T nativo nunca llega acá --
-                    // ColumnPlan::for_field lo fuerza a `json` para tener el
-                    // 3er estado.
-                    None if col.field.optional => {}
-                    None => out.push((col.field.name.clone(), Value::Null)),
-                }
+                continue;
+            }
+
+            let effective_ty: &Type = match &col.field.ty {
+                Type::Optional(inner) => inner.as_ref(),
+                other => other,
+            };
+            let value = match (effective_ty, cell) {
+                (_, Cell::Null) => None,
+                (Type::Int, Cell::Int(n)) => Some(Value::Int(*n)),
+                (Type::Int64, Cell::Int(n)) => Some(Value::Int64(*n)),
+                (Type::Timestamp, Cell::Int(n)) => Some(Value::Timestamp(*n)),
+                (Type::Float, Cell::Float(f)) => Some(Value::Float(*f)),
+                (Type::String, Cell::Text(t)) => Some(Value::Str(t.clone())),
+                (Type::Bool, Cell::Bool(b)) => Some(Value::Bool(*b)),
+                (Type::Enum(name), Cell::Text(variant)) => Some(Value::Variant {
+                    enum_name: name.clone(),
+                    variant: variant.clone(),
+                    fields: Vec::new(),
+                }),
+                // Un desajuste acá significa que el plan de columnas y lo que
+                // la base devolvió no coinciden: schema escrito por otra
+                // versión del programa, o un backend nuevo mapeando mal un
+                // tipo. Fallar fuerte con los dos lados a la vista es lo único
+                // útil -- devolver un valor "parecido" escondería el problema
+                // adentro de la respuesta de un rpc.
+                (ty, cell) => panic!(
+                    "la columna '{}' declara {ty} pero la base devolvió {cell:?}",
+                    col.field.name
+                ),
+            };
+            match value {
+                Some(v) => out.push((col.field.name.clone(), v)),
+                // NULL en una columna nativa: "ausente" si la clave es
+                // opcional, si no la columna es nullable-por-tipo (`x: T?`) y
+                // NULL significa `Value::Null` con la clave presente. `x?: T?`
+                // con T nativo nunca llega acá -- ColumnPlan::for_field lo
+                // fuerza a `json` para tener el 3er estado.
+                None if col.field.optional => {}
+                None => out.push((col.field.name.clone(), Value::Null)),
             }
         }
-        Ok(out)
+        out
     }
 
-    /// Valor a bindear para `col`, dado el valor del `Value::Struct` de
-    /// entrada en esa clave (`None` si la clave está ausente -- solo
-    /// alcanzable si `col.field.optional`, ver `ColumnPlan`). Inversa de
-    /// `row_to_fields`.
-    fn write_param(&self, col: &ColumnPlan, slot: Option<&Value>) -> SqlValue {
-        let Some(v) = slot else { return SqlValue::Null };
+    /// Valor a bindear para `col`, dado el valor del `Value::Struct` de entrada
+    /// en esa clave (`None` si la clave está ausente -- solo alcanzable si
+    /// `col.field.optional`, ver `ColumnPlan`). Inversa de `row_to_fields`.
+    fn write_param(&self, col: &ColumnPlan, slot: Option<&Value>) -> Cell {
+        let Some(v) = slot else { return Cell::Null };
         if col.json {
-            // `value_to_json(Value::Null)` serializa al texto `"null"` --
-            // exactamente el sentinel de "presente pero null" que el caso
-            // `x?: T?` necesita, sin ningún código especial acá.
-            return SqlValue::Text(serde_json::to_string(&value_to_json(v, &self.simple_enums)).expect("serializar a JSON no puede fallar"));
+            // `value_to_json(Value::Null)` da el JSON `null` -- exactamente el
+            // sentinel de "presente pero null" que el caso `x?: T?` necesita,
+            // sin ningún código especial acá. Y no es lo mismo que un NULL de
+            // SQL, que significa "clave ausente": los dos backends conservan
+            // esa diferencia (TEXT "null" en SQLite, JSONB null en PostgreSQL).
+            return Cell::Json(value_to_json(v, &self.simple_enums));
         }
         match v {
-            Value::Null => SqlValue::Null,
-            Value::Int(n) => SqlValue::Integer(*n),
-            Value::Int64(n) => SqlValue::Integer(*n),
-            Value::Timestamp(n) => SqlValue::Integer(*n),
-            Value::Float(f) => SqlValue::Real(*f),
-            Value::Str(s) => SqlValue::Text(s.clone()),
-            Value::Bool(b) => SqlValue::Integer(i64::from(*b)),
-            Value::Variant { variant, .. } => SqlValue::Text(variant.clone()),
+            Value::Null => Cell::Null,
+            Value::Int(n) => Cell::Int(*n),
+            Value::Int64(n) => Cell::Int(*n),
+            Value::Timestamp(n) => Cell::Int(*n),
+            Value::Float(f) => Cell::Float(*f),
+            Value::Str(s) => Cell::Text(s.clone()),
+            Value::Bool(b) => Cell::Bool(*b),
+            Value::Variant { variant, .. } => Cell::Text(variant.clone()),
             other => panic!("valor no representable en una columna nativa de SQL: {other:?}"),
         }
     }
