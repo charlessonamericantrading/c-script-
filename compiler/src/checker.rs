@@ -408,6 +408,25 @@ impl Checker {
                     errors.push(err(format!("'{}' ya está declarado (enum duplicado)", e.name)).with_span(e.span));
                 }
                 Item::Enum(e) => {
+                    // Una variante CON datos se emite en TypeScript como
+                    // `{ type: "Variante"; ...campos }` (codegen/ts_emit.rs):
+                    // el discriminante ocupa la clave `type`. Un campo de
+                    // payload con ese mismo nombre produciria un identificador
+                    // duplicado en el contrato generado, asi que se rechaza
+                    // aqui y no mas tarde, en un archivo .d.ts que no compila.
+                    for variant in &e.variants {
+                        if let Some(fields) = &variant.fields {
+                            if let Some(f) = fields.iter().find(|f| f.name == "type") {
+                                errors.push(
+                                    err(format!(
+                                        "'type' no puede ser el nombre de un campo de la variante '{}::{}': esa clave la ocupa el discriminante del union generado. Renombralo (p. ej. 'kind').",
+                                        e.name, variant.name
+                                    ))
+                                    .with_span(f.name_span),
+                                );
+                            }
+                        }
+                    }
                     checker.enums.insert(e.name.clone(), e.clone());
                 }
                 _ => {}
@@ -2950,6 +2969,38 @@ mod tests {
         let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
         let offset = src.find(needle).unwrap_or_else(|| panic!("'{needle}' no aparece en el source de prueba: {src}"));
         Checker::hover_type_at(&program, offset)
+    }
+
+    /// Con las palabras clave admitidas como nombre de campo, `type` pasa a
+    /// ser escribible -- pero en una variante CON datos choca con la clave del
+    /// discriminante y produciria `{ type: "Ok"; type: string }`, que es un
+    /// identificador duplicado y no compila en TypeScript.
+    #[test]
+    fn a_variant_payload_field_named_type_collides_with_the_discriminant() {
+        let errs = check_source("enum Res { Ok { type: String } }
+type T = { id: Int, r: Res }")
+            .expect_err("deberia rechazarse");
+        assert!(
+            errs.iter().any(|e| e.message.contains("discriminante")),
+            "mensaje inesperado: {errs:?}"
+        );
+    }
+
+    /// La restriccion es SOLO de las variantes con datos: un struct corriente
+    /// se emite como `interface`, ahi no hay discriminante que chocar.
+    #[test]
+    fn a_plain_struct_field_named_type_is_allowed() {
+        check_source("type Lead = { id: Int, type: String, service: String }
+db { leads: Lead[] }")
+            .expect("un struct normal puede tener un campo 'type'");
+    }
+
+    /// Una variante SIN datos no lleva payload, asi que su nombre nunca choca.
+    #[test]
+    fn a_unit_variant_is_unaffected() {
+        check_source("enum Status { Nuevo, Cerrado }
+type T = { id: Int, s: Status }")
+            .expect("las variantes unitarias no tienen campos");
     }
 
     // ---- hover de expresión arbitraria (GRAMMAR.md §3.24) ----
