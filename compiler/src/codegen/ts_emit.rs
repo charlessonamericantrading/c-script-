@@ -121,40 +121,41 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     let mut out = String::new();
     out.push_str("// Generado automáticamente por linkc — no editar a mano.\n\n");
 
-    let Some(service) = program.items.iter().find_map(|i| match i {
-        Item::Service(s) => Some(s),
-        _ => None,
-    }) else {
-        return Ok(out); // sin service declarado, no hay cliente que generar
-    };
-
-    // Primera pasada: resolver todas las firmas para (a) saber qué importar
-    // de "./contract" y "./validators" y (b) no resolver dos veces lo mismo
-    // en la segunda.
+    // Recolecta TODOS los `service` del programa, no el primero: un programa
+    // con mas de un `service` (GRAMMAR.md no lo limita a uno, a diferencia de
+    // `db{}`) generaba client.ts con una sola clase -- `emit_hooks`, la
+    // funcion hermana un poco mas abajo en este mismo archivo, ya resolvia
+    // esto con el mismo patron de recoleccion multi-servicio; aca faltaba.
+    // `contract.d.ts` (interfaz `{Name}Client` por servicio) y `hooks.ts`
+    // nunca tuvieron el bug -- solo esta funcion se detenia en el primero.
     let mut imported_names = std::collections::BTreeSet::new();
     let mut validator_names = std::collections::BTreeSet::new();
-    let mut resolved: Vec<(&RpcDecl, bool, Vec<Type>, Type)> = Vec::new();
-    for m in &service.members {
-        let (rpc, is_stream) = match m {
-            Member::Rpc(r) => (r, false),
-            Member::Stream(r) => (r, true),
-        };
-        let mut param_tys = Vec::new();
-        for p in &rpc.params {
-            let ty = checker.resolve_type(&p.ty).map_err(|e| e.to_string())?;
-            collect_type_names(&ty, &mut imported_names);
-            param_tys.push(ty);
+    let mut services: Vec<(&ServiceDecl, Vec<(&RpcDecl, bool, Vec<Type>, Type)>)> = Vec::new();
+    for item in &program.items {
+        let Item::Service(service) = item else { continue };
+        let mut resolved: Vec<(&RpcDecl, bool, Vec<Type>, Type)> = Vec::new();
+        for m in &service.members {
+            let (rpc, is_stream) = match m {
+                Member::Rpc(r) => (r, false),
+                Member::Stream(r) => (r, true),
+            };
+            let mut param_tys = Vec::new();
+            for p in &rpc.params {
+                let ty = checker.resolve_type(&p.ty).map_err(|e| e.to_string())?;
+                collect_type_names(&ty, &mut imported_names);
+                param_tys.push(ty);
+            }
+            let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
+            collect_type_names(&ret_ty, &mut imported_names);
+            validators_emit::collect_validator_names(&ret_ty, &mut validator_names);
+            resolved.push((rpc, is_stream, param_tys, ret_ty));
         }
-        let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
-        collect_type_names(&ret_ty, &mut imported_names);
-        // Un `stream` valida cada ELEMENTO que emite contra este mismo
-        // ret_ty (la firma declara el elemento, no List<T> -- ver
-        // check_rpc en checker.rs), igual que un rpc normal valida su
-        // único valor de retorno: mismo validador, ningún caso especial.
-        validators_emit::collect_validator_names(&ret_ty, &mut validator_names);
-        resolved.push((rpc, is_stream, param_tys, ret_ty));
+        imported_names.insert(format!("{}Client", service.name));
+        services.push((service, resolved));
     }
-    imported_names.insert(format!("{}Client", service.name));
+    if services.is_empty() {
+        return Ok(out); // sin ningun service declarado, no hay cliente que generar
+    }
     // Los `const` se emiten en ESTE archivo (ver `emit_const_decl`), así que
     // su tipo declarado también hay que importarlo -- `const DEF: Role = ...`
     // no compila si `Role` no está en scope acá.
@@ -216,6 +217,10 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         }
     }
 
+    // Un `class {Name}ClientImpl` + `create{Name}Client` por cada service
+    // recolectado arriba -- antes esta función entera corría UNA sola vez
+    // para el primer (y único) `service` que encontraba.
+    for (service, resolved) in &services {
     out.push_str(&format!("class {name}ClientImpl implements {name}Client {{\n", name = service.name));
     // Constructor explícito, no "parameter property" (`private x: T` en la
     // firma) -- esa azúcar de TS no la entienden strip-only transpilers
@@ -234,7 +239,7 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     out.push_str("  constructor(baseUrl: string) {\n    this.baseUrl = baseUrl;\n  }\n\n");
     out.push_str("  setToken(token: string | null): void {\n    this.token = token;\n  }\n\n");
 
-    for (rpc, is_stream, param_tys, ret_ty) in &resolved {
+    for (rpc, is_stream, param_tys, ret_ty) in resolved {
         let params: Vec<String> = rpc
             .params
             .iter()
@@ -310,9 +315,10 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     out.push_str("}\n\n");
 
     out.push_str(&format!(
-        "export function create{name}Client(baseUrl: string): {name}Client {{\n  return new {name}ClientImpl(baseUrl);\n}}\n",
+        "export function create{name}Client(baseUrl: string): {name}Client {{\n  return new {name}ClientImpl(baseUrl);\n}}\n\n",
         name = service.name
     ));
+    }
 
     Ok(out)
 }
@@ -874,6 +880,49 @@ mod tests {
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/users.link"),
         )
         .expect("no se pudo leer examples/users.link")
+    }
+
+    /// Regresión: `emit_client` usaba `.find_map()` sobre `program.items` y
+    /// se detenía en el primer `Item::Service` -- un programa con más de un
+    /// `service` (GRAMMAR.md no lo limita a uno) generaba `client.ts` con
+    /// una sola clase, silenciosamente, sin ningún error. `contract.d.ts`
+    /// (interfaz `{Name}Client` por servicio, chequeado abajo) y `hooks.ts`
+    /// (misma función hermana, mismo archivo) ya iteraban todos los
+    /// servicios correctamente -- solo esta función se quedaba corta.
+    #[test]
+    fn emit_client_covers_every_service_not_just_the_first() {
+        let src = r#"
+            type A = { id: Int, x: Int }
+            type B = { id: Int, y: Int }
+            db { as: A[], bs: B[] }
+            service SvcA { rpc list() -> A[] { db.as.all() } }
+            service SvcB { rpc list() -> B[] { db.bs.all() } }
+            service SvcC { rpc list() -> B[] { db.bs.all() } }
+        "#;
+        let (contract, client) = emit_both(src);
+
+        // Las tres interfaces ya se emitían bien -- confirma que el bug era
+        // solo de emit_client, no del checker ni de emit_contract.
+        assert!(contract.contains("export interface SvcAClient"));
+        assert!(contract.contains("export interface SvcBClient"));
+        assert!(contract.contains("export interface SvcCClient"));
+
+        for name in ["SvcA", "SvcB", "SvcC"] {
+            assert!(
+                client.contains(&format!("class {name}ClientImpl implements {name}Client")),
+                "falta la clase de '{name}' en client.ts:\n{client}"
+            );
+            assert!(
+                client.contains(&format!("export function create{name}Client(baseUrl: string): {name}Client")),
+                "falta la factory de '{name}' en client.ts:\n{client}"
+            );
+        }
+
+        // Los helpers compartidos (transporte, validación, Result guards)
+        // se emiten UNA sola vez, no una copia por servicio.
+        assert_eq!(client.matches("export class LinkTransportError").count(), 1);
+        assert_eq!(client.matches("export class LinkValidationError").count(), 1);
+        assert_eq!(client.matches("export function isOk").count(), 1);
     }
 
     #[test]
