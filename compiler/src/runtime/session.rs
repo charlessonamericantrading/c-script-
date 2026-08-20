@@ -1,52 +1,38 @@
-//! Auth v0 (GRAMMAR.md §3.14): sesión opaca en memoria + roles. Sin JWT, y
-//! sin ninguna dependencia nueva PARA ESTA FEATURE puntual -- el criterio de
-//! "sin agregar dependencias" no rige para todo el proyecto (la persistencia
-//! real de `db`, GRAMMAR.md §3.17, sí trajo una -- `rusqlite` -- a propósito
-//! y de forma explícita), pero auth v0 en particular se resolvió entero con
-//! lo que tiny_http+serde_json ya daban.
+//! Auth v0 (GRAMMAR.md §3.14): sesión opaca en memoria + roles. Sin JWT.
+//!
+//! Se resolvió originalmente sin agregar dependencias, con lo que
+//! tiny_http+serde_json ya daban; la única pieza que ese criterio dejaba
+//! incómoda era la entropía del token (ver `fresh_128_bits`). Desde que
+//! `crypto.hashPassword` pasó a Argon2id y el proyecto tomó `getrandom`, los
+//! tokens de sesión salen del CSPRNG del sistema como corresponde.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-/// 128 bits genuinamente sembrados por el SO, vía un truco de hilo
-/// descartable -- NO un CSPRNG auditado, alcanza para v0/demo.
+/// 128 bits del CSPRNG del sistema (BCryptGenRandom/ProcessPrng en Windows,
+/// getrandom(2) en Linux, random_get en WASI).
 ///
-/// `std::collections::hash_map::RandomState` cachea sus keys (k0,k1) POR
-/// HILO: la primera vez que se pide en un hilo dado, lee del SO; cada
-/// llamada SUBSIGUIENTE en ESE MISMO hilo solo incrementa k0 en 1 -- k1
-/// nunca cambia. Como el intérprete de c-script corre siempre en el hilo
-/// principal (single-threaded por diseño, ver runtime/server.rs), llamar
-/// `RandomState::new()` repetidas veces ahí NO da un secreto nuevo por
-/// llamada: da un único secreto fijado una vez al arrancar el proceso,
-/// reusado con un contador chico encima -- insuficiente para un token de
-/// sesión (~0 bits de entropía nueva por token, no ~128 como el nombre del
-/// tipo podría sugerir). Este fue el hallazgo de seguridad central de la
-/// ronda de auth: dos revisores adversariales llegaron, cada uno por su
-/// cuenta, a esta misma causa raíz.
-///
-/// Un hilo RECIÉN CREADO nunca inicializó ese cache thread-local, así que
-/// su PRIMER `RandomState::new()` sí pega contra el RNG real del SO
-/// (`BCryptGenRandom`/`ProcessPrng` en Windows, `getrandom(2)` en Linux).
-/// Acá se fuerza exactamente eso: se crea un hilo descartable, y DENTRO de
-/// él se derivan 2 hashes de 64 bits de la MISMA `RandomState` (sin volver a
-/// llamar `::new()`, que reincidiría en el problema) -- ambos derivados de
-/// las mismas (k0,k1) frescas, mezclados vía SipHash con un discriminador
-/// distinto cada uno. El costo del spawn+join (decenas de microsegundos) es
-/// irrelevante para una operación de login. Una implementación real
-/// necesitaría el crate `rand`/`getrandom`.
+/// HISTORIA, porque el reemplazo importa: esto llamaba a
+/// RandomState::new() para sacar entropia. El hallazgo central de la ronda de
+/// auth fue que eso NO da un secreto nuevo por llamada -- RandomState cachea
+/// (k0,k1) por hilo la primera vez y despues solo incrementa k0, asi que en el
+/// hilo principal (el interprete es single-threaded por diseno, ver
+/// runtime/server.rs) cada token nuevo aportaba ~0 bits de entropia, no ~128.
+/// La solucion de entonces fue spawnear un hilo descartable por token, porque
+/// un hilo recien creado si pega contra el RNG del SO en su primer
+/// RandomState::new(); funcionaba, pero era un rodeo alrededor de no tener una
+/// dependencia de RNG. Ahora que crypto.hashPassword necesita sales de verdad,
+/// getrandom entro al proyecto y este rodeo sobra: se pide directo al SO.
 fn fresh_128_bits() -> (u64, u64) {
-    std::thread::spawn(|| {
-        use std::collections::hash_map::RandomState;
-        use std::hash::{BuildHasher, Hasher};
-        let rs = RandomState::new();
-        let mut h1 = rs.build_hasher();
-        h1.write_u8(1);
-        let mut h2 = rs.build_hasher();
-        h2.write_u8(2);
-        (h1.finish(), h2.finish())
-    })
-    .join()
-    .expect("el hilo de generación de tokens no debería poder paniquear")
+    let mut buf = [0u8; 16];
+    // Si el SO no puede dar entropia, la respuesta correcta es cortar: emitir un
+    // token de sesion "por defecto" seria emitir uno adivinable.
+    getrandom::getrandom(&mut buf)
+        .expect("el sistema no pudo generar entropia para un token de sesion");
+    (
+        u64::from_le_bytes(buf[..8].try_into().unwrap()),
+        u64::from_le_bytes(buf[8..].try_into().unwrap()),
+    )
 }
 
 fn fresh_token() -> String {

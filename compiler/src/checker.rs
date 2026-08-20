@@ -465,7 +465,7 @@ impl Checker {
                         },
                         Ok(other) => errors.push(
                             err(format!(
-                                "la colección '{}' de 'db' tiene que ser una lista de structs (T[]), se encontró {other:?}",
+                                "la colección '{}' de 'db' tiene que ser una lista de structs (T[]), se encontró {other}",
                                 coll.name
                             ))
                             .with_span(db.span),
@@ -647,7 +647,7 @@ impl Checker {
                             }
                             errors.push(e);
                         }
-                        if let Err(e) = checker.check_rpc_annotation(rpc) {
+                        if let Err(e) = checker.check_rpc_annotation(rpc, is_stream) {
                             let mut e = e.with_span(rpc.span);
                             if let Some(file) = file_for(index) {
                                 e = e.with_file(file);
@@ -844,7 +844,7 @@ impl Checker {
                 match self.resolve_type_subst(inner, subst)? {
                     Type::Struct { .. } => Ok(Type::PatchOf(Box::new(self.resolve_type_subst(inner, subst)?))),
                     other => Err(err(format!(
-                        "Patch<T> requiere que T sea un struct, se encontró {other:?}"
+                        "Patch<T> requiere que T sea un struct, se encontró {other}"
                     ))),
                 }
             }
@@ -1091,7 +1091,7 @@ impl Checker {
                     Ok(())
                 } else {
                     Err(err(format!(
-                        "el bloque no termina en una expresión y se esperaba un valor de tipo {expected:?}"
+                        "el bloque no termina en una expresión y se esperaba un valor de tipo {expected}"
                     )))
                 }
             }
@@ -1196,14 +1196,72 @@ impl Checker {
         check_wire_safe(&ret, &format!("el retorno de '{}'", r.name), true)
     }
 
+    /// Qué combinaciones de anotaciones son legales (GRAMMAR.md §3.35). El
+    /// parser acepta cualquier secuencia a propósito -- que `@content_type`
+    /// sobre un `stream` sea un error es una regla del lenguaje, no de la
+    /// gramática, y da mejor mensaje acá.
+    fn check_annotation_combination(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        let auth_count = r
+            .annotations
+            .iter()
+            .filter(|a| matches!(a, Annotation::Authenticated | Annotation::Requires { .. }))
+            .count();
+        if auth_count > 1 {
+            return Err(err(format!(
+                "'{}' declara más de una anotación de auth -- `@requires` ya implica autenticado, no hace falta sumarle `@authenticated`",
+                r.name
+            )));
+        }
+
+        let content_types: Vec<&String> = r
+            .annotations
+            .iter()
+            .filter_map(|a| match a {
+                Annotation::ContentType(ct) => Some(ct),
+                _ => None,
+            })
+            .collect();
+        if content_types.len() > 1 {
+            return Err(err(format!(
+                "'{}' declara `@content_type` más de una vez: una respuesta tiene un solo Content-Type",
+                r.name
+            )));
+        }
+        let Some(ct) = content_types.first() else {
+            return Ok(());
+        };
+        if ct.trim().is_empty() {
+            return Err(err(format!(
+                "`@content_type(\"\")` en '{}': el tipo MIME no puede estar vacío",
+                r.name
+            )));
+        }
+        if is_stream {
+            return Err(err(format!(
+                "`@content_type` en el stream '{}': un `stream` siempre se sirve como Server-Sent Events (text/event-stream), no se puede cambiar su Content-Type (GRAMMAR.md §3.35)",
+                r.name
+            )));
+        }
+        let ret = self.resolve_type(&r.return_type)?;
+        if ret != Type::String {
+            return Err(err(format!(
+                "`@content_type` en '{}': el rpc tiene que devolver `String` -- el cuerpo de la respuesta se escribe tal cual, y {} no es texto que se pueda mandar sin serializar a JSON (GRAMMAR.md §3.35)",
+                r.name,
+                ret
+            )));
+        }
+        Ok(())
+    }
+
     /// `@requires(Enum.Variante)` (GRAMMAR.md §3.14, auth v0) tiene que
     /// nombrar un enum de verdad y una variante que de verdad exista en él --
     /// si no, el error aparece acá, en tiempo de compilación, no como un 403
     /// que nunca se puede satisfacer en runtime. Sin restricción de "enum
     /// simple" (ver `check_auth_method`): la comparación en runtime es solo
     /// por tag, nunca mira campos.
-    fn check_rpc_annotation(&self, r: &RpcDecl) -> Result<(), CheckError> {
-        let Some(Annotation::Requires { enum_name, variant_name }) = &r.annotation else {
+    fn check_rpc_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        self.check_annotation_combination(r, is_stream)?;
+        let Some(Annotation::Requires { enum_name, variant_name }) = r.auth() else {
             return Ok(());
         };
         let decl = self.enums.get(enum_name).ok_or_else(|| {
@@ -1368,7 +1426,7 @@ impl Checker {
             Expr::ArrayLit(items) if items.is_empty() => match expected {
                 Type::List(_) | Type::Dynamic => Ok(()),
                 other => Err(err(format!(
-                    "un array vacío '[]' requiere un tipo esperado de lista, se esperaba {other:?}"
+                    "un array vacío '[]' requiere un tipo esperado de lista, se esperaba {other}"
                 ))),
             },
             // Rama EXPLÍCITA, no delegar al fallback de abajo -- si esto
@@ -1391,7 +1449,7 @@ impl Checker {
                 if is_subtype(&t, expected) {
                     Ok(())
                 } else {
-                    Err(err(format!("se esperaba un valor de tipo {expected:?}, se encontró {t:?}")))
+                    Err(err(format!("se esperaba un valor de tipo {expected}, se encontró {t}")))
                 }
             }
         }
@@ -1415,7 +1473,7 @@ impl Checker {
         env: &Env,
     ) -> Result<(), CheckError> {
         let Type::Function(expected_params, expected_ret) = expected else {
-            return Err(err(format!("se esperaba un valor de tipo {expected:?}, se encontró un closure")));
+            return Err(err(format!("se esperaba un valor de tipo {expected}, se encontró un closure")));
         };
         if params.len() != expected_params.len() {
             return Err(err(format!(
@@ -1453,7 +1511,7 @@ impl Checker {
     ) -> Result<(), CheckError> {
         let Type::ResultOf(ok_ty, err_ty) = expected else {
             return Err(err(format!(
-                "'Result.{variant} {{...}}' usado donde se esperaba {expected:?}, no un Result<T, E>"
+                "'Result.{variant} {{...}}' usado donde se esperaba {expected}, no un Result<T, E>"
             )));
         };
         match variant {
@@ -1495,7 +1553,7 @@ impl Checker {
     ) -> Result<(), CheckError> {
         let Type::Generic(gname, gargs) = expected else {
             return Err(err(format!(
-                "'{name}' es genérico -- se necesita un tipo esperado ya instanciado (ej. anotá el 'let', o usalo donde el tipo ya se conoce), se encontró {expected:?}"
+                "'{name}' es genérico -- se necesita un tipo esperado ya instanciado (ej. anotá el 'let', o usalo donde el tipo ya se conoce), se encontró {expected}"
             )));
         };
         if gname != name {
@@ -1546,7 +1604,7 @@ impl Checker {
             }
             other => {
                 return Err(err(format!(
-                    "'match' requiere un valor de tipo enum, Int, String, Bool o unión; se encontró {other:?}"
+                    "'match' requiere un valor de tipo enum, Int, String, Bool o unión; se encontró {other}"
                 )))
             }
         }
@@ -1807,7 +1865,7 @@ impl Checker {
         if ok {
             Ok(())
         } else {
-            Err(err(format!("el patrón literal {lit:?} no coincide con el tipo del escrutinio ({ty:?})")))
+            Err(err(format!("el patrón literal {lit:?} no coincide con el tipo del escrutinio ({ty})")))
         }
     }
 
@@ -2055,7 +2113,15 @@ impl Checker {
                             Err(err(format!("'db' no tiene ninguna colección llamada '{field}'")))
                         }
                     }
-                    other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
+                    // `T?` aparte: es el error que mas se comete, porque en
+                    // TypeScript `if (x != null)` SI angosta y acá no
+                    // (GRAMMAR.md §3.4). Decir solo "no se puede" deja a quien
+                    // lo lee -- humano o modelo -- probando variantes que
+                    // tampoco existen.
+                    Type::Optional(inner) => Err(err(format!(
+                        "no se puede acceder al campo '{field}' sobre {inner}?: un valor nullable no se angosta con `if x != null` (no hay narrowing en c-script, GRAMMAR.md §3.4). Devolvé el {inner}? tal cual y desarmalo del lado de TypeScript, que sí angosta `{inner} | null`"
+                    ))),
+                    other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other}"))),
                 }
             }
             Expr::Call { callee, args } => {
@@ -2095,7 +2161,7 @@ impl Checker {
                         }
                         Ok(*ret)
                     }
-                    other => Err(err(format!("no se puede llamar un valor de tipo {other:?}"))),
+                    other => Err(err(format!("no se puede llamar un valor de tipo {other}"))),
                 }
             }
             Expr::StructLit { name, variant, fields } => {
@@ -2130,7 +2196,7 @@ impl Checker {
                 match base_ty {
                     Type::List(elem_ty) => Ok(*elem_ty),
                     Type::Dynamic => Ok(Type::Dynamic),
-                    other => Err(err(format!("no se puede indexar un valor de tipo {other:?} (se esperaba una lista)"))),
+                    other => Err(err(format!("no se puede indexar un valor de tipo {other} (se esperaba una lista)"))),
                 }
             }
             Expr::TupleLit(items) => {
@@ -2150,7 +2216,7 @@ impl Checker {
                         ))
                     }),
                     Type::Dynamic => Ok(Type::Dynamic),
-                    other => Err(err(format!("'.{index}' requiere una tupla, se encontró {other:?}"))),
+                    other => Err(err(format!("'.{index}' requiere una tupla, se encontró {other}"))),
                 }
             }
             Expr::Paren(inner) => self.synth_expr(inner, env),
@@ -2267,7 +2333,7 @@ impl Checker {
                 let t = self.synth_expr(operand, env)?;
                 match t {
                     Type::Int | Type::Int64 | Type::Float | Type::Dynamic => Ok(t),
-                    other => Err(err(format!("'-' unario requiere Int, Int64 o Float, se encontró {other:?}"))),
+                    other => Err(err(format!("'-' unario requiere Int, Int64 o Float, se encontró {other}"))),
                 }
             }
             UnaryOp::Not => {
@@ -2733,7 +2799,7 @@ impl Checker {
                 match self.synth_expr(role_arg, env)? {
                     Type::Enum(_) => Ok(Type::String),
                     other => Err(err(format!(
-                        "'createSession' espera un valor de un enum declarado (ej. Role.Admin {{}}), se encontró {other:?}"
+                        "'createSession' espera un valor de un enum declarado (ej. Role.Admin {{}}), se encontró {other}"
                     ))),
                 }
             }

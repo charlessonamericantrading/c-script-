@@ -304,6 +304,19 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
             render_type(ret_ty)
         ));
         push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names);
+
+        // Un rpc con `@content_type` responde el String tal cual, sin comillas
+        // de JSON alrededor (GRAMMAR.md §3.35) -- llamar a `res.json()` acá
+        // reventaría con un SyntaxError sobre el primer `<` del HTML. Tampoco
+        // corre el validador: no hay JSON que validar, y el checker ya exigió
+        // que el retorno sea String.
+        if let Some(ct) = rpc.content_type() {
+            out.push_str(&format!("    // Content-Type declarado: {ct}\n"));
+            out.push_str("    return await res.text();\n");
+            out.push_str("  }\n\n");
+            continue;
+        }
+
         out.push_str("    const json: unknown = await res.json();\n");
         out.push_str(&format!(
             "    if (!({check})) throw new LinkValidationError(\"{}\", json);\n",
