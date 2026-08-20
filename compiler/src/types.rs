@@ -118,6 +118,9 @@ pub enum Type {
     /// acceso al body crudo y a los headers de LA request HTTP que está
     /// invocando este rpc en este momento.
     Request,
+    /// Tipo interno para el módulo `smtp` builtin (GRAMMAR.md §3.43) --
+    /// mandar un email por SMTP.
+    Smtp,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -194,6 +197,7 @@ impl std::fmt::Display for Type {
             Type::Base64 => write!(f, "base64"),
             Type::Env => write!(f, "env"),
             Type::Request => write!(f, "request"),
+            Type::Smtp => write!(f, "smtp"),
         }
     }
 }

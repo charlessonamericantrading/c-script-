@@ -2207,6 +2207,9 @@ impl Checker {
                 if name == "request" {
                     return Ok(Type::Request);
                 }
+                if name == "smtp" {
+                    return Ok(Type::Smtp);
+                }
                 if name == "now" {
                     return Ok(Type::Function(vec![], Box::new(Type::Timestamp)));
                 }
@@ -2764,6 +2767,15 @@ impl Checker {
                 };
                 self.check_expr(name_arg, &Type::String, env)?;
                 Some(Type::Optional(Box::new(Type::String)))
+            }
+            (Type::Smtp, "send") => {
+                let [to, subject, body] = args else {
+                    return Err(err("'smtp.send' toma exactamente 3 argumentos (to: String, subject: String, body: String)"));
+                };
+                self.check_expr(to, &Type::String, env)?;
+                self.check_expr(subject, &Type::String, env)?;
+                self.check_expr(body, &Type::String, env)?;
+                Some(Type::Void)
             }
             (Type::Base64, "decode") => {
                 let [str_arg] = args else {

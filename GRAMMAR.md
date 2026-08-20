@@ -64,6 +64,7 @@
   - [3.40 PostgreSQL: TLS y reconexión automática — RESUELTO (alcance acotado)](#340-postgresql-tls-y-reconexión-automática--resuelto-alcance-acotado)
   - [3.41 CORS configurable y headers de seguridad — RESUELTO (alcance acotado)](#341-cors-configurable-y-headers-de-seguridad--resuelto-alcance-acotado)
   - [3.42 `@route` con múltiples parámetros — RESUELTO (alcance acotado)](#342-route-con-múltiples-parámetros--resuelto-alcance-acotado)
+  - [3.43 `smtp.send`: mandar email — RESUELTO (alcance acotado)](#343-smtpsend-mandar-email--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -2137,6 +2138,80 @@ de múltiples valores en el orden correcto) y en `compiler/tests/cli_route.rs`
 contra un servidor real: una ruta de dos parámetros bindeando por nombre
 en un orden distinto al de la firma del rpc, y una ruta con un segmento
 literal ganándole a una totalmente dinámica del mismo largo.
+
+---
+
+### 3.43 `smtp.send`: mandar email — RESUELTO (alcance acotado)
+
+Última pieza de la misma auditoría que §3.38-§3.42. Un backend real casi
+siempre necesita mandar mail -- confirmar un registro, resetear una
+contraseña, notificar un evento -- y no había ninguna forma de hacerlo desde
+c-script.
+
+**Lo que hay ahora:**
+
+```
+smtp.send(to: String, subject: String, body: String) -> Void
+```
+
+```
+rpc register(email: String) -> Void {
+  // ... crear el usuario ...
+  smtp.send(email, "Bienvenido", "Gracias por registrarte.");
+}
+```
+
+**De dónde salen la conexión y el remitente -- del ENTORNO, nunca de
+argumentos del rpc.** Dos variables de entorno, mismo criterio que
+`LINK_DATABASE_URL` (§3.36):
+
+| Variable | Contenido |
+|---|---|
+| `LINK_SMTP_URL` | Connection string de `lettre` (la librería detrás): `smtps://usuario:clave@host` (TLS implícito, puerto 465 por default -- la opción recomendada), `smtp://usuario:clave@host?tls=required` (STARTTLS obligatorio), o `smtp://host` sin más (sin cifrar, para un relay local de desarrollo). |
+| `LINK_SMTP_FROM` | La dirección remitente, opcionalmente con nombre (`"Mi App <no-reply@midominio.com>"`). |
+
+La razón de que estas dos NO sean parámetros del rpc: un `.link` no debería
+poder hardcodear ni filtrar credenciales de un relay SMTP en su código
+fuente, y dejar que cualquier caller elija el remitente abriría la puerta a
+que datos de la request terminen falsificando el `From:` de un email real
+(el mismo tipo de riesgo que `@rate_limit`/CORS vienen tratando con
+cuidado en esta misma serie de rondas).
+
+**TLS, mismo stack que Postgres (§3.40).** `lettre` con el feature
+`rustls-tls` -- `rustls` + `ring` + `webpki-roots`, sin OpenSSL ni ninguna
+dependencia nativa del sistema, para que los 4 targets de release sigan
+compilando sin instalar nada.
+
+**Fallas, todas como error de runtime normal (igual que `http.get`/`http.post`,
+no como un `Result<T,E>` del lenguaje):** variable de entorno faltante,
+dirección inválida (remitente o destinatario), o el relay inalcanzable
+vuelven un mensaje claro que nombra qué falló -- nunca un panic, nunca tira
+abajo el servidor.
+
+**Límites honestos de esta ronda:**
+
+- **Un solo destinatario por llamada.** Sin `cc`/`bcc`, sin lista de
+  destinatarios. Mandar a varios es una llamada a `smtp.send` por cada uno.
+- **Solo texto plano.** Sin HTML, sin adjuntos. El body es el `String` tal
+  cual, sin ningún tipo de contenido MIME alternativo.
+- **Sin plantillas.** Armar el `subject`/`body` (con interpolación de
+  strings, `+`) es responsabilidad de quien escribe el rpc.
+- **Sin cola ni reintento.** `smtp.send` es sincrónico: bloquea el hilo del
+  servidor (single-threaded, §3.13) hasta que el relay responde o falla. Un
+  relay lento hace lento a TODO el servidor mientras dura ese envío -- igual
+  trade-off que ya vale para `crypto.hashPassword` (§3.34) y cualquier otra
+  operación bloqueante del intérprete.
+
+**Verificado** en `compiler/tests/cli_smtp.rs` contra un servidor SMTP real
+-- escrito a mano en el propio archivo de test (sin ninguna dependencia
+externa al binario, para que corra igual en CI que en cualquier máquina):
+habla lo mínimo del protocolo (`EHLO`/`MAIL FROM`/`RCPT TO`/`DATA`) para que
+`smtp.send` complete un envío de punta a punta de verdad, y el test confirma
+que el remitente, destinatario, asunto y cuerpo que el servidor de mentira
+RECIBIÓ son exactamente los que se mandaron -- más los cuatro caminos de
+error (falta `LINK_SMTP_URL`, falta `LINK_SMTP_FROM`, dirección inválida,
+relay inalcanzable), todos devolviendo un 500 con mensaje claro, nunca un
+panic.
 
 ---
 

@@ -799,7 +799,7 @@ pub(crate) fn render_type(ty: &Type) -> String {
             .collect::<Vec<_>>()
             .join(" | "),
         // `db`/`db.<coleccion>`/`auth`/`Service`/`math`/`crypto`/`http`/`json`/`base64` son internos del checker
-        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Env | Type::Request => {
+        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Env | Type::Request | Type::Smtp => {
             unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64 nunca aparece en un TypeExpr real")
         }
     }
@@ -864,7 +864,7 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
             }
         }
         Type::Int | Type::Int64 | Type::Timestamp | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
-        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Env | Type::Request => {
+        Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Env | Type::Request | Type::Smtp => {
             unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64 nunca aparece en un TypeExpr real")
         }
     }

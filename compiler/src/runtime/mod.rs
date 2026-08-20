@@ -95,6 +95,9 @@ pub enum Value {
     /// (ver `Db::request_context`; ausente fuera de un servidor real, ej.
     /// desde `linkc test`).
     Request,
+    /// Marcador interno para el módulo `smtp` (GRAMMAR.md §3.43) -- mandar
+    /// un email por SMTP.
+    Smtp,
     BoundMethod(Box<Value>, String),
     /// Una `fn` de nivel superior referenciada POR NOMBRE, ej. `let g = add_one;`
     /// (GRAMMAR.md §3.10). Es una REFERENCIA a función (como un `fn` pointer
@@ -178,6 +181,7 @@ impl std::fmt::Debug for Value {
             Value::Base64 => write!(f, "Base64"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
+            Value::Smtp => write!(f, "Smtp"),
             Value::BoundMethod(recv, method) => f.debug_tuple("BoundMethod").field(recv).field(method).finish(),
             Value::FnRef(name) => f.debug_tuple("FnRef").field(name).finish(),
             // A propósito NO imprime `captured_env` -- podría ser cíclico
@@ -387,6 +391,9 @@ pub(crate) fn eval_expr(
             if name == "request" {
                 return Ok(Value::Request);
             }
+            if name == "smtp" {
+                return Ok(Value::Smtp);
+            }
             // Un `const` de nivel superior: su valor es siempre un literal
             // (el checker lo exige), así que evaluarlo en un env vacío no
             // depende de nada del scope actual.
@@ -423,7 +430,7 @@ pub(crate) fn eval_expr(
                     .map(|(_, v)| v)
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -1380,6 +1387,44 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre request: '{other}'"))),
         },
+        Value::Smtp => match method {
+            "send" => {
+                let (Some(Value::Str(to)), Some(Value::Str(subject)), Some(Value::Str(body))) =
+                    (args.first(), args.get(1), args.get(2))
+                else {
+                    return Err(err("smtp.send requiere 3 argumentos String (to, subject, body)"));
+                };
+                // Conexión y remitente salen del ENTORNO del proceso, nunca
+                // de argumentos del rpc (GRAMMAR.md §3.43) -- mismo criterio
+                // que `LINK_DATABASE_URL`: un `.link` no debería poder
+                // hardcodear ni filtrar credenciales de un relay SMTP, y
+                // dejar que cualquier caller elija el remitente abriría la
+                // puerta a spoofear el `From:` con datos de la request.
+                let url = std::env::var("LINK_SMTP_URL")
+                    .map_err(|_| err("smtp.send: falta la variable de entorno LINK_SMTP_URL (ej. 'smtps://usuario:clave@smtp.proveedor.com')"))?;
+                let from = std::env::var("LINK_SMTP_FROM")
+                    .map_err(|_| err("smtp.send: falta la variable de entorno LINK_SMTP_FROM (la dirección remitente)"))?;
+
+                let from_mbox: lettre::message::Mailbox =
+                    from.parse().map_err(|e| err(format!("smtp.send: LINK_SMTP_FROM ('{from}') no es una dirección válida: {e}")))?;
+                let to_mbox: lettre::message::Mailbox =
+                    to.parse().map_err(|e| err(format!("smtp.send: 'to' ('{to}') no es una dirección válida: {e}")))?;
+                let email = lettre::Message::builder()
+                    .from(from_mbox)
+                    .to(to_mbox)
+                    .subject(subject.as_str())
+                    .body(body.clone())
+                    .map_err(|e| err(format!("smtp.send: no se pudo armar el mensaje: {e}")))?;
+
+                use lettre::Transport;
+                let mailer = lettre::SmtpTransport::from_url(&url)
+                    .map_err(|e| err(format!("smtp.send: LINK_SMTP_URL inválida: {e}")))?
+                    .build();
+                mailer.send(&email).map_err(|e| err(format!("smtp.send: no se pudo mandar el email: {e}")))?;
+                Ok(Value::Null)
+            }
+            other => Err(err(format!("método desconocido sobre smtp: '{other}'"))),
+        },
         Value::Http => match method {
             "get" => {
                 let url = match args.first() {
@@ -2061,7 +2106,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }

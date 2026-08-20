@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.7.0] - 2026-08-20
+
+### ✨ Nuevo
+- **`smtp.send(to, subject, body)`: mandar email.** Cierra el último gap de la misma lista de bloqueos de migración de esta serie de rondas — un backend real casi siempre necesita mandar mail (confirmar un registro, resetear una contraseña) y no había forma de hacerlo desde c-script. La conexión (`LINK_SMTP_URL`) y el remitente (`LINK_SMTP_FROM`) salen del entorno del proceso, nunca de argumentos del rpc — así un `.link` no puede hardcodear credenciales de un relay, y ningún caller puede spoofear el remitente con datos de la request. TLS vía `lettre` con el feature `rustls-tls` — mismo stack (`rustls` + `ring` + `webpki-roots`, sin OpenSSL) que ya usa el driver de PostgreSQL desde v1.4.0. Fallas (variable de entorno faltante, dirección inválida, relay inalcanzable) son errores de runtime normales, igual que `http.get`/`http.post` — nunca un panic. Límites honestos de esta ronda: un solo destinatario por llamada, solo texto plano (sin HTML ni adjuntos), sincrónico (bloquea el hilo único del servidor mientras dura el envío). Detalle completo, verificado contra un servidor SMTP real (escrito a mano en el propio test, sin dependencias externas): GRAMMAR.md §3.43.
+
 ## [1.6.0] - 2026-08-20
 
 ### ✨ Nuevo
