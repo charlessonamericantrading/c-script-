@@ -87,25 +87,46 @@ fn main() -> ExitCode {
         Some("lint") => cmd_lint(&args[2..]),
         Some("doc") => cmd_doc(&args[2..]),
         Some("docker") => cmd_docker(&args[2..]),
+        // `--help` es una peticion valida, no un error: va a stdout y sale 0.
+        // Sin este brazo caia en `cmd_check("--help")`, que respondia con un
+        // mensaje sobre archivos .link inexistentes.
+        Some("--help") | Some("-h") | Some("help") => {
+            print_usage(false);
+            ExitCode::SUCCESS
+        }
         Some(path) => cmd_check(path), // `linkc <archivo.link>` -- solo lex+parse+check
         None => {
-            eprintln!("uso: linkc <subcomando> [opciones]");
-            eprintln!("subcomandos conocidos:");
-            eprintln!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)");
-            eprintln!("     linkc build <archivo.link> <outdir>    (genera contratos TS, cliente, hooks, schemas Zod y OpenAPI)");
-            eprintln!("     linkc test <archivo.link>              (ejecuta pruebas de comportamiento integradas)");
-            eprintln!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)");
-            eprintln!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)");
-            eprintln!("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)");
-            eprintln!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)");
-            eprintln!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)");
-            eprintln!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)");
-            eprintln!("     linkc serve <archivo.link> <puerto>    (inicia servidor HTTP con SQLite embebido)");
-            eprintln!("     linkc lsp                              (inicia el servidor Language Server Protocol)");
+            print_usage(true);
             ExitCode::FAILURE
         }
     }
 }
+
+/// Texto de uso. Se imprime en stdout con codigo 0 cuando lo pide el usuario
+/// (`--help`) y en stderr con codigo 1 cuando `linkc` se invoca mal.
+fn print_usage(to_stderr: bool) {
+    let out = |line: &str| {
+        if to_stderr {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
+    out(&format!("uso: linkc <subcomando> [opciones]"));
+    out(&format!("subcomandos conocidos:"));
+    out(&format!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)"));
+    out(&format!("     linkc build <archivo.link> <outdir>    (genera contratos TS, cliente, hooks, schemas Zod y OpenAPI)"));
+    out(&format!("     linkc test <archivo.link>              (ejecuta pruebas de comportamiento integradas)"));
+    out(&format!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)"));
+    out(&format!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)"));
+    out(&format!("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)"));
+    out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
+    out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
+    out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
+    out(&format!("     linkc serve <archivo.link> <puerto>    (inicia servidor HTTP con SQLite embebido)"));
+    out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
+}
+
 
 fn cmd_fmt(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else {
@@ -305,7 +326,7 @@ fn cmd_check(path: &str) -> ExitCode {
     // conocido -- si además no parece un archivo real, es casi seguro un
     // subcomando mal escrito, no un archivo que el usuario quiere tipar.
     if !path.ends_with(".link") && !Path::new(path).exists() {
-        eprintln!("'{path}' no es un subcomando conocido (build, serve, new, dev, lsp, wasm) ni un archivo .link existente");
+        eprintln!("'{path}' no es un subcomando conocido ni un archivo .link existente -- `linkc --help` lista los subcomandos");
         return ExitCode::FAILURE;
     }
     match load_and_check(path) {
