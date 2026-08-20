@@ -26,7 +26,7 @@ use std::time::Duration;
 /// Un programa con un campo de cada familia: nativo requerido, nativo nullable,
 /// opcional-por-clave, enum simple (columna TEXT), struct anidado (JSONB) y el
 /// caso de tres estados `campo?: T?`.
-const PROGRAM: &str = r#"
+const PROGRAM_TEMPLATE: &str = r#"
 type Meta = { source: String, score: Int }
 
 type Lead = {
@@ -54,17 +54,17 @@ type NewLead = {
 
 enum Status { New, Contacted, Won }
 
-db { leads: Lead[], }
+db { COLLECTION: Lead[], }
 
 service Leads {
-  rpc list() -> Lead[] { db.leads.all() }
-  rpc get(id: Int) -> Lead? { db.leads.find(id) }
-  rpc total() -> Int { db.leads.count() }
-  rpc remove(id: Int) -> Bool { db.leads.delete(id) }
-  rpc update(id: Int, patch: Patch<Lead>) -> Lead { db.leads.applyPatch(id, patch) }
+  rpc list() -> Lead[] { db.COLLECTION.all() }
+  rpc get(id: Int) -> Lead? { db.COLLECTION.find(id) }
+  rpc total() -> Int { db.COLLECTION.count() }
+  rpc remove(id: Int) -> Bool { db.COLLECTION.delete(id) }
+  rpc update(id: Int, patch: Patch<Lead>) -> Lead { db.COLLECTION.applyPatch(id, patch) }
 
   rpc create(email: String, score: Float) -> Lead {
-    db.leads.insert(NewLead {
+    db.COLLECTION.insert(NewLead {
       email: email,
       name: null,
       status: Status.New {},
@@ -76,10 +76,22 @@ service Leads {
   }
 
   rpc pending() -> Lead[] {
-    db.leads.findWhere(|l: Lead| { !l.contacted })
+    db.COLLECTION.findWhere(|l: Lead| { !l.contacted })
   }
 }
 "#;
+
+/// El programa con la colección (y por lo tanto la tabla) que pide el test.
+fn program_for(collection: &str) -> String {
+    PROGRAM_TEMPLATE.replace("COLLECTION", collection)
+}
+
+/// PostgreSQL no serializa bien el DDL concurrente: dos conexiones haciendo
+/// `CREATE TABLE IF NOT EXISTS` a la vez pueden chocar en los catálogos del
+/// sistema. Cada test usa su propia tabla, y además el arranque (drop + create)
+/// se serializa acá -- `cargo test` corre los tests en paralelo por defecto y
+/// eso no se cambia solo para esto.
+static SETUP: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn pg_url() -> Option<String> {
     let url = std::env::var("LINK_TEST_PG_URL").ok().filter(|v| !v.trim().is_empty());
@@ -107,9 +119,9 @@ impl TempDir {
         Self(path)
     }
 
-    fn program(&self) -> PathBuf {
-        let path = self.0.join("leads.link");
-        std::fs::write(&path, PROGRAM).unwrap();
+    fn program(&self, collection: &str) -> PathBuf {
+        let path = self.0.join("app.link");
+        std::fs::write(&path, program_for(collection)).unwrap();
         path
     }
 }
@@ -123,10 +135,12 @@ impl Drop for TempDir {
 /// Cada test arranca con la tabla borrada: la base de CI es compartida entre
 /// tests del mismo job, y un `count()` no significa nada si quedaron filas de
 /// otro. Borrar la tabla ejercita además la creación desde cero en cada test.
-fn reset_schema(url: &str) {
+fn reset_schema(url: &str, collection: &str) {
     let mut client =
         postgres::Client::connect(url, postgres::NoTls).expect("conectar a la base de PostgreSQL de test");
-    client.batch_execute("DROP TABLE IF EXISTS \"leads\";").expect("limpiar el esquema");
+    client
+        .batch_execute(&format!("DROP TABLE IF EXISTS \"{collection}\";"))
+        .expect("limpiar el esquema");
 }
 
 fn free_port() -> u16 {
@@ -141,25 +155,45 @@ struct Serve {
 impl Serve {
     fn start(src: &PathBuf, url: &str) -> Self {
         let port = free_port();
+        // La salida del servidor va a archivos, no a /dev/null: cuando esto
+        // falla, el motivo lo tiene el proceso hijo, y tirarlo obliga a
+        // adivinar. (Primera versión de este test: 3 fallos en CI que solo
+        // decían "no respondió a tiempo".)
+        let log_dir = src.parent().expect("el .link vive en algún directorio");
+        let out_path = log_dir.join(format!("serve-{port}.out"));
+        let err_path = log_dir.join(format!("serve-{port}.err"));
         let child = Command::new(env!("CARGO_BIN_EXE_linkc"))
             .arg("serve")
             .arg(src)
             .arg(port.to_string())
             .env("LINK_DATABASE_URL", url)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&out_path).expect("crear el log de stdout"))
+            .stderr(std::fs::File::create(&err_path).expect("crear el log de stderr"))
             .spawn()
             .expect("iniciar 'linkc serve'");
 
         // Un round-trip HTTP completo es la única señal confiable de que el
         // servidor ya está sirviendo (mismo criterio que tests/server_http.rs).
+        let mut server = Serve { child, port };
         for _ in 0..300 {
             if ureq::get(&format!("http://127.0.0.1:{port}/health")).call().is_ok() {
-                return Serve { child, port };
+                return server;
+            }
+            // Si el proceso ya murió, no tiene sentido seguir esperando.
+            if let Ok(Some(status)) = server.child.try_wait() {
+                panic!(
+                    "'linkc serve' salió con {status} antes de escuchar:\nstdout: {}\nstderr: {}",
+                    std::fs::read_to_string(&out_path).unwrap_or_default(),
+                    std::fs::read_to_string(&err_path).unwrap_or_default()
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("'linkc serve' no respondió a tiempo en el puerto {port}");
+        panic!(
+            "'linkc serve' no respondió a tiempo en el puerto {port}\nstdout: {}\nstderr: {}",
+            std::fs::read_to_string(&out_path).unwrap_or_default(),
+            std::fs::read_to_string(&err_path).unwrap_or_default()
+        );
     }
 
     fn rpc(&self, method: &str, body: &str) -> serde_json::Value {
@@ -182,13 +216,15 @@ impl Drop for Serve {
 
 #[test]
 fn the_crud_surface_works_against_a_real_postgres() {
+    const COLLECTION: &str = "leads_crud";
     let Some(url) = pg_url() else {
         eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
         return;
     };
-    reset_schema(&url);
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
     let temp = TempDir::new("crud");
-    let src = temp.program();
+    let src = temp.program(COLLECTION);
     let server = Serve::start(&src, &url);
 
     let a = server.rpc("Leads/create", r#"{"email":"ada@example.com","score":9.5}"#);
@@ -234,13 +270,15 @@ fn the_crud_surface_works_against_a_real_postgres() {
 
 #[test]
 fn rows_survive_a_restart_and_are_readable_from_plain_sql() {
+    const COLLECTION: &str = "leads_persist";
     let Some(url) = pg_url() else {
         eprintln!("saltado: LINK_TEST_PG_URL no está definida");
         return;
     };
-    reset_schema(&url);
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
     let temp = TempDir::new("persist");
-    let src = temp.program();
+    let src = temp.program(COLLECTION);
 
     let id = {
         let server = Serve::start(&src, &url);
@@ -261,7 +299,7 @@ fn rows_survive_a_restart_and_are_readable_from_plain_sql() {
     // Postgres de siempre" no sería cierto.
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
     let rows = client
-        .query("SELECT \"email\", \"status\", \"score\", \"contacted\", \"meta\" FROM \"leads\" ORDER BY \"id\"", &[])
+        .query("SELECT \"email\", \"status\", \"score\", \"contacted\", \"meta\" FROM \"{COLLECTION}\" ORDER BY \"id\"", &[])
         .expect("consultar la tabla desde SQL plano");
     assert_eq!(rows.len(), 1);
 
@@ -282,20 +320,22 @@ fn rows_survive_a_restart_and_are_readable_from_plain_sql() {
     // El struct anidado es JSONB de verdad, consultable con los operadores de
     // Postgres -- no un string con JSON adentro.
     let by_json = client
-        .query("SELECT count(*) FROM \"leads\" WHERE \"meta\"->>'source' = $1", &[&"test"])
+        .query("SELECT count(*) FROM \"{COLLECTION}\" WHERE \"meta\"->>'source' = $1", &[&"test"])
         .expect("consultar por dentro del JSONB");
     assert_eq!(by_json[0].get::<_, i64>(0), 1, "el JSONB es consultable como tal");
 }
 
 #[test]
 fn the_runtime_creates_the_same_schema_that_linkc_build_emits() {
+    const COLLECTION: &str = "leads_schema";
     let Some(url) = pg_url() else {
         eprintln!("saltado: LINK_TEST_PG_URL no está definida");
         return;
     };
-    reset_schema(&url);
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
     let temp = TempDir::new("schema");
-    let src = temp.program();
+    let src = temp.program(COLLECTION);
 
     // El runtime crea las tablas al conectarse.
     let _server = Serve::start(&src, &url);
@@ -318,7 +358,7 @@ fn the_runtime_creates_the_same_schema_that_linkc_build_emits() {
     let cols = client
         .query(
             "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
-             WHERE table_name = 'leads' ORDER BY ordinal_position",
+             WHERE table_name = $1 ORDER BY ordinal_position",
             &[],
         )
         .expect("leer el esquema real");
@@ -355,16 +395,19 @@ fn the_runtime_creates_the_same_schema_that_linkc_build_emits() {
 
 #[test]
 fn a_new_field_is_added_to_an_existing_table_without_losing_rows() {
+    const COLLECTION: &str = "leads_migrate";
     let Some(url) = pg_url() else {
         eprintln!("saltado: LINK_TEST_PG_URL no está definida");
         return;
     };
-    reset_schema(&url);
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
     let temp = TempDir::new("migrate");
 
     // Versión 1 del programa, con datos adentro.
-    let v1 = temp.0.join("leads.link");
-    std::fs::write(&v1, PROGRAM).unwrap();
+    let v1 = temp.0.join("app.link");
+    let v1_src = program_for(COLLECTION);
+    std::fs::write(&v1, &v1_src).unwrap();
     let id = {
         let server = Serve::start(&v1, &url);
         server.rpc("Leads/create", r#"{"email":"vieja@example.com","score":1.0}"#)["id"]
@@ -373,11 +416,11 @@ fn a_new_field_is_added_to_an_existing_table_without_losing_rows() {
     };
 
     // Versión 2: el programa gana un campo. La tabla ya existe y tiene filas.
-    let v2 = PROGRAM.replace(
+    let v2 = v1_src.replace(
         "  note?: String?,\n  createdAt: Timestamp,\n}\n\ntype NewLead",
         "  note?: String?,\n  owner?: String,\n  createdAt: Timestamp,\n}\n\ntype NewLead",
     );
-    assert_ne!(v2, PROGRAM, "el reemplazo del campo nuevo tiene que haber aplicado");
+    assert_ne!(v2, v1_src, "el reemplazo del campo nuevo tiene que haber aplicado");
     std::fs::write(&v1, &v2).unwrap();
 
     let server = Serve::start(&v1, &url);
@@ -387,8 +430,8 @@ fn a_new_field_is_added_to_an_existing_table_without_losing_rows() {
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
     let cols = client
         .query(
-            "SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = 'leads' AND column_name = 'owner'",
-            &[],
+            "SELECT column_name, is_nullable FROM information_schema.columns WHERE table_name = $1 AND column_name = 'owner'",
+            &[&COLLECTION],
         )
         .expect("buscar la columna nueva");
     assert_eq!(cols.len(), 1, "la columna nueva se agregó sola");
@@ -401,7 +444,7 @@ fn a_new_field_is_added_to_an_existing_table_without_losing_rows() {
 fn a_bad_connection_url_fails_with_a_message_instead_of_a_panic() {
     // Este no necesita base: prueba justamente el camino en que no hay ninguna.
     let temp = TempDir::new("badurl");
-    let src = temp.program();
+    let src = temp.program("leads_badurl");
 
     let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
         .arg("serve")
