@@ -98,6 +98,7 @@ linkc serve main.link 3000   # Starts HTTP server with auto-migrating database
 
 ## 🧠 Language at a Glance
 
+<!-- linkc:check -->
 ```rust
 // 1. Data Models & Enums
 type User = {
@@ -126,7 +127,7 @@ service UserService {
       id: 0,
       name: name,
       email: email,
-      role: Role.Member,
+      role: Role.Member {},
       created_at: now(),
     });
     new_user

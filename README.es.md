@@ -98,6 +98,7 @@ linkc serve main.link 3000   # Inicia servidor HTTP con SQLite embebido y auto-m
 
 ## 🧠 El Lenguaje de un Vistazo
 
+<!-- linkc:check -->
 ```rust
 // 1. Modelos de Datos y Enums
 type User = {
@@ -126,7 +127,7 @@ service UserService {
       id: 0,
       name: name,
       email: email,
-      role: Role.Member,
+      role: Role.Member {},
       created_at: now(),
     });
     new_user
