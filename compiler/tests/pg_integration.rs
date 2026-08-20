@@ -299,7 +299,7 @@ fn rows_survive_a_restart_and_are_readable_from_plain_sql() {
     // Postgres de siempre" no sería cierto.
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
     let rows = client
-        .query("SELECT \"email\", \"status\", \"score\", \"contacted\", \"meta\" FROM \"{COLLECTION}\" ORDER BY \"id\"", &[])
+        .query(&format!("SELECT \"email\", \"status\", \"score\", \"contacted\", \"meta\" FROM \"{COLLECTION}\" ORDER BY \"id\""), &[])
         .expect("consultar la tabla desde SQL plano");
     assert_eq!(rows.len(), 1);
 
@@ -320,7 +320,7 @@ fn rows_survive_a_restart_and_are_readable_from_plain_sql() {
     // El struct anidado es JSONB de verdad, consultable con los operadores de
     // Postgres -- no un string con JSON adentro.
     let by_json = client
-        .query("SELECT count(*) FROM \"{COLLECTION}\" WHERE \"meta\"->>'source' = $1", &[&"test"])
+        .query(&format!("SELECT count(*) FROM \"{COLLECTION}\" WHERE \"meta\"->>'source' = $1"), &[&"test"])
         .expect("consultar por dentro del JSONB");
     assert_eq!(by_json[0].get::<_, i64>(0), 1, "el JSONB es consultable como tal");
 }
@@ -359,7 +359,7 @@ fn the_runtime_creates_the_same_schema_that_linkc_build_emits() {
         .query(
             "SELECT column_name, data_type, is_nullable FROM information_schema.columns \
              WHERE table_name = $1 ORDER BY ordinal_position",
-            &[],
+            &[&COLLECTION],
         )
         .expect("leer el esquema real");
     let real: Vec<(String, String, String)> = cols.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect();
