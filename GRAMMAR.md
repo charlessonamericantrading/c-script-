@@ -6,6 +6,62 @@
 
 ---
 
+## Índice
+
+> Este archivo es la especificación completa (~190 KB): la gramática EBNF, las reglas
+> del checker bidireccional, el mapeo exhaustivo a TypeScript, y — sección por sección —
+> el **límite honesto** de cada feature (qué quedó adentro, qué quedó afuera y por qué).
+>
+> Si lo que necesitás es escribir c-script y no entender cómo está construido, empezá por
+> [`llms.txt`](llms.txt): la referencia condensada, con los errores de sintaxis que un LLM
+> comete siempre. Volvé acá para el detalle de una feature puntual.
+
+- [1. Gramática Léxica](#1-gramática-léxica)
+- [2. Gramática Sintáctica](#2-gramática-sintáctica)
+  - [2.1 Programa e ítems de nivel superior](#21-programa-e-ítems-de-nivel-superior)
+  - [2.2 Expresiones de tipo — y la trampa del postfix](#22-expresiones-de-tipo--y-la-trampa-del-postfix)
+  - [2.3 Expresiones, sentencias y patrones (cuerpo de un `rpc`)](#23-expresiones-sentencias-y-patrones-cuerpo-de-un-rpc)
+- [3. Sistema de Tipos](#3-sistema-de-tipos)
+  - [3.1 Juicios bidireccionales](#31-juicios-bidireccionales)
+  - [3.2 Subtipado: estructural para `type`, nominal para `enum`](#32-subtipado-estructural-para-type-nominal-para-enum)
+  - [3.3 Exhaustividad en `match` — RESUELTO (enum + literales, or-patterns, guardas)](#33-exhaustividad-en-match--resuelto-enum--literales-or-patterns-guardas)
+  - [3.4 Nullability (`T?`) — RESUELTO (default aplicado)](#34-nullability-t--resuelto-default-aplicado)
+  - [3.5 Manejo de errores en `rpc` — RESUELTO (default aplicado)](#35-manejo-de-errores-en-rpc--resuelto-default-aplicado)
+  - [3.6 Genéricos definidos por el usuario — RESUELTO (monomorfización)](#36-genéricos-definidos-por-el-usuario--resuelto-monomorfización)
+  - [3.7 Operadores e `if/else`](#37-operadores-e-ifelse)
+  - [3.8 Métodos builtin](#38-métodos-builtin)
+  - [3.9 Uniones de tipo (`A | B`) — RESUELTO (subtipado de flujo de valor Y narrowing)](#39-uniones-de-tipo-a--b--resuelto-subtipado-de-flujo-de-valor-y-narrowing)
+  - [3.10 Funciones como valores — RESUELTO (referencias Y closures reales, `.map`/`.filter`)](#310-funciones-como-valores--resuelto-referencias-y-closures-reales-mapfilter)
+  - [3.11 Validadores runtime (`validators.ts`) — RESUELTO](#311-validadores-runtime-validatorsts--resuelto)
+  - [3.12 "DB tipada" v0 (`db { ... }`) — RESUELTO](#312-db-tipada-v0-db-----resuelto)
+  - [3.13 Streaming real (SSE) para `stream` — RESUELTO, alcance `List<T>`](#313-streaming-real-sse-para-stream--resuelto-alcance-listt)
+  - [3.14 Auth v0 (sesión opaca en memoria + roles) — RESUELTO](#314-auth-v0-sesión-opaca-en-memoria--roles--resuelto)
+  - [3.15 Constructo de loop: `while` — RESUELTO, alcance acotado](#315-constructo-de-loop-while--resuelto-alcance-acotado)
+  - [3.16 Push real: pub-sub sobre `db` para `stream` — RESUELTO, alcance acotado (shape fijo)](#316-push-real-pub-sub-sobre-db-para-stream--resuelto-alcance-acotado-shape-fijo)
+  - [3.17 Persistencia real: `db` sobre SQLite — RESUELTO](#317-persistencia-real-db-sobre-sqlite--resuelto)
+  - [3.18 CRUD real: `delete`/`deleteWhere`/`findWhere` sobre `db` — RESUELTO](#318-crud-real-deletedeletewherefindwhere-sobre-db--resuelto)
+  - [3.19 Protocolo LSP real (`linkc lsp`) — RESUELTO, Nivel 1+2](#319-protocolo-lsp-real-linkc-lsp--resuelto-nivel-12)
+  - [3.20 Codegen WASM nativo v0 (`linkc wasm`) — RESUELTO, alcance mínimo](#320-codegen-wasm-nativo-v0-linkc-wasm--resuelto-alcance-mínimo)
+  - [3.21 LSP Nivel 3 (Ronda 1/3): goto-definición de un nombre de tipo en una firma — RESUELTO](#321-lsp-nivel-3-ronda-13-goto-definición-de-un-nombre-de-tipo-en-una-firma--resuelto)
+  - [3.22 Identidad de archivo en `Span` — RESUELTO](#322-identidad-de-archivo-en-span--resuelto)
+  - [3.23 `Field`/`Param` ganan `name_span` — RESUELTO](#323-fieldparam-ganan-name_span--resuelto)
+  - [3.24 Hover de expresión arbitraria — RESUELTO, LSP Nivel 3 ronda 2/3](#324-hover-de-expresión-arbitraria--resuelto-lsp-nivel-3-ronda-23)
+  - [3.25 Completion sensible al tipo del receptor — RESUELTO, LSP Nivel 3 ronda 3/3 (último ítem)](#325-completion-sensible-al-tipo-del-receptor--resuelto-lsp-nivel-3-ronda-33-último-ítem)
+  - [3.26 Observabilidad: tracing estructurado por RPC — RESUELTO, v0](#326-observabilidad-tracing-estructurado-por-rpc--resuelto-v0)
+  - [3.27 Hot reload real en `linkc dev` — RESUELTO, v0](#327-hot-reload-real-en-linkc-dev--resuelto-v0)
+  - [3.28 Fase 3 (PLAN.md §4): política de estabilidad de sintaxis, y por qué source maps NO se persigue todavía](#328-fase-3-planmd-4-política-de-estabilidad-de-sintaxis-y-por-qué-source-maps-no-se-persigue-todavía)
+  - [3.29 `linkc test`: contrato contra un snapshot commiteado (PLAN.md §5, "tests de contrato")](#329-linkc-test-contrato-contra-un-snapshot-commiteado-planmd-5-tests-de-contrato)
+  - [3.30 `Int64` — RESUELTO, cierra la única fila "no" de tipos que quedaba en PLAN.md §2.3](#330-int64--resuelto-cierra-la-única-fila-no-de-tipos-que-quedaba-en-planmd-23)
+  - [3.31 `Timestamp` — RESUELTO, alcance acotado a propósito](#331-timestamp--resuelto-alcance-acotado-a-propósito)
+  - [3.32 Función builtin `now() -> Timestamp` — RESUELTO](#332-función-builtin-now---timestamp--resuelto)
+  - [3.33 Test runner de comportamiento integrado (`test "nombre" { ... }`, `assert`, `panic`) — RESUELTO](#333-test-runner-de-comportamiento-integrado-test-nombre----assert-panic--resuelto)
+- [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
+  - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
+  - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
+- [5. Estado](#5-estado)
+
+---
+
 ## 1. Gramática Léxica
 
 ```ebnf

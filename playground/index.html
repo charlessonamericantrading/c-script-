@@ -166,9 +166,16 @@
   </style>
 </head>
 <body>
+  <div style="background:#3d2e00; color:#f0d58c; border-bottom:1px solid #7a5c00; padding:8px 16px; font-size:0.85rem; line-height:1.45;">
+    <strong>Esta página es una maqueta estática.</strong> No ejecuta <code>linkc</code>: ignora lo que
+    escribas y muestra siempre la misma salida de ejemplo, incluido el "0 errores" del panel de
+    diagnósticos. Sirve para ver la <em>forma</em> de lo que genera el compilador, no para probar código.
+    Para eso: <code>cargo build --release</code> en <code>compiler/</code> y después
+    <code>linkc build archivo.link gen</code>.
+  </div>
   <header>
     <div class="brand">
-      <span>⚡</span> Link Playground <span style="font-size:0.8rem; font-weight:normal; background:rgba(88,166,255,0.15); color:var(--accent); padding:2px 8px; border-radius:12px;">v1.0 Nativo</span>
+      <span>⚡</span> Link Playground <span style="font-size:0.8rem; font-weight:normal; background:rgba(210,153,34,0.18); color:#d29922; padding:2px 8px; border-radius:12px;" title="Esta página no ejecuta el compilador: muestra una salida enlatada.">MAQUETA — no compila de verdad</span>
     </div>
     <div class="controls">
       <select id="example-select" onchange="loadExample(this.value)">
@@ -362,13 +369,15 @@ CREATE TABLE IF NOT EXISTS "users" (
   "role" TEXT NOT NULL,
   "created_at" BIGINT NOT NULL
 );`;
-      outputs.console = `⚡ Compilando con linkc v1.0.0...
+      // Salida enlatada, idéntica para cualquier entrada: esto es una maqueta.
+      outputs.console = `[maqueta -- esta salida no viene de compilar tu código]
+⚡ Compilando con linkc v1.0.0...
 OK: tipo verificado limpiamente.
 Pruebas integradas ejecutadas: 1/1 pasaron exitosamente (0 fallos).
 Bytecode WebAssembly nativo: emitido (memoria lineal compartida).`;
 
       document.getElementById('output-view').textContent = outputs[currentTab];
-      document.getElementById('diagnostics-status').textContent = '0 errores — Todo tipa limpiamente';
+      document.getElementById('diagnostics-status').textContent = 'maqueta — no se analizó tu código';
     }
 
     function compileAndRun() {
