@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.4.0] - 2026-08-20
+
+### ✨ Nuevo
+- **PostgreSQL: TLS oportunista y reconexión automática.** Los dos gaps reales que quedaban de una misma lista de bloqueos de migración ("Postgres sin pool/TLS/reconexión") — el tercero, pool de conexiones, no aplica: el intérprete es single-threaded, atiende una request a la vez, así que más de una conexión no compraría nada. TLS es `rustls` puro (crates `rustls` + `tokio-postgres-rustls`, backend `ring`), sin OpenSSL ni ninguna librería nativa del sistema, para que los 4 targets de release sigan compilando sin instalar nada — `sslmode` sale de la URL de conexión (`disable` = texto plano de siempre; sin especificar o `prefer` = intenta TLS y cae solo a texto plano si el servidor no lo ofrece, el nuevo default; `require` = TLS obligatorio). Antes de esta ronda, conectar a cualquier proveedor administrado que exige TLS (Supabase, Neon, RDS) era simplemente imposible. Reconexión: una conexión cortada ya no tira abajo el servidor hasta un reinicio manual — la request que la encuentra sigue fallando (nunca se reintenta a ciegas: podría duplicar un INSERT que el servidor ya había aplicado antes de cortarse), pero la conexión se reemplaza antes de devolver ese error, así que la request SIGUIENTE ya encuentra la base sana. Detalle completo, con los límites honestos que quedan (sin backoff más allá de un intento por request, sin fixture de CI con TLS real todavía, sigue sin `LISTEN`/`NOTIFY`): GRAMMAR.md §3.40.
+
 ## [1.3.0] - 2026-08-20
 
 ### ✨ Nuevo

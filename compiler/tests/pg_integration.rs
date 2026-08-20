@@ -205,6 +205,31 @@ impl Serve {
             .expect("leer el body");
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("{method} no devolvió JSON ({e}): {text}"))
     }
+
+    /// Como `rpc`, pero sin panickear -- para el test de reconexión
+    /// (`a_dropped_connection_self_heals_without_a_process_restart`), que
+    /// necesita poder ver una request FALLAR (mientras la conexión a
+    /// Postgres sigue cortada) sin abortar el test. `linkc serve` sigue
+    /// respondiendo HTTP normalmente incluso cuando la query interna a
+    /// Postgres falla -- un 5xx con `{"error": "..."}"`, no un timeout ni
+    /// una conexión rechazada -- así que `Err` acá es "el status no fue
+    /// 2xx", con el mensaje de error del body si lo trae.
+    fn try_rpc(&self, method: &str, body: &str) -> Result<serde_json::Value, String> {
+        let request = ureq::post(&format!("http://127.0.0.1:{}/{method}", self.port))
+            .set("Content-Type", "application/json")
+            .send_string(body);
+        match request {
+            Ok(r) => {
+                let text = r.into_string().map_err(|e| e.to_string())?;
+                serde_json::from_str(&text).map_err(|e| format!("{method} no devolvió JSON ({e}): {text}"))
+            }
+            Err(ureq::Error::Status(status, r)) => {
+                let text = r.into_string().unwrap_or_default();
+                Err(format!("{method} devolvió {status}: {text}"))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
 }
 
 impl Drop for Serve {
@@ -520,4 +545,137 @@ fn a_bad_connection_url_fails_with_a_message_instead_of_a_panic() {
         !stderr.contains("panicked at"),
         "una base caída es una condición operativa normal, no un bug del compilador: {stderr}"
     );
+}
+
+/// Agrega un query param a una URL de conexión que hoy no trae ninguno
+/// (`LINK_TEST_PG_URL` en CI es justo así) -- alcanza para lo que necesitan
+/// los tests de acá abajo, no es un parser de URL genérico.
+fn with_query_param(url: &str, param: &str) -> String {
+    if url.contains('?') {
+        format!("{url}&{param}")
+    } else {
+        format!("{url}?{param}")
+    }
+}
+
+#[test]
+fn sslmode_disable_still_connects_in_plaintext() {
+    // Regresión explícita del comportamiento de ANTES de GRAMMAR.md §3.40:
+    // quien pide texto plano a propósito (`sslmode=disable`) lo sigue
+    // teniendo, sin que el intento de TLS oportunista de la nueva versión
+    // se interponga.
+    const COLLECTION: &str = "leads_sslmode_disable";
+    let Some(base_url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&base_url, COLLECTION);
+
+    let url = with_query_param(&base_url, "sslmode=disable");
+    let temp = TempDir::new("sslmode-disable");
+    let src = temp.program(COLLECTION);
+    let server = Serve::start(&src, &url);
+
+    let created = server.rpc("Leads/create", r#"{"email":"plain@example.com","score":1.0}"#);
+    assert_eq!(created["value"]["email"], "plain@example.com", "body: {created:?}");
+}
+
+#[test]
+fn default_sslmode_still_connects_against_a_server_without_tls_configured() {
+    // El otro lado de la misma regresión: SIN pedir `sslmode` explícito, el
+    // default pasó de "nunca cifrar" a "intentar TLS, seguir en texto plano
+    // si el servidor no lo ofrece" (`SslMode::Prefer`, GRAMMAR.md §3.40). El
+    // Postgres de CI no tiene TLS configurado -- si el fallback a texto
+    // plano no funcionara, ESTE test (y de hecho todos los demás de este
+    // archivo, que usan la URL tal cual) fallarían al conectar.
+    const COLLECTION: &str = "leads_sslmode_default";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("sslmode-default");
+    let src = temp.program(COLLECTION);
+    let server = Serve::start(&src, &url);
+
+    let created = server.rpc("Leads/create", r#"{"email":"default@example.com","score":1.0}"#);
+    assert_eq!(created["value"]["email"], "default@example.com", "body: {created:?}");
+}
+
+#[test]
+fn a_dropped_connection_self_heals_without_a_process_restart() {
+    // Antes de GRAMMAR.md §3.40: `Backend::Postgres` guardaba UN
+    // `postgres::Client` para toda la vida del proceso, sin reemplazarlo
+    // nunca -- una conexión cortada (red inestable, el propio Postgres
+    // reiniciando, un firewall cerrando conexiones ociosas) dejaba CADA
+    // request siguiente fallando hasta un reinicio manual de `linkc serve`.
+    //
+    // Este test corta la conexión de verdad (`pg_terminate_backend` desde
+    // una conexión administrativa aparte, identificando el backend del
+    // servidor por `application_name`) y prueba que, SIN reiniciar el
+    // proceso, el servidor vuelve a servir solo.
+    //
+    // No se asume que la PRIMERA request después del corte falle: es una
+    // carrera entre cuándo el cliente interno nota la conexión cerrada y
+    // cuándo llega esa request, y afirmar sobre el resultado exacto de esa
+    // carrera sería un test frágil por diseño. Lo que se prueba es la
+    // propiedad que de verdad importa: que se recupera SOLO, en un plazo
+    // razonable, sin ayuda humana.
+    const COLLECTION: &str = "leads_reconnect";
+    const APP_NAME: &str = "linkc_reconnect_test";
+    let Some(base_url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&base_url, COLLECTION);
+
+    let url = with_query_param(&base_url, &format!("application_name={APP_NAME}"));
+    let temp = TempDir::new("reconnect");
+    let src = temp.program(COLLECTION);
+    let server = Serve::start(&src, &url);
+
+    // La conexión funciona antes de tocar nada.
+    let first = server.rpc("Leads/create", r#"{"email":"before@example.com","score":1.0}"#);
+    assert_eq!(first["value"]["email"], "before@example.com", "body: {first:?}");
+
+    // Cortar la conexión del SERVIDOR (identificada por application_name),
+    // desde una conexión administrativa aparte -- nunca la del propio test
+    // runner, que usa otra conexión distinta para esto.
+    let mut admin = postgres::Client::connect(&base_url, postgres::NoTls).expect("conectar como admin");
+    let terminated = admin
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE application_name = $1 AND pid <> pg_backend_pid()",
+            &[&APP_NAME],
+        )
+        .expect("ejecutar pg_terminate_backend");
+    assert!(terminated > 0, "no se encontró la conexión del servidor por application_name -- ¿cambió cómo se identifica?");
+
+    // Reintentar hasta que vuelva a andar, sin reiniciar `server` (mismo
+    // proceso, mismo PID todo el tiempo).
+    let mut last_err = String::new();
+    let mut recovered = false;
+    for _ in 0..100 {
+        match server.try_rpc("Leads/create", r#"{"email":"after@example.com","score":2.0}"#) {
+            Ok(created) if created["value"]["email"] == "after@example.com" => {
+                recovered = true;
+                break;
+            }
+            Ok(other) => last_err = format!("respuesta inesperada: {other:?}"),
+            Err(e) => last_err = e,
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(recovered, "el servidor nunca se recuperó de la conexión cortada (último error: {last_err})");
+
+    // La conexión de verdad quedó sana, no solo esa única request: los
+    // datos de ANTES del corte siguen ahí, y una lectura normal funciona.
+    let all = server.rpc("Leads/list", "{}");
+    let emails: Vec<&str> = all["value"].as_array().expect("list debe devolver un array").iter().map(|l| l["email"].as_str().unwrap()).collect();
+    assert!(emails.contains(&"before@example.com"), "la fila de antes del corte debe seguir ahí: {emails:?}");
+    assert!(emails.contains(&"after@example.com"), "la fila de después de reconectar debe estar: {emails:?}");
 }

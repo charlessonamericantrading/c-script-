@@ -61,6 +61,7 @@
   - [3.37 `@route("/blog/:slug")`: URLs amigables para SEO — RESUELTO (alcance acotado)](#337-routeblogslug-urls-amigables-para-seo--resuelto-alcance-acotado)
   - [3.38 `env`, `request` y `crypto.hmacSha256`: verificar webhooks de terceros — RESUELTO (alcance acotado)](#338-env-request-y-cryptohmacsha256-verificar-webhooks-de-terceros--resuelto-alcance-acotado)
   - [3.39 `@rate_limit("20/1m")`: límite de requests por cliente — RESUELTO (alcance acotado)](#339-rate_limit201m-límite-de-requests-por-cliente--resuelto-alcance-acotado)
+  - [3.40 PostgreSQL: TLS y reconexión automática — RESUELTO (alcance acotado)](#340-postgresql-tls-y-reconexión-automática--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1498,12 +1499,12 @@ y volver a crear la tabla no es una opción.
   que poner en las que ya están. No hay forma de dar un default todavía.
 - **Ninguna otra migración es automática**: renombrar un campo, cambiarle el
   tipo o borrarlo no se detecta ni se aplica. La columna vieja queda ahí.
-- **Una sola conexión, sin pool.** El intérprete es single-threaded por diseño
-  (§3.13) y atiende una request a la vez, así que un pool no compraría nada
-  todavía -- pero tampoco hay reconexión: si la base se cae, el servidor no se
-  recupera solo.
-- **Sin TLS**: la conexión se abre con `NoTls`. Alcanza para una base en la
-  misma red privada; no para una remota sobre internet.
+- **Una sola conexión, sin pool -- deliberado, no pendiente.** El intérprete es
+  single-threaded por diseño (§3.13) y atiende una request a la vez: nunca hay
+  dos queries en vuelo al mismo tiempo, así que un pool de más de una conexión
+  no compraría nada (esperarían su turno igual, solo que en una cola distinta).
+  **TLS y reconexión automática sí eran gaps reales de esta ronda -- resueltos
+  en §3.40.**
 - **Sin transacciones expuestas.** Cada operación va sola, igual que en SQLite;
   el lenguaje no tiene todavía forma de agrupar varias en una transacción.
 - **`LISTEN`/`NOTIFY` no se usa.** Los `stream` (§3.16) siguen notificando desde
@@ -1841,6 +1842,114 @@ agota aunque ninguna request traiga token válido), y los formatos que el
 checker rechaza (sin conteo, conteo/ventana en cero, unidad de ventana
 desconocida, declarado dos veces). Unit tests del parser y del token bucket
 en `compiler/src/rate_limit.rs`.
+
+---
+
+### 3.40 PostgreSQL: TLS y reconexión automática — RESUELTO (alcance acotado)
+
+Auditoría del 20/08/2026, misma fuente que §3.38/§3.39 (un análisis de
+factibilidad de migración real) y misma frase señalada como bloqueo: "Postgres
+sin pool, TLS ni reconexión". §3.36 ya documentaba las tres como límites
+honestos. De las tres, **pool no era un gap real** (ver el bullet actualizado
+en §3.36: con el intérprete atendiendo una request a la vez, una segunda
+conexión ociosa no compra nada) -- las otras dos sí, y son las que cierra esta
+ronda.
+
+**TLS, vía `rustls` puro -- sin OpenSSL ni ninguna librería nativa del
+sistema.** La razón de elegir `rustls` (crates `rustls` + `tokio-postgres-rustls`,
+backend criptográfico `ring`) en vez de `native-tls`/`postgres-openssl`: los 4
+targets de release (Linux, Windows, macOS x86_64 y ARM, GRAMMAR.md — ver
+`.github/workflows/release.yml`) tienen que seguir compilando sin instalar
+nada del sistema operativo -- `rustls` es Rust puro, sin ese riesgo.
+
+`sslmode` sale de la URL de conexión, estándar libpq (`postgres://.../db?sslmode=...`),
+`postgres::Config` ya lo parsea:
+
+| `sslmode` | Comportamiento |
+|---|---|
+| `disable` | Texto plano, sin intentar TLS -- igual que ANTES de esta ronda. |
+| *(sin especificar)* | **Cambia de default**: antes era texto plano siempre; ahora intenta TLS primero y, si el servidor no lo ofrece, sigue en texto plano solo (`tokio-postgres` maneja ese fallback, sin código extra acá) -- mismo comportamiento que `sslmode=prefer` explícito. |
+| `require` | TLS obligatorio; si el servidor no lo ofrece, la conexión falla con un mensaje claro. |
+
+El cambio de default es intencional: cualquier servicio administrado real
+(Supabase, Neon, RDS, Railway, etc.) exige TLS hoy, y antes de esta ronda
+`linkc serve` era literalmente incapaz de conectarse a uno de ellos --
+`postgres::NoTls` no negocia, punto. El efecto práctico para quien apunta a un
+Postgres local sin TLS configurado (el caso más común en desarrollo, y el que
+usa la CI de este mismo repo) es ninguno: el fallback a texto plano es
+transparente.
+
+**Reconexión automática, con una elección deliberada sobre qué SÍ
+reintentar.** `Backend::Postgres` guarda ahora la URL de conexión junto al
+`postgres::Client`, y las cuatro operaciones que tocan la base
+(`execute`/`execute_ddl`/`query`/`insert_returning_id`, `runtime/store.rs`)
+pasan por `with_reconnect`: si el error es de conexión cerrada
+(`Error::is_closed()`, de `tokio-postgres`), reemplaza el cliente por uno
+nuevo (reconectado con el MISMO criterio de TLS que el arranque -- una sola
+función, `connect_postgres_client` en `runtime/db.rs`, para las dos cosas, por
+el mismo motivo de siempre: dos lugares abriendo la conexión con criterios
+distintos es la clase de divergencia que GRAMMAR.md §3.9 viene registrando).
+
+Lo deliberado: **`with_reconnect` NUNCA reintenta la operación que encontró la
+conexión cortada.** La request que la encuentra sigue devolviendo su error tal
+cual (un 500 con el mensaje real) -- lo que cambia es que la conexión queda
+sana ANTES de que ese error vuelva, así que la PRÓXIMA request (otro intento
+del cliente, u otro rpc cualquiera) ya encuentra la base reconectada, en vez de
+que el proceso entero quede sirviendo error tras error hasta un reinicio
+manual, que era el comportamiento de antes de esta ronda.
+
+La razón de NO reintentar automáticamente la operación en sí: una conexión
+puede cortarse en cualquier punto de una request -- incluido DESPUÉS de que el
+servidor ya aplicó un `INSERT`, pero ANTES de que la respuesta (`RETURNING
+"id"`) llegara al cliente. Reintentar a ciegas en ese caso insertaría una fila
+DUPLICADA, sin que quien llamó al rpc se entere. "Falla una vez, se cura sola
+para la próxima" es la garantía correcta acá -- transparencia total (reintentar
+también la escritura) habría sido más cómoda pero incorrecta.
+
+**Límites honestos de esta ronda:**
+
+- **La request que encuentra la conexión cortada falla igual.** No hay
+  reintento transparente de la operación en sí, a propósito (ver arriba) --
+  quien llama sigue viendo ese error puntual; solo la request SIGUIENTE se
+  beneficia de la reconexión.
+- **Un solo intento de reconexión por request que falla.** Si ese intento
+  también falla (la base sigue caída, no solo esa conexión), el cliente viejo
+  queda como estaba y la request siguiente vuelve a intentarlo sola -- no hay
+  backoff exponencial ni un límite de reintentos distinto de "una vez por
+  request que topa con el problema".
+- **Un handshake TLS de verdad completado contra un servidor que sí ofrece
+  SSL no tiene un fixture de CI propio en este repo todavía** -- levantar un
+  `postgres:16` con certificados en GitHub Actions es una pieza aparte de
+  infraestructura, no prototipeada localmente antes de este cambio (sin
+  Docker ni un Postgres local a mano en esta ronda). Lo que SÍ está verificado
+  en CI es la integración completa contra el Postgres real de siempre
+  (`sslmode` sin especificar, negociando y cayendo a texto plano porque ese
+  servidor no tiene TLS) y el camino explícito `sslmode=disable`. La conexión
+  usa la integración pública estándar de `tokio-postgres` + `rustls`
+  (`tokio-postgres-rustls`), no código de negociación TLS propio, así que el
+  riesgo residual es bajo -- pero no está clavado con un test end-to-end
+  contra un servidor que de verdad exija TLS.
+- **Sigue sin haber `LISTEN`/`NOTIFY`.** Dos instancias de `linkc serve` contra
+  la misma base todavía no se enteran de las escrituras de la otra en un
+  `stream` -- eso necesitaría un hilo de escucha aparte, y el modelo de
+  concurrencia actual (todo en el hilo principal, `RefCell` en vez de
+  `Mutex`, ver §3.13) no lo soporta sin un rediseño real. Sigue siendo el
+  límite más grande de correr más de una instancia contra la misma base.
+
+**Verificado** en `compiler/tests/pg_integration.rs` contra un PostgreSQL
+real: `sslmode=disable` conectando en texto plano tal cual antes;
+`sslmode` sin especificar conectando igual contra un servidor sin TLS
+configurado (prueba el fallback de `Prefer`); y un test que corta la
+conexión de verdad -- `pg_terminate_backend` desde una conexión
+administrativa aparte, identificando la del servidor por
+`application_name` -- y reintenta hasta que el MISMO proceso (nunca
+reiniciado) vuelve a servir, confirmando además que la fila insertada
+ANTES del corte sigue ahí y una fila nueva después del corte se puede
+crear. Deliberadamente no afirma sobre si la PRIMERA request después del
+corte falla o no -- es una carrera contra cuándo el cliente interno nota la
+conexión cerrada, y fijar ese detalle habría sido un test frágil por
+diseño; lo que se prueba es la propiedad real: que se recupera solo, en un
+plazo razonable, sin reiniciar el proceso.
 
 ---
 

@@ -295,6 +295,38 @@ pub(crate) struct RequestContext {
     pub headers: Vec<(String, String)>,
 }
 
+/// Única forma de abrir una conexión NUEVA a PostgreSQL -- usada tanto por
+/// `Db::connect_postgres` (arranque) como por `store::with_reconnect`
+/// (después de una conexión perdida), a propósito: dos lugares que abrieran
+/// la conexión por su cuenta con criterios distintos de TLS es exactamente
+/// la clase de divergencia entre capas que este proyecto viene evitando
+/// desde GRAMMAR.md §3.9.
+///
+/// TLS es rustls puro (crate `tokio-postgres-rustls` + `rustls` con el
+/// backend `ring`), no OpenSSL/`native-tls` -- así los 4 targets de release
+/// (Linux/Windows/macOS x86_64+ARM) compilan sin instalar ninguna librería
+/// del sistema. `sslmode` sale de la URL de conexión (estándar libpq,
+/// `postgres::Config` ya lo parsea): `disable` conecta en texto plano tal
+/// cual el comportamiento de antes de esta ronda; cualquier otro valor
+/// (incluido el default si no se especifica, `prefer`) intenta TLS primero
+/// -- y si el servidor no lo ofrece, la propia `tokio-postgres` cae a texto
+/// plano sola, sin código extra acá (GRAMMAR.md §3.40).
+pub(crate) fn connect_postgres_client(url: &str) -> Result<postgres::Client, String> {
+    // rustls exige un crypto provider de proceso instalado ANTES del primer
+    // `ClientConfig::builder()` -- se instala UNA vez; `install_default()`
+    // devuelve `Err` si ya había uno (llamado desde acá Y desde un
+    // reconnect posterior), así que el resultado se ignora a propósito.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let config: postgres::Config = url.parse().map_err(|e| format!("URL de conexión inválida: {e}"))?;
+    if config.get_ssl_mode() == postgres::config::SslMode::Disable {
+        postgres::Client::connect(url, postgres::NoTls).map_err(|e| format!("no se pudo conectar a PostgreSQL: {e}"))
+    } else {
+        let tls = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
+        postgres::Client::connect(url, tls).map_err(|e| format!("no se pudo conectar a PostgreSQL: {e}"))
+    }
+}
+
 impl Db {
     /// Única forma real de construcción -- `db_path` puede ser un archivo
     /// de verdad (persistencia real, lo que usa `linkc serve`) o el string
@@ -361,9 +393,8 @@ impl Db {
         }
         let simple_enums = simple_enum_names(program);
 
-        let client = postgres::Client::connect(url, postgres::NoTls)
-            .map_err(|e| format!("no se pudo conectar a PostgreSQL: {e}"))?;
-        let backend = Backend::Postgres(std::cell::RefCell::new(client));
+        let client = connect_postgres_client(url)?;
+        let backend = Backend::Postgres { client: std::cell::RefCell::new(client), url: url.to_string() };
 
         let mut columns = HashMap::new();
         for (name, element_ty) in checker.db_collections() {

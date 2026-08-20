@@ -47,24 +47,31 @@ pub(crate) enum ColumnKind {
 
 pub(crate) enum Backend {
     Sqlite(rusqlite::Connection),
-    /// `RefCell` porque el cliente de `postgres` pide `&mut self` para
-    /// consultar, y `Db` se comparte como `&Db` por todo el intérprete. Es
-    /// seguro por la misma razón que ya vale para `SessionStore` y para
-    /// `Db::subscribers`: el intérprete corre entero en el hilo principal
-    /// (ver runtime/server.rs), una request a la vez.
-    Postgres(RefCell<postgres::Client>),
+    Postgres {
+        /// `RefCell` porque el cliente de `postgres` pide `&mut self` para
+        /// consultar, y `Db` se comparte como `&Db` por todo el intérprete.
+        /// Es seguro por la misma razón que ya vale para `SessionStore` y
+        /// para `Db::subscribers`: el intérprete corre entero en el hilo
+        /// principal (ver runtime/server.rs), una request a la vez.
+        client: RefCell<postgres::Client>,
+        /// La URL de conexión original -- guardada para poder RECONECTAR
+        /// (`with_reconnect`, abajo) con el mismo criterio de TLS que usó
+        /// la conexión inicial (`db::connect_postgres_client`), sin
+        /// duplicar esa lógica acá (GRAMMAR.md §3.40).
+        url: String,
+    },
 }
 
 impl Backend {
     pub(crate) fn is_postgres(&self) -> bool {
-        matches!(self, Backend::Postgres(_))
+        matches!(self, Backend::Postgres { .. })
     }
 
     /// El placeholder del parámetro `n` (1-based).
     pub(crate) fn placeholder(&self, n: usize) -> String {
         match self {
             Backend::Sqlite(_) => "?".to_string(),
-            Backend::Postgres(_) => format!("${n}"),
+            Backend::Postgres { .. } => format!("${n}"),
         }
     }
 
@@ -75,14 +82,10 @@ impl Backend {
                     params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
                 conn.execute(sql, refs.as_slice()).map_err(|e| e.to_string())
             }
-            Backend::Postgres(client) => {
+            Backend::Postgres { client, url } => {
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     params.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
-                client
-                    .borrow_mut()
-                    .execute(sql, refs.as_slice())
-                    .map(|n| n as usize)
-                    .map_err(|e| e.to_string())
+                with_reconnect(client, url, |c| c.execute(sql, refs.as_slice())).map(|n| n as usize)
             }
         }
     }
@@ -91,7 +94,7 @@ impl Backend {
     pub(crate) fn execute_ddl(&self, sql: &str) -> Result<(), String> {
         match self {
             Backend::Sqlite(conn) => conn.execute_batch(sql).map_err(|e| e.to_string()),
-            Backend::Postgres(client) => client.borrow_mut().batch_execute(sql).map_err(|e| e.to_string()),
+            Backend::Postgres { client, url } => with_reconnect(client, url, |c| c.batch_execute(sql)),
         }
     }
 
@@ -120,10 +123,10 @@ impl Backend {
                     .map_err(|e| e.to_string())?;
                 rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
             }
-            Backend::Postgres(client) => {
+            Backend::Postgres { client, url } => {
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     params.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
-                let rows = client.borrow_mut().query(sql, refs.as_slice()).map_err(|e| e.to_string())?;
+                let rows = with_reconnect(client, url, |c| c.query(sql, refs.as_slice()))?;
                 rows.iter()
                     .map(|row| {
                         kinds
@@ -152,14 +155,11 @@ impl Backend {
             // (`lastval()`) es por sesión: con una segunda conexión de por medio
             // devolvería el id de otra fila. `RETURNING` lo resuelve en la misma
             // sentencia, sin ventana de carrera posible.
-            Backend::Postgres(client) => {
+            Backend::Postgres { client, url } => {
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     params.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
                 let returning = format!("{sql} RETURNING \"id\"");
-                let row = client
-                    .borrow_mut()
-                    .query_one(&returning, refs.as_slice())
-                    .map_err(|e| e.to_string())?;
+                let row = with_reconnect(client, url, |c| c.query_one(&returning, refs.as_slice()))?;
                 // `Row::get` (a diferencia de todo lo demás en este archivo)
                 // PANICKEA si el valor no convierte al tipo pedido -- documentado
                 // así en tokio-postgres. `Db::connect_postgres` ya rechaza al
@@ -175,6 +175,37 @@ impl Backend {
             }
         }
     }
+}
+
+/// Repara la conexión SOLA cuando se cortó, pero nunca reintenta la
+/// operación que la encontró cortada (GRAMMAR.md §3.40). `op` corre UNA
+/// vez -- si el error es de conexión cerrada (`Error::is_closed`, ver
+/// tokio-postgres), esta request sigue devolviendo ese error tal cual (no
+/// hay forma de saber si el servidor ya había aplicado un INSERT/UPDATE
+/// antes de que la conexión se cayera; reintentarlo a ciegas podría
+/// duplicar una fila), pero la conexión se reemplaza por una nueva ANTES de
+/// devolver el error -- así que la PRÓXIMA request (un reintento real del
+/// cliente, o cualquier otro rpc) encuentra la base ya reconectada, en vez
+/// de que el proceso entero quede sirviendo error tras error hasta un
+/// reinicio manual (el comportamiento de antes de esta ronda).
+///
+/// Reconectar es best-effort: si TAMBIÉN falla, se deja el cliente viejo
+/// como estaba -- la request siguiente vuelve a intentarlo sola, con la
+/// misma lógica, sin ningún estado especial que limpiar.
+fn with_reconnect<T>(
+    client: &RefCell<postgres::Client>,
+    url: &str,
+    op: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error>,
+) -> Result<T, String> {
+    let result = op(&mut client.borrow_mut());
+    if let Err(e) = &result {
+        if e.is_closed() {
+            if let Ok(fresh) = super::db::connect_postgres_client(url) {
+                *client.borrow_mut() = fresh;
+            }
+        }
+    }
+    result.map_err(|e| e.to_string())
 }
 
 fn sqlite_cell(row: &rusqlite::Row, i: usize, kind: ColumnKind) -> rusqlite::Result<Cell> {
