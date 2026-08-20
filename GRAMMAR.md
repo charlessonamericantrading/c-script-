@@ -55,6 +55,7 @@
   - [3.31 `Timestamp` — RESUELTO, alcance acotado a propósito](#331-timestamp--resuelto-alcance-acotado-a-propósito)
   - [3.32 Función builtin `now() -> Timestamp` — RESUELTO](#332-función-builtin-now---timestamp--resuelto)
   - [3.33 Test runner de comportamiento integrado (`test "nombre" { ... }`, `assert`, `panic`) — RESUELTO](#333-test-runner-de-comportamiento-integrado-test-nombre----assert-panic--resuelto)
+  - [3.34 `crypto`: contraseñas y aleatoriedad — RESUELTO (Argon2id + CSPRNG del SO)](#334-crypto-contraseñas-y-aleatoriedad--resuelto-argon2id--csprng-del-so)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1232,6 +1233,78 @@ test "crear usuario incrementa id y persiste" {
 - **Llamada a servicios:** Dentro de los tests (y en el lenguaje en general), los servicios y sus RPCs pueden ser invocados directamente como `Service.rpc(args...)`.
 - **Builtins:** `assert(cond: Bool, [msg: String])` verifica condiciones y falla con el mensaje especificado; `panic(msg: String)` aborta la ejecución con un error explícito.
 - **CLI:** `linkc test <archivo.link>` ejecuta todos los tests de comportamiento y reporta el conteo de pasados/fallidos con exit code 0 o 1. Si se pasa un segundo argumento `.snap`, continúa ejecutando el test de snapshot de contratos.
+
+---
+
+### 3.34 `crypto`: contraseñas y aleatoriedad — RESUELTO (Argon2id + CSPRNG del SO)
+
+Auditoría del 20/08/2026, disparada por un intento real de migrar un panel de
+administración a c-script: el módulo `crypto` tenía el nombre de la seguridad
+pero no su comportamiento. Las cuatro cosas que estaban mal, todas en
+`runtime/mod.rs`:
+
+1. **`hashPassword` era un solo SHA-256 con una sal constante** —
+   `"link_salt_2026"`, escrita en el compilador. No una sal por usuario: la
+   MISMA sal para toda aplicación escrita en este lenguaje, en cualquier parte
+   del mundo. Dos usuarios con la misma contraseña producían el mismo hash, y
+   una única rainbow table calculada una vez servía contra todas. Sin
+   iteraciones ni costo de memoria, además: exactamente el escenario para el
+   que existe un KDF.
+2. **`verifyPassword` comparaba con `==` de `String`**, que corta en el primer
+   byte distinto. El tiempo de respuesta filtra cuántos caracteres del hash
+   acertó quien está probando.
+3. **`randomToken(n)` era SHA-256 del reloj** (`SystemTime::now().as_nanos()`
+   más el largo pedido). Un token es adivinable para quien pueda acotar el
+   instante en que se emitió, y dos llamadas dentro del mismo nanosegundo
+   devuelven el mismo token. Cero bits de entropía real.
+4. **`uuid()` era lo mismo**, formateado con los bits de versión de un v4 para
+   que pareciera aleatorio. Dos identificadores "únicos" generados en el mismo
+   nanosegundo eran idénticos.
+
+Lo notable del hallazgo es dónde NO estaba el bug: `runtime/session.rs` ya
+había pasado por una auditoría propia sobre exactamente este tema (el problema
+de `RandomState`, documentado en §3.14) y sus tokens de sesión sí tenían
+entropía del sistema. La corrección se había aplicado a una capa y nunca se
+propagó a la API que ve el usuario del lenguaje — el mismo patrón
+"dos capas que discrepan" que este documento viene registrando desde §3.9.
+
+**Lo que hay ahora:**
+
+| Función | Implementación |
+|---|---|
+| `crypto.hashPassword(pwd)` | Argon2id (RFC 9106, parámetros por defecto de la crate `argon2`: m=19 MiB, t=2, p=1) con sal aleatoria de 16 bytes **por contraseña**, salida en formato PHC `$argon2id$v=19$m=...,t=...,p=...$sal$hash` |
+| `crypto.verifyPassword(pwd, hash)` | Verificación de la crate, que compara en tiempo constante; el camino legado usa `subtle::ConstantTimeEq` |
+| `crypto.randomToken(n)` | `getrandom` (CSPRNG del SO: `BCryptGenRandom` en Windows, `getrandom(2)` en Linux, `random_get` en WASI) |
+| `crypto.uuid()` | UUIDv4 real, 122 bits del mismo CSPRNG |
+| `crypto.hashSha256(s)` | Sin cambios: es un digest y se documenta como tal, no como algo para contraseñas |
+
+**Migración, y por qué se aceptan los hashes viejos.** `verifyPassword`
+reconoce el formato anterior (`sha256$<sal>$<hex>`) y lo verifica en tiempo
+constante. Rechazarlo habría sido más "limpio", pero significaría que
+actualizar el compilador deja afuera a todos los usuarios ya registrados de
+cualquier app en producción. La próxima vez que esa contraseña se guarde,
+`hashPassword` la escribe ya en Argon2id.
+
+**Límites honestos de esta ronda:**
+
+- **Los parámetros de Argon2id no se pueden configurar desde el lenguaje.** Son
+  los del default de la crate. Un servicio que necesite subir el costo de
+  memoria hoy no tiene cómo pedirlo.
+- **No hay señal de "este hash es viejo, re-hashealo".** `verifyPassword`
+  devuelve `Bool`; quien quiera migrar de forma proactiva tiene que mirar el
+  prefijo del hash guardado desde su propio código.
+- **Hashear bloquea el hilo del servidor.** El intérprete es single-threaded
+  por diseño (§3.13), y un `hashPassword` cuesta ~15 ms en la máquina donde se
+  midió esto. Es el precio correcto para un login, pero es tiempo de servidor
+  serializado: N logins simultáneos se atienden uno detrás del otro.
+- **Sin rotación ni expiración de sesiones** — eso sigue como estaba en §3.14.
+
+**Tests que fijan estas propiedades** (`runtime/mod.rs`, módulo de tests): que
+dos hashes de la misma contraseña difieran, que ambos verifiquen igual, que el
+hash declare `$argon2id$`, que un hash legado válido siga verificando y uno que
+no corresponde no, y que dos `randomToken`/`uuid` consecutivos sean distintos.
+Cada uno de esos asserts falla con la implementación anterior — que es la
+prueba de que testean la propiedad y no la firma.
 
 ---
 

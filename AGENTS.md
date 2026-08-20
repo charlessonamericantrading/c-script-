@@ -148,6 +148,4 @@ These are known and tracked; check `gh pr list` before starting on any of them.
 - `linkc --help` is rejected as an unknown argument (PR #5).
 - The TypeScript client emitter only covers the first `service` in a file (PR #7).
 - PostgreSQL DDL declares a nullable `T?` column as `JSONB` instead of its native type (PR #3).
-- `crypto.hashPassword` / `randomToken` / `uuid` are not cryptographically sound; see the
-  "Security" section of `GRAMMAR.md` before building anything that depends on them.
 - The response `Content-Type` is hardcoded, so the server cannot return HTML.

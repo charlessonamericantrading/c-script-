@@ -36,7 +36,8 @@ Works, verified by running it:
 - `linkc serve` — real HTTP server, embedded SQLite that persists across restarts, SSE streams.
 - `linkc test` — runs `test "..."` blocks against an isolated in-memory database.
 - `linkc dev`, `linkc lint`, `linkc doc`, `linkc docker`, `linkc lsp`, `linkc new`.
-- Declarative auth: `@authenticated` and `@requires(Role.Admin)`, with opaque session tokens.
+- Declarative auth: `@authenticated` and `@requires(Role.Admin)`, with session tokens drawn from the OS CSPRNG.
+- `crypto.hashPassword` / `verifyPassword` — Argon2id (RFC 9106) with a random per-password salt, PHC format, constant-time verification. `crypto.randomToken` and `crypto.uuid` also come from the OS CSPRNG.
 
 Does NOT work today — do not propose designs that depend on these:
 
