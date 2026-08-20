@@ -44,6 +44,7 @@ gana esta. Verificado el 20/08/2026 corriendo el compilador, no leyéndolo.
 - Auth declarativa: `@authenticated`, `@requires(Role.Admin)`, tokens de sesión desde el CSPRNG del sistema
 - PostgreSQL como base de runtime: `linkc serve app.link 8787 --db postgres://usuario:clave@host/base` (o `LINK_DATABASE_URL`), con auto-migración no destructiva. El mismo programa, el mismo contrato generado — SQLite sigue siendo el default
 - Respuestas que no son JSON: `@content_type("text/html; charset=utf-8")` sobre un rpc que devuelve `String` manda ese cuerpo tal cual — páginas HTML, sitemaps XML, CSV — y se combina con `@requires(Role.Admin)` para páginas detrás de auth
+- `linkc fmt`, `linkc --help`, y el emisor de cliente TypeScript para archivos multi-service funcionan correctamente ahora
 - Hashing de contraseñas real: `crypto.hashPassword` es Argon2id (RFC 9106) con sal aleatoria por contraseña, en formato PHC; `verifyPassword` compara en tiempo constante y sigue aceptando los hashes de la versión anterior para no dejar afuera a los usuarios ya registrados
 - Contrato TypeScript, cliente tipado, validadores runtime, hooks de React, schemas Zod y OpenAPI 3.1 generados
 
@@ -54,10 +55,7 @@ gana esta. Verificado el 20/08/2026 corriendo el compilador, no leyéndolo.
 | Sin URLs limpias | El ruteo es siempre `/Servicio/rpc` — sin parámetros en el path ni rutas propias. El HTML sí funciona (ver `@content_type`), pero un blog en `/blog/mi-post` necesita un proxy adelante. Los errores siempre vuelven en JSON, así que no hay página 404 propia. |
 | Sin escapado de HTML | Las páginas se arman concatenando `String`; nada escapa por vos los datos que interpolás. |
 | PostgreSQL sin pool, TLS ni LISTEN/NOTIFY | El driver de runtime funciona (ver abajo), pero abre una sola conexión sin cifrar y no reconecta; dos instancias del servidor contra la misma base no ven las escrituras de la otra en un `stream`. |
-| `linkc fmt` no es seguro | Borra los comentarios y puede emitir código que ya no parsea (arreglo pendiente en el PR #2). |
-| `linkc --help` | No es un argumento reconocido; corré `linkc` sin argumentos (arreglo pendiente en el PR #5). |
-| Codegen multi-service | El emisor del cliente TypeScript solo cubre el primer `service` del archivo (arreglo pendiente en el PR #7). |
-| Sin artefactos publicados | No hay release de GitHub, ni paquete npm, ni extensión en el Marketplace todavía — hay que compilar desde el código. |
+| Sin paquete npm | `link-lang` todavía no está en el registro de npm. Los releases de GitHub sí funcionan — ver Instalación más abajo. |
 | `linkc wasm` | Congelado a propósito en funciones escalares de enteros/booleanos; el camino de producción es `wasm32-wasip1`. |
 | El playground web | Es una maqueta estática: no ejecuta el compilador. |
 
@@ -77,9 +75,10 @@ irm https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master
 
 #### 🌐 Vía NPM / npx
 
-> **Todavía no está publicado.** `link-lang` no está en el registro de npm, y tampoco hay
-> release de GitHub, así que los instaladores `curl` e `irm` de arriba terminan compilando
-> desde el código. Hasta que salga la primera release, este es el camino soportado:
+> **Todavía no está publicado.** `link-lang` no está en el registro de npm. Usá alguno de
+> los instaladores de arriba (bajan el binario real precompilado desde
+> [GitHub Releases](https://github.com/charlessonamericantrading/c-script-/releases)), o
+> compilá desde el código:
 
 ```bash
 git clone https://github.com/charlessonamericantrading/c-script-.git

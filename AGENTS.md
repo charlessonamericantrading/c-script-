@@ -44,7 +44,7 @@ cargo test                   # unit + integration; spawns real LSP and HTTP subp
 ```
 
 ```bash
-linkc                        # lists subcommands (note: `linkc --help` is not recognised)
+linkc                        # lists subcommands (also: linkc --help)
 linkc build examples/users.link gen
 linkc test examples/users.link
 linkc serve examples/users.link 8787
@@ -60,8 +60,6 @@ client against a real server.
   places where two layers disagree — the checker accepting what the runtime cannot do, the
   documentation describing what the parser rejects. A change is verified when the binary
   ran, not when the code looks right.
-- **Never run `linkc fmt` on files in this repository.** It currently deletes comments and
-  can emit source that no longer parses.
 - **Comments explain why, not what**, and they record decisions and their limits. The
   existing comments are long on purpose; match that, and update them when the code beneath
   them changes.
@@ -142,9 +140,5 @@ test "a created note is listed and is not pinned" {
 
 ## Known broken, do not re-report as new findings
 
-These are known and tracked; check `gh pr list` before starting on any of them.
-
-- `linkc fmt` destroys comments and can emit unparseable source (PR #2).
-- `linkc --help` is rejected as an unknown argument (PR #5).
-- The TypeScript client emitter only covers the first `service` in a file (PR #7).
-- PostgreSQL DDL declares a nullable `T?` column as `JSONB` instead of its native type (PR #3).
+None right now. Check `gh pr list` before reporting a bug — it may already be tracked in
+an open PR. This section stays here as the place to look, and to add to, when something is.

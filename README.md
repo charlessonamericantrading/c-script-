@@ -44,6 +44,7 @@ this section wins. Verified on 2026-08-20 by running the compiler, not by readin
 - Declarative auth: `@authenticated`, `@requires(Role.Admin)`, session tokens from the OS CSPRNG
 - PostgreSQL as the runtime database: `linkc serve app.link 8787 --db postgres://user:pass@host/db` (or `LINK_DATABASE_URL`), with non-destructive auto-migration. Same program, same generated contract — SQLite remains the default
 - Non-JSON responses: `@content_type("text/html; charset=utf-8")` on an rpc returning `String` sends that body verbatim — HTML pages, XML sitemaps, CSV — and stacks with `@requires(Role.Admin)` for pages behind auth
+- `linkc fmt`, `linkc --help`, and the TypeScript client emitter for multi-service files all work correctly now
 - Real password hashing: `crypto.hashPassword` is Argon2id (RFC 9106) with a random per-password salt, in PHC format; `verifyPassword` compares in constant time and still accepts hashes written by the previous version so existing users are not locked out
 - Generated TypeScript contract, typed client, runtime validators, React hooks, Zod schemas, OpenAPI 3.1
 
@@ -54,10 +55,7 @@ this section wins. Verified on 2026-08-20 by running the compiler, not by readin
 | No clean URLs | Routing is always `/Service/rpc` — no path parameters, no custom routes. HTML itself works (see `@content_type`), but a blog at `/blog/my-post` needs a proxy in front. Errors always come back as JSON, so there is no custom 404 page. |
 | No HTML escaping | Pages are built by concatenating `String`; nothing escapes interpolated data for you. |
 | PostgreSQL has no pool, TLS or LISTEN/NOTIFY | The runtime driver works (see below), but it opens a single plain connection and does not reconnect; two server instances against one database do not see each other's writes on `stream`. |
-| `linkc fmt` is unsafe | It deletes comments and can emit source that no longer parses (fix pending in PR #2). |
-| `linkc --help` | Not a recognised argument; run `linkc` with no arguments (fix pending in PR #5). |
-| Multi-service codegen | The TypeScript client emitter only covers the first `service` in a file (fix pending in PR #7). |
-| No published artifacts | There is no GitHub release, no npm package and no Marketplace extension yet — build from source. |
+| No npm package | `link-lang` is not on the npm registry yet. GitHub releases work — see Installation below. |
 | `linkc wasm` | Deliberately frozen at integer/boolean scalar functions; the production path is `wasm32-wasip1`. |
 | The web playground | A static mockup: it does not run the compiler. |
 
@@ -77,9 +75,10 @@ irm https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master
 
 #### 🌐 via NPM / npx
 
-> **Not published yet.** `link-lang` is not on the npm registry, and there is no GitHub
-> release either, so the `curl` and `irm` installers above fall back to building from
-> source. Until the first release is published, this is the supported path:
+> **Not published yet.** `link-lang` is not on the npm registry. Use one of the installers
+> above (they download the real prebuilt binary from
+> [GitHub Releases](https://github.com/charlessonamericantrading/c-script-/releases)), or
+> build from source:
 
 ```bash
 git clone https://github.com/charlessonamericantrading/c-script-.git
