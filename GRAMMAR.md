@@ -62,6 +62,7 @@
   - [3.38 `env`, `request` y `crypto.hmacSha256`: verificar webhooks de terceros — RESUELTO (alcance acotado)](#338-env-request-y-cryptohmacsha256-verificar-webhooks-de-terceros--resuelto-alcance-acotado)
   - [3.39 `@rate_limit("20/1m")`: límite de requests por cliente — RESUELTO (alcance acotado)](#339-rate_limit201m-límite-de-requests-por-cliente--resuelto-alcance-acotado)
   - [3.40 PostgreSQL: TLS y reconexión automática — RESUELTO (alcance acotado)](#340-postgresql-tls-y-reconexión-automática--resuelto-alcance-acotado)
+  - [3.41 CORS configurable y headers de seguridad — RESUELTO (alcance acotado)](#341-cors-configurable-y-headers-de-seguridad--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1950,6 +1951,98 @@ corte falla o no -- es una carrera contra cuándo el cliente interno nota la
 conexión cerrada, y fijar ese detalle habría sido un test frágil por
 diseño; lo que se prueba es la propiedad real: que se recupera solo, en un
 plazo razonable, sin reiniciar el proceso.
+
+---
+
+### 3.41 CORS configurable y headers de seguridad — RESUELTO (alcance acotado)
+
+Última pieza de la misma auditoría que §3.38/§3.39/§3.40. Antes de esta
+ronda, `linkc serve` mandaba `Access-Control-Allow-Origin: *` en TODA
+respuesta, sin forma de acotarlo -- una API con auth Bearer (§3.14) servida
+así deja que CUALQUIER página, de cualquier origen, lea la respuesta de un
+rpc si el navegador de quien la visita ya tiene un token guardado (en
+`localStorage`, por ejemplo) y ese sitio hace el fetch con el header
+`Authorization` puesto. `*` no protege nada ahí: es la sesión del usuario la
+que importa, no la del sitio que hace la request. Tampoco había ningún
+header de seguridad más allá de CORS.
+
+**CORS configurable, opt-in:**
+
+```bash
+linkc serve app.link 8787 --cors-origin https://app.midominio.com --cors-origin https://admin.midominio.com
+LINK_CORS_ORIGINS=https://app.midominio.com,https://admin.midominio.com linkc serve app.link 8787
+```
+
+Sin ninguno de los dos, el default NO cambia: `*`, igual que siempre --
+ningún despliegue existente se rompe por actualizar. Con al menos un origen
+configurado, el servidor pasa a un **allowlist real**: el `Origin` de la
+request entrante se compara EXACTO contra la lista, y
+
+- si matchea, `Access-Control-Allow-Origin` se manda con ESE valor exacto
+  (nunca `*`) más `Vary: Origin` (la respuesta depende de qué origen pidió,
+  así que un cache intermedio no puede servir la respuesta pensada para un
+  origen a otro distinto);
+- si no matchea (o no vino `Origin` en absoluto -- el caso normal de un
+  server-to-server o `curl`), el header se OMITE por completo. La request
+  se procesa igual (200, con la respuesta real) -- CORS lo hace cumplir el
+  NAVEGADOR sobre la respuesta, nunca el servidor rechazando la request; sin
+  el header, el navegador de quien sí lo respeta bloquea que el JavaScript
+  de ese origen lea el body.
+
+`--cors-origin` gana sobre `LINK_CORS_ORIGINS` (mismo criterio de
+precedencia que `--db`/`LINK_DATABASE_URL`, §3.36).
+
+**Headers de seguridad fijos, siempre, en TODA respuesta** (incluidas las de
+error -- un 401/404/429 los necesita igual, y un `stream` SSE también, ver
+abajo):
+
+| Header | Valor | Para qué |
+|---|---|---|
+| `X-Content-Type-Options` | `nosniff` | El navegador no "adivina" el tipo real de un body y lo ejecuta como algo distinto del `Content-Type` declarado. |
+| `X-Frame-Options` | `DENY` | Ninguna respuesta de este servidor se puede embeber en un `<iframe>` de otro sitio -- protección contra clickjacking. |
+| `Referrer-Policy` | `no-referrer` | La URL completa de una request a este servidor (que puede llevar datos en el path o la query) nunca sale en el header `Referer` de un link que salga desde una página servida por acá. |
+
+**Deliberadamente AFUERA de esta ronda, y por qué:**
+
+- **CSP (`Content-Security-Policy`)**: depende del CONTENIDO de cada página
+  -- qué scripts/estilos carga, desde dónde. Un default fijo o rompe páginas
+  legítimas (`@content_type("text/html")`, §3.35) que cargan algo externo, o
+  no protege nada por ser demasiado laxo. Sin una forma de que el programa
+  declare su propia política, un CSP del lado del servidor sería adivinar.
+- **HSTS (`Strict-Transport-Security`)**: solo tiene sentido sobre una
+  conexión que YA es HTTPS -- mandarlo sobre HTTP (que es todo lo que
+  `linkc serve` habla, ver el modelo de despliegue en
+  [`docs/routing.md`](../docs/routing.md)) sería una promesa falsa. Le
+  corresponde a quien SÍ termina TLS -- el reverse proxy (nginx/Caddy) del
+  deploy real, no al proceso c-script.
+- **`Access-Control-Allow-Credentials`**: solo importa para requests que
+  llevan cookies o `credentials: "include"`. La auth de c-script es
+  exclusivamente `Authorization: Bearer` (§3.14, sin `Set-Cookie` en ningún
+  lado del runtime) -- no hay credential ambiente que este header necesite
+  habilitar.
+- **Ningún origen con wildcard parcial** (`https://*.midominio.com`): cada
+  entrada de la allowlist es un match EXACTO, sin patrones. Un subdominio
+  nuevo necesita agregarse a la lista explícitamente.
+
+**Dónde vive el código.** `runtime/server.rs`: `CorsConfig` (la política,
+armada una vez al arrancar) y `CorsHeaders` (ya resuelta para una request
+puntual, contra su `Origin`) son los mismos dos tipos que usan TANTO
+`cors_response_with_type` (la respuesta normal de un rpc, vía el builder de
+`tiny_http`) COMO `sse_preamble` (el header de un `stream`, armado a mano
+byte a byte -- ver §3.13 sobre por qué un `stream` no puede pasar por el
+builder normal). Una sola función resuelve la política por request
+(`CorsConfig::headers_for`); las dos rutas de escritura la consumen igual,
+así que no pueden divergir en qué mandan -- el motivo de siempre (§3.9).
+
+**Verificado** en `compiler/tests/cli_cors.rs` contra un servidor real: el
+default `*` sin romper nada, un origen permitido ecoado exacto con
+`Vary: Origin`, uno no permitido sin el header (pero la request igual
+procesada, 200 con el body real), el preflight `OPTIONS` con el mismo
+criterio, la precedencia `--cors-origin` sobre `LINK_CORS_ORIGINS`, los tres
+headers de seguridad presentes en una respuesta de ERROR (500 por un rpc
+inexistente), y -- el caso que más importaba fijar -- que un `stream` SSE
+respeta la MISMA allowlist que un rpc normal, no la política vieja
+hardcodeada que tenía antes.
 
 ---
 

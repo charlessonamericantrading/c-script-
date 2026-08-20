@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.5.0] - 2026-08-20
+
+### ✨ Nuevo
+- **CORS configurable y headers de seguridad fijos.** `linkc serve` mandaba `Access-Control-Allow-Origin: *` en toda respuesta, sin forma de acotarlo — sobre una API con auth Bearer, cualquier sitio podía leer una respuesta si el navegador de quien lo visita ya tenía el token guardado. `--cors-origin <origen>` (repetible) o `LINK_CORS_ORIGINS` (separados por coma) cambian el default a un allowlist real: el `Origin` de la request se compara exacto, se ecoa literal (nunca `*`) más `Vary: Origin` si matchea, y se omite el header por completo si no — la request se procesa igual, es el navegador quien bloquea la lectura. Sin configurar nada, el comportamiento no cambia. Además, toda respuesta —incluidos errores y un `stream` SSE, que arma su header a mano y antes no pasaba por el mismo camino— lleva ahora `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` y `Referrer-Policy: no-referrer`. CSP y HSTS quedan afuera a propósito (CSP depende del contenido de cada página; HSTS le corresponde al reverse proxy que termina TLS, nunca a `linkc serve`). Detalle completo: GRAMMAR.md §3.41.
+
 ## [1.4.0] - 2026-08-20
 
 ### ✨ Nuevo

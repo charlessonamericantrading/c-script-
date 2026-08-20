@@ -74,7 +74,62 @@ pub enum DbSource {
     Postgres(String),
 }
 
-pub fn serve(program: Program, port: u16, source: DbSource) {
+/// Política de CORS del servidor (GRAMMAR.md §3.41), armada UNA vez al
+/// arrancar (`main.rs::resolve_cors_origins`), nunca por request.
+#[derive(Clone)]
+pub enum CorsConfig {
+    /// Sin `--cors-origin`/`LINK_CORS_ORIGINS`: cualquier origen, el
+    /// comportamiento de siempre (`Access-Control-Allow-Origin: *`) -- no
+    /// romper a nadie que no pida esto explícitamente.
+    Any,
+    /// Con al menos un origen configurado: solo esos, ecoados literal
+    /// (nunca `*`) cuando el `Origin` de la request matchea EXACTO alguno
+    /// de la lista.
+    Allowlist(Vec<String>),
+}
+
+/// Los headers de CORS ya resueltos para UNA request particular -- se
+/// computa una sola vez por request (`CorsConfig::headers_for`, con el
+/// `Origin` que mandó el cliente) y se reusa en la respuesta que sea que
+/// termine mandándose, incluida la de un `stream` SSE (`write_stream`/
+/// `write_live_stream`, más abajo, que arman su header a mano).
+#[derive(Clone)]
+struct CorsHeaders {
+    /// El valor para `Access-Control-Allow-Origin`, si corresponde
+    /// mandarlo. `None` -- nunca un string vacío -- es la señal de "no
+    /// mandes el header": con un allowlist configurado y un origen que no
+    /// matchea, omitir el header es lo que hace que el navegador rechace
+    /// la respuesta: exactamente el comportamiento que un allowlist tiene
+    /// que dar.
+    allow_origin: Option<String>,
+    /// Si además hay que mandar `Vary: Origin` -- correcto solo cuando la
+    /// respuesta depende de qué origen pidió (el caso `Allowlist`); con
+    /// `*` la respuesta es la misma para cualquiera, así que `Vary` no
+    /// aporta nada y no se manda.
+    vary_origin: bool,
+}
+
+impl CorsConfig {
+    fn headers_for(&self, request_origin: Option<&str>) -> CorsHeaders {
+        // Defensa en profundidad: un `Origin` de verdad, parseado por
+        // tiny_http, nunca puede traer CR/LF (el parser de líneas HTTP se
+        // lo impide antes de que este código lo vea) -- pero `write_stream`/
+        // `write_live_stream` interpolan este valor en un header armado a
+        // mano, sin pasar por `tiny_http::Header::from_bytes` (que sí
+        // valida esto), así que no vale la pena depender solo de esa
+        // garantía ajena.
+        let request_origin = request_origin.filter(|o| !o.contains(['\r', '\n']));
+        match self {
+            CorsConfig::Any => CorsHeaders { allow_origin: Some("*".to_string()), vary_origin: false },
+            CorsConfig::Allowlist(list) => {
+                let matched = request_origin.filter(|o| list.iter().any(|a| a == o)).map(str::to_string);
+                CorsHeaders { allow_origin: matched, vary_origin: true }
+            }
+        }
+    }
+}
+
+pub fn serve(program: Program, port: u16, source: DbSource, cors: CorsConfig) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
@@ -117,8 +172,17 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
     println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     for mut request in server.incoming_requests() {
+        // Resuelto UNA vez por request, antes de cualquier otra cosa --
+        // hasta el preflight OPTIONS lo necesita (GRAMMAR.md §3.41).
+        let request_origin = request
+            .headers()
+            .iter()
+            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Origin"))
+            .map(|h| h.value.as_str().to_string());
+        let cors_headers = cors.headers_for(request_origin.as_deref());
+
         if *request.method() == tiny_http::Method::Options {
-            let _ = request.respond(cors_response(204, String::new()));
+            let _ = request.respond(cors_response(204, String::new(), &cors_headers));
             continue;
         }
 
@@ -159,7 +223,7 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
                 "services": services
             })
             .to_string();
-            let _ = request.respond(cors_response(200, health_json));
+            let _ = request.respond(cors_response(200, health_json, &cors_headers));
             log_done(req_id, Some("health"), 200, start, "");
             continue;
         }
@@ -167,12 +231,12 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
         let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, &route_table) {
             Ok(resolved) => resolved,
             Err(None) => {
-                let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method")));
+                let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method"), &cors_headers));
                 log_done(req_id, None, 404, start, "");
                 continue;
             }
             Err(Some(msg)) => {
-                let _ = request.respond(cors_response(400, error_json(&msg)));
+                let _ = request.respond(cors_response(400, error_json(&msg), &cors_headers));
                 log_done(req_id, None, 400, start, &format!("error={msg:?}"));
                 continue;
             }
@@ -189,7 +253,7 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
                 .expect("check_rate_limit_annotation (checker.rs) ya validó este formato en compilación");
             let client_ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "desconocida".to_string());
             if !rate_limiter.check(&client_ip, service_name, rpc_name, spec) {
-                let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento")));
+                let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
                 log_done(req_id, Some(&method), 429, start, "");
                 continue;
             }
@@ -202,7 +266,7 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
         // pruebe estar autorizado (GRAMMAR.md §3.14).
         let token = extract_bearer_token(&request);
         if let Err((status, msg)) = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name) {
-            let _ = request.respond(cors_response(status, error_json(msg)));
+            let _ = request.respond(cors_response(status, error_json(msg), &cors_headers));
             log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
             continue;
         }
@@ -218,12 +282,13 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
             if let Some(collection) = live_subscribe_collection(&program, service_name, rpc_name) {
                 match db.subscribe(collection) {
                     Ok((snapshot, events)) => {
-                        std::thread::spawn(move || write_live_stream(request, snapshot, events, req_id, method, start));
+                        let cors_headers = cors_headers.clone();
+                        std::thread::spawn(move || write_live_stream(request, snapshot, events, cors_headers, req_id, method, start));
                     }
                     Err(e) => {
                         let status = status_for(&e);
                         let msg = e.to_string();
-                        let _ = request.respond(cors_response(status, error_json(&msg)));
+                        let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
                         log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
                     }
                 }
@@ -246,12 +311,12 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
                 Err(e) => {
                     let status = status_for(&e);
                     let msg = e.to_string();
-                    let _ = request.respond(cors_response(status, error_json(&msg)));
+                    let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
                     log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
                     continue;
                 }
             };
-            std::thread::spawn(move || write_stream(request, elements, req_id, method, start));
+            std::thread::spawn(move || write_stream(request, elements, cors_headers, req_id, method, start));
             continue;
         }
 
@@ -272,7 +337,7 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
         } else {
             String::new()
         };
-        let _ = request.respond(cors_response_with_type(status, response_body, &response_type));
+        let _ = request.respond(cors_response_with_type(status, response_body, &response_type, &cors_headers));
         log_done(req_id, Some(&method), status, start, &extra);
         // Defensa en profundidad, no carga estructural: el `set_request_context`
         // de arriba ya garantiza que la PRÓXIMA request nunca ve el contexto de
@@ -571,7 +636,37 @@ fn status_for(e: &super::RuntimeError) -> u16 {
 /// push real reconocido por `live_subscribe_collection` -- ver
 /// `write_live_stream`, más abajo, para el caso que sí anuncia eventos
 /// futuros de verdad.
-fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, req_id: u64, method: String, start: std::time::Instant) {
+/// El preámbulo HTTP de una respuesta SSE, armado a mano (ver el comentario
+/// de `write_stream` sobre por qué no `tiny_http::Response`). Comparte los
+/// mismos headers de CORS y de seguridad que cualquier otra respuesta del
+/// servidor (`cors_response_with_type`, más abajo) -- separado en su propia
+/// función para que las dos NO diverjan en qué headers mandan (GRAMMAR.md
+/// §3.9), ya que acá no hay forma de reusar el builder de `tiny_http` que sí
+/// usa el resto del servidor.
+fn sse_preamble(cors: &CorsHeaders) -> String {
+    let mut header = String::from(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n",
+    );
+    if let Some(origin) = &cors.allow_origin {
+        header.push_str("Access-Control-Allow-Origin: ");
+        header.push_str(origin);
+        header.push_str("\r\n");
+        if cors.vary_origin {
+            header.push_str("Vary: Origin\r\n");
+        }
+    }
+    header.push_str("X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n\r\n");
+    header
+}
+
+fn write_stream(
+    request: tiny_http::Request,
+    elements: Vec<serde_json::Value>,
+    cors: CorsHeaders,
+    req_id: u64,
+    method: String,
+    start: std::time::Instant,
+) {
     // Escrito a mano en vez de tiny_http::Response + request.respond(): ese
     // camino sólo llama flush() UNA vez, al final (request.rs::respond_impl),
     // sobre un BufWriter::with_capacity(1024, ...) (client.rs) que envuelve
@@ -597,8 +692,8 @@ fn write_stream(request: tiny_http::Request, elements: Vec<serde_json::Value>, r
     // fin de body bajo HTTP/1.1. Chunked es la señal que todo cliente
     // HTTP/1.1 (fetch, curl, EventSource) sabe reconocer sin ambigüedad.
     let mut writer = request.into_writer();
-    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
-    if writer.write_all(header).is_err() {
+    let header = sse_preamble(&cors);
+    if writer.write_all(header.as_bytes()).is_err() {
         log_done(req_id, Some(&method), 0, start, "client_disconnected=true stage=before_first_byte");
         return;
     }
@@ -659,13 +754,14 @@ fn write_live_stream(
     request: tiny_http::Request,
     snapshot: Vec<serde_json::Value>,
     events: Receiver<serde_json::Value>,
+    cors: CorsHeaders,
     req_id: u64,
     method: String,
     start: std::time::Instant,
 ) {
     let mut writer = request.into_writer();
-    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
-    if writer.write_all(header).is_err() {
+    let header = sse_preamble(&cors);
+    if writer.write_all(header.as_bytes()).is_err() {
         log_done(req_id, Some(&method), 0, start, "client_disconnected=true stage=before_first_byte");
         return;
     }
@@ -714,38 +810,74 @@ fn error_json(message: &str) -> String {
 
 const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
-fn cors_response(status: u16, body: String) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    cors_response_with_type(status, body, JSON_CONTENT_TYPE)
+fn cors_response(status: u16, body: String, cors: &CorsHeaders) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    cors_response_with_type(status, body, JSON_CONTENT_TYPE, cors)
 }
 
 /// Igual que `cors_response` pero con el Content-Type que pidió el rpc
 /// (GRAMMAR.md §3.35). Un valor que no sea un header HTTP válido cae de vuelta
 /// a JSON en vez de tirar el servidor: el checker ya rechaza el string vacío,
 /// pero esto no puede validar todo el universo de tipos MIME.
+///
+/// CORS y los headers de seguridad de acá abajo (GRAMMAR.md §3.41) van en
+/// TODA respuesta, sin excepción -- incluidas las de error: un 401/404/429
+/// también necesita `Access-Control-Allow-Origin` para que el browser deje
+/// que el cliente generado LEA ese error en vez de reportar un fallo de red
+/// genérico sin mensaje.
 fn cors_response_with_type(
     status: u16,
     body: String,
     content_type_value: &str,
+    cors: &CorsHeaders,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type_value.as_bytes())
         .unwrap_or_else(|_| {
             tiny_http::Header::from_bytes(&b"Content-Type"[..], JSON_CONTENT_TYPE.as_bytes()).unwrap()
         });
-    let allow_origin = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
-    let allow_methods =
-        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, GET, OPTIONS"[..]).unwrap();
-    // "Authorization" agregado para auth v0 (GRAMMAR.md §3.14): sin esto,
-    // cualquier browser real rechaza el preflight OPTIONS apenas el cliente
-    // generado manda ese header (ver push_fetch_call en ts_emit.rs), y la
-    // request real nunca llega a salir -- ni siquiera es que el servidor la
-    // rechace, el propio browser la bloquea antes de intentarla.
-    let allow_headers =
-        tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, Authorization"[..])
-            .unwrap();
-    tiny_http::Response::from_string(body)
-        .with_status_code(status)
-        .with_header(content_type)
-        .with_header(allow_origin)
-        .with_header(allow_methods)
-        .with_header(allow_headers)
+    let mut response = tiny_http::Response::from_string(body).with_status_code(status).with_header(content_type);
+
+    if let Some(origin) = &cors.allow_origin {
+        // `.unwrap_or` en vez de `.unwrap()`: a diferencia de los headers de
+        // abajo (valores constantes, siempre válidos), este es un `Origin`
+        // que en el caso `Allowlist` viene de la request -- `headers_for`
+        // ya lo filtró contra CR/LF, pero no vale la pena que una entrada
+        // rara tire el proceso entero por un `unwrap()` en el hilo principal
+        // del accept-loop.
+        if let Ok(allow_origin) = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], origin.as_bytes()) {
+            response = response.with_header(allow_origin);
+            let allow_methods =
+                tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, GET, OPTIONS"[..]).unwrap();
+            // "Authorization" agregado para auth v0 (GRAMMAR.md §3.14): sin
+            // esto, cualquier browser real rechaza el preflight OPTIONS
+            // apenas el cliente generado manda ese header (ver
+            // push_fetch_call en ts_emit.rs), y la request real nunca llega
+            // a salir -- ni siquiera es que el servidor la rechace, el
+            // propio browser la bloquea antes de intentarla.
+            let allow_headers =
+                tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, Authorization"[..])
+                    .unwrap();
+            response = response.with_header(allow_methods).with_header(allow_headers);
+            if cors.vary_origin {
+                let vary = tiny_http::Header::from_bytes(&b"Vary"[..], &b"Origin"[..]).unwrap();
+                response = response.with_header(vary);
+            }
+        }
+    }
+
+    // Headers de seguridad fijos (GRAMMAR.md §3.41) -- en TODA respuesta,
+    // sin depender de `@content_type` ni de si el rpc devuelve HTML:
+    //  - `nosniff`: un browser no debe "adivinar" el tipo de un body y
+    //    ejecutarlo como algo distinto de lo que dice el Content-Type real.
+    //  - `X-Frame-Options: DENY`: ninguna respuesta de este servidor se
+    //    puede embeber en un <iframe> de otro sitio (protección clickjacking).
+    //  - `Referrer-Policy: no-referrer`: la URL completa de una request a
+    //    este servidor (que puede tener datos sensibles en el path o query)
+    //    nunca sale en el header `Referer` de un link que salga desde acá.
+    // CSP y HSTS quedan afuera a propósito -- ver GRAMMAR.md §3.41 para el
+    // porqué (CSP depende del contenido de cada página; HSTS le corresponde
+    // a quien termina TLS, que no es `linkc serve`).
+    let nosniff = tiny_http::Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap();
+    let frame_options = tiny_http::Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap();
+    let referrer_policy = tiny_http::Header::from_bytes(&b"Referrer-Policy"[..], &b"no-referrer"[..]).unwrap();
+    response.with_header(nosniff).with_header(frame_options).with_header(referrer_policy)
 }

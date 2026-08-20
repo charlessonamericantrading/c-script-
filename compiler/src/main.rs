@@ -123,7 +123,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
 }
 
@@ -830,7 +830,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>]");
+        eprintln!("uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--cors-origin <origen>]");
         return ExitCode::FAILURE;
     };
     let Ok(port) = port_str.parse::<u16>() else {
@@ -846,13 +846,56 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
 
+    let cors = match resolve_cors_origins(args) {
+        Ok(origins) => match origins {
+            Some(list) => runtime::server::CorsConfig::Allowlist(list),
+            None => runtime::server::CorsConfig::Any,
+        },
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    runtime::server::serve(program, port, source);
+    runtime::server::serve(program, port, source, cors);
     ExitCode::SUCCESS
+}
+
+/// Qué orígenes puede pedir CORS, en orden de precedencia (mismo criterio
+/// que `resolve_db_source`, arriba):
+///
+/// 1. `--cors-origin <origen>`, repetible -- una vez por origen permitido.
+/// 2. La variable de entorno `LINK_CORS_ORIGINS`, orígenes separados por
+///    coma (para un contenedor, donde no siempre se controla el comando).
+/// 3. Ninguno de los dos: `None`, que sigue significando "cualquier
+///    origen" -- el comportamiento de siempre, sin romper a nadie que no
+///    pida esto explícitamente (GRAMMAR.md §3.41).
+fn resolve_cors_origins(args: &[String]) -> Result<Option<Vec<String>>, String> {
+    let mut from_flags: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--cors-origin" {
+            match args.get(i + 1) {
+                Some(v) => from_flags.push(v.clone()),
+                None => return Err("uso: --cors-origin <origen> (falta el valor)".to_string()),
+            }
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    if !from_flags.is_empty() {
+        return Ok(Some(from_flags));
+    }
+    Ok(std::env::var("LINK_CORS_ORIGINS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()))
 }
 
 /// De dónde saca los datos `linkc serve`, en orden de precedencia:
