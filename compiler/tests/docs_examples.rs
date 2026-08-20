@@ -41,6 +41,7 @@ const DOCS: &[&str] = &[
     "docs/architecture.md",
     "CONTRIBUTING.md",
     "AGENTS.md",
+    "CLAUDE.md",
     // La especificación también: sus ejemplos son los que alguien lee cuando
     // quiere el detalle exacto de una feature, y no tienen por qué estar
     // menos verificados que los del README.

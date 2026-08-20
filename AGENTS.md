@@ -34,6 +34,7 @@ is `linkc`. They are one project.
 | `examples/users.link` | The reference program. CI compiles it, snapshots its contract, serves it and drives it from a real client |
 | `GRAMMAR.md` | The specification, and the honest limits of every feature. Has a table of contents |
 | `llms.txt` | Condensed language reference plus the mistakes LLMs make. Read it before writing `.link` code |
+| `CLAUDE.md` | What Claude Code auto-loads on open. A thin pointer into this file — keep it short, don't duplicate |
 
 ## Build, test, run
 
