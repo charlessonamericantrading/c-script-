@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-521-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.5.0-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-528-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.6.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,7 +36,7 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 20/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 521 pruebas automáticas:
+**Funciona hoy**, cubierto por 528 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - SQLite embebido con persistencia real entre reinicios y auto-migraciones no destructivas
@@ -44,7 +44,7 @@ gana esta. Verificado el 20/08/2026 corriendo el compilador, no leyéndolo.
 - Auth declarativa: `@authenticated`, `@requires(Role.Admin)`, tokens de sesión desde el CSPRNG del sistema
 - PostgreSQL como base de runtime: `linkc serve app.link 8787 --db postgres://usuario:clave@host/base` (o `LINK_DATABASE_URL`), con auto-migración no destructiva, TLS oportunista (rustls puro, sin OpenSSL -- conecta contra proveedores administrados como Supabase/Neon/RDS que lo exigen) y reconexión automática tras una conexión cortada. El mismo programa, el mismo contrato generado — SQLite sigue siendo el default
 - Respuestas que no son JSON: `@content_type("text/html; charset=utf-8")` sobre un rpc que devuelve `String` manda ese cuerpo tal cual — páginas HTML, sitemaps XML, CSV — y se combina con `@requires(Role.Admin)` para páginas detrás de auth
-- URLs amigables: `@route("/blog/:slug")` le da a un rpc una URL limpia y rastreable por GET, además de (nunca en vez de) su dirección normal `/Servicio/rpc` — el cliente generado sigue usando esta última
+- URLs amigables: `@route("/blog/:slug")` le da a un rpc una URL limpia y rastreable por GET, además de (nunca en vez de) su dirección normal `/Servicio/rpc` — el cliente generado sigue usando esta última. Cualquier cantidad de segmentos `:parámetro`, en cualquier posición (`/blog/:categoria/:slug`), bindeados por nombre; una ruta más específica (más segmentos fijos) le gana determinísticamente a una totalmente dinámica que también matchearía
 - Verificar webhooks de terceros: `env.get(name)`, `request.rawBody()` / `request.header(name)` y `crypto.hmacSha256(secret, message)` le dan a un rpc todo lo necesario para chequear la firma de un callback de Stripe/GitHub/etc. antes de confiar en él
 - Límite de requests por cliente: `@rate_limit("20/1m")` acota un rpc a N requests por ventana de tiempo, por `(ip del cliente, servicio, rpc)`, con 429 al exceder — token bucket con refill continuo
 - CORS configurable y headers de seguridad fijos: `--cors-origin <origen>` (repetible, o `LINK_CORS_ORIGINS`) pasa del `*` abierto a un allowlist real (match exacto, ecoado literal + `Vary: Origin`); toda respuesta -- incluidos errores y un `stream` SSE -- lleva `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`
@@ -56,7 +56,6 @@ gana esta. Verificado el 20/08/2026 corriendo el compilador, no leyéndolo.
 
 | Límite | Detalle |
 |---|---|
-| Sin rutas multi-parámetro | `@route` soporta como mucho un segmento dinámico, y tiene que ser el último — `/blog/:categoria/:slug` se rechaza. Por ahora, modelá eso como rpc separados. |
 | Sin página 404 propia | Los errores siempre vuelven en JSON, incluso en una `@route` de HTML, así que no hay forma de renderizar una página de error propia. |
 | Sin escapado de HTML | Las páginas se arman concatenando `String`; nada escapa por vos los datos que interpolás. |
 | PostgreSQL sin LISTEN/NOTIFY | Dos instancias del servidor contra la misma base no ven las escrituras de la otra en un `stream`. (TLS y reconexión automática tras una conexión cortada ya están soportados -- ver arriba; un pool de conexiones no aporta nada acá, porque el intérprete es single-threaded y solo corre una query a la vez.) |
@@ -231,7 +230,7 @@ Link incluye de forma nativa todas las herramientas que necesitas:
 
 ## 🧪 Pruebas y Control de Calidad
 
-El compilador y el runtime de Link están verificados por **521 pruebas automáticas** unitarias,
+El compilador y el runtime de Link están verificados por **528 pruebas automáticas** unitarias,
 de integración y de CLI, incluidas pruebas que levantan el binario real como subproceso, manejan
 un servidor HTTP real, y compilan cada ejemplo de c-script publicado en la documentación de este repo:
 

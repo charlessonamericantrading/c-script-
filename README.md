@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-521-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.5.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-528-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.6.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,7 +36,7 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-20 by running the compiler, not by reading it.
 
-**Works today**, covered by 521 automated tests:
+**Works today**, covered by 528 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
@@ -44,7 +44,7 @@ this section wins. Verified on 2026-08-20 by running the compiler, not by readin
 - Declarative auth: `@authenticated`, `@requires(Role.Admin)`, session tokens from the OS CSPRNG
 - PostgreSQL as the runtime database: `linkc serve app.link 8787 --db postgres://user:pass@host/db` (or `LINK_DATABASE_URL`), with non-destructive auto-migration, opportunistic TLS (pure-rustls, no OpenSSL — connects to managed providers like Supabase/Neon/RDS that require it), and automatic reconnection after a dropped connection. Same program, same generated contract — SQLite remains the default
 - Non-JSON responses: `@content_type("text/html; charset=utf-8")` on an rpc returning `String` sends that body verbatim — HTML pages, XML sitemaps, CSV — and stacks with `@requires(Role.Admin)` for pages behind auth
-- Friendly URLs: `@route("/blog/:slug")` gives an rpc a clean, crawlable GET path alongside (never instead of) its normal `/Service/rpc` address — the generated client keeps using the latter
+- Friendly URLs: `@route("/blog/:slug")` gives an rpc a clean, crawlable GET path alongside (never instead of) its normal `/Service/rpc` address — the generated client keeps using the latter. Any number of `:param` segments, in any position (`/blog/:category/:slug`), bound by name; a more specific route (more fixed segments) deterministically wins over a fully dynamic one that would also match
 - Verifying third-party webhooks: `env.get(name)`, `request.rawBody()` / `request.header(name)`, and `crypto.hmacSha256(secret, message)` give an rpc everything it needs to check a Stripe/GitHub/etc. signature before trusting a callback
 - Per-client rate limiting: `@rate_limit("20/1m")` caps an rpc to N requests per time window per `(client IP, service, rpc)`, 429 on exceeding, token bucket with continuous refill
 - Configurable CORS and fixed security headers: `--cors-origin <origin>` (repeatable, or `LINK_CORS_ORIGINS`) switches from open `*` to a real allowlist (exact match, echoed literal + `Vary: Origin`); every response — including errors and `stream` SSE — carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`
@@ -56,7 +56,6 @@ this section wins. Verified on 2026-08-20 by running the compiler, not by readin
 
 | Limitation | Detail |
 |---|---|
-| No multi-parameter routes | `@route` supports at most one dynamic segment, and it has to be the last one — `/blog/:category/:slug` is rejected. Model that as separate rpcs for now. |
 | No custom 404 page | Errors always come back as JSON, even for an HTML `@route`, so there is no way to render a branded error page. |
 | No HTML escaping | Pages are built by concatenating `String`; nothing escapes interpolated data for you. |
 | PostgreSQL has no LISTEN/NOTIFY | Two server instances against one database do not see each other's writes on `stream`. (TLS and automatic reconnection on a dropped connection are now supported — see below; a connection pool isn't meaningful here since the interpreter is single-threaded and only ever runs one query at a time.) |
@@ -234,7 +233,7 @@ Link comes out-of-the-box with all the developer tooling you need:
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **521 automated unit, integration and CLI tests**, including tests that
+Link is verified by **528 automated unit, integration and CLI tests**, including tests that
 spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
 example published in this repository's documentation:
 

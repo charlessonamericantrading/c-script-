@@ -63,6 +63,7 @@
   - [3.39 `@rate_limit("20/1m")`: límite de requests por cliente — RESUELTO (alcance acotado)](#339-rate_limit201m-límite-de-requests-por-cliente--resuelto-alcance-acotado)
   - [3.40 PostgreSQL: TLS y reconexión automática — RESUELTO (alcance acotado)](#340-postgresql-tls-y-reconexión-automática--resuelto-alcance-acotado)
   - [3.41 CORS configurable y headers de seguridad — RESUELTO (alcance acotado)](#341-cors-configurable-y-headers-de-seguridad--resuelto-alcance-acotado)
+  - [3.42 `@route` con múltiples parámetros — RESUELTO (alcance acotado)](#342-route-con-múltiples-parámetros--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1631,7 +1632,9 @@ implementan la misma regla por separado, y divergen).
   `/blog/:categoria/:slug` (dos parámetros) no está soportado -- resolver
   ambigüedad entre patrones con MÁS de un segmento dinámico es una extensión
   real, no una línea de más. El caso que motivó esto (una URL humana por
-  página de contenido SEO) no lo necesita.
+  página de contenido SEO) no lo necesita. **Resuelto en §3.42**: cualquier
+  cantidad de parámetros, en cualquier posición, con detección de conflictos
+  generalizada.
 - **Sin query string ni body en un rpc con `@route`.** Todos sus parámetros
   tienen que salir del path. Si hace falta más información, se resuelve con
   otro rpc aparte (sin `@route`), llamado desde el cliente normal.
@@ -2043,6 +2046,97 @@ headers de seguridad presentes en una respuesta de ERROR (500 por un rpc
 inexistente), y -- el caso que más importaba fijar -- que un `stream` SSE
 respeta la MISMA allowlist que un rpc normal, no la política vieja
 hardcodeada que tenía antes.
+
+---
+
+### 3.42 `@route` con múltiples parámetros — RESUELTO (alcance acotado)
+
+§3.37 dejó un límite explícito, documentado como "extensión real, no una
+línea de más": como mucho UN segmento dinámico por ruta, y tenía que ser el
+ÚLTIMO -- `/blog/:categoria/:slug` (dos parámetros) no estaba soportado.
+Auditoría del 20/08/2026: esa extensión.
+
+**Lo que hay ahora:**
+
+```
+@route("/blog/:categoria/:slug")
+rpc page(slug: String, categoria: String) -> String { ... }
+```
+
+Cualquier cantidad de segmentos `:nombre`, en CUALQUIER posición -- no
+tienen que ser los últimos, ni ir todos juntos. El binding entre la ruta y
+los parámetros del rpc es por NOMBRE, no por posición: `page` arriba declara
+`slug` antes que `categoria` en su firma, en el orden contrario al de la
+ruta, y funciona igual -- lo único que importa es que el CONJUNTO de nombres
+coincida exacto (ni de más, ni de menos), mismo criterio que ya valía para
+el caso de un solo parámetro.
+
+**Precedencia, generalizada.** El criterio de siempre ("una ruta literal le
+gana a una dinámica que también matchearía", §3.37) se generaliza a
+**especificidad**: cuenta cuántos segmentos de cada ruta son literales
+fijos, y la que tiene MÁS gana, determinísticamente, cuando las dos podrían
+matchear el mismo path real. `/blog/featured/:slug` (1 literal) le gana a
+`/blog/:categoria/:slug` (0 literales) para el path `/blog/featured/algo`.
+
+**Conflictos, generalizados -- el caso que de verdad ameritaba pensarlo con
+cuidado.** No alcanza con comparar la FORMA exacta de dos rutas (lo que
+hacía §3.37: mismos segmentos literales, y las dos terminan en parámetro o
+las dos no). Con múltiples parámetros en distintas posiciones, dos rutas de
+forma DISTINTA pueden igual matchear el mismo path real sin que ninguna sea
+más específica:
+
+```
+@route("/blog/:categoria/latest")   // 1 literal (posición 1)
+@route("/blog/featured/:slug")      // 1 literal (posición 0)
+```
+
+Ninguna tiene la misma forma que la otra (en la posición 0 una es parámetro
+y la otra literal, y viceversa en la 1), pero las dos matchean
+`/blog/featured/latest` -- y las dos tienen exactamente UN segmento
+literal, así que ninguna es más específica. Eso es un conflicto real, y el
+checker lo rechaza, aunque las dos formas sean técnicamente distintas.
+
+La regla exacta (`RoutePattern::conflicts_with`, `compiler/src/route.rs`):
+dos rutas del mismo largo conflictúan si (a) podrían matchear el mismo path
+-- no hay ninguna posición donde las dos sean literales con texto DISTINTO,
+lo único que prueba que nunca se cruzan -- Y (b) tienen la misma
+especificidad (mismo número de segmentos literales). Si difieren en
+especificidad, no es un conflicto: la más específica gana sola, sin
+ambigüedad.
+
+**Nombres de parámetro repetidos dentro de la MISMA ruta** (`/:slug/comentarios/:slug`)
+se rechazan al parsear: un valor capturado no puede bindear a dos lugares
+distintos del rpc a la vez sin que uno de los dos gane arbitrariamente.
+
+**Dónde vive el código.** Todo en `compiler/src/route.rs` -- el mismo módulo
+compartido de siempre entre checker (`check_route_conflicts`,
+`check_route_annotation`) y runtime (`build_route_table`/`resolve_route` en
+`runtime/server.rs`). La tabla de rutas se ordena UNA vez, al arrancar, por
+especificidad descendente; `resolve_route` hace una sola pasada y se queda
+con el primer match -- que por construcción es el más específico, porque el
+checker ya garantizó que nunca hay dos entradas empatadas que puedan
+matchear el mismo path real.
+
+**Límites honestos de esta ronda:**
+
+- **Sigue sin query string ni body en un rpc con `@route`.** Todos sus
+  parámetros tienen que salir del path -- mismo límite que §3.37, sin
+  cambios.
+- **Sin segmentos "catch-all"** (`/docs/:resto*`, capturando el resto del
+  path como un solo valor). Cada `:nombre` es exactamente un segmento.
+- **La detección de conflictos es conservadora, no exhaustiva sobre
+  TODAS las combinaciones posibles de valores.** Rechaza cualquier PAR de
+  rutas que estructuralmente podrían cruzarse (aunque en la práctica el
+  programa nunca reciba ese path exacto) -- puede rechazar una combinación
+  que en los hechos nunca iba a pasar, a cambio de la garantía más fuerte
+  de nunca dejar pasar una ambigüedad real sin avisar.
+
+**Verificado** en `compiler/src/route.rs` (unit tests del parser, de
+`conflicts_with` con el caso de conflicto cruzado de arriba, y del binding
+de múltiples valores en el orden correcto) y en `compiler/tests/cli_route.rs`
+contra un servidor real: una ruta de dos parámetros bindeando por nombre
+en un orden distinto al de la firma del rpc, y una ruta con un segmento
+literal ganándole a una totalmente dinámica del mismo largo.
 
 ---
 

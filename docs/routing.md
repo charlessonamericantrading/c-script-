@@ -22,6 +22,14 @@ service Blog {
     "<!doctype html><h1>" + slug + "</h1>"
   }
 
+  // Más de un parámetro, en cualquier posición (GRAMMAR.md §3.42) -- se
+  // bindean por NOMBRE, no por el orden en que aparecen en la ruta.
+  @content_type("text/html; charset=utf-8")
+  @route("/blog/:categoria/:slug")
+  rpc pageInCategory(slug: String, categoria: String) -> String {
+    "<!doctype html><h1>" + categoria + "/" + slug + "</h1>"
+  }
+
   rpc create(slug: String, title: String, body: String) -> Post {
     db.posts.insert(NewPost { slug: slug, title: title, body: body })
   }
@@ -29,20 +37,24 @@ service Blog {
 
 test "la pagina se arma como String" {
   assert(Blog.page("hola-mundo").contains("hola-mundo"));
+  assert(Blog.pageInCategory("hola-mundo", "rust").contains("rust/hola-mundo"));
 }
 ```
 
 `GET /blog/hola-mundo` invoca `Blog.page("hola-mundo")` sin body, como manda
-cualquier crawler. Referencia completa, reglas de forma y límites:
-[GRAMMAR.md §3.37](../GRAMMAR.md#337-routeblogslug-urls-amigables-para-seo--resuelto-alcance-acotado).
+cualquier crawler; `GET /blog/rust/hola-mundo` invoca
+`Blog.pageInCategory("hola-mundo", "rust")` igual. Referencia completa,
+reglas de forma y límites:
+[GRAMMAR.md §3.37](../GRAMMAR.md#337-routeblogslug-urls-amigables-para-seo--resuelto-alcance-acotado)
+y [§3.42](../GRAMMAR.md#342-route-con-múltiples-parámetros--resuelto-alcance-acotado).
 
 **Cuándo alcanza:** una URL humana por página (blog, ficha de producto,
-`sitemap.xml`), un solo parámetro tomado del path. Es el caso que cubre la
-enorme mayoría de contenido pensado para SEO.
+`sitemap.xml`), con cualquier cantidad de parámetros tomados del path, en
+cualquier posición (`/blog/:categoria/:slug`, GRAMMAR.md §3.42). Es el caso
+que cubre la enorme mayoría de contenido pensado para SEO.
 
-**Cuándo NO alcanza (v0, a propósito):**
+**Cuándo NO alcanza (a propósito):**
 
-- Más de un segmento dinámico (`/blog/:categoria/:slug`).
 - Una página de error 404 propia -- los errores de c-script siempre son JSON.
 - Servir archivos estáticos de verdad (imágenes, CSS) -- eso nunca fue el
   trabajo de `linkc serve`.
@@ -62,10 +74,11 @@ existe -- sigue viendo requests normales a `/Servicio/rpc` (o a una
 
 ### Ejemplo: nginx
 
-Sirve estáticos directo desde disco, reescribe `/blog/:categoria/:slug`
-(el caso de dos parámetros que `@route` todavía no soporta) hacia un rpc
-que los toma como querystring, y muestra una página 404 propia en vez del
-JSON de error de c-script.
+Sirve estáticos directo desde disco y muestra una página 404 propia en vez
+del JSON de error de c-script -- lo que `@route` sigue sin cubrir, aunque ya
+soporte cualquier cantidad de parámetros en cualquier posición
+(`/blog/:categoria/:slug` funciona tal cual dentro del `.link`, sin
+necesitar el proxy para eso, GRAMMAR.md §3.42).
 
 ```nginx
 server {
@@ -78,21 +91,9 @@ server {
         expires 30d;
     }
 
-    # /blog/tecnologia/mi-post -> POST /Blog/pageByCategory
-    # con {"categoria":"tecnologia","slug":"mi-post"} en el body.
-    location ~ ^/blog/([^/]+)/([^/]+)$ {
-        proxy_pass http://127.0.0.1:8787/Blog/pageByCategory;
-        proxy_method POST;
-        proxy_set_header Content-Type "application/json";
-        # nginx no arma JSON solo -- esto necesita el módulo
-        # `njs`/`lua`, o resolverlo en un rpc con @route de un solo
-        # parámetro y un segundo lookup adentro de c-script. La otra
-        # opción, más simple, es exponer /blog/:categoria/:slug tal cual
-        # como un @route de UN parámetro (`categoriaYSlug`) y separar los
-        # dos campos adentro del propio rpc con `.split("/")`.
-    }
-
-    # Cualquier otra cosa: al servidor c-script tal cual.
+    # Cualquier otra cosa: al servidor c-script tal cual (incluida
+    # /blog/:categoria/:slug, que ya resuelve `@route` sin intervención
+    # del proxy).
     location / {
         proxy_pass http://127.0.0.1:8787;
         proxy_set_header Host $host;
@@ -135,9 +136,10 @@ miapp.com {
 
 ### El límite real de este camino
 
-El proxy resuelve el ruteo y los estáticos, pero la LÓGICA sigue viviendo
-en c-script -- un rpc con dos parámetros (`categoria`, `slug`) todavía tiene
-que existir, tomando ambos valores como argumentos normales. Lo único que
-cambia es de dónde vienen esos valores: de un `@route` de un solo segmento,
-o de la reescritura que hizo el proxy antes de que la request llegue a
-`linkc serve`.
+El proxy resuelve estáticos y una 404 propia, pero la LÓGICA sigue viviendo
+en c-script -- el rpc que sirve una página sigue siendo un rpc normal,
+declarado con `@route` (§3.42 ya cubre cualquier cantidad de parámetros, en
+cualquier posición, así que el proxy no necesita reescribir nada para eso).
+Lo que el proxy sigue resolviendo, y `@route` no: estáticos de verdad
+(imágenes, CSS, JS) servidos directo desde disco, sin pasar por `linkc
+serve`, y una página de error propia en vez del JSON de siempre.

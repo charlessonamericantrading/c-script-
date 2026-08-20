@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.6.0] - 2026-08-20
+
+### ✨ Nuevo
+- **`@route` con múltiples parámetros, en cualquier posición.** v0 (v1.2.0) solo permitía un segmento dinámico, y tenía que ser el último — `/blog/:categoria/:slug` se rechazaba. Ahora cualquier cantidad de segmentos `:nombre`, en cualquier posición, se bindean por NOMBRE (no por orden) contra los parámetros del rpc. La precedencia de siempre ("una ruta literal le gana a una dinámica que también matchearía") se generalizó a especificidad: gana la ruta con más segmentos literales fijos, determinísticamente. La detección de conflictos también se generalizó más allá de comparar formas exactas: dos rutas de forma DISTINTA que podrían igual matchear el mismo path real, empatadas en especificidad, se rechazan en compilación (`/blog/:categoria/latest` y `/blog/featured/:slug` matchean las dos `/blog/featured/latest`, y ninguna es más específica). Detalle completo, con el caso de conflicto cruzado explicado paso a paso: GRAMMAR.md §3.42.
+
 ## [1.5.0] - 2026-08-20
 
 ### ✨ Nuevo

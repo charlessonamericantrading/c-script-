@@ -1311,46 +1311,40 @@ impl Checker {
         }
         let pattern = crate::route::parse_route_pattern(raw).map_err(|e| err(format!("`@route(\"{raw}\")` en '{}': {e}", r.name)))?;
 
-        match &pattern.param_name {
-            // Ruta puramente literal: el rpc no puede pedir NINGÚN parámetro
-            // -- no hay de dónde sacarlo (v0 no lee query string ni body en
-            // un rpc con @route, a propósito: así la URL sirve tal cual para
-            // un crawler, sin depender de un POST con JSON).
-            None => {
-                if !r.params.is_empty() {
-                    return Err(err(format!(
-                        "`@route(\"{raw}\")` en '{}': la ruta no tiene ningún `:parámetro`, pero el rpc pide {} -- un rpc con `@route` solo puede tomar los parámetros que la ruta declara",
-                        r.name,
-                        r.params.len()
-                    )));
-                }
-            }
-            // Con un `:nombre` al final, el rpc tiene que tener EXACTAMENTE
-            // ese único parámetro, de un tipo que de verdad salga de un
-            // segmento de URL (texto). `Int` se acepta parseando el
-            // segmento; cualquier otra cosa (Bool, Float, un struct) no
+        // El rpc tiene que tomar EXACTAMENTE los parámetros que la ruta
+        // declara -- ni de más (v0 no lee query string ni body en un rpc
+        // con @route, a propósito: así la URL sirve tal cual para un
+        // crawler, sin depender de un POST con JSON) ni de menos, y cada
+        // uno con el MISMO nombre. El orden de los parámetros del rpc no
+        // tiene por qué coincidir con el orden en que aparecen en la ruta
+        // -- lo que importa es el nombre, que es como se bindea el valor
+        // capturado (GRAMMAR.md §3.42).
+        let route_params = pattern.param_names();
+        if r.params.len() != route_params.len() {
+            return Err(err(format!(
+                "`@route(\"{raw}\")` en '{}': la ruta declara {} parámetro(s) ({}), pero el rpc toma {} -- tienen que coincidir exacto",
+                r.name,
+                route_params.len(),
+                route_params.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "),
+                r.params.len()
+            )));
+        }
+        for name in &route_params {
+            let Some(param) = r.params.iter().find(|p| &p.name == name) else {
+                return Err(err(format!(
+                    "`@route(\"{raw}\")` en '{}': la ruta tiene un parámetro ':{name}', pero el rpc no tiene ninguno que se llame '{name}' -- tienen que coincidir por nombre",
+                    r.name
+                )));
+            };
+            // De un segmento de URL sale texto. `Int` se acepta parseando
+            // el segmento; cualquier otra cosa (Bool, Float, un struct) no
             // tiene una representación de un solo segmento sin ambigüedad.
-            Some(name) => {
-                let [only] = r.params.as_slice() else {
-                    return Err(err(format!(
-                        "`@route(\"{raw}\")` en '{}': la ruta tiene un parámetro (':{name}'), así que el rpc tiene que tomar EXACTAMENTE uno -- tiene {}",
-                        r.name,
-                        r.params.len()
-                    )));
-                };
-                if &only.name != name {
-                    return Err(err(format!(
-                        "`@route(\"{raw}\")` en '{}': el parámetro del rpc se llama '{}', pero la ruta dice ':{name}' -- tienen que coincidir",
-                        r.name, only.name
-                    )));
-                }
-                let param_ty = self.resolve_type(&only.ty)?;
-                if !matches!(param_ty, Type::String | Type::Int) {
-                    return Err(err(format!(
-                        "`@route(\"{raw}\")` en '{}': ':{name}' viene de un segmento de URL, así que el parámetro tiene que ser `String` o `Int` -- es {param_ty}",
-                        r.name
-                    )));
-                }
+            let param_ty = self.resolve_type(&param.ty)?;
+            if !matches!(param_ty, Type::String | Type::Int) {
+                return Err(err(format!(
+                    "`@route(\"{raw}\")` en '{}': ':{name}' viene de un segmento de URL, así que el parámetro tiene que ser `String` o `Int` -- es {param_ty}",
+                    r.name
+                )));
             }
         }
         Ok(())
@@ -1384,12 +1378,16 @@ impl Checker {
         Ok(())
     }
 
-    /// Dos `@route` con la MISMA forma (mismos segmentos literales, y los dos
-    /// terminan en parámetro o los dos no) son indistinguibles al despachar
-    /// una request real -- no hay forma de saber cuál de los dos rpc debería
-    /// atenderla. Se rechaza en compilación, no se resuelve por orden de
-    /// declaración ni "el primero gana": ese tipo de regla implícita es
-    /// exactamente lo que después alguien pisa sin darse cuenta.
+    /// Dos `@route` en CONFLICTO (`RoutePattern::conflicts_with`, route.rs:
+    /// pueden matchear el mismo path real y ninguna es más específica que la
+    /// otra) son indistinguibles al despachar una request real -- no hay
+    /// forma de saber cuál de los dos rpc debería atenderla. Se rechaza en
+    /// compilación, no se resuelve por orden de declaración ni "el primero
+    /// gana": ese tipo de regla implícita es exactamente lo que después
+    /// alguien pisa sin darse cuenta. Cuando SÍ hay una más específica
+    /// (más segmentos literales fijos), esa gana determinísticamente y NO
+    /// es un error -- `resolve_route` en runtime/server.rs es quien aplica
+    /// esa prioridad.
     fn check_route_conflicts(&self, program: &Program) -> Vec<CheckError> {
         let mut seen: Vec<(String, crate::route::RoutePattern)> = Vec::new();
         let mut errors = Vec::new();
@@ -1402,11 +1400,13 @@ impl Checker {
                 // `check_route_annotation` -- acá solo hace falta no volver
                 // a fallar parseándola de nuevo, no duplicar el error.
                 let Ok(pattern) = crate::route::parse_route_pattern(raw) else { continue };
-                if let Some((other_rpc, _)) = seen.iter().find(|(_, p)| p.same_shape(&pattern)) {
+                if let Some((other_rpc, _)) = seen.iter().find(|(_, p)| p.conflicts_with(&pattern)) {
                     errors.push(err(format!(
-                        "`@route(\"{raw}\")` en '{}' tiene la misma forma que la ruta de '{other_rpc}' -- \
-                         una request real no podría distinguir cuál de los dos atenderla. Cambiá uno de los \
-                         dos patrones (agregar un segmento literal alcanza, ej. '/blog/{{prefijo}}/:slug')",
+                        "`@route(\"{raw}\")` en '{}' entra en conflicto con la ruta de '{other_rpc}' -- \
+                         un path real podría matchear las dos, y ninguna es más específica (mismo número de \
+                         segmentos literales fijos), así que no hay forma determinística de saber cuál debería \
+                         atenderla. Agregar un segmento literal a una de las dos alcanza para desempatar \
+                         (ej. '/blog/{{prefijo}}/:slug')",
                         r.name
                     )));
                 }

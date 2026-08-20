@@ -307,6 +307,57 @@ fn an_unmatched_path_falls_back_to_the_normal_404() {
     assert_eq!(status, 404);
 }
 
+// GRAMMAR.md §3.42: `@route` con MÁS de un parámetro, en cualquier
+// posición -- v0 (§3.37) solo permitía uno, y tenía que ser el último.
+
+const MULTI_PARAM_PROGRAM: &str = r#"
+service Blog {
+  @route("/blog/:categoria/:slug")
+  rpc page(slug: String, categoria: String) -> String {
+    categoria + "/" + slug
+  }
+
+  @route("/blog/featured/:slug")
+  rpc featuredInCategory(slug: String) -> String {
+    "FEATURED/" + slug
+  }
+}
+"#;
+
+#[test]
+fn a_route_with_multiple_params_captures_each_by_name() {
+    let temp = TempDir::new("multi-param");
+    let src = temp.write("app.link", MULTI_PARAM_PROGRAM);
+    let server = Serve::start(&src);
+
+    // El orden de los parámetros del RPC (slug, categoria) es distinto al
+    // orden en que aparecen en la ruta (categoria, slug) -- a propósito,
+    // para probar que el binding es por NOMBRE, no por posición.
+    let (status, _, body) = server.get("/blog/rust/hola-mundo");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"rust/hola-mundo\"");
+}
+
+#[test]
+fn a_route_with_one_more_literal_segment_wins_over_a_fully_dynamic_one() {
+    // `/blog/featured/:slug` (1 segmento literal) y `/blog/:categoria/:slug`
+    // (0 literales) matchean las dos `/blog/featured/algo` -- la más
+    // específica gana, generalizando la precedencia de un solo parámetro
+    // (§3.37) a cualquier cantidad de segmentos.
+    let temp = TempDir::new("more-specific-wins");
+    let src = temp.write("app.link", MULTI_PARAM_PROGRAM);
+    let server = Serve::start(&src);
+
+    let (status, _, body) = server.get("/blog/featured/algo");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"FEATURED/algo\"", "la ruta con el segmento literal fijo tiene que ganar");
+
+    // Cualquier otra categoría sigue yendo al rpc totalmente dinámico.
+    let (status, _, body) = server.get("/blog/rust/algo");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"rust/algo\"");
+}
+
 #[test]
 fn the_checker_rejects_what_cannot_work() {
     let temp = TempDir::new("checker-rejects");
@@ -322,13 +373,28 @@ service B { @route("/blog/:id") rpc q(id: String) -> String { id } }
     );
     let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(!out.status.success(), "dos rutas con la misma forma debieron rechazarse");
-    assert!(stderr.contains("misma forma"), "mensaje inesperado: {stderr}");
+    assert!(stderr.contains("conflicto"), "mensaje inesperado: {stderr}");
 
-    // Un parámetro que no es el último segmento -- v0 no lo soporta.
-    let out = build(&temp, r#"service A { @route("/:cat/:slug") rpc p(cat: String, slug: String) -> String { slug } }"#);
+    // Dos rutas de FORMA distinta (ninguna es same_shape de la otra) pero
+    // que igual podrían matchear el mismo path real, empatadas en
+    // especificidad -- GRAMMAR.md §3.42, el caso que motivó no comparar
+    // solo "misma forma" sino "podrían pisarse Y ninguna es más específica".
+    let out = build(
+        &temp,
+        r#"
+service A { @route("/blog/:categoria/ultimo") rpc p(categoria: String) -> String { categoria } }
+service B { @route("/blog/destacado/:slug") rpc q(slug: String) -> String { slug } }
+"#,
+    );
+    let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "las dos matchean /blog/destacado/ultimo, y ninguna es más específica");
+    assert!(stderr.contains("conflicto"), "mensaje inesperado: {stderr}");
+
+    // Un nombre de parámetro repetido DENTRO de la misma ruta.
+    let out = build(&temp, r#"service A { @route("/:slug/comentarios/:slug") rpc p(slug: String) -> String { slug } }"#);
     let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(!out.status.success());
-    assert!(stderr.contains("ÚLTIMO"), "mensaje inesperado: {stderr}");
+    assert!(stderr.contains("más de una vez"), "mensaje inesperado: {stderr}");
 
     // Un tipo que no puede venir de un segmento de URL.
     let out = build(&temp, r#"service A { @route("/x/:on") rpc p(on: Bool) -> String { "x" } }"#);

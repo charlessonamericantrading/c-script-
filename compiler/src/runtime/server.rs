@@ -363,9 +363,10 @@ fn parse_args(body: &str) -> Result<serde_json::Value, String> {
     }
 }
 
-/// Una `@route` ya resuelta contra el programa (GRAMMAR.md §3.37): a qué
-/// (servicio, rpc) apunta, y si su parámetro -- si tiene -- es `Int` (para
-/// convertir el segmento de URL capturado al JSON que
+/// Una `@route` ya resuelta contra el programa (GRAMMAR.md §3.37, §3.42): a
+/// qué (servicio, rpc) apunta, y si cada uno de sus parámetros -- en el
+/// MISMO orden que `pattern.param_names()`/lo que devuelve `pattern.matches`
+/// -- es `Int` (para convertir el segmento de URL capturado al JSON que
 /// `invoke_rpc_with_sessions` espera; el checker ya garantizó que no puede
 /// ser otra cosa que `String`/`Int`, así que "no es Int" siempre significa
 /// "es String").
@@ -373,16 +374,24 @@ struct RouteEntry {
     pattern: RoutePattern,
     service_name: String,
     rpc_name: String,
-    param_is_int: bool,
+    param_is_int: Vec<bool>,
 }
 
-/// Arma la tabla de `@route` UNA vez al arrancar, nunca por request. El
-/// checker ya corrió sobre `program` antes de que `serve` pudiera llegar a
-/// llamarse (`load_and_check` en main.rs), así que acá no puede aparecer un
-/// patrón inválido, un rpc con el parámetro mal, ni dos rutas en conflicto
-/// -- si algo de eso pasara, sería un bug en el checker, no una condición
-/// operativa a manejar con gracia, de ahí los `expect`/`unwrap_or_else` con
-/// panic en vez de propagar un `Result`.
+/// Arma la tabla de `@route` UNA vez al arrancar, nunca por request,
+/// ordenada por especificidad DESCENDENTE (más segmentos literales fijos
+/// primero) -- `resolve_route` hace una sola pasada y devuelve el primer
+/// match, así que el ORDEN de esta tabla ES la prioridad de despacho
+/// (GRAMMAR.md §3.42). El checker (`check_route_conflicts`) ya garantizó
+/// que nunca hay dos entradas con la MISMA especificidad que puedan
+/// matchear el mismo path real, así que un empate en el orden de esta
+/// tabla nunca puede importar cuál queda primero.
+///
+/// El checker ya corrió sobre `program` antes de que `serve` pudiera llegar
+/// a llamarse (`load_and_check` en main.rs), así que acá no puede aparecer
+/// un patrón inválido, un rpc con los parámetros mal, ni dos rutas en
+/// conflicto -- si algo de eso pasara, sería un bug en el checker, no una
+/// condición operativa a manejar con gracia, de ahí los
+/// `expect`/`unwrap_or_else` con panic en vez de propagar un `Result`.
 fn build_route_table(program: &Program) -> Vec<RouteEntry> {
     let (checker, _) = crate::checker::Checker::build_symbols(program);
     let mut table = Vec::new();
@@ -393,18 +402,23 @@ fn build_route_table(program: &Program) -> Vec<RouteEntry> {
             let Some(raw) = r.route() else { continue };
             let pattern = crate::route::parse_route_pattern(raw)
                 .unwrap_or_else(|e| panic!("@route inválido llegó a serve() sin que el checker lo rechazara: {e}"));
-            let param_is_int = match &pattern.param_name {
-                Some(_) => {
+            let param_is_int: Vec<bool> = pattern
+                .param_names()
+                .iter()
+                .map(|name| {
+                    let param = r.params.iter().find(|p| &p.name == name).unwrap_or_else(|| {
+                        panic!("@route(\"{raw}\") pide ':{name}' pero '{}' no tiene ese parámetro -- el checker debió haberlo rechazado", r.name)
+                    });
                     let ty = checker
-                        .resolve_type(&r.params[0].ty)
+                        .resolve_type(&param.ty)
                         .unwrap_or_else(|e| panic!("tipo de parámetro de @route no resolvió en serve() habiendo pasado el checker: {e}"));
                     matches!(ty, crate::types::Type::Int)
-                }
-                None => false,
-            };
+                })
+                .collect();
             table.push(RouteEntry { pattern, service_name: s.name.clone(), rpc_name: r.name.clone(), param_is_int });
         }
     }
+    table.sort_by_key(|e| std::cmp::Reverse(e.pattern.specificity()));
     table
 }
 
@@ -455,41 +469,38 @@ fn resolve_route<'a>(
     route_table: &'a [RouteEntry],
 ) -> Result<(&'a str, &'a str, serde_json::Value), Option<String>> {
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    // Precedencia: una ruta puramente literal que matchea gana SIEMPRE sobre
-    // una con parámetro que también matchearía (`/blog/featured` sobre
-    // `/blog/:slug`) -- mismo criterio que usa cualquier router HTTP común.
-    // `check_route_conflicts` (checker.rs) ya garantiza que a lo sumo UNA
-    // entrada de cada "forma" puede matchear un path real, así que estas dos
-    // pasadas nunca pueden encontrar más de un candidato cada una.
-    let matched = route_table
-        .iter()
-        .find(|e| e.pattern.param_name.is_none() && e.pattern.matches(&segments).is_some())
-        .or_else(|| route_table.iter().find(|e| e.pattern.param_name.is_some() && e.pattern.matches(&segments).is_some()));
-    if let Some(entry) = matched {
-        let captured = entry.pattern.matches(&segments).expect("ya se confirmó que matchea arriba");
-        let args = match captured {
-            None => serde_json::json!({}),
-            Some(raw_segment) => {
-                // `matches` solo devuelve `Some(_)` cuando el patrón tiene
-                // `param_name` -- invariante de `RoutePattern::matches`.
-                let param_name = entry.pattern.param_name.as_deref().expect("captured un valor sin param_name declarado");
-                let decoded = percent_decode(raw_segment);
-                let value = if entry.param_is_int {
-                    match decoded.parse::<i64>() {
-                        Ok(n) => serde_json::Value::from(n),
-                        Err(_) => {
-                            return Err(Some(format!(
-                                "parámetro de ruta ':{param_name}' inválido: se esperaba un entero, se recibió '{decoded}'"
-                            )));
-                        }
+    // `route_table` ya viene ordenada por especificidad descendente
+    // (`build_route_table`), así que el PRIMER match de esta única pasada
+    // es, por construcción, el más específico -- `/blog/featured` le gana a
+    // `/blog/:slug`, y eso se generaliza a cualquier combinación de
+    // segmentos literales/parámetro (GRAMMAR.md §3.42). `check_route_conflicts`
+    // (checker.rs) ya garantiza que nunca hay dos entradas EMPATADAS en
+    // especificidad que puedan matchear el mismo path real, así que nunca
+    // hay ambigüedad sobre cuál de las que matchean es "la primera".
+    let matched = route_table.iter().find_map(|e| e.pattern.matches(&segments).map(|captured| (e, captured)));
+    if let Some((entry, captured)) = matched {
+        // `captured` está en el mismo orden que `entry.pattern.param_names()`
+        // (invariante de `RoutePattern::matches`), que es el mismo orden en
+        // que se armó `entry.param_is_int` en `build_route_table` -- así que
+        // zippearlos con los nombres da la asociación correcta.
+        let mut args = serde_json::Map::new();
+        for ((name, raw_segment), is_int) in entry.pattern.param_names().into_iter().zip(captured).zip(&entry.param_is_int) {
+            let decoded = percent_decode(raw_segment);
+            let value = if *is_int {
+                match decoded.parse::<i64>() {
+                    Ok(n) => serde_json::Value::from(n),
+                    Err(_) => {
+                        return Err(Some(format!(
+                            "parámetro de ruta ':{name}' inválido: se esperaba un entero, se recibió '{decoded}'"
+                        )));
                     }
-                } else {
-                    serde_json::Value::String(decoded)
-                };
-                serde_json::json!({ param_name: value })
-            }
-        };
-        return Ok((&entry.service_name, &entry.rpc_name, args));
+                }
+            } else {
+                serde_json::Value::String(decoded)
+            };
+            args.insert(name.to_string(), value);
+        }
+        return Ok((&entry.service_name, &entry.rpc_name, serde_json::Value::Object(args)));
     }
     let (service_name, rpc_name) = parse_path(path).ok_or(None)?;
     let args = parse_args(body).map_err(Some)?;
