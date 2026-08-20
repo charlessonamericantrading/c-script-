@@ -143,6 +143,15 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
             let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
             let res_schema = type_to_json_schema(&ret_ty);
 
+            // Un rpc con `@content_type` responde ese tipo, no JSON
+            // (GRAMMAR.md §3.35) -- si el spec dijera application/json, un
+            // cliente generado desde este OpenAPI intentaría parsear el HTML.
+            let response_content_type = if is_stream {
+                "text/event-stream"
+            } else {
+                rpc.content_type().unwrap_or("application/json")
+            };
+
             let mut operation = json!({
                 "summary": format!("{}::{}", service.name, rpc.name),
                 "tags": [service.name.clone()],
@@ -150,7 +159,7 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
                     "200": {
                         "description": if is_stream { "Server-Sent Events Stream" } else { "Respuesta exitosa" },
                         "content": {
-                            if is_stream { "text/event-stream" } else { "application/json" }: {
+                            response_content_type: {
                                 "schema": res_schema
                             }
                         }

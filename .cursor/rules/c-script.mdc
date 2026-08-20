@@ -11,6 +11,7 @@ You are developing with **c-script** (file extension `.link`, CLI `linkc`), a hi
 ## Key Syntax Reference
 
 ### 1. Types & Data Structures
+<!-- linkc:part -->
 ```rust
 // Basic types: Int, Float, Int64, String, Bool, Timestamp, Void
 // Postfix collections: T[] or Map<K, V> or Tuples (A, B)
@@ -38,6 +39,7 @@ enum Result<T, E> {
 ```
 
 ### 2. Database Definition (`db { ... }`)
+<!-- linkc:part -->
 ```rust
 db {
   users: User[],
@@ -47,6 +49,7 @@ db {
 ```
 
 ### 3. Services & Streaming
+<!-- linkc:part -->
 ```rust
 service Users {
   rpc list(limit: Int = 20) -> User[] {
@@ -72,13 +75,14 @@ service Users {
 ```
 
 ### 4. Built-in Testing
+<!-- linkc:part -->
 ```rust
 test "insert and retrieve" {
   let user = db.users.insert(User {
     id: 0,
     name: "John",
     email: "john@example.com",
-    role: Role.Member,
+    role: Role.Member {},
     createdAt: now(),
   });
   assert(user.id > 0, "ID assigned by SQLite");

@@ -3,6 +3,30 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [Sin publicar]
+
+### 🔐 Seguridad
+- **`crypto.hashPassword` ahora es Argon2id** (RFC 9106) con sal aleatoria por contraseña y salida en formato PHC. Antes era un solo SHA-256 sobre la constante `"link_salt_2026"` — la misma sal para toda aplicación escrita en el lenguaje, sin iteraciones: dos usuarios con la misma contraseña compartían hash y una sola rainbow table las rompía todas.
+- **`crypto.verifyPassword` compara en tiempo constante.** La comparación anterior (`==` de `String`) cortaba en el primer byte distinto y filtraba, por tiempo de respuesta, cuánto del hash había acertado quien probaba. Sigue aceptando los hashes del formato viejo para no dejar afuera a los usuarios ya registrados de una app en producción.
+- **`crypto.randomToken` y `crypto.uuid` salen del CSPRNG del sistema.** Antes derivaban de `SystemTime::now().as_nanos()`: eran adivinables para quien pudiera acotar el instante de emisión, y dos llamadas dentro del mismo nanosegundo devolvían el mismo valor.
+- **Los tokens de sesión piden entropía directo al SO** (`getrandom`), reemplazando el rodeo del hilo descartable sobre `RandomState` que documenta GRAMMAR.md §3.14.
+- Detalle completo, con los límites que quedan (parámetros de Argon2id no configurables desde el lenguaje, sin señal de re-hash, el hashing bloquea el hilo del servidor ~15 ms): GRAMMAR.md §3.34.
+
+### ✨ Nuevo
+- **`@content_type("...")`: respuestas que no son JSON.** Un rpc que devuelve `String` puede declarar el Content-Type de su respuesta, y entonces el cuerpo se escribe tal cual: HTML, sitemaps XML, CSV, texto plano. Antes el Content-Type estaba literal en el binario (`application/json` para rpcs, `text/event-stream` para streams) y un programa c-script no podía devolver una página, lo que dejaba fuera cualquier render en servidor y cualquier historia de SEO. Las tres capas cambiaron juntas: el servidor manda el header, el cliente TypeScript generado lee `res.text()` en vez de `res.json()`, y el spec OpenAPI declara el mismo tipo. Detalle y límites (sin rutas limpias, sin escapado de HTML, los errores siguen en JSON): GRAMMAR.md §3.35.
+- **Las anotaciones de un rpc pasaron a ser una lista.** `@requires(Role.Admin) @content_type("text/html")` es válido — auth y Content-Type son dimensiones distintas, y un panel de administración necesita las dos. El checker sigue rechazando dos anotaciones de la misma dimensión.
+
+### 🩺 Diagnósticos
+- **Los tipos en los errores del compilador se escriben como en c-script.** Interpolaban el `Debug` de Rust, así que un error sobre un `T?` mostraba `Optional(Struct { name: Some("Todo"), fields: [FieldType { name: "id", optional: false, ty: Int }, ...] })`. Ahora dice `Todo?`.
+- **El acceso a un campo sobre `T?` explica qué hacer**, no solo que no se puede: es el error más frecuente, porque en TypeScript `if (x != null)` sí angosta y en c-script no.
+
+### 📚 Documentación
+- **Los ejemplos de la documentación ahora los compila el compilador.** `compiler/tests/docs_examples.rs` toma cada bloque de código c-script publicado en README, `llms.txt`, `llms-full.txt`, `AGENTS.md`, las reglas de Cursor/Copilot y `docs/`, lo compila con el binario real y, si declara un `test "..."`, lo ejecuta. Casi ninguno compilaba: el ejemplo insignia del README usaba `role: Role.Member` sin llaves, y `llms.txt` enseñaba closures con tipo de retorno y lectura de campos sobre un `T?`.
+- **Nuevo `AGENTS.md`**: mapa del repo, comandos reales, convenciones y la lista de lo que está roto a sabiendas, para Claude Code / Codex.
+- **Sección "Estado" en ambos README**: qué funciona y qué no, con el motivo técnico de cada límite.
+- **Índice navegable en GRAMMAR.md** (190 KB, 44 secciones) con anclas compatibles con GitHub.
+- Correcciones de honestidad: badge de CI real en vez de una imagen estática que decía "passing" con el CI en rojo, número de tests real (453), el playground etiquetado como la maqueta que es, `npm install -g link-lang` marcado como no publicado, y el copyright del README alineado con LICENSE (decía "Google DeepMind").
+
 ## [1.0.0] - 2026-08-15
 
 ### 🚀 Novedades y Características Principales

@@ -5,8 +5,8 @@
   <p><strong>El lenguaje compilado de backend diseñado para garantizar Seguridad de Tipos Extremo a Extremo (End-to-End Type Safety) con TypeScript.</strong></p>
   
   <p>
-    <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Estado de Build" /></a>
-    <a href="#"><img src="https://img.shields.io/badge/tests-450%20passed-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-457-success.svg" alt="Tests" /></a>
     <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.0.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
@@ -31,6 +31,35 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 
 ---
 
+## 📊 Estado — qué funciona y qué no
+
+Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
+gana esta. Verificado el 20/08/2026 corriendo el compilador, no leyéndolo.
+
+**Funciona hoy**, cubierto por 457 pruebas automáticas:
+
+- `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- SQLite embebido con persistencia real entre reinicios y auto-migraciones no destructivas
+- Push en vivo sobre Server-Sent Events (`stream` + `db.<c>.subscribe()`)
+- Auth declarativa: `@authenticated`, `@requires(Role.Admin)`, tokens de sesión desde el CSPRNG del sistema
+- Respuestas que no son JSON: `@content_type("text/html; charset=utf-8")` sobre un rpc que devuelve `String` manda ese cuerpo tal cual — páginas HTML, sitemaps XML, CSV — y se combina con `@requires(Role.Admin)` para páginas detrás de auth
+- Hashing de contraseñas real: `crypto.hashPassword` es Argon2id (RFC 9106) con sal aleatoria por contraseña, en formato PHC; `verifyPassword` compara en tiempo constante y sigue aceptando los hashes de la versión anterior para no dejar afuera a los usuarios ya registrados
+- Contrato TypeScript, cliente tipado, validadores runtime, hooks de React, schemas Zod y OpenAPI 3.1 generados
+
+**Todavía no funciona** — no planifiques sobre esto:
+
+| Límite | Detalle |
+|---|---|
+| Sin URLs limpias | El ruteo es siempre `/Servicio/rpc` — sin parámetros en el path ni rutas propias. El HTML sí funciona (ver `@content_type`), pero un blog en `/blog/mi-post` necesita un proxy adelante. Los errores siempre vuelven en JSON, así que no hay página 404 propia. |
+| Sin escapado de HTML | Las páginas se arman concatenando `String`; nada escapa por vos los datos que interpolás. |
+| PostgreSQL es solo DDL | `linkc build` emite el esquema SQL de PostgreSQL, pero `linkc serve` usa siempre SQLite. No hay driver de Postgres. |
+| `linkc fmt` no es seguro | Borra los comentarios y puede emitir código que ya no parsea (arreglo pendiente en el PR #2). |
+| `linkc --help` | No es un argumento reconocido; corré `linkc` sin argumentos (arreglo pendiente en el PR #5). |
+| Codegen multi-service | El emisor del cliente TypeScript solo cubre el primer `service` del archivo (arreglo pendiente en el PR #7). |
+| Sin artefactos publicados | No hay release de GitHub, ni paquete npm, ni extensión en el Marketplace todavía — hay que compilar desde el código. |
+| `linkc wasm` | Congelado a propósito en funciones escalares de enteros/booleanos; el camino de producción es `wasm32-wasip1`. |
+| El playground web | Es una maqueta estática: no ejecuta el compilador. |
+
 ## ⚡ Inicio Rápido (10 Segundos)
 
 ### 1. Instalación
@@ -46,20 +75,29 @@ irm https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master
 ```
 
 #### 🌐 Vía NPM / npx
+
+> **Todavía no está publicado.** `link-lang` no está en el registro de npm, y tampoco hay
+> release de GitHub, así que los instaladores `curl` e `irm` de arriba terminan compilando
+> desde el código. Hasta que salga la primera release, este es el camino soportado:
+
 ```bash
-npm install -g link-lang
-# o probalo directamente con npx:
-npx link-lang --help
+git clone https://github.com/charlessonamericantrading/c-script-.git
+cd c-script-/compiler
+cargo build --release        # target/release/linkc
 ```
 
 ---
 
 ## 🤖 Diseñado para Cursor y Agentes de IA (Grok, Claude, GPT)
 
-Link incluye estándares nativos para que puedas desarrollar aplicaciones completas con modelos de IA en Cursor o Windsurf con **cero alucinaciones**:
+Link trae las reglas del lenguaje en el formato que lee cada herramienta, y **cada ejemplo
+de esas reglas lo compila el binario real en cada corrida de CI** (`compiler/tests/docs_examples.rs`)
+— que es lo que de verdad baja las alucinaciones: que lo que el agente lee sea lo que el
+compilador acepta, no una promesa.
 
-- **`.cursorrules` y `.cursor/rules/c-script.mdc`**: Instrucciones precisas para que Grok, Claude y GPT-4 comprendan la sintaxis de Link, definición de servicios, tipos, decoradores y runner de pruebas.
-- **`llms.txt` y `llms-full.txt`**: Archivos estandarizados de contexto para motores de IA.
+- **[`AGENTS.md`](AGENTS.md)**: lo que leen primero Claude Code y Codex — mapa del repo, comandos reales, convenciones del proyecto, y la lista de lo que está roto a sabiendas para que un agente no lo reporte como hallazgo nuevo.
+- **[`llms.txt`](llms.txt) y [`llms-full.txt`](llms-full.txt)**: la referencia condensada del lenguaje, con los errores de sintaxis que comete todo LLM (las variantes de enum necesitan llaves como valor, los closures no llevan tipo de retorno, un `T?` no se puede desreferenciar).
+- **`.cursorrules`, `.cursor/rules/c-script.mdc`, `.windsurfrules`, `.github/copilot-instructions.md`**: las mismas reglas en el formato de cada herramienta.
 - **Instalar la extensión del editor en 1 clic**:
   ```bash
   # Para Cursor
@@ -98,6 +136,7 @@ linkc serve main.link 3000   # Inicia servidor HTTP con SQLite embebido y auto-m
 
 ## 🧠 El Lenguaje de un Vistazo
 
+<!-- linkc:check -->
 ```rust
 // 1. Modelos de Datos y Enums
 type User = {
@@ -126,7 +165,7 @@ service UserService {
       id: 0,
       name: name,
       email: email,
-      role: Role.Member,
+      role: Role.Member {},
       created_at: now(),
     });
     new_user
@@ -175,14 +214,18 @@ Link incluye de forma nativa todas las herramientas que necesitas:
 
 ## 🌐 Playground Web Interactivo
 
-Probá Link directamente en tu navegador sin instalar nada:
-- Abrí [`playground/index.html`](playground/index.html) para escribir código Link, ver la generación de contratos en tiempo real y ejecutar pruebas.
+> **Es una maqueta estática, no un playground que funcione.** [`playground/index.html`](playground/index.html)
+> muestra la forma que tiene la salida generada para un ejemplo enlatado; no ejecuta el
+> compilador y no lee lo que escribís. Para probar el lenguaje de verdad, compilá `linkc`
+> desde el código y corré `linkc build` sobre un archivo `.link`.
 
 ---
 
 ## 🧪 Pruebas y Control de Calidad
 
-El compilador y runtime de Link están verificados por **450 pruebas automáticas unitarias y de integración**:
+El compilador y el runtime de Link están verificados por **457 pruebas automáticas** unitarias,
+de integración y de CLI, incluidas pruebas que levantan el binario real como subproceso, manejan
+un servidor HTTP real, y compilan cada ejemplo de c-script publicado en la documentación de este repo:
 
 ```bash
 cd compiler
@@ -193,4 +236,4 @@ cargo test
 
 ## 📄 Licencia
 
-Licencia MIT — Copyright (c) 2026 Google DeepMind / Link Authors.
+Licencia MIT — Copyright (c) 2026 Charlesson UK Consulting Group LTD. Ver [LICENSE](LICENSE).
