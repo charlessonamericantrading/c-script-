@@ -11,6 +11,7 @@ You are an expert full-stack engineer and compiler specialist for **c-script** (
 - Collections: `T[]` (list), `Map<K, V>`, Tuples `(A, B)`.
 - Nullability: `T?` maps to `T | null` in TypeScript and JSON. Optional record fields: `field?: T`.
 - Structs:
+  <!-- linkc:part -->
   ```rust
   type User = {
     id: Int,
@@ -22,6 +23,7 @@ You are an expert full-stack engineer and compiler specialist for **c-script** (
   }
   ```
 - Enums & ADTs (Algebraic Data Types):
+  <!-- linkc:part -->
   ```rust
   // Simple enum -> TypeScript string union: "Admin" | "Member" | "Guest"
   enum Role { Admin, Member, Guest }
@@ -33,7 +35,7 @@ You are an expert full-stack engineer and compiler specialist for **c-script** (
   }
   ```
 - Unions: `A | B` with exhaustive pattern matching (`match`).
-- Closures & Functions: `|x: Int| -> Int { x * 2 }` or `fn helper(a: String) -> String { ... }`.
+- Closures & Functions: `|x: Int| { x * 2 }` (no return-type annotation) or `fn helper(a: String) -> String { ... }`.
 
 ---
 
@@ -41,6 +43,7 @@ You are an expert full-stack engineer and compiler specialist for **c-script** (
 
 ### Service & RPCs
 Services expose HTTP endpoints and automatically generate typed TypeScript clients:
+<!-- linkc:part -->
 ```rust
 service Users {
   // Simple RPC endpoint (POST /Users/getById)
@@ -71,6 +74,7 @@ service Users {
 
 ### Embedded Database (`db { ... }`)
 Built-in zero-config SQLite persistence with compile-time type checking:
+<!-- linkc:part -->
 ```rust
 db {
   users: User[],
@@ -82,18 +86,19 @@ Available operations on `db.<collection>`:
 - `.insert(row: T) -> T`
 - `.applyPatch(id: Int, patch: Partial<T>) -> T?`
 - `.delete(id: Int) -> Bool`
-- `.findWhere(|row: T| -> Bool) -> T[]`
-- `.deleteWhere(|row: T| -> Bool) -> Int`
+- `.findWhere(|row: T| { <Bool> }) -> T[]`
+- `.deleteWhere(|row: T| { <Bool> }) -> Int`
 - `.subscribe() -> T` (for live push streams)
 
 ### Integrated Tests (`test "name" { ... }`)
+<!-- linkc:part -->
 ```rust
 test "can create and retrieve user" {
   let u = db.users.insert(User {
     id: 0,
     name: "Alice",
     email: "alice@example.com",
-    role: Role.Admin,
+    role: Role.Admin {},
     createdAt: now(),
   });
   assert(u.id > 0, "id should be auto-incremented");

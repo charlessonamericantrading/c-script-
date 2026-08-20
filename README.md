@@ -5,8 +5,8 @@
   <p><strong>The compiled backend language designed for absolute End-to-End Type Safety with TypeScript.</strong></p>
   
   <p>
-    <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status" /></a>
-    <a href="#"><img src="https://img.shields.io/badge/tests-450%20passed-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-466-success.svg" alt="Tests" /></a>
     <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.0.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
@@ -31,6 +31,36 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 
 ---
 
+## 📊 Status — what works and what does not
+
+This section is the ground truth. If any other section of this README disagrees with it,
+this section wins. Verified on 2026-08-20 by running the compiler, not by reading it.
+
+**Works today**, covered by 466 automated tests:
+
+- `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
+- Live push over Server-Sent Events (`stream` + `db.<c>.subscribe()`)
+- Declarative auth: `@authenticated`, `@requires(Role.Admin)`, session tokens from the OS CSPRNG
+- PostgreSQL as the runtime database: `linkc serve app.link 8787 --db postgres://user:pass@host/db` (or `LINK_DATABASE_URL`), with non-destructive auto-migration. Same program, same generated contract — SQLite remains the default
+- Non-JSON responses: `@content_type("text/html; charset=utf-8")` on an rpc returning `String` sends that body verbatim — HTML pages, XML sitemaps, CSV — and stacks with `@requires(Role.Admin)` for pages behind auth
+- Real password hashing: `crypto.hashPassword` is Argon2id (RFC 9106) with a random per-password salt, in PHC format; `verifyPassword` compares in constant time and still accepts hashes written by the previous version so existing users are not locked out
+- Generated TypeScript contract, typed client, runtime validators, React hooks, Zod schemas, OpenAPI 3.1
+
+**Does not work yet** — do not plan around these:
+
+| Limitation | Detail |
+|---|---|
+| No clean URLs | Routing is always `/Service/rpc` — no path parameters, no custom routes. HTML itself works (see `@content_type`), but a blog at `/blog/my-post` needs a proxy in front. Errors always come back as JSON, so there is no custom 404 page. |
+| No HTML escaping | Pages are built by concatenating `String`; nothing escapes interpolated data for you. |
+| PostgreSQL has no pool, TLS or LISTEN/NOTIFY | The runtime driver works (see below), but it opens a single plain connection and does not reconnect; two server instances against one database do not see each other's writes on `stream`. |
+| `linkc fmt` is unsafe | It deletes comments and can emit source that no longer parses (fix pending in PR #2). |
+| `linkc --help` | Not a recognised argument; run `linkc` with no arguments (fix pending in PR #5). |
+| Multi-service codegen | The TypeScript client emitter only covers the first `service` in a file (fix pending in PR #7). |
+| No published artifacts | There is no GitHub release, no npm package and no Marketplace extension yet — build from source. |
+| `linkc wasm` | Deliberately frozen at integer/boolean scalar functions; the production path is `wasm32-wasip1`. |
+| The web playground | A static mockup: it does not run the compiler. |
+
 ## ⚡ Quick Start (10 Seconds)
 
 ### 1. Installation
@@ -46,20 +76,32 @@ irm https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master
 ```
 
 #### 🌐 via NPM / npx
+
+> **Not published yet.** `link-lang` is not on the npm registry, and there is no GitHub
+> release either, so the `curl` and `irm` installers above fall back to building from
+> source. Until the first release is published, this is the supported path:
+
 ```bash
-npm install -g link-lang
-# or run directly with npx:
-npx link-lang --help
+git clone https://github.com/charlessonamericantrading/c-script-.git
+cd c-script-/compiler
+cargo build --release        # target/release/linkc
 ```
 
 ---
 
 ## 🤖 Built for Cursor & AI Agents (Grok, Claude, GPT)
 
-Link includes native AI standards so you can develop full-stack applications with AI models in Cursor or Windsurf with **zero hallucination**:
+Link ships the language rules in the format each tool reads, and **every example in those
+rules is compiled by the real binary on every CI run** — which is what actually reduces
+hallucination: what the agent reads is what the compiler accepts, not a promise.
 
-- **`.cursorrules` & `.cursor/rules/c-script.mdc`**: Teaches Grok, Claude, and GPT-4 the exact Link syntax, type definitions, RPC rules, and test runner.
-- **`llms.txt` & `llms-full.txt`**: Standardized LLM context files for instant ingestion.
+- **[`AGENTS.md`](AGENTS.md)**: what Claude Code and Codex read first — repository map, real commands, project conventions, and the list of what is knowingly broken so an agent does not report it as a new finding.
+- **[`llms.txt`](llms.txt) & [`llms-full.txt`](llms-full.txt)**: the condensed language reference, including the syntax mistakes every LLM makes (enum variants need braces as values, closures take no return type, `T?` cannot be dereferenced).
+- **`.cursorrules`, `.cursor/rules/c-script.mdc`, `.windsurfrules`, `.github/copilot-instructions.md`**: the same rules in each tool's own format.
+
+Every c-script example in those files is compiled by the real binary on every CI run
+(`compiler/tests/docs_examples.rs`), so what an agent reads here is what the compiler
+actually accepts.
 - **Install Editor Extension in 1-Click**:
   ```bash
   # For Cursor
@@ -98,6 +140,7 @@ linkc serve main.link 3000   # Starts HTTP server with auto-migrating database
 
 ## 🧠 Language at a Glance
 
+<!-- linkc:check -->
 ```rust
 // 1. Data Models & Enums
 type User = {
@@ -126,7 +169,7 @@ service UserService {
       id: 0,
       name: name,
       email: email,
-      role: Role.Member,
+      role: Role.Member {},
       created_at: now(),
     });
     new_user
@@ -175,14 +218,18 @@ Link comes out-of-the-box with all the developer tooling you need:
 
 ## 🌐 Interactive Web Playground
 
-Try Link right inside your browser without installing anything:
-- Open [`playground/index.html`](playground/index.html) to write Link code, view real-time TypeScript contracts, OpenAPI specs, and run tests.
+> **This is a static mockup, not a working playground.** [`playground/index.html`](playground/index.html)
+> shows the shape of the generated output for a canned example; it does not run the
+> compiler and it does not read what you type. To actually try the language, build
+> `linkc` from source and run `linkc build` on a `.link` file.
 
 ---
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **450 automated unit, integration, and CLI tests**:
+Link is verified by **466 automated unit, integration and CLI tests**, including tests that
+spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
+example published in this repository's documentation:
 
 ```bash
 cd compiler
@@ -193,4 +240,4 @@ cargo test
 
 ## 📄 License
 
-MIT License — Copyright (c) 2026 Google DeepMind / Link Authors.
+MIT License — Copyright (c) 2026 Charlesson UK Consulting Group LTD. See [LICENSE](LICENSE).

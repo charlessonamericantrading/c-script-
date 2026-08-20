@@ -83,17 +83,19 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - PORT=3000
       - LINK_ENV=production
-      - DATABASE_PATH=/data/{app_name}.db
-      # Descomentar para conectar a PostgreSQL en lugar de SQLite embebido:
-      # - DATABASE_URL=postgres://link_user:secret_password@postgres:5432/{app_name}_db
+      # Descomenta esta línea (y el servicio de abajo) para correr contra
+      # PostgreSQL en vez del SQLite embebido. La variable se llama
+      # LINK_DATABASE_URL: es la que `linkc serve` lee de verdad
+      # (GRAMMAR.md §3.36).
+      # - LINK_DATABASE_URL=postgres://link_user:secret_password@postgres:5432/{app_name}_db
     volumes:
       - {app_name}_data:/data
     networks:
       - link_network
 
-  # Servicio opcional de PostgreSQL para alta concurrencia
+  # Servicio opcional de PostgreSQL. Cambiá la contraseña antes de usar esto
+  # en cualquier lado que no sea tu máquina.
   # postgres:
   #   image: postgres:16-alpine
   #   container_name: link_{app_name}_postgres
@@ -106,6 +108,10 @@ services:
   #     - postgres_data:/var/lib/postgresql/data
   #   networks:
   #     - link_network
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U link_user"]
+  #     interval: 5s
+  #     retries: 10
 
 volumes:
   {app_name}_data:
@@ -159,6 +165,12 @@ mod tests {
         let compose = fs::read_to_string(temp_dir.join("docker-compose.yml")).unwrap();
         assert!(compose.contains("users_api"));
         assert!(compose.contains("3000:3000"));
+        // El compose traía `DATABASE_URL` y `DATABASE_PATH`, que el binario no
+        // lee: descomentar esa línea dejaba al servidor en SQLite mientras
+        // quien la descomentó creía estar en PostgreSQL. La variable real es
+        // LINK_DATABASE_URL (GRAMMAR.md §3.36).
+        assert!(compose.contains("LINK_DATABASE_URL"), "el compose debe nombrar la variable real");
+        assert!(!compose.contains("DATABASE_PATH"), "no debe ofrecer variables que nadie lee");
 
         let ignore = fs::read_to_string(temp_dir.join(".dockerignore")).unwrap();
         assert!(ignore.contains("node_modules/"));

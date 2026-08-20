@@ -13,6 +13,7 @@ This repository develops **c-script** (also referred to as **Link**), a compiled
 - Collections: `T[]` (list), `Map<K, V>`, Tuples `(A, B)`.
 - Nullable: `T?` (maps to `T | null`). Optional struct fields: `field?: T`.
 - Structs:
+  <!-- linkc:part -->
   ```rust
   type User = {
     id: Int,
@@ -22,8 +23,19 @@ This repository develops **c-script** (also referred to as **Link**), a compiled
     created_at: Timestamp,
     avatar?: String,
   }
+
+  // The creation shape that `db.users.insert` expects: User without `id`
+  // (Omit<User, "id">).
+  type NewUser = {
+    name: String,
+    email: String,
+    role: Role,
+    created_at: Timestamp,
+    avatar?: String,
+  }
   ```
 - Enums & Discriminated Unions:
+  <!-- linkc:part -->
   ```rust
   enum Role { Admin, Member, Guest }
 
@@ -35,6 +47,7 @@ This repository develops **c-script** (also referred to as **Link**), a compiled
 
 ### Database (`db { ... }`)
 Built-in SQLite persistence with compile-time checked operations:
+<!-- linkc:part -->
 ```rust
 db {
   users: User[],
@@ -46,15 +59,25 @@ CRUD operations:
 - `db.users.insert(user)`
 - `db.users.applyPatch(id, partial)`
 - `db.users.delete(id)`
-- `db.users.findWhere(|u: User| -> Bool { ... })`
-- `db.users.deleteWhere(|u: User| -> Bool { ... })`
+- `db.users.findWhere(|u: User| { ... })` (a closure has no return-type annotation)
+- `db.users.deleteWhere(|u: User| { ... })`
 - `db.users.subscribe()` (for reactive push streams)
 
 ### Services, RPCs, and Streaming
+<!-- linkc:part -->
 ```rust
 service UserService {
   rpc list() -> User[] {
     db.users.all()
+  }
+
+  rpc create(name: String, email: String) -> User {
+    db.users.insert(NewUser {
+      name: name,
+      email: email,
+      role: Role.Member {},
+      created_at: now(),
+    })
   }
 
   @authenticated
@@ -76,6 +99,7 @@ service UserService {
 ```
 
 ### Integrated Tests
+<!-- linkc:part -->
 ```rust
 test "can insert and find user" {
   let created = UserService.create("Alice", "alice@example.com");

@@ -6,6 +6,65 @@
 
 ---
 
+## Índice
+
+> Este archivo es la especificación completa (~190 KB): la gramática EBNF, las reglas
+> del checker bidireccional, el mapeo exhaustivo a TypeScript, y — sección por sección —
+> el **límite honesto** de cada feature (qué quedó adentro, qué quedó afuera y por qué).
+>
+> Si lo que necesitás es escribir c-script y no entender cómo está construido, empezá por
+> [`llms.txt`](llms.txt): la referencia condensada, con los errores de sintaxis que un LLM
+> comete siempre. Volvé acá para el detalle de una feature puntual.
+
+- [1. Gramática Léxica](#1-gramática-léxica)
+- [2. Gramática Sintáctica](#2-gramática-sintáctica)
+  - [2.1 Programa e ítems de nivel superior](#21-programa-e-ítems-de-nivel-superior)
+  - [2.2 Expresiones de tipo — y la trampa del postfix](#22-expresiones-de-tipo--y-la-trampa-del-postfix)
+  - [2.3 Expresiones, sentencias y patrones (cuerpo de un `rpc`)](#23-expresiones-sentencias-y-patrones-cuerpo-de-un-rpc)
+- [3. Sistema de Tipos](#3-sistema-de-tipos)
+  - [3.1 Juicios bidireccionales](#31-juicios-bidireccionales)
+  - [3.2 Subtipado: estructural para `type`, nominal para `enum`](#32-subtipado-estructural-para-type-nominal-para-enum)
+  - [3.3 Exhaustividad en `match` — RESUELTO (enum + literales, or-patterns, guardas)](#33-exhaustividad-en-match--resuelto-enum--literales-or-patterns-guardas)
+  - [3.4 Nullability (`T?`) — RESUELTO (default aplicado)](#34-nullability-t--resuelto-default-aplicado)
+  - [3.5 Manejo de errores en `rpc` — RESUELTO (default aplicado)](#35-manejo-de-errores-en-rpc--resuelto-default-aplicado)
+  - [3.6 Genéricos definidos por el usuario — RESUELTO (monomorfización)](#36-genéricos-definidos-por-el-usuario--resuelto-monomorfización)
+  - [3.7 Operadores e `if/else`](#37-operadores-e-ifelse)
+  - [3.8 Métodos builtin](#38-métodos-builtin)
+  - [3.9 Uniones de tipo (`A | B`) — RESUELTO (subtipado de flujo de valor Y narrowing)](#39-uniones-de-tipo-a--b--resuelto-subtipado-de-flujo-de-valor-y-narrowing)
+  - [3.10 Funciones como valores — RESUELTO (referencias Y closures reales, `.map`/`.filter`)](#310-funciones-como-valores--resuelto-referencias-y-closures-reales-mapfilter)
+  - [3.11 Validadores runtime (`validators.ts`) — RESUELTO](#311-validadores-runtime-validatorsts--resuelto)
+  - [3.12 "DB tipada" v0 (`db { ... }`) — RESUELTO](#312-db-tipada-v0-db-----resuelto)
+  - [3.13 Streaming real (SSE) para `stream` — RESUELTO, alcance `List<T>`](#313-streaming-real-sse-para-stream--resuelto-alcance-listt)
+  - [3.14 Auth v0 (sesión opaca en memoria + roles) — RESUELTO](#314-auth-v0-sesión-opaca-en-memoria--roles--resuelto)
+  - [3.15 Constructo de loop: `while` — RESUELTO, alcance acotado](#315-constructo-de-loop-while--resuelto-alcance-acotado)
+  - [3.16 Push real: pub-sub sobre `db` para `stream` — RESUELTO, alcance acotado (shape fijo)](#316-push-real-pub-sub-sobre-db-para-stream--resuelto-alcance-acotado-shape-fijo)
+  - [3.17 Persistencia real: `db` sobre SQLite — RESUELTO](#317-persistencia-real-db-sobre-sqlite--resuelto)
+  - [3.18 CRUD real: `delete`/`deleteWhere`/`findWhere` sobre `db` — RESUELTO](#318-crud-real-deletedeletewherefindwhere-sobre-db--resuelto)
+  - [3.19 Protocolo LSP real (`linkc lsp`) — RESUELTO, Nivel 1+2](#319-protocolo-lsp-real-linkc-lsp--resuelto-nivel-12)
+  - [3.20 Codegen WASM nativo v0 (`linkc wasm`) — RESUELTO, alcance mínimo](#320-codegen-wasm-nativo-v0-linkc-wasm--resuelto-alcance-mínimo)
+  - [3.21 LSP Nivel 3 (Ronda 1/3): goto-definición de un nombre de tipo en una firma — RESUELTO](#321-lsp-nivel-3-ronda-13-goto-definición-de-un-nombre-de-tipo-en-una-firma--resuelto)
+  - [3.22 Identidad de archivo en `Span` — RESUELTO](#322-identidad-de-archivo-en-span--resuelto)
+  - [3.23 `Field`/`Param` ganan `name_span` — RESUELTO](#323-fieldparam-ganan-name_span--resuelto)
+  - [3.24 Hover de expresión arbitraria — RESUELTO, LSP Nivel 3 ronda 2/3](#324-hover-de-expresión-arbitraria--resuelto-lsp-nivel-3-ronda-23)
+  - [3.25 Completion sensible al tipo del receptor — RESUELTO, LSP Nivel 3 ronda 3/3 (último ítem)](#325-completion-sensible-al-tipo-del-receptor--resuelto-lsp-nivel-3-ronda-33-último-ítem)
+  - [3.26 Observabilidad: tracing estructurado por RPC — RESUELTO, v0](#326-observabilidad-tracing-estructurado-por-rpc--resuelto-v0)
+  - [3.27 Hot reload real en `linkc dev` — RESUELTO, v0](#327-hot-reload-real-en-linkc-dev--resuelto-v0)
+  - [3.28 Fase 3 (PLAN.md §4): política de estabilidad de sintaxis, y por qué source maps NO se persigue todavía](#328-fase-3-planmd-4-política-de-estabilidad-de-sintaxis-y-por-qué-source-maps-no-se-persigue-todavía)
+  - [3.29 `linkc test`: contrato contra un snapshot commiteado (PLAN.md §5, "tests de contrato")](#329-linkc-test-contrato-contra-un-snapshot-commiteado-planmd-5-tests-de-contrato)
+  - [3.30 `Int64` — RESUELTO, cierra la única fila "no" de tipos que quedaba en PLAN.md §2.3](#330-int64--resuelto-cierra-la-única-fila-no-de-tipos-que-quedaba-en-planmd-23)
+  - [3.31 `Timestamp` — RESUELTO, alcance acotado a propósito](#331-timestamp--resuelto-alcance-acotado-a-propósito)
+  - [3.32 Función builtin `now() -> Timestamp` — RESUELTO](#332-función-builtin-now---timestamp--resuelto)
+  - [3.33 Test runner de comportamiento integrado (`test "nombre" { ... }`, `assert`, `panic`) — RESUELTO](#333-test-runner-de-comportamiento-integrado-test-nombre----assert-panic--resuelto)
+  - [3.34 `crypto`: contraseñas y aleatoriedad — RESUELTO (Argon2id + CSPRNG del SO)](#334-crypto-contraseñas-y-aleatoriedad--resuelto-argon2id--csprng-del-so)
+  - [3.35 `@content_type`: respuestas que no son JSON — RESUELTO (alcance acotado)](#335-content_type-respuestas-que-no-son-json--resuelto-alcance-acotado)
+  - [3.36 PostgreSQL en runtime — RESUELTO (alcance acotado)](#336-postgresql-en-runtime--resuelto-alcance-acotado)
+- [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
+  - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
+  - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
+- [5. Estado](#5-estado)
+
+---
+
 ## 1. Gramática Léxica
 
 ```ebnf
@@ -57,9 +116,11 @@ field        = identifier , [ "?" ] , ":" , type_expr ;
 const_decl   = "const" , identifier , ":" , type_expr , "=" , expr , ";" ;
 
 service_decl = "service" , identifier , "{" , { member_decl } , "}" ;
-member_decl  = [ annotation ] , ( rpc_decl | stream_decl ) ;
+member_decl  = { annotation } , ( rpc_decl | stream_decl ) ;
 (* auth v0, §3.14 -- a lo sumo UNA por rpc/stream, nunca una lista *)
-annotation   = "@authenticated" | "@requires" , "(" , identifier , "." , identifier , ")" ;
+annotation   = "@authenticated"
+             | "@requires" , "(" , identifier , "." , identifier , ")"
+             | "@content_type" , "(" , string_lit , ")" ;
 rpc_decl     = "rpc" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 stream_decl  = "stream" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 param_list   = param , { "," , param } ;
@@ -725,7 +786,7 @@ service Users {
 }
 ```
 
-`@authenticated` exige una sesión válida, cualquier rol. `@requires(Enum.Variante)` exige además que el rol de esa sesión sea exactamente esa variante. **A lo sumo una anotación por rpc/stream** (`RpcDecl.annotation: Option<Annotation>`, nunca una lista) y **un solo rol por `@requires`** (sin OR de roles) — límites deliberados de v0, no descuidos.
+`@authenticated` exige una sesión válida, cualquier rol. `@requires(Enum.Variante)` exige además que el rol de esa sesión sea exactamente esa variante. **A lo sumo una anotación DE AUTH por rpc/stream** (`@requires` ya implica autenticado; el checker rechaza dos) y **un solo rol por `@requires`** (sin OR de roles) — límites deliberados de v0, no descuidos. Desde §3.35 la lista sí admite varias anotaciones (`RpcDecl.annotations: Vec<Annotation>`), porque `@content_type` es una dimensión distinta de la auth: una página de panel de administración es HTML *y* está protegida.
 
 **`@requires(Role.Admin)` reusa el mecanismo de `Enum.Variante` que YA existía para nombrar una variante en un patrón de `match`** (`parse_pattern_atom`, `ident "." ident`, SIN llaves) — no se inventó una tercera sintaxis. Esto es a propósito ASIMÉTRICO con `Role.Admin {}` (que sí hace falta para *construir* un valor real, ej. al llamar `auth.createSession(Role.Admin {})`): una anotación nombra un TAG a comparar, una expresión construye un VALOR — dos reglas correctas por separado, pero que un usuario puede confundir la primera vez que las ve una al lado de la otra.
 
@@ -1154,6 +1215,7 @@ Cierra el límite honesto documentado en §3.31 ("sin construcción desde códig
 
 Completa el objetivo de PLAN.md §5 ("Testing: runner integrado"). Permite escribir tests de integración y comportamiento directamente en archivos `.link`.
 
+<!-- linkc:check -->
 ```link
 type User = { id: Int, name: String }
 db { users: User[] }
@@ -1176,6 +1238,281 @@ test "crear usuario incrementa id y persiste" {
 - **Llamada a servicios:** Dentro de los tests (y en el lenguaje en general), los servicios y sus RPCs pueden ser invocados directamente como `Service.rpc(args...)`.
 - **Builtins:** `assert(cond: Bool, [msg: String])` verifica condiciones y falla con el mensaje especificado; `panic(msg: String)` aborta la ejecución con un error explícito.
 - **CLI:** `linkc test <archivo.link>` ejecuta todos los tests de comportamiento y reporta el conteo de pasados/fallidos con exit code 0 o 1. Si se pasa un segundo argumento `.snap`, continúa ejecutando el test de snapshot de contratos.
+
+---
+
+### 3.34 `crypto`: contraseñas y aleatoriedad — RESUELTO (Argon2id + CSPRNG del SO)
+
+Auditoría del 20/08/2026, disparada por un intento real de migrar un panel de
+administración a c-script: el módulo `crypto` tenía el nombre de la seguridad
+pero no su comportamiento. Las cuatro cosas que estaban mal, todas en
+`runtime/mod.rs`:
+
+1. **`hashPassword` era un solo SHA-256 con una sal constante** —
+   `"link_salt_2026"`, escrita en el compilador. No una sal por usuario: la
+   MISMA sal para toda aplicación escrita en este lenguaje, en cualquier parte
+   del mundo. Dos usuarios con la misma contraseña producían el mismo hash, y
+   una única rainbow table calculada una vez servía contra todas. Sin
+   iteraciones ni costo de memoria, además: exactamente el escenario para el
+   que existe un KDF.
+2. **`verifyPassword` comparaba con `==` de `String`**, que corta en el primer
+   byte distinto. El tiempo de respuesta filtra cuántos caracteres del hash
+   acertó quien está probando.
+3. **`randomToken(n)` era SHA-256 del reloj** (`SystemTime::now().as_nanos()`
+   más el largo pedido). Un token es adivinable para quien pueda acotar el
+   instante en que se emitió, y dos llamadas dentro del mismo nanosegundo
+   devuelven el mismo token. Cero bits de entropía real.
+4. **`uuid()` era lo mismo**, formateado con los bits de versión de un v4 para
+   que pareciera aleatorio. Dos identificadores "únicos" generados en el mismo
+   nanosegundo eran idénticos.
+
+Lo notable del hallazgo es dónde NO estaba el bug: `runtime/session.rs` ya
+había pasado por una auditoría propia sobre exactamente este tema (el problema
+de `RandomState`, documentado en §3.14) y sus tokens de sesión sí tenían
+entropía del sistema. La corrección se había aplicado a una capa y nunca se
+propagó a la API que ve el usuario del lenguaje — el mismo patrón
+"dos capas que discrepan" que este documento viene registrando desde §3.9.
+
+**Lo que hay ahora:**
+
+| Función | Implementación |
+|---|---|
+| `crypto.hashPassword(pwd)` | Argon2id (RFC 9106, parámetros por defecto de la crate `argon2`: m=19 MiB, t=2, p=1) con sal aleatoria de 16 bytes **por contraseña**, salida en formato PHC `$argon2id$v=19$m=...,t=...,p=...$sal$hash` |
+| `crypto.verifyPassword(pwd, hash)` | Verificación de la crate, que compara en tiempo constante; el camino legado usa `subtle::ConstantTimeEq` |
+| `crypto.randomToken(n)` | `getrandom` (CSPRNG del SO: `BCryptGenRandom` en Windows, `getrandom(2)` en Linux, `random_get` en WASI) |
+| `crypto.uuid()` | UUIDv4 real, 122 bits del mismo CSPRNG |
+| `crypto.hashSha256(s)` | Sin cambios: es un digest y se documenta como tal, no como algo para contraseñas |
+
+**Migración, y por qué se aceptan los hashes viejos.** `verifyPassword`
+reconoce el formato anterior (`sha256$<sal>$<hex>`) y lo verifica en tiempo
+constante. Rechazarlo habría sido más "limpio", pero significaría que
+actualizar el compilador deja afuera a todos los usuarios ya registrados de
+cualquier app en producción. La próxima vez que esa contraseña se guarde,
+`hashPassword` la escribe ya en Argon2id.
+
+**Límites honestos de esta ronda:**
+
+- **Los parámetros de Argon2id no se pueden configurar desde el lenguaje.** Son
+  los del default de la crate. Un servicio que necesite subir el costo de
+  memoria hoy no tiene cómo pedirlo.
+- **No hay señal de "este hash es viejo, re-hashealo".** `verifyPassword`
+  devuelve `Bool`; quien quiera migrar de forma proactiva tiene que mirar el
+  prefijo del hash guardado desde su propio código.
+- **Hashear bloquea el hilo del servidor.** El intérprete es single-threaded
+  por diseño (§3.13), y un `hashPassword` cuesta ~15 ms en la máquina donde se
+  midió esto. Es el precio correcto para un login, pero es tiempo de servidor
+  serializado: N logins simultáneos se atienden uno detrás del otro.
+- **Sin rotación ni expiración de sesiones** — eso sigue como estaba en §3.14.
+
+**Tests que fijan estas propiedades** (`runtime/mod.rs`, módulo de tests): que
+dos hashes de la misma contraseña difieran, que ambos verifiquen igual, que el
+hash declare `$argon2id$`, que un hash legado válido siga verificando y uno que
+no corresponde no, y que dos `randomToken`/`uuid` consecutivos sean distintos.
+Cada uno de esos asserts falla con la implementación anterior — que es la
+prueba de que testean la propiedad y no la firma.
+
+---
+
+### 3.35 `@content_type`: respuestas que no son JSON — RESUELTO (alcance acotado)
+
+El `Content-Type` de la respuesta estaba literal en el binario: `application/json`
+para todo rpc, `text/event-stream` para todo stream. No había una tercera vía, y
+eso no es un detalle de implementación — significa que un programa c-script **no
+puede devolver una página**. Sin HTML no hay render en servidor, y sin render en
+servidor no hay SEO: el hallazgo salió de un intento real de migrar un sitio con
+178 páginas públicas, que se frenó exactamente acá.
+
+**Lo que hay ahora:** un rpc que devuelve `String` puede declarar el
+Content-Type de su respuesta, y entonces el cuerpo es ese `String` **tal cual**,
+sin las comillas de JSON alrededor. Sirve igual para un sitemap XML, un CSV, un
+`robots.txt` o texto plano:
+
+<!-- linkc:check -->
+```link
+type Article = { id: Int, slug: String, title: String }
+type NewArticle = { slug: String, title: String }
+
+enum Role { Admin, Member }
+
+db { articles: Article[], }
+
+service Site {
+  @content_type("text/html; charset=utf-8")
+  rpc home() -> String {
+    "<!doctype html><html><head><title>Mi sitio</title></head><body><h1>Hola</h1></body></html>"
+  }
+
+  @content_type("application/xml; charset=utf-8")
+  rpc sitemap() -> String {
+    "<?xml version=\"1.0\"?><urlset><url><loc>https://ejemplo.com/</loc></url></urlset>"
+  }
+
+  // Una página protegida: auth y Content-Type son dimensiones distintas y se
+  // combinan. Sin token, la respuesta es un 401 en JSON, no una página.
+  @requires(Role.Admin)
+  @content_type("text/html; charset=utf-8")
+  rpc panel() -> String {
+    "<h1>Panel</h1>"
+  }
+
+  // Un rpc sin la anotación sigue respondiendo JSON, igual que siempre.
+  rpc list() -> Article[] {
+    db.articles.all()
+  }
+}
+
+test "la pagina se arma como String" {
+  assert(Site.home().contains("<h1>Hola</h1>"), "el html sale entero");
+  assert(Site.list().length() == 0, "y los rpc normales siguen devolviendo datos");
+}
+```
+
+**Las tres piezas tienen que coincidir, y por eso las tres cambiaron:**
+
+- `runtime/server.rs` manda el header declarado y escribe el String crudo.
+- `codegen/ts_emit.rs` genera `await res.text()` para ese rpc en vez de
+  `res.json()`. La primera versión no lo hacía, y el cliente generado moría con
+  un `SyntaxError` sobre el primer `<` del HTML — el mismo patrón de
+  "dos capas que discrepan" de §3.9: el servidor tenía razón y el cliente no se
+  había enterado.
+- `codegen/openapi_emit.rs` declara ese Content-Type en la respuesta 200. Si
+  siguiera diciendo `application/json`, cualquier cliente generado a partir del
+  spec parsearía mal.
+
+**Reglas que impone el checker** (con su error, en tiempo de compilación):
+
+| Caso | Por qué se rechaza |
+|---|---|
+| El rpc no devuelve `String` | El cuerpo se escribe tal cual; una lista de structs no es texto |
+| Sobre un `stream` | SSE define su propio Content-Type por protocolo (§3.13) |
+| `@content_type` dos veces | Una respuesta tiene un solo Content-Type |
+| Valor vacío | No es un tipo MIME |
+| Dos anotaciones de auth | `@requires` ya implica autenticado (§3.14) |
+
+**Las anotaciones pasaron de `Option<Annotation>` a `Vec<Annotation>`.** El
+modelo anterior ("a lo sumo una") hacía inexpresable justo el caso que motivó
+todo esto en su forma más útil: un panel de administración es HTML **y** está
+detrás de `@requires(Role.Admin)`. Combinar auth con `@content_type` ahora se
+puede; combinar dos anotaciones de la misma dimensión, no.
+
+**Límites honestos de esta ronda:**
+
+- **Los errores siguen saliendo en JSON**, aunque el rpc declare HTML. Es
+  deliberado: el cliente generado espera `{"error": ...}` para cualquier status
+  ≥ 400, y devolver una página de error rompería ese contrato justo cuando algo
+  ya salió mal. No hay forma de servir una página de error 404 propia.
+- **El ruteo no cambió**: la URL sigue siendo `/Servicio/rpc`. Para SEO de
+  verdad hacen falta rutas limpias (`/blog/mi-articulo`) y parámetros en el
+  path, que es una ronda aparte — hoy se resuelve con un proxy adelante.
+- **No hay helpers de plantillas.** El HTML se arma concatenando `String`, sin
+  escapado automático: quien interpole datos de la base tiene que escaparlos a
+  mano. Es una fuente real de XSS y hoy el lenguaje no ayuda.
+- **Sin `Cache-Control`, `ETag` ni compresión** — nada de la capa de caching
+  HTTP es configurable todavía.
+
+**Verificado** en `compiler/tests/cli_content_type.rs` contra el binario real:
+un servidor de verdad devolviendo HTML y XML con su header, un rpc normal
+respondiendo JSON igual que siempre, el cliente generado leyendo texto, el
+spec OpenAPI declarando lo mismo que manda el servidor, las cuatro
+combinaciones que el checker rechaza, y una página HTML detrás de
+`@requires(Role.Admin)` que sin token devuelve un 401 en JSON.
+
+---
+
+### 3.36 PostgreSQL en runtime — RESUELTO (alcance acotado)
+
+`runtime/postgres.rs` existía desde v1.0 y generaba DDL: `linkc build` emitía un
+`schema.postgres.sql` correcto, con BIGINT/JSONB/DOUBLE PRECISION y todo. Lo que
+no existía era el otro extremo: **`linkc serve` usaba SQLite siempre, sin
+excepción**. No había forma de conectar un programa c-script a la base que un
+equipo ya administra, y el propio README hablaba de un "adaptador PostgreSQL
+enterprise" que en realidad era un generador de texto. Ningún test lo detectaba
+porque los tests de esa capa comparaban strings de SQL contra strings esperados
+-- nunca tocaron una base.
+
+**Lo que hay ahora:**
+
+```bash
+linkc serve app.link 8787 --db postgres://usuario:clave@host/base
+LINK_DATABASE_URL=postgres://... linkc serve app.link 8787
+```
+
+Sin `--db` ni variable de entorno, el default no cambió: `app.link` → `app.db`,
+SQLite al lado del fuente (§3.17). Un valor que empieza con `postgres://` o
+`postgresql://` es PostgreSQL; cualquier otro es la ruta de un archivo SQLite.
+
+**Lo que NO cambia según el backend:** nada del lenguaje. El mismo `.link`, los
+mismos `rpc`, el mismo contrato TypeScript generado, los mismos `test`. Un
+programa no se entera de qué motor tiene atrás.
+
+**Cómo está partido el código.** `runtime/store.rs` es la única capa que sabe de
+motores, y lo que contiene es exactamente lo que difiere entre los dos:
+
+| | SQLite | PostgreSQL |
+|---|---|---|
+| Placeholders | `?` | `$1`, `$2`, … |
+| Id recién insertado | `last_insert_rowid()` | `RETURNING "id"` |
+| Booleano | INTEGER 0/1 | BOOLEAN |
+| Compuestos | TEXT con JSON adentro | JSONB nativo |
+| Clave primaria | `INTEGER PRIMARY KEY AUTOINCREMENT` | `BIGSERIAL` |
+| Deriva de esquema | falla fuerte (§3.17) | `ALTER TABLE … ADD COLUMN IF NOT EXISTS` |
+
+Todo lo demás -- y es donde está lo difícil -- sigue siendo un solo código para
+los dos: `ColumnPlan` decide qué campo va a columna nativa y cuál a JSON, con el
+caso `campo?: T?` que necesita tres estados (ausente / null / valor) donde una
+columna SQL tiene un solo bit de NULL. Esa regla es del LENGUAJE, no del motor,
+y duplicarla por backend habría sido la forma más rápida de que los dos se
+separaran con el tiempo.
+
+Por el mismo motivo, el DDL que crea el runtime sale del MISMO
+`create_postgres_table_sql` que usa `linkc build` para emitir
+`schema.postgres.sql`. Si el runtime armara las tablas por su cuenta, el
+esquema que el proyecto documenta y el que la base realmente tiene podrían
+divergir, que es la familia de bugs que §3.9 viene registrando.
+
+**Lo legible desde SQL.** Un enum simple se guarda como el nombre de su variante
+en texto plano (`'Admin'`), no como un número; un struct anidado es JSONB de
+verdad, consultable con `->>` e indexable. La promesa de "es tu Postgres de
+siempre" solo vale si se puede abrir con `psql` y entender lo que hay, así que
+hay un test que consulta la tabla por fuera de c-script para fijarlo.
+
+**Migración no destructiva.** Al conectarse, el runtime hace `CREATE TABLE IF
+NOT EXISTS` y después un `ADD COLUMN IF NOT EXISTS` por campo. Una tabla escrita
+por una versión anterior del programa gana las columnas nuevas sin perder filas.
+Es distinto a propósito de lo que hace SQLite (§3.17), que ante cualquier deriva
+de esquema falla fuerte: PostgreSQL es el backend donde hay datos de producción
+y volver a crear la tabla no es una opción.
+
+**Límites honestos de esta ronda:**
+
+- **La columna migrada siempre queda nullable**, aunque el campo sea requerido:
+  `ADD COLUMN … NOT NULL` sobre una tabla con filas falla, porque no hay valor
+  que poner en las que ya están. No hay forma de dar un default todavía.
+- **Ninguna otra migración es automática**: renombrar un campo, cambiarle el
+  tipo o borrarlo no se detecta ni se aplica. La columna vieja queda ahí.
+- **Una sola conexión, sin pool.** El intérprete es single-threaded por diseño
+  (§3.13) y atiende una request a la vez, así que un pool no compraría nada
+  todavía -- pero tampoco hay reconexión: si la base se cae, el servidor no se
+  recupera solo.
+- **Sin TLS**: la conexión se abre con `NoTls`. Alcanza para una base en la
+  misma red privada; no para una remota sobre internet.
+- **Sin transacciones expuestas.** Cada operación va sola, igual que en SQLite;
+  el lenguaje no tiene todavía forma de agrupar varias en una transacción.
+- **`LISTEN`/`NOTIFY` no se usa.** Los `stream` (§3.16) siguen notificando desde
+  el proceso, así que dos instancias de `linkc serve` contra la misma base no se
+  enteran de las escrituras de la otra. Con SQLite pasaba lo mismo; en
+  PostgreSQL duele más, porque compartir la base entre instancias es
+  justamente para lo que uno la elige.
+
+**Verificado** en `compiler/tests/pg_integration.rs` contra un PostgreSQL real
+(el job `postgres` de CI levanta un `postgres:16`): el CRUD completo por HTTP
+contra un servidor real, las filas sobreviviendo al reinicio del proceso, la
+tabla leída desde SQL plano (incluido un `WHERE meta->>'source'`), el esquema
+real comparado columna por columna contra el `schema.postgres.sql` que emite
+`linkc build`, una migración que agrega un campo sin perder filas, y una URL
+inválida que falla con un mensaje en vez de un panic. Si la variable de entorno
+con la URL falta, el test **falla** en vez de saltearse: un test que se saltea en
+silencio pasa en verde sin haber probado nada.
 
 ---
 
