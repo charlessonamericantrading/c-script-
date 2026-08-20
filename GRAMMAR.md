@@ -1514,6 +1514,36 @@ inválida que falla con un mensaje en vez de un panic. Si la variable de entorno
 con la URL falta, el test **falla** en vez de saltearse: un test que se saltea en
 silencio pasa en verde sin haber probado nada.
 
+**Corrección post-release (20/08/2026, v1.1.1): una tabla preexistente con `id`
+no entero tiraba abajo el servidor entero.** `CREATE TABLE IF NOT EXISTS` es un
+no-op sobre una tabla que ya existía -- nunca mira sus columnas. Encontrado en
+un intento real de migración desde un backend que ya usaba UUID como clave
+primaria: apuntar `linkc serve` a esa tabla conectaba sin ninguna queja, y
+recién en el primer `insert` -- `RETURNING "id"` leído como `i64` contra una
+columna `uuid` vía `Row::get` (que en `tokio-postgres` panickea si el valor no
+convierte al tipo pedido, a diferencia de todo lo demás en `store.rs`, que usa
+`try_get`) -- el proceso moría. Y como `handle_rpc` corre sincrónico en el hilo
+principal del accept-loop (`server.rs`), ese panic no tiraba abajo solo esa
+request: tiraba abajo el servidor completo, para cualquier cliente conectado,
+en cualquier colección.
+
+Dos capas de arreglo:
+
+1. `store.rs::insert_returning_id` pasa a `try_get` -- defensa en profundidad,
+   ninguna lectura de PostgreSQL en el archivo debería poder panickear.
+2. `Db::connect_postgres` valida el tipo de `"id"` de cualquier tabla
+   preexistente ANTES de aceptar la primera request (`validate_existing_id_column`
+   en `runtime/db.rs`) -- mismo momento y mismo criterio que `check_schema_matches`
+   ya aplica para SQLite (§3.17), adaptado a que Postgres no recrea tablas: si
+   `"id"` no es `bigint`/`integer`/`smallint`, el arranque falla con un mensaje
+   que nombra la tabla y el tipo real encontrado, en vez de conectar igual y
+   fallar recién en el primer insert.
+
+Verificado en `pg_integration.rs`: una tabla creada a mano con
+`id UUID PRIMARY KEY DEFAULT gen_random_uuid()`, apuntando `linkc serve` a
+ella -- el arranque falla, el mensaje nombra `uuid` y la tabla, nunca aparece
+`panicked at`, y el servidor nunca llega a imprimir que está escuchando.
+
 ---
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)

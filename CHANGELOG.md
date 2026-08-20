@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.1.1] - 2026-08-20
+
+### 🔥 Arreglo crítico
+- **Una tabla PostgreSQL preexistente con `id` no entero tiraba abajo el servidor completo.** Bug introducido en la propia v1.1.0, encontrado en un intento real de migración desde un backend que ya usaba UUID como clave primaria. `CREATE TABLE IF NOT EXISTS` es un no-op sobre una tabla que ya existía y nunca miraba sus columnas; el primer `insert` contra ella hacía panic (`Row::get` de `tokio-postgres` panickea si el valor no convierte al tipo pedido) en el hilo principal del servidor -- así que no fallaba esa request, fallaba el proceso entero, para todos los clientes conectados. Ahora `linkc serve` rechaza el arranque con un mensaje claro (qué tabla, qué tipo encontró) antes de aceptar una sola conexión, y ninguna lectura de PostgreSQL en `store.rs` puede panickear (defensa en profundidad). Detalle completo y verificación contra un PostgreSQL real: GRAMMAR.md §3.36.
+
 ## [1.1.0] - 2026-08-20
 
 Versión menor y no de parche porque hay features nuevas (PostgreSQL en runtime,

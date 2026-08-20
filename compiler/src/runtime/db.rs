@@ -198,6 +198,58 @@ fn check_schema_matches(connection: &Connection, collection: &str, columns: &[Co
     )))
 }
 
+/// Equivalente de `check_schema_matches` para PostgreSQL, pero acotado a lo
+/// único que de verdad puede tirar abajo el servidor si se lo deja pasar: el
+/// tipo de "id" en una tabla que YA EXISTÍA antes de este `connect_postgres`.
+///
+/// `CREATE TABLE IF NOT EXISTS` es un no-op sobre una tabla preexistente --
+/// nunca mira sus columnas. Encontrado en producción real: una tabla creada
+/// por otro sistema con `id UUID` (típico al migrar desde un backend que ya
+/// usaba UUID como clave primaria) dejaba pasar el connect sin ninguna queja,
+/// y recién en el primer `insert` -- `RETURNING "id"` leído con `i64` contra
+/// una columna `uuid` -- `store.rs::insert_returning_id` panickeaba. Como
+/// `handle_rpc` corre sincrónico en el hilo principal del accept-loop
+/// (server.rs), ese panic no tiraba abajo solo esa request: tiraba abajo el
+/// proceso entero. Acá se falla ANTES de aceptar la primera request, con un
+/// mensaje que dice qué pasó y qué hacer -- el mismo momento y el mismo
+/// criterio que `check_schema_matches` ya aplica para SQLite.
+///
+/// A propósito NO se generaliza a validar TODAS las columnas como hace
+/// `check_schema_matches`: PostgreSQL es el backend con auto-migración no
+/// destructiva (`ALTER TABLE ADD COLUMN IF NOT EXISTS`, ver `connect_postgres`
+/// más abajo) -- un tipo distinto en una columna que no sea "id" hoy se
+/// descubre en la primera lectura, vía el `try_get` normal de `store.rs`, que
+/// devuelve un error limpio, NO un panic (el panic era específico de la
+/// variante `Row::get` sin chequear que usaba justo el fetch del id nuevo).
+/// "id" es el único caso donde ese error limpio no alcanzaba a tiempo.
+fn validate_existing_id_column(backend: &Backend, collection: &str) -> Result<(), String> {
+    let sql = format!(
+        "SELECT data_type FROM information_schema.columns WHERE table_name = {} AND column_name = 'id'",
+        backend.placeholder(1)
+    );
+    let rows = backend
+        .query(&sql, &[Cell::Text(collection.to_string())], &[ColumnKind::Text])
+        .map_err(|e| format!("no se pudo verificar el esquema de '{collection}' en PostgreSQL: {e}"))?;
+
+    // Sin fila: o la tabla se acaba de crear (su "id" siempre es BIGSERIAL,
+    // por construcción -- nada que validar) o por algún motivo no tiene
+    // columna "id" en absoluto, en cuyo caso cualquier find/insert/delete
+    // sobre esta colección va a fallar de todos modos con su propio mensaje.
+    // Ninguno de los dos casos es este el lugar para inventar uno mejor.
+    let Some(Cell::Text(data_type)) = rows.first().and_then(|row| row.first()) else {
+        return Ok(());
+    };
+    if matches!(data_type.as_str(), "bigint" | "integer" | "smallint") {
+        return Ok(());
+    }
+    Err(format!(
+        "la tabla '{collection}' ya existe en PostgreSQL con \"id\" de tipo '{data_type}', pero c-script requiere una \
+         clave primaria entera autoincremental (BIGSERIAL) -- típico al migrar desde un backend que usaba UUID como id. \
+         No se puede usar esta tabla sin migrarla a mano: agregá una columna \"id\" BIGSERIAL nueva, o apuntá esta \
+         colección a otro nombre de tabla."
+    ))
+}
+
 pub struct Db {
     backend: Backend,
     /// Reconstruido UNA vez por vida del servidor (no por request, a
@@ -306,6 +358,17 @@ impl Db {
             backend
                 .execute_ddl(&super::postgres::create_postgres_table_sql(name, &non_id, &simple_enums))
                 .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
+
+            // `CREATE TABLE IF NOT EXISTS` es un no-op sobre una tabla que ya
+            // existía -- nunca mira si SU "id" es compatible. Encontrado en
+            // producción: una tabla real con `id UUID` (migrando desde otro
+            // backend) dejaba pasar el connect sin queja, y el primer insert
+            // recién ahí fallaba -- antes de este chequeo, con un panic que
+            // tiraba abajo el servidor entero (ver store.rs::insert_returning_id).
+            // Falla ACÁ, al conectar, con un mensaje que dice qué hacer --
+            // mismo momento y mismo criterio que `check_schema_matches` ya
+            // aplica para SQLite, adaptado a que Postgres no recrea tablas.
+            validate_existing_id_column(&backend, name)?;
 
             // Migración no destructiva: una tabla que ya existe de una versión
             // anterior del programa gana las columnas nuevas. A diferencia de

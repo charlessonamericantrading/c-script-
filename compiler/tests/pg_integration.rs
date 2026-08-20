@@ -441,6 +441,61 @@ fn a_new_field_is_added_to_an_existing_table_without_losing_rows() {
 }
 
 #[test]
+fn a_preexisting_table_with_a_non_integer_id_fails_at_connect_not_at_first_insert() {
+    // Encontrado en producción real (migrando desde un backend que ya usaba
+    // UUID como clave primaria): una tabla creada por OTRO sistema, con
+    // `id UUID`, dejaba pasar `CREATE TABLE IF NOT EXISTS` sin ninguna queja
+    // -- es un no-op sobre una tabla que ya existe, nunca mira sus columnas.
+    // El primer `db.<col>.insert(...)` recién ahí explotaba: `RETURNING "id"`
+    // leído como `i64` contra una columna `uuid` -- y como `handle_rpc` corre
+    // sincrónico en el hilo principal del accept-loop (server.rs), eso no
+    // tiraba abajo solo esa request, tiraba abajo el PROCESO ENTERO.
+    //
+    // Este test fija que ahora se rechaza ANTES de aceptar la primera
+    // conexión, con un mensaje que dice qué pasó -- nunca con un panic.
+    const COLLECTION: &str = "leads_uuid_id";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\"id\" UUID PRIMARY KEY DEFAULT gen_random_uuid(), \"email\" TEXT NOT NULL)"
+        ))
+        .expect("crear la tabla preexistente con id UUID (simula una migrada desde otro backend)");
+
+    let temp = TempDir::new("uuid-id");
+    let src = temp.program(COLLECTION);
+
+    // Arranque directo -- a diferencia de Serve::start, que esperaría el
+    // puerto en vano: esto tiene que fallar YA, antes de que el servidor
+    // llegue a escuchar nada.
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("serve")
+        .arg(&src)
+        .arg(free_port().to_string())
+        .env("LINK_DATABASE_URL", &url)
+        .output()
+        .expect("ejecutar linkc serve");
+
+    assert!(!out.status.success(), "una tabla con id no entero no puede terminar en éxito");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("uuid"), "el error tiene que nombrar el tipo real encontrado: {stderr}");
+    assert!(stderr.contains(COLLECTION), "el error tiene que nombrar la tabla: {stderr}");
+    assert!(
+        !stderr.contains("panicked at"),
+        "tiene que fallar LIMPIO al conectar, no crashear el proceso en el primer insert: {stderr}"
+    );
+    // Confirma que el rechazo pasa ANTES de aceptar una conexión, no que el
+    // accept-loop murió después de arrancar bien.
+    assert!(!stderr.contains("escuchando en"), "no debió llegar a anunciar que estaba sirviendo: {stderr}");
+}
+
+#[test]
 fn a_bad_connection_url_fails_with_a_message_instead_of_a_panic() {
     // Este no necesita base: prueba justamente el camino en que no hay ninguna.
     let temp = TempDir::new("badurl");

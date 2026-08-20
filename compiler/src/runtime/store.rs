@@ -160,7 +160,18 @@ impl Backend {
                     .borrow_mut()
                     .query_one(&returning, refs.as_slice())
                     .map_err(|e| e.to_string())?;
-                Ok(row.get::<_, i64>(0))
+                // `Row::get` (a diferencia de todo lo demás en este archivo)
+                // PANICKEA si el valor no convierte al tipo pedido -- documentado
+                // así en tokio-postgres. `Db::connect_postgres` ya rechaza al
+                // conectar cualquier tabla preexistente cuyo "id" no sea entero
+                // (ver validate_existing_id_column en db.rs), así que en el
+                // camino normal esto nunca dispara -- pero como handle_rpc corre
+                // sincrónico en el hilo principal del accept-loop (server.rs), un
+                // panic acá tira abajo el servidor ENTERO, no solo esta request.
+                // `try_get` es la variante que no panickea: defensa en
+                // profundidad, no confiar en que la validación de arriba sea la
+                // única puerta.
+                row.try_get::<_, i64>(0).map_err(|e| e.to_string())
             }
         }
     }
