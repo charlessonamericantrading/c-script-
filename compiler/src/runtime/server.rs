@@ -62,7 +62,17 @@ fn log_done(req_id: u64, method: Option<&str>, status: u16, start: std::time::In
     }
 }
 
-pub fn serve(program: Program, port: u16, db_path: PathBuf) {
+/// De dónde salen los datos que sirve este servidor (GRAMMAR.md §3.36).
+/// El resto del programa no cambia según cuál sea: el mismo `.link`, los
+/// mismos rpc, el mismo contrato TypeScript generado.
+pub enum DbSource {
+    /// Un archivo SQLite al lado del fuente -- el default de siempre.
+    SqliteFile(PathBuf),
+    /// Una URL de conexión de PostgreSQL (`postgres://usuario:clave@host/base`).
+    Postgres(String),
+}
+
+pub fn serve(program: Program, port: u16, source: DbSource) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
@@ -75,11 +85,26 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
     // desconocida: 'items'" en cada rpc; y uno que sí declaraba `users`
     // pero con otra forma recibía los campos del `User` del demo, que su
     // propio tipo no tiene.
-    let db = Db::new(&program, &db_path);
+    let db = match source {
+        DbSource::SqliteFile(db_path) => Db::new(&program, &db_path),
+        // A diferencia de abrir un archivo local, conectarse a una base remota
+        // falla por motivos operativos normales (está caída, la clave cambió,
+        // la base no existe todavía). Eso merece un mensaje que se entienda y
+        // un exit code, no el panic que usa el camino de SQLite.
+        DbSource::Postgres(url) => match Db::connect_postgres(&program, &url) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("error: {e}");
+                eprintln!("       revisá la URL de conexión (LINK_DATABASE_URL o --db) y que la base esté levantada");
+                std::process::exit(1);
+            }
+        },
+    };
     // Auth v0 (GRAMMAR.md §3.14): vive mientras el proceso corre, igual que
     // `db` -- sin expiración, sin persistencia entre reinicios.
     let sessions = SessionStore::new();
-    println!("c-script server escuchando en http://localhost:{port}  (Ctrl+C para detener)");
+    let backend = if db.is_postgres() { "PostgreSQL" } else { "SQLite" };
+    println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     for mut request in server.incoming_requests() {
         if *request.method() == tiny_http::Method::Options {
