@@ -8,8 +8,17 @@ use crate::types::{FieldType, Type};
 use std::collections::HashSet;
 
 /// Mapeo de tipos de Link a dialecto PostgreSQL nativo.
+///
+/// `T?` se mapea al tipo nativo de `T`: la nulabilidad de una columna la
+/// expresa la ausencia de `NOT NULL`, no un tipo distinto. Sin desenvolver el
+/// `Optional` aqui, `String?` no hacia match con `Type::String` y caia en el
+/// `_ => "JSONB"` final, asi que una columna de texto nullable corriente se
+/// declaraba `JSONB`. El runtime SQLite ya desenvuelve (`ColumnPlan::for_field`
+/// en runtime/db.rs), de modo que los dos backends emitian esquemas distintos
+/// para el mismo programa.
 pub fn link_to_postgres_type(ty: &Type, simple_enums: &HashSet<String>) -> &'static str {
     match ty {
+        Type::Optional(inner) => link_to_postgres_type(inner.as_ref(), simple_enums),
         Type::Int | Type::Int64 | Type::Timestamp => "BIGINT",
         Type::Float => "DOUBLE PRECISION",
         Type::String => "TEXT",
@@ -20,12 +29,26 @@ pub fn link_to_postgres_type(ty: &Type, simple_enums: &HashSet<String>) -> &'sta
     }
 }
 
+/// Tipo de columna de un campo concreto, con la misma regla de tres estados
+/// que `ColumnPlan::for_field` (runtime/db.rs): `campo?: T?` distingue
+/// ausente / null / valor, y eso no lo puede representar una columna nativa
+/// nullable -- necesita JSON. Un solo nivel de opcionalidad, en cambio, es una
+/// columna nativa que admite NULL.
+fn postgres_column_type(field: &FieldType, simple_enums: &HashSet<String>) -> &'static str {
+    let double_optional = field.optional && matches!(field.ty, Type::Optional(_));
+    if double_optional {
+        "JSONB"
+    } else {
+        link_to_postgres_type(&field.ty, simple_enums)
+    }
+}
+
 /// Genera la sentencia DDL `CREATE TABLE IF NOT EXISTS` para una colección en PostgreSQL.
 pub fn create_postgres_table_sql(collection: &str, fields: &[FieldType], simple_enums: &HashSet<String>) -> String {
     let mut cols = vec!["\"id\" BIGSERIAL PRIMARY KEY".to_string()];
 
     for f in fields {
-        let pg_type = link_to_postgres_type(&f.ty, simple_enums);
+        let pg_type = postgres_column_type(f, simple_enums);
         let not_null = if !f.optional && !matches!(f.ty, Type::Optional(_)) {
             " NOT NULL"
         } else {
@@ -73,7 +96,7 @@ pub fn alter_table_add_column_postgres(
     field: &FieldType,
     simple_enums: &HashSet<String>,
 ) -> String {
-    let pg_type = link_to_postgres_type(&field.ty, simple_enums);
+    let pg_type = postgres_column_type(field, simple_enums);
     format!(
         "ALTER TABLE \"{collection}\" ADD COLUMN IF NOT EXISTS \"{}\" {};",
         field.name, pg_type
@@ -105,6 +128,89 @@ mod tests {
         assert!(ddl.contains("\"is_active\" BOOLEAN NOT NULL"));
         assert!(ddl.contains("\"created_at\" BIGINT NOT NULL"));
         assert!(ddl.contains("\"metadata\" JSONB NOT NULL"));
+    }
+
+    /// Regresion: `String?` no hacia match con `Type::String` y caia en el
+    /// `_ => "JSONB"`, asi que toda columna de texto nullable se declaraba
+    /// JSONB en vez de TEXT. Lo mismo para Int?/Bool?/Float?/Timestamp? y
+    /// para un enum simple opcional.
+    #[test]
+    fn optional_scalars_keep_their_native_column_type() {
+        let code = r#"
+        type Lead = {
+          id: Int,
+          email: String,
+          company: String?,
+          score: Int?,
+          rating: Float?,
+          contacted: Bool?,
+          closedAt: Timestamp?,
+          status: Status?,
+        }
+        enum Status { Nuevo, Cerrado }
+        db { leads: Lead[], }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let ddl = generate_postgres_ddl(&program).unwrap();
+
+        assert!(ddl.contains("\"email\" TEXT NOT NULL"), "{ddl}");
+        assert!(ddl.contains("\"company\" TEXT,") || ddl.contains("\"company\" TEXT
+"), "company deberia ser TEXT nullable: {ddl}");
+        assert!(!ddl.contains("\"company\" JSONB"), "company se declaro JSONB: {ddl}");
+        assert!(!ddl.contains("\"score\" JSONB"), "score se declaro JSONB: {ddl}");
+        assert!(ddl.contains("\"score\" BIGINT"), "{ddl}");
+        assert!(ddl.contains("\"rating\" DOUBLE PRECISION"), "{ddl}");
+        assert!(ddl.contains("\"contacted\" BOOLEAN"), "{ddl}");
+        assert!(ddl.contains("\"closedAt\" BIGINT"), "{ddl}");
+        assert!(ddl.contains("\"status\" TEXT"), "enum simple opcional deberia ser TEXT: {ddl}");
+    }
+
+    /// La nulabilidad la expresa `NOT NULL`, no el tipo: desenvolver el
+    /// `Optional` no puede colar un NOT NULL en una columna que admite null.
+    #[test]
+    fn optional_columns_are_still_nullable() {
+        let code = r#"
+        type T = { id: Int, a: String, b: String? }
+        db { ts: T[], }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let ddl = generate_postgres_ddl(&program).unwrap();
+        assert!(ddl.contains("\"a\" TEXT NOT NULL"), "{ddl}");
+        assert!(!ddl.contains("\"b\" TEXT NOT NULL"), "b es nullable y quedo NOT NULL: {ddl}");
+    }
+
+    /// `campo?: T?` distingue ausente / null / valor. Ese tercer estado no
+    /// cabe en una columna nativa nullable -- igual que en SQLite
+    /// (`ColumnPlan::for_field`), se guarda como JSON.
+    #[test]
+    fn a_doubly_optional_field_stays_json_like_in_sqlite() {
+        let simple_enums = HashSet::new();
+        let field = FieldType {
+            name: "nickname".to_string(),
+            optional: true,
+            ty: Type::Optional(Box::new(Type::String)),
+        };
+        assert_eq!(
+            alter_table_add_column_postgres("users", &field, &simple_enums),
+            "ALTER TABLE \"users\" ADD COLUMN IF NOT EXISTS \"nickname\" JSONB;"
+        );
+    }
+
+    /// Un `T?` de un solo nivel via ALTER TABLE tambien es columna nativa.
+    #[test]
+    fn alter_table_uses_the_native_type_for_a_single_optional() {
+        let simple_enums = HashSet::new();
+        let field = FieldType {
+            name: "avatar_url".to_string(),
+            optional: false,
+            ty: Type::Optional(Box::new(Type::String)),
+        };
+        assert_eq!(
+            alter_table_add_column_postgres("users", &field, &simple_enums),
+            "ALTER TABLE \"users\" ADD COLUMN IF NOT EXISTS \"avatar_url\" TEXT;"
+        );
     }
 
     #[test]
