@@ -3,6 +3,12 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.3.0] - 2026-08-20
+
+### ✨ Nuevo
+- **`env.get`, `request.rawBody`/`request.header` y `crypto.hmacSha256`: verificar webhooks de terceros.** Disparado por un análisis de factibilidad de migración real que encontró un bloqueo concreto — sin leer una variable de entorno, ver el body crudo de una request ni calcular un HMAC, ningún rpc podía verificar la firma de un webhook entrante (Stripe, GitHub, o cualquiera que firme sus callbacks) y tenía que confiar en el body a ciegas. Las tres piezas juntas cierran eso. El contexto de la request (body + headers) vive en un `RefCell` sobre `Db` (ya threadeada en todo `runtime/mod.rs`), llenado por `runtime/server.rs` al principio de cada request — mismo criterio que ya usa `Db::subscribers`, en vez de sumar un parámetro más a las ~11 firmas que threadean `db`/`fns`/`checker`/`sessions`. Límite honesto: `rawBody()` requiere que el body sea JSON válido (aunque el rpc no use sus campos), porque el parseo de argumentos corre antes que cualquier rpc sin importar cuántos declare. Detalle completo, con el hallazgo de por qué CSRF NO aplica a este modelo de auth (Bearer-only, sin cookies) en vez de construir middleware para eso: GRAMMAR.md §3.38.
+- **`@rate_limit("20/1m")`: límite de requests por cliente.** Como mucho N requests por ventana de tiempo, por `(ip del cliente, servicio, rpc)` — 429 al exceder, mismo shape de error que cualquier otro rechazo. Token bucket con refill continuo (no un contador de ventana fija, que deja pasar el doble en el borde de la ventana). La IP sale de la conexión TCP real (`Request::remote_addr`), nunca de `X-Forwarded-For` sin un proxy de confianza configurado (v0 no lo tiene). Combina con `@authenticated`/`@requires`/`@content_type`/`@route`; corre ANTES que el gate de auth, a propósito, para que un rpc protegido tampoco deje probar credenciales sin límite. Límite honesto: el estado vive en memoria de UN proceso, sin coordinación entre réplicas ni persistencia entre reinicios. Detalle completo: GRAMMAR.md §3.39.
+
 ## [1.2.0] - 2026-08-20
 
 ### ✨ Nuevo

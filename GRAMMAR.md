@@ -59,6 +59,8 @@
   - [3.35 `@content_type`: respuestas que no son JSON — RESUELTO (alcance acotado)](#335-content_type-respuestas-que-no-son-json--resuelto-alcance-acotado)
   - [3.36 PostgreSQL en runtime — RESUELTO (alcance acotado)](#336-postgresql-en-runtime--resuelto-alcance-acotado)
   - [3.37 `@route("/blog/:slug")`: URLs amigables para SEO — RESUELTO (alcance acotado)](#337-routeblogslug-urls-amigables-para-seo--resuelto-alcance-acotado)
+  - [3.38 `env`, `request` y `crypto.hmacSha256`: verificar webhooks de terceros — RESUELTO (alcance acotado)](#338-env-request-y-cryptohmacsha256-verificar-webhooks-de-terceros--resuelto-alcance-acotado)
+  - [3.39 `@rate_limit("20/1m")`: límite de requests por cliente — RESUELTO (alcance acotado)](#339-rate_limit201m-límite-de-requests-por-cliente--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -119,13 +121,14 @@ const_decl   = "const" , identifier , ":" , type_expr , "=" , expr , ";" ;
 service_decl = "service" , identifier , "{" , { member_decl } , "}" ;
 member_decl  = { annotation } , ( rpc_decl | stream_decl ) ;
 (* Varias por rpc/stream se permiten -- lo que el checker rechaza es dos DE
-   LA MISMA DIMENSIÓN (dos de auth, dos @content_type, dos @route), no la
-   combinación entre dimensiones distintas: §3.14 (auth), §3.35
-   (@content_type), §3.37 (@route). *)
+   LA MISMA DIMENSIÓN (dos de auth, dos @content_type, dos @route, dos
+   @rate_limit), no la combinación entre dimensiones distintas: §3.14
+   (auth), §3.35 (@content_type), §3.37 (@route), §3.39 (@rate_limit). *)
 annotation   = "@authenticated"
              | "@requires" , "(" , identifier , "." , identifier , ")"
              | "@content_type" , "(" , string_lit , ")"
-             | "@route" , "(" , string_lit , ")" ;
+             | "@route" , "(" , string_lit , ")"
+             | "@rate_limit" , "(" , string_lit , ")" ;
 rpc_decl     = "rpc" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 stream_decl  = "stream" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 param_list   = param , { "," , param } ;
@@ -1657,6 +1660,187 @@ en JSON sin token, un path sin ninguna ruta cayendo al 404 de siempre, y las
 cuatro combinaciones que el checker rechaza (forma de dos rutas en
 conflicto, parámetro que no es el último segmento, tipo no permitido,
 `@route` sobre un `stream`).
+
+---
+
+### 3.38 `env`, `request` y `crypto.hmacSha256`: verificar webhooks de terceros — RESUELTO (alcance acotado)
+
+Auditoría del 20/08/2026, disparada por un análisis de factibilidad de
+migración real (un e-commerce evaluando mover su backend a c-script), que
+encontró un bloqueo concreto: no había forma de leer un secreto de
+configuración desde el lenguaje, ni de ver el body crudo de una request, ni
+de calcular un HMAC — las tres cosas que hacen falta para verificar la firma
+de un webhook entrante (Stripe, GitHub, o cualquier proveedor que firme sus
+callbacks). Sin esto, cualquier `rpc` expuesto para recibir un webhook tenía
+que confiar en el body sin verificar quién lo mandó.
+
+**Lo que hay ahora, las tres piezas:**
+
+| Función | Firma | Notas |
+|---|---|---|
+| `env.get(name)` | `(String) -> String?` | Lee `std::env::var` del proceso servidor. `None` si la variable no está seteada o no es UTF-8 válido — nunca un error. |
+| `request.rawBody()` | `() -> String` | El body EXACTO de la request HTTP que invocó este rpc, antes de cualquier parseo. String vacío fuera de un servidor real (ej. `linkc test`). |
+| `request.header(name)` | `(String) -> String?` | Un header de esa misma request, sin distinguir mayúsculas/minúsculas (como manda el estándar HTTP). `None` si no vino. |
+| `crypto.hmacSha256(secret, message)` | `(String, String) -> String` | HMAC-SHA256 (crate `hmac` + `sha2`), hex en minúsculas — el primitivo que hace falta para verificar la firma de CUALQUIER proveedor, no solo Stripe. |
+
+Combinadas, verifican un webhook así:
+
+```
+service Webhooks {
+  rpc stripeEvent() -> String {
+    let body = request.rawBody();
+    let signature = request.header("Stripe-Signature");
+    let secret = env.get("STRIPE_WEBHOOK_SECRET");
+    // comparar `crypto.hmacSha256(secret, body)` contra `signature`
+    // (con la forma exacta que documente el proveedor -- Stripe, por
+    // ejemplo, firma "timestamp.body", no el body solo) antes de confiar
+    // en nada de lo que sigue.
+    body
+  }
+}
+```
+
+**De dónde sale el contexto de la request.** `Db` (ya threadeada por todo
+`runtime/mod.rs` — `db: &Db` en ~11 firmas, ver §3.9) gana un
+`current_request: RefCell<Option<RequestContext>>` con el body y los headers
+crudos. `runtime/server.rs` lo llena al principio de CADA request, antes de
+cualquier dispatch (`/Servicio/rpc` o `@route`), y la request SIGUIENTE lo
+pisa antes de que su propio dispatch corra — nunca hace falta limpiarlo a
+mano entre medio (hay un `clear_request_context()` al final del loop
+igual, defensa en profundidad, no carga estructural). Se optó por esto en
+vez de sumar un parámetro más a las ~11 firmas que ya threadean `db`/`fns`/
+`checker`/`sessions`/`current_token`/`step_budget`: mismo criterio que ya
+usa `Db::subscribers` (push real, §3.16) — piggybackear sobre una struct que
+YA está en todos lados, en vez de tocar cada call site.
+
+**Por qué no CSRF, en vez de construirlo.** El mismo análisis de
+factibilidad marcó "sin protección CSRF" como un gap. No aplica: CSRF ataca
+credenciales que el NAVEGADOR adjunta solo (cookies, autoridad ambiente) —
+un sitio malicioso hace que el navegador de la víctima mande una request a
+otro dominio, y esa request sale con la cookie de sesión puesta
+automáticamente. La auth de c-script (§3.14) es exclusivamente
+`Authorization: Bearer <token>` — un header que el navegador NUNCA adjunta
+solo, tiene que escribirlo explícitamente el código JavaScript que hace el
+fetch. `grep -rn "Set-Cookie\|cookie"` sobre todo `runtime/` no encuentra
+ningún uso: no hay ninguna cookie que un atacante pueda hacer viajar sin
+querer. Construir middleware CSRF acá sería copiar un patrón de Express que
+no resuelve nada en este modelo de auth — documentado en vez de
+implementado.
+
+**Límites honestos de esta ronda:**
+
+- **`request.rawBody()` requiere que el body sea JSON válido**, aunque el
+  rpc no use ninguno de sus campos. `resolve_route` (runtime/server.rs)
+  parsea el body como JSON ANTES de invocar cualquier rpc, sin importar
+  cuántos parámetros declare — un body con forma de webhook real (JSON con
+  más campos de los que el rpc usa, como manda cualquier proveedor) pasa
+  sin problema; un body que no sea JSON en absoluto (form-encoded, XML)
+  nunca llega a ejecutar el rpc. Resolver esto del todo — una anotación
+  para saltear el parseo — es una extensión real, no una línea de más; el
+  caso que motivó esta ronda (verificar un webhook JSON) no la necesita.
+- **`env.get` lee el entorno del PROCESO servidor**, no un `.env` por
+  request ni scoping por servicio — el mismo modelo que cualquier backend
+  que lee `process.env`/`os.environ`.
+- **Sin helper de "verificar firma" integrado.** El lenguaje da los tres
+  primitivos; comparar el HMAC calculado contra el header recibido, y en
+  tiempo constante, es responsabilidad de quien escribe el rpc (`==` de
+  `String` en c-script no es de tiempo constante — mismo caveat que
+  `verifyPassword` documentó en §3.34 antes de corregirse ahí; acá no hay
+  wrapper que lo corrija por vos).
+
+**Verificado** en `compiler/tests/cli_env_request.rs` contra un servidor
+real: `env.get` con la variable seteada en el PROCESO hijo (`Command::env`,
+nunca `std::env::set_var` sobre el proceso de test — mutaría estado
+compartido entre tests que corren en paralelo) y sin setear (da `null`);
+`request.rawBody()` devolviendo el body de un webhook realista byte a byte;
+`request.header()` con y sin el header, y sin distinguir mayúsculas de
+minúsculas; y que dos requests consecutivas nunca se mezclan (cada una ve
+SU PROPIO body). `crypto.hmacSha256` fijado en `runtime/mod.rs` contra un
+vector de referencia calculado con Python (`hmac.new(...).hexdigest()`), no
+inventado a mano.
+
+---
+
+### 3.39 `@rate_limit("20/1m")`: límite de requests por cliente — RESUELTO (alcance acotado)
+
+Segunda pieza del mismo análisis de factibilidad que motivó §3.38: sin forma
+de limitar cuántas veces un cliente puede llamar a un rpc, cualquier
+operación cara (enviar un email, cobrar una tarjeta, disparar un webhook
+saliente) queda expuesta a que alguien la golpee sin límite — por accidente
+(un bug en un cliente que reintenta en loop) o a propósito.
+
+**Lo que hay ahora:**
+
+```
+@rate_limit("20/1m")
+rpc sendPasswordReset(email: String) -> Void { ... }
+```
+
+Como mucho 20 requests por minuto para ESTE rpc, contadas por
+`(ip_del_cliente, servicio, rpc)` — otro cliente, u otro rpc del mismo
+servicio, tiene su propio cupo, sin compartirlo. Al excederlo, **429** con
+`{"error": "..."}`, mismo shape de error que cualquier otro rechazo del
+servidor.
+
+**Formato del límite:** `"N/ventana"`, donde la ventana es un número
+opcional seguido de `s`/`m`/`h` (`"5/s"` = 5 por segundo, `"20/1m"` = 20 por
+minuto, `"100/2h"` = 100 cada dos horas). Validado en compilación
+(`check_rate_limit_annotation`, checker.rs) contra el mismo parser que usa
+el servidor en runtime (`compiler/src/rate_limit.rs`, `RateLimitSpec::parse`)
+— un solo lugar que decide qué es un límite válido, mismo motivo que
+`route.rs` (§3.37) para existir aparte: dos capas que implementan la misma
+regla por separado terminan divergiendo (§3.9).
+
+**Algoritmo: token bucket con refill continuo**, no un contador de ventana
+fija. Un bucket de capacidad N se rellena a razón de N/ventana por segundo,
+así que una ráfaga corta al principio de la ventana no deja "muerto" el
+resto de la ventana como pasaría con un contador que resetea de golpe en el
+límite exacto (el problema clásico de "doble ráfaga en el borde de la
+ventana" de un contador de ventana fija).
+
+**De dónde sale la IP del cliente — y de dónde NO.** `Request::remote_addr()`
+de `tiny_http`: la IP de la conexión TCP real. **Nunca** un header como
+`X-Forwarded-For`, que cualquier cliente puede mandar con el valor que
+quiera — confiar en él sin un mecanismo de "proxy de confianza" configurado
+(que v0 no tiene) dejaría a cualquiera evadir el límite mandando un header
+distinto en cada request. Consecuencia honesta: detrás de un proxy o
+balanceador, esto limita por la IP del proxy, no la del usuario final — la
+misma limitación que documenta cualquier rate limiter que no conoce su
+topología de red por adelantado.
+
+**Combina con cualquier otra anotación** (`@authenticated`, `@requires`,
+`@content_type`, `@route`) — es una dimensión ortogonal, igual que
+`@content_type`/`@route` lo son entre sí desde §3.35. Corre **antes** que el
+gate de auth (`check_auth_gate`, runtime/server.rs), a propósito: si
+corriera después, un rpc protegido dejaría probar credenciales sin límite
+alguno (un 401 no cuesta nada de recursos reales, así que no frenarlo ahí
+sería inútil contra fuerza bruta).
+
+**Límites honestos de esta ronda:**
+
+- **El estado vive en memoria del proceso**, un solo `RateLimiter` para todo
+  el servidor (mismo modelo de concurrencia que `route_table`: se arma y
+  muta en el hilo principal, nunca cruza a los hilos de escritura de
+  stream). Un reinicio del proceso resetea todos los buckets — no hay
+  persistencia entre despliegues, ni coordinación entre réplicas si el
+  mismo `.link` corre en más de un proceso a la vez.
+  - Reinicios frecuentes en un ambiente de despliegue agresivo (o correr N
+    réplicas detrás de un balanceador) diluyen el límite real -- es un
+    límite POR PROCESO, no global de la aplicación.
+- **Barrido de buckets inactivos, no eviction fina.** Cada 1000 checks se
+  descartan los buckets sin actividad hace más de una hora, así un proceso
+  de larga vida con muchos clientes distintos no crece sin límite en
+  memoria — pero no hay un tope duro de cuántos buckets simultáneos puede
+  haber entre barridos.
+
+**Verificado** en `compiler/tests/cli_rate_limit.rs` contra un servidor
+real: las primeras N requests pasan y la N+1 da 429, un rpc SIN
+`@rate_limit` no se ve afectado por haber agotado el bucket de otro, la
+combinación con `@requires` (el límite corre antes que el 401, así que se
+agota aunque ninguna request traiga token válido), y los formatos que el
+checker rechaza (sin conteo, conteo/ventana en cero, unidad de ventana
+desconocida, declarado dos veces). Unit tests del parser y del token bucket
+en `compiler/src/rate_limit.rs`.
 
 ---
 

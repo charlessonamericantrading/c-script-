@@ -18,6 +18,7 @@ pub mod doc;
 pub mod docker;
 pub mod lsp;
 pub mod parser;
+pub mod rate_limit;
 pub mod route;
 pub mod runtime;
 pub mod scaffold;

@@ -270,6 +270,29 @@ pub struct Db {
     /// (`Db::call`/`Db::subscribe`), nunca desde ningún hilo escritor (que
     /// solo recibe el `Receiver`, ya extraído, nunca vuelve a tocar `Db`).
     subscribers: RefCell<HashMap<String, Vec<SyncSender<serde_json::Value>>>>,
+    /// Contexto de LA request HTTP que está invocando un rpc ahora mismo --
+    /// body crudo + headers, para `request.rawBody()`/`request.header()`
+    /// (GRAMMAR.md §3.38). `server.rs` lo fija justo antes de invocar el rpc
+    /// y lo limpia apenas termina; nunca sobrevive entre requests. Vive acá
+    /// -- no como un parámetro nuevo enhebrado por las ~11 firmas que ya
+    /// cargan `db`/`sessions`/`current_token` -- por el mismo motivo que
+    /// `subscribers` vive acá: `db: &Db` ya está disponible en CUALQUIER
+    /// punto del árbol de evaluación (`call_method`, `eval_expr`, ...), así
+    /// que sumar un campo acá es aditivo puro, sin tocar ninguna firma
+    /// existente. `RefCell`, mismo criterio de siempre: un solo hilo.
+    current_request: RefCell<Option<RequestContext>>,
+}
+
+/// Ver la doc de `Db::current_request`. Dos structs (no una tupla) porque
+/// `runtime/server.rs` construye esto con nombres de campo, más legible que
+/// posiciones.
+pub(crate) struct RequestContext {
+    pub raw_body: String,
+    /// (nombre, valor) tal como llegaron -- la búsqueda por nombre
+    /// (`current_request_header`) es case-insensitive, como manda HTTP; acá
+    /// se guardan tal cual para no perder la capitalización original en caso
+    /// de que algo alguna vez necesite mostrarlos.
+    pub headers: Vec<(String, String)>,
 }
 
 impl Db {
@@ -318,6 +341,7 @@ impl Db {
             simple_enums,
             columns,
             subscribers: RefCell::new(HashMap::new()),
+            current_request: RefCell::new(None),
         }
     }
 
@@ -388,7 +412,14 @@ impl Db {
             columns.insert(name.clone(), cols);
         }
 
-        Ok(Db { backend, checker, simple_enums, columns, subscribers: RefCell::new(HashMap::new()) })
+        Ok(Db {
+            backend,
+            checker,
+            simple_enums,
+            columns,
+            subscribers: RefCell::new(HashMap::new()),
+            current_request: RefCell::new(None),
+        })
     }
 
     /// Fixture SOLO para tests y para el demo wasm (`bin/wasm_demo.rs`) --
@@ -446,6 +477,41 @@ db { users: User[] }
     /// del intérprete se ramifica por esto.
     pub fn is_postgres(&self) -> bool {
         self.backend.is_postgres()
+    }
+
+    /// Ver la doc de `Db::current_request` (arriba). Llamado por
+    /// `server.rs` una vez por request, justo antes de invocar el rpc.
+    pub(crate) fn set_request_context(&self, ctx: RequestContext) {
+        *self.current_request.borrow_mut() = Some(ctx);
+    }
+
+    /// Simétrico de `set_request_context` -- `server.rs` lo llama apenas
+    /// termina de manejar la request, para que `request.rawBody()`/
+    /// `request.header()` nunca puedan filtrar datos de una request anterior
+    /// hacia otra (ej. si algún día se reusa un `Db` entre requests de
+    /// formas que hoy no se dan, pero que esto deja imposibles por
+    /// construcción en vez de "porque nadie se olvidó de limpiar").
+    pub(crate) fn clear_request_context(&self) {
+        *self.current_request.borrow_mut() = None;
+    }
+
+    /// `""` -- no `None` -- fuera de una request HTTP real (ej. invocado
+    /// desde `linkc test`, que llama `invoke_rpc` directo sin pasar por
+    /// `server.rs`): un body ausente y uno vacío son la misma cosa para
+    /// cualquier verificación de firma que lo use, y devolver un `String`
+    /// simple (no `String?`) evita que TODO código que llama `rawBody()`
+    /// tenga que manejar un `null` que en la práctica nunca es información
+    /// útil -- distinto de `current_request_header`, donde "el header no
+    /// vino" sí es una distinción real que el caller necesita poder ver.
+    pub(crate) fn current_request_body(&self) -> String {
+        self.current_request.borrow().as_ref().map(|c| c.raw_body.clone()).unwrap_or_default()
+    }
+
+    pub(crate) fn current_request_header(&self, name: &str) -> Option<String> {
+        self.current_request
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone()))
     }
 
     pub fn call(&self, collection: &str, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {

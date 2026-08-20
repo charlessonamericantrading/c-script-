@@ -28,9 +28,10 @@
 
 use super::db::Db;
 use super::session::SessionStore;
-use super::{invoke_rpc_with_sessions, is_stream_member, live_subscribe_collection, required_auth};
+use super::{invoke_rpc_with_sessions, is_stream_member, live_subscribe_collection, required_auth, required_rate_limit};
 use crate::ast::{Annotation, Item, Member};
 use crate::ast::Program;
+use crate::rate_limit::{RateLimitSpec, RateLimiter};
 use crate::route::RoutePattern;
 use std::io::Write;
 use std::path::PathBuf;
@@ -109,6 +110,10 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
     // request -- el programa ya pasó el checker antes de llegar a `serve`,
     // así que build_route_table no puede encontrar nada inválido acá.
     let route_table = build_route_table(&program);
+    // `@rate_limit` (GRAMMAR.md §3.39): un solo `RateLimiter` para todo el
+    // proceso, igual criterio que `route_table` de arriba -- se arma/muta
+    // en el hilo principal, nunca cruza a los hilos de escritura de stream.
+    let mut rate_limiter = RateLimiter::new();
     println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     for mut request in server.incoming_requests() {
@@ -124,6 +129,16 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
 
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
+
+        // `request.rawBody()`/`request.header()` (GRAMMAR.md §3.38): fijado
+        // ACÁ, antes de cualquier dispatch, así que para cuando un rpc
+        // corre -- sea por `/Servicio/rpc` o por una `@route` -- el
+        // contexto siempre es el de ESTA request. La próxima iteración lo
+        // sobreescribe antes de que su propio dispatch corra, así que nunca
+        // hace falta limpiarlo a mano entre medio.
+        let headers: Vec<(String, String)> =
+            request.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect();
+        db.set_request_context(super::db::RequestContext { raw_body: body.clone(), headers });
 
         if path == "/" || path == "/health" || path == "/status" {
             let services: Vec<String> = program
@@ -163,6 +178,22 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
             }
         };
         let method = format!("{service_name}.{rpc_name}");
+
+        // `@rate_limit` (GRAMMAR.md §3.39): corre ANTES del gate de auth de
+        // abajo, a propósito -- si corriera después, un rpc protegido dejaría
+        // probar credenciales sin límite alguno (401 no cuesta nada). La IP
+        // sale de la conexión TCP real (`remote_addr`), nunca de un header
+        // que el cliente controla -- ver rate_limit.rs para el porqué.
+        if let Some(raw_spec) = required_rate_limit(&program, service_name, rpc_name) {
+            let spec = RateLimitSpec::parse(raw_spec)
+                .expect("check_rate_limit_annotation (checker.rs) ya validó este formato en compilación");
+            let client_ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "desconocida".to_string());
+            if !rate_limiter.check(&client_ip, service_name, rpc_name, spec) {
+                let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento")));
+                log_done(req_id, Some(&method), 429, start, "");
+                continue;
+            }
+        }
 
         // El gate de autorización corre ACÁ, antes de `parse_args`/
         // `json_to_typed_value` en cualquiera de las dos ramas de abajo --
@@ -243,6 +274,11 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
         };
         let _ = request.respond(cors_response_with_type(status, response_body, &response_type));
         log_done(req_id, Some(&method), status, start, &extra);
+        // Defensa en profundidad, no carga estructural: el `set_request_context`
+        // de arriba ya garantiza que la PRÓXIMA request nunca ve el contexto de
+        // esta. Limpiarlo acá además evita que sobreviva en memoria más de lo
+        // necesario entre el fin de esta request y el arranque de la próxima.
+        db.clear_request_context();
     }
 }
 
@@ -446,9 +482,9 @@ fn check_auth_gate(
         // cualquiera con un token de bajo privilegio un mapeo completo
         // endpoint->rol gratis (hallado en el review adversarial).
         Annotation::Requires { .. } => Err((403, "no tenés permiso para esta operación")),
-        // `required_auth` solo devuelve anotaciones de auth: si estos dos
+        // `required_auth` solo devuelve anotaciones de auth: si estas tres
         // llegaran a matchear, el bug está allá arriba, no acá.
-        Annotation::ContentType(_) | Annotation::Route(_) => Ok(()),
+        Annotation::ContentType(_) | Annotation::Route(_) | Annotation::RateLimit(_) => Ok(()),
     }
 }
 

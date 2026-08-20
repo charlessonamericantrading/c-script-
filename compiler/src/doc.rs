@@ -322,12 +322,17 @@ fn render_service(s: &ServiceDecl) -> String {
                     Some(Annotation::Authenticated) => {
                         r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string()
                     }
-                    // `auth()` nunca devuelve ContentType ni Route; el brazo
-                    // existe para que agregar una anotación nueva rompa acá y
-                    // no pase de largo mostrando "Público" por descarte.
-                    Some(Annotation::ContentType(_)) | Some(Annotation::Route(_)) | None => {
+                    // `auth()` nunca devuelve ContentType, Route ni RateLimit;
+                    // el brazo existe para que agregar una anotación nueva
+                    // rompa acá y no pase de largo mostrando "Público" por
+                    // descarte.
+                    Some(Annotation::ContentType(_)) | Some(Annotation::Route(_)) | Some(Annotation::RateLimit(_)) | None => {
                         r#"<span class="badge">🌐 Público</span>"#.to_string()
                     }
+                };
+                let rate_limit_badge = match r.rate_limit() {
+                    Some(spec) => format!(r#"<span class="badge">⏱️ @rate_limit("{spec}")</span>"#),
+                    None => String::new(),
                 };
                 let content_type_badge = match r.content_type() {
                     Some(ct) => format!(r#"<span class="badge">📄 {ct}</span>"#),
@@ -337,7 +342,7 @@ fn render_service(s: &ServiceDecl) -> String {
                     Some(pattern) => format!(r#"<span class="badge">🔗 {pattern}</span>"#),
                     None => String::new(),
                 };
-                let auth_badge = format!("{auth_badge}{content_type_badge}{route_badge}");
+                let auth_badge = format!("{auth_badge}{content_type_badge}{route_badge}{rate_limit_badge}");
 
                 let mut params_str = Vec::new();
                 let mut params_table = String::new();

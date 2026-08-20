@@ -238,6 +238,16 @@ impl RpcDecl {
             _ => None,
         })
     }
+
+    /// El límite declarado con `@rate_limit("20/1m")`, si hay -- texto
+    /// crudo, sin parsear (GRAMMAR.md §3.39). El checker valida el formato;
+    /// acá es solo el string tal como se escribió.
+    pub fn rate_limit(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::RateLimit(spec) => Some(spec.as_str()),
+            _ => None,
+        })
+    }
 }
 
 /// Anotaciones de un rpc/stream. Se permiten varias, pero no cualquier
@@ -253,6 +263,9 @@ pub enum Annotation {
     /// que convive con el `/Servicio/rpc` de siempre (nunca lo reemplaza).
     /// Ver GRAMMAR.md §3.37.
     Route(String),
+    /// `@rate_limit("20/1m")` -- como mucho N requests por ventana de
+    /// tiempo, por (ip del cliente, servicio, rpc). Ver GRAMMAR.md §3.39.
+    RateLimit(String),
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

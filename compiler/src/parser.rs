@@ -435,9 +435,15 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::Route(value)
                 }
+                "rate_limit" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let value = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::RateLimit(value)
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")' o '@route(\"/ruta/:param\")')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")' o '@rate_limit(\"N/ventana\")')"
                     )))
                 }
             };

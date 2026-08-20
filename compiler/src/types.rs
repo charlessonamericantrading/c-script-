@@ -112,6 +112,12 @@ pub enum Type {
     Json,
     /// Tipo interno para el módulo `base64` builtin
     Base64,
+    /// Tipo interno para el módulo `env` builtin (GRAMMAR.md §3.38)
+    Env,
+    /// Tipo interno para el módulo `request` builtin (GRAMMAR.md §3.38) --
+    /// acceso al body crudo y a los headers de LA request HTTP que está
+    /// invocando este rpc en este momento.
+    Request,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -186,6 +192,8 @@ impl std::fmt::Display for Type {
             Type::Http => write!(f, "http"),
             Type::Json => write!(f, "json"),
             Type::Base64 => write!(f, "base64"),
+            Type::Env => write!(f, "env"),
+            Type::Request => write!(f, "request"),
         }
     }
 }

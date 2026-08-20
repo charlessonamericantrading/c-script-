@@ -1356,6 +1356,34 @@ impl Checker {
         Ok(())
     }
 
+    /// Valida el FORMATO de `@rate_limit("N/ventana")` en compilación --
+    /// `crate::rate_limit::RateLimitSpec::parse` es la misma función que usa
+    /// el servidor para interpretarlo en runtime (GRAMMAR.md §3.39, mismo
+    /// motivo de módulo compartido que `check_route_annotation` de arriba).
+    /// No hay restricción de auth/content_type/route acá: rate limiting es
+    /// una dimensión ortogonal, se puede combinar con cualquiera de esas.
+    fn check_rate_limit_annotation(&self, r: &RpcDecl) -> Result<(), CheckError> {
+        let specs: Vec<&String> = r
+            .annotations
+            .iter()
+            .filter_map(|a| match a {
+                Annotation::RateLimit(spec) => Some(spec),
+                _ => None,
+            })
+            .collect();
+        if specs.len() > 1 {
+            return Err(err(format!(
+                "'{}' declara `@rate_limit` más de una vez: un rpc tiene un solo límite",
+                r.name
+            )));
+        }
+        let Some(raw) = specs.first() else {
+            return Ok(());
+        };
+        crate::rate_limit::RateLimitSpec::parse(raw).map_err(|e| err(format!("`@rate_limit(\"{raw}\")` en '{}': {e}", r.name)))?;
+        Ok(())
+    }
+
     /// Dos `@route` con la MISMA forma (mismos segmentos literales, y los dos
     /// terminan en parámetro o los dos no) son indistinguibles al despachar
     /// una request real -- no hay forma de saber cuál de los dos rpc debería
@@ -1397,6 +1425,7 @@ impl Checker {
     fn check_rpc_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
         self.check_annotation_combination(r, is_stream)?;
         self.check_route_annotation(r, is_stream)?;
+        self.check_rate_limit_annotation(r)?;
         let Some(Annotation::Requires { enum_name, variant_name }) = r.auth() else {
             return Ok(());
         };
@@ -2172,6 +2201,12 @@ impl Checker {
                 if name == "base64" {
                     return Ok(Type::Base64);
                 }
+                if name == "env" {
+                    return Ok(Type::Env);
+                }
+                if name == "request" {
+                    return Ok(Type::Request);
+                }
                 if name == "now" {
                     return Ok(Type::Function(vec![], Box::new(Type::Timestamp)));
                 }
@@ -2642,6 +2677,14 @@ impl Checker {
                 self.check_expr(data, &Type::String, env)?;
                 Some(Type::String)
             }
+            (Type::Crypto, "hmacSha256") => {
+                let [secret, message] = args else {
+                    return Err(err("'crypto.hmacSha256' toma exactamente 2 argumentos (secret: String, message: String)"));
+                };
+                self.check_expr(secret, &Type::String, env)?;
+                self.check_expr(message, &Type::String, env)?;
+                Some(Type::String)
+            }
             (Type::Crypto, "randomToken") => {
                 let [length] = args else {
                     return Err(err("'crypto.randomToken' toma exactamente 1 argumento (length: Int)"));
@@ -2703,6 +2746,24 @@ impl Checker {
                 };
                 self.check_expr(str_arg, &Type::String, env)?;
                 Some(Type::String)
+            }
+            (Type::Env, "get") => {
+                let [name_arg] = args else {
+                    return Err(err("'env.get' toma exactamente 1 argumento (nombre: String)"));
+                };
+                self.check_expr(name_arg, &Type::String, env)?;
+                Some(Type::Optional(Box::new(Type::String)))
+            }
+            (Type::Request, "rawBody") => {
+                self.expect_no_args(args, "rawBody")?;
+                Some(Type::String)
+            }
+            (Type::Request, "header") => {
+                let [name_arg] = args else {
+                    return Err(err("'request.header' toma exactamente 1 argumento (nombre: String)"));
+                };
+                self.check_expr(name_arg, &Type::String, env)?;
+                Some(Type::Optional(Box::new(Type::String)))
             }
             (Type::Base64, "decode") => {
                 let [str_arg] = args else {

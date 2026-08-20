@@ -42,11 +42,15 @@ Works, verified by running it:
 - PostgreSQL as the runtime database: `linkc serve app.link 8787 --db postgres://user:pass@host/db` (or `LINK_DATABASE_URL`). Same program, same generated contract; SQLite stays the default. No connection pool, no TLS, no LISTEN/NOTIFY — see GRAMMAR.md §3.36.
 - Non-JSON responses: `@content_type("text/html; charset=utf-8")` on an rpc returning `String` sends that body verbatim with that header — HTML, XML sitemaps, CSV, plain text. Combines with `@authenticated` / `@requires`.
 - Friendly URLs: `@route("/blog/:slug")` on an rpc gives it an additional GET-friendly path, alongside (never instead of) the normal `/Service/rpc` address the generated client keeps using. A trailing `:name` segment binds to a `String` or `Int` parameter of that same name — see GRAMMAR.md §3.37.
+- Verifying third-party webhooks: `env.get(name) -> String?` reads a process env var; `request.rawBody() -> String` and `request.header(name) -> String?` expose the exact incoming HTTP body/headers; `crypto.hmacSha256(secret, message) -> String` computes an HMAC-SHA256 hex digest. Together they let an rpc check a webhook's signature before trusting it — see GRAMMAR.md §3.38.
+- Per-client rate limiting: `@rate_limit("20/1m")` on an rpc caps it to N requests per time window, per `(client IP, service, rpc)` — 429 on exceeding. Format is `"N/Ns"`, `"N/Nm"` or `"N/Nh"`; combines with any other annotation and runs before the auth gate — see GRAMMAR.md §3.39.
 
 Does NOT work today — do not propose designs that depend on these:
 
 - **Multi-parameter routes.** `@route` supports at most one dynamic segment, and it must be the last one — `/blog/:category/:slug` is rejected. Model that as separate rpcs, or wait for a future round.
 - **HTML escaping.** Pages are built by concatenating `String`; nothing escapes interpolated data for you. Escape anything that came from the database yourself.
+- **`request.rawBody()` needs a JSON body.** Argument parsing runs before any rpc regardless of its parameter count, so a non-JSON body never reaches the rpc — a JSON webhook payload with extra fields is fine.
+- **`@rate_limit` is per-process, in-memory.** No persistence across restarts, no coordination across replicas. The client IP comes from the real TCP connection, never `X-Forwarded-For`.
 - **Native WASM codegen** (`linkc wasm`) is deliberately frozen at integer/boolean scalar functions.
 - **No npm package yet.** Prebuilt binaries are on [GitHub Releases](https://github.com/charlessonamericantrading/c-script-/releases); `npm i link-lang` is not published.
 
@@ -82,6 +86,10 @@ difference between code that compiles and code that does not.
    not `name`) — of type `String` or `Int`, nothing else. A route with no `:param`
    requires the rpc to take zero parameters; there is no query-string or body
    fallback.
+10. **`@rate_limit`'s argument is `"N/window"`, not a sentence.** `"20/1m"` (20 per
+    minute), never `"20 per minute"` or `"20/minute"`. Window unit is exactly one of
+    `s`/`m`/`h`; the window's number is optional (`"5/m"` means `"5/1m"`) but the
+    unit is not.
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `insert(Omit<T,"id">) -> T`, `applyPatch(id, patch) -> T`, `delete(id) -> Bool`,

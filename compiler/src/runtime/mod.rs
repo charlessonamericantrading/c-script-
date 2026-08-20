@@ -88,6 +88,13 @@ pub enum Value {
     Json,
     /// Marcador interno para el módulo `base64`
     Base64,
+    /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
+    Env,
+    /// Marcador interno para el módulo `request` (GRAMMAR.md §3.38) -- body
+    /// crudo y headers de la request HTTP que invocó este rpc, si la hay
+    /// (ver `Db::request_context`; ausente fuera de un servidor real, ej.
+    /// desde `linkc test`).
+    Request,
     BoundMethod(Box<Value>, String),
     /// Una `fn` de nivel superior referenciada POR NOMBRE, ej. `let g = add_one;`
     /// (GRAMMAR.md §3.10). Es una REFERENCIA a función (como un `fn` pointer
@@ -169,6 +176,8 @@ impl std::fmt::Debug for Value {
             Value::Http => write!(f, "Http"),
             Value::Json => write!(f, "Json"),
             Value::Base64 => write!(f, "Base64"),
+            Value::Env => write!(f, "Env"),
+            Value::Request => write!(f, "Request"),
             Value::BoundMethod(recv, method) => f.debug_tuple("BoundMethod").field(recv).field(method).finish(),
             Value::FnRef(name) => f.debug_tuple("FnRef").field(name).finish(),
             // A propósito NO imprime `captured_env` -- podría ser cíclico
@@ -372,6 +381,12 @@ pub(crate) fn eval_expr(
             if name == "base64" {
                 return Ok(Value::Base64);
             }
+            if name == "env" {
+                return Ok(Value::Env);
+            }
+            if name == "request" {
+                return Ok(Value::Request);
+            }
             // Un `const` de nivel superior: su valor es siempre un literal
             // (el checker lo exige), así que evaluarlo en un env vacío no
             // depende de nada del scope actual.
@@ -408,7 +423,7 @@ pub(crate) fn eval_expr(
                     .map(|(_, v)| v)
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -1176,6 +1191,19 @@ fn call_method(
                 let hex_str: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
                 Ok(Value::Str(hex_str))
             }
+            "hmacSha256" => {
+                let (secret, message) = match (args.first(), args.get(1)) {
+                    (Some(Value::Str(s)), Some(Value::Str(m))) => (s, m),
+                    _ => return Err(err("crypto.hmacSha256 requiere dos argumentos String (secret, message)")),
+                };
+                use hmac::{Hmac, Mac};
+                use sha2::Sha256;
+                let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+                    .map_err(|e| err(format!("clave HMAC inválida: {e}")))?;
+                mac.update(message.as_bytes());
+                let hex_str: String = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+                Ok(Value::Str(hex_str))
+            }
             "randomToken" => {
                 let length = match args.first() {
                     Some(Value::Int(n)) => *n as usize,
@@ -1322,6 +1350,35 @@ fn call_method(
                 Ok(Value::Str(s))
             }
             other => Err(err(format!("método desconocido sobre base64: '{other}'"))),
+        },
+        Value::Env => match method {
+            "get" => {
+                let name = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("env.get requiere un argumento String")),
+                };
+                // `Ok` -> presente y UTF-8 válido -> Some. Cualquier otro
+                // caso (ausente, o presente pero no-UTF-8) es `None`: para
+                // un programa c-script "no está seteada" y "no se puede leer
+                // como texto" son la misma cosa práctica -- no hay ningún
+                // uso real que distinga entre las dos.
+                match std::env::var(name.as_str()) {
+                    Ok(v) => Ok(Value::Str(v)),
+                    Err(_) => Ok(Value::Null),
+                }
+            }
+            other => Err(err(format!("método desconocido sobre env: '{other}'"))),
+        },
+        Value::Request => match method {
+            "rawBody" => Ok(Value::Str(db.current_request_body())),
+            "header" => {
+                let name = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("request.header requiere un argumento String")),
+                };
+                Ok(db.current_request_header(name).map(Value::Str).unwrap_or(Value::Null))
+            }
+            other => Err(err(format!("método desconocido sobre request: '{other}'"))),
         },
         Value::Http => match method {
             "get" => {
@@ -1911,6 +1968,21 @@ pub fn required_auth<'a>(program: &'a Program, service_name: &str, rpc_name: &st
     })
 }
 
+/// Anotación `@rate_limit("N/ventana")` de `{service_name}.{rpc_name}`, si
+/// tiene una -- hermana de `required_auth` (mismo archivo/patrón, mismo uso
+/// desde `server.rs` antes de invocar nada). El texto crudo, sin parsear:
+/// `server.rs` lo pasa a `rate_limit::RateLimitSpec::parse`, que el checker
+/// ya validó que nunca falla para un programa que compiló (GRAMMAR.md §3.39).
+pub fn required_rate_limit<'a>(program: &'a Program, service_name: &str, rpc_name: &str) -> Option<&'a str> {
+    program.items.iter().find_map(|i| match i {
+        Item::Service(s) if s.name == service_name => s.members.iter().find_map(|m| match m {
+            Member::Rpc(r) | Member::Stream(r) if r.name == rpc_name => r.rate_limit(),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
 /// Si el CUERPO de `service_name.rpc_name` matchea el shape de push real
 /// v0 (GRAMMAR.md §3.16), el nombre de la colección a la que se suscribe.
 /// Otra hermana de `is_stream_member`/`required_auth`: `server.rs` la usa
@@ -1989,7 +2061,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -3452,6 +3524,12 @@ mod tests {
             // Crypto
             let sha = crypto.hashSha256("hello");
             assert(sha == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+            // HMAC-SHA256(key="key", msg="The quick brown fox jumps over the
+            // lazy dog") -- vector de referencia calculado con Python
+            // (hmac.new(b"key", b"...", hashlib.sha256).hexdigest()), no
+            // inventado a mano.
+            let mac = crypto.hmacSha256("key", "The quick brown fox jumps over the lazy dog");
+            assert(mac == "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8");
             let pwd = "secret_password_123";
             let hash = crypto.hashPassword(pwd);
             assert(crypto.verifyPassword(pwd, hash) == true);
