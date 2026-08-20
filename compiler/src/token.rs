@@ -21,6 +21,43 @@ impl Span {
     }
 }
 
+impl TokenKind {
+    /// Texto fuente de una palabra clave, o `None` si el token no lo es.
+    ///
+    /// Existe para las posiciones donde la gramatica pide un NOMBRE y una
+    /// palabra clave no puede significar otra cosa -- declaracion de campo,
+    /// campo de un literal de struct, campo de un patron y acceso `.campo`.
+    /// Sin esto, un modelo con una columna llamada `service`, `type` o `from`
+    /// -- nombres normales en un esquema real -- no se puede describir en
+    /// Link, aunque en esas posiciones no haya ninguna ambiguedad.
+    pub fn keyword_text(&self) -> Option<&'static str> {
+        match self {
+            TokenKind::Type => Some("type"),
+            TokenKind::Enum => Some("enum"),
+            TokenKind::Service => Some("service"),
+            TokenKind::Rpc => Some("rpc"),
+            TokenKind::Stream => Some("stream"),
+            TokenKind::Match => Some("match"),
+            TokenKind::Import => Some("import"),
+            TokenKind::From => Some("from"),
+            TokenKind::Pub => Some("pub"),
+            TokenKind::Const => Some("const"),
+            TokenKind::Fn => Some("fn"),
+            TokenKind::Let => Some("let"),
+            TokenKind::Mut => Some("mut"),
+            TokenKind::Return => Some("return"),
+            TokenKind::If => Some("if"),
+            TokenKind::Else => Some("else"),
+            TokenKind::While => Some("while"),
+            TokenKind::Test => Some("test"),
+            TokenKind::True => Some("true"),
+            TokenKind::False => Some("false"),
+            TokenKind::Null => Some("null"),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Literales

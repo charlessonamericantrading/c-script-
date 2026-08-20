@@ -111,6 +111,29 @@ impl Parser {
         }
     }
 
+    /// Como `eat_ident`, pero en posicion de NOMBRE DE CAMPO tambien acepta
+    /// una palabra clave. Ahi no hay ambiguedad -- una declaracion de campo es
+    /// siempre `NOMBRE : tipo`, y despues de un `.` solo puede venir un campo
+    /// o un indice de tupla -- y sin esto no se puede modelar una tabla con
+    /// una columna `service`, `type` o `from`, que son nombres corrientes.
+    fn eat_field_name(&mut self) -> Result<String, ParseError> {
+        match self.peek().clone() {
+            TokenKind::Ident(name) => {
+                self.advance();
+                Ok(name)
+            }
+            other => match other.keyword_text() {
+                Some(text) => {
+                    self.advance();
+                    Ok(text.to_string())
+                }
+                None => Err(self.error(format!(
+                    "se esperaba un nombre de campo, se encontro {other:?}"
+                ))),
+            },
+        }
+    }
+
     fn eat_string(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
             TokenKind::Str(s) => {
@@ -325,7 +348,7 @@ impl Parser {
 
     fn parse_field(&mut self) -> Result<Field, ParseError> {
         let name_span = self.span(); // cubre solo el identificador -- ver ast.rs::Field::name_span
-        let name = self.eat_ident()?;
+        let name = self.eat_field_name()?;
         let optional = if self.check(&TokenKind::Question) {
             self.advance();
             true
@@ -1051,7 +1074,7 @@ impl Parser {
     }
 
     fn parse_field_pattern(&mut self) -> Result<FieldPattern, ParseError> {
-        let name = self.eat_ident()?;
+        let name = self.eat_field_name()?;
         let pattern = if self.check(&TokenKind::Colon) {
             self.advance();
             self.parse_pattern()?
@@ -1080,7 +1103,7 @@ impl Parser {
                             e = Spanned { node: Expr::TupleIndex { base: Box::new(e), index }, span };
                         }
                         _ => {
-                            let field = self.eat_ident()?;
+                            let field = self.eat_field_name()?;
                             let span = merge(e.span, self.prev_span());
                             e = Spanned { node: Expr::FieldAccess { base: Box::new(e), field }, span };
                         }
@@ -1274,7 +1297,7 @@ impl Parser {
     }
 
     fn parse_field_init(&mut self) -> Result<(String, Spanned<Expr>), ParseError> {
-        let name = self.eat_ident()?;
+        let name = self.eat_field_name()?;
         self.eat(&TokenKind::Colon)?;
         let value = self.parse_expr()?;
         Ok((name, value))
@@ -1391,6 +1414,36 @@ mod tests {
                 NOSPAN
             )
         );
+    }
+
+    #[test]
+    fn keywords_are_valid_field_names_in_declarations_literals_and_access() {
+        // Un esquema real puede tener una columna `service`, `type` o `from`.
+        // En posicion de nombre de campo no hay ambiguedad posible, asi que
+        // reservarlas ahi hacia el modelo indescriptible sin renombrar la
+        // columna de produccion.
+        let program = parse_source(
+            "type Lead = { id: Int, service: String, type: String, from: String }
+             fn pick(l: Lead) -> String { l.service }",
+        );
+        assert_eq!(program.items.len(), 2);
+
+        let program = parse_source(
+            "type L = { id: Int, service: String }
+             fn make() -> L { L { id: 1, service: \"seo\" } }",
+        );
+        assert_eq!(program.items.len(), 2);
+    }
+
+    #[test]
+    fn a_keyword_is_still_rejected_where_a_real_identifier_is_required() {
+        // El relajamiento es SOLO en posicion de campo: un `type` como nombre
+        // de rpc, de fn o de parametro sigue siendo un error de sintaxis.
+        let tokens = tokenize("fn service() -> Int { 1 }").unwrap();
+        assert!(parse(tokens).is_err(), "'service' no deberia valer como nombre de fn");
+
+        let tokens = tokenize("type type = { id: Int }").unwrap();
+        assert!(parse(tokens).is_err(), "'type' no deberia valer como nombre de tipo");
     }
 
     #[test]
