@@ -62,7 +62,17 @@ fn log_done(req_id: u64, method: Option<&str>, status: u16, start: std::time::In
     }
 }
 
-pub fn serve(program: Program, port: u16, db_path: PathBuf) {
+/// De dónde salen los datos que sirve este servidor (GRAMMAR.md §3.36).
+/// El resto del programa no cambia según cuál sea: el mismo `.link`, los
+/// mismos rpc, el mismo contrato TypeScript generado.
+pub enum DbSource {
+    /// Un archivo SQLite al lado del fuente -- el default de siempre.
+    SqliteFile(PathBuf),
+    /// Una URL de conexión de PostgreSQL (`postgres://usuario:clave@host/base`).
+    Postgres(String),
+}
+
+pub fn serve(program: Program, port: u16, source: DbSource) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
@@ -75,11 +85,26 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
     // desconocida: 'items'" en cada rpc; y uno que sí declaraba `users`
     // pero con otra forma recibía los campos del `User` del demo, que su
     // propio tipo no tiene.
-    let db = Db::new(&program, &db_path);
+    let db = match source {
+        DbSource::SqliteFile(db_path) => Db::new(&program, &db_path),
+        // A diferencia de abrir un archivo local, conectarse a una base remota
+        // falla por motivos operativos normales (está caída, la clave cambió,
+        // la base no existe todavía). Eso merece un mensaje que se entienda y
+        // un exit code, no el panic que usa el camino de SQLite.
+        DbSource::Postgres(url) => match Db::connect_postgres(&program, &url) {
+            Ok(db) => db,
+            Err(e) => {
+                eprintln!("error: {e}");
+                eprintln!("       revisá la URL de conexión (LINK_DATABASE_URL o --db) y que la base esté levantada");
+                std::process::exit(1);
+            }
+        },
+    };
     // Auth v0 (GRAMMAR.md §3.14): vive mientras el proceso corre, igual que
     // `db` -- sin expiración, sin persistencia entre reinicios.
     let sessions = SessionStore::new();
-    println!("c-script server escuchando en http://localhost:{port}  (Ctrl+C para detener)");
+    let backend = if db.is_postgres() { "PostgreSQL" } else { "SQLite" };
+    println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     for mut request in server.incoming_requests() {
         if *request.method() == tiny_http::Method::Options {
@@ -186,7 +211,7 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
             continue;
         }
 
-        let (status, response_body) =
+        let (status, response_body, response_type) =
             handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, &body);
         // `response_body` en una falla es `{"error": "<mensaje>"}`
         // (`error_json`, más abajo) -- se extrae el mensaje solo para el
@@ -203,7 +228,7 @@ pub fn serve(program: Program, port: u16, db_path: PathBuf) {
         } else {
             String::new()
         };
-        let _ = request.respond(cors_response(status, response_body));
+        let _ = request.respond(cors_response_with_type(status, response_body, &response_type));
         log_done(req_id, Some(&method), status, start, &extra);
     }
 }
@@ -275,7 +300,29 @@ fn check_auth_gate(
         // cualquiera con un token de bajo privilegio un mapeo completo
         // endpoint->rol gratis (hallado en el review adversarial).
         Annotation::Requires { .. } => Err((403, "no tenés permiso para esta operación")),
+        // `required_auth` solo devuelve anotaciones de auth: si esto llegara
+        // a matchear, el bug está allá arriba, no acá.
+        Annotation::ContentType(_) => Ok(()),
     }
+}
+
+/// El Content-Type que declaró el rpc con `@content_type("...")`, si lo hizo
+/// (GRAMMAR.md §3.35). Cuando hay uno, el cuerpo de la respuesta es el
+/// `String` que devolvió el rpc TAL CUAL -- sin comillas de JSON alrededor --
+/// que es lo que permite servir HTML, XML (un sitemap), CSV o texto plano
+/// desde un programa c-script.
+fn declared_content_type(program: &Program, service_name: &str, rpc_name: &str) -> Option<String> {
+    program.items.iter().find_map(|item| match item {
+        crate::ast::Item::Service(s) if s.name == service_name => {
+            s.members.iter().find_map(|m| match m {
+                crate::ast::Member::Rpc(r) if r.name == rpc_name => {
+                    r.content_type().map(str::to_string)
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    })
 }
 
 fn handle_rpc(
@@ -286,14 +333,31 @@ fn handle_rpc(
     service_name: &str,
     rpc_name: &str,
     body: &str,
-) -> (u16, String) {
+) -> (u16, String, String) {
     let args_json = match parse_args(body) {
         Ok(v) => v,
-        Err(e) => return (400, error_json(&e)),
+        Err(e) => return (400, error_json(&e), JSON_CONTENT_TYPE.to_string()),
     };
     match invoke_rpc_with_sessions(program, service_name, rpc_name, &args_json, db, sessions, token) {
-        Ok(result) => (200, result.to_string()),
-        Err(e) => (status_for(&e), error_json(&e.to_string())),
+        Ok(result) => match declared_content_type(program, service_name, rpc_name) {
+            // El checker ya garantizó que un rpc con `@content_type` devuelve
+            // `String`, así que `as_str()` acá siempre acierta; el fallback
+            // existe para no inventar un panic si esa invariante se rompiera.
+            Some(ct) => {
+                let text = result.as_str().map(str::to_string).unwrap_or_else(|| result.to_string());
+                (200, text, ct)
+            }
+            None => (200, result.to_string(), JSON_CONTENT_TYPE.to_string()),
+        },
+        // Un error SIEMPRE sale como JSON, aunque el rpc declare otro
+        // Content-Type: el cliente generado espera `{"error": ...}` para
+        // cualquier status >= 400, y una página de error en HTML rompería ese
+        // contrato justo cuando algo ya salió mal.
+        Err(e) => (
+            status_for(&e),
+            error_json(&e.to_string()),
+            JSON_CONTENT_TYPE.to_string(),
+        ),
     }
 }
 
@@ -466,8 +530,25 @@ fn error_json(message: &str) -> String {
     serde_json::json!({ "error": message }).to_string()
 }
 
+const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
+
 fn cors_response(status: u16, body: String) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json; charset=utf-8"[..]).unwrap();
+    cors_response_with_type(status, body, JSON_CONTENT_TYPE)
+}
+
+/// Igual que `cors_response` pero con el Content-Type que pidió el rpc
+/// (GRAMMAR.md §3.35). Un valor que no sea un header HTTP válido cae de vuelta
+/// a JSON en vez de tirar el servidor: el checker ya rechaza el string vacío,
+/// pero esto no puede validar todo el universo de tipos MIME.
+fn cors_response_with_type(
+    status: u16,
+    body: String,
+    content_type_value: &str,
+) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type_value.as_bytes())
+        .unwrap_or_else(|_| {
+            tiny_http::Header::from_bytes(&b"Content-Type"[..], JSON_CONTENT_TYPE.as_bytes()).unwrap()
+        });
     let allow_origin = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], &b"*"[..]).unwrap();
     let allow_methods =
         tiny_http::Header::from_bytes(&b"Access-Control-Allow-Methods"[..], &b"POST, GET, OPTIONS"[..]).unwrap();

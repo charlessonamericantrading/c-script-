@@ -315,15 +315,25 @@ fn render_service(s: &ServiceDecl) -> String {
         match member {
             Member::Rpc(r) => {
                 let rpc_name = &r.name;
-                let auth_badge = match &r.annotation {
+                let auth_badge = match r.auth() {
                     Some(Annotation::Requires { enum_name, variant_name }) => {
                         format!(r#"<span class="badge auth-badge">🔒 @requires({enum_name}.{variant_name})</span>"#)
                     }
                     Some(Annotation::Authenticated) => {
                         r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string()
                     }
-                    None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
+                    // `auth()` nunca devuelve ContentType; el brazo existe
+                    // para que agregar una anotación nueva rompa acá y no
+                    // pase de largo mostrando "Público" por descarte.
+                    Some(Annotation::ContentType(_)) | None => {
+                        r#"<span class="badge">🌐 Público</span>"#.to_string()
+                    }
                 };
+                let content_type_badge = match r.content_type() {
+                    Some(ct) => format!(r#"<span class="badge">📄 {ct}</span>"#),
+                    None => String::new(),
+                };
+                let auth_badge = format!("{auth_badge}{content_type_badge}");
 
                 let mut params_str = Vec::new();
                 let mut params_table = String::new();

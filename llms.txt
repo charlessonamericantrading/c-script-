@@ -1,40 +1,115 @@
 # c-script (Link) — Backend Language with Native End-to-End Type Safety for TypeScript
 
-> c-script is a compiled backend programming language and toolchain with native, zero-IDL isomorphic type safety for TypeScript frontends, embedded SQLite database with live reactive push streaming, declarative RBAC authentication, and integrated testing.
+> c-script is a compiled backend language and toolchain. One `.link` file is the single
+> source of truth for your types, your database schema, your RPC endpoints, your auth
+> rules and your tests; `linkc build` emits the TypeScript contract, a typed client,
+> runtime validators, React hooks, Zod schemas and an OpenAPI 3.1 spec from it. Rename a
+> field in the backend and the frontend stops compiling — that is the entire point.
 
-## Documentation & Spec
-- [Grammar & Specification](GRAMMAR.md): Complete EBNF grammar, bidirectional type checker, and TypeScript mapping table.
-- [Engineering Plan](PLAN.md): Architecture, trade-offs, and roadmap.
-- [VS Code Extension](editors/vscode): LSP client and syntax highlighting.
-- [Full LLM Reference](llms-full.txt): In-depth cheat sheet and API specification.
+## Names (read this first — they are all the same project)
 
-## Core Language Features
-- **Isomorphic Types**: Structs, enums, unions (`A | B`), generics, closures, and nullable types (`T?`) map 1:1 to TypeScript interfaces, discriminated unions, and JSON.
-- **Embedded Database**: `db { collection: Type[] }` creates typed tables on disk in SQLite with `.all()`, `.find()`, `.insert()`, `.applyPatch()`, `.delete()`, `.findWhere()`, `.deleteWhere()`.
-- **Reactive Streaming**: `stream endpoint() -> T` over Server-Sent Events (SSE) with `db.<col>.subscribe()`. Consumed as `AsyncIterable<T>` in TypeScript.
-- **Declarative Auth**: `@authenticated` and `@requires(Role.Admin)` with 128-bit opaque session tokens.
-- **Integrated Test Runner**: `test "description" { ... }` blocks executed with in-memory DB isolation via `linkc test <file.link>`.
-- **Full Toolchain**: LSP 2.0 (`linkc lsp`), Formatter (`linkc fmt`), Linter (`linkc lint`), Docs (`linkc doc`), Containerizer (`linkc docker`).
+| Thing | Value |
+|---|---|
+| Repository | `charlessonamericantrading/c-script-` (the trailing `-` is part of the name) |
+| Language name | **c-script** (canonical, decided in PLAN.md "Sobre el nombre") |
+| Brand used in the README | **Link** |
+| Source file extension | `.link` |
+| Compiler / CLI binary | `linkc` |
+| Planned npm wrapper | `link-lang` (**not published yet** — `npm i link-lang` fails today) |
 
-## CLI Quickstart
+## Documentation (absolute URLs — fetch these directly)
+
+- Grammar & full specification (EBNF, bidirectional type checker, c-script→TypeScript mapping table, and the honest limits of every feature): https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/GRAMMAR.md — large (~190 KB); it has a table of contents at the top, fetch the section you need.
+- Engineering plan, architecture and roadmap: https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/PLAN.md
+- Instructions for coding agents: https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/AGENTS.md
+- Extended LLM reference (type mapping tables, generated-output shapes): https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/llms-full.txt
+- Working reference program (compiles, runs, and is checked by CI on every push): https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/examples/users.link
+
+## What works today, and what does not
+
+Do not infer capabilities from feature names. This section is the ground truth; if it
+disagrees with any prose elsewhere in the repo, this section wins.
+
+Works, verified by running it:
+
+- `linkc build` — emits `contract.d.ts`, `client.ts`, `validators.ts`, `hooks.ts`, `schemas.ts`, `openapi.json`.
+- `linkc serve` — real HTTP server, embedded SQLite that persists across restarts, SSE streams.
+- `linkc test` — runs `test "..."` blocks against an isolated in-memory database.
+- `linkc dev`, `linkc lint`, `linkc doc`, `linkc docker`, `linkc lsp`, `linkc new`.
+- Declarative auth: `@authenticated` and `@requires(Role.Admin)`, with session tokens drawn from the OS CSPRNG.
+- `crypto.hashPassword` / `verifyPassword` — Argon2id (RFC 9106) with a random per-password salt, PHC format, constant-time verification. `crypto.randomToken` and `crypto.uuid` also come from the OS CSPRNG.
+- PostgreSQL as the runtime database: `linkc serve app.link 8787 --db postgres://user:pass@host/db` (or `LINK_DATABASE_URL`). Same program, same generated contract; SQLite stays the default. No connection pool, no TLS, no LISTEN/NOTIFY — see GRAMMAR.md §3.36.
+- Non-JSON responses: `@content_type("text/html; charset=utf-8")` on an rpc returning `String` sends that body verbatim with that header — HTML, XML sitemaps, CSV, plain text. Combines with `@authenticated` / `@requires`.
+
+Does NOT work today — do not propose designs that depend on these:
+
+- **Clean URLs.** Routing is always `/Service/rpc`; there are no path parameters and no custom routes, so serving a blog at `/blog/my-post` needs a proxy in front. HTML itself works (see `@content_type`), and so does an error page — errors always come back as JSON.
+- **HTML escaping.** Pages are built by concatenating `String`; nothing escapes interpolated data for you. Escape anything that came from the database yourself.
+- **`linkc fmt` is unsafe.** It currently deletes comments and can emit source that no longer parses. Do not run it on code you care about (fix pending in PR #2).
+- **`linkc --help`** is not a recognised argument. Run `linkc` with no arguments to list subcommands.
+- **Native WASM codegen** (`linkc wasm`) is deliberately frozen at integer/boolean scalar functions.
+- **No published binaries or npm package.** Build from source: `cd compiler && cargo build --release`.
+
+## The rules an LLM gets wrong
+
+Every one of these was a real bug in this repository's own documentation. They are the
+difference between code that compiles and code that does not.
+
+1. **An enum variant used as a VALUE needs braces**: `Role.Member {}`, not `Role.Member`.
+   Inside an annotation it is written without braces: `@requires(Role.Admin)`. Inside a
+   `match` pattern, also without braces: `Filter.All => ...`. This single rule causes most
+   first-attempt failures.
+2. **Closures take no return-type annotation**: `|t: Todo| { !t.completed }`, never
+   `|t: Todo| -> Bool { ... }`.
+3. **A `T?` cannot be dereferenced.** `if x != null` type-checks as a boolean test but does
+   not narrow `x`, so `x.field` inside the branch is an error. Return `T?` to the frontend
+   (TypeScript narrows it fine) instead of taking it apart in c-script.
+4. **`db.<c>.insert` takes the type without `id`** (`Omit<T, "id">`). Passing a full struct
+   with an explicit `id` is accepted, but the value is ignored — the database assigns 1, 2, 3…
+5. **`db.<c>.subscribe()` is legal in exactly one place**: as the entire body of
+   `stream f() -> T { while true { db.<c>.subscribe() } }`. Anywhere else it is an error.
+6. **`Patch<T>` has no literal syntax.** It arrives as an RPC parameter and is passed
+   straight to `applyPatch(id, patch)`.
+7. **Default parameter values work** (`rpc list(limit: Int = 20)`), including enums — but
+   the default obeys rule 1: `rpc list(f: Filter = Filter.All {})`.
+
+8. **`@content_type` only goes on an rpc returning `String`** — never on a `stream`
+   (SSE owns its content type), and at most once. Auth annotations stack with it:
+   `@requires(Role.Admin) @content_type("text/html")` is valid and is how an admin
+   page is written.
+
+Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
+`insert(Omit<T,"id">) -> T`, `applyPatch(id, patch) -> T`, `delete(id) -> Bool`,
+`deleteWhere(pred) -> Int`, `subscribe()` (see rule 5).
+
+## CLI
+
 ```bash
-# Compile and emit TypeScript contracts, client, validators, and OpenAPI
-linkc build backend.link src/gen
-
-# Run built-in test suite
-linkc test backend.link
-
-# Start HTTP + SQLite backend server on port 8787
-linkc serve backend.link 8787
-
-# Interactive hot-reloading dev mode
-linkc dev backend.link src/gen 8787
+linkc new my-app --template nextjs   # or: vite, minimal
+linkc build backend.link src/gen     # TypeScript contract, client, validators, OpenAPI
+linkc test backend.link              # run the test blocks
+linkc serve backend.link 8787        # HTTP + SQLite + SSE
+linkc dev backend.link src/gen 8787  # rebuild and restart on change
 ```
 
-## Example Program (`backend.link`)
+## Verified example
+
+This program compiles and its test passes. It is re-verified on every CI run by
+`compiler/tests/docs_examples.rs`, which is what the `linkc:check` marker below means —
+every c-script block in this repository's documentation is compiled by the real binary,
+so an example that stops working breaks the build.
+
+<!-- linkc:check -->
 ```rust
 type Todo = {
   id: Int,
+  title: String,
+  completed: Bool,
+  createdAt: Timestamp,
+}
+
+// The creation shape: the same fields as Todo without `id` (Omit<Todo, "id">).
+type NewTodo = {
   title: String,
   completed: Bool,
   createdAt: Timestamp,
@@ -47,37 +122,39 @@ db {
 }
 
 service Todos {
-  rpc list(filter: Filter = Filter.All) -> Todo[] {
+  // Note `Filter.All {}`: an enum variant in expression position needs braces.
+  rpc list(filter: Filter = Filter.All {}) -> Todo[] {
     match filter {
       Filter.All => db.todos.all(),
-      Filter.Pending => db.todos.findWhere(|t: Todo| -> Bool { !t.completed }),
-      Filter.Done => db.todos.findWhere(|t: Todo| -> Bool { t.completed }),
+      Filter.Pending => db.todos.findWhere(|t: Todo| { !t.completed }),
+      Filter.Done => db.todos.findWhere(|t: Todo| { t.completed }),
     }
   }
 
   rpc create(title: String) -> Todo {
-    db.todos.insert(Todo {
-      id: 0,
+    db.todos.insert(NewTodo {
       title: title,
       completed: false,
       createdAt: now(),
     })
   }
 
-  rpc toggle(id: Int) -> Todo? {
-    let existing = db.todos.find(id);
-    if existing != null {
-      db.todos.applyPatch(id, Todo {
-        id: id,
-        title: existing.title,
-        completed: !existing.completed,
-        createdAt: existing.createdAt,
-      })
-    } else {
-      null
-    }
+  // Returns Todo? and hands it to TypeScript as `Todo | null`. Do not try to
+  // read a field off it here -- there is no narrowing in c-script.
+  rpc getById(id: Int) -> Todo? {
+    db.todos.find(id)
   }
 
+  rpc update(id: Int, patch: Patch<Todo>) -> Todo {
+    db.todos.applyPatch(id, patch)
+  }
+
+  rpc remove(id: Int) -> Bool {
+    db.todos.delete(id)
+  }
+
+  // Live push over Server-Sent Events. This exact shape is the only legal
+  // position for subscribe().
   stream watch() -> Todo {
     while true {
       db.todos.subscribe()
@@ -85,10 +162,20 @@ service Todos {
   }
 }
 
-test "can create and toggle todo" {
+test "a new todo gets an id and starts pending" {
   let created = Todos.create("Learn c-script");
-  assert(created.id > 0, "ID assigned");
-  let toggled = Todos.toggle(created.id);
-  assert(toggled != null && toggled.completed == true, "Todo marked as completed");
+  assert(created.id > 0, "insert assigns the id");
+  assert(created.completed == false, "a new todo starts pending");
+  assert(Todos.list(Filter.Pending {}).length() == 1, "it shows up under Pending");
 }
+```
+
+The TypeScript side consumes it with full inference:
+
+```ts
+import { createClient } from "./gen/client";
+
+const api = createClient("http://localhost:8787");
+const todo = await api.Todos.create("Learn c-script"); // todo: Todo
+for await (const t of api.Todos.watch()) console.log(t.title);
 ```

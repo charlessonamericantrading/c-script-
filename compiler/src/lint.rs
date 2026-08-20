@@ -21,10 +21,10 @@ pub fn lint_program(program: &Program) -> Vec<LintWarning> {
             }
             Item::Service(s) => {
                 let has_auth = s.members.iter().any(|m| match m {
-                    Member::Rpc(r) | Member::Stream(r) => r.annotation.is_some(),
+                    Member::Rpc(r) | Member::Stream(r) => r.auth().is_some(),
                 });
                 let has_unauth = s.members.iter().any(|m| match m {
-                    Member::Rpc(r) | Member::Stream(r) => r.annotation.is_none(),
+                    Member::Rpc(r) | Member::Stream(r) => r.auth().is_none(),
                 });
 
                 if has_auth && has_unauth {
