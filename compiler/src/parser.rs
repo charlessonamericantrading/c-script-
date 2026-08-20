@@ -429,9 +429,15 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::ContentType(value)
                 }
+                "route" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let value = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::Route(value)
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)' o '@content_type(\"tipo/mime\")')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")' o '@route(\"/ruta/:param\")')"
                     )))
                 }
             };

@@ -303,6 +303,12 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
             params.join(", "),
             render_type(ret_ty)
         ));
+        // `@route` (GRAMMAR.md §3.37) es un alias ADEMÁS de esta dirección,
+        // nunca un reemplazo -- el cliente generado sigue llamando siempre a
+        // /Service/rpc; la URL linda es para un crawler, no para código.
+        if let Some(pattern) = rpc.route() {
+            out.push_str(&format!("    // También accesible en: {pattern}\n"));
+        }
         push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names);
 
         // Un rpc con `@content_type` responde el String tal cual, sin comillas

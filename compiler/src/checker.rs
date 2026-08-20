@@ -697,6 +697,13 @@ impl Checker {
             }
         }
 
+        // Aparte del loop de arriba: un conflicto de `@route` es entre DOS
+        // rpc, no un error DE un rpc individual -- necesita haber visto el
+        // programa entero antes de poder decidir nada. Sin span/file por
+        // rpc individual (el mensaje ya nombra a los dos), así que estos
+        // errores no pasan por `file_for`.
+        errors.extend(checker.check_route_conflicts(program));
+
         (checker, errors)
     }
 
@@ -1272,6 +1279,115 @@ impl Checker {
         Ok(())
     }
 
+    /// Valida la forma de `@route("...")` y que el rpc tenga EXACTAMENTE los
+    /// parámetros que esa forma implica (GRAMMAR.md §3.37). El conflicto
+    /// ENTRE rutas de distintos rpc (dos patrones con la misma forma) no se
+    /// puede resolver acá -- necesita ver TODO el programa a la vez -- así
+    /// que lo hace `check_route_conflicts`, llamado aparte desde
+    /// `check_program_full` después de recorrer todos los rpc.
+    fn check_route_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        let routes: Vec<&String> = r
+            .annotations
+            .iter()
+            .filter_map(|a| match a {
+                Annotation::Route(pattern) => Some(pattern),
+                _ => None,
+            })
+            .collect();
+        if routes.len() > 1 {
+            return Err(err(format!(
+                "'{}' declara `@route` más de una vez: un rpc tiene una sola URL amigable adicional",
+                r.name
+            )));
+        }
+        let Some(raw) = routes.first() else {
+            return Ok(());
+        };
+        if is_stream {
+            return Err(err(format!(
+                "`@route` en el stream '{}': un `stream` no tiene una request/response HTTP normal a la que pegarle una URL alternativa (GRAMMAR.md §3.37)",
+                r.name
+            )));
+        }
+        let pattern = crate::route::parse_route_pattern(raw).map_err(|e| err(format!("`@route(\"{raw}\")` en '{}': {e}", r.name)))?;
+
+        match &pattern.param_name {
+            // Ruta puramente literal: el rpc no puede pedir NINGÚN parámetro
+            // -- no hay de dónde sacarlo (v0 no lee query string ni body en
+            // un rpc con @route, a propósito: así la URL sirve tal cual para
+            // un crawler, sin depender de un POST con JSON).
+            None => {
+                if !r.params.is_empty() {
+                    return Err(err(format!(
+                        "`@route(\"{raw}\")` en '{}': la ruta no tiene ningún `:parámetro`, pero el rpc pide {} -- un rpc con `@route` solo puede tomar los parámetros que la ruta declara",
+                        r.name,
+                        r.params.len()
+                    )));
+                }
+            }
+            // Con un `:nombre` al final, el rpc tiene que tener EXACTAMENTE
+            // ese único parámetro, de un tipo que de verdad salga de un
+            // segmento de URL (texto). `Int` se acepta parseando el
+            // segmento; cualquier otra cosa (Bool, Float, un struct) no
+            // tiene una representación de un solo segmento sin ambigüedad.
+            Some(name) => {
+                let [only] = r.params.as_slice() else {
+                    return Err(err(format!(
+                        "`@route(\"{raw}\")` en '{}': la ruta tiene un parámetro (':{name}'), así que el rpc tiene que tomar EXACTAMENTE uno -- tiene {}",
+                        r.name,
+                        r.params.len()
+                    )));
+                };
+                if &only.name != name {
+                    return Err(err(format!(
+                        "`@route(\"{raw}\")` en '{}': el parámetro del rpc se llama '{}', pero la ruta dice ':{name}' -- tienen que coincidir",
+                        r.name, only.name
+                    )));
+                }
+                let param_ty = self.resolve_type(&only.ty)?;
+                if !matches!(param_ty, Type::String | Type::Int) {
+                    return Err(err(format!(
+                        "`@route(\"{raw}\")` en '{}': ':{name}' viene de un segmento de URL, así que el parámetro tiene que ser `String` o `Int` -- es {param_ty}",
+                        r.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Dos `@route` con la MISMA forma (mismos segmentos literales, y los dos
+    /// terminan en parámetro o los dos no) son indistinguibles al despachar
+    /// una request real -- no hay forma de saber cuál de los dos rpc debería
+    /// atenderla. Se rechaza en compilación, no se resuelve por orden de
+    /// declaración ni "el primero gana": ese tipo de regla implícita es
+    /// exactamente lo que después alguien pisa sin darse cuenta.
+    fn check_route_conflicts(&self, program: &Program) -> Vec<CheckError> {
+        let mut seen: Vec<(String, crate::route::RoutePattern)> = Vec::new();
+        let mut errors = Vec::new();
+        for item in &program.items {
+            let Item::Service(s) = item else { continue };
+            for m in &s.members {
+                let Member::Rpc(r) = m else { continue };
+                let Some(raw) = r.route() else { continue };
+                // Una ruta con forma inválida ya la reportó
+                // `check_route_annotation` -- acá solo hace falta no volver
+                // a fallar parseándola de nuevo, no duplicar el error.
+                let Ok(pattern) = crate::route::parse_route_pattern(raw) else { continue };
+                if let Some((other_rpc, _)) = seen.iter().find(|(_, p)| p.same_shape(&pattern)) {
+                    errors.push(err(format!(
+                        "`@route(\"{raw}\")` en '{}' tiene la misma forma que la ruta de '{other_rpc}' -- \
+                         una request real no podría distinguir cuál de los dos atenderla. Cambiá uno de los \
+                         dos patrones (agregar un segmento literal alcanza, ej. '/blog/{{prefijo}}/:slug')",
+                        r.name
+                    )));
+                }
+                seen.push((r.name.clone(), pattern));
+            }
+        }
+        errors
+    }
+
     /// `@requires(Enum.Variante)` (GRAMMAR.md §3.14, auth v0) tiene que
     /// nombrar un enum de verdad y una variante que de verdad exista en él --
     /// si no, el error aparece acá, en tiempo de compilación, no como un 403
@@ -1280,6 +1396,7 @@ impl Checker {
     /// por tag, nunca mira campos.
     fn check_rpc_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
         self.check_annotation_combination(r, is_stream)?;
+        self.check_route_annotation(r, is_stream)?;
         let Some(Annotation::Requires { enum_name, variant_name }) = r.auth() else {
             return Ok(());
         };

@@ -58,6 +58,7 @@
   - [3.34 `crypto`: contraseñas y aleatoriedad — RESUELTO (Argon2id + CSPRNG del SO)](#334-crypto-contraseñas-y-aleatoriedad--resuelto-argon2id--csprng-del-so)
   - [3.35 `@content_type`: respuestas que no son JSON — RESUELTO (alcance acotado)](#335-content_type-respuestas-que-no-son-json--resuelto-alcance-acotado)
   - [3.36 PostgreSQL en runtime — RESUELTO (alcance acotado)](#336-postgresql-en-runtime--resuelto-alcance-acotado)
+  - [3.37 `@route("/blog/:slug")`: URLs amigables para SEO — RESUELTO (alcance acotado)](#337-routeblogslug-urls-amigables-para-seo--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -117,10 +118,14 @@ const_decl   = "const" , identifier , ":" , type_expr , "=" , expr , ";" ;
 
 service_decl = "service" , identifier , "{" , { member_decl } , "}" ;
 member_decl  = { annotation } , ( rpc_decl | stream_decl ) ;
-(* auth v0, §3.14 -- a lo sumo UNA por rpc/stream, nunca una lista *)
+(* Varias por rpc/stream se permiten -- lo que el checker rechaza es dos DE
+   LA MISMA DIMENSIÓN (dos de auth, dos @content_type, dos @route), no la
+   combinación entre dimensiones distintas: §3.14 (auth), §3.35
+   (@content_type), §3.37 (@route). *)
 annotation   = "@authenticated"
              | "@requires" , "(" , identifier , "." , identifier , ")"
-             | "@content_type" , "(" , string_lit , ")" ;
+             | "@content_type" , "(" , string_lit , ")"
+             | "@route" , "(" , string_lit , ")" ;
 rpc_decl     = "rpc" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 stream_decl  = "stream" , identifier , "(" , [ param_list ] , ")" , "->" , type_expr , block ;
 param_list   = param , { "," , param } ;
@@ -1543,6 +1548,115 @@ Verificado en `pg_integration.rs`: una tabla creada a mano con
 `id UUID PRIMARY KEY DEFAULT gen_random_uuid()`, apuntando `linkc serve` a
 ella -- el arranque falla, el mensaje nombra `uuid` y la tabla, nunca aparece
 `panicked at`, y el servidor nunca llega a imprimir que está escuchando.
+
+---
+
+### 3.37 `@route("/blog/:slug")`: URLs amigables para SEO — RESUELTO (alcance acotado)
+
+§3.35 (`@content_type`) resolvió la mitad del problema de SEO: un rpc ya podía
+devolver HTML de verdad. La otra mitad seguía intacta -- el ruteo es siempre
+`/Servicio/rpc`, sin parámetros en el path ni rutas propias. Una página de blog
+servida en `/Blog/page` (con el slug adentro de un body JSON) no es una URL que
+un buscador indexe de forma útil ni que un humano pueda compartir. `@route`
+cierra esa segunda mitad.
+
+**Lo que hay ahora:**
+
+```
+@content_type("text/html; charset=utf-8")
+@route("/blog/:slug")
+rpc page(slug: String) -> String { ... }
+```
+
+`GET /blog/mi-primer-post` invoca `Blog.page("mi-primer-post")` -- sin body,
+como manda cualquier crawler. La dirección de siempre, `/Blog/page` por POST
+con `{"slug": "..."}`, **sigue funcionando exactamente igual**: `@route` es un
+alias que se SUMA, nunca reemplaza nada -- el cliente TypeScript generado
+sigue llamando a `/Servicio/rpc` como siempre (con un comentario nuevo que
+menciona el alias, nada más).
+
+**Reglas de forma, todas verificadas en `check_route_annotation`
+(checker.rs):**
+
+- El patrón tiene que empezar con `/`, sin segmentos vacíos.
+- Un segmento `:nombre` es un parámetro. **A lo sumo el ÚLTIMO segmento puede
+  serlo** -- `/blog/:slug` sí, `/:categoria/:slug` no (ver "límites" abajo).
+- Sin parámetro (`@route("/sitemap.xml")`): el rpc no puede pedir NINGÚN
+  parámetro -- v0 no lee query string ni body en un rpc con `@route`, a
+  propósito, para que la URL sirva tal cual para un crawler sin depender de
+  un POST con JSON.
+- Con parámetro (`@route("/blog/:slug")`): el rpc tiene que tomar
+  EXACTAMENTE ese parámetro, con ESE nombre, de tipo `String` o `Int` -- los
+  únicos dos que salen de un segmento de URL sin ambigüedad. `Int` se
+  obtiene parseando el segmento; si no parsea, 400 con un mensaje que nombra
+  el parámetro y lo que llegó, nunca un 500 ni mucho menos un panic.
+- `@route` sobre un `stream`: rechazado -- un stream no tiene una
+  request/response HTTP normal a la que pegarle una URL alternativa.
+
+**Conflictos entre rutas, detectados en compilación
+(`check_route_conflicts`).** Dos `@route` con la MISMA FORMA (mismos
+segmentos literales, y las dos terminan en parámetro o las dos no) son
+indistinguibles al despachar una request real -- se rechaza al compilar, sin
+importar el nombre del parámetro de cada una. Lo que SÍ convive sin
+conflicto: una ruta literal y una con parámetro que comparten prefijo
+(`/blog/featured` y `/blog/:slug`) -- la literal gana siempre que matchee
+exacto, mismo criterio de precedencia que cualquier router HTTP común.
+
+Ese criterio de precedencia fue, de hecho, el primer bug real que este mismo
+feature encontró en su propio desarrollo: la primera versión de
+`resolve_route` (`runtime/server.rs`) devolvía la primera entrada de la tabla
+de rutas que matcheara, en orden de DECLARACIÓN -- así que `/blog/featured`
+resolvía al rpc de `/blog/:slug` (declarado primero en el programa de
+prueba) en vez de al rpc literal. Se encontró corriendo el servidor real y
+pidiendo esa URL exacta, no leyendo el código -- exactamente el motivo por
+el que este proyecto prueba contra el binario. `cli_route.rs` fija esa
+precedencia como test explícito.
+
+**Dónde vive el parser de patrones.** `compiler/src/route.rs`, un módulo sin
+dependencias de `Program`/`Checker`/`Db` -- usado TAL CUAL tanto por el
+checker (validar en compilación) como por `runtime/server.rs` (armar la
+tabla de rutas y despachar en runtime). Una sola fuente de verdad de qué es
+un patrón válido y qué significa que matchee, para no repetir la clase de
+bug que este documento viene registrando desde §3.9 (dos capas que
+implementan la misma regla por separado, y divergen).
+
+**Límites honestos de esta ronda, a propósito:**
+
+- **Un solo segmento dinámico por ruta, y tiene que ser el último.**
+  `/blog/:categoria/:slug` (dos parámetros) no está soportado -- resolver
+  ambigüedad entre patrones con MÁS de un segmento dinámico es una extensión
+  real, no una línea de más. El caso que motivó esto (una URL humana por
+  página de contenido SEO) no lo necesita.
+- **Sin query string ni body en un rpc con `@route`.** Todos sus parámetros
+  tienen que salir del path. Si hace falta más información, se resuelve con
+  otro rpc aparte (sin `@route`), llamado desde el cliente normal.
+- **No aparece en `openapi.json`.** El spec generado sigue documentando
+  únicamente `/Servicio/rpc` -- que es el contrato que consume el cliente
+  tipado. `@route` es la cara humana/crawler, no parte del contrato
+  programático; sumarla al spec (con sus propios parámetros `in: path`) queda
+  para una ronda futura si hace falta.
+- **Sin trailing slash ni normalización.** `/blog/mi-post/` (con barra
+  final) NO matchea `/blog/:slug` -- es un segmento vacío, rechazado como
+  cualquier otro.
+- **Los errores de un rpc con `@route` siguen siendo JSON**, nunca una
+  página de error en HTML -- mismo criterio que ya vale para
+  `@content_type` (§3.35): el cliente generado espera `{"error": ...}` para
+  cualquier status ≥ 400.
+
+Para cualquiera de estos límites -- rutas de dos parámetros, una 404 propia,
+servir estáticos de verdad -- [`docs/routing.md`](../docs/routing.md) tiene
+el patrón de proxy (nginx/Caddy) que los resuelve sin tocar `linkc`.
+
+**Verificado** en `compiler/tests/cli_route.rs` contra un servidor real,
+hablando HTTP de verdad: un `GET` sin body a una ruta con parámetro String,
+la precedencia literal-antes-que-dinámico, una ruta puramente literal sin
+parámetros, un parámetro `Int` inválido devolviendo 400 con mensaje claro (no
+un 500 ni un panic), la dirección `/Servicio/rpc` de siempre funcionando en
+paralelo a la ruta linda, `@route` combinado con `@requires` devolviendo 401
+en JSON sin token, un path sin ninguna ruta cayendo al 404 de siempre, y las
+cuatro combinaciones que el checker rechaza (forma de dos rutas en
+conflicto, parámetro que no es el último segmento, tipo no permitido,
+`@route` sobre un `stream`).
 
 ---
 

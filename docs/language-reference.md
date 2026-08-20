@@ -110,3 +110,20 @@ service Users {
 
 - `@authenticated`: Exige que la petición HTTP adjunte una sesión activa válida.
 - `@requires(Role.Admin)`: Verifica que la sesión pertenezca al rol especificado.
+
+---
+
+## 6. Content-Type y URLs amigables
+
+Un rpc que devuelve `String` puede combinar estos dos decoradores, además de
+los de auth de arriba:
+
+- `@content_type("text/html; charset=utf-8")`: el cuerpo de la respuesta es
+  ese `String` tal cual, sin las comillas de JSON -- HTML, XML, CSV, texto
+  plano. Detalle: [GRAMMAR.md §3.35](../GRAMMAR.md#335-content_type-respuestas-que-no-son-json--resuelto-alcance-acotado).
+- `@route("/blog/:slug")`: URL adicional, amigable para un crawler, que
+  convive con la dirección `/Servicio/rpc` de siempre sin reemplazarla. El
+  segmento final `:nombre` se bindea a un parámetro `String`/`Int` del rpc
+  con ese mismo nombre. Detalle y el patrón de proxy para lo que no cubre:
+  [GRAMMAR.md §3.37](../GRAMMAR.md#337-routeblogslug-urls-amigables-para-seo--resuelto-alcance-acotado)
+  y [`docs/routing.md`](routing.md).

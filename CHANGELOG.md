@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.2.0] - 2026-08-20
+
+### ✨ Nuevo
+- **`@route("/blog/:slug")`: URLs amigables para SEO.** `@content_type` (v1.1.0) ya permitía devolver HTML de verdad; el ruteo seguía siendo siempre `/Servicio/rpc`. Ahora un rpc puede declarar una URL alternativa, limpia y rastreable por GET, que convive con la dirección de siempre sin reemplazarla — el cliente TypeScript generado sigue llamando a `/Servicio/rpc`. Un segmento final `:nombre` se bindea a un parámetro `String` o `Int` del rpc con ese mismo nombre; sin parámetro, el rpc no puede pedir ninguno (v0 no lee query string ni body en una `@route`, a propósito, para que sirva tal cual a un crawler). Combina con `@authenticated`/`@requires`. Dos rutas con la misma forma se rechazan en compilación; una literal (`/blog/featured`) siempre gana sobre una dinámica que también matchearía (`/blog/:slug`) con el mismo criterio de precedencia que cualquier router HTTP común -- ese fue, de hecho, el primer bug real que este mismo feature encontró en su propio desarrollo (`cli_route.rs` lo fija como test explícito). Límites de esta ronda (un solo segmento dinámico y tiene que ser el último; no aparece en `openapi.json`; sin trailing slash): GRAMMAR.md §3.37.
+
 ## [1.1.1] - 2026-08-20
 
 ### 🔥 Arreglo crítico

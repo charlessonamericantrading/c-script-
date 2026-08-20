@@ -39,6 +39,7 @@ const DOCS: &[&str] = &[
     ".windsurfrules",
     "docs/language-reference.md",
     "docs/architecture.md",
+    "docs/routing.md",
     "CONTRIBUTING.md",
     "AGENTS.md",
     "CLAUDE.md",

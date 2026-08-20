@@ -227,17 +227,32 @@ impl RpcDecl {
             _ => None,
         })
     }
+
+    /// El patrón de ruta declarado con `@route("/blog/:slug")`, si hay --
+    /// texto crudo, sin parsear (GRAMMAR.md §3.37). El checker es quien
+    /// valida la forma y arma el binding contra los parámetros del rpc;
+    /// acá es solo el string tal como se escribió.
+    pub fn route(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::Route(pattern) => Some(pattern.as_str()),
+            _ => None,
+        })
+    }
 }
 
 /// Anotaciones de un rpc/stream. Se permiten varias, pero no cualquier
-/// combinación: el checker rechaza dos de auth, dos de `@content_type`, y
-/// `@content_type` sobre un `stream` o sobre un rpc que no devuelve `String`.
+/// combinación: el checker rechaza dos de auth, dos de `@content_type`, dos
+/// de `@route`, y tanto `@content_type` como `@route` sobre un `stream`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Annotation {
     Authenticated,
     Requires { enum_name: String, variant_name: String },
     /// `@content_type("text/html; charset=utf-8")` -- ver GRAMMAR.md §3.35.
     ContentType(String),
+    /// `@route("/blog/:slug")` -- URL alternativa, amigable para crawlers,
+    /// que convive con el `/Servicio/rpc` de siempre (nunca lo reemplaza).
+    /// Ver GRAMMAR.md §3.37.
+    Route(String),
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

@@ -18,6 +18,7 @@ pub mod doc;
 pub mod docker;
 pub mod lsp;
 pub mod parser;
+pub mod route;
 pub mod runtime;
 pub mod scaffold;
 pub mod token;

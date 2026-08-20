@@ -29,8 +29,9 @@
 use super::db::Db;
 use super::session::SessionStore;
 use super::{invoke_rpc_with_sessions, is_stream_member, live_subscribe_collection, required_auth};
-use crate::ast::Annotation;
+use crate::ast::{Annotation, Item, Member};
 use crate::ast::Program;
+use crate::route::RoutePattern;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -104,6 +105,10 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
     // `db` -- sin expiración, sin persistencia entre reinicios.
     let sessions = SessionStore::new();
     let backend = if db.is_postgres() { "PostgreSQL" } else { "SQLite" };
+    // `@route` (GRAMMAR.md §3.37): armada UNA vez al arrancar, nunca por
+    // request -- el programa ya pasó el checker antes de llegar a `serve`,
+    // así que build_route_table no puede encontrar nada inválido acá.
+    let route_table = build_route_table(&program);
     println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     for mut request in server.incoming_requests() {
@@ -144,10 +149,18 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
             continue;
         }
 
-        let Some((service_name, rpc_name)) = parse_path(&path) else {
-            let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method")));
-            log_done(req_id, None, 404, start, "");
-            continue;
+        let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, &route_table) {
+            Ok(resolved) => resolved,
+            Err(None) => {
+                let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method")));
+                log_done(req_id, None, 404, start, "");
+                continue;
+            }
+            Err(Some(msg)) => {
+                let _ = request.respond(cors_response(400, error_json(&msg)));
+                log_done(req_id, None, 400, start, &format!("error={msg:?}"));
+                continue;
+            }
         };
         let method = format!("{service_name}.{rpc_name}");
 
@@ -186,14 +199,11 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
                 continue;
             }
 
-            let args_json = match parse_args(&body) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = request.respond(cors_response(400, error_json(&e)));
-                    log_done(req_id, Some(&method), 400, start, &format!("error={e:?}"));
-                    continue;
-                }
-            };
+            // `args_json` ya viene resuelto de `resolve_route` de arriba (el
+            // mismo body-parseado-como-JSON de siempre: un `stream` nunca
+            // puede tener `@route`, el checker lo rechaza, así que la tabla
+            // de rutas nunca matchea acá -- no hace falta volver a parsear.
+            //
             // invoke_rpc_with_sessions corre ACÁ, en el hilo principal --
             // ver el porqué en el comentario de arriba del módulo. Lo único
             // que cruza al hilo de escritura es `elements` (ya JSON puro) y
@@ -215,7 +225,7 @@ pub fn serve(program: Program, port: u16, source: DbSource) {
         }
 
         let (status, response_body, response_type) =
-            handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, &body);
+            handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, args_json);
         // `response_body` en una falla es `{"error": "<mensaje>"}`
         // (`error_json`, más abajo) -- se extrae el mensaje solo para el
         // log en vez de loguear el JSON completo escapado adentro de otro
@@ -250,6 +260,139 @@ fn parse_args(body: &str) -> Result<serde_json::Value, String> {
     } else {
         serde_json::from_str(body).map_err(|e| format!("JSON inválido: {e}"))
     }
+}
+
+/// Una `@route` ya resuelta contra el programa (GRAMMAR.md §3.37): a qué
+/// (servicio, rpc) apunta, y si su parámetro -- si tiene -- es `Int` (para
+/// convertir el segmento de URL capturado al JSON que
+/// `invoke_rpc_with_sessions` espera; el checker ya garantizó que no puede
+/// ser otra cosa que `String`/`Int`, así que "no es Int" siempre significa
+/// "es String").
+struct RouteEntry {
+    pattern: RoutePattern,
+    service_name: String,
+    rpc_name: String,
+    param_is_int: bool,
+}
+
+/// Arma la tabla de `@route` UNA vez al arrancar, nunca por request. El
+/// checker ya corrió sobre `program` antes de que `serve` pudiera llegar a
+/// llamarse (`load_and_check` en main.rs), así que acá no puede aparecer un
+/// patrón inválido, un rpc con el parámetro mal, ni dos rutas en conflicto
+/// -- si algo de eso pasara, sería un bug en el checker, no una condición
+/// operativa a manejar con gracia, de ahí los `expect`/`unwrap_or_else` con
+/// panic en vez de propagar un `Result`.
+fn build_route_table(program: &Program) -> Vec<RouteEntry> {
+    let (checker, _) = crate::checker::Checker::build_symbols(program);
+    let mut table = Vec::new();
+    for item in &program.items {
+        let Item::Service(s) = item else { continue };
+        for m in &s.members {
+            let Member::Rpc(r) = m else { continue };
+            let Some(raw) = r.route() else { continue };
+            let pattern = crate::route::parse_route_pattern(raw)
+                .unwrap_or_else(|e| panic!("@route inválido llegó a serve() sin que el checker lo rechazara: {e}"));
+            let param_is_int = match &pattern.param_name {
+                Some(_) => {
+                    let ty = checker
+                        .resolve_type(&r.params[0].ty)
+                        .unwrap_or_else(|e| panic!("tipo de parámetro de @route no resolvió en serve() habiendo pasado el checker: {e}"));
+                    matches!(ty, crate::types::Type::Int)
+                }
+                None => false,
+            };
+            table.push(RouteEntry { pattern, service_name: s.name.clone(), rpc_name: r.name.clone(), param_is_int });
+        }
+    }
+    table
+}
+
+/// Decodificación percent-encoding mínima (`%XX` -> byte), para un segmento
+/// de PATH -- no de query string, así que a propósito no toca `+` (esa
+/// convención es de `application/x-www-form-urlencoded`, no de un path).
+/// Bytes que terminan formando UTF-8 inválido caen a `from_utf8_lossy`: un
+/// slug de URL con basura no es motivo para que el servidor haga nada más
+/// dramático que sustituir el caracter de reemplazo.
+fn percent_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
+            match hex {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+                None => {}
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Resuelve (servicio, rpc, args) para esta request -- por una `@route` si el
+/// path matchea alguna, si no por el `/Service/rpc` de siempre leyendo
+/// `body` como el JSON de argumentos (GRAMMAR.md §3.37). Las dos direcciones
+/// conviven SIEMPRE, ninguna reemplaza a la otra: un rpc con `@route` sigue
+/// siendo alcanzable por su dirección normal -- así lo llama el cliente
+/// TypeScript generado -- además de por la ruta linda, pensada para un
+/// crawler que nunca va a mandar un POST con JSON.
+///
+/// `Err(None)`: ninguna `@route` matcheó, y el path tampoco tiene la forma
+/// `/Service/rpc` -- 404. `Err(Some(msg))`: una `@route` matcheó pero el
+/// segmento capturado no convierte al tipo del parámetro, o (mismo camino de
+/// siempre) el body de un `/Service/rpc` no es JSON válido -- 400 en los
+/// dos casos.
+fn resolve_route<'a>(
+    path: &'a str,
+    body: &str,
+    route_table: &'a [RouteEntry],
+) -> Result<(&'a str, &'a str, serde_json::Value), Option<String>> {
+    let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    // Precedencia: una ruta puramente literal que matchea gana SIEMPRE sobre
+    // una con parámetro que también matchearía (`/blog/featured` sobre
+    // `/blog/:slug`) -- mismo criterio que usa cualquier router HTTP común.
+    // `check_route_conflicts` (checker.rs) ya garantiza que a lo sumo UNA
+    // entrada de cada "forma" puede matchear un path real, así que estas dos
+    // pasadas nunca pueden encontrar más de un candidato cada una.
+    let matched = route_table
+        .iter()
+        .find(|e| e.pattern.param_name.is_none() && e.pattern.matches(&segments).is_some())
+        .or_else(|| route_table.iter().find(|e| e.pattern.param_name.is_some() && e.pattern.matches(&segments).is_some()));
+    if let Some(entry) = matched {
+        let captured = entry.pattern.matches(&segments).expect("ya se confirmó que matchea arriba");
+        let args = match captured {
+            None => serde_json::json!({}),
+            Some(raw_segment) => {
+                // `matches` solo devuelve `Some(_)` cuando el patrón tiene
+                // `param_name` -- invariante de `RoutePattern::matches`.
+                let param_name = entry.pattern.param_name.as_deref().expect("captured un valor sin param_name declarado");
+                let decoded = percent_decode(raw_segment);
+                let value = if entry.param_is_int {
+                    match decoded.parse::<i64>() {
+                        Ok(n) => serde_json::Value::from(n),
+                        Err(_) => {
+                            return Err(Some(format!(
+                                "parámetro de ruta ':{param_name}' inválido: se esperaba un entero, se recibió '{decoded}'"
+                            )));
+                        }
+                    }
+                } else {
+                    serde_json::Value::String(decoded)
+                };
+                serde_json::json!({ param_name: value })
+            }
+        };
+        return Ok((&entry.service_name, &entry.rpc_name, args));
+    }
+    let (service_name, rpc_name) = parse_path(path).ok_or(None)?;
+    let args = parse_args(body).map_err(Some)?;
+    Ok((service_name, rpc_name, args))
 }
 
 /// El header `Authorization: Bearer <token>`, si vino -- `None` para
@@ -303,9 +446,9 @@ fn check_auth_gate(
         // cualquiera con un token de bajo privilegio un mapeo completo
         // endpoint->rol gratis (hallado en el review adversarial).
         Annotation::Requires { .. } => Err((403, "no tenés permiso para esta operación")),
-        // `required_auth` solo devuelve anotaciones de auth: si esto llegara
-        // a matchear, el bug está allá arriba, no acá.
-        Annotation::ContentType(_) => Ok(()),
+        // `required_auth` solo devuelve anotaciones de auth: si estos dos
+        // llegaran a matchear, el bug está allá arriba, no acá.
+        Annotation::ContentType(_) | Annotation::Route(_) => Ok(()),
     }
 }
 
@@ -328,6 +471,10 @@ fn declared_content_type(program: &Program, service_name: &str, rpc_name: &str) 
     })
 }
 
+/// `args_json` ya viene resuelto por `resolve_route` -- del body si la
+/// request usó la dirección `/Service/rpc` de siempre, o de un segmento de
+/// URL si usó una `@route` (GRAMMAR.md §3.37). Esta función no sabe ni le
+/// importa de cuál de los dos vino.
 fn handle_rpc(
     program: &Program,
     db: &Db,
@@ -335,12 +482,8 @@ fn handle_rpc(
     token: Option<&str>,
     service_name: &str,
     rpc_name: &str,
-    body: &str,
+    args_json: serde_json::Value,
 ) -> (u16, String, String) {
-    let args_json = match parse_args(body) {
-        Ok(v) => v,
-        Err(e) => return (400, error_json(&e), JSON_CONTENT_TYPE.to_string()),
-    };
     match invoke_rpc_with_sessions(program, service_name, rpc_name, &args_json, db, sessions, token) {
         Ok(result) => match declared_content_type(program, service_name, rpc_name) {
             // El checker ya garantizó que un rpc con `@content_type` devuelve

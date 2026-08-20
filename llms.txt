@@ -41,10 +41,11 @@ Works, verified by running it:
 - `crypto.hashPassword` / `verifyPassword` — Argon2id (RFC 9106) with a random per-password salt, PHC format, constant-time verification. `crypto.randomToken` and `crypto.uuid` also come from the OS CSPRNG.
 - PostgreSQL as the runtime database: `linkc serve app.link 8787 --db postgres://user:pass@host/db` (or `LINK_DATABASE_URL`). Same program, same generated contract; SQLite stays the default. No connection pool, no TLS, no LISTEN/NOTIFY — see GRAMMAR.md §3.36.
 - Non-JSON responses: `@content_type("text/html; charset=utf-8")` on an rpc returning `String` sends that body verbatim with that header — HTML, XML sitemaps, CSV, plain text. Combines with `@authenticated` / `@requires`.
+- Friendly URLs: `@route("/blog/:slug")` on an rpc gives it an additional GET-friendly path, alongside (never instead of) the normal `/Service/rpc` address the generated client keeps using. A trailing `:name` segment binds to a `String` or `Int` parameter of that same name — see GRAMMAR.md §3.37.
 
 Does NOT work today — do not propose designs that depend on these:
 
-- **Clean URLs.** Routing is always `/Service/rpc`; there are no path parameters and no custom routes, so serving a blog at `/blog/my-post` needs a proxy in front. HTML itself works (see `@content_type`), and so does an error page — errors always come back as JSON.
+- **Multi-parameter routes.** `@route` supports at most one dynamic segment, and it must be the last one — `/blog/:category/:slug` is rejected. Model that as separate rpcs, or wait for a future round.
 - **HTML escaping.** Pages are built by concatenating `String`; nothing escapes interpolated data for you. Escape anything that came from the database yourself.
 - **Native WASM codegen** (`linkc wasm`) is deliberately frozen at integer/boolean scalar functions.
 - **No npm package yet.** Prebuilt binaries are on [GitHub Releases](https://github.com/charlessonamericantrading/c-script-/releases); `npm i link-lang` is not published.
@@ -76,6 +77,11 @@ difference between code that compiles and code that does not.
    (SSE owns its content type), and at most once. Auth annotations stack with it:
    `@requires(Role.Admin) @content_type("text/html")` is valid and is how an admin
    page is written.
+9. **`@route`'s parameter name must match the rpc's parameter name exactly**:
+   `@route("/blog/:slug")` requires a parameter literally named `slug` (not `id`,
+   not `name`) — of type `String` or `Int`, nothing else. A route with no `:param`
+   requires the rpc to take zero parameters; there is no query-string or body
+   fallback.
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `insert(Omit<T,"id">) -> T`, `applyPatch(id, patch) -> T`, `delete(id) -> Bool`,
