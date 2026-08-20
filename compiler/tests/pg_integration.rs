@@ -578,7 +578,7 @@ fn sslmode_disable_still_connects_in_plaintext() {
     let server = Serve::start(&src, &url);
 
     let created = server.rpc("Leads/create", r#"{"email":"plain@example.com","score":1.0}"#);
-    assert_eq!(created["value"]["email"], "plain@example.com", "body: {created:?}");
+    assert_eq!(created["email"], "plain@example.com", "body: {created:?}");
 }
 
 #[test]
@@ -602,7 +602,7 @@ fn default_sslmode_still_connects_against_a_server_without_tls_configured() {
     let server = Serve::start(&src, &url);
 
     let created = server.rpc("Leads/create", r#"{"email":"default@example.com","score":1.0}"#);
-    assert_eq!(created["value"]["email"], "default@example.com", "body: {created:?}");
+    assert_eq!(created["email"], "default@example.com", "body: {created:?}");
 }
 
 #[test]
@@ -640,7 +640,7 @@ fn a_dropped_connection_self_heals_without_a_process_restart() {
 
     // La conexión funciona antes de tocar nada.
     let first = server.rpc("Leads/create", r#"{"email":"before@example.com","score":1.0}"#);
-    assert_eq!(first["value"]["email"], "before@example.com", "body: {first:?}");
+    assert_eq!(first["email"], "before@example.com", "body: {first:?}");
 
     // Cortar la conexión del SERVIDOR (identificada por application_name),
     // desde una conexión administrativa aparte -- nunca la del propio test
@@ -661,7 +661,7 @@ fn a_dropped_connection_self_heals_without_a_process_restart() {
     let mut recovered = false;
     for _ in 0..100 {
         match server.try_rpc("Leads/create", r#"{"email":"after@example.com","score":2.0}"#) {
-            Ok(created) if created["value"]["email"] == "after@example.com" => {
+            Ok(created) if created["email"] == "after@example.com" => {
                 recovered = true;
                 break;
             }
@@ -675,7 +675,7 @@ fn a_dropped_connection_self_heals_without_a_process_restart() {
     // La conexión de verdad quedó sana, no solo esa única request: los
     // datos de ANTES del corte siguen ahí, y una lectura normal funciona.
     let all = server.rpc("Leads/list", "{}");
-    let emails: Vec<&str> = all["value"].as_array().expect("list debe devolver un array").iter().map(|l| l["email"].as_str().unwrap()).collect();
+    let emails: Vec<&str> = all.as_array().expect("list debe devolver un array").iter().map(|l| l["email"].as_str().unwrap()).collect();
     assert!(emails.contains(&"before@example.com"), "la fila de antes del corte debe seguir ahí: {emails:?}");
     assert!(emails.contains(&"after@example.com"), "la fila de después de reconectar debe estar: {emails:?}");
 }
