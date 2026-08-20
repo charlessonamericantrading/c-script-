@@ -7,6 +7,7 @@ pub mod db;
 pub mod postgres;
 pub mod server;
 pub mod session;
+pub(crate) mod store;
 mod timestamp;
 
 use crate::ast::*;
@@ -954,6 +955,29 @@ fn call_callable(
     }
 }
 
+/// Bytes del CSPRNG del sistema (BCryptGenRandom en Windows, getrandom(2) en
+/// Linux, random_get en WASI). Todo lo que en este lenguaje se llame
+/// "aleatorio" o "seguro" sale de acá, nunca del reloj.
+fn os_random_bytes(n: usize) -> Result<Vec<u8>, RuntimeError> {
+    let mut buf = vec![0u8; n];
+    getrandom::getrandom(&mut buf)
+        .map_err(|e| err(format!("el sistema no pudo generar bytes aleatorios: {e}")))?;
+    Ok(buf)
+}
+
+/// Comparación que no corta en el primer byte distinto: dos secretos se comparan
+/// en tiempo constante para no filtrar, vía la duración, cuánto del valor
+/// esperado adivinó quien está probando.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    // La diferencia de LARGO no es secreta (el formato del hash es público); lo
+    // que no debe filtrarse es en qué posición difieren dos del mismo largo.
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn call_method(
     receiver: Value,
@@ -1146,11 +1170,10 @@ fn call_method(
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("crypto.hashSha256 requiere un argumento String")),
                 };
-                use sha2::{Sha256, Digest};
+                use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(data.as_bytes());
-                let result = hasher.finalize();
-                let hex_str: String = result.iter().map(|b| format!("{:02x}", b)).collect();
+                let hex_str: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
                 Ok(Value::Str(hex_str))
             }
             "randomToken" => {
@@ -1158,64 +1181,100 @@ fn call_method(
                     Some(Value::Int(n)) => *n as usize,
                     _ => return Err(err("crypto.randomToken requiere un argumento Int")),
                 };
-                use sha2::{Sha256, Digest};
-                let seed = format!("{}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(), length);
-                let mut hasher = Sha256::new();
-                hasher.update(seed.as_bytes());
-                let result = hasher.finalize();
-                let hex_str: String = result.iter().map(|b| format!("{:02x}", b)).collect();
-                let truncated = hex_str.chars().take(length.max(8)).collect();
-                Ok(Value::Str(truncated))
+                // El token sale del CSPRNG del sistema. La versión anterior era
+                // SHA-256 del reloj (SystemTime::now().as_nanos()), lo que hacía
+                // que un token fuese adivinable para quien pudiera acotar el
+                // instante en que se emitió -- y que dos llamadas dentro del
+                // mismo nanosegundo devolvieran el MISMO token.
+                let length = length.max(8);
+                let bytes = os_random_bytes(length.div_ceil(2))?;
+                let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                Ok(Value::Str(hex.chars().take(length).collect()))
             }
             "hashPassword" => {
                 let pwd = match args.first() {
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("crypto.hashPassword requiere un argumento String")),
                 };
-                use sha2::{Sha256, Digest};
-                let salt = "link_salt_2026";
-                let mut hasher = Sha256::new();
-                hasher.update(salt.as_bytes());
-                hasher.update(pwd.as_bytes());
-                let result = hasher.finalize();
-                let hex_str: String = result.iter().map(|b| format!("{:02x}", b)).collect();
-                Ok(Value::Str(format!("sha256${salt}${hex_str}")))
+                // Argon2id con sal aleatoria POR CONTRASEÑA, en formato PHC
+                // ($argon2id$v=19$m=...,t=...,p=...$sal$hash).
+                //
+                // Lo anterior era un solo SHA-256 sobre la constante
+                // "link_salt_2026" concatenada con la contraseña: la MISMA sal
+                // para todos los programas escritos en este lenguaje, sin
+                // iteraciones. Dos usuarios con la misma contraseña producían el
+                // mismo hash, y una única rainbow table servía contra cualquier
+                // aplicación Link que existiera. Un KDF con costo de memoria
+                // configurable (Argon2id es el que recomienda el RFC 9106 para
+                // contraseñas) es la diferencia entre "hashear" y "resistir a
+                // quien se robó la base".
+                use argon2::password_hash::{PasswordHasher, SaltString};
+                use argon2::Argon2;
+                let salt_bytes = os_random_bytes(16)?;
+                let salt = SaltString::encode_b64(&salt_bytes)
+                    .map_err(|e| err(format!("no se pudo generar la sal: {e}")))?;
+                let hash = Argon2::default()
+                    .hash_password(pwd.as_bytes(), &salt)
+                    .map_err(|e| err(format!("no se pudo hashear la contraseña: {e}")))?;
+                Ok(Value::Str(hash.to_string()))
             }
             "verifyPassword" => {
                 let pwd = match args.first() {
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("crypto.verifyPassword requiere contraseña")),
                 };
-                let hash = match args.get(1) {
+                let stored = match args.get(1) {
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("crypto.verifyPassword requiere hash")),
                 };
-                let parts: Vec<&str> = hash.split('$').collect();
-                if parts.len() != 3 || parts[0] != "sha256" {
-                    return Ok(Value::Bool(false));
+
+                // Los hashes viejos (sha256$<sal>$<hex>) siguen verificando: si
+                // esto los rechazara, actualizar el compilador dejaría afuera a
+                // todos los usuarios ya registrados de una app en producción. Se
+                // aceptan para poder migrar -- la próxima vez que esa contraseña
+                // se guarde, hashPassword la escribe ya en Argon2id.
+                if let Some(rest) = stored.strip_prefix("sha256$") {
+                    let Some((salt, expected)) = rest.split_once('$') else {
+                        return Ok(Value::Bool(false));
+                    };
+                    use sha2::{Digest, Sha256};
+                    let mut hasher = Sha256::new();
+                    hasher.update(salt.as_bytes());
+                    hasher.update(pwd.as_bytes());
+                    let hex_str: String =
+                        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+                    // Comparación en tiempo constante: el == de String corta en
+                    // el primer byte distinto, y ese tiempo le dice a quien mide
+                    // cuántos caracteres del hash acertó.
+                    return Ok(Value::Bool(constant_time_eq(
+                        hex_str.as_bytes(),
+                        expected.as_bytes(),
+                    )));
                 }
-                let salt = parts[1];
-                let expected = parts[2];
-                use sha2::{Sha256, Digest};
-                let mut hasher = Sha256::new();
-                hasher.update(salt.as_bytes());
-                hasher.update(pwd.as_bytes());
-                let result = hasher.finalize();
-                let hex_str: String = result.iter().map(|b| format!("{:02x}", b)).collect();
-                Ok(Value::Bool(hex_str == expected))
+
+                use argon2::password_hash::{PasswordHash, PasswordVerifier};
+                use argon2::Argon2;
+                let Ok(parsed) = PasswordHash::new(stored) else {
+                    return Ok(Value::Bool(false));
+                };
+                Ok(Value::Bool(
+                    Argon2::default()
+                        .verify_password(pwd.as_bytes(), &parsed)
+                        .is_ok(),
+                ))
             }
             "uuid" => {
-                use sha2::{Sha256, Digest};
-                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-                let mut hasher = Sha256::new();
-                hasher.update(t.to_be_bytes());
-                let hash = hasher.finalize();
-                let s = format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    hash[0], hash[1], hash[2], hash[3],
-                    hash[4], hash[5],
-                    (hash[6] & 0x0f), hash[7],
-                    (hash[8] & 0x3f) | 0x80, hash[9],
-                    hash[10], hash[11], hash[12], hash[13], hash[14], hash[15]
+                // UUIDv4 de verdad: 122 bits del CSPRNG del sistema. Antes era
+                // SHA-256 del reloj disfrazado de v4 -- dos llamadas en el mismo
+                // nanosegundo devolvían el mismo "identificador único".
+                let b = os_random_bytes(16)?;
+                let s = format!(
+                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    b[0], b[1], b[2], b[3],
+                    b[4], b[5],
+                    b[6] & 0x0f, b[7],
+                    (b[8] & 0x3f) | 0x80, b[9],
+                    b[10], b[11], b[12], b[13], b[14], b[15]
                 );
                 Ok(Value::Str(s))
             }
@@ -1845,7 +1904,7 @@ pub fn is_stream_member(program: &Program, service_name: &str, rpc_name: &str) -
 pub fn required_auth<'a>(program: &'a Program, service_name: &str, rpc_name: &str) -> Option<&'a Annotation> {
     program.items.iter().find_map(|i| match i {
         Item::Service(s) if s.name == service_name => s.members.iter().find_map(|m| match m {
-            Member::Rpc(r) | Member::Stream(r) if r.name == rpc_name => r.annotation.as_ref(),
+            Member::Rpc(r) | Member::Stream(r) if r.name == rpc_name => r.auth(),
             _ => None,
         }),
         _ => None,
@@ -3443,4 +3502,59 @@ mod tests {
         assert_eq!(summary.total, 1);
         assert_eq!(summary.passed, 1, "todos los asserts de stdlib debieron pasar");
     }
+
+    /// Que un round-trip de contraseña funcione no prueba NADA sobre seguridad:
+    /// el SHA-256 con sal fija que había antes también pasaba ese test. Lo que
+    /// hay que fijar son las propiedades que lo hacen resistente, y cada una de
+    /// estas fallaba con la implementación anterior.
+    #[test]
+    fn crypto_properties_that_the_old_implementation_did_not_have() {
+        let code = r#"
+        test "propiedades de crypto" {
+            // 1. La MISMA contraseña hasheada dos veces da hashes DISTINTOS:
+            //    la sal es aleatoria por contraseña. Antes la sal era la
+            //    constante "link_salt_2026" para todo programa Link del mundo,
+            //    asi que dos usuarios con la misma clave compartian hash y una
+            //    sola rainbow table los rompia a todos.
+            let a = crypto.hashPassword("misma-contrasena");
+            let b = crypto.hashPassword("misma-contrasena");
+            assert(a != b, "dos hashes de la misma contrasena deben diferir");
+
+            // 2. Y aun asi, las dos verifican.
+            assert(crypto.verifyPassword("misma-contrasena", a), "verifica contra el primero");
+            assert(crypto.verifyPassword("misma-contrasena", b), "verifica contra el segundo");
+            assert(crypto.verifyPassword("otra", a) == false, "rechaza la equivocada");
+
+            // 3. Es un KDF de verdad, no un digest: el formato PHC lo declara.
+            assert(a.startsWith("$argon2id$"), "el hash declara el algoritmo y sus parametros");
+
+            // 4. Los hashes viejos siguen verificando, para poder migrar sin
+            //    dejar afuera a los usuarios ya registrados de una app en
+            //    produccion. Se reconstruye aca uno exactamente como lo escribia
+            //    la implementacion anterior: sha256(sal_fija + contrasena).
+            let hex = crypto.hashSha256("link_salt_2026" + "clave-vieja");
+            let legado = "sha256$link_salt_2026$" + hex;
+            assert(crypto.verifyPassword("clave-vieja", legado), "un hash legado valido verifica");
+            assert(crypto.verifyPassword("otra-clave", legado) == false, "y uno que no corresponde, no");
+
+            // 5. Dos tokens seguidos son distintos. Antes salian de SHA-256 del
+            //    reloj: dos llamadas en el mismo nanosegundo devolvian el mismo
+            //    token, y quien pudiera acotar el instante podia adivinarlo.
+            let t1 = crypto.randomToken(32);
+            let t2 = crypto.randomToken(32);
+            assert(t1 != t2, "dos tokens consecutivos deben diferir");
+            assert(t1.length() == 32, "respeta el largo pedido");
+
+            // 6. Lo mismo para uuid(), que ademas dice ser v4 en su formato.
+            let u1 = crypto.uuid();
+            let u2 = crypto.uuid();
+            assert(u1 != u2, "dos uuid consecutivos deben diferir");
+            assert(u1.length() == 36, "formato uuid");
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests de crypto");
+        assert_eq!(summary.passed, 1, "fallaron asserts de crypto: {summary:?}");
+    }
+
 }

@@ -123,7 +123,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto>    (inicia servidor HTTP con SQLite embebido)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
 }
 
@@ -830,7 +830,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc serve <archivo.link> <puerto>");
+        eprintln!("uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>]");
         return ExitCode::FAILURE;
     };
     let Ok(port) = port_str.parse::<u16>() else {
@@ -838,15 +838,49 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
+    let source = match resolve_db_source(path, args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    // `myapp.link` -> `myapp.db`, al lado del archivo fuente (GRAMMAR.md
-    // §3.17) -- mismo patrón que `build_once` ya usa para nombrar
-    // contract.d.ts/client.ts/validators.ts, sin ninguna flag de CLI nueva.
-    let db_path = Path::new(path).with_extension("db");
-    runtime::server::serve(program, port, db_path);
+    runtime::server::serve(program, port, source);
     ExitCode::SUCCESS
+}
+
+/// De dónde saca los datos `linkc serve`, en orden de precedencia:
+///
+/// 1. `--db <url|archivo>` en la línea de comandos.
+/// 2. La variable de entorno `LINK_DATABASE_URL` (la que usa un contenedor,
+///    donde no siempre se controla el comando).
+/// 3. El default de siempre: `myapp.link` -> `myapp.db` al lado del fuente
+///    (GRAMMAR.md §3.17).
+///
+/// Un valor que empieza con `postgres://` o `postgresql://` es PostgreSQL;
+/// cualquier otro es la ruta de un archivo SQLite.
+fn resolve_db_source(path: &str, args: &[String]) -> Result<runtime::server::DbSource, String> {
+    let flag = match args.iter().position(|a| a == "--db") {
+        Some(i) => match args.get(i + 1) {
+            Some(v) => Some(v.clone()),
+            None => return Err("uso: --db <url|archivo> (falta el valor)".to_string()),
+        },
+        None => None,
+    };
+    let value = flag.or_else(|| std::env::var("LINK_DATABASE_URL").ok().filter(|v| !v.trim().is_empty()));
+
+    let Some(value) = value else {
+        return Ok(runtime::server::DbSource::SqliteFile(Path::new(path).with_extension("db")));
+    };
+    if value.starts_with("postgres://") || value.starts_with("postgresql://") {
+        Ok(runtime::server::DbSource::Postgres(value))
+    } else {
+        Ok(runtime::server::DbSource::SqliteFile(PathBuf::from(value)))
+    }
 }

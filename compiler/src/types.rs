@@ -114,6 +114,82 @@ pub enum Type {
     Base64,
 }
 
+/// Cómo se escribe un tipo EN c-script, para los mensajes de error.
+///
+/// Antes de esto el checker interpolaba el `Debug` de Rust, así que quien se
+/// equivocaba con un `T?` leía literalmente
+/// `Optional(Struct { name: Some("Todo"), fields: [FieldType { name: "id",
+/// optional: false, ty: Int }, ...] })`. Eso no le dice a un humano qué
+/// escribir, y a un modelo que está generando código le dice todavía menos:
+/// le enseña una sintaxis que no existe.
+impl std::fmt::Display for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Type::Int => write!(f, "Int"),
+            Type::Int64 => write!(f, "Int64"),
+            Type::Timestamp => write!(f, "Timestamp"),
+            Type::Float => write!(f, "Float"),
+            Type::String => write!(f, "String"),
+            Type::Bool => write!(f, "Bool"),
+            Type::Void => write!(f, "Void"),
+            Type::Null => write!(f, "null"),
+            Type::Optional(inner) => write!(f, "{inner}?"),
+            Type::List(inner) => write!(f, "{inner}[]"),
+            Type::Tuple(items) => {
+                let rendered: Vec<String> = items.iter().map(Type::to_string).collect();
+                write!(f, "({})", rendered.join(", "))
+            }
+            Type::Function(params, ret) => {
+                let rendered: Vec<String> = params.iter().map(Type::to_string).collect();
+                write!(f, "|{}| -> {ret}", rendered.join(", "))
+            }
+            // Un struct con nombre se nombra; uno anónimo (o construido al
+            // vuelo por el checker) muestra su forma, que es lo único que lo
+            // identifica -- el subtipado de structs es estructural (§3.2).
+            Type::Struct { name: Some(n), .. } => write!(f, "{n}"),
+            Type::Struct { name: None, fields } => {
+                let rendered: Vec<String> = fields
+                    .iter()
+                    .map(|field| {
+                        let opt = if field.optional { "?" } else { "" };
+                        format!("{}{}: {}", field.name, opt, field.ty)
+                    })
+                    .collect();
+                write!(f, "{{ {} }}", rendered.join(", "))
+            }
+            Type::Enum(n) => write!(f, "{n}"),
+            Type::ResultOf(ok, e) => write!(f, "Result<{ok}, {e}>"),
+            Type::PatchOf(inner) => write!(f, "Patch<{inner}>"),
+            Type::MapOf(k, v) => write!(f, "Map<{k}, {v}>"),
+            Type::Generic(name, args) => {
+                if args.is_empty() {
+                    return write!(f, "{name}");
+                }
+                let rendered: Vec<String> = args.iter().map(Type::to_string).collect();
+                write!(f, "{name}<{}>", rendered.join(", "))
+            }
+            Type::TypeParam(name) => write!(f, "{name}"),
+            Type::Union(members) => {
+                let rendered: Vec<String> = members.iter().map(Type::to_string).collect();
+                write!(f, "{}", rendered.join(" | "))
+            }
+            Type::Dynamic => write!(f, "Dynamic"),
+            // Tipos internos: no se pueden escribir en una firma, pero sí
+            // aparecen en errores (ej. usar `db` donde va un valor), así que
+            // se nombran como el identificador que los produce.
+            Type::Db => write!(f, "db"),
+            Type::DbCollection(inner) => write!(f, "db.<colección de {inner}>"),
+            Type::Auth => write!(f, "auth"),
+            Type::Service(name) => write!(f, "service {name}"),
+            Type::Math => write!(f, "math"),
+            Type::Crypto => write!(f, "crypto"),
+            Type::Http => write!(f, "http"),
+            Type::Json => write!(f, "json"),
+            Type::Base64 => write!(f, "base64"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldType {
     pub name: String,

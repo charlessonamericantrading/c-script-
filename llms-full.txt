@@ -27,6 +27,7 @@ This document is optimized for LLMs (Grok, Claude, GPT, DeepSeek) and developers
 | `field?: T` | `field?: T` | key omitted | Optional object property |
 
 ### Type Definitions & Enums
+<!-- linkc:part -->
 ```rust
 // Struct
 type User = {
@@ -50,9 +51,25 @@ enum ApiResult<T, E> {
   Ok { data: T },
   Err { code: Int, error: E },
 }
+
+// The running example used by the rest of this file.
+type Product = {
+  id: Int,
+  title: String,
+  price: Float,
+  createdAt: Timestamp,
+}
+
+// The creation shape `db.products.insert` expects: Product without `id`.
+type NewProduct = {
+  title: String,
+  price: Float,
+  createdAt: Timestamp,
+}
 ```
 
 ### Functions & Closures
+<!-- linkc:part -->
 ```rust
 // Internal helper function (not exposed as RPC)
 fn calculateDiscount(total: Float, vip: Bool) -> Float {
@@ -63,8 +80,12 @@ fn calculateDiscount(total: Float, vip: Bool) -> Float {
   }
 }
 
-// Inline closure
-let isEven = |n: Int| -> Bool { n % 2 == 0 };
+// Closures appear as arguments to collection and list methods. They carry no
+// return-type annotation, and there is no top-level `let` -- statements live
+// inside a function, an rpc or a test.
+fn expensive(prices: Float[]) -> Float[] {
+  prices.filter(|p: Float| { p > 100.0 })
+}
 ```
 
 ---
@@ -73,6 +94,7 @@ let isEven = |n: Int| -> Bool { n % 2 == 0 };
 
 Services define public API endpoints. Each method in a `service` is automatically exposed as an HTTP POST RPC and mapped to TypeScript client methods.
 
+<!-- linkc:part -->
 ```rust
 service Products {
   // RPC with default parameter value
@@ -85,12 +107,13 @@ service Products {
   }
 
   // Authentication & RBAC Decorators
+  // NOTE: `linkc test` does not enforce @authenticated -- a test block calls
+  // this rpc without a session. Auth is enforced by `linkc serve`, over HTTP.
   @authenticated
-  rpc create(input: NewProduct) -> Product {
-    db.products.insert(Product {
-      id: 0,
-      title: input.title,
-      price: input.price,
+  rpc create(title: String, price: Float) -> Product {
+    db.products.insert(NewProduct {
+      title: title,
+      price: price,
       createdAt: now(),
     })
   }
@@ -115,6 +138,7 @@ service Products {
 
 Declaring a `db` block configures an embedded SQLite database with schema auto-generation.
 
+<!-- linkc:part -->
 ```rust
 db {
   products: Product[],
@@ -125,11 +149,12 @@ db {
 ### Database Methods on `db.<collection>`
 - `db.<col>.all() -> T[]`
 - `db.<col>.find(id: Int) -> T?`
-- `db.<col>.insert(item: T) -> T` (Auto-increments `id`)
-- `db.<col>.applyPatch(id: Int, patch: Partial<T>) -> T?`
+- `db.<col>.count() -> Int`
+- `db.<col>.insert(item: Omit<T, "id">) -> T` (the database assigns `id`; passing a full `T` with an explicit `id` is accepted but the value is ignored)
+- `db.<col>.applyPatch(id: Int, patch: Patch<T>) -> T` (`Patch<T>` has no literal syntax -- it arrives as an rpc parameter)
 - `db.<col>.delete(id: Int) -> Bool`
-- `db.<col>.findWhere(predicate: |item: T| -> Bool) -> T[]`
-- `db.<col>.deleteWhere(predicate: |item: T| -> Bool) -> Int`
+- `db.<col>.findWhere(|item: T| { Bool expression }) -> T[]`
+- `db.<col>.deleteWhere(|item: T| { Bool expression }) -> Int`
 - `db.<col>.subscribe() -> T` (Yields when row is inserted, patched, or deleted)
 
 ---
@@ -138,17 +163,17 @@ db {
 
 The built-in test runner provides zero-dependency behavioral assertions and snapshot testing with isolated in-memory databases per test.
 
+<!-- linkc:part -->
 ```rust
 test "inserting and fetching product" {
-  let created = Products.create(NewProduct {
-    title: "Mechanical Keyboard",
-    price: 99.99,
-  });
+  let created = Products.create("Mechanical Keyboard", 99.99);
   assert(created.id > 0, "id generated");
 
+  // `get` returns Product? -- it can be compared against null, but its fields
+  // cannot be read here: there is no narrowing in c-script. Hand the value to
+  // TypeScript, which narrows `Product | null` correctly.
   let fetched = Products.get(created.id);
   assert(fetched != null, "product exists");
-  assert(fetched.price == 99.99, "price matches");
 }
 ```
 

@@ -20,6 +20,7 @@
 
 ### Declaración de Structs
 
+<!-- linkc:part -->
 ```rust
 type User = {
   id: Int,
@@ -37,6 +38,7 @@ type User = {
 
 ### Enum Simple (Unión de Cadenas)
 
+<!-- linkc:part -->
 ```rust
 enum Role { Admin, Member, Guest }
 ```
@@ -44,6 +46,7 @@ enum Role { Admin, Member, Guest }
 
 ### Enum con Datos (Unión Discriminada)
 
+<!-- linkc:part -->
 ```rust
 enum Result<T, E> {
   Ok  { value: T },
@@ -63,6 +66,7 @@ export type Result<T, E> =
 
 Cada colección declarada dentro del bloque `db` compila internamente a una tabla SQLite persistente en disco.
 
+<!-- linkc:part -->
 ```rust
 db {
   users: User[],
@@ -82,6 +86,7 @@ db {
 
 ## 4. Servicios RPC y Streaming SSE
 
+<!-- linkc:part -->
 ```rust
 service Users {
   rpc list(limit: Int = 20) -> User[] {
