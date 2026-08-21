@@ -159,6 +159,49 @@ impl Serve {
         reader.read_exact(&mut buf).expect("body");
         (status, content_type, String::from_utf8_lossy(&buf).to_string())
     }
+
+    /// Como `get`, pero mandando un body JSON -- para un rpc que toma
+    /// parámetros (`escapeHtml` necesita un valor real de la request, no
+    /// uno hardcodeado en el `.link`, para probar algo real).
+    fn post(&self, path: &str, body: &str) -> (u16, String, String) {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("conectar");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.port,
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).expect("escribir request");
+        stream.flush().ok();
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("línea de estado");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("estado HTTP inesperado: {status_line:?}"));
+
+        let mut content_type = String::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("header");
+            if n == 0 || line.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.trim().split_once(':') {
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "content-type" => content_type = v.trim().to_string(),
+                    "content-length" => content_length = v.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf).expect("body");
+        (status, content_type, String::from_utf8_lossy(&buf).to_string())
+    }
 }
 
 impl Drop for Serve {
@@ -321,4 +364,35 @@ service Panel {
     assert_eq!(status, 401);
     assert_eq!(content_type, "application/json; charset=utf-8");
     assert!(body.contains("error"), "el body de error debe ser JSON: {body}");
+}
+
+#[test]
+fn escape_html_neutralizes_a_real_payload_interpolated_into_an_html_page() {
+    // GRAMMAR.md §3.45: `.escapeHtml()` es la herramienta que faltaba para
+    // armar una página `@content_type("text/html")` con datos que no
+    // controla el propio programa (un nombre, un comentario) sin quedar
+    // abierta a inyectar HTML/JS ajeno. Se prueba con un payload de XSS de
+    // libro, contra el servidor real -- no alcanza con que el método
+    // exista, tiene que llegar escapado en la respuesta HTTP de verdad.
+    let temp = TempDir::new("escape-html");
+    let out = build(
+        &temp,
+        r#"
+service Blog {
+  @content_type("text/html; charset=utf-8")
+  rpc page(name: String) -> String {
+    "<h1>Hola " + name.escapeHtml() + "</h1>"
+  }
+}
+"#,
+    );
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&temp.0.join("app.link"));
+    let payload = r#"<img src=x onerror=alert(1)>"#;
+    let (status, content_type, body) = server.post("/Blog/page", &serde_json::json!({"name": payload}).to_string());
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "text/html; charset=utf-8");
+    assert_eq!(body, "<h1>Hola &lt;img src=x onerror=alert(1)&gt;</h1>");
+    assert!(!body.contains("<img"), "el payload sin escapar no puede sobrevivir tal cual en la respuesta: {body}");
 }

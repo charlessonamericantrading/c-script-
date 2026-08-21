@@ -977,6 +977,16 @@ fn call_callable(
     }
 }
 
+/// Escapa los 5 caracteres que HTML interpreta como marcado, no como texto
+/// (GRAMMAR.md §3.45) -- mismo set que cualquier escapador de HTML estándar
+/// (`html.escape` de Python, las guías de OWASP). `&` va PRIMERO a
+/// propósito: si se escapara después de `<`/`>`/etc, el `&` que esas
+/// mismas entidades acaban de insertar (`&amp;`, `&lt;`, ...) se
+/// escaparía DE NUEVO, dejando `&amp;amp;` en vez de `&amp;`.
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
+}
+
 /// Bytes del CSPRNG del sistema (BCryptGenRandom en Windows, getrandom(2) en
 /// Linux, random_get en WASI). Todo lo que en este lenguaje se llame
 /// "aleatorio" o "seguro" sale de acá, nunca del reloj.
@@ -1134,6 +1144,7 @@ fn call_method(
             "trim" => Ok(Value::Str(s.trim().to_string())),
             "toUpper" => Ok(Value::Str(s.to_uppercase())),
             "toLower" => Ok(Value::Str(s.to_lowercase())),
+            "escapeHtml" => Ok(Value::Str(escape_html(&s))),
             other => Err(err(format!("método desconocido sobre String: '{other}'"))),
         },
         Value::Timestamp(ms) => match method {
@@ -3587,6 +3598,8 @@ mod tests {
             assert(s.trim().toLower() == "hola mundo");
             assert(s.trim().startsWith("Hola") == true);
             assert(s.trim().endsWith("Mundo") == true);
+            assert("<script>alert(1)</script>".escapeHtml() == "&lt;script&gt;alert(1)&lt;/script&gt;");
+            assert("a & b \"quoted\" 'single'".escapeHtml() == "a &amp; b &quot;quoted&quot; &#39;single&#39;");
 
             // UUID & Crypto
             let u = crypto.uuid();

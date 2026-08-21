@@ -66,6 +66,7 @@
   - [3.42 `@route` con múltiples parámetros — RESUELTO (alcance acotado)](#342-route-con-múltiples-parámetros--resuelto-alcance-acotado)
   - [3.43 `smtp.send`: mandar email — RESUELTO (alcance acotado)](#343-smtpsend-mandar-email--resuelto-alcance-acotado)
   - [3.44 PostgreSQL LISTEN/NOTIFY: `stream` entre varias instancias — RESUELTO (alcance acotado)](#344-postgresql-listennotify-stream-entre-varias-instancias--resuelto-alcance-acotado)
+  - [3.45 `String.escapeHtml()`: sanitizar datos en una página — RESUELTO (alcance acotado)](#345-stringescapehtml-sanitizar-datos-en-una-página--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1418,8 +1419,10 @@ puede; combinar dos anotaciones de la misma dimensión, no.
   verdad hacen falta rutas limpias (`/blog/mi-articulo`) y parámetros en el
   path, que es una ronda aparte — hoy se resuelve con un proxy adelante.
 - **No hay helpers de plantillas.** El HTML se arma concatenando `String`, sin
-  escapado automático: quien interpole datos de la base tiene que escaparlos a
-  mano. Es una fuente real de XSS y hoy el lenguaje no ayuda.
+  escapado AUTOMÁTICO: quien interpole datos de la base tiene que escaparlos
+  a mano. **`.escapeHtml()` (§3.45) da la herramienta para eso** -- lo que
+  sigue sin haber es algo que lo fuerce por default, así que sigue siendo
+  responsabilidad de quien escribe el rpc acordarse de usarlo.
 - **Sin `Cache-Control`, `ETag` ni compresión** — nada de la capa de caching
   HTTP es configurable todavía.
 
@@ -2312,6 +2315,78 @@ tests del parseo del payload de NOTIFY (`parse_remote_notification`,
 `runtime/db.rs`): un payload bien formado de otra instancia se acepta, el
 propio eco se descarta, y un payload mal formado se ignora en vez de
 panickear.
+
+---
+
+### 3.45 `String.escapeHtml()`: sanitizar datos en una página — RESUELTO (alcance acotado)
+
+§3.35 (`@content_type`) permite devolver HTML de verdad desde un rpc, pero
+la respuesta se arma concatenando `String` -- nada escapaba por vos los
+datos que interpolabas. Un nombre de usuario, un comentario, cualquier
+texto que no controla el propio programa, podía llevar `<script>` o un
+atributo `onerror=` y terminar ejecutándose en el navegador de quien mira
+la página: el mismo problema que resuelve el auto-escape de cualquier motor
+de templates real (Django, Rails ERB, JSX).
+
+**Lo que hay ahora:**
+
+```
+rpc page(comentario: String) -> String {
+  "<p>" + comentario.escapeHtml() + "</p>"
+}
+```
+
+Un método más sobre `String` (mismo lugar que `.trim()`/`.toUpper()`/
+`.startsWith()`), no un tipo de string nuevo ni un sistema de templates con
+auto-escape implícito -- deliberado: c-script no tiene una construcción de
+"template", así que auto-escapar por default habría significado inventar
+una encima de la nada (un tipo `HtmlString` que distinga "ya seguro" de "sin
+escapar", con su propia complejidad de cuándo se permite mezclar uno con
+otro). Un método explícito da la herramienta sin esa complejidad: quien
+arma HTML decide qué interpolar tal cual (el markup propio) y qué pasar por
+`.escapeHtml()` (los datos que no controla).
+
+Escapa los 5 caracteres que HTML interpreta como marcado en vez de texto --
+mismo set que cualquier escapador estándar (`html.escape` de Python, las
+guías de OWASP):
+
+| Caracter | Se convierte en |
+|---|---|
+| `&` | `&amp;` |
+| `<` | `&lt;` |
+| `>` | `&gt;` |
+| `"` | `&quot;` |
+| `'` | `&#39;` |
+
+`&` se escapa PRIMERO, a propósito: si se escapara después de los demás, el
+`&` que esas mismas entidades acaban de insertar (`&lt;`, `&quot;`, ...) se
+escaparía de nuevo, dejando `&amp;lt;` en vez de `&lt;`.
+
+**Límites honestos de esta ronda:**
+
+- **No es automático.** Nada fuerza a escapar -- un rpc que concatena datos
+  sin pasarlos por `.escapeHtml()` sigue compilando y sirviendo esa página
+  tal cual, vulnerable. La herramienta existe; usarla en el lugar correcto
+  sigue siendo responsabilidad de quien escribe el rpc.
+- **Solo texto de nodo/atributo entre comillas dobles, no todos los
+  contextos HTML.** El escape de acá alcanza para interpolar dentro del
+  texto de una etiqueta o dentro de un atributo `"..."` -- NO cubre
+  interpolar directo dentro de un bloque `<script>`/`<style>`, ni un
+  atributo sin comillas (`onerror=comentario`, sin `"`): esos contextos
+  necesitan reglas de escape distintas que esto no aplica.
+- **Sin sanitización de HTML "permitido a medias"** (dejar pasar `<b>` pero
+  no `<script>`, el caso de un editor de texto enriquecido). Esto es
+  escape TOTAL -- todo interpolado se vuelve texto plano visible, nunca
+  markup. Para HTML parcialmente confiable hace falta una librería de
+  sanitización de verdad, que este método no reemplaza.
+
+**Verificado** en `compiler/tests/cli_content_type.rs` contra un servidor
+real: un payload de XSS de libro (`<img src=x onerror=alert(1)>`) mandado
+como parámetro de un rpc con `@content_type("text/html")`, confirmando que
+la respuesta HTTP real lo devuelve escapado -- `<img` nunca aparece tal
+cual en el body -- no solo que el método produce el string esperado en
+aislamiento. Unit tests adicionales (`runtime/mod.rs`) fijan los 5
+caracteres y el orden de escape (`&` primero).
 
 ---
 

@@ -2599,6 +2599,10 @@ impl Checker {
                 self.expect_no_args(args, "toLower")?;
                 Some(Type::String)
             }
+            (Type::String, "escapeHtml") => {
+                self.expect_no_args(args, "escapeHtml")?;
+                Some(Type::String)
+            }
             (Type::Timestamp, "toMillis") => {
                 self.expect_no_args(args, "toMillis")?;
                 Some(Type::Int64)

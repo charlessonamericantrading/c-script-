@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.9.0] - 2026-08-21
+
+### ✨ Nuevo
+- **`"...".escapeHtml()`: sanitizar datos antes de interpolarlos en una página.** `@content_type("text/html")` (v1.1.0) permitía devolver HTML de verdad, pero la respuesta se arma concatenando `String` sin ningún escapado — un nombre de usuario o un comentario con `<script>` podía terminar ejecutándose en el navegador de quien mira la página. Un método más sobre `String` (mismo lugar que `.trim()`/`.toUpper()`), no un tipo de string nuevo ni un sistema de templates con auto-escape implícito — deliberado, para no inventar una construcción de "template" encima de la nada. Escapa `& < > " '`, con `&` primero (si fuera al final, re-escaparía las entidades que las otras reemplazadas ya insertaron). No es automático: nada fuerza a usarlo, sigue siendo responsabilidad de quien escribe el rpc. Verificado con un payload de XSS de libro contra un servidor real, no solo el método en aislamiento. Detalle completo, incluidos los contextos que este escape NO cubre (dentro de `<script>`, atributos sin comillas): GRAMMAR.md §3.45.
+
 ## [1.8.0] - 2026-08-21
 
 ### ✨ Nuevo
