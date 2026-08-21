@@ -71,6 +71,7 @@
   - [3.47 `http.getWithHeaders`/`http.postWithHeaders`: headers en llamadas salientes — RESUELTO](#347-httpgetwithheadershttppostwithheaders-headers-en-llamadas-salientes--resuelto)
   - [3.48 `db.<coleccion>.page(limit, offset)`: paginación real, empujada a SQL — RESUELTO](#348-dbcoleccionpagelimit-offset-paginación-real-empujada-a-sql--resuelto)
   - [3.49 `@requires(Role.Admin | Role.Agent)`: OR de roles — RESUELTO](#349-requiresroleadmin--roleagent-or-de-roles--resuelto)
+  - [3.50 `--session-ttl`: expiración real de sesión — RESUELTO](#350---session-ttl-expiración-real-de-sesión--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -840,7 +841,7 @@ rpc logout() -> Void { auth.destroySession() }
 
 **Cliente generado: `token` es estado MUTABLE de instancia, no un parámetro por-llamada.** `{Service}ClientImpl` gana `private token: string | null` + `setToken(token)`, parte de la interfaz pública (`{Service}Client`) para que algo tipado como tal también pueda llamarlo. `push_fetch_call` adjunta `Authorization: Bearer ${token}` en TODO rpc si hay token seteado (el servidor decide caso por caso si lo exige). Correcto para "una instancia de cliente = un usuario/sesión activa" (mismo patrón que la mayoría de SDKs generados reales) — pero una instancia COMPARTIDA entre requests concurrentes de usuarios DISTINTOS (ej. un backend-for-frontend Node reusando un cliente módulo-level) puede pisarse el token entre requests. Documentado como límite v0 explícito; la alternativa (token por-llamada) cambiaría la forma pública de TODOS los métodos generados, no solo los protegidos.
 
-**Fuera de alcance, a propósito:** verificación de contraseña/credenciales; expiración de sesión (vive hasta `destroySession()` o hasta reiniciar el proceso — el lenguaje ya tiene un `while`, §3.15, pero sigue sin ningún temporizador/reloj, así que expresar "expirá en N minutos" sigue sin ser posible); múltiples roles por `@requires` o múltiples anotaciones por rpc; exponer la identidad del caller dentro de un cuerpo (`ctx.user`/similar — solo el ROL viaja en la sesión, nunca una referencia al `User` completo); un CSPRNG auditado (ver el hallazgo de arriba).
+**Fuera de alcance, a propósito:** verificación de contraseña/credenciales; exponer la identidad del caller dentro de un cuerpo (`ctx.user`/similar — solo el ROL viaja en la sesión, nunca una referencia al `User` completo); un CSPRNG auditado (ver el hallazgo de arriba). Dos límites de esta lista original **ya se resolvieron**: expiración de sesión ("vive hasta `destroySession()` o hasta reiniciar el proceso" — resuelto en §3.50, `--session-ttl`) y múltiples roles por `@requires` (resuelto en §3.49, `Role.Admin | Role.Agent`) — múltiples anotaciones DE AUTH por rpc (dos `@requires` distintos en el mismo rpc) sigue sin tener sentido y el checker lo sigue rechazando, eso no cambió.
 
 ---
 
@@ -2674,6 +2675,69 @@ rechazado antes de siquiera mirar el rol (401); y un `@requires` de un
 solo rol en el MISMO programa sin ningún cambio de comportamiento. Más
 tests de compilación (`checker.rs`) para el OR válido, la variante
 desconocida, y el rechazo en el parser de mezclar dos enums.
+
+### 3.50 `--session-ttl`: expiración real de sesión — RESUELTO
+
+Último límite honesto real de auth v0 (§3.14) que quedaba: una sesión
+vivía hasta `destroySession()` o hasta reiniciar el proceso -- sin forma
+de expresar "sesión válida 7 días", el patrón más común de cualquier
+sistema de auth real (cookies de sesión, tokens de acceso con expiración
+fija).
+
+```
+linkc serve app.link 8787 --session-ttl 7d
+# o, para un contenedor (mismo criterio que --db/--cors-origin):
+LINK_SESSION_TTL=7d linkc serve app.link 8787
+```
+
+**Configuración de servidor, no del lenguaje -- ninguna sintaxis nueva en
+`.link`.** `auth.createSession(role)` no ganó un parámetro de TTL: el
+tiempo de vida es una decisión operativa (¿cuánto dura una sesión en
+ESTE deploy?), no algo que cada `rpc` deba decidir caso por caso, mismo
+criterio que ya vale para `--cors-origin`/`--db` (§3.36, §3.41). Formato
+`"Ns"`/`"Nm"`/`"Nh"`/`"Nd"` -- mismo espíritu que `@rate_limit("20/1m")`
+(§3.39) pero CON días: la escala típica de una sesión (horas a semanas)
+los necesita de verdad, a diferencia de una ventana de rate limit, donde
+"N por día" es un caso raro.
+
+**Sin flag/variable, cero cambios de comportamiento.** El default sigue
+siendo "sin expirar sola" -- exactamente v0, para no romper a nadie que
+no pida esto explícitamente (mismo criterio que TODA config opcional de
+`linkc serve` hasta ahora).
+
+**Limpieza perezosa, no un barrido de fondo.** Una sesión vencida se
+borra recién en el PRÓXIMO acceso a ese token (`SessionStore::role_for`),
+no por un timer que la busque proactivamente -- este intérprete no tiene
+ningún hilo de mantenimiento (single-threaded por diseño, §3.13), así que
+inventar uno solo para esto hubiera sido la primera excepción a ese
+modelo. Costo real: una sesión creada y nunca vuelta a usar después de
+expirar queda en memoria hasta que alguien intente usarla (o el proceso
+reinicie) -- aceptable para v0, documentado en vez de escondido.
+
+**Token vencido y token que nunca existió son INDISTINGUIBLES desde
+afuera, a propósito.** `role_for` devuelve `None` para los dos casos por
+igual, y `check_auth_gate` (`server.rs`) da el mismo 401 "se requiere
+autenticación" -- mismo principio que ya regía para "no revelar qué rol
+hacía falta" en un 403 (hallazgo del review adversarial original de auth
+v0): un atacante que prueba tokens no debería poder distinguir "este
+token existió alguna vez y venció" de "este token es pura invención".
+
+**`Instant`, no `SystemTime`, para el reloj interno.** El TTL se mide con
+`std::time::Instant` (monotónico, inmune a que el reloj del sistema
+salte hacia atrás/adelante por NTP o cambio de horario) -- a diferencia
+de `now() -> Timestamp` (§3.32), que SÍ necesita `SystemTime` porque
+tiene que representar una fecha de calendario real que el programa
+compara/muestra. Acá no hace falta ninguna fecha visible, solo "cuánto
+pasó desde que se creó" -- `Instant` es la herramienta más correcta para
+eso, no una casualidad de implementación.
+
+**Verificado** contra un servidor real (`compiler/tests/server_http.rs`):
+`--session-ttl 2s`, un login real, acceso inmediato aceptado, y el MISMO
+token rechazado (401) tres segundos después, sin haber llamado
+`destroySession` en ningún momento. Tests unitarios (`session.rs`)
+confirman además que un store sin TTL configurado (`new()`, el default)
+nunca expira nada, y que un token vencido y uno inexistente dan
+exactamente la misma respuesta.
 
 ---
 

@@ -123,7 +123,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>] [--session-ttl <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d')"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
 }
 
@@ -830,7 +830,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--cors-origin <origen>]");
+        eprintln!("uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--cors-origin <origen>] [--session-ttl <duración>]");
         return ExitCode::FAILURE;
     };
     let Ok(port) = port_str.parse::<u16>() else {
@@ -857,13 +857,70 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
 
+    let session_ttl = match resolve_session_ttl(args) {
+        Ok(ttl) => ttl,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    runtime::server::serve(program, port, source, cors);
+    runtime::server::serve(program, port, source, cors, session_ttl);
     ExitCode::SUCCESS
+}
+
+/// Cuánto vive una sesión antes de expirar sola (GRAMMAR.md §3.50), en orden
+/// de precedencia (mismo criterio que `resolve_db_source`/
+/// `resolve_cors_origins`, arriba):
+///
+/// 1. `--session-ttl <duración>` en la línea de comandos.
+/// 2. La variable de entorno `LINK_SESSION_TTL`.
+/// 3. Ninguno de los dos: `None`, que sigue significando "nunca expira sola"
+///    -- el comportamiento de siempre (vive hasta `destroySession()` o
+///    reiniciar el proceso), sin romper a nadie que no pida esto
+///    explícitamente.
+fn resolve_session_ttl(args: &[String]) -> Result<Option<std::time::Duration>, String> {
+    let flag = match args.iter().position(|a| a == "--session-ttl") {
+        Some(i) => match args.get(i + 1) {
+            Some(v) => Some(v.clone()),
+            None => return Err("uso: --session-ttl <duración> (falta el valor, ej. '7d')".to_string()),
+        },
+        None => None,
+    };
+    let value = flag.or_else(|| std::env::var("LINK_SESSION_TTL").ok().filter(|v| !v.trim().is_empty()));
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    parse_duration(&value).map(Some)
+}
+
+/// "Ns"/"Nm"/"Nh"/"Nd" (segundos/minutos/horas/días) -- mismo espíritu que
+/// `RateLimitSpec::parse` (`rate_limit.rs`, "N/Nm") pero CON días: la escala
+/// típica de una sesión (horas a semanas) los necesita de verdad, a
+/// diferencia de una ventana de rate limit, donde "N por día" es un caso
+/// raro y por eso ese parser no los tiene.
+fn parse_duration(raw: &str) -> Result<std::time::Duration, String> {
+    let invalid = || format!("duración inválida: '{raw}' (se esperaba 'Ns', 'Nm', 'Nh' o 'Nd', ej. '7d' -- 7 días)");
+    if raw.is_empty() {
+        return Err(invalid());
+    }
+    let (num_str, unit) = raw.split_at(raw.len() - 1);
+    let num: u64 = num_str.parse().map_err(|_| invalid())?;
+    if num == 0 {
+        return Err(invalid());
+    }
+    match unit {
+        "s" => Ok(std::time::Duration::from_secs(num)),
+        "m" => Ok(std::time::Duration::from_secs(num * 60)),
+        "h" => Ok(std::time::Duration::from_secs(num * 3600)),
+        "d" => Ok(std::time::Duration::from_secs(num * 86400)),
+        _ => Err(invalid()),
+    }
 }
 
 /// Qué orígenes puede pedir CORS, en orden de precedencia (mismo criterio

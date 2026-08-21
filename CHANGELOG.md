@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.14.0] - 2026-08-21
+
+### ✨ Nuevo
+- **`--session-ttl`: expiración real de sesión.** Último gap de la misma serie de chequeos externos -- "las sesiones no expiran solas... no hay forma de expresar 'sesión válida 7 días'". `linkc serve app.link 8787 --session-ttl 7d` (o `LINK_SESSION_TTL`, formato `Ns`/`Nm`/`Nh`/`Nd` -- mismo espíritu que `@rate_limit("20/1m")` pero CON días, porque la escala típica de una sesión los pide de verdad). Configuración de SERVIDOR, no del lenguaje -- `auth.createSession(role)` no ganó ningún parámetro nuevo, mismo criterio que `--cors-origin`/`--db`. Sin flag/variable, cero cambios de comportamiento: sigue viviendo hasta `destroySession()` o reiniciar el proceso, como siempre. Limpieza perezosa (una sesión vencida se borra recién en el próximo acceso a ese token, no por un barrido de fondo -- este intérprete no tiene ningún hilo de mantenimiento) -- costo documentado, no escondido. Token vencido y token que nunca existió dan el mismo 401, indistinguibles desde afuera a propósito, mismo criterio que ya regía para no revelar qué rol hacía falta en un 403. `Instant` (monotónico), no `SystemTime`, para medir el TTL -- inmune a que el reloj del sistema salte por NTP o cambio de horario. Verificado contra un servidor real: `--session-ttl 2s`, login real, acceso inmediato aceptado, el MISMO token rechazado 3 segundos después sin haber llamado `destroySession`. 555 tests (7 nuevos). Detalle completo: GRAMMAR.md §3.50.
+
 ## [1.13.0] - 2026-08-21
 
 ### ✨ Nuevo

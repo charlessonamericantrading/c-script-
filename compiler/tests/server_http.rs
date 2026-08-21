@@ -78,7 +78,7 @@ impl ServeProcess {
         let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/users.link");
         let link_path = dir.join("users.link");
         std::fs::copy(&src, &link_path).expect("copiar examples/users.link al directorio temporal");
-        Self::start_at_path(link_path)
+        Self::start_at_path(link_path, &[])
     }
 
     /// Como `start_with_flagship_example`, pero con un programa propio en
@@ -86,20 +86,28 @@ impl ServeProcess {
     /// `@requires`, GRAMMAR.md §3.49) que necesitan un `enum`/`service`
     /// específico del test, no el del demo insignia.
     fn start_with_program(dir_suffix: &str, source: &str) -> Self {
+        Self::start_with_program_and_args(dir_suffix, source, &[])
+    }
+
+    /// Como `start_with_program`, pero con flags extra después del puerto
+    /// (ej. `--session-ttl 2s`, GRAMMAR.md §3.50) -- para casos que
+    /// necesitan configurar `linkc serve` más allá de programa+puerto.
+    fn start_with_program_and_args(dir_suffix: &str, source: &str, extra_args: &[&str]) -> Self {
         let dir = std::env::temp_dir().join(format!("cscript-server-http-integration-{dir_suffix}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("crear directorio temporal");
         let link_path = dir.join("app.link");
         std::fs::write(&link_path, source).expect("escribir el programa del test");
-        Self::start_at_path(link_path)
+        Self::start_at_path(link_path, extra_args)
     }
 
-    fn start_at_path(link_path: PathBuf) -> Self {
+    fn start_at_path(link_path: PathBuf, extra_args: &[&str]) -> Self {
         let port = free_port();
         let child = Command::new(env!("CARGO_BIN_EXE_linkc"))
             .arg("serve")
             .arg(&link_path)
             .arg(port.to_string())
+            .args(extra_args)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -280,6 +288,45 @@ fn requires_with_or_of_roles_accepts_any_named_role_and_rejects_the_rest() {
     assert_eq!(status, 403, "adminOnly no incluye Agent, sin OR de por medio: {body:?}");
     let (status, body) = server.post("/Dashboard/adminOnly", &json!({}), Some(&admin_token));
     assert_eq!(status, 200, "body: {body:?}");
+
+    server.shutdown();
+}
+
+const TTL_PROGRAM: &str = r#"
+enum Role { Admin }
+
+service Auth {
+  rpc loginAs(role: Role) -> String {
+    auth.createSession(role)
+  }
+}
+
+service Protected {
+  @requires(Role.Admin)
+  rpc secret() -> String { "shh" }
+}
+"#;
+
+#[test]
+fn a_session_created_under_session_ttl_expires_on_its_own_over_a_real_subprocess() {
+    // GRAMMAR.md §3.50: `--session-ttl` -- antes de esta ronda, una sesión
+    // vivía hasta `destroySession()` o hasta reiniciar el proceso, sin
+    // forma de expresar "sesión válida 7 días". Contra el binario real,
+    // con un TTL corto: el token sirve enseguida, y después de vencido el
+    // servidor lo trata igual que "nunca hubo token" (401), sin que haga
+    // falta llamar `destroySession` a mano.
+    let server = ServeProcess::start_with_program_and_args("session-ttl", TTL_PROGRAM, &["--session-ttl", "2s"]);
+
+    let (_, token) = server.post("/Auth/loginAs", &json!({"role": "Admin"}), None);
+    let token = token.as_str().unwrap().to_string();
+
+    let (status, body) = server.post("/Protected/secret", &json!({}), Some(&token));
+    assert_eq!(status, 200, "recién logueado, el token todavía es válido: {body:?}");
+
+    std::thread::sleep(Duration::from_secs(3));
+
+    let (status, body) = server.post("/Protected/secret", &json!({}), Some(&token));
+    assert_eq!(status, 401, "pasado el TTL, el mismo token deja de servir: {body:?}");
 
     server.shutdown();
 }

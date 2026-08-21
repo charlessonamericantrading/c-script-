@@ -37,6 +37,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 /// Un id incremental por request -- lo único que hace falta para poder
 /// correlacionar líneas de log una vez que hay más de un hilo escribiendo a
@@ -129,7 +130,7 @@ impl CorsConfig {
     }
 }
 
-pub fn serve(program: Program, port: u16, source: DbSource, cors: CorsConfig) {
+pub fn serve(program: Program, port: u16, source: DbSource, cors: CorsConfig, session_ttl: Option<Duration>) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
@@ -163,8 +164,12 @@ pub fn serve(program: Program, port: u16, source: DbSource, cors: CorsConfig) {
         },
     };
     // Auth v0 (GRAMMAR.md §3.14): vive mientras el proceso corre, igual que
-    // `db` -- sin expiración, sin persistencia entre reinicios.
-    let sessions = SessionStore::new();
+    // `db` -- sin persistencia entre reinicios. Sin expiración por default;
+    // `--session-ttl`/`LINK_SESSION_TTL` (GRAMMAR.md §3.50) la agrega.
+    let sessions = match session_ttl {
+        Some(ttl) => SessionStore::with_ttl(ttl),
+        None => SessionStore::new(),
+    };
     let backend = if db.is_postgres() { "PostgreSQL" } else { "SQLite" };
     // `@route` (GRAMMAR.md §3.37): armada UNA vez al arrancar, nunca por
     // request -- el programa ya pasó el checker antes de llegar a `serve`,

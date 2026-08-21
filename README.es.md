@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-551-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.13.0-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-555-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.14.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,12 +36,12 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 21/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 551 pruebas automáticas:
+**Funciona hoy**, cubierto por 555 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - SQLite embebido con persistencia real entre reinicios y auto-migraciones no destructivas
 - Push en vivo sobre Server-Sent Events (`stream` + `db.<c>.subscribe()`)
-- Auth declarativa: `@authenticated`, `@requires(Role.Admin)` (o `@requires(Role.Admin | Role.Agent)` para cualquiera de varios roles, todos del mismo enum), tokens de sesión desde el CSPRNG del sistema
+- Auth declarativa: `@authenticated`, `@requires(Role.Admin)` (o `@requires(Role.Admin | Role.Agent)` para cualquiera de varios roles, todos del mismo enum), tokens de sesión desde el CSPRNG del sistema. `linkc serve --session-ttl 7d` (o `LINK_SESSION_TTL`) hace que las sesiones expiren solas -- sin configurar, siguen viviendo hasta `destroySession()` o un reinicio del proceso, como antes
 - PostgreSQL como base de runtime: `linkc serve app.link 8787 --db postgres://usuario:clave@host/base` (o `LINK_DATABASE_URL`), con auto-migración no destructiva, TLS oportunista (rustls puro, sin OpenSSL -- conecta contra proveedores administrados como Supabase/Neon/RDS que lo exigen), reconexión automática tras una conexión cortada, y LISTEN/NOTIFY para que un `stream` conectado a una instancia de `linkc serve` vea una escritura que entró por otra instancia contra la misma base. El mismo programa, el mismo contrato generado — SQLite sigue siendo el default
 - Respuestas que no son JSON: `@content_type("text/html; charset=utf-8")` sobre un rpc que devuelve `String` manda ese cuerpo tal cual — páginas HTML, sitemaps XML, CSV — y se combina con `@requires(Role.Admin)` para páginas detrás de auth. `"...".escapeHtml()` sanitiza datos no confiables antes de meterlos en una página (no es automático -- se llama donde se interpola). `response.setStatus(code)` elige el status HTTP del camino de éxito (ej. una página 404 propia para un `@route` que no encontró nada, o 201 en un `create` JSON común) — los errores de transporte siguen saliendo siempre en JSON, sin cambios
 - URLs amigables: `@route("/blog/:slug")` le da a un rpc una URL limpia y rastreable por GET, además de (nunca en vez de) su dirección normal `/Servicio/rpc` — el cliente generado sigue usando esta última. Cualquier cantidad de segmentos `:parámetro`, en cualquier posición (`/blog/:categoria/:slug`), bindeados por nombre; una ruta más específica (más segmentos fijos) le gana determinísticamente a una totalmente dinámica que también matchearía
@@ -65,6 +65,7 @@ gana esta. Verificado el 21/08/2026 corriendo el compilador, no leyéndolo.
 | `smtp.send` es texto plano, un destinatario, bloqueante | Sin body HTML, sin adjuntos, sin cc/bcc; mandar a varios es una llamada por destinatario. Es sincrónico -- un relay lento hace lento a TODO el servidor (single-threaded) mientras dura esa request. |
 | `http.get`/`http.post` (con o sin headers) solo devuelven el body | Sin acceso al status code ni a los headers de la RESPUESTA -- un 4xx/5xx de la API llamada se vuelve un error de runtime genérico, no un valor sobre el que el programa pueda ramificar (ej. reintentar solo en 429). |
 | `db.<c>.page` no tiene cursor | El caller calcula el próximo `offset` a mano (`offset + limit`); sin token de continuación opaco, y sin total de páginas incorporado -- para eso, `count()`. |
+| `--session-ttl` limpia de forma perezosa | Una sesión vencida se borra de memoria recién la próxima vez que se usa su token -- una creada y nunca vuelta a usar queda en memoria hasta que el proceso reinicia. |
 | El push de `stream` entre instancias (LISTEN/NOTIFY) tiene límites reales | Una fila cambiada de más de 8000 bytes (el límite de payload de NOTIFY que impone el propio Postgres) no se propaga a otras instancias -- sigue publicándose local donde se escribió. NOTIFY es best-effort, sin cola de reintento; un servidor inactivo puede tardar hasta 200ms en notar un cambio remoto; cada instancia abre una conexión extra a Postgres solo para LISTEN; SQLite no participa en absoluto. |
 | Sin paquete npm | `link-lang` todavía no está en el registro de npm. Los releases de GitHub sí funcionan — ver Instalación más abajo. |
 | `linkc wasm` | Congelado a propósito en funciones escalares de enteros/booleanos; el camino de producción es `wasm32-wasip1`. |
@@ -250,7 +251,7 @@ wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_w
 
 ## 🧪 Pruebas y Control de Calidad
 
-El compilador y el runtime de Link están verificados por **551 pruebas automáticas** unitarias,
+El compilador y el runtime de Link están verificados por **555 pruebas automáticas** unitarias,
 de integración y de CLI, incluidas pruebas que levantan el binario real como subproceso, manejan
 un servidor HTTP real, y compilan cada ejemplo de c-script publicado en la documentación de este repo:
 
