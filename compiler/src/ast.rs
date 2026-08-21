@@ -630,3 +630,27 @@ pub fn recognize_live_subscribe(body: &Block) -> Option<&str> {
     let Expr::FieldAccess { base: db_ident, field: collection } = &base.node else { return None };
     matches!(&db_ident.node, Expr::Ident(n) if n == "db").then(|| collection.as_str())
 }
+
+/// Reconoce `|item: T| item.campo` -- el ÚNICO shape de closure que
+/// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.52) aceptan
+/// como selector: un acceso de campo simple sobre el propio parámetro,
+/// nada más -- ni una expresión derivada (`item.campo + 1`), ni una
+/// llamada a método, ni acceso anidado (`item.campo.otro`), ni más de un
+/// parámetro. Cualquier otra forma devuelve `None` -- esos casos no se
+/// pueden traducir a una columna SQL real (no hay forma de "empujar" una
+/// expresión c-script arbitraria a SQL), así que el checker los rechaza
+/// con un mensaje claro en vez de intentar adivinar.
+///
+/// `param_names`, no `Vec<ClosureParam>`: el nombre es lo único que hace
+/// falta acá, y así la misma función sirve tanto para `Expr::Closure`
+/// (checker, params con anotación de tipo) como para `Value::Closure`
+/// (runtime, params ya reducidos a `Vec<String>`) sin que ninguno de los
+/// dos tenga que convertir su propia representación a la del otro.
+pub fn recognize_field_selector<'a>(param_names: &[String], body: &'a Block) -> Option<&'a str> {
+    let [param] = param_names else { return None };
+    if !body.stmts.is_empty() {
+        return None;
+    }
+    let Expr::FieldAccess { base, field } = &body.tail.as_ref()?.node else { return None };
+    matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
+}

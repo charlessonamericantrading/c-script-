@@ -3665,6 +3665,85 @@ mod tests {
     }
 
     #[test]
+    fn aggregate_by_methods_group_and_aggregate_for_real_against_sqlite() {
+        // GRAMMAR.md §3.52: sumBy/countBy/avgBy/maxBy/minBy -- corren contra
+        // el SQLite en memoria real de `test` (no un mock), incluido el caso
+        // de agrupar por un campo ENUM, que tiene que devolver el enum REAL
+        // como key (no degradar a String) -- `scalar_cell_to_value` es lo
+        // que hace eso en runtime/db.rs.
+        let code = r#"
+        enum Plan { Free, Pro, Enterprise }
+        type Order = { id: Int, planId: String, plan: Plan, amountCents: Int, score: Float }
+        db { orders: Order[] }
+
+        service Orders {
+            rpc create(planId: String, plan: Plan, amountCents: Int, score: Float) -> Order {
+                db.orders.insert(Order { id: 0, planId: planId, plan: plan, amountCents: amountCents, score: score })
+            }
+        }
+
+        test "sumBy/countBy/avgBy/maxBy/minBy contra datos reales" {
+            Orders.create("pro", Plan.Pro {}, 2000, 4.5);
+            Orders.create("pro", Plan.Pro {}, 2000, 3.5);
+            Orders.create("free", Plan.Free {}, 0, 5.0);
+            Orders.create("ent", Plan.Enterprise {}, 10000, 2.0);
+            Orders.create("ent", Plan.Enterprise {}, 15000, 1.0);
+
+            let revenue = db.orders.sumBy(|o: Order| { o.planId }, |o: Order| { o.amountCents });
+            assert(revenue.length() == 3, "una fila por planId distinto");
+
+            let counts = db.orders.countBy(|o: Order| { o.plan });
+            assert(counts.length() == 3, "una fila por variante de Plan distinta");
+
+            let avgs = db.orders.avgBy(|o: Order| { o.planId }, |o: Order| { o.score });
+            assert(avgs.length() == 3);
+
+            let maxes = db.orders.maxBy(|o: Order| { o.planId }, |o: Order| { o.amountCents });
+            assert(maxes.length() == 3);
+
+            let mins = db.orders.minBy(|o: Order| { o.planId }, |o: Order| { o.amountCents });
+            assert(mins.length() == 3);
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests");
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.passed, 1, "{:?}", summary.failed);
+    }
+
+    #[test]
+    fn count_by_on_an_enum_field_returns_the_real_enum_variant_as_key() {
+        // Verificación de valor exacto, no solo longitud -- confirma que
+        // `scalar_cell_to_value` reconstruye `Value::Variant` (no
+        // `Value::Str`) para una key agrupada por un campo enum.
+        let code = r#"
+        enum Plan { Free, Pro }
+        type Order = { id: Int, plan: Plan }
+        type PlanCount = { key: Plan, value: Int }
+        db { orders: Order[] }
+
+        service Orders {
+            rpc create(plan: Plan) -> Order { db.orders.insert(Order { id: 0, plan: plan }) }
+        }
+
+        test "la key de countBy sobre un enum es el enum real, no un String" {
+            Orders.create(Plan.Pro {});
+            Orders.create(Plan.Pro {});
+            Orders.create(Plan.Free {});
+
+            let counts = db.orders.countBy(|o: Order| { o.plan });
+            let proCount = counts.filter(|row: PlanCount| { row.key == Plan.Pro {} });
+            assert(proCount.length() == 1, "un solo grupo Pro");
+            assert(proCount[0].value == 2, "dos orders con plan Pro");
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests");
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.passed, 1, "{:?}", summary.failed);
+    }
+
+    #[test]
     fn math_and_crypto_and_string_methods_work_in_runtime() {
         let code = r#"
         test "stdlib builtins math, crypto and strings" {

@@ -98,11 +98,20 @@ difference between code that compiles and code that does not.
     minute), never `"20 per minute"` or `"20/minute"`. Window unit is exactly one of
     `s`/`m`/`h`; the window's number is optional (`"5/m"` means `"5/1m"`) but the
     unit is not.
+11. **`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`'s selectors must be `|item: T| { item.field }`,
+    a bare field access — with the closure braces (rule 2 still applies: no `-> Type`).
+    `|o: Order| { o.amount + 1 }` or any other derived expression, method call, or nested
+    access is rejected at compile time: it can't be pushed to SQL. Group-by is restricted to
+    `String`/`Int`/`Bool`/`enum` fields (no `Float`, no date truncation yet); the aggregated
+    field for `sumBy`/`avgBy`/`maxBy`/`minBy` must be `Int` or `Float`. Neither selector may
+    point at an optional field (`f?: T` or `f: T?`).
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `page(limit: Int, offset: Int) -> T[]` (LIMIT/OFFSET pushed to real SQL, not `all().take(n)`
 — see GRAMMAR.md §3.48), `insert(Omit<T,"id">) -> T`, `applyPatch(id, patch) -> T`,
-`delete(id) -> Bool`, `deleteWhere(pred) -> Int`, `subscribe()` (see rule 5).
+`delete(id) -> Bool`, `deleteWhere(pred) -> Int`, `subscribe()` (see rule 5),
+`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (`GROUP BY` pushed to real SQL — see rule 11 and
+GRAMMAR.md §3.52).
 
 ## CLI
 

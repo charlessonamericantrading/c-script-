@@ -73,6 +73,7 @@
   - [3.49 `@requires(Role.Admin | Role.Agent)`: OR de roles — RESUELTO](#349-requiresroleadmin--roleagent-or-de-roles--resuelto)
   - [3.50 `--session-ttl`: expiración real de sesión — RESUELTO](#350---session-ttl-expiración-real-de-sesión--resuelto)
   - [3.51 `auth.currentRole()`: leer el rol del caller dentro de un cuerpo — RESUELTO](#351-authcurrentrole-leer-el-rol-del-caller-dentro-de-un-cuerpo--resuelto)
+  - [3.52 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`: agregación con `GROUP BY` real, empujada a SQL — RESUELTO](#352-sumbycountbyavgbymaxbyminby-agregación-con-group-by-real-empujada-a-sql--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -2809,6 +2810,98 @@ permitido/denegado; `auth.currentRole()` funcionando en un rpc SIN
 ninguna anotación de auth; `null` tanto sin token como con un token que
 nunca existió. Más un test de compilación (`checker.rs`) para el tipo
 `String?` y el rechazo de argumentos.
+
+### 3.52 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`: agregación con `GROUP BY` real, empujada a SQL — RESUELTO
+
+Último gap real de esta serie: "KPIs de `/admin/revenue` (MRR por plan) o
+`/admin/analytics` (top por vistas) hay que calcularlos trayendo todas
+las filas a memoria y agregando a mano en el propio lenguaje -- funciona
+en tablas chicas, se degrada mal si crecen". `findWhere`/`deleteWhere`
+(§2.1) ya traían todo a memoria para evaluar un predicado arbitrario;
+esto es lo mismo pero para `GROUP BY` -- y acá SÍ hay una forma real de
+empujarlo a SQL, porque el shape que hace falta reconocer es mucho más
+chico que "un predicado cualquiera".
+
+```
+type RevenueByPlan = { key: String, value: Int }
+
+rpc revenueByPlan() -> RevenueByPlan[] {
+  db.orders.sumBy(|o: Order| { o.planId }, |o: Order| { o.amountCents })
+}
+```
+
+**Cinco métodos, no un query builder.** `sumBy`/`avgBy`/`maxBy`/`minBy`
+toman DOS selectores (agrupar por, agregar); `countBy` toma uno solo
+(`COUNT(*)` por grupo, no cuenta un campo). Se descartó una API tipo
+`db.orders.groupBy(...).sum(...)` encadenada -- eso necesitaría un tipo
+intermedio nuevo ("query en construcción") en el sistema de tipos, mucho
+más superficie que cinco métodos con nombre explícito por combinación
+(mismo criterio de "nombre por forma" que ya usa §3.47 para no inventar
+la primera aridad variable del lenguaje sobre un mismo nombre).
+
+**El closure NUNCA se ejecuta -- solo nombra una columna.** A diferencia
+de `findWhere` (el predicado SÍ corre, una vez por fila, en el
+intérprete), acá el shape reconocido (`ast::recognize_field_selector`,
+mismo patrón que `recognize_live_subscribe` de §3.16: una función
+standalone que checker.rs Y runtime llaman cada uno por su lado) es
+EXACTAMENTE `|item: T| { item.campo }` -- un acceso de campo simple,
+nada más. Cualquier otra forma (`item.campo + 1`, un método, un campo
+anidado) se rechaza en compilación con un mensaje claro: no hay forma
+real de traducir una expresión c-script arbitraria a SQL, así que ni se
+intenta -- se reconoce un shape chico y ancho (cualquier campo real
+sirve) en vez de un intérprete de expresiones parcial.
+
+**Restricciones de tipo, deliberadas y angostas:**
+- **Agrupar** solo por `String`, `Int`, `Bool` o un `enum` -- ni `Float`
+  (igualdad exacta de floats es una trampa conocida, mismo motivo que
+  §3.3 no tiene patrón `Float` en `match`), ni `Timestamp`/`Int64`
+  todavía. Agrupar por fecha con truncado (`GROUP BY` mes/día) queda
+  fuera de esta ronda -- necesitaría una segunda pieza (algo como
+  `.truncateToMonth()`) que reconocer, no solo el campo desnudo.
+- **Agregar** (`sumBy`/`avgBy`/`maxBy`/`minBy`) solo `Int`/`Float` --
+  `Int64` tampoco todavía.
+- **Ninguno de los dos acepta un campo opcional** -- ni por clave
+  (`campo?: T`) ni nullable (`campo: T?`). Un grupo o un valor "ausente"
+  no tiene una fila SQL real que lo represente sin inventar más
+  semántica (¿el grupo `null` cuenta aparte? ¿se descarta?) -- se deja
+  afuera en vez de adivinar.
+
+**Agrupar por un campo `enum` devuelve el enum REAL como `key`, no un
+`String`.** La columna de storage detrás sigue siendo `TEXT` (mismo
+mapeo que cualquier enum simple, GRAMMAR.md tabla §4), pero el checker
+ya le promete al programa el tipo declarado del campo tal cual
+(`field_selector` no lo degrada) -- así que el runtime tiene que
+CUMPLIRLO: `scalar_cell_to_value` (`runtime/db.rs`) reconstruye
+`Value::Variant`, no `Value::Str`, para ese caso -- mismo camino que ya
+usa `row_to_fields` para una columna enum normal. Se encontró y arregló
+DURANTE esta ronda (verificado contra un servidor real antes de escribir
+el test permanente): la primera versión degradaba a `String` en runtime
+mientras el checker prometía el enum, exactamente la clase de
+desacuerdo entre capas que GRAMMAR.md §3.9 existe para evitar.
+
+**`AVG` siempre da `Float`, aunque la columna de origen sea `Int`.**
+`SUM`/`MAX`/`MIN` preservan el tipo de la columna (sumar `Int` sigue
+dando `Int`) -- pero un promedio es fraccionario por naturaleza en SQL,
+sea cual sea el tipo de entrada, así que el tipo de retorno de `avgBy`
+es `Float` siempre, sin excepción.
+
+**Portátil entre SQLite y Postgres sin ninguna rama por backend.**
+`SELECT "campo" AS "key", SUM("otro") AS "value" FROM "c" GROUP BY
+"campo"` es SQL estándar en los dos motores -- mismo criterio que
+`page` (§3.48): nombres de columna vienen del propio programa compilado
+(nunca de input del caller), así que interpolarlos directo en el string
+SQL es seguro, mismo patrón que ya usa el resto de `db.rs`.
+
+**Verificado** contra los dos backends: `runtime/mod.rs` (test de
+integración vía `test "..."` real, SQLite en memoria) corre los cinco
+métodos contra datos reales y confirma además, con un assert de VALOR
+exacto (no solo de longitud), que agrupar por un campo enum devuelve la
+variante real comparable con `==` -- `compiler/tests/pg_integration.rs`
+repite `sumBy`/`countBy` contra un PostgreSQL real en CI. Más 8 tests de
+compilación (`checker.rs`) para cada camino de rechazo: selector
+derivado, tipo de agrupación inválido, tipo de valor inválido, campo
+opcional (las dos formas), aridad de argumentos, y que agrupar por un
+enum tipa con el enum real como key.
 
 ---
 

@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.16.0] - 2026-08-21
+
+### ✨ Nuevo
+- **`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`: agregación con `GROUP BY` real, empujada a SQL.** El más grande de la serie de gaps que salió del mismo chequeo externo -- "KPIs de MRR por plan o cohorte mensual hay que calcularlos trayendo todas las filas a memoria y agregando a mano -- se degrada mal si la tabla crece". `findWhere`/`deleteWhere` (v1.0) ya traían todo a memoria para un predicado arbitrario; esto hace lo mismo para `GROUP BY`, pero de verdad empujado a la base -- el closure selector NUNCA se ejecuta, solo NOMBRA una columna: shape reconocido `|item: T| { item.campo }` (mismo patrón que `recognize_live_subscribe` de v1.0 para `stream`), cualquier otra forma (expresión derivada, método, campo anidado) se rechaza en compilación porque no hay forma real de traducirla a SQL. Cinco métodos con nombre explícito, no un query builder encadenado -- mismo criterio de "nombre por forma" que ya usa v1.11 para no inventar la primera aridad variable del lenguaje. Agrupar solo por `String`/`Int`/`Bool`/enum (Float excluido por el mismo motivo que `match` no tiene patrón `Float`; fechas truncadas quedan para otra ronda); agregar solo `Int`/`Float`; ningún campo opcional en ninguno de los dos roles. Agrupar por un campo enum devuelve el enum REAL como key, no un string degradado -- encontrado y corregido durante esta misma ronda (la primera versión sí degradaba, exactamente la clase de desacuerdo checker-vs-runtime que este proyecto viene evitando desde v1.0). `AVG` siempre da `Float`, `SUM`/`MAX`/`MIN` preservan el tipo de la columna. Portátil entre SQLite y Postgres sin ninguna rama por backend. Verificado contra los dos backends -- SQLite vía `test "..."` real (incluida una comparación de VALOR exacto sobre la key enum, no solo longitud) y Postgres en CI -- más 8 tests de compilación para cada camino de rechazo. 568 tests (11 nuevos). Detalle completo: GRAMMAR.md §3.52.
+
 ## [1.15.0] - 2026-08-21
 
 ### ✨ Nuevo

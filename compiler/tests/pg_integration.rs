@@ -348,6 +348,72 @@ fn page_pushes_limit_offset_to_real_sql_against_postgres() {
     assert!(err.is_err(), "offset negativo tiene que fallar, no mandarse tal cual al SQL de Postgres");
 }
 
+const AGGREGATE_PROGRAM: &str = r#"
+enum Plan { Free, Pro, Enterprise }
+type Order = { id: Int, planId: String, plan: Plan, amountCents: Int }
+type StringInt = { key: String, value: Int }
+type PlanInt = { key: Plan, value: Int }
+
+db { COLLECTION: Order[], }
+
+service Orders {
+  rpc create(planId: String, plan: Plan, amountCents: Int) -> Order {
+    db.COLLECTION.insert(Order { id: 0, planId: planId, plan: plan, amountCents: amountCents })
+  }
+
+  rpc revenueByPlanId() -> StringInt[] {
+    db.COLLECTION.sumBy(|o: Order| { o.planId }, |o: Order| { o.amountCents })
+  }
+
+  rpc countByPlan() -> PlanInt[] {
+    db.COLLECTION.countBy(|o: Order| { o.plan })
+  }
+}
+"#;
+
+#[test]
+fn aggregate_by_pushes_group_by_to_real_sql_against_postgres() {
+    // GRAMMAR.md §3.52: mismo criterio que `page` (arriba) -- `GROUP BY`
+    // real tiene que dar el mismo resultado en los dos backends, SQLite
+    // (ya probado en runtime/mod.rs) y Postgres acá. Incluye agrupar por
+    // un campo ENUM (`countByPlan`), que tiene que devolver el enum real
+    // como key en los dos backends por igual.
+    const COLLECTION: &str = "orders_aggregate";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("aggregate");
+    let src = temp.write("app.link", &AGGREGATE_PROGRAM.replace("COLLECTION", COLLECTION));
+    let server = Serve::start(&src, &url);
+
+    server.rpc("Orders/create", r#"{"planId":"pro","plan":"Pro","amountCents":2000}"#);
+    server.rpc("Orders/create", r#"{"planId":"pro","plan":"Pro","amountCents":2000}"#);
+    server.rpc("Orders/create", r#"{"planId":"free","plan":"Free","amountCents":0}"#);
+    server.rpc("Orders/create", r#"{"planId":"ent","plan":"Enterprise","amountCents":10000}"#);
+    server.rpc("Orders/create", r#"{"planId":"ent","plan":"Enterprise","amountCents":15000}"#);
+
+    let revenue = server.rpc("Orders/revenueByPlanId", "{}");
+    let mut by_key: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for row in revenue.as_array().unwrap() {
+        by_key.insert(row["key"].as_str().unwrap().to_string(), row["value"].as_i64().unwrap());
+    }
+    assert_eq!(by_key.get("pro"), Some(&4000), "{by_key:?}");
+    assert_eq!(by_key.get("free"), Some(&0), "{by_key:?}");
+    assert_eq!(by_key.get("ent"), Some(&25000), "{by_key:?}");
+
+    let counts = server.rpc("Orders/countByPlan", "{}");
+    let mut count_by_key: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    for row in counts.as_array().unwrap() {
+        count_by_key.insert(row["key"].as_str().unwrap().to_string(), row["value"].as_i64().unwrap());
+    }
+    assert_eq!(count_by_key.get("Pro"), Some(&2), "la key es el nombre de variante real: {count_by_key:?}");
+    assert_eq!(count_by_key.get("Free"), Some(&1), "{count_by_key:?}");
+    assert_eq!(count_by_key.get("Enterprise"), Some(&2), "{count_by_key:?}");
+}
+
 #[test]
 fn rows_survive_a_restart_and_are_readable_from_plain_sql() {
     const COLLECTION: &str = "leads_persist";

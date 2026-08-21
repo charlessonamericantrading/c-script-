@@ -3027,8 +3027,7 @@ impl Checker {
                 self.check_expr(offset_arg, &Type::Int, env)?;
                 Ok(Type::List(Box::new(element_ty.clone())))
             }
-
-
+            "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.check_aggregate_by(element_ty, method, args, env),
 
             // Deliberadamente SIEMPRE un error acá, nunca una firma normal
             // y libremente componible como las de arriba (GRAMMAR.md
@@ -3045,7 +3044,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch/delete/deleteWhere/findWhere/count/page/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch/delete/deleteWhere/findWhere/count/page/sumBy/countBy/avgBy/maxBy/minBy/subscribe)"
             ))),
         }
     }
@@ -3103,6 +3102,93 @@ impl Checker {
         }
         let without_id: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
         Ok(Type::Struct { name: None, fields: without_id })
+    }
+
+    /// Extrae el campo que selecciona `|item: T| item.campo` (GRAMMAR.md
+    /// §3.52) -- exige EXACTAMENTE ese shape (`ast::recognize_field_selector`)
+    /// y que `campo` sea de verdad un campo de `element_ty`, devolviendo su
+    /// tipo. `role` ("de agrupación"/"de valor") es solo para el mensaje.
+    fn field_selector(&self, element_ty: &Type, arg: &Spanned<Expr>, method: &str, role: &str) -> Result<(String, Type), CheckError> {
+        let shape_err = || {
+            err(format!(
+                "'{method}' espera un selector de campo {role} de la forma `|item: T| item.campo` -- un acceso de campo simple, sin expresiones derivadas ni llamadas a método (no hay forma de traducir eso a una columna SQL real)"
+            ))
+        };
+        let Expr::Closure { params, body } = &arg.node else {
+            return Err(shape_err());
+        };
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        let Some(field_name) = crate::ast::recognize_field_selector(&param_names, body) else {
+            return Err(shape_err());
+        };
+        let Type::Struct { fields, .. } = element_ty else {
+            return Err(err("una colección de 'db' debe resolver a un struct"));
+        };
+        let Some(field) = fields.iter().find(|f| f.name == field_name) else {
+            return Err(err(format!("'{method}': '{field_name}' no es un campo de este struct")));
+        };
+        // Dos formas de "opcional" (GRAMMAR.md §3.4): por CLAVE (`campo?: T`,
+        // `field.optional`) y por TIPO/nullable (`campo: T?`,
+        // `Type::Optional`) -- ninguna de las dos está soportada como
+        // selector todavía, y las dos se rechazan con el MISMO mensaje: un
+        // grupo/valor "ausente" no tiene una fila SQL real que representarlo.
+        if field.optional || matches!(field.ty, Type::Optional(_)) {
+            return Err(err(format!(
+                "'{method}': el campo {role} '{field_name}' es opcional -- agregar por un campo que puede faltar (por clave, `campo?: T`, o nullable, `campo: T?`) todavía no está soportado"
+            )));
+        }
+        Ok((field_name.to_string(), field.ty.clone()))
+    }
+
+    /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.52):
+    /// agregación con `GROUP BY` empujada a SQL de verdad -- a diferencia de
+    /// `findWhere`/`deleteWhere` (predicado como closure, evaluado en el
+    /// intérprete DESPUÉS de traer todas las filas), acá el closure nunca se
+    /// ejecuta: solo se usa para NOMBRAR una columna (`field_selector`
+    /// arriba), y la agregación entera corre adentro de la base.
+    /// `countBy` es el único de los cinco sin selector de valor -- cuenta
+    /// FILAS por grupo (`COUNT(*)`), no un campo específico.
+    fn check_aggregate_by(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>], _env: &Env) -> Result<Type, CheckError> {
+        let needs_value = method != "countBy";
+        let expected = if needs_value { 2 } else { 1 };
+        if args.len() != expected {
+            let shape =
+                if needs_value { "(groupBy: |item: T| item.campo, value: |item: T| item.campo)" } else { "(groupBy: |item: T| item.campo)" };
+            return Err(err(format!("'{method}' toma exactamente {expected} argumento(s) {shape}")));
+        }
+
+        let (key_field, key_ty) = self.field_selector(element_ty, &args[0], method, "de agrupación")?;
+        if !matches!(key_ty, Type::String | Type::Int | Type::Bool | Type::Enum(_)) {
+            return Err(err(format!(
+                "'{method}': el campo de agrupación '{key_field}' es {key_ty} -- solo se puede agrupar por String, Int, Bool o un enum (fechas/horas necesitan truncar antes, que todavía no está soportado; Float e Int64 tampoco, GRAMMAR.md §3.52)"
+            )));
+        }
+
+        let value_ty = if needs_value {
+            let (value_field, field_ty) = self.field_selector(element_ty, &args[1], method, "de valor")?;
+            if !matches!(field_ty, Type::Int | Type::Float) {
+                return Err(err(format!(
+                    "'{method}': el campo de valor '{value_field}' es {field_ty} -- tiene que ser Int o Float (Int64 todavía no está soportado, GRAMMAR.md §3.52)"
+                )));
+            }
+            Some(field_ty)
+        } else {
+            None
+        };
+
+        let result_ty = match method {
+            "countBy" => Type::Int,
+            "avgBy" => Type::Float,
+            _ => value_ty.expect("sumBy/maxBy/minBy siempre validan un selector de valor arriba"),
+        };
+
+        Ok(Type::List(Box::new(Type::Struct {
+            name: None,
+            fields: vec![
+                FieldType { name: "key".to_string(), optional: false, ty: key_ty },
+                FieldType { name: "value".to_string(), optional: false, ty: result_ty },
+            ],
+        })))
     }
 
     fn expect_no_args(&self, args: &[Spanned<Expr>], method: &str) -> Result<(), CheckError> {
@@ -5104,5 +5190,131 @@ type T = { id: Int, s: Status }")
         let src_field = "type User = { name: String } fn f(u: User) -> String { u.nmae }";
         let err_field = check_source(src_field).unwrap_err();
         assert!(err_field[0].message.contains("¿quisiste decir 'name'?"), "{}", err_field[0].message);
+    }
+
+    // GRAMMAR.md §3.52: `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`.
+
+    #[test]
+    fn sum_by_typechecks_with_a_real_field_selector_pair() {
+        let src = r#"
+            type Order = { id: Int, planId: String, amountCents: Int }
+            db { orders: Order[] }
+            fn f() -> Int {
+                let rows = db.orders.sumBy(|o: Order| { o.planId }, |o: Order| { o.amountCents });
+                rows.length()
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn count_by_grouping_on_an_enum_field_returns_the_real_enum_as_the_key_type() {
+        // No degrada a String -- la key sale con el tipo enum REAL
+        // (`field_selector` devuelve el tipo declarado tal cual), así que
+        // asignarla a un struct con `key: Plan` tiene que tipar.
+        let src = r#"
+            enum Plan { Free, Pro }
+            type Order = { id: Int, plan: Plan }
+            type PlanCount = { key: Plan, value: Int }
+            db { orders: Order[] }
+            service S {
+                rpc counts() -> PlanCount[] { db.orders.countBy(|o: Order| { o.plan }) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn aggregate_by_rejects_a_derived_expression_as_the_selector() {
+        let src = r#"
+            type Order = { id: Int, planId: String, amountCents: Int }
+            db { orders: Order[] }
+            fn f() -> Int {
+                let rows = db.orders.sumBy(|o: Order| { o.planId + "x" }, |o: Order| { o.amountCents });
+                rows.length()
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("selector de campo"), "{msg}");
+    }
+
+    #[test]
+    fn aggregate_by_rejects_a_float_group_key() {
+        let src = r#"
+            type Order = { id: Int, score: Float, amountCents: Int }
+            db { orders: Order[] }
+            fn f() -> Int {
+                let rows = db.orders.sumBy(|o: Order| { o.score }, |o: Order| { o.amountCents });
+                rows.length()
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("solo se puede agrupar por"), "{msg}");
+    }
+
+    #[test]
+    fn sum_by_rejects_a_non_numeric_value_field() {
+        let src = r#"
+            type Order = { id: Int, planId: String, label: String }
+            db { orders: Order[] }
+            fn f() -> Int {
+                let rows = db.orders.sumBy(|o: Order| { o.planId }, |o: Order| { o.label });
+                rows.length()
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("tiene que ser Int o Float"), "{msg}");
+    }
+
+    #[test]
+    fn aggregate_by_rejects_an_optional_field_as_selector() {
+        let src = r#"
+            type Order = { id: Int, planId: String?, amountCents: Int }
+            db { orders: Order[] }
+            fn f() -> Int {
+                let rows = db.orders.sumBy(|o: Order| { o.planId }, |o: Order| { o.amountCents });
+                rows.length()
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("es opcional"), "{msg}");
+    }
+
+    #[test]
+    fn count_by_takes_exactly_one_argument_the_others_take_exactly_two() {
+        let src = r#"
+            type Order = { id: Int, planId: String, amountCents: Int }
+            db { orders: Order[] }
+            fn f() -> Int {
+                let rows = db.orders.countBy(|o: Order| { o.planId }, |o: Order| { o.amountCents });
+                rows.length()
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("'countBy' toma exactamente 1"), "{msg}");
+
+        let src2 = r#"
+            type Order = { id: Int, planId: String, amountCents: Int }
+            db { orders: Order[] }
+            fn f() -> Int {
+                let rows = db.orders.sumBy(|o: Order| { o.planId });
+                rows.length()
+            }
+        "#;
+        let msg2 = format!("{:?}", check_source(src2).unwrap_err());
+        assert!(msg2.contains("'sumBy' toma exactamente 2"), "{msg2}");
+    }
+
+    #[test]
+    fn avg_by_always_returns_float_even_summing_an_int_field() {
+        let src = r#"
+            type Order = { id: Int, planId: String, amountCents: Int }
+            type StringFloat = { key: String, value: Float }
+            db { orders: Order[] }
+            service S {
+                rpc avg() -> StringFloat[] { db.orders.avgBy(|o: Order| { o.planId }, |o: Order| { o.amountCents }) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 }

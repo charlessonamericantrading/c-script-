@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-557-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.15.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-568-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.16.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,7 +36,7 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-21 by running the compiler, not by reading it.
 
-**Works today**, covered by 557 automated tests:
+**Works today**, covered by 568 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
@@ -48,6 +48,7 @@ this section wins. Verified on 2026-08-21 by running the compiler, not by readin
 - Verifying third-party webhooks: `env.get(name)`, `request.rawBody()` / `request.header(name)`, and `crypto.hmacSha256(secret, message)` give an rpc everything it needs to check a Stripe/GitHub/etc. signature before trusting a callback
 - Calling third-party APIs: `http.get(url)` / `http.post(url, body)`, plus `http.getWithHeaders(url, headers)` / `http.postWithHeaders(url, body, headers)` for calls that need `Authorization` or any other header — `headers` is any `{name: String, value: String}[]` you declare, no built-in type required. Response is the body as `String`; a non-2xx becomes a normal runtime error, not a panic
 - Real pagination: `db.<c>.page(limit, offset)` pushes `LIMIT`/`OFFSET` into the actual SQL query (SQLite and Postgres both) instead of fetching the whole table and slicing in memory — same row order as `all()`, so pages never overlap or skip a row
+- Real aggregation: `db.<c>.sumBy(groupSelector, valueSelector)` / `countBy(groupSelector)` / `avgBy` / `maxBy` / `minBy` push a `GROUP BY` into actual SQL — MRR by plan, counts by status — instead of pulling every row into memory. Selectors must be a bare field access (`|o: Order| { o.planId }`); group-by is `String`/`Int`/`Bool`/`enum` only (no date truncation yet), the aggregated field must be `Int`/`Float`. Grouping by an `enum` field returns the real enum as the key, not a string
 - Per-client rate limiting: `@rate_limit("20/1m")` caps an rpc to N requests per time window per `(client IP, service, rpc)`, 429 on exceeding, token bucket with continuous refill
 - Sending email: `smtp.send(to, subject, body)` — connection (`LINK_SMTP_URL`) and sender (`LINK_SMTP_FROM`) come from the process environment, never from rpc arguments. TLS via pure-rustls, same stack as the PostgreSQL driver
 - Configurable CORS and fixed security headers: `--cors-origin <origin>` (repeatable, or `LINK_CORS_ORIGINS`) switches from open `*` to a real allowlist (exact match, echoed literal + `Vary: Origin`); every response — including errors and `stream` SSE — carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`
@@ -67,6 +68,7 @@ this section wins. Verified on 2026-08-21 by running the compiler, not by readin
 | `db.<c>.page` has no cursor | The caller computes the next `offset` by hand (`offset + limit`); no opaque continuation token, and no built-in total-page count — use `count()` for that. |
 | `--session-ttl` cleans up lazily | An expired session is only removed from memory the next time its token is used — one created and never touched again stays in memory until the process restarts. |
 | `auth.currentRole()` exposes only the role, not the caller | No `ctx.user`-style reference to the actual `User` who logged in — the session only ever stored the role tag, since v0. |
+| Aggregation (`sumBy`/etc.) has no date bucketing or `Int64` support | Can't `GROUP BY` a truncated date (monthly cohorts, for example) — only bare `String`/`Int`/`Bool`/`enum` fields. `Int64` isn't a valid group or aggregate field yet either. |
 | Cross-instance `stream` push (LISTEN/NOTIFY) has real limits | A changed row over 8000 bytes (Postgres's own NOTIFY payload cap) doesn't propagate to other instances — it still publishes locally where it was written. NOTIFY is best-effort with no retry queue; an idle server can take up to 200ms to notice a remote change; each instance opens one extra Postgres connection just for LISTEN; SQLite doesn't participate at all. |
 | No npm package | `link-lang` is not on the npm registry yet. GitHub releases work — see Installation below. |
 | `linkc wasm` | Deliberately frozen at integer/boolean scalar functions; the production path is `wasm32-wasip1`. |
@@ -255,7 +257,7 @@ wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_w
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **557 automated unit, integration and CLI tests**, including tests that
+Link is verified by **568 automated unit, integration and CLI tests**, including tests that
 spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
 example published in this repository's documentation:
 

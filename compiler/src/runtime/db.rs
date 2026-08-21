@@ -735,6 +735,7 @@ db { users: User[] }
                 }
                 self.select_rows_page(collection, columns, limit, offset).map(Value::List)
             }
+            "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.select_grouped(collection, columns, method, &args).map(Value::List),
             "find" => {
                 let id = as_int(args.first().ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?)?;
                 Ok(self.select_rows(collection, columns, Some(id))?.into_iter().next().unwrap_or(Value::Null))
@@ -998,6 +999,73 @@ db { users: User[] }
         Ok(rows.iter().map(|cells| Value::Struct(self.row_to_fields(cells, columns))).collect())
     }
 
+    /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.52) --
+    /// `GROUP BY` real, corriendo adentro de la base. El checker ya validó
+    /// el shape de cada closure (`check_aggregate_by`) y que los campos
+    /// existen y son del tipo correcto; acá se vuelve a correr
+    /// `recognize_field_selector` sobre el `Value::Closure` que de verdad
+    /// llegó -- el checker corrió sobre el AST en compilación, esto corre
+    /// sobre el mismo AST otra vez pero en runtime, mismo criterio que
+    /// `ast::recognize_live_subscribe` (usado por checker.rs Y por
+    /// runtime::live_subscribe_collection, cada uno en su propio momento).
+    fn select_grouped(&self, collection: &str, columns: &[ColumnPlan], method: &str, args: &[Value]) -> Result<Vec<Value>, RuntimeError> {
+        let key_field = closure_field_name(args.first(), "de agrupación")?;
+        let key_col = columns
+            .iter()
+            .find(|c| c.field.name == key_field)
+            .ok_or_else(|| RuntimeError::new(format!("'{method}': '{key_field}' no es una columna real de '{collection}'")))?;
+
+        let (value_expr, value_kind) = if method == "countBy" {
+            ("COUNT(*)".to_string(), ColumnKind::Int)
+        } else {
+            let value_field = closure_field_name(args.get(1), "de valor")?;
+            let value_col = columns
+                .iter()
+                .find(|c| c.field.name == value_field)
+                .ok_or_else(|| RuntimeError::new(format!("'{method}': '{value_field}' no es una columna real de '{collection}'")))?;
+            let sql_fn = match method {
+                "sumBy" => "SUM",
+                "avgBy" => "AVG",
+                "maxBy" => "MAX",
+                "minBy" => "MIN",
+                other => panic!("select_grouped llamado con un método que Db::call no debería enrutar acá: '{other}'"),
+            };
+            // AVG en SQL siempre devuelve fraccionario, sin importar si la
+            // columna de origen es entera -- MAX/MIN/SUM sí preservan el
+            // tipo de la columna (una suma de INTEGER sigue siendo entera).
+            let kind = if method == "avgBy" { ColumnKind::Float } else { value_col.kind() };
+            (format!("{sql_fn}(\"{value_field}\")"), kind)
+        };
+
+        let key_ty = key_col.field.ty.clone();
+        // El valor (SUM/COUNT/AVG/MAX/MIN) nunca es un enum -- el checker
+        // exige Int/Float para el selector de valor, y count/avg producen
+        // Int/Float por construcción -- así que alcanza con derivar el
+        // `Type` directo del `ColumnKind` calculado arriba, sin necesitar
+        // el `FieldType` real de ninguna columna.
+        let value_ty = match value_kind {
+            ColumnKind::Int => Type::Int,
+            ColumnKind::Float => Type::Float,
+            other => panic!("select_grouped: una agregación no debería producir un value de tipo {other:?}"),
+        };
+        let sql =
+            format!("SELECT \"{key_field}\" AS \"key\", {value_expr} AS \"value\" FROM \"{collection}\" GROUP BY \"{key_field}\"");
+        let kinds = vec![key_col.kind(), value_kind];
+        let rows = self
+            .backend
+            .query(&sql, &[], &kinds)
+            .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|cells| {
+                Value::Struct(vec![
+                    ("key".to_string(), scalar_cell_to_value(&key_ty, &cells[0])),
+                    ("value".to_string(), scalar_cell_to_value(&value_ty, &cells[1])),
+                ])
+            })
+            .collect())
+    }
+
     /// Reconstruye una fila entera (`"id"` + cada columna declarada) como los
     /// pares `(nombre, Value)` de un `Value::Struct` -- inversa de
     /// `write_param`. Las celdas llegan en el mismo orden que emitió el SELECT
@@ -1098,6 +1166,49 @@ db { users: User[] }
             Value::Variant { variant, .. } => Cell::Text(variant.clone()),
             other => panic!("valor no representable en una columna nativa de SQL: {other:?}"),
         }
+    }
+}
+
+/// Extrae el nombre de campo de un argumento `sumBy`/`countBy`/`avgBy`/
+/// `maxBy`/`minBy` (GRAMMAR.md §3.52) -- defensivo, no un caso esperado en
+/// la práctica: el checker ya garantizó en compilación que cada argumento
+/// es exactamente `|item: T| item.campo` (mismo criterio que el
+/// `unwrap_or_else` de `@content_type` en `server.rs`).
+fn closure_field_name(arg: Option<&Value>, role: &str) -> Result<String, RuntimeError> {
+    let Some(Value::Closure(params, body, _)) = arg else {
+        return Err(RuntimeError::new(format!("selector {role} inválido: se esperaba un closure")));
+    };
+    crate::ast::recognize_field_selector(params, body)
+        .map(str::to_string)
+        .ok_or_else(|| RuntimeError::new(format!("selector {role} inválido: se esperaba `|item: T| item.campo`")))
+}
+
+/// Convierte la celda de `key`/`value` que devuelve `select_grouped` --
+/// más simple que `row_to_fields` porque acá NUNCA hay JSON: el checker ya
+/// exigió que tanto el campo de agrupación como el de valor sean
+/// escalares NO opcionales (`check_aggregate_by`, checker.rs), y una
+/// columna `NOT NULL` agregada sobre al menos una fila real (GROUP BY
+/// nunca produce un grupo vacío) no puede devolver `Cell::Null` -- si
+/// llega, es una violación de esa invariante, no una condición normal.
+///
+/// `ty` importa para el caso `Type::Enum`: agrupar por un campo enum
+/// (ej. `countBy(|o: Order| { o.status })`) tiene que devolver una `key`
+/// del tipo enum REAL, no un `String` -- el checker ya le prometió eso al
+/// programa (`field_selector` devuelve el tipo declarado del campo tal
+/// cual), así que acá hay que cumplirlo reconstruyendo `Value::Variant`,
+/// mismo camino que ya usa `row_to_fields` para una columna enum normal
+/// -- si no, el checker y el runtime terminarían en desacuerdo sobre qué
+/// forma tiene el mismo valor (GRAMMAR.md §3.9).
+fn scalar_cell_to_value(ty: &Type, cell: &Cell) -> Value {
+    match (ty, cell) {
+        (Type::Enum(name), Cell::Text(variant)) => {
+            Value::Variant { enum_name: name.clone(), variant: variant.clone(), fields: Vec::new() }
+        }
+        (_, Cell::Int(n)) => Value::Int(*n),
+        (_, Cell::Float(f)) => Value::Float(*f),
+        (_, Cell::Text(t)) => Value::Str(t.clone()),
+        (_, Cell::Bool(b)) => Value::Bool(*b),
+        (ty, cell) => panic!("una agregación devolvió {cell:?} para una columna declarada {ty}"),
     }
 }
 
