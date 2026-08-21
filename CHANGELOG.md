@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.15.0] - 2026-08-21
+
+### ✨ Nuevo
+- **`auth.currentRole()`: leer el rol del caller dentro de un cuerpo.** Último gap de la misma serie de chequeos externos -- "no hay forma de leer el rol del caller dentro de un rpc... bloquea cualquier endpoint que hoy se comporte distinto según si eres agent o admin, no solo permitido/denegado". Con `@requires(Role.Admin | Role.Agent)` (v1.13) ya real, esto importaba de verdad: un endpoint compartido entre roles necesita a veces comportarse DISTINTO según cuál es, no solo decidir si entra. Devuelve `String?` (el nombre de la variante, ej. `"Admin"`), no el enum real -- evitar que el checker necesite saber con qué enum se autenticó CADA rpc en cualquier punto anidado de una expresión, mismo motivo por el que `response.setStatus` (v1.10) tampoco intentó saber si estaba dentro de un `stream`. Disponible SIEMPRE, sin requerir `@requires`/`@authenticated` en el rpc que lo llama -- mismo criterio que `request.rawBody()`/`request.header()`. `null` para "sin sesión" y "token inválido/vencido" por igual -- reusa `SessionStore::role_for` tal cual, así que hereda esa indistinguibilidad gratis, sin código nuevo. Cero cambios al modelo de sesión: ningún parámetro nuevo en `createSession`, el rol ya viajaba en la sesión desde v0, solo faltaba exponerlo. Límite honesto que sigue sin resolverse: solo el ROL, nunca la identidad completa del caller (`ctx.user`) -- la sesión nunca guardó una referencia al `User` real. Verificado contra un servidor real: un `sharedPanel` con `@requires(Role.Admin | Role.Agent)` respondiendo contenido DISTINTO según cuál rol autenticó, funcionando también en un rpc sin ninguna anotación de auth, y `null` tanto sin token como con uno inexistente. 557 tests (2 nuevos). Detalle completo: GRAMMAR.md §3.51.
+
 ## [1.14.0] - 2026-08-21
 
 ### ✨ Nuevo

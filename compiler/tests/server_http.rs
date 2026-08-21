@@ -330,3 +330,68 @@ fn a_session_created_under_session_ttl_expires_on_its_own_over_a_real_subprocess
 
     server.shutdown();
 }
+
+const CURRENT_ROLE_PROGRAM: &str = r#"
+enum Role { Admin, Agent, Member }
+
+service Auth {
+  rpc loginAs(role: Role) -> String {
+    auth.createSession(role)
+  }
+}
+
+service Dashboard {
+  @requires(Role.Admin | Role.Agent)
+  rpc sharedPanel() -> String {
+    let role = auth.currentRole();
+    if role == "Admin" {
+      "panel de administrador"
+    } else {
+      "panel de agente"
+    }
+  }
+
+  rpc whoAmI() -> String? {
+    auth.currentRole()
+  }
+}
+"#;
+
+#[test]
+fn current_role_lets_a_shared_endpoint_behave_differently_per_role_over_a_real_subprocess() {
+    // GRAMMAR.md §3.51: la brecha real que motivó esto -- "bloquea
+    // cualquier endpoint que hoy se comporte distinto según si eres agent
+    // o admin, no solo permitido/denegado". `sharedPanel` acepta los dos
+    // roles (§3.49) pero responde DISTINTO según cuál autenticó -- eso es
+    // lo nuevo que `auth.currentRole()` habilita.
+    let server = ServeProcess::start_with_program("current-role", CURRENT_ROLE_PROGRAM);
+
+    let (_, admin_token) = server.post("/Auth/loginAs", &json!({"role": "Admin"}), None);
+    let admin_token = admin_token.as_str().unwrap().to_string();
+    let (_, agent_token) = server.post("/Auth/loginAs", &json!({"role": "Agent"}), None);
+    let agent_token = agent_token.as_str().unwrap().to_string();
+
+    let (status, body) = server.post("/Dashboard/sharedPanel", &json!({}), Some(&admin_token));
+    assert_eq!(status, 200);
+    assert_eq!(body, "panel de administrador");
+    let (status, body) = server.post("/Dashboard/sharedPanel", &json!({}), Some(&agent_token));
+    assert_eq!(status, 200);
+    assert_eq!(body, "panel de agente");
+
+    // Disponible SIN ninguna anotación de auth en el rpc que lo llama --
+    // `whoAmI` no tiene ni `@requires` ni `@authenticated`.
+    let (status, body) = server.post("/Dashboard/whoAmI", &json!({}), Some(&admin_token));
+    assert_eq!(status, 200);
+    assert_eq!(body, "Admin");
+
+    // Sin token, y con un token que nunca existió, dan lo mismo: null --
+    // mismo criterio de indistinguibilidad que ya rige `role_for` (§3.50).
+    let (status, body) = server.post("/Dashboard/whoAmI", &json!({}), None);
+    assert_eq!(status, 200);
+    assert_eq!(body, Value::Null);
+    let (status, body) = server.post("/Dashboard/whoAmI", &json!({}), Some("un-token-que-nunca-existio"));
+    assert_eq!(status, 200);
+    assert_eq!(body, Value::Null);
+
+    server.shutdown();
+}

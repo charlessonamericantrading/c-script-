@@ -3079,8 +3079,12 @@ impl Checker {
                 self.expect_no_args(args, "destroySession")?;
                 Ok(Type::Void)
             }
+            "currentRole" => {
+                self.expect_no_args(args, "currentRole")?;
+                Ok(Type::Optional(Box::new(Type::String)))
+            }
             other => Err(err(format!(
-                "'{other}' no es un método conocido de 'auth' (createSession/destroySession)"
+                "'{other}' no es un método conocido de 'auth' (createSession/destroySession/currentRole)"
             ))),
         }
     }
@@ -4739,6 +4743,29 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(bad).is_err());
+    }
+
+    #[test]
+    fn current_role_types_as_optional_string_and_takes_no_arguments() {
+        // GRAMMAR.md §3.51: disponible SIEMPRE, sin requerir ninguna
+        // anotación de auth en el rpc que lo llama -- mismo criterio que
+        // request.rawBody()/request.header() (§3.38).
+        let src = r#"
+            service S {
+                rpc whoAmI() -> String? { auth.currentRole() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        let bad = r#"
+            service S {
+                rpc whoAmI() -> String? { auth.currentRole("Admin") }
+            }
+        "#;
+        let result = check_source(bad);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("currentRole"), "debería mencionar 'currentRole': {msg}");
     }
 
     #[test]

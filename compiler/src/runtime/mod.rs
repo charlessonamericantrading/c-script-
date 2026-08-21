@@ -1581,6 +1581,18 @@ fn call_method(
                 }
                 Ok(Value::Null)
             }
+            // `null` para "sin sesión" y "token inválido/vencido" por
+            // igual, a propósito -- mismo criterio de indistinguibilidad
+            // que ya rige el 401 de `check_auth_gate` (GRAMMAR.md §3.50):
+            // un cuerpo de rpc no debería poder distinguir "nadie se
+            // autenticó" de "algo estaba mal con el token" mirando esto.
+            // Disponible SIEMPRE, no solo bajo `@requires`/`@authenticated`
+            // -- mismo criterio que `request.rawBody()`/`request.header()`
+            // (§3.38), que tampoco están atados a una anotación.
+            "currentRole" => {
+                let role = current_token.and_then(|tok| sessions.role_for(tok)).map(|(_, variant)| variant);
+                Ok(role.map(Value::Str).unwrap_or(Value::Null))
+            }
             other => Err(err(format!("método desconocido sobre auth: '{other}'"))),
         },
         Value::Service(s_name) => {

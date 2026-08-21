@@ -72,6 +72,7 @@
   - [3.48 `db.<coleccion>.page(limit, offset)`: paginación real, empujada a SQL — RESUELTO](#348-dbcoleccionpagelimit-offset-paginación-real-empujada-a-sql--resuelto)
   - [3.49 `@requires(Role.Admin | Role.Agent)`: OR de roles — RESUELTO](#349-requiresroleadmin--roleagent-or-de-roles--resuelto)
   - [3.50 `--session-ttl`: expiración real de sesión — RESUELTO](#350---session-ttl-expiración-real-de-sesión--resuelto)
+  - [3.51 `auth.currentRole()`: leer el rol del caller dentro de un cuerpo — RESUELTO](#351-authcurrentrole-leer-el-rol-del-caller-dentro-de-un-cuerpo--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -841,7 +842,7 @@ rpc logout() -> Void { auth.destroySession() }
 
 **Cliente generado: `token` es estado MUTABLE de instancia, no un parámetro por-llamada.** `{Service}ClientImpl` gana `private token: string | null` + `setToken(token)`, parte de la interfaz pública (`{Service}Client`) para que algo tipado como tal también pueda llamarlo. `push_fetch_call` adjunta `Authorization: Bearer ${token}` en TODO rpc si hay token seteado (el servidor decide caso por caso si lo exige). Correcto para "una instancia de cliente = un usuario/sesión activa" (mismo patrón que la mayoría de SDKs generados reales) — pero una instancia COMPARTIDA entre requests concurrentes de usuarios DISTINTOS (ej. un backend-for-frontend Node reusando un cliente módulo-level) puede pisarse el token entre requests. Documentado como límite v0 explícito; la alternativa (token por-llamada) cambiaría la forma pública de TODOS los métodos generados, no solo los protegidos.
 
-**Fuera de alcance, a propósito:** verificación de contraseña/credenciales; exponer la identidad del caller dentro de un cuerpo (`ctx.user`/similar — solo el ROL viaja en la sesión, nunca una referencia al `User` completo); un CSPRNG auditado (ver el hallazgo de arriba). Dos límites de esta lista original **ya se resolvieron**: expiración de sesión ("vive hasta `destroySession()` o hasta reiniciar el proceso" — resuelto en §3.50, `--session-ttl`) y múltiples roles por `@requires` (resuelto en §3.49, `Role.Admin | Role.Agent`) — múltiples anotaciones DE AUTH por rpc (dos `@requires` distintos en el mismo rpc) sigue sin tener sentido y el checker lo sigue rechazando, eso no cambió.
+**Fuera de alcance, a propósito:** verificación de contraseña/credenciales; un CSPRNG auditado (ver el hallazgo de arriba). Tres límites de esta lista original **ya se resolvieron**: expiración de sesión ("vive hasta `destroySession()` o hasta reiniciar el proceso" — resuelto en §3.50, `--session-ttl`), múltiples roles por `@requires` (resuelto en §3.49, `Role.Admin | Role.Agent`), y leer el ROL del caller dentro de un cuerpo (resuelto en §3.51, `auth.currentRole()`) — múltiples anotaciones DE AUTH por rpc (dos `@requires` distintos en el mismo rpc) sigue sin tener sentido y el checker lo sigue rechazando, eso no cambió. **Sigue sin resolverse:** exponer la identidad COMPLETA del caller (`ctx.user`/similar, una referencia al `User` real, no solo su rol) — la sesión sigue guardando únicamente el TAG del rol (§3.51 lo expone, no lo amplía), nunca una referencia al struct completo.
 
 ---
 
@@ -2738,6 +2739,76 @@ token rechazado (401) tres segundos después, sin haber llamado
 confirman además que un store sin TTL configurado (`new()`, el default)
 nunca expira nada, y que un token vencido y uno inexistente dan
 exactamente la misma respuesta.
+
+### 3.51 `auth.currentRole()`: leer el rol del caller dentro de un cuerpo — RESUELTO
+
+Último límite real de esta misma serie: `@requires`/`@authenticated`
+(§3.14) eran una puerta de sí/no, pero el CUERPO de un rpc no tenía
+forma de saber qué rol autenticó la request. Con `@requires(Role.Admin |
+Role.Agent)` (§3.49) ya real, esto importaba de verdad: un endpoint
+compartido entre dos roles a menudo necesita comportarse DISTINTO según
+cuál de los dos es, no solo decidir "entra o no entra".
+
+```
+@requires(Role.Admin | Role.Agent)
+rpc sharedPanel() -> String {
+  if auth.currentRole() == "Admin" {
+    "panel de administrador"
+  } else {
+    "panel de agente"
+  }
+}
+```
+
+**Devuelve `String?`, no el enum real.** La alternativa -- que
+`currentRole()` devuelva un valor del enum REAL declarado en el
+`@requires` del propio rpc (`Role?` en vez de `String?`) -- se descartó:
+exigiría que el checker sepa, en cualquier punto arbitrariamente anidado
+de una expresión, con qué enum se autenticó ESTE rpc en particular, una
+pieza de contexto que hoy no viaja por `check_expr` (mismo motivo, ya
+razonado en §3.46, por el que `response.setStatus` tampoco intentó saber
+si estaba dentro de un `stream`). `String?` es más chico, no necesita
+ningún contexto nuevo, y sigue siendo suficiente para lo que el caso real
+pedía: ramificar lógica por rol, no reconstruir un valor tipado del enum
+completo.
+
+**Disponible SIEMPRE, no solo bajo `@requires`/`@authenticated`.** Mismo
+criterio que `request.rawBody()`/`request.header()` (§3.38): un rpc SIN
+ninguna anotación de auth puede llamar `auth.currentRole()` igual --
+`null` si no hay sesión válida, el nombre de la variante si la hay. Útil
+para un endpoint público que se comporta distinto si el caller resulta
+estar logueado, sin por eso EXIGIR que lo esté.
+
+**`null` para "sin sesión" y "token inválido" son indistinguibles, a
+propósito.** Mismo principio que ya regía para el 401 genérico (§3.14) y
+para expiración (§3.50, `role_for`): esto reusa exactamente
+`SessionStore::role_for`, así que hereda esa propiedad gratis, sin
+código nuevo -- un token vencido bajo `--session-ttl` también da `null`
+acá, consistente con que ya no cuenta como sesión válida en ningún otro
+lado.
+
+**Cero cambios al modelo de sesión.** No hay ningún parámetro nuevo en
+`auth.createSession(role)` ni un nuevo campo en `SessionStore` -- el rol
+ya viajaba en la sesión desde v0 (§3.14); lo único que faltaba era
+EXPONERLO al cuerpo del rpc. `current_token: Option<&str>` ya llegaba a
+`call_method` desde antes (lo usa `destroySession`), así que esto es
+aditivo puro sobre plumbing que ya existía.
+
+**Límite honesto, sigue sin resolverse:** solo el ROL, nunca la
+identidad completa del caller. `auth.currentRole()` no reemplaza un
+`ctx.user`/similar -- la sesión sigue sin guardar ninguna referencia al
+`User` real que inició sesión (§3.14 nunca lo guardó, ver el hallazgo de
+diseño original). Si un rpc necesita saber QUIÉN es el caller, no solo
+QUÉ rol tiene, sigue sin haber forma de resolverlo desde adentro del
+lenguaje.
+
+**Verificado** contra un servidor real (`compiler/tests/server_http.rs`):
+un `sharedPanel` con `@requires(Role.Admin | Role.Agent)` respondiendo
+CONTENIDO DISTINTO según cuál de los dos roles autenticó -- no solo
+permitido/denegado; `auth.currentRole()` funcionando en un rpc SIN
+ninguna anotación de auth; `null` tanto sin token como con un token que
+nunca existió. Más un test de compilación (`checker.rs`) para el tipo
+`String?` y el rechazo de argumentos.
 
 ---
 
