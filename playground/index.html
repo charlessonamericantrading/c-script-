@@ -167,15 +167,14 @@
 </head>
 <body>
   <div style="background:#3d2e00; color:#f0d58c; border-bottom:1px solid #7a5c00; padding:8px 16px; font-size:0.85rem; line-height:1.45;">
-    <strong>Esta página es una maqueta estática.</strong> No ejecuta <code>linkc</code>: ignora lo que
-    escribas y muestra siempre la misma salida de ejemplo, incluido el "0 errores" del panel de
-    diagnósticos. Sirve para ver la <em>forma</em> de lo que genera el compilador, no para probar código.
-    Para eso: <code>cargo build --release</code> en <code>compiler/</code> y después
-    <code>linkc build archivo.link gen</code>.
+    Compila de verdad en tu navegador (el mismo lexer/parser/checker/generadores de <code>linkc</code>,
+    compilados a WebAssembly) -- pero solo un archivo suelto: no resuelve <code>import</code> entre
+    varios archivos, y no ejecuta <code>test</code> (eso necesita el intérprete nativo). Para eso:
+    <code>cargo build --release</code> en <code>compiler/</code> y después <code>linkc test archivo.link</code>.
   </div>
   <header>
     <div class="brand">
-      <span>⚡</span> Link Playground <span style="font-size:0.8rem; font-weight:normal; background:rgba(210,153,34,0.18); color:#d29922; padding:2px 8px; border-radius:12px;" title="Esta página no ejecuta el compilador: muestra una salida enlatada.">MAQUETA — no compila de verdad</span>
+      <span>⚡</span> Link Playground <span id="wasm-status-badge" style="font-size:0.8rem; font-weight:normal; background:rgba(210,153,34,0.18); color:#d29922; padding:2px 8px; border-radius:12px;">cargando compilador…</span>
     </div>
     <div class="controls">
       <select id="example-select" onchange="loadExample(this.value)">
@@ -203,12 +202,12 @@
     <div class="output-pane">
       <div class="pane-header">
         <div class="tabs">
-          <button class="tab active" onclick="setTab('contract', this)">contract.d.ts</button>
-          <button class="tab" onclick="setTab('client', this)">client.ts</button>
-          <button class="tab" onclick="setTab('validators', this)">validators.ts</button>
-          <button class="tab" onclick="setTab('openapi', this)">openapi.json</button>
-          <button class="tab" onclick="setTab('postgres', this)">schema.postgres.sql</button>
-          <button class="tab" onclick="setTab('console', this)">Consola / Tests</button>
+          <button id="tab-contract" class="tab active" onclick="setTab('contract', this)">contract.d.ts</button>
+          <button id="tab-client" class="tab" onclick="setTab('client', this)">client.ts</button>
+          <button id="tab-validators" class="tab" onclick="setTab('validators', this)">validators.ts</button>
+          <button id="tab-openapi" class="tab" onclick="setTab('openapi', this)">openapi.json</button>
+          <button id="tab-postgres" class="tab" onclick="setTab('postgres', this)">schema.postgres.sql</button>
+          <button id="tab-console" class="tab" onclick="setTab('console', this)">Consola</button>
         </div>
       </div>
       <pre id="output-view" class="output-view"></pre>
@@ -237,13 +236,13 @@ db {
 service UserService {
   @requires(Role.Admin)
   rpc create(name: String, email: String) -> User {
-    let new_user = db.users.insert({
+    db.users.insert(User {
+      id: 0,
       name: name,
       email: email,
       role: Role.Member {},
       created_at: now(),
-    });
-    new_user
+    })
   }
 
   rpc list() -> User[] {
@@ -267,10 +266,10 @@ db {
 
 service ChatService {
   rpc send(sender: String, content: String) -> Message {
-    db.messages.insert({ sender: sender, content: content })
+    db.messages.insert(Message { id: 0, sender: sender, content: content })
   }
 
-  stream feed() -> Message[] {
+  stream feed() -> Message {
     db.messages.all()
   }
 }`,
@@ -309,84 +308,61 @@ test "calculo matematico" {
 
     function compile() {
       const src = document.getElementById('source-code').value;
-      
-      // Simulación de pipeline de compilación reactivo en el cliente
-      outputs.contract = `// Generado automáticamente por Link v1.0
-export interface User {
-  id: number;
-  name: string;
-  email: string;
-  role: "Admin" | "Member";
-  created_at: number;
-}
+      const statusEl = document.getElementById('diagnostics-status');
 
-export type Role = "Admin" | "Member";
-`;
-      outputs.client = `import type { User, Role } from "./contract";
-
-export function createClient(baseUrl: string) {
-  return {
-    userService: {
-      create: async (name: string, email: string): Promise<User> => {
-        const res = await fetch(\`\${baseUrl}/rpc/UserService.create\`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, email }),
-        });
-        return res.json();
-      },
-      list: async (): Promise<User[]> => {
-        const res = await fetch(\`\${baseUrl}/rpc/UserService.list\`);
-        return res.json();
+      if (!window.compileLinkWasm) {
+        statusEl.textContent = 'cargando compilador wasm…';
+        return;
       }
-    }
-  };
-}`;
-      outputs.validators = `export function validateUser(x: unknown): boolean {
-  if (typeof x !== 'object' || x === null) return false;
-  const o = x as Record<string, unknown>;
-  return typeof o.id === 'number' && typeof o.name === 'string' && typeof o.email === 'string';
-}`;
-      outputs.openapi = JSON.stringify({
-        openapi: "3.1.0",
-        info: { title: "Link API", version: "1.0.0" },
-        paths: {
-          "/rpc/UserService.create": {
-            post: { summary: "create", requestBody: { content: { "application/json": {} } } }
-          },
-          "/rpc/UserService.list": {
-            post: { summary: "list" }
-          }
-        }
-      }, null, 2);
-      outputs.postgres = `-- Schema PostgreSQL Enterprise generado por Link
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
-CREATE TABLE IF NOT EXISTS "users" (
-  "id" BIGSERIAL PRIMARY KEY,
-  "name" TEXT NOT NULL,
-  "email" TEXT NOT NULL,
-  "role" TEXT NOT NULL,
-  "created_at" BIGINT NOT NULL
-);`;
-      // Salida enlatada, idéntica para cualquier entrada: esto es una maqueta.
-      outputs.console = `[maqueta -- esta salida no viene de compilar tu código]
-⚡ Compilando con linkc v1.0.0...
-OK: tipo verificado limpiamente.
-Pruebas integradas ejecutadas: 1/1 pasaron exitosamente (0 fallos).
-Bytecode WebAssembly nativo: emitido (memoria lineal compartida).`;
+      let result;
+      try {
+        result = JSON.parse(window.compileLinkWasm(src));
+      } catch (e) {
+        statusEl.textContent = 'error interno del playground: ' + e;
+        return;
+      }
 
-      document.getElementById('output-view').textContent = outputs[currentTab];
-      document.getElementById('diagnostics-status').textContent = 'maqueta — no se analizó tu código';
+      if (result.ok) {
+        outputs.contract = result.contract;
+        outputs.client = result.client;
+        outputs.validators = result.validators;
+        outputs.openapi = result.openapi;
+        outputs.postgres = result.postgres;
+        outputs.console = 'OK: tipo verificado limpiamente (lexer, parser y checker de tipos reales de linkc, compilados a wasm).\n\n' +
+          'Ejecutar `test` necesita el intérprete nativo, que no corre en el navegador -- para eso: `linkc test archivo.link`.';
+        statusEl.textContent = '0 errores de sintaxis o tipo';
+        setTab(currentTab, document.getElementById('tab-' + currentTab));
+      } else {
+        outputs.contract = outputs.client = outputs.validators = outputs.openapi = outputs.postgres = '';
+        outputs.console = result.errors.join('\n\n');
+        statusEl.textContent = result.errors.length + (result.errors.length === 1 ? ' error' : ' errores');
+        currentTab = 'console';
+        setTab('console', document.getElementById('tab-console'));
+      }
     }
 
     function compileAndRun() {
-      setTab('console');
+      setTab('console', document.getElementById('tab-console'));
       compile();
     }
 
     // Inicializar
     loadExample('crud');
+    window.addEventListener('link-wasm-ready', compile);
+  </script>
+  <script type="module">
+    import init, { compile_link } from './pkg/playground_wasm.js';
+    init()
+      .then(() => {
+        window.compileLinkWasm = compile_link;
+        document.getElementById('wasm-status-badge').remove();
+        window.dispatchEvent(new Event('link-wasm-ready'));
+      })
+      .catch(err => {
+        document.getElementById('wasm-status-badge').textContent = 'no se pudo cargar el compilador wasm';
+        document.getElementById('diagnostics-status').textContent = 'error cargando wasm: ' + err;
+      });
   </script>
 </body>
 </html>

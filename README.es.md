@@ -65,7 +65,7 @@ gana esta. Verificado el 21/08/2026 corriendo el compilador, no leyéndolo.
 | El push de `stream` entre instancias (LISTEN/NOTIFY) tiene límites reales | Una fila cambiada de más de 8000 bytes (el límite de payload de NOTIFY que impone el propio Postgres) no se propaga a otras instancias -- sigue publicándose local donde se escribió. NOTIFY es best-effort, sin cola de reintento; un servidor inactivo puede tardar hasta 200ms en notar un cambio remoto; cada instancia abre una conexión extra a Postgres solo para LISTEN; SQLite no participa en absoluto. |
 | Sin paquete npm | `link-lang` todavía no está en el registro de npm. Los releases de GitHub sí funcionan — ver Instalación más abajo. |
 | `linkc wasm` | Congelado a propósito en funciones escalares de enteros/booleanos; el camino de producción es `wasm32-wasip1`. |
-| El playground web | Es una maqueta estática: no ejecuta el compilador. |
+| El playground web compila un solo archivo | Corre el lexer/parser/checker/generadores reales (compilados a `wasm32-unknown-unknown`), pero sin pasar por el cargador de módulos: sin `import` entre archivos, y sin ejecutar `test` (eso necesita el intérprete nativo). |
 
 ## ⚡ Inicio Rápido (10 Segundos)
 
@@ -222,10 +222,26 @@ Link incluye de forma nativa todas las herramientas que necesitas:
 
 ## 🌐 Playground Web Interactivo
 
-> **Es una maqueta estática, no un playground que funcione.** [`playground/index.html`](playground/index.html)
-> muestra la forma que tiene la salida generada para un ejemplo enlatado; no ejecuta el
-> compilador y no lee lo que escribís. Para probar el lenguaje de verdad, compilá `linkc`
-> desde el código y corré `linkc build` sobre un archivo `.link`.
+[`playground/index.html`](playground/index.html) corre el lexer, parser, checker de tipos y
+generadores REALES de `linkc` en tu navegador -- compilados a `wasm32-unknown-unknown` vía el
+crate [`playground-wasm`](compiler/playground-wasm), no una demo enlatada. Compila un solo
+archivo (sin `import` entre archivos) y no ejecuta `test` (eso necesita el intérprete nativo --
+para eso, `linkc test` local). Para probarlo:
+
+```bash
+cd playground && python3 -m http.server 8000   # cualquier servidor estático sirve
+# abrí http://localhost:8000/ -- abrir index.html directo por file:// NO funciona,
+# los navegadores bloquean fetch() de archivos locales, y el módulo wasm carga vía fetch()
+```
+
+Para regenerar `playground/pkg/` después de tocar el compilador:
+
+```bash
+cd compiler/playground-wasm
+cargo build --target wasm32-unknown-unknown --release
+wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_wasm \
+  target/wasm32-unknown-unknown/release/playground_wasm.wasm
+```
 
 ---
 

@@ -461,7 +461,7 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
         }
     }
 
-    if let Ok(pg_ddl) = linkc::runtime::postgres::generate_postgres_ddl(&program) {
+    if let Ok(pg_ddl) = linkc::codegen::postgres_emit::generate_postgres_ddl(&program) {
         let pg_sql_path = format!("{outdir}/schema.postgres.sql");
         let _ = fs::write(&pg_sql_path, pg_ddl);
     }

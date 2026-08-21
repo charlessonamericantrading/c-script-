@@ -65,7 +65,7 @@ this section wins. Verified on 2026-08-21 by running the compiler, not by readin
 | Cross-instance `stream` push (LISTEN/NOTIFY) has real limits | A changed row over 8000 bytes (Postgres's own NOTIFY payload cap) doesn't propagate to other instances — it still publishes locally where it was written. NOTIFY is best-effort with no retry queue; an idle server can take up to 200ms to notice a remote change; each instance opens one extra Postgres connection just for LISTEN; SQLite doesn't participate at all. |
 | No npm package | `link-lang` is not on the npm registry yet. GitHub releases work — see Installation below. |
 | `linkc wasm` | Deliberately frozen at integer/boolean scalar functions; the production path is `wasm32-wasip1`. |
-| The web playground | A static mockup: it does not run the compiler. |
+| The web playground compiles one file only | Runs the real lexer/parser/checker/codegen (compiled to `wasm32-unknown-unknown`), but bypasses the module loader: no `import` across files, and no `test` execution (that needs the native interpreter). |
 
 ## ⚡ Quick Start (10 Seconds)
 
@@ -225,10 +225,26 @@ Link comes out-of-the-box with all the developer tooling you need:
 
 ## 🌐 Interactive Web Playground
 
-> **This is a static mockup, not a working playground.** [`playground/index.html`](playground/index.html)
-> shows the shape of the generated output for a canned example; it does not run the
-> compiler and it does not read what you type. To actually try the language, build
-> `linkc` from source and run `linkc build` on a `.link` file.
+[`playground/index.html`](playground/index.html) runs the real `linkc` lexer, parser, type
+checker and code generators in your browser — compiled to `wasm32-unknown-unknown` via the
+[`playground-wasm`](compiler/playground-wasm) crate, not a canned demo. It compiles a single
+file (no cross-file `import`) and does not execute `test` (that needs the native interpreter —
+run `linkc test` locally for that). To try it locally:
+
+```bash
+cd playground && python3 -m http.server 8000   # any static file server works
+# open http://localhost:8000/ -- opening index.html directly via file:// will NOT work,
+# browsers block fetch() of local files, and the wasm module loads via fetch()
+```
+
+To rebuild `playground/pkg/` after changing the compiler:
+
+```bash
+cd compiler/playground-wasm
+cargo build --target wasm32-unknown-unknown --release
+wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_wasm \
+  target/wasm32-unknown-unknown/release/playground_wasm.wasm
+```
 
 ---
 

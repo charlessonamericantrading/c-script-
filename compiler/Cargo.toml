@@ -16,20 +16,40 @@ path = "src/main.rs"
 name = "wasm_demo"
 path = "src/bin/wasm_demo.rs"
 
+[features]
+default = ["runtime"]
+# Todas las dependencias nativas del intérprete/servidor (sockets, SQLite en C,
+# TLS, RNG del sistema) viven detrás de este feature. Apagarlo (--no-default-features)
+# deja compilar lexer/parser/checker/codegen a wasm32-unknown-unknown.
+runtime = [
+    "dep:tiny_http",
+    "dep:rusqlite",
+    "dep:ureq",
+    "dep:base64",
+    "dep:argon2",
+    "dep:getrandom",
+    "dep:subtle",
+    "dep:postgres",
+    "dep:hmac",
+    "dep:rustls",
+    "dep:tokio-postgres-rustls",
+    "dep:lettre",
+]
+
 [dependencies]
-tiny_http = "0.12"
+tiny_http = { version = "0.12", optional = true }
 serde_json = "1"
 serde = { version = "1.0", features = ["derive"] }
 wasm-encoder = "0.200"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 sha2 = "0.10"
-ureq = { version = "2.9", default-features = false }
-base64 = "0.22"
-argon2 = "0.5"
-getrandom = "0.2"
-subtle = "2"
-postgres = { version = "0.19", features = ["with-serde_json-1"] }
-hmac = "0.12"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring", "webpki-roots"] }
-lettre = { version = "0.11.23", default-features = false, features = ["builder", "hostname", "smtp-transport", "rustls-tls"] }
+ureq = { version = "2.9", default-features = false, optional = true }
+base64 = { version = "0.22", optional = true }
+argon2 = { version = "0.5", optional = true }
+getrandom = { version = "0.2", optional = true }
+subtle = { version = "2", optional = true }
+postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }
+hmac = { version = "0.12", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring", "webpki-roots"], optional = true }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "hostname", "smtp-transport", "rustls-tls"], optional = true }

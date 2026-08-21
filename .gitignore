@@ -1,4 +1,5 @@
 /compiler/target/
+/compiler/playground-wasm/target/
 /frontend/node_modules/
 /editors/vscode/node_modules/
 /editors/vscode/out/

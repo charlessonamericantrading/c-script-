@@ -20,6 +20,12 @@ pub mod lsp;
 pub mod parser;
 pub mod rate_limit;
 pub mod route;
+// Detrás de un feature (default-on, así que `cargo build` normal no cambia)
+// porque es el único módulo con dependencias nativas (rusqlite/postgres/
+// tiny_http/argon2/lettre) -- excluirlo es lo que permite compilar
+// lexer/parser/checker/codegen solos a `wasm32-unknown-unknown` para el
+// playground web, sin tocar el binario `linkc` normal.
+#[cfg(feature = "runtime")]
 pub mod runtime;
 pub mod scaffold;
 pub mod token;

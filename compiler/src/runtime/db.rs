@@ -548,7 +548,7 @@ impl Db {
             // realmente tiene podrían divergir -- que es la clase de bug que
             // este repo ya encontró varias veces (GRAMMAR.md §3.9).
             backend
-                .execute_ddl(&super::postgres::create_postgres_table_sql(name, &non_id, &simple_enums))
+                .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(name, &non_id, &simple_enums))
                 .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
 
             // `CREATE TABLE IF NOT EXISTS` es un no-op sobre una tabla que ya
@@ -574,7 +574,7 @@ impl Db {
             // están. Es un límite real y está documentado.
             for field in &non_id {
                 backend
-                    .execute_ddl(&super::postgres::alter_table_add_column_postgres(name, field, &simple_enums))
+                    .execute_ddl(&crate::codegen::postgres_emit::alter_table_add_column_postgres(name, field, &simple_enums))
                     .map_err(|e| format!("no se pudo migrar la tabla '{name}': {e}"))?;
             }
             columns.insert(name.clone(), cols);
