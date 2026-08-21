@@ -70,6 +70,7 @@
   - [3.46 `response.setStatus(code)`: página 404 propia para un `@route` — RESUELTO](#346-responsesetstatuscode-página-404-propia-para-un-route--resuelto)
   - [3.47 `http.getWithHeaders`/`http.postWithHeaders`: headers en llamadas salientes — RESUELTO](#347-httpgetwithheadershttppostwithheaders-headers-en-llamadas-salientes--resuelto)
   - [3.48 `db.<coleccion>.page(limit, offset)`: paginación real, empujada a SQL — RESUELTO](#348-dbcoleccionpagelimit-offset-paginación-real-empujada-a-sql--resuelto)
+  - [3.49 `@requires(Role.Admin | Role.Agent)`: OR de roles — RESUELTO](#349-requiresroleadmin--roleagent-or-de-roles--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -803,7 +804,7 @@ service Users {
 }
 ```
 
-`@authenticated` exige una sesión válida, cualquier rol. `@requires(Enum.Variante)` exige además que el rol de esa sesión sea exactamente esa variante. **A lo sumo una anotación DE AUTH por rpc/stream** (`@requires` ya implica autenticado; el checker rechaza dos) y **un solo rol por `@requires`** (sin OR de roles) — límites deliberados de v0, no descuidos. Desde §3.35 la lista sí admite varias anotaciones (`RpcDecl.annotations: Vec<Annotation>`), porque `@content_type` es una dimensión distinta de la auth: una página de panel de administración es HTML *y* está protegida.
+`@authenticated` exige una sesión válida, cualquier rol. `@requires(Enum.Variante)` exige además que el rol de esa sesión sea exactamente esa variante. **A lo sumo una anotación DE AUTH por rpc/stream** (`@requires` ya implica autenticado; el checker rechaza dos) — límite deliberado de v0, sigue vigente. **"Un solo rol por `@requires`" era otro límite de v0 -- resuelto en §3.49**: `@requires(Role.Admin | Role.Agent)` acepta cualquiera de varios roles, todos del mismo enum. Desde §3.35 la lista sí admite varias anotaciones (`RpcDecl.annotations: Vec<Annotation>`), porque `@content_type` es una dimensión distinta de la auth: una página de panel de administración es HTML *y* está protegida.
 
 **`@requires(Role.Admin)` reusa el mecanismo de `Enum.Variante` que YA existía para nombrar una variante en un patrón de `match`** (`parse_pattern_atom`, `ident "." ident`, SIN llaves) — no se inventó una tercera sintaxis. Esto es a propósito ASIMÉTRICO con `Role.Admin {}` (que sí hace falta para *construir* un valor real, ej. al llamar `auth.createSession(Role.Admin {})`): una anotación nombra un TAG a comparar, una expresión construye un VALOR — dos reglas correctas por separado, pero que un usuario puede confundir la primera vez que las ve una al lado de la otra.
 
@@ -2623,6 +2624,56 @@ error), y limit/offset negativos rechazados -- `compiler/tests/
 pg_integration.rs` repite exactamente el mismo caso contra un PostgreSQL
 real en CI, confirmando que el mismo programa se comporta igual en los
 dos backends.
+
+### 3.49 `@requires(Role.Admin | Role.Agent)`: OR de roles — RESUELTO
+
+Límite de v0 (§3.14): `@requires` solo podía nombrar UN rol. Un endpoint
+que dos roles distintos necesitan ver (un dashboard que comparten Admin y
+Agent, por ejemplo) no tenía forma de expresarse sin duplicar el rpc
+entero, uno por rol, o aflojar a `@authenticated` (cualquier rol, sin
+restricción real).
+
+```
+@requires(Role.Admin | Role.Agent)
+rpc sharedPanel() -> String { "panel compartido" }
+```
+
+**Reusa el `|` que ya existía para uniones de tipo, sin gramática
+nueva.** `A | B` como TIPO (§2.2) y `Role.Admin | Role.Agent` como lista
+de alternativas dentro de `@requires` son dos contextos distintos, pero
+el mismo token con un significado análogo ("cualquiera de estos") --
+más fácil de aprender que inventar un separador propio para esto.
+
+**Todas las alternativas tienen que venir del MISMO enum -- rechazado en
+el PARSER, no en el checker.** `@requires(Role.Admin | Status.Active)` no
+tiene significado: una sesión tiene el rol de UN enum a la vez
+(`auth.createSession(role)` toma un solo valor), así que "el rol es
+`Role.Admin` O `Status.Active`" no es una pregunta que tenga sentido
+hacerle a una sesión real. Se rechaza en el parser porque es puramente
+sintáctico -- comparar el identificador antes de cada `.` contra el
+primero no necesita tabla de símbolos, y el error sale en el token exacto
+que no matchea, antes de que el checker llegue a mirar nada semántico.
+
+**Cada alternativa se sigue validando contra el enum declarado**, igual
+que la v0 de un solo rol (§3.14) -- `@requires(Role.Admin | Role.Typo)`
+es un error de COMPILACIÓN, nunca un 403 imposible de satisfacer
+descubierto en producción.
+
+**Runtime: sin cambios de forma, un `.any()` más.** `check_auth_gate`
+(`runtime/server.rs`) seguía comparando el rol de la sesión contra UNA
+tupla `(enum, variante)`; ahora compara contra una lista de variantes del
+mismo enum -- el mensaje de error (403 genérico, sin nombrar qué rol
+hacía falta) no cambió: seguir sin filtrar qué roles protegen un
+endpoint importa igual de acá que de v0 (hallazgo del review adversarial
+original, GRAMMAR.md §3.14).
+
+**Verificado** contra un servidor real (`compiler/tests/server_http.rs`):
+dos logins reales con roles DISTINTOS, ambos aceptados por el mismo
+`@requires` compartido; un tercer rol rechazado (403); sin token,
+rechazado antes de siquiera mirar el rol (401); y un `@requires` de un
+solo rol en el MISMO programa sin ningún cambio de comportamiento. Más
+tests de compilación (`checker.rs`) para el OR válido, la variante
+desconocida, y el rechazo en el parser de mezclar dos enums.
 
 ---
 

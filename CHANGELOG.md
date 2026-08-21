@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.13.0] - 2026-08-21
+
+### ✨ Nuevo
+- **`@requires(Role.Admin | Role.Agent)`: OR de roles.** Último gap real de la misma serie de chequeos externos -- "un solo rol por `@requires`" (v0, §3.14) hacía que un endpoint compartido entre dos roles (un dashboard que ven tanto Admin como Agent) no tuviera forma de expresarse sin duplicar el rpc completo. Reusa el `|` que ya existía para uniones de tipo (`A | B`), sin gramática nueva -- mismo token, significado análogo ("cualquiera de estos"). Todas las alternativas tienen que venir del MISMO enum -- una sesión tiene el rol de un solo enum a la vez, así que mezclar dos (`Role.Admin | Status.Active`) no tiene significado; se rechaza en el PARSER (puramente sintáctico, no hace falta tabla de símbolos) con el error apuntando exactamente al identificador que no matchea. Cada alternativa se sigue validando contra el enum declarado, igual que la v0 de un solo rol -- una variante inexistente sigue siendo un error de COMPILACIÓN, nunca un 403 imposible de satisfacer. Runtime: mismo mecanismo de siempre, un `.any()` más sobre la lista de variantes en vez de comparar contra una sola. Verificado contra un servidor real: dos logins con roles DISTINTOS, ambos aceptados por el mismo `@requires` compartido; un tercer rol rechazado; un `@requires` de un solo rol en el mismo programa sin ningún cambio de comportamiento. 551 tests (4 nuevos). Detalle completo: GRAMMAR.md §3.49.
+
 ## [1.12.0] - 2026-08-21
 
 ### ✨ Nuevo

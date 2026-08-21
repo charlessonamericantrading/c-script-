@@ -3265,7 +3265,7 @@ mod tests {
         assert_eq!(required_auth(&program, "S", "me"), Some(&Annotation::Authenticated));
         assert_eq!(
             required_auth(&program, "S", "deleteThing"),
-            Some(&Annotation::Requires { enum_name: "Role".to_string(), variant_name: "Admin".to_string() })
+            Some(&Annotation::Requires { enum_name: "Role".to_string(), variant_names: vec!["Admin".to_string()] })
         );
         assert_eq!(required_auth(&program, "S", "list"), None);
         assert_eq!(required_auth(&program, "S", "noExiste"), None);

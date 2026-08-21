@@ -316,8 +316,9 @@ fn render_service(s: &ServiceDecl) -> String {
             Member::Rpc(r) => {
                 let rpc_name = &r.name;
                 let auth_badge = match r.auth() {
-                    Some(Annotation::Requires { enum_name, variant_name }) => {
-                        format!(r#"<span class="badge auth-badge">🔒 @requires({enum_name}.{variant_name})</span>"#)
+                    Some(Annotation::Requires { enum_name, variant_names }) => {
+                        let roles = variant_names.iter().map(|v| format!("{enum_name}.{v}")).collect::<Vec<_>>().join(" | ");
+                        format!(r#"<span class="badge auth-badge">🔒 @requires({roles})</span>"#)
                     }
                     Some(Annotation::Authenticated) => {
                         r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string()

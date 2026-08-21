@@ -419,9 +419,30 @@ impl Parser {
                     self.eat(&TokenKind::LParen)?;
                     let enum_name = self.eat_ident()?;
                     self.eat(&TokenKind::Dot)?;
-                    let variant_name = self.eat_ident()?;
+                    let mut variant_names = vec![self.eat_ident()?];
+                    // `@requires(Role.Admin | Role.Agent)` (GRAMMAR.md
+                    // §3.49): reusa el `|` que ya existe para uniones de
+                    // tipo (`A | B`) -- mismo token, significado análogo
+                    // ("cualquiera de estos"), sin gramática nueva. Los
+                    // sucesivos `Enum.Variante` tienen que nombrar el MISMO
+                    // enum que el primero -- se valida ACÁ, no en el
+                    // checker, porque es puramente sintáctico (comparar
+                    // identificadores, no hace falta tabla de símbolos) y
+                    // el error sale antes, en el lugar exacto del token que
+                    // no matchea.
+                    while self.check(&TokenKind::Pipe) {
+                        self.advance();
+                        let next_enum = self.eat_ident()?;
+                        if next_enum != enum_name {
+                            return Err(self.error(format!(
+                                "'@requires' mezcla dos enums distintos ('{enum_name}' y '{next_enum}') -- una sesión tiene el rol de UN solo enum, así que todas las alternativas de un mismo '@requires' tienen que venir del mismo enum"
+                            )));
+                        }
+                        self.eat(&TokenKind::Dot)?;
+                        variant_names.push(self.eat_ident()?);
+                    }
                     self.eat(&TokenKind::RParen)?;
-                    Annotation::Requires { enum_name, variant_name }
+                    Annotation::Requires { enum_name, variant_names }
                 }
                 "content_type" => {
                     self.eat(&TokenKind::LParen)?;

@@ -598,8 +598,8 @@ fn check_auth_gate(
     };
     match annotation {
         Annotation::Authenticated => Ok(()),
-        Annotation::Requires { enum_name, variant_name }
-            if &role_enum == enum_name && &role_variant == variant_name =>
+        Annotation::Requires { enum_name, variant_names }
+            if &role_enum == enum_name && variant_names.iter().any(|v| v == &role_variant) =>
         {
             Ok(())
         }

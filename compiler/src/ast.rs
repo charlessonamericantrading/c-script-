@@ -209,9 +209,11 @@ impl PartialEq for RpcDecl {
 
 impl RpcDecl {
     /// La anotación de auth, si hay (GRAMMAR.md §3.14). Sigue siendo a lo sumo
-    /// UNA: `@requires` ya implica autenticado, y no hay forma de pedir
-    /// "cualquiera de estos N roles" -- lo que el checker permite combinar es
-    /// auth con `@content_type`, que es una dimensión distinta (§3.35).
+    /// UNA anotación de auth por rpc -- pero desde §3.49, `@requires` en sí
+    /// puede nombrar varios roles con `|` (`Role.Admin | Role.Agent`), así
+    /// que "un solo rol por endpoint" ya no es una restricción real. Lo que
+    /// el checker permite combinar es auth con `@content_type`, que es una
+    /// dimensión distinta (§3.35).
     pub fn auth(&self) -> Option<&Annotation> {
         self.annotations
             .iter()
@@ -256,7 +258,13 @@ impl RpcDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Annotation {
     Authenticated,
-    Requires { enum_name: String, variant_name: String },
+    /// `@requires(Role.Admin)` o, desde §3.49, `@requires(Role.Admin |
+    /// Role.Agent)` -- `variant_names` tiene siempre al menos 1 elemento
+    /// (el parser no acepta paréntesis vacíos), y todos vienen del MISMO
+    /// `enum_name` (el parser ya lo exige -- mezclar dos enums distintos en
+    /// un solo `@requires` no tendría significado: una sesión tiene un rol
+    /// de UN enum, nunca de dos a la vez).
+    Requires { enum_name: String, variant_names: Vec<String> },
     /// `@content_type("text/html; charset=utf-8")` -- ver GRAMMAR.md §3.35.
     ContentType(String),
     /// `@route("/blog/:slug")` -- URL alternativa, amigable para crawlers,

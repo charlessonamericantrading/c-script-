@@ -1444,20 +1444,22 @@ impl Checker {
         self.check_annotation_combination(r, is_stream)?;
         self.check_route_annotation(r, is_stream)?;
         self.check_rate_limit_annotation(r)?;
-        let Some(Annotation::Requires { enum_name, variant_name }) = r.auth() else {
+        let Some(Annotation::Requires { enum_name, variant_names }) = r.auth() else {
             return Ok(());
         };
         let decl = self.enums.get(enum_name).ok_or_else(|| {
             err(format!(
-                "@requires({enum_name}.{variant_name}) en '{}': '{enum_name}' no es un enum declarado",
+                "@requires({enum_name}...) en '{}': '{enum_name}' no es un enum declarado",
                 r.name
             ))
         })?;
-        if !decl.variants.iter().any(|v| &v.name == variant_name) {
-            return Err(err(format!(
-                "@requires({enum_name}.{variant_name}) en '{}': '{enum_name}' no tiene una variante '{variant_name}'",
-                r.name
-            )));
+        for variant_name in variant_names {
+            if !decl.variants.iter().any(|v| &v.name == variant_name) {
+                return Err(err(format!(
+                    "@requires({enum_name}.{variant_name}) en '{}': '{enum_name}' no tiene una variante '{variant_name}'",
+                    r.name
+                )));
+            }
         }
         Ok(())
     }
@@ -3244,6 +3246,58 @@ type T = { id: Int, r: Res }")
         check_source("type Lead = { id: Int, type: String, service: String }
 db { leads: Lead[] }")
             .expect("un struct normal puede tener un campo 'type'");
+    }
+
+    /// `@requires(Role.Admin | Role.Agent)` (GRAMMAR.md §3.49): dos roles
+    /// declarados, ambos existentes en el enum -- tiene que tipar limpio.
+    #[test]
+    fn requires_with_or_of_roles_typechecks() {
+        check_source(
+            "enum Role { Admin, Agent, Member }
+service S {
+  @requires(Role.Admin | Role.Agent)
+  rpc panel() -> Int { 1 }
+}",
+        )
+        .expect("un OR de roles del mismo enum debe tipar");
+    }
+
+    /// Cada alternativa del OR se valida contra el enum -- una que no
+    /// existe es un error de tipos, no algo que se descubra en runtime
+    /// como un 403 imposible de satisfacer.
+    #[test]
+    fn requires_with_or_of_roles_rejects_an_unknown_variant() {
+        let errs = check_source(
+            "enum Role { Admin, Agent }
+service S {
+  @requires(Role.Admin | Role.Nonexistent)
+  rpc panel() -> Int { 1 }
+}",
+        )
+        .expect_err("una variante inexistente en el OR debe rechazarse");
+        assert!(
+            errs.iter().any(|e| e.message.contains("Nonexistent") && e.message.contains("no tiene una variante")),
+            "mensaje inesperado: {errs:?}"
+        );
+    }
+
+    /// Mezclar dos enums en un mismo `@requires` no tiene significado (una
+    /// sesión tiene el rol de UN enum) -- se rechaza en el PARSER, no acá,
+    /// porque es puramente sintáctico (comparar identificadores).
+    #[test]
+    fn requires_with_or_across_two_different_enums_is_a_parse_error() {
+        let src = "enum Role { Admin }
+enum Status { Active }
+service S {
+  @requires(Role.Admin | Status.Active)
+  rpc panel() -> Int { 1 }
+}";
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("mezclar enums en un OR debe rechazarse en el parser");
+        assert!(
+            err.iter().any(|e| e.message.contains("mezcla dos enums distintos")),
+            "mensaje inesperado: {err:?}"
+        );
     }
 
     /// Una variante SIN datos no lleva payload, asi que su nombre nunca choca.

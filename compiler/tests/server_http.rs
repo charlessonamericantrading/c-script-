@@ -78,7 +78,23 @@ impl ServeProcess {
         let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/users.link");
         let link_path = dir.join("users.link");
         std::fs::copy(&src, &link_path).expect("copiar examples/users.link al directorio temporal");
+        Self::start_at_path(link_path)
+    }
 
+    /// Como `start_with_flagship_example`, pero con un programa propio en
+    /// vez de `examples/users.link` -- para casos (ej. OR de roles en
+    /// `@requires`, GRAMMAR.md §3.49) que necesitan un `enum`/`service`
+    /// específico del test, no el del demo insignia.
+    fn start_with_program(dir_suffix: &str, source: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("cscript-server-http-integration-{dir_suffix}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("crear directorio temporal");
+        let link_path = dir.join("app.link");
+        std::fs::write(&link_path, source).expect("escribir el programa del test");
+        Self::start_at_path(link_path)
+    }
+
+    fn start_at_path(link_path: PathBuf) -> Self {
         let port = free_port();
         let child = Command::new(env!("CARGO_BIN_EXE_linkc"))
             .arg("serve")
@@ -208,6 +224,62 @@ fn admin_gated_rpcs_reject_without_a_token_and_succeed_with_a_real_login_token_o
     let (status, removed) = server.post("/Users/remove", &json!({"id": 999}), Some(&token));
     assert_eq!(status, 200, "remove con un token de Admin real debe aceptar: {removed:?}");
     assert_eq!(removed, json!(false), "999 no existe -- remove debe devolver false, no fallar");
+
+    server.shutdown();
+}
+
+const OR_ROLES_PROGRAM: &str = r#"
+enum Role { Admin, Agent, Member }
+
+service Auth {
+  rpc loginAs(role: Role) -> String {
+    auth.createSession(role)
+  }
+}
+
+service Dashboard {
+  @requires(Role.Admin | Role.Agent)
+  rpc sharedPanel() -> String { "panel compartido" }
+
+  @requires(Role.Admin)
+  rpc adminOnly() -> String { "solo admin" }
+}
+"#;
+
+#[test]
+fn requires_with_or_of_roles_accepts_any_named_role_and_rejects_the_rest() {
+    // GRAMMAR.md §3.49: `@requires(Role.Admin | Role.Agent)` -- antes de
+    // esta ronda, un endpoint compartido entre dos roles (ej. un dashboard
+    // que ven tanto Admin como Agent) no tenía forma de expresarse sin
+    // duplicar el rpc entero para cada rol. Contra el servidor real, no
+    // solo el checker: dos logins reales con roles distintos, ambos
+    // aceptados por el mismo `@requires`, un tercer rol rechazado, y el
+    // `@requires` de un solo rol (`adminOnly`) sin cambios de
+    // comportamiento -- Agent sigue sin poder entrar ahí.
+    let server = ServeProcess::start_with_program("or-roles", OR_ROLES_PROGRAM);
+
+    let (_, admin_token) = server.post("/Auth/loginAs", &json!({"role": "Admin"}), None);
+    let admin_token = admin_token.as_str().unwrap().to_string();
+    let (_, agent_token) = server.post("/Auth/loginAs", &json!({"role": "Agent"}), None);
+    let agent_token = agent_token.as_str().unwrap().to_string();
+    let (_, member_token) = server.post("/Auth/loginAs", &json!({"role": "Member"}), None);
+    let member_token = member_token.as_str().unwrap().to_string();
+
+    let (status, body) = server.post("/Dashboard/sharedPanel", &json!({}), Some(&admin_token));
+    assert_eq!(status, 200, "Admin es una de las alternativas: {body:?}");
+    let (status, body) = server.post("/Dashboard/sharedPanel", &json!({}), Some(&agent_token));
+    assert_eq!(status, 200, "Agent es la OTRA alternativa: {body:?}");
+    let (status, body) = server.post("/Dashboard/sharedPanel", &json!({}), Some(&member_token));
+    assert_eq!(status, 403, "Member no está en ninguna alternativa: {body:?}");
+    let (status, body) = server.post("/Dashboard/sharedPanel", &json!({}), None);
+    assert_eq!(status, 401, "sin token, ni siquiera llega a evaluar el rol: {body:?}");
+
+    // `@requires(Role.Admin)` de un solo rol sigue funcionando exactamente
+    // igual que siempre -- esta ronda no le cambió nada a ese caso.
+    let (status, body) = server.post("/Dashboard/adminOnly", &json!({}), Some(&agent_token));
+    assert_eq!(status, 403, "adminOnly no incluye Agent, sin OR de por medio: {body:?}");
+    let (status, body) = server.post("/Dashboard/adminOnly", &json!({}), Some(&admin_token));
+    assert_eq!(status, 200, "body: {body:?}");
 
     server.shutdown();
 }
