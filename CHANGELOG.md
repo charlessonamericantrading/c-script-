@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.17.0] - 2026-08-22
+
+### ✨ Nuevo
+- **`auth.createSessionWithId(role, userId)` y `auth.currentUserId()`: asociar e inspeccionar el id del usuario en la sesión.** Cierra el gap de identidad de usuario que quedaba pendiente tras `auth.currentRole()` (v1.15.0) -- "la sesión solo guardaba el rol, impidiendo saber qué usuario específico autenticó la llamada sin pasar el id a mano como parámetro". `auth.createSessionWithId(role, userId)` permite emitir un token asociando tanto el rol como un `userId: Int` de forma segura en memoria. `auth.currentUserId()` devuelve `Int?` con el identificador del usuario autenticado en la petición actual. Mismo principio de indistinguibilidad: devuelve `null` si no hay sesión activa, si el token expiró bajo `--session-ttl` o si la sesión se creó sin id (`auth.createSession(role)`). Verificado contra un servidor HTTP real, tests de tipos en `checker.rs` y tests unitarios en `session.rs`. 573 tests (5 nuevos). Detalle completo: GRAMMAR.md §3.53.
+
 ## [1.16.0] - 2026-08-21
 
 ### ✨ Nuevo

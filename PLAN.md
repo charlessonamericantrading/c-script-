@@ -266,76 +266,84 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 **`hot reload` de esta misma fila: RESUELTO, v0.** `linkc dev <archivo> <outdir> [puerto]` (GRAMMAR.md §3.27) -- con el puerto opcional, cada rebuild exitoso reinicia un `linkc serve` hijo real con el programa actualizado (restart de proceso, no un hot-swap en memoria -- decisión deliberada para no tocar el modelo de threading de `runtime/server.rs`, ver §3.13). Un rebuild fallido nunca tira abajo el servidor. Con esto, los OCHO ítems de esta fila de Fase 2 (DB tipada, auth, WebSocket/SSE -- vía SSE real, no WebSocket, ver §3.13/§3.16 -- validadores runtime, hot reload, LSP completo, package manager, observabilidad) tienen al menos una v0 real y verificada -- cada uno con sus propios límites honestos documentados en su sección de GRAMMAR.md correspondiente, no pendientes de "empezar" en el sentido en que lo estaban al escribir este roadmap originalmente.
 
-**`Testing` de §5 ("runner integrado + tests de contrato"): RESUELTO en su mitad de "tests de contrato", v0.** `linkc test <archivo> <snapshot> [--update]` (GRAMMAR.md §3.29) compara el mismo trío que emite `linkc build` contra un snapshot de texto commiteado a git, y falla (no sobreescribe solo) cuando difiere -- exactamente "que el `.d.ts` generado no rompa sin querer". Dogfooded sobre el propio demo insignia (`examples/users.link.snap`, verificado en CI en cada push/PR). La otra mitad de esa misma línea de §5, el "runner integrado" para escribir aserciones de COMPORTAMIENTO (`test { }` dentro de un `.link`, no solo la forma del contrato), es una feature de lenguaje nueva y separada -- queda fuera de esta ronda a propósito, mismo criterio ya aplicado en la decisión de no perseguir source maps sin un caso concreto (§3.28 de GRAMMAR.md).
+**`Testing` de §5 ("runner integrado + tests de contrato"): RESUELTO EN AMBAS MITADES, v1.0.0.**
+1. **Tests de contrato**: `linkc test <archivo> <snapshot> [--update]` (GRAMMAR.md §3.29) compara el contrato emitido contra un snapshot commiteado a git con diff LCS línea a línea. Dogfooded en CI en cada commit (`examples/users.link.snap`).
+2. **Runner integrado de comportamiento**: `test "nombre" { ... }` (GRAMMAR.md §3.33) con builtins `assert(cond, msg)` y `panic(msg)`, invocación directa de servicios `Service.rpc(...)`, y aislamiento automático de base de datos (`:memory:`) por test al ejecutar `linkc test <archivo.link>`.
+
+**`Fase 3 · 1.0 (Producción)`: RESUELTO y publicado en v1.0.0.**
+- Sistema de tipos bidireccional completo con inferencia, subtipado estructural para structs, nominal para enums, uniones `A | B`, genéricos monomorfizados y closures reales de primera clase.
+- Tipos `Timestamp` (ISO-8601 UTC) e `Int64` (mismo rango 64-bit sin pérdida de precisión en TS), más builtin `now() -> Timestamp` (GRAMMAR.md §3.30–§3.32).
+- Toolchain integral: `linkc build`, `serve`, `test`, `dev`, `lint`, `doc`, `docker`, `lsp`, `new`, `fmt`.
+
+**Evolución Post-1.0 (v1.1.0 a v1.17.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
+- **PostgreSQL en Runtime** (v1.1.0/v1.4.0/v1.8.0, GRAMMAR.md §3.36/§3.40/§3.44): Soporte de base de datos PostgreSQL real (`--db postgres://...`), auto-migraciones de esquema no destructivas, TLS oportunista y obligatorio vía `rustls` puro (compatible con Supabase/Neon/RDS), auto-reconexión transparente tras corte y LISTEN/NOTIFY en hilo dedicado para sincronizar `stream` SSE entre múltiples instancias.
+- **Criptografía y Seguridad** (v1.1.0/v1.3.0/v1.5.0, GRAMMAR.md §3.34/§3.38/§3.41): Argon2id (RFC 9106) con sal aleatoria en formato PHC y verificación en tiempo constante; tokens de sesión y UUIDs alimentados por el CSPRNG del sistema operativo (`getrandom`); cálculo de HMAC-SHA256 para verificación de webhooks; CORS con allowlist configurable (`--cors-origin`) y cabeceras de seguridad estrictas fijas (`nosniff`, `DENY`, `no-referrer`).
+- **Extensibilidad Web y SEO** (v1.1.0/v1.2.0/v1.6.0/v1.9.0/v1.10.0, GRAMMAR.md §3.35/§3.37/§3.42/§3.45/§3.46): Decorador `@content_type("...")` para respuestas no-JSON (HTML, XML, CSV); URLs amigables `@route("/...")` con múltiples parámetros dinámicos y precedencia determinística; sanitización explícita `String.escapeHtml()`; y selección de status HTTP en éxito `response.setStatus(code)` (e.g. páginas 404 personalizadas o 201 Created).
+- **Integraciones y Operaciones** (v1.3.0/v1.7.0/v1.11.0, GRAMMAR.md §3.38/§3.43/§3.47): Lectura de entorno `env.get()`, inspección de cuerpo crudo y cabeceras entrantes `request.rawBody()` / `request.header()`; límite de peticiones `@rate_limit("N/ventana")` con token bucket continuo; envío de correos vía relay `smtp.send(to, subject, body)` con TLS; y peticiones HTTP salientes con cabeceras `http.getWithHeaders` / `http.postWithHeaders`.
+- **Motor de Consultas y Autorización Avanzada** (v1.12.0 a v1.17.0, GRAMMAR.md §3.48–§3.53): Paginación empujada a SQL nativo `db.<c>.page(limit, offset)`; agregación analítica nativa con `GROUP BY` en base de datos (`sumBy`, `countBy`, `avgBy`, `maxBy`, `minBy`) preservando tipos reales; autorización con OR de roles `@requires(Role.Admin | Role.Agent)`; expiración temporal de sesiones `--session-ttl` (o `LINK_SESSION_TTL`); e introspección de sesión `auth.currentRole() -> String?`, emisión con identidad `auth.createSessionWithId(role, userId)` y lectura de identificador `auth.currentUserId() -> Int?`.
 
 **Hitos "go / no-go":**
-- Fin de Fase 0: ¿la demo E2E convence a 5 devs externos? Si no, replantear.
-- Fin de Fase 1: ¿alguien construye algo real sin abandonar? Si no, seguir como framework, no como lenguaje.
-
-**Estimación de esfuerzo total:**
-- MVP: ~0.5–1 persona-año.
-- Hasta 1.0 usable-pero-nicho: ~4–8 persona-año.
-- Competir de verdad con Go/Rust: **20+ persona-año** (y sobre todo, comunidad).
+- Fin de Fase 0: ✅ Demo E2E probada y verificada.
+- Fin de Fase 1: ✅ Herramientas CLI, LSP inicial y soporte WASI validados.
+- Fin de Fase 2: ✅ DB SQLite embebida, SSE reactivo, auth y generador de contratos validados.
+- Fin de Fase 3: ✅ Suite 1.0 lista con 573 pruebas automatizadas continuas.
 
 ---
 
 ## 5. Ecosistema y Herramientas
 
-- **Package manager** (`linkc add`): resolución de dependencias, lockfile. *Aprende de Cargo; no reinventes npm.*
-- **CLI**: `linkc new`, `linkc dev` (hot reload + regenera contrato), `linkc build`, `linkc deploy`, `linkc gen` (solo contrato).
-- **LSP**: autocompletado, diagnósticos, go-to-def. **Imprescindible desde Alpha** — sin buen editor, no hay adopción.
-- **Testing**: runner integrado + tests de contrato (que el `.d.ts` generado no rompa sin querer).
-- **Debugging / observabilidad**: source maps, OpenTelemetry, logs estructurados desde Beta.
-- **Integraciones (Beta)**: Postgres (queries tipadas), auth (JWT/sesiones), colas, cache. Al principio, **interop nativa con crates de Rust / paquetes de Go** para no construir todo el ecosistema desde cero.
+- **Package manager**: `link.json` con dependencias locales y dependencias Git remotas (`git+https://...#rev`), con lockfile criptográfico `link.lock` (SHA-256).
+- **CLI**: `linkc new` (scaffolding Next.js/Vite/Minimal), `linkc dev` (hot reload interactivo con reinicio de servidor), `linkc build`, `linkc serve`, `linkc test` (unitario + snapshots), `linkc lint`, `linkc doc`, `linkc docker`, `linkc fmt`, `linkc lsp`.
+- **LSP**: Protocolo JSON-RPC 2.0 completo en stdio con Nivel 1, 2 y 3 (diagnósticos en tiempo real, spans UTF-16, autocompletado sensible al tipo del receptor `x.`, hover de tipos de expresiones y salto a definición multi-archivo). Extensión oficial para VS Code y Cursor (`c-script-vscode-1.0.0.vsix`).
+- **Testing**: Runner de tests de comportamiento `test "..." { assert(...) }` con DB aislada por test y verificación de snapshots de contrato con diff LCS (`linkc test <file.link> <file.snap>`).
+- **Observabilidad**: Tracing estructurado por RPC con identificador de petición (`req_id`), método, código de estado y duración en milisegundos.
+- **Integraciones de Almacenamiento y Auth**: SQLite nativo embebido con auto-migración y PostgreSQL con TLS, auto-reconexión y LISTEN/NOTIFY distribuido. Autenticación declarativa RBAC con sesiones opacas, Argon2id, roles (`auth.currentRole`), id de usuario (`auth.createSessionWithId`/`auth.currentUserId`) y expiración configurable.
 
 ---
 
 ## 6. Estrategia de Adopción y Comunidad
 
-- **Cuña inicial**: equipos full-stack TypeScript que ya usan tRPC pero necesitan más rendimiento en el backend. No compitas con Go/Rust de frente; compite en *"la mejor experiencia backend para un frontend TS"*.
-- **"Time to wow" < 5 minutos**: `link new` → editas un tipo → el frontend deja de compilar. Ese momento vende el proyecto.
-- **Docs y templates**: starter Next.js + c-script, ejemplos reales, migración desde tRPC.
-- **Open source con gobernanza clara** (licencia permisiva, RFCs públicos). La comunidad es el activo, no el compilador.
+- **Cuña inicial**: Equipos full-stack TypeScript que buscan el rendimiento y robustez de un backend de sistemas sin sacrificar la inferencia de tipos inmediata en el frontend.
+- **"Time to wow" < 5 minutos**: `linkc new my-app` → modificar un campo en `main.link` → `tsc` del frontend falla al instante en desarrollo.
+- **Docs y plantillas**: Integración oficial con Next.js 14 App Router, Vite+React y Backend puro.
+- **Transparencia y Calidad**: Documentación probada por el propio compilador (`compiler/tests/docs_examples.rs`), 573 tests en CI continuo y límites documentados sin promesas falsas.
 
 ---
 
 ## 7. Riesgos, Mitigaciones y Costes
 
-| Riesgo | Prob. | Impacto | Mitigación |
+| Riesgo | Prob. | Impacto | Mitigación Aplicada / Estado |
 |---|---|---|---|
-| Adopción nula | Alta | Crítico | Empezar como framework/codegen sobre Rust; ganar usuarios **antes** del lenguaje |
-| Coste/tiempo subestimado 3–5× | Alta | Alto | MVP acotado; reutilizar crates existentes (`wasm-encoder`/`serde`) en vez de escribir un codegen o un parser JSON propios; no reinventar |
-| Type system no mapea 1:1 a TS | Media | Alto | Diseñar el sistema de tipos **partiendo de TS**; validadores generados; suite de tests de isomorfismo |
-| Ecosistema ausente (DB, auth) | Alta | Alto | Interop nativa con Rust/Go al inicio |
-| Mantenimiento a largo plazo | Media | Alto | Open source + gobernanza; foco en un nicho |
-| Debugging/observabilidad pobre | Media | Medio | Source maps y OpenTelemetry desde Beta |
-| Un competidor TS-first cierra el hueco | Media | Alto | Moverse rápido en la cuña; el diferencial es *perf + E2E sin IDL* |
+| Adopción nula | Alta | Crítico | Experiencia DX superior: cero IDLs separados, cliente TS + validadores Zod generados automáticamente |
+| Type system no mapea 1:1 a TS | Media | Alto | Isomorfismo desde el diseño: suite exhaustiva de tests que compilan y validan el cliente emitido contra `tsc` |
+| Ecosistema ausente (DB, auth, net) | Alta | Alto | Baterías incluidas: drivers SQLite y Postgres nativos, auth Argon2id, HTTP cliente/servidor, SMTP y SSE integrados |
+| Divergencia checker vs runtime | Media | Alto | Verificación empírica continua: cada feature se prueba contra servidores y bases de datos reales en CI |
+| Mantenimiento y complejidad | Media | Alto | Arquitectura modular en Rust (lexer/parser/checker/codegen/runtime) sin dependencias nativas pesadas (p.ej. pure `rustls`) |
 
 ---
 
-## 8. Recomendaciones Finales
+## 8. Hoja de Ruta Futura (Fase 4 · Hacia c-script 2.0)
 
-### 8.1 ¿Lenguaje completo o herramienta primero?
+Con las Fases 0 a 3 completadas y el núcleo v1.17.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
 
-**Herramienta primero.** Construye el **puente de tipos** como framework + codegen sobre Rust (o Go). Razones:
-- Entregas el diferencial (E2E type safety con perf de sistemas) en semanas, no años.
-- Heredas un ecosistema completo (DB, auth, crates) gratis.
-- Validas demanda con riesgo mínimo.
-- Si topas con límites que *solo* un lenguaje resuelve, entonces —y solo entonces— justifica el lenguaje, con usuarios ya en la mano.
+### 8.1 Ecosistema y Distribución
+1. **Publicación en el registro npm**: Empaquetar y publicar `link-lang` en npm para permitir ejecución vía `npx linkc` o instalación global estándar.
+2. **Ampliación del Playground Web**: Soporte para resolución de múltiples archivos y ejecución simulada de tests en el navegador mediante `wasm32-unknown-unknown`.
 
-### 8.2 Próximos 30 días (ruta pragmática)
+### 8.2 Base de Datos y Consultas Avanzadas
+1. **Agregación con truncamiento temporal**: Soporte para agrupar por fechas truncadas (`date_trunc` para cohortes diarias/mensuales) en `sumBy`/`countBy`/etc.
+2. **Soporte de `Int64` en agregaciones**: Permitir campos `Int64` en las cláusulas de agrupación y suma/promedio.
+3. **Paginación por cursor**: Introducción de tokens de cursor opacos y determinísticos (`Cursor<T>`) para tablas de gran volumen.
 
-1. **Semana 1** — Define el sistema de tipos y su mapeo exacto a TS (tabla §2.3). Este documento es el contrato del contrato.
-2. **Semana 2** — PoC del **emisor**: dado un modelo de tipos (structs Rust con `serde` + `ts-rs`/`specta`), genera `.d.ts` + un `client.ts` tipado que hable con un servidor RPC mínimo (axum).
-3. **Semana 3** — Cierra el loop E2E: un frontend Next.js consume el cliente; cambia un tipo en el backend → `tsc` del frontend falla. **Ese es el momento "wow".**
-4. **Semana 4** — Enséñaselo a 5 devs. Decide con datos si escalar a framework o a lenguaje.
-
-### 8.3 La primera decisión de diseño que debes tomar tú
-
-Antes de escribir el emisor, hay que decidir **cómo se representa la ausencia** (`T?`): `T | null`, `field?: T`, o ambos. Es la decisión que más condiciona serialización, validadores y DX. Está desarrollada en §2.3 y es el primer punto donde tu criterio manda.
+### 8.3 Runtime y Comunicaciones
+1. **Inspección de respuestas en `http.get`/`http.post`**: Exponer cabeceras de respuesta y códigos de estado HTTP numéricos para permitir lógica de reintentos selectiva (e.g. en 429 Too Many Requests).
+2. **Limpieza proactiva de sesiones**: Implementar recolección periódica en segundo plano para sesiones expiradas bajo `--session-ttl`.
+3. **Rate limiting distribuido**: Permitir configuración de proxies de confianza (`X-Forwarded-For`) y adaptadores para estado compartido (e.g. Redis) en despliegues con réplicas.
+4. **Mejoras en `smtp.send`**: Soporte para envío asíncrono no bloqueante, múltiples destinatarios y cuerpos HTML.
 
 ---
 
 ### Sobre el nombre
 
-Decidido: **c-script**, en minúsculas. La extensión de archivo (`.link`) y el nombre del binario del compilador (`linkc`) se mantienen como está — no hace falta que deletreen la marca, igual que `.rs` no dice "rust". Ver GRAMMAR.md para el resto de las convenciones de nomenclatura.
+Decidido: **c-script**, en minúsculas. La extensión de archivo (`.link`) y el nombre del binario del compilador (`linkc`) se mantienen como está — no hace falta que deletreen la marca, igual que `.rs` no dice "rust". Ver [GRAMMAR.md](GRAMMAR.md) para el resto de las convenciones de nomenclatura.
+

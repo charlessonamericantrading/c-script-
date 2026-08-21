@@ -44,13 +44,14 @@ fn fresh_token() -> String {
 /// Una sesión guardada -- rol como par de `String`, NO el `Value` completo
 /// del intérprete (evita cualquier discusión sobre Send/Sync de `Value`, hoy
 /// no es Send por `Value::Closure` que contiene `Rc`, y es exactamente lo
-/// mismo que ya se serializa al wire para un enum simple), más CUÁNDO expira
-/// -- `None` significa "nunca" (comportamiento de siempre, sin `--session-
-/// ttl`). Struct con nombres de campo, no una tupla más grande -- mismo
-/// criterio que `RequestContext` (`db.rs`): más legible que posiciones.
+/// mismo que ya se serializa al wire para un enum simple), un `user_id`
+/// opcional (`i64`), más CUÁNDO expira -- `None` significa "nunca" (comportamiento
+/// de siempre, sin `--session-ttl`). Struct con nombres de campo, no una
+/// tupla más grande -- mismo criterio que `RequestContext` (`db.rs`): más legible que posiciones.
 struct SessionEntry {
     enum_name: String,
     variant_name: String,
+    user_id: Option<i64>,
     expires_at: Option<Instant>,
 }
 
@@ -86,9 +87,13 @@ impl SessionStore {
     }
 
     pub fn create(&self, enum_name: String, variant_name: String) -> String {
+        self.create_with_user_id(enum_name, variant_name, None)
+    }
+
+    pub fn create_with_user_id(&self, enum_name: String, variant_name: String, user_id: Option<i64>) -> String {
         let token = fresh_token();
         let expires_at = self.ttl.map(|ttl| Instant::now() + ttl);
-        self.sessions.borrow_mut().insert(token.clone(), SessionEntry { enum_name, variant_name, expires_at });
+        self.sessions.borrow_mut().insert(token.clone(), SessionEntry { enum_name, variant_name, user_id, expires_at });
         token
     }
 
@@ -116,6 +121,19 @@ impl SessionStore {
             return None;
         }
         Some((entry.enum_name.clone(), entry.variant_name.clone()))
+    }
+
+    /// Devuelve el `user_id` guardado en la sesión (`Some(id)` si se creó con
+    /// `create_with_user_id` o `createSessionWithId`, `None` si se creó sin id,
+    /// si no existe o si ya expiró).
+    pub fn user_id_for(&self, token: &str) -> Option<i64> {
+        let mut sessions = self.sessions.borrow_mut();
+        let entry = sessions.get(token)?;
+        if entry.expires_at.is_some_and(|exp| Instant::now() >= exp) {
+            sessions.remove(token);
+            return None;
+        }
+        entry.user_id
     }
 }
 
@@ -208,4 +226,28 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         assert_eq!(store.role_for(&token), store.role_for("un-token-que-nunca-existio"));
     }
+
+    #[test]
+    fn create_with_user_id_persists_and_returns_user_id() {
+        let store = SessionStore::new();
+        let token_with_id = store.create_with_user_id("Role".to_string(), "Member".to_string(), Some(42));
+        assert_eq!(store.user_id_for(&token_with_id), Some(42));
+        assert_eq!(store.role_for(&token_with_id), Some(("Role".to_string(), "Member".to_string())));
+
+        let token_without_id = store.create("Role".to_string(), "Admin".to_string());
+        assert_eq!(store.user_id_for(&token_without_id), None);
+        assert_eq!(store.role_for(&token_without_id), Some(("Role".to_string(), "Admin".to_string())));
+
+        assert_eq!(store.user_id_for("token-inexistente"), None);
+    }
+
+    #[test]
+    fn user_id_for_expires_with_ttl() {
+        let store = SessionStore::with_ttl(Duration::from_millis(20));
+        let token = store.create_with_user_id("Role".to_string(), "Member".to_string(), Some(101));
+        assert_eq!(store.user_id_for(&token), Some(101));
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(store.user_id_for(&token), None);
+    }
 }
+

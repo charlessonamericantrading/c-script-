@@ -3074,6 +3074,23 @@ impl Checker {
                     ))),
                 }
             }
+            "createSessionWithId" => {
+                let [role_arg, user_id_arg] = args else {
+                    return Err(err("'createSessionWithId' toma exactamente 2 argumentos (role: un valor de un enum declarado, userId: Int)"));
+                };
+                match self.synth_expr(role_arg, env)? {
+                    Type::Enum(_) => {}
+                    other => return Err(err(format!(
+                        "'createSessionWithId' espera un valor de un enum declarado como primer argumento (ej. Role.Admin {{}}), se encontró {other}"
+                    ))),
+                }
+                match self.synth_expr(user_id_arg, env)? {
+                    Type::Int => Ok(Type::String),
+                    other => Err(err(format!(
+                        "'createSessionWithId' espera un Int como segundo argumento (userId), se encontró {other}"
+                    ))),
+                }
+            }
             "destroySession" => {
                 self.expect_no_args(args, "destroySession")?;
                 Ok(Type::Void)
@@ -3082,8 +3099,12 @@ impl Checker {
                 self.expect_no_args(args, "currentRole")?;
                 Ok(Type::Optional(Box::new(Type::String)))
             }
+            "currentUserId" => {
+                self.expect_no_args(args, "currentUserId")?;
+                Ok(Type::Optional(Box::new(Type::Int)))
+            }
             other => Err(err(format!(
-                "'{other}' no es un método conocido de 'auth' (createSession/destroySession/currentRole)"
+                "'{other}' no es un método conocido de 'auth' (createSession/createSessionWithId/destroySession/currentRole/currentUserId)"
             ))),
         }
     }
@@ -4852,6 +4873,58 @@ type T = { id: Int, s: Status }")
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("currentRole"), "debería mencionar 'currentRole': {msg}");
+    }
+
+    #[test]
+    fn create_session_with_id_requires_an_enum_and_an_int() {
+        let src = r#"
+            enum Role { Admin, Member }
+            service S {
+                rpc login() -> String { auth.createSessionWithId(Role.Member {}, 42) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        let bad_role = r#"
+            service S {
+                rpc login() -> String { auth.createSessionWithId(1, 42) }
+            }
+        "#;
+        let res_role = check_source(bad_role);
+        assert!(res_role.is_err());
+        let msg_role = format!("{:?}", res_role.unwrap_err());
+        assert!(msg_role.contains("createSessionWithId"), "debería mencionar 'createSessionWithId': {msg_role}");
+
+        let bad_id = r#"
+            enum Role { Admin, Member }
+            service S {
+                rpc login() -> String { auth.createSessionWithId(Role.Admin {}, "42") }
+            }
+        "#;
+        let res_id = check_source(bad_id);
+        assert!(res_id.is_err());
+        let msg_id = format!("{:?}", res_id.unwrap_err());
+        assert!(msg_id.contains("Int"), "debería mencionar 'Int': {msg_id}");
+    }
+
+    #[test]
+    fn current_user_id_types_as_optional_int_and_takes_no_arguments() {
+        let src = r#"
+            service S {
+                rpc whoAmI() -> Int? { auth.currentUserId() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        let bad = r#"
+            service S {
+                rpc whoAmI() -> Int? { auth.currentUserId(1) }
+            }
+        "#;
+        let result = check_source(bad);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("currentUserId"), "debería mencionar 'currentUserId': {msg}");
     }
 
     #[test]

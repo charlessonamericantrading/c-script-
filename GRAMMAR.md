@@ -74,6 +74,7 @@
   - [3.50 `--session-ttl`: expiración real de sesión — RESUELTO](#350---session-ttl-expiración-real-de-sesión--resuelto)
   - [3.51 `auth.currentRole()`: leer el rol del caller dentro de un cuerpo — RESUELTO](#351-authcurrentrole-leer-el-rol-del-caller-dentro-de-un-cuerpo--resuelto)
   - [3.52 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`: agregación con `GROUP BY` real, empujada a SQL — RESUELTO](#352-sumbycountbyavgbymaxbyminby-agregación-con-group-by-real-empujada-a-sql--resuelto)
+  - [3.53 `auth.createSessionWithId()` y `auth.currentUserId()`: asociar e inspeccionar el id del caller — RESUELTO](#353-authcreatesessionwithid-y-authcurrentuserid-asociar-e-inspeccionar-el-id-del-caller--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -578,7 +579,10 @@ Sin coerción implícita — a diferencia de JS, `1 + "1"` es un error de tipos,
 | `.map(f: (T) -> U)` | `T[]` | `U[]` | ver §3.10 |
 | `.length()` | `T[]` | `Int` | cantidad de elementos -- faltaba (solo existía para `String`) hasta que `login` (§3.14) necesitó "¿matcheó algún usuario?" |
 | `.createSession(role: R)` | `auth` | `String` | ver §3.14 -- `R` debe ser un enum declarado |
+| `.createSessionWithId(role: R, userId: Int)` | `auth` | `String` | ver §3.53 -- asocia el rol y el id numérico del usuario |
 | `.destroySession()` | `auth` | `Void` | ver §3.14 -- sin argumentos, opera sobre la sesión de la request actual |
+| `.currentRole()` | `auth` | `String?` | ver §3.51 -- devuelve el nombre de la variante del rol autenticado (`null` si no hay sesión) |
+| `.currentUserId()` | `auth` | `Int?` | ver §3.53 -- devuelve el `userId` asociado a la sesión (`null` si no hay sesión o se creó sin id) |
 
 No hay coerción implícita en ningún operador (§3.7) — `.toFloat()`/`.toInt()` son las únicas conversiones numéricas, y son siempre explícitas. `.length()`/`.contains()` son método, no propiedad (`x.length`, sin paréntesis) — consistencia con `.toFloat()`/`.toInt()` importó más acá que imitar la convención de propiedad de JS/TS.
 
@@ -843,7 +847,7 @@ rpc logout() -> Void { auth.destroySession() }
 
 **Cliente generado: `token` es estado MUTABLE de instancia, no un parámetro por-llamada.** `{Service}ClientImpl` gana `private token: string | null` + `setToken(token)`, parte de la interfaz pública (`{Service}Client`) para que algo tipado como tal también pueda llamarlo. `push_fetch_call` adjunta `Authorization: Bearer ${token}` en TODO rpc si hay token seteado (el servidor decide caso por caso si lo exige). Correcto para "una instancia de cliente = un usuario/sesión activa" (mismo patrón que la mayoría de SDKs generados reales) — pero una instancia COMPARTIDA entre requests concurrentes de usuarios DISTINTOS (ej. un backend-for-frontend Node reusando un cliente módulo-level) puede pisarse el token entre requests. Documentado como límite v0 explícito; la alternativa (token por-llamada) cambiaría la forma pública de TODOS los métodos generados, no solo los protegidos.
 
-**Fuera de alcance, a propósito:** verificación de contraseña/credenciales; un CSPRNG auditado (ver el hallazgo de arriba). Tres límites de esta lista original **ya se resolvieron**: expiración de sesión ("vive hasta `destroySession()` o hasta reiniciar el proceso" — resuelto en §3.50, `--session-ttl`), múltiples roles por `@requires` (resuelto en §3.49, `Role.Admin | Role.Agent`), y leer el ROL del caller dentro de un cuerpo (resuelto en §3.51, `auth.currentRole()`) — múltiples anotaciones DE AUTH por rpc (dos `@requires` distintos en el mismo rpc) sigue sin tener sentido y el checker lo sigue rechazando, eso no cambió. **Sigue sin resolverse:** exponer la identidad COMPLETA del caller (`ctx.user`/similar, una referencia al `User` real, no solo su rol) — la sesión sigue guardando únicamente el TAG del rol (§3.51 lo expone, no lo amplía), nunca una referencia al struct completo.
+**Fuera de alcance, a propósito:** verificación de contraseña/credenciales; un CSPRNG auditado (ver el hallazgo de arriba). Cuatro límites de esta lista original **ya se resolvieron**: expiración de sesión ("vive hasta `destroySession()` o hasta reiniciar el proceso" — resuelto en §3.50, `--session-ttl`), múltiples roles por `@requires` (resuelto en §3.49, `Role.Admin | Role.Agent`), leer el ROL del caller dentro de un cuerpo (resuelto en §3.51, `auth.currentRole()`), y persistir/leer el ID del caller (resuelto en §3.53, `auth.createSessionWithId(role, userId)` y `auth.currentUserId()`) — múltiples anotaciones DE AUTH por rpc (dos `@requires` distintos en el mismo rpc) sigue sin tener sentido y el checker lo sigue rechazando, eso no cambió. Cargar la entidad completa `User` en memoria (`ctx.user`) sigue haciéndose de forma explícita mediante `db.users.find(uid)` a partir del `userId` obtenido.
 
 ---
 
@@ -2902,6 +2906,37 @@ compilación (`checker.rs`) para cada camino de rechazo: selector
 derivado, tipo de agrupación inválido, tipo de valor inválido, campo
 opcional (las dos formas), aridad de argumentos, y que agrupar por un
 enum tipa con el enum real como key.
+
+### 3.53 `auth.createSessionWithId()` y `auth.currentUserId()`: asociar e inspeccionar el id del caller — RESUELTO
+
+Con `auth.currentRole()` (§3.51) era posible saber el rol con el que se autenticó la petición, pero no la identidad numérica del usuario (`userId: Int`). Un sistema real donde cada usuario es dueño de sus propios recursos (e.g. `db.notes.findWhere(|n: Note| { n.authorId == uid })`) obligaba a pasar el `userId` como parámetro explícito en cada llamada RPC, perdiendo la seguridad que otorga la sesión en el servidor.
+
+<!-- linkc:fragment -->
+```rust
+service Auth {
+  rpc login(email: String) -> String {
+    let user = db.users.findWhere(|u: User| { u.email == email })[0];
+    auth.createSessionWithId(user.role, user.id)
+  }
+}
+
+service Notes {
+  @authenticated
+  rpc myNotes() -> Note[] {
+    let uid = auth.currentUserId();
+    db.notes.findWhere(|n: Note| { n.authorId == uid })
+  }
+}
+```
+
+**Dos métodos dedicados y explícitos:**
+- `auth.createSessionWithId(role: R, userId: Int) -> String`: toma el rol (un enum declarado) y el identificador de usuario (`Int`). Emite un token de sesión seguro de 128 bits asociando ambos datos en memoria. `auth.createSession(role)` de siempre sigue existiendo sin cambios (fija `userId` en `None`).
+- `auth.currentUserId() -> Int?`: devuelve el `userId` asociado a la sesión de la request actual (`Int?`).
+
+**`null` para "sin sesión", "sin id asociado" y "token inválido/expirado":**
+Mismo principio de indistinguibilidad de siempre (§3.14, §3.50, §3.51) — un endpoint público o autenticado obtiene `null` si no hay sesión activa, si el token expiró bajo `--session-ttl`, o si la sesión se creó mediante `createSession(role)` sin id.
+
+**Verificado** contra un servidor real (`compiler/tests/server_http.rs`): login con `createSessionWithId`, recuperación exitosa de `currentUserId()` (`42`) y `currentRole()` (`"Member"`), bifurcación de lógica con `@authenticated`, y retorno de `null` en peticiones sin sesión o con sesiones creadas sin id. Más 3 tests de compilación en `checker.rs` (tipado de argumentos y retorno `Int?`) y tests unitarios en `session.rs`.
 
 ---
 

@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-568-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.16.0-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-573-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.17.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -34,14 +34,14 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 ## 📊 Estado — qué funciona y qué no
 
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
-gana esta. Verificado el 21/08/2026 corriendo el compilador, no leyéndolo.
+gana esta. Verificado el 22/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 568 pruebas automáticas:
+**Funciona hoy**, cubierto por 573 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - SQLite embebido con persistencia real entre reinicios y auto-migraciones no destructivas
 - Push en vivo sobre Server-Sent Events (`stream` + `db.<c>.subscribe()`)
-- Auth declarativa: `@authenticated`, `@requires(Role.Admin)` (o `@requires(Role.Admin | Role.Agent)` para cualquiera de varios roles, todos del mismo enum), tokens de sesión desde el CSPRNG del sistema. `linkc serve --session-ttl 7d` (o `LINK_SESSION_TTL`) hace que las sesiones expiren solas -- sin configurar, siguen viviendo hasta `destroySession()` o un reinicio del proceso, como antes. `auth.currentRole() -> String?` lee qué rol autenticó la request actual desde adentro del cuerpo de un rpc -- deja que un endpoint `Role.Admin | Role.Agent` se comporte distinto según el rol, no solo permitir/denegar; funciona también sin ninguna anotación de auth, `null` si no hay sesión válida
+- Auth declarativa: `@authenticated`, `@requires(Role.Admin)` (o `@requires(Role.Admin | Role.Agent)` para cualquiera de varios roles, todos del mismo enum), tokens de sesión desde el CSPRNG del sistema. `linkc serve --session-ttl 7d` (o `LINK_SESSION_TTL`) hace que las sesiones expiren solas -- sin configurar, siguen viviendo hasta `destroySession()` o un reinicio del proceso, como antes. `auth.currentRole() -> String?` lee qué rol autenticó la request actual desde adentro del cuerpo de un rpc -- deja que un endpoint `Role.Admin | Role.Agent` se comporte distinto según el rol, no solo permitir/denegar; funciona también sin ninguna anotación de auth, `null` si no hay sesión válida. `auth.createSessionWithId(role, userId)` asocia el id del usuario a la sesión y `auth.currentUserId() -> Int?` lo inspecciona desde el cuerpo de cualquier rpc (`null` si no hay sesión o se creó sin id)
 - PostgreSQL como base de runtime: `linkc serve app.link 8787 --db postgres://usuario:clave@host/base` (o `LINK_DATABASE_URL`), con auto-migración no destructiva, TLS oportunista (rustls puro, sin OpenSSL -- conecta contra proveedores administrados como Supabase/Neon/RDS que lo exigen), reconexión automática tras una conexión cortada, y LISTEN/NOTIFY para que un `stream` conectado a una instancia de `linkc serve` vea una escritura que entró por otra instancia contra la misma base. El mismo programa, el mismo contrato generado — SQLite sigue siendo el default
 - Respuestas que no son JSON: `@content_type("text/html; charset=utf-8")` sobre un rpc que devuelve `String` manda ese cuerpo tal cual — páginas HTML, sitemaps XML, CSV — y se combina con `@requires(Role.Admin)` para páginas detrás de auth. `"...".escapeHtml()` sanitiza datos no confiables antes de meterlos en una página (no es automático -- se llama donde se interpola). `response.setStatus(code)` elige el status HTTP del camino de éxito (ej. una página 404 propia para un `@route` que no encontró nada, o 201 en un `create` JSON común) — los errores de transporte siguen saliendo siempre en JSON, sin cambios
 - URLs amigables: `@route("/blog/:slug")` le da a un rpc una URL limpia y rastreable por GET, además de (nunca en vez de) su dirección normal `/Servicio/rpc` — el cliente generado sigue usando esta última. Cualquier cantidad de segmentos `:parámetro`, en cualquier posición (`/blog/:categoria/:slug`), bindeados por nombre; una ruta más específica (más segmentos fijos) le gana determinísticamente a una totalmente dinámica que también matchearía
@@ -67,7 +67,7 @@ gana esta. Verificado el 21/08/2026 corriendo el compilador, no leyéndolo.
 | `http.get`/`http.post` (con o sin headers) solo devuelven el body | Sin acceso al status code ni a los headers de la RESPUESTA -- un 4xx/5xx de la API llamada se vuelve un error de runtime genérico, no un valor sobre el que el programa pueda ramificar (ej. reintentar solo en 429). |
 | `db.<c>.page` no tiene cursor | El caller calcula el próximo `offset` a mano (`offset + limit`); sin token de continuación opaco, y sin total de páginas incorporado -- para eso, `count()`. |
 | `--session-ttl` limpia de forma perezosa | Una sesión vencida se borra de memoria recién la próxima vez que se usa su token -- una creada y nunca vuelta a usar queda en memoria hasta que el proceso reinicia. |
-| `auth.currentRole()` solo expone el rol, no el caller | Sin una referencia estilo `ctx.user` al `User` real que inició sesión -- la sesión solo guardó el tag del rol, desde v0. |
+| La estructura completa de usuario no se auto-carga en sesión | `auth.currentRole()` y `auth.currentUserId()` exponen el rol autenticado y el id numérico del usuario, pero cargar el struct `User` completo en memoria se hace explícitamente vía `db.users.find(uid)`. |
 | La agregación (`sumBy`/etc.) no tiene truncado de fechas ni soporta `Int64` | No se puede agrupar por una fecha truncada (cohortes mensuales, por ejemplo) -- solo campos `String`/`Int`/`Bool`/`enum` desnudos. `Int64` tampoco es un campo válido para agrupar ni para agregar todavía. |
 | El push de `stream` entre instancias (LISTEN/NOTIFY) tiene límites reales | Una fila cambiada de más de 8000 bytes (el límite de payload de NOTIFY que impone el propio Postgres) no se propaga a otras instancias -- sigue publicándose local donde se escribió. NOTIFY es best-effort, sin cola de reintento; un servidor inactivo puede tardar hasta 200ms en notar un cambio remoto; cada instancia abre una conexión extra a Postgres solo para LISTEN; SQLite no participa en absoluto. |
 | Sin paquete npm | `link-lang` todavía no está en el registro de npm. Los releases de GitHub sí funcionan — ver Instalación más abajo. |

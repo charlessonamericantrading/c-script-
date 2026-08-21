@@ -1575,6 +1575,16 @@ fn call_method(
                 };
                 Ok(Value::Str(sessions.create(enum_name, variant)))
             }
+            "createSessionWithId" => {
+                let mut it = args.into_iter();
+                let role = it.next().ok_or_else(|| err("createSessionWithId requiere 2 argumentos (role, userId)"))?;
+                let user_id_val = it.next().ok_or_else(|| err("createSessionWithId requiere 2 argumentos (role, userId)"))?;
+                let Value::Variant { enum_name, variant, .. } = role else {
+                    return Err(err("createSessionWithId requiere un valor de un enum declarado como primer argumento"));
+                };
+                let user_id = as_int(&user_id_val)?;
+                Ok(Value::Str(sessions.create_with_user_id(enum_name, variant, Some(user_id))))
+            }
             "destroySession" => {
                 if let Some(tok) = current_token {
                     sessions.destroy(tok);
@@ -1592,6 +1602,10 @@ fn call_method(
             "currentRole" => {
                 let role = current_token.and_then(|tok| sessions.role_for(tok)).map(|(_, variant)| variant);
                 Ok(role.map(Value::Str).unwrap_or(Value::Null))
+            }
+            "currentUserId" => {
+                let user_id = current_token.and_then(|tok| sessions.user_id_for(tok));
+                Ok(user_id.map(Value::Int).unwrap_or(Value::Null))
             }
             other => Err(err(format!("método desconocido sobre auth: '{other}'"))),
         },

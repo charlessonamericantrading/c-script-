@@ -395,3 +395,83 @@ fn current_role_lets_a_shared_endpoint_behave_differently_per_role_over_a_real_s
 
     server.shutdown();
 }
+
+const CURRENT_USER_ID_PROGRAM: &str = r#"
+enum Role { Admin, Member }
+
+service Auth {
+  rpc loginWithId(role: Role, userId: Int) -> String {
+    auth.createSessionWithId(role, userId)
+  }
+
+  rpc loginWithoutId(role: Role) -> String {
+    auth.createSession(role)
+  }
+}
+
+service Users {
+  rpc currentUserId() -> Int? {
+    auth.currentUserId()
+  }
+
+  rpc currentRole() -> String? {
+    auth.currentRole()
+  }
+
+  @authenticated
+  rpc myProfile() -> String {
+    let uid = auth.currentUserId();
+    if uid == 42 {
+      "perfil de usuario 42"
+    } else {
+      "otro usuario"
+    }
+  }
+}
+"#;
+
+#[test]
+fn current_user_id_returns_stored_user_id_over_a_real_subprocess() {
+    // GRAMMAR.md §3.53: persistir y consultar la identidad (userId) del caller.
+    let server = ServeProcess::start_with_program("current-user-id", CURRENT_USER_ID_PROGRAM);
+
+    let (_, token_with_id) = server.post("/Auth/loginWithId", &json!({"role": "Member", "userId": 42}), None);
+    let token_with_id = token_with_id.as_str().unwrap().to_string();
+
+    let (_, token_without_id) = server.post("/Auth/loginWithoutId", &json!({"role": "Admin"}), None);
+    let token_without_id = token_without_id.as_str().unwrap().to_string();
+
+    // Con token que incluye userId:
+    let (status, body) = server.post("/Users/currentUserId", &json!({}), Some(&token_with_id));
+    assert_eq!(status, 200);
+    assert_eq!(body, json!(42));
+
+    let (status, body) = server.post("/Users/currentRole", &json!({}), Some(&token_with_id));
+    assert_eq!(status, 200);
+    assert_eq!(body, "Member");
+
+    let (status, body) = server.post("/Users/myProfile", &json!({}), Some(&token_with_id));
+    assert_eq!(status, 200);
+    assert_eq!(body, "perfil de usuario 42");
+
+    // Con token sin userId:
+    let (status, body) = server.post("/Users/currentUserId", &json!({}), Some(&token_without_id));
+    assert_eq!(status, 200);
+    assert_eq!(body, Value::Null);
+
+    let (status, body) = server.post("/Users/currentRole", &json!({}), Some(&token_without_id));
+    assert_eq!(status, 200);
+    assert_eq!(body, "Admin");
+
+    // Sin token o con token inexistente:
+    let (status, body) = server.post("/Users/currentUserId", &json!({}), None);
+    assert_eq!(status, 200);
+    assert_eq!(body, Value::Null);
+
+    let (status, body) = server.post("/Users/currentUserId", &json!({}), Some("token-fantasma"));
+    assert_eq!(status, 200);
+    assert_eq!(body, Value::Null);
+
+    server.shutdown();
+}
+

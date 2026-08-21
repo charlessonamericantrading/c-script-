@@ -1459,7 +1459,10 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
         Type::Float => Some(vec![method("toInt()", "Convert this Float to Int")]),
         Type::Auth => Some(vec![
             method("createSession(role)", "Create an opaque session token for the given Role"),
+            method("createSessionWithId(role, userId)", "Create an opaque session token for the given Role and userId"),
             method("destroySession()", "Destroy the current session"),
+            method("currentRole()", "Get the caller's authenticated role (String?)"),
+            method("currentUserId()", "Get the caller's authenticated user id (Int?)"),
         ]),
         Type::Struct { fields, .. } => Some(
             fields
