@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.12.0] - 2026-08-21
+
+### ✨ Nuevo
+- **`db.<coleccion>.page(limit, offset)`: paginación real, empujada a SQL.** Antes, acotar una colección grande significaba `.all().take(n)` -- pero `.take` (un método de `List<T>`) corre DESPUÉS de que `.all()` ya trajo la tabla ENTERA a memoria; pedir "la página 400" costaba lo mismo que traer la tabla completa. `page` pone `LIMIT`/`OFFSET` DENTRO del SQL -- portátil entre SQLite y Postgres sin ninguna rama por backend (`Backend::placeholder` ya resolvía esa diferencia). Mismo `ORDER BY "id"` que `.all()`, siempre, para que las páginas sean determinísticas (nunca se solapan ni se saltean una fila). `limit`/`offset` negativos son un error de runtime claro ANTES de tocar SQL -- Postgres y SQLite tratan un valor negativo de forma DISTINTA entre sí (la clase de divergencia entre capas que este proyecto viene evitando desde v1.0), así que dejarlo pasar tal cual hubiera hecho que el mismo programa se comportara diferente según el backend. Límite honesto: sin cursor, el caller arma el siguiente `offset` a mano. Verificado contra los DOS backends: test unitario con SQLite en memoria (páginas sin solapar, última página parcial, offset más allá del final como lista vacía, valores negativos rechazados) y el mismo caso repetido en `pg_integration.rs` contra un PostgreSQL real en CI. Detalle completo: GRAMMAR.md §3.48.
+
 ## [1.11.0] - 2026-08-21
 
 ### ✨ Nuevo

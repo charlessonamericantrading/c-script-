@@ -79,6 +79,10 @@ service Leads {
   rpc pending() -> Lead[] {
     db.COLLECTION.findWhere(|l: Lead| { !l.contacted })
   }
+
+  rpc page(limit: Int, offset: Int) -> Lead[] {
+    db.COLLECTION.page(limit, offset)
+  }
 }
 "#;
 
@@ -298,6 +302,50 @@ fn the_crud_surface_works_against_a_real_postgres() {
         false,
         "borrar dos veces devuelve false"
     );
+}
+
+#[test]
+fn page_pushes_limit_offset_to_real_sql_against_postgres() {
+    // GRAMMAR.md §3.48: la razón de ser de `page` es que `LIMIT`/`OFFSET`
+    // viajen DENTRO del SQL -- para una tabla grande, no cuesta O(tabla
+    // entera) como `all().take(n)` en el lenguaje. `all()` ya prueba el
+    // camino sin paginar contra SQLite/Postgres; este test prueba el camino
+    // CON LIMIT/OFFSET, específicamente contra Postgres (mismo criterio de
+    // "los dos backends por separado" que ya usa el resto de este archivo).
+    const COLLECTION: &str = "leads_page";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("page");
+    let src = temp.program(COLLECTION);
+    let server = Serve::start(&src, &url);
+
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let row = server.rpc("Leads/create", &format!(r#"{{"email":"lead{i}@example.com","score":1.0}}"#));
+        ids.push(row["id"].as_i64().unwrap());
+    }
+
+    let page1 = server.rpc("Leads/page", r#"{"limit":2,"offset":0}"#);
+    let page1_ids: Vec<i64> = page1.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(page1_ids, ids[0..2], "primera página: los primeros 2 por id");
+
+    let page2 = server.rpc("Leads/page", r#"{"limit":2,"offset":2}"#);
+    let page2_ids: Vec<i64> = page2.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(page2_ids, ids[2..4], "segunda página: sigue donde terminó la primera, sin solaparse");
+
+    let last_page = server.rpc("Leads/page", r#"{"limit":2,"offset":4}"#);
+    let last_page_ids: Vec<i64> = last_page.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(last_page_ids, ids[4..5], "última página parcial: solo lo que queda, no un error");
+
+    let past_the_end = server.rpc("Leads/page", r#"{"limit":2,"offset":100}"#);
+    assert_eq!(past_the_end.as_array().unwrap().len(), 0, "offset más allá del final: lista vacía, no error");
+
+    let err = server.try_rpc("Leads/page", r#"{"limit":2,"offset":-1}"#);
+    assert!(err.is_err(), "offset negativo tiene que fallar, no mandarse tal cual al SQL de Postgres");
 }
 
 #[test]

@@ -725,6 +725,16 @@ db { users: User[] }
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
         match method {
             "all" => self.select_rows(collection, columns, None).map(Value::List),
+            "page" => {
+                let limit = as_int(args.first().ok_or_else(|| RuntimeError::new("page requiere 2 argumentos (limit, offset)"))?)?;
+                let offset = as_int(args.get(1).ok_or_else(|| RuntimeError::new("page requiere 2 argumentos (limit, offset)"))?)?;
+                if limit < 0 || offset < 0 {
+                    return Err(RuntimeError::new(format!(
+                        "db.<c>.page({limit}, {offset}): limit y offset tienen que ser >= 0"
+                    )));
+                }
+                self.select_rows_page(collection, columns, limit, offset).map(Value::List)
+            }
             "find" => {
                 let id = as_int(args.first().ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?)?;
                 Ok(self.select_rows(collection, columns, Some(id))?.into_iter().next().unwrap_or(Value::Null))
@@ -959,6 +969,35 @@ db { users: User[] }
         Ok(rows.iter().map(|cells| Value::Struct(self.row_to_fields(cells, columns))).collect())
     }
 
+    /// `db.<c>.page(limit, offset)` (GRAMMAR.md §3.48) -- a diferencia de
+    /// `.all()` (que trae TODA la tabla y recién ahí el intérprete podría
+    /// cortarla con `.take()`, si el programa se acordara de hacerlo),
+    /// `LIMIT`/`OFFSET` van adentro del propio SQL: para una tabla grande,
+    /// pedir la página 400 sigue costando O(página), no O(tabla entera).
+    /// Mismo orden que `.all()` (`ORDER BY "id"`) para que la paginación sea
+    /// determinística entre llamadas -- páginas que se solapan o se saltean
+    /// filas por un orden distinto en cada query serían peor que no tener
+    /// paginación.
+    fn select_rows_page(&self, collection: &str, columns: &[ColumnPlan], limit: i64, offset: i64) -> Result<Vec<Value>, RuntimeError> {
+        let mut col_list = vec!["\"id\"".to_string()];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        let sql = format!(
+            "SELECT {} FROM \"{collection}\" ORDER BY \"id\" LIMIT {} OFFSET {}",
+            col_list.join(", "),
+            self.backend.placeholder(1),
+            self.backend.placeholder(2)
+        );
+        let mut kinds = vec![ColumnKind::Int];
+        kinds.extend(columns.iter().map(ColumnPlan::kind));
+        let params = vec![Cell::Int(limit), Cell::Int(offset)];
+
+        let rows = self
+            .backend
+            .query(&sql, &params, &kinds)
+            .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+        Ok(rows.iter().map(|cells| Value::Struct(self.row_to_fields(cells, columns))).collect())
+    }
+
     /// Reconstruye una fila entera (`"id"` + cada columna declarada) como los
     /// pares `(nombre, Value)` de un `Value::Struct` -- inversa de
     /// `write_param`. Las celdas llegan en el mismo orden que emitió el SELECT
@@ -1117,6 +1156,51 @@ mod tests {
 
         let delete_again = db.call("users", "delete", vec![Value::Int(id)]).unwrap();
         assert_eq!(delete_again, Value::Bool(false));
+    }
+
+    #[test]
+    fn test_db_page_pushes_limit_offset_to_sql_instead_of_fetching_everything() {
+        let program = crate::parser::parse(crate::lexer::tokenize("type User = { id: Int, name: String }\ndb { users: User[] }").unwrap()).unwrap();
+        let db = Db::new(&program, Path::new(":memory:"));
+
+        let mut ids = Vec::new();
+        for name in ["Ana", "Beto", "Cami", "Dani", "Ema"] {
+            let row = db.call("users", "insert", vec![Value::Struct(vec![("name".into(), Value::Str(name.into()))])]).unwrap();
+            let Value::Struct(fields) = row else { panic!("se esperaba struct") };
+            ids.push(fields.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap());
+        }
+
+        let ids_of = |v: Value| -> Vec<i64> {
+            let Value::List(items) = v else { panic!("se esperaba List") };
+            items
+                .into_iter()
+                .map(|item| {
+                    let Value::Struct(fields) = item else { panic!("se esperaba struct") };
+                    fields.into_iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(&v).unwrap()).unwrap()
+                })
+                .collect()
+        };
+
+        let page1 = db.call("users", "page", vec![Value::Int(2), Value::Int(0)]).unwrap();
+        assert_eq!(ids_of(page1), ids[0..2], "primera página: los primeros 2 por id");
+
+        let page2 = db.call("users", "page", vec![Value::Int(2), Value::Int(2)]).unwrap();
+        assert_eq!(ids_of(page2), ids[2..4], "segunda página: sigue sin solaparse con la primera");
+
+        let last = db.call("users", "page", vec![Value::Int(2), Value::Int(4)]).unwrap();
+        assert_eq!(ids_of(last), ids[4..5], "última página parcial: lo que queda, no un error");
+
+        let past_the_end = db.call("users", "page", vec![Value::Int(2), Value::Int(100)]).unwrap();
+        assert_eq!(ids_of(past_the_end), Vec::<i64>::new(), "offset más allá del final: lista vacía");
+
+        assert!(
+            db.call("users", "page", vec![Value::Int(2), Value::Int(-1)]).is_err(),
+            "offset negativo tiene que fallar en vez de mandarse tal cual al SQL"
+        );
+        assert!(
+            db.call("users", "page", vec![Value::Int(-1), Value::Int(0)]).is_err(),
+            "limit negativo tiene que fallar en vez de mandarse tal cual al SQL"
+        );
     }
 
     #[test]

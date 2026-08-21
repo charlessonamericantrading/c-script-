@@ -50,6 +50,7 @@ Works, verified by running it:
 - Configurable CORS + fixed security headers on `linkc serve`: `--cors-origin <origin>` (repeatable) or `LINK_CORS_ORIGINS` (comma-separated) switches from open `*` to an exact-match allowlist (echoed literal + `Vary: Origin`; a non-matching `Origin` gets no CORS header at all, on every response including `stream` SSE and errors). Every response also carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` — see GRAMMAR.md §3.41. No CSP (depends on page content) or HSTS (belongs at the TLS-terminating reverse proxy, not `linkc serve` itself).
 - Sending email: `smtp.send(to: String, subject: String, body: String) -> Void`. Connection and sender come from the process environment (`LINK_SMTP_URL`, `LINK_SMTP_FROM`), never from rpc arguments — see GRAMMAR.md §3.43. Plain text only, one recipient per call, synchronous (blocks the single-threaded server for that request).
 - Calling third-party APIs: `http.get(url: String) -> String` / `http.post(url: String, body: String) -> String` (unchanged), plus `http.getWithHeaders(url: String, headers) -> String` / `http.postWithHeaders(url: String, body: String, headers) -> String` for calls that need `Authorization` or any other header. `headers` is `{name: String, value: String}[]` — structural, not a builtin type, so any struct you declare with those two fields works. Response is only the body as `String`; a non-2xx becomes a runtime error (not a value with the status code) — see GRAMMAR.md §3.47.
+- `db.<collection>.page(limit: Int, offset: Int) -> T[]`: real pagination — `LIMIT`/`OFFSET` pushed into the actual SQL query on both SQLite and Postgres, not `all().take(n)` (which fetches the whole table first). Same `ORDER BY "id"` as `all()` so pages don't overlap or skip rows. Negative `limit`/`offset` is a runtime error (rejected before reaching SQL, since SQLite and Postgres treat a negative value differently); an `offset` past the end is an empty list, not an error — see GRAMMAR.md §3.48.
 
 Does NOT work today — do not propose designs that depend on these:
 
@@ -98,8 +99,9 @@ difference between code that compiles and code that does not.
     unit is not.
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
-`insert(Omit<T,"id">) -> T`, `applyPatch(id, patch) -> T`, `delete(id) -> Bool`,
-`deleteWhere(pred) -> Int`, `subscribe()` (see rule 5).
+`page(limit: Int, offset: Int) -> T[]` (LIMIT/OFFSET pushed to real SQL, not `all().take(n)`
+— see GRAMMAR.md §3.48), `insert(Omit<T,"id">) -> T`, `applyPatch(id, patch) -> T`,
+`delete(id) -> Bool`, `deleteWhere(pred) -> Int`, `subscribe()` (see rule 5).
 
 ## CLI
 

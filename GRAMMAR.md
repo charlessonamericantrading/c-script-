@@ -69,6 +69,7 @@
   - [3.45 `String.escapeHtml()`: sanitizar datos en una página — RESUELTO (alcance acotado)](#345-stringescapehtml-sanitizar-datos-en-una-página--resuelto-alcance-acotado)
   - [3.46 `response.setStatus(code)`: página 404 propia para un `@route` — RESUELTO](#346-responsesetstatuscode-página-404-propia-para-un-route--resuelto)
   - [3.47 `http.getWithHeaders`/`http.postWithHeaders`: headers en llamadas salientes — RESUELTO](#347-httpgetwithheadershttppostwithheaders-headers-en-llamadas-salientes--resuelto)
+  - [3.48 `db.<coleccion>.page(limit, offset)`: paginación real, empujada a SQL — RESUELTO](#348-dbcoleccionpagelimit-offset-paginación-real-empujada-a-sql--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -2556,6 +2557,72 @@ mismo criterio de robustez que ya prueba `cli_smtp.rs` para el llamado
 saliente equivalente por SMTP. De paso, esta ronda le dio a `http.get`/
 `http.post` su primera cobertura de tests real (no tenían ninguna hasta
 ahora).
+
+### 3.48 `db.<coleccion>.page(limit, offset)`: paginación real, empujada a SQL — RESUELTO
+
+Antes de esta ronda, la única forma de acotar cuántas filas trae una
+colección era `.all().take(n)` -- pero `.take` (§3.10, un método de
+`List<T>` genérico, no de una colección de `db`) corre DESPUÉS de que
+`.all()` ya trajo la tabla ENTERA a memoria. Para una tabla chica no se
+nota; para una con miles de filas, pedir "la página 400" seguía costando
+exactamente lo mismo que traer la tabla completa. `page` resuelve esto de
+la única forma real posible: `LIMIT`/`OFFSET` viajan DENTRO del SQL.
+
+```
+rpc listUsers(limit: Int, offset: Int) -> User[] {
+  db.users.page(limit, offset)
+}
+```
+
+**Un método nuevo, no una segunda forma de `.take`.** `db.<c>.take` (el
+método de `List<T>`) sigue significando "de lo que ya tengo en memoria,
+los primeros N" -- eso no cambia, y sigue siendo la herramienta correcta
+para acotar el resultado de `.findWhere(pred)` (que de por sí ya trae todo
+a memoria para poder evaluar el predicado -- SQL pushdown de un predicado
+arbitrario es un problema aparte, no resuelto acá). `page` es la
+herramienta nueva y distinta: dos argumentos siempre, sin default (mismo
+criterio de "nombre explícito por forma" que ya usa §3.47 para no
+convertir esto en la primera aridad variable del lenguaje sobre un mismo
+nombre).
+
+**Mismo orden que `.all()`, siempre.** `ORDER BY "id"` en ambos casos --
+paginar con un orden distinto en cada query dejaría que una fila
+aparezca en dos páginas, o en ninguna, según cuándo se ejecute cada
+consulta. Página determinística, no "lo que el motor devuelva esta vez".
+
+**Portátil entre SQLite y Postgres sin ninguna rama por backend.**
+`LIMIT $1 OFFSET $2` (Postgres) / `LIMIT ? OFFSET ?` (SQLite) es idéntico
+en ambos dialectos -- mismo criterio que el resto de `db.rs`, que ya
+resuelve el placeholder correcto por backend (`Backend::placeholder`) sin
+que el código que arma la consulta necesite saber cuál es. `limit`/
+`offset` viajan como parámetros bindeados, nunca interpolados en el
+string SQL, aunque ya sean `Int` validados por el checker -- mismo
+criterio defensivo de siempre.
+
+**Validado en runtime, ambos backends.** `limit < 0` o `offset < 0` es un
+error claro ANTES de tocar el SQL -- Postgres rechaza un `OFFSET`
+negativo con su propio error (menos legible), y SQLite lo interpreta con
+una semántica propia distinta (trata un `LIMIT` negativo como "sin
+límite") que hubiera hecho que el mismo programa se comportara distinto
+según el backend -- exactamente la clase de divergencia entre capas que
+este proyecto viene evitando desde §3.9. Un `offset` más allá del final
+de la tabla no es un error: lista vacía, igual que pedir una página que
+no existe en cualquier API paginada real.
+
+**Límite honesto: sin cursor, sin "próxima página" implícito.** El
+caller arma el siguiente `offset` a mano (`offset + limit`) -- no hay un
+token de continuación opaco (paginación por cursor, mejor para tablas que
+cambian mientras se pagina) ni un total de páginas calculado por el
+lenguaje. Para eso, `count()` (ya existente) sigue siendo la forma de
+saber cuántas hay en total.
+
+**Verificado** contra los dos backends: `compiler/src/runtime/db.rs`
+(test unitario, SQLite en memoria) confirma páginas sin solapar, la
+última página parcial, un offset más allá del final (lista vacía, no
+error), y limit/offset negativos rechazados -- `compiler/tests/
+pg_integration.rs` repite exactamente el mismo caso contra un PostgreSQL
+real en CI, confirmando que el mismo programa se comporta igual en los
+dos backends.
 
 ---
 

@@ -3017,6 +3017,14 @@ impl Checker {
                 self.expect_no_args(args, "count")?;
                 Ok(Type::Int)
             }
+            "page" => {
+                let [limit_arg, offset_arg] = args else {
+                    return Err(err("'page' toma exactamente 2 argumentos (limit: Int, offset: Int)"));
+                };
+                self.check_expr(limit_arg, &Type::Int, env)?;
+                self.check_expr(offset_arg, &Type::Int, env)?;
+                Ok(Type::List(Box::new(element_ty.clone())))
+            }
 
 
 
@@ -3035,7 +3043,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch/delete/deleteWhere/findWhere/count/page/subscribe)"
             ))),
         }
     }
