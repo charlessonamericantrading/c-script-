@@ -68,6 +68,7 @@
   - [3.44 PostgreSQL LISTEN/NOTIFY: `stream` entre varias instancias — RESUELTO (alcance acotado)](#344-postgresql-listennotify-stream-entre-varias-instancias--resuelto-alcance-acotado)
   - [3.45 `String.escapeHtml()`: sanitizar datos en una página — RESUELTO (alcance acotado)](#345-stringescapehtml-sanitizar-datos-en-una-página--resuelto-alcance-acotado)
   - [3.46 `response.setStatus(code)`: página 404 propia para un `@route` — RESUELTO](#346-responsesetstatuscode-página-404-propia-para-un-route--resuelto)
+  - [3.47 `http.getWithHeaders`/`http.postWithHeaders`: headers en llamadas salientes — RESUELTO](#347-httpgetwithheadershttppostwithheaders-headers-en-llamadas-salientes--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -2480,6 +2481,81 @@ siempre) para un `@route` sin resultado, un 201 sobre un rpc JSON plano
 (confirmando que no está atado a HTML), y un código fuera de rango (`50`)
 devolviendo el 500 con el mensaje de validación esperado -- no un status
 HTTP roto llegando al cliente.
+
+### 3.47 `http.getWithHeaders`/`http.postWithHeaders`: headers en llamadas salientes — RESUELTO
+
+`http.get(url)`/`http.post(url, body)` (§3.5) ya existían, pero sin ninguna
+forma de mandar un header -- así que aunque la llamada saliente en sí
+funcionaba, autenticarse contra CUALQUIER API real de terceros era
+imposible: Stripe, GitHub, o cualquier servicio que exija `Authorization`
+(o cualquier otro header propio) rechazaba la request antes de mirarla
+siquiera. `env.get`/`crypto.hmacSha256` (§3.38) ya resolvían el lado
+ENTRANTE (verificar la firma de un webhook); este era el lado SALIENTE
+simétrico que quedaba pendiente.
+
+```
+type Header = { name: String, value: String }
+
+rpc createCharge(amountCents: Int) -> String {
+  http.postWithHeaders(
+    "https://api.stripe.com/v1/charges",
+    "amount=" + amountCents.toString() + "&currency=usd",
+    [
+      Header { name: "Authorization", value: "Bearer " + env.get("STRIPE_SECRET_KEY") },
+      Header { name: "Content-Type", value: "application/x-www-form-urlencoded" },
+    ]
+  )
+}
+```
+
+**Dos métodos NUEVOS, no una sobrecarga de los existentes.** `http.get`/
+`http.post` quedan exactamente como estaban -- ningún programa existente
+cambia de comportamiento. `getWithHeaders`/`postWithHeaders` son builtins
+aparte (mismo criterio que ya separa `Int`/`Int64`, o `check_program`/
+`check_program_with_files`, GRAMMAR.md en general): un nombre explícito por
+forma, en vez de una aridad variable sobre el mismo nombre, que hubiera
+sido la primera vez que un builtin de este lenguaje se comporta distinto
+según CUÁNTOS argumentos recibe.
+
+**El tipo de cada header es estructural, sin nombre.** El checker espera
+`{name: String, value: String}[]` -- un tipo ANÓNIMO (`Type::Struct{name:
+None, ...}`), no un `Header` inventado por el lenguaje. Como `type` en
+c-script ya es estructural (§3.2, `is_subtype` ignora el nombre), cualquier
+struct que el programa declare con esos dos campos sirve tal cual --
+`Header` en el ejemplo de arriba es una elección del programa, no una
+palabra reservada. Alternativa descartada: `Map<K,V>` (§4) parecía la
+opción obvia, pero NO tiene forma literal en c-script (`{K: V}` no se
+parsea -- ambigüedad real con un struct de un campo, §2.2) y ningún
+mecanismo para construir un valor desde cero -- solo existe como tipo de
+ANOTACIÓN. Reusar `List<T>` + struct, ambos con literal real ya
+existente, no necesitó ninguna sintaxis nueva.
+
+**Runtime: cada `(name, value)` se aplica con `Request::set` de `ureq`
+antes de mandar la request.** El checker ya garantiza la forma exacta
+(subtipado estructural), así que el error que puede tirar
+`http_headers_from_value` en runtime es defensivo -- el mismo criterio que
+ya vale para el `unwrap_or_else` de `@content_type` en `server.rs` -- no
+un caso que un programa bien tipado pueda alcanzar en la práctica.
+
+**Límite honesto: la respuesta sigue siendo solo el body, como texto.**
+Ni `http.get`/`http.post` ni las versiones con headers exponen el status
+code ni los headers de la RESPUESTA -- un 4xx/5xx de la API llamada se ve
+como un `Err`/`RuntimeError` genérico (el mensaje incluye el error de
+`ureq`, pero no como un valor que el programa pueda inspeccionar por
+campo). Suficiente para el caso que motivó esta ronda (crear un recurso y
+seguir, o fallar) pero no para lógica que necesite ramificar según el
+status exacto de la respuesta (ej. reintentar solo en 429, no en 402) --
+eso queda para una ronda aparte si hace falta.
+
+**Verificado** en `compiler/tests/cli_http.rs` contra un servidor HTTP real
+armado a mano en el propio test (no un mock interno): confirma que
+`Authorization`/headers custom llegan tal cual en un GET y un POST reales,
+que el body de un POST sigue viajando junto con los headers, y que un host
+inalcanzable falla con un error de runtime normal (500, sin panic) --
+mismo criterio de robustez que ya prueba `cli_smtp.rs` para el llamado
+saliente equivalente por SMTP. De paso, esta ronda le dio a `http.get`/
+`http.post` su primera cobertura de tests real (no tenían ninguna hasta
+ahora).
 
 ---
 

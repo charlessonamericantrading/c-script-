@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.11.0] - 2026-08-21
+
+### ✨ Nuevo
+- **`http.getWithHeaders`/`http.postWithHeaders`: headers en llamadas salientes.** `http.get`/`http.post` (v1.0) ya existían pero sin ninguna forma de mandar un header -- así que aunque la llamada saliente funcionaba, autenticarse contra CUALQUIER API real de terceros (Stripe, GitHub, cualquiera que exija `Authorization`) era imposible. Era el lado saliente que quedaba pendiente, simétrico a `env.get`/`crypto.hmacSha256` (v1.3, el lado entrante de verificar webhooks). Dos métodos NUEVOS, no una sobrecarga de aridad variable sobre los existentes -- `http.get`/`http.post` quedan sin cambios. El tipo de cada header es `{name: String, value: String}[]`, estructural y SIN nombre reservado por el lenguaje (`Map<K,V>` se descartó: no tiene forma literal en c-script, ningún mecanismo para construir un valor desde cero) -- cualquier struct que el programa declare con esos dos campos funciona, gracias al subtipado estructural que `type` ya tiene (v1.0). Límite honesto: ni la versión con headers ni la original exponen el status code ni los headers de la RESPUESTA -- un 4xx/5xx se ve como un error de runtime genérico, no un valor que el programa pueda inspeccionar. Verificado contra un servidor HTTP real armado a mano en el test (no un mock interno): confirma que los headers declarados llegan tal cual, que el body de un POST viaja junto con ellos, y que un host inalcanzable falla limpio (no panic) -- de paso, primera cobertura de tests real para `http.get`/`http.post`, que no tenían ninguna hasta ahora. Detalle completo: GRAMMAR.md §3.47.
+
 ## [1.10.0] - 2026-08-21
 
 ### ✨ Nuevo

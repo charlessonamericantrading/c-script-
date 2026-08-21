@@ -39,6 +39,24 @@ fn err(msg: impl Into<String>) -> CheckError {
     CheckError { message: msg.into(), span: None, file: None }
 }
 
+/// El tipo que `http.getWithHeaders`/`http.postWithHeaders` (GRAMMAR.md
+/// §3.47) esperan para cada header: SIN nombre (`name: None`) a propósito --
+/// el subtipado estructural (§3.2) ya acepta cualquier struct declarado por
+/// el usuario que tenga estos dos campos, así que no hace falta que el
+/// lenguaje invente un tipo `Header` propio ni que el usuario nombre el suyo
+/// de una forma particular. `is_subtype` ignora el nombre en la comparación
+/// (`structural_subtyping_ignores_the_name`, types.rs), que es exactamente
+/// la propiedad que esto usa.
+fn http_header_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "name".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "value".to_string(), optional: false, ty: Type::String },
+        ],
+    }
+}
+
 impl CheckError {
     /// El PRIMER stamp gana: a medida que un error burbujea desde adentro
     /// hacia afuera (ej. de una sub-expresión hasta la sentencia que la
@@ -2734,6 +2752,27 @@ impl Checker {
                 };
                 self.check_expr(url, &Type::String, env)?;
                 self.check_expr(body, &Type::String, env)?;
+                Some(Type::String)
+            }
+            (Type::Http, "getWithHeaders") => {
+                let [url, headers] = args else {
+                    return Err(err(
+                        "'http.getWithHeaders' toma exactamente 2 argumentos (url: String, headers: {name: String, value: String}[])",
+                    ));
+                };
+                self.check_expr(url, &Type::String, env)?;
+                self.check_expr(headers, &Type::List(Box::new(http_header_type())), env)?;
+                Some(Type::String)
+            }
+            (Type::Http, "postWithHeaders") => {
+                let [url, body, headers] = args else {
+                    return Err(err(
+                        "'http.postWithHeaders' toma exactamente 3 argumentos (url: String, body: String, headers: {name: String, value: String}[])",
+                    ));
+                };
+                self.check_expr(url, &Type::String, env)?;
+                self.check_expr(body, &Type::String, env)?;
+                self.check_expr(headers, &Type::List(Box::new(http_header_type())), env)?;
                 Some(Type::String)
             }
             (Type::Json, "parse") => {

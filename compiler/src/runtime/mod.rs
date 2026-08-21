@@ -993,6 +993,29 @@ fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#39;")
 }
 
+/// Extrae `(name, value)` de cada `Value::Struct` de la lista que
+/// `http.getWithHeaders`/`http.postWithHeaders` reciben como argumento de
+/// headers (GRAMMAR.md §3.47) -- el checker ya garantizó la forma
+/// (`http_header_type()`, checker.rs) vía subtipado estructural, así que el
+/// error de acá es defensivo, no un caso esperado en la práctica (mismo
+/// criterio que el `unwrap_or_else` de `@content_type` en server.rs).
+fn http_headers_from_value(items: &[Value]) -> Result<Vec<(String, String)>, RuntimeError> {
+    items
+        .iter()
+        .map(|item| {
+            let Value::Struct(fields) = item else {
+                return Err(err("cada header tiene que ser un struct con campos 'name' y 'value', ambos String"));
+            };
+            let name = fields.iter().find(|(n, _)| n == "name").map(|(_, v)| v);
+            let value = fields.iter().find(|(n, _)| n == "value").map(|(_, v)| v);
+            match (name, value) {
+                (Some(Value::Str(n)), Some(Value::Str(v))) => Ok((n.clone(), v.clone())),
+                _ => Err(err("cada header tiene que ser un struct con campos 'name' y 'value', ambos String")),
+            }
+        })
+        .collect()
+}
+
 /// Bytes del CSPRNG del sistema (BCryptGenRandom en Windows, getrandom(2) en
 /// Linux, random_get en WASI). Todo lo que en este lenguaje se llame
 /// "aleatorio" o "seguro" sale de acá, nunca del reloj.
@@ -1480,6 +1503,52 @@ fn call_method(
                     _ => return Err(err("http.post requiere un argumento Body String")),
                 };
                 match ureq::post(url).send_string(body) {
+                    Ok(resp) => {
+                        let text = resp.into_string().unwrap_or_default();
+                        Ok(Value::Str(text))
+                    }
+                    Err(e) => Err(err(format!("error HTTP al hacer POST a {url}: {e}"))),
+                }
+            }
+            "getWithHeaders" => {
+                let url = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.getWithHeaders requiere un argumento URL String")),
+                };
+                let headers = match args.get(1) {
+                    Some(Value::List(items)) => http_headers_from_value(items)?,
+                    _ => return Err(err("http.getWithHeaders requiere una lista de headers como segundo argumento")),
+                };
+                let mut req = ureq::get(url);
+                for (name, value) in &headers {
+                    req = req.set(name, value);
+                }
+                match req.call() {
+                    Ok(resp) => {
+                        let text = resp.into_string().unwrap_or_default();
+                        Ok(Value::Str(text))
+                    }
+                    Err(e) => Err(err(format!("error HTTP al hacer GET a {url}: {e}"))),
+                }
+            }
+            "postWithHeaders" => {
+                let url = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.postWithHeaders requiere un argumento URL String")),
+                };
+                let body = match args.get(1) {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.postWithHeaders requiere un argumento Body String")),
+                };
+                let headers = match args.get(2) {
+                    Some(Value::List(items)) => http_headers_from_value(items)?,
+                    _ => return Err(err("http.postWithHeaders requiere una lista de headers como tercer argumento")),
+                };
+                let mut req = ureq::post(url);
+                for (name, value) in &headers {
+                    req = req.set(name, value);
+                }
+                match req.send_string(body) {
                     Ok(resp) => {
                         let text = resp.into_string().unwrap_or_default();
                         Ok(Value::Str(text))
