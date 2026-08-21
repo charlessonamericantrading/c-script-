@@ -1031,10 +1031,29 @@ db { users: User[] }
                 other => panic!("select_grouped llamado con un método que Db::call no debería enrutar acá: '{other}'"),
             };
             // AVG en SQL siempre devuelve fraccionario, sin importar si la
-            // columna de origen es entera -- MAX/MIN/SUM sí preservan el
-            // tipo de la columna (una suma de INTEGER sigue siendo entera).
+            // columna de origen es entera -- MAX/MIN sí preservan el tipo
+            // de la columna a nivel LÓGICO. Pero a nivel de TIPO DE CABLE,
+            // Postgres promueve el resultado de SUM/AVG sobre una columna
+            // entera a `numeric` (precisión arbitraria) -- ni `i64` ni
+            // `f64` decodifican `numeric` directo (`postgres_cell`,
+            // store.rs). SQLite no tiene ese problema (afinidad de tipos,
+            // no tipos de cable fijos), así que esto pasó los tests
+            // locales y explotó recién en CI contra Postgres real -- hallado
+            // corriendo el job de Postgres, no por inspección de código.
+            // `CAST(expr AS BIGINT/DOUBLE PRECISION)` fuerza el tipo de
+            // cable de vuelta al que `kinds` promete, portable entre los
+            // dos motores (a diferencia de `::bigint`, sintaxis exclusiva
+            // de Postgres) -- incluso cuando ya sería un no-op (MAX sobre
+            // una columna entera, que Postgres nunca promueve), el cast es
+            // gratis y mantiene una sola regla sin memorizar la tabla de
+            // promoción de tipos de cada función agregada.
             let kind = if method == "avgBy" { ColumnKind::Float } else { value_col.kind() };
-            (format!("{sql_fn}(\"{value_field}\")"), kind)
+            let cast_as = match kind {
+                ColumnKind::Int => "BIGINT",
+                ColumnKind::Float => "DOUBLE PRECISION",
+                other => panic!("select_grouped: un selector de valor numérico no debería resolver a {other:?}"),
+            };
+            (format!("CAST({sql_fn}(\"{value_field}\") AS {cast_as})"), kind)
         };
 
         let key_ty = key_col.field.ty.clone();
