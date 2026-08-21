@@ -396,3 +396,95 @@ service Blog {
     assert_eq!(body, "<h1>Hola &lt;img src=x onerror=alert(1)&gt;</h1>");
     assert!(!body.contains("<img"), "el payload sin escapar no puede sobrevivir tal cual en la respuesta: {body}");
 }
+
+#[test]
+fn response_set_status_renders_a_branded_404_page_instead_of_the_json_error_path() {
+    // GRAMMAR.md §3.46: la brecha original -- un rpc `@route`+`@content_type`
+    // solo podía devolver 200 en el camino de éxito; cualquier "no
+    // encontrado" tenía que fallar (panic/Err), y un error SIEMPRE sale como
+    // JSON (server.rs), rompiendo justo la página HTML que se quería mostrar.
+    // Prueba contra el servidor real: el status HTTP de la respuesta tiene
+    // que ser 404 de verdad, con el HTML tal cual lo armó el rpc -- no el
+    // `{"error": ...}` de siempre.
+    let temp = TempDir::new("response-set-status-404");
+    let out = build(
+        &temp,
+        r#"
+type User = { id: Int, name: String }
+db { users: User[] }
+
+service Web {
+  @route("/users/:id")
+  @content_type("text/html")
+  rpc userPage(id: Int) -> String {
+    let found = db.users.find(id);
+    if found == null {
+      response.setStatus(404);
+      "<h1>404: usuario no encontrado</h1>"
+    } else {
+      "<h1>encontrado</h1>"
+    }
+  }
+}
+"#,
+    );
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&temp.0.join("app.link"));
+    let (status, content_type, body) = server.get("/users/999");
+    assert_eq!(status, 404);
+    assert_eq!(content_type, "text/html");
+    assert_eq!(body, "<h1>404: usuario no encontrado</h1>");
+}
+
+#[test]
+fn response_set_status_also_works_on_a_plain_json_rpc_for_a_2xx_other_than_200() {
+    // No está atado a `@content_type`/HTML -- cualquier rpc puede pedir un
+    // status de éxito distinto de 200 (ej. 201 Created para un `create`).
+    let temp = TempDir::new("response-set-status-json");
+    let out = build(
+        &temp,
+        r#"
+service Web {
+  rpc create(name: String) -> String {
+    response.setStatus(201);
+    "creado: " + name
+  }
+}
+"#,
+    );
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&temp.0.join("app.link"));
+    let (status, content_type, body) = server.post("/Web/create", &serde_json::json!({"name": "Ada"}).to_string());
+    assert_eq!(status, 201);
+    assert_eq!(content_type, "application/json; charset=utf-8");
+    assert_eq!(body, "\"creado: Ada\"");
+}
+
+#[test]
+fn response_set_status_rejects_a_code_outside_the_valid_http_range() {
+    // Validado en RUNTIME (el argumento puede ser cualquier expresión, no
+    // solo un literal, así que no hay forma de chequearlo en compilación) --
+    // pero SIGUE siendo un error claro, no un status HTTP inválido escrito
+    // tal cual al socket.
+    let temp = TempDir::new("response-set-status-invalid");
+    let out = build(
+        &temp,
+        r#"
+service Web {
+  rpc bad() -> String {
+    response.setStatus(50);
+    "no deberia llegar"
+  }
+}
+"#,
+    );
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&temp.0.join("app.link"));
+    let (status, content_type, body) = server.post("/Web/bad", "{}");
+    assert_eq!(status, 500);
+    assert_eq!(content_type, "application/json; charset=utf-8");
+    assert!(body.contains("un status HTTP válido está entre 100 y 599"), "body inesperado: {body}");
+}

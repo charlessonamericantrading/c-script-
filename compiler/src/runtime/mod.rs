@@ -97,6 +97,9 @@ pub enum Value {
     /// Marcador interno para el módulo `smtp` (GRAMMAR.md §3.43) -- mandar
     /// un email por SMTP.
     Smtp,
+    /// Marcador interno para el módulo `response` (GRAMMAR.md §3.46) --
+    /// controlar la respuesta HTTP de este rpc.
+    Response,
     BoundMethod(Box<Value>, String),
     /// Una `fn` de nivel superior referenciada POR NOMBRE, ej. `let g = add_one;`
     /// (GRAMMAR.md §3.10). Es una REFERENCIA a función (como un `fn` pointer
@@ -181,6 +184,7 @@ impl std::fmt::Debug for Value {
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
             Value::Smtp => write!(f, "Smtp"),
+            Value::Response => write!(f, "Response"),
             Value::BoundMethod(recv, method) => f.debug_tuple("BoundMethod").field(recv).field(method).finish(),
             Value::FnRef(name) => f.debug_tuple("FnRef").field(name).finish(),
             // A propósito NO imprime `captured_env` -- podría ser cíclico
@@ -393,6 +397,9 @@ pub(crate) fn eval_expr(
             if name == "smtp" {
                 return Ok(Value::Smtp);
             }
+            if name == "response" {
+                return Ok(Value::Response);
+            }
             // Un `const` de nivel superior: su valor es siempre un literal
             // (el checker lo exige), así que evaluarlo en un env vacío no
             // depende de nada del scope actual.
@@ -429,7 +436,7 @@ pub(crate) fn eval_expr(
                     .map(|(_, v)| v)
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -1435,6 +1442,20 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre smtp: '{other}'"))),
         },
+        Value::Response => match method {
+            "setStatus" => {
+                let code = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err(err("response.setStatus requiere un argumento Int")),
+                };
+                if !(100..=599).contains(&code) {
+                    return Err(err(format!("response.setStatus({code}): un status HTTP válido está entre 100 y 599")));
+                }
+                db.set_response_status(code as u16);
+                Ok(Value::Null)
+            }
+            other => Err(err(format!("método desconocido sobre response: '{other}'"))),
+        },
         Value::Http => match method {
             "get" => {
                 let url = match args.first() {
@@ -2116,7 +2137,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }

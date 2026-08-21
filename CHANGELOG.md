@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.10.0] - 2026-08-21
+
+### ✨ Nuevo
+- **`response.setStatus(code)`: página 404 propia para un `@route`.** Último límite honesto real que quedaba de v1.1.0/v1.6.0 — un rpc `@route`+`@content_type("text/html")` (pensado para navegación directa del browser, no para el cliente generado) solo podía devolver 200; "no encontrado" no tenía forma de ser otra cosa que un `Err`/panic, y un error SIEMPRE sale como JSON, rompiendo justo la página HTML que se quería mostrar. La primera idea de diseño (dejar que `@content_type` acepte `Result<String, E>`) se descartó: rompe el contrato de `Result<T,E>` que el cliente generado ya asume, y de todos modos `E` es un `enum` de dominio, no HTML. La pieza que realmente faltaba era más chica: que un rpc elija SU status en el camino de ÉXITO. Mismo mecanismo que `request.rawBody()`/`request.header()` (v1.3.0) — un side-channel por request dentro de `Db`, no una nueva forma de `Value` que hubiera divergido entre checker y runtime. No está atado a HTML: cualquier rpc puede pedir un status de éxito distinto de 200 (`201` en un `create`, por ejemplo). Validado en runtime (100–599, el argumento puede ser cualquier expresión, no un literal); un `Err` posterior a llamarlo lo ignora por completo, el camino de error sigue siendo JSON siempre. Verificado contra un servidor real: una 404 con HTML propio, un 201 sobre un rpc JSON plano, y un código fuera de rango devolviendo el 500 esperado. Detalle completo: GRAMMAR.md §3.46.
+
 ## [1.9.0] - 2026-08-21
 
 ### ✨ Nuevo

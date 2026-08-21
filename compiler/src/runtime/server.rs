@@ -649,16 +649,24 @@ fn handle_rpc(
     args_json: serde_json::Value,
 ) -> (u16, String, String) {
     match invoke_rpc_with_sessions(program, service_name, rpc_name, &args_json, db, sessions, token) {
-        Ok(result) => match declared_content_type(program, service_name, rpc_name) {
-            // El checker ya garantizó que un rpc con `@content_type` devuelve
-            // `String`, así que `as_str()` acá siempre acierta; el fallback
-            // existe para no inventar un panic si esa invariante se rompiera.
-            Some(ct) => {
-                let text = result.as_str().map(str::to_string).unwrap_or_else(|| result.to_string());
-                (200, text, ct)
+        Ok(result) => {
+            // `response.setStatus(code)` (GRAMMAR.md §3.46): consumido ACÁ,
+            // una sola vez, solo en el camino de éxito -- un `Err` de abajo
+            // nunca llega a este `match`, así que un override que el cuerpo
+            // haya pedido antes de fallar simplemente no se usa (queda para
+            // que `clear_request_context` lo limpie al final de la request).
+            let status = db.take_response_status().unwrap_or(200);
+            match declared_content_type(program, service_name, rpc_name) {
+                // El checker ya garantizó que un rpc con `@content_type` devuelve
+                // `String`, así que `as_str()` acá siempre acierta; el fallback
+                // existe para no inventar un panic si esa invariante se rompiera.
+                Some(ct) => {
+                    let text = result.as_str().map(str::to_string).unwrap_or_else(|| result.to_string());
+                    (status, text, ct)
+                }
+                None => (status, result.to_string(), JSON_CONTENT_TYPE.to_string()),
             }
-            None => (200, result.to_string(), JSON_CONTENT_TYPE.to_string()),
-        },
+        }
         // Un error SIEMPRE sale como JSON, aunque el rpc declare otro
         // Content-Type: el cliente generado espera `{"error": ...}` para
         // cualquier status >= 400, y una página de error en HTML rompería ese

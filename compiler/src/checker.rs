@@ -2210,6 +2210,9 @@ impl Checker {
                 if name == "smtp" {
                     return Ok(Type::Smtp);
                 }
+                if name == "response" {
+                    return Ok(Type::Response);
+                }
                 if name == "now" {
                     return Ok(Type::Function(vec![], Box::new(Type::Timestamp)));
                 }
@@ -2779,6 +2782,13 @@ impl Checker {
                 self.check_expr(to, &Type::String, env)?;
                 self.check_expr(subject, &Type::String, env)?;
                 self.check_expr(body, &Type::String, env)?;
+                Some(Type::Void)
+            }
+            (Type::Response, "setStatus") => {
+                let [code_arg] = args else {
+                    return Err(err("'response.setStatus' toma exactamente 1 argumento (code: Int)"));
+                };
+                self.check_expr(code_arg, &Type::Int, env)?;
                 Some(Type::Void)
             }
             (Type::Base64, "decode") => {

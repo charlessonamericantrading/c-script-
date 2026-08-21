@@ -281,6 +281,13 @@ pub struct Db {
     /// que sumar un campo acá es aditivo puro, sin tocar ninguna firma
     /// existente. `RefCell`, mismo criterio de siempre: un solo hilo.
     current_request: RefCell<Option<RequestContext>>,
+    /// `response.setStatus(code)` (GRAMMAR.md §3.46) para ESTA request --
+    /// mismo criterio que `current_request` (vive acá para no enhebrar un
+    /// parámetro nuevo por todas las firmas que ya cargan `db`), pero al
+    /// revés: la escribe el CUERPO del rpc, la lee `server.rs` una sola vez
+    /// después de que `invoke_rpc` vuelve con éxito. `Cell`, no `RefCell`
+    /// -- `Option<u16>` es `Copy`, no hace falta pedir prestado nada.
+    response_status_override: std::cell::Cell<Option<u16>>,
     /// Id aleatorio de ESTA instancia del proceso -- solo tiene sentido con
     /// Postgres (GRAMMAR.md §3.44): va adentro de cada `NOTIFY` para que el
     /// hilo de LISTEN de esta MISMA instancia pueda reconocer y descartar
@@ -504,6 +511,7 @@ impl Db {
             columns,
             subscribers: RefCell::new(HashMap::new()),
             current_request: RefCell::new(None),
+            response_status_override: std::cell::Cell::new(None),
             instance_id: random_instance_id(),
         }
     }
@@ -591,6 +599,7 @@ impl Db {
                 columns,
                 subscribers: RefCell::new(HashMap::new()),
                 current_request: RefCell::new(None),
+                response_status_override: std::cell::Cell::new(None),
                 instance_id,
             },
             remote_rx,
@@ -668,6 +677,29 @@ db { users: User[] }
     /// construcción en vez de "porque nadie se olvidó de limpiar").
     pub(crate) fn clear_request_context(&self) {
         *self.current_request.borrow_mut() = None;
+        // Defensa en profundidad simétrica a la de arriba -- si un rpc
+        // llamó `response.setStatus` y DESPUÉS erró/panicó (así que
+        // `handle_rpc` nunca llegó a consumirlo con `take_response_status`),
+        // esto evita que el valor sobreviva para la PRÓXIMA request.
+        self.response_status_override.set(None);
+    }
+
+    /// Llamado por `response.setStatus(code)` (GRAMMAR.md §3.46) -- guarda
+    /// el override para que `handle_rpc` lo use en vez de 200 al armar la
+    /// respuesta, SOLO en el camino de éxito (`handle_rpc` nunca llega a
+    /// leerlo si el rpc termina en `Err`: un error siempre va con el status
+    /// que le corresponde a la falla, nunca con uno que el cuerpo haya
+    /// pedido antes de fallar).
+    pub(crate) fn set_response_status(&self, code: u16) {
+        self.response_status_override.set(Some(code));
+    }
+
+    /// Consume el override (lo deja en `None` para la próxima invocación) --
+    /// `take`, no `get`, para que un valor de UNA request nunca sobreviva
+    /// por accidente a la que sigue si algún día `Db` se reusara de una
+    /// forma que hoy no pasa.
+    pub(crate) fn take_response_status(&self) -> Option<u16> {
+        self.response_status_override.take()
     }
 
     /// `""` -- no `None` -- fuera de una request HTTP real (ej. invocado

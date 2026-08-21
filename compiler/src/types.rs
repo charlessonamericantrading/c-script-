@@ -121,6 +121,10 @@ pub enum Type {
     /// Tipo interno para el módulo `smtp` builtin (GRAMMAR.md §3.43) --
     /// mandar un email por SMTP.
     Smtp,
+    /// Tipo interno para el módulo `response` builtin (GRAMMAR.md §3.46) --
+    /// controlar la respuesta HTTP de ESTE rpc (por ahora, solo el status
+    /// code en el camino de éxito).
+    Response,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -198,6 +202,7 @@ impl std::fmt::Display for Type {
             Type::Env => write!(f, "env"),
             Type::Request => write!(f, "request"),
             Type::Smtp => write!(f, "smtp"),
+            Type::Response => write!(f, "response"),
         }
     }
 }

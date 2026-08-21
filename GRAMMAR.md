@@ -67,6 +67,7 @@
   - [3.43 `smtp.send`: mandar email — RESUELTO (alcance acotado)](#343-smtpsend-mandar-email--resuelto-alcance-acotado)
   - [3.44 PostgreSQL LISTEN/NOTIFY: `stream` entre varias instancias — RESUELTO (alcance acotado)](#344-postgresql-listennotify-stream-entre-varias-instancias--resuelto-alcance-acotado)
   - [3.45 `String.escapeHtml()`: sanitizar datos en una página — RESUELTO (alcance acotado)](#345-stringescapehtml-sanitizar-datos-en-una-página--resuelto-alcance-acotado)
+  - [3.46 `response.setStatus(code)`: página 404 propia para un `@route` — RESUELTO](#346-responsesetstatuscode-página-404-propia-para-un-route--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1411,10 +1412,13 @@ puede; combinar dos anotaciones de la misma dimensión, no.
 
 **Límites honestos de esta ronda:**
 
-- **Los errores siguen saliendo en JSON**, aunque el rpc declare HTML. Es
-  deliberado: el cliente generado espera `{"error": ...}` para cualquier status
-  ≥ 400, y devolver una página de error rompería ese contrato justo cuando algo
-  ya salió mal. No hay forma de servir una página de error 404 propia.
+- **Los errores de TRANSPORTE siguen saliendo en JSON**, aunque el rpc declare
+  HTML -- deliberado, sigue vigente: el cliente generado espera `{"error": ...}`
+  para cualquier status ≥ 400 causado por un `Err`/panic, y una página de error
+  ahí rompería ese contrato justo cuando algo ya salió mal. **Resuelto para el
+  caso que sí importa (§3.46):** un rpc puede pedir su PROPIO status (`response.
+  setStatus`, ej. 404) en el camino de ÉXITO -- una página HTML "no encontrado"
+  no es un error de transporte, es una respuesta válida con otro status.
 - **El ruteo no cambió**: la URL sigue siendo `/Servicio/rpc`. Para SEO de
   verdad hacen falta rutas limpias (`/blog/mi-articulo`) y parámetros en el
   path, que es una ronda aparte — hoy se resuelve con un proxy adelante.
@@ -1651,14 +1655,16 @@ implementan la misma regla por separado, y divergen).
 - **Sin trailing slash ni normalización.** `/blog/mi-post/` (con barra
   final) NO matchea `/blog/:slug` -- es un segmento vacío, rechazado como
   cualquier otro.
-- **Los errores de un rpc con `@route` siguen siendo JSON**, nunca una
-  página de error en HTML -- mismo criterio que ya vale para
+- **Los errores DE TRANSPORTE de un rpc con `@route` siguen siendo JSON**,
+  nunca una página de error en HTML -- mismo criterio que ya vale para
   `@content_type` (§3.35): el cliente generado espera `{"error": ...}` para
-  cualquier status ≥ 400.
+  cualquier status ≥ 400 causado por un `Err`/panic. Una 404 "no encontrado"
+  propia, en cambio, ya no necesita eso -- `response.setStatus` (§3.46)
+  resuelve ese caso desde el camino de éxito.
 
-Para cualquiera de estos límites -- rutas de dos parámetros, una 404 propia,
-servir estáticos de verdad -- [`docs/routing.md`](../docs/routing.md) tiene
-el patrón de proxy (nginx/Caddy) que los resuelve sin tocar `linkc`.
+Para cualquiera de estos límites -- rutas de dos parámetros, servir
+estáticos de verdad -- [`docs/routing.md`](../docs/routing.md) tiene el
+patrón de proxy (nginx/Caddy) que los resuelve sin tocar `linkc`.
 
 **Verificado** en `compiler/tests/cli_route.rs` contra un servidor real,
 hablando HTTP de verdad: un `GET` sin body a una ruta con parámetro String,
@@ -2387,6 +2393,93 @@ la respuesta HTTP real lo devuelve escapado -- `<img` nunca aparece tal
 cual en el body -- no solo que el método produce el string esperado en
 aislamiento. Unit tests adicionales (`runtime/mod.rs`) fijan los 5
 caracteres y el orden de escape (`&` primero).
+
+### 3.46 `response.setStatus(code)`: página 404 propia para un `@route` — RESUELTO
+
+Último límite honesto real que quedaba de §3.35/§3.37: un rpc `@route` +
+`@content_type("text/html")` -- pensado para que alguien navegue a esa URL
+directo desde el navegador, no para el cliente generado -- solo podía
+devolver 200. "No encontrado" no tenía forma de ser otra cosa que un
+`Err`/panic, y un error SIEMPRE sale como JSON (§3.35), rompiendo justo la
+página HTML que se quería mostrar en el peor momento.
+
+**La pregunta de diseño real no era sobre `Result<T,E>`.** La primera idea
+-- dejar que `@content_type` acepte `Result<String, E>`, con `Err`
+mapeando a un status fijo -- rompe el contrato que el cliente generado ya
+asume (`Result<T,E>` viaja siempre como `{type:"Ok"|"Err", ...}` en un 200,
+GRAMMAR.md §3.5) y además no resuelve nada: `E` es un `enum` de dominio,
+no HTML, así que igual haría falta una segunda pieza para convertirlo en
+markup. Reformulado, el problema es más chico de lo que parecía: la única
+pieza que faltaba es que un rpc pueda elegir SU status en el camino de
+ÉXITO -- "no encontrado" no es un error de transporte, es una respuesta
+válida con otro status y un body distinto.
+
+```
+@route("/users/:id")
+@content_type("text/html")
+rpc userPage(id: Int) -> String {
+  let found = db.users.find(id);
+  if found == null {
+    response.setStatus(404);
+    "<h1>404: usuario no encontrado</h1>"
+  } else {
+    "<h1>encontrado</h1>"
+  }
+}
+```
+
+**Diseño: side-channel por request, mismo mecanismo que `request.rawBody()`/
+`request.header()` (§3.38), no una nueva forma de valor.** `response` es un
+módulo builtin más (mismo lugar que `db`/`http`/`env`); `setStatus(code)`
+NO devuelve el status en el valor de retorno del rpc (eso hubiera exigido
+inventar una representación de `Value` que "es un `String`" para el checker
+pero carga algo más en runtime -- exactamente la clase de divergencia
+checker-vs-runtime que este proyecto viene evitando desde §3.9). En cambio,
+guarda el código en un `Cell` por request dentro de `Db` -- el mismo lugar
+donde ya vive el contexto de la request entrante -- y `server.rs` lo
+consume UNA vez, después de que `invoke_rpc` vuelve con éxito, para elegir
+el status de la respuesta en vez de 200 fijo. Si el rpc no lo llama nunca,
+el comportamiento no cambia: 200, como siempre.
+
+**No está atado a `@content_type`/HTML.** Cualquier rpc puede pedir un
+status de éxito distinto de 200 -- un `create` que quiere devolver 201, un
+`delete` que quiere 204. El caso motivador es la página HTML, pero la
+herramienta es más general a propósito: no hay ninguna razón real para
+restringirla a un solo tipo de contenido.
+
+**Validado en runtime, no en compilación.** El argumento puede ser
+cualquier expresión (`response.setStatus(a_veces_calculado)`), no solo un
+literal, así que no hay forma de chequear el valor exacto en el checker --
+`setStatus` exige `Int` como tipo, y en runtime rechaza cualquier código
+fuera de 100–599 con un error claro, en vez de escribir un status HTTP
+inválido tal cual al socket.
+
+**Camino de error, sin cambios: sigue siendo JSON siempre.** Si el rpc
+termina en `Err`/panic DESPUÉS de haber llamado `response.setStatus`, ese
+override nunca se usa -- `handle_rpc` solo lo consume en la rama `Ok`,
+antes de armar la respuesta; el status de un error sigue saliendo de
+`status_for(&RuntimeError)` como siempre (§3.35 sigue vigente ahí). El
+`Cell` se limpia igual al final de la request (mismo `clear_request_context`
+que ya limpiaba `request.rawBody()`) para que un override nunca sobreviva
+a la request que lo pidió.
+
+**Límite honesto:** dentro de un `stream`, llamarlo es un no-op silencioso
+-- el status de una conexión SSE está fijado en 200 para toda la conexión
+(§3.13), no por evento, así que no hay ningún status que cambiar ahí. No
+hay un error de compilación para este caso porque detectarlo exigiría que
+el checker sepa, en cada punto de una expresión arbitrariamente anidada,
+si está dentro del cuerpo de un `stream` o de un `rpc` normal -- una pieza
+de contexto que hoy no se enhebra por `check_expr` y que agregar solo para
+esto sería una complicación real a cambio de rechazar un caso de uso que,
+en la práctica, no tiene ningún motivo para aparecer (nadie escribe
+`response.setStatus` dentro de un `stream` esperando que haga algo).
+
+**Verificado** en `compiler/tests/cli_content_type.rs` contra un servidor
+real: una 404 con el HTML propio del rpc (no el `{"error": ...}` de
+siempre) para un `@route` sin resultado, un 201 sobre un rpc JSON plano
+(confirmando que no está atado a HTML), y un código fuera de rango (`50`)
+devolviendo el 500 con el mensaje de validación esperado -- no un status
+HTTP roto llegando al cliente.
 
 ---
 
