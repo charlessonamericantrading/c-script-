@@ -2936,6 +2936,24 @@ impl Checker {
                 self.check_expr(body, &Type::String, env)?;
                 Some(Type::Void)
             }
+            (Type::Smtp, "sendToMany") => {
+                let [to, subject, body] = args else {
+                    return Err(err("'smtp.sendToMany' toma exactamente 3 argumentos (to: String[], subject: String, body: String)"));
+                };
+                self.check_expr(to, &Type::List(Box::new(Type::String)), env)?;
+                self.check_expr(subject, &Type::String, env)?;
+                self.check_expr(body, &Type::String, env)?;
+                Some(Type::Void)
+            }
+            (Type::Smtp, "sendHtml") => {
+                let [to, subject, html] = args else {
+                    return Err(err("'smtp.sendHtml' toma exactamente 3 argumentos (to: String[], subject: String, html: String)"));
+                };
+                self.check_expr(to, &Type::List(Box::new(Type::String)), env)?;
+                self.check_expr(subject, &Type::String, env)?;
+                self.check_expr(html, &Type::String, env)?;
+                Some(Type::Void)
+            }
             (Type::Response, "setStatus") => {
                 let [code_arg] = args else {
                     return Err(err("'response.setStatus' toma exactamente 1 argumento (code: Int)"));

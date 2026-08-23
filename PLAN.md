@@ -275,7 +275,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - Tipos `Timestamp` (ISO-8601 UTC) e `Int64` (mismo rango 64-bit sin pérdida de precisión en TS), más builtin `now() -> Timestamp` (GRAMMAR.md §3.30–§3.32).
 - Toolchain integral: `linkc build`, `serve`, `test`, `dev`, `lint`, `doc`, `docker`, `lsp`, `new`, `fmt`.
 
-**Evolución Post-1.0 (v1.1.0 a v1.23.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
+**Evolución Post-1.0 (v1.1.0 a v1.24.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
 - **PostgreSQL en Runtime** (v1.1.0/v1.4.0/v1.8.0, GRAMMAR.md §3.36/§3.40/§3.44): Soporte de base de datos PostgreSQL real (`--db postgres://...`), auto-migraciones de esquema no destructivas, TLS oportunista y obligatorio vía `rustls` puro (compatible con Supabase/Neon/RDS), auto-reconexión transparente tras corte y LISTEN/NOTIFY en hilo dedicado para sincronizar `stream` SSE entre múltiples instancias.
 - **Criptografía y Seguridad** (v1.1.0/v1.3.0/v1.5.0, GRAMMAR.md §3.34/§3.38/§3.41): Argon2id (RFC 9106) con sal aleatoria en formato PHC y verificación en tiempo constante; tokens de sesión y UUIDs alimentados por el CSPRNG del sistema operativo (`getrandom`); cálculo de HMAC-SHA256 para verificación de webhooks; CORS con allowlist configurable (`--cors-origin`) y cabeceras de seguridad estrictas fijas (`nosniff`, `DENY`, `no-referrer`).
 - **Extensibilidad Web y SEO** (v1.1.0/v1.2.0/v1.6.0/v1.9.0/v1.10.0, GRAMMAR.md §3.35/§3.37/§3.42/§3.45/§3.46): Decorador `@content_type("...")` para respuestas no-JSON (HTML, XML, CSV); URLs amigables `@route("/...")` con múltiples parámetros dinámicos y precedencia determinística; sanitización explícita `String.escapeHtml()`; y selección de status HTTP en éxito `response.setStatus(code)` (e.g. páginas 404 personalizadas o 201 Created).
@@ -286,6 +286,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - **Inspección de Respuestas HTTP Salientes** (v1.21.0, GRAMMAR.md §3.60): `http.getWithStatus`/`http.postWithStatus` devuelven `{status: Int, headers: {...}[], body: String}` -- un 4xx/5xx de la API llamada deja de ser un error de runtime genérico y pasa a ser un dato que el programa puede inspeccionar (ej. reintentar solo en 429). `http.get`/`http.post`/`http.getWithHeaders`/`http.postWithHeaders` quedan sin cambios.
 - **Paginación por Cursor** (v1.22.0, GRAMMAR.md §3.61): `db.<c>.pageAfter(cursor, limit)` -- el cursor es el `id` del último elemento visto (`null` para la primera página), estable bajo escritura concurrente a diferencia de `page(limit, offset)`, que cuenta filas desde el principio en cada llamada. `page` queda sin cambios, sigue siendo la opción correcta para saltar a una página arbitraria.
 - **`@route` con Query String** (v1.23.0, GRAMMAR.md §3.62): cualquier parámetro del rpc que no esté en el path se lee de la query string por nombre (`String`/`Int` obligatorio, `String?`/`Int?` opcional). De paso, corrigió un bug real: la query string se coleaba entera dentro del último segmento de path capturado (ej. `/blog/slug?utm_source=x` corrompía `:slug`) -- ahora se separa antes de partir en segmentos, para toda ruta, tenga o no parámetros de query declarados.
+- **`smtp` a Varios Destinatarios y HTML** (v1.24.0, GRAMMAR.md §3.63): `smtp.sendToMany(to, subject, body)` manda un mensaje con un `RCPT TO` por destinatario; `smtp.sendHtml(to, subject, html)` manda cuerpo HTML. `send` queda sin cambios. Envío asíncrono sigue pendiente (§8.3.3).
 
 **Hitos "go / no-go":**
 - Fin de Fase 0: ✅ Demo E2E probada y verificada.
@@ -329,7 +330,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 ## 8. Hoja de Ruta Futura (Fase 4 · Hacia c-script 2.0)
 
-Con las Fases 0 a 3 completadas y el núcleo v1.23.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
+Con las Fases 0 a 3 completadas y el núcleo v1.24.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
 
 ### 8.1 Ecosistema y Distribución
 1. **Publicación en el registro npm**: Empaquetar y publicar `link-lang` en npm para permitir ejecución vía `npx linkc` o instalación global estándar.
@@ -344,7 +345,7 @@ Con las Fases 0 a 3 completadas y el núcleo v1.23.0 plenamente operativo, las s
 ### 8.3 Runtime y Comunicaciones
 1. **Limpieza proactiva de sesiones**: Implementar recolección periódica en segundo plano para sesiones expiradas bajo `--session-ttl`.
 2. **Rate limiting distribuido**: Permitir configuración de proxies de confianza (`X-Forwarded-For`) y adaptadores para estado compartido (e.g. Redis) en despliegues con réplicas.
-3. **Mejoras en `smtp.send`**: Soporte para envío asíncrono no bloqueante, múltiples destinatarios y cuerpos HTML.
+3. **Envío asíncrono no bloqueante para `smtp`**: `send`/`sendToMany`/`sendHtml` (GRAMMAR.md §3.63) siguen siendo sincrónicos -- un relay lento hace lento al servidor entero (de un solo hilo) mientras dura esa request. Múltiples destinatarios y cuerpo HTML ya están resueltos.
 
 ### 8.4 Autenticación y Seguridad
 1. **Carga opcional del `User` completo en sesión**: `auth.currentRole()`/`currentUserId()` exponen rol e id, pero cargar el struct completo sigue requiriendo `db.users.find(uid)` explícito en cada rpc que lo necesite.

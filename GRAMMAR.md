@@ -84,6 +84,7 @@
   - [3.60 `http.getWithStatus`/`http.postWithStatus`: código de estado y headers de la respuesta — RESUELTO](#360-httpgetwithstatushttppostwithstatus-código-de-estado-y-headers-de-la-respuesta--resuelto)
   - [3.61 `db.<c>.pageAfter(cursor, limit)`: cursor de continuación — RESUELTO](#361-dbcpageaftercursor-limit-cursor-de-continuación--resuelto)
   - [3.62 `@route` con parámetros de query string — RESUELTO](#362-route-con-parámetros-de-query-string--resuelto)
+  - [3.63 `smtp.sendToMany()`/`smtp.sendHtml()`: varios destinatarios y cuerpo HTML — RESUELTO](#363-smtpsendtomanysmtpsendhtml-varios-destinatarios-y-cuerpo-html--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3190,6 +3191,32 @@ service Search {
 **Decodificación:** `+` significa espacio en un valor de query string (`application/x-www-form-urlencoded`) -- a diferencia de un segmento de path, donde `+` es un caracter literal. `%XX` se decodifica igual en los dos casos. Un query param no declarado por el rpc (como `utm_source` en el ejemplo de arriba) se ignora sin error -- ni bloquea, ni se cuela en ningún lado.
 
 **Verificado** contra un servidor real (`cli_route.rs`): query param obligatorio y opcional leídos por nombre; falta el obligatorio -> 400 nombrando cuál; un `Int` inválido -> 400; la query string ya NO corrompe el segmento de path capturado (el test que fija el bug de arriba); un query param desconocido no pisa uno real; `+`/`%XX` decodificados correctamente.
+
+---
+
+### 3.63 `smtp.sendToMany()`/`smtp.sendHtml()`: varios destinatarios y cuerpo HTML — RESUELTO
+
+`smtp.send` (§3.43) mandaba texto plano a UN destinatario -- mandar a varios significaba una llamada por destinatario (N conversaciones SMTP separadas, no un solo mensaje con varios `RCPT TO`), y no había forma de mandar HTML, algo que cualquier notificación transaccional real (confirmación de compra, bienvenida) necesita.
+
+<!-- linkc:fragment -->
+```rust
+rpc notifyTeam(emails: String[], subject: String, html: String) -> Void {
+  smtp.sendHtml(emails, subject, html)
+}
+```
+
+**Dos métodos nuevos, `send` sin cambios** -- mismo criterio que `getWithHeaders`/`getWithStatus` (§3.47/§3.60): agregar, no sobrecargar.
+
+| Método | Firma | Qué hace |
+|---|---|---|
+| `smtp.sendToMany(to, subject, body)` | `(String[], String, String) -> Void` | Texto plano, UN mensaje con un `RCPT TO:` por destinatario -- no N conversaciones SMTP separadas. |
+| `smtp.sendHtml(to, subject, html)` | `(String[], String, String) -> Void` | Cuerpo HTML (`Content-Type: text/html`), a uno o varios destinatarios -- `to` es lista también acá, un solo elemento cubre el caso de un destinatario. |
+
+Los dos comparten la conexión/remitente desde el ENTORNO del proceso (`LINK_SMTP_URL`/`LINK_SMTP_FROM`), mismo criterio de siempre (§3.43) -- ninguno de los dos agrega una forma de que el rpc elija el remitente. `to` vacío es un error de runtime claro, no un mensaje mandado a nadie.
+
+**Límites honestos que siguen en pie:** sin adjuntos, sin `cc`/`bcc`, sin envío asíncrono -- los tres son sincrónicos, un relay lento sigue haciendo lento al servidor entero (de un solo hilo) mientras dura esa request. Nada de esto cambió respecto a `send`.
+
+**Verificado** contra un servidor SMTP real armado a mano en el test (`cli_smtp.rs`, habla el protocolo real: EHLO/MAIL FROM/RCPT TO/DATA), no un mock interno: `sendToMany` con dos destinatarios produce dos `RCPT TO:` en la MISMA conversación; una lista vacía falla limpio; `sendHtml` produce un mensaje con `Content-Type: text/html` y el markup sin escapar en el body.
 
 ---
 

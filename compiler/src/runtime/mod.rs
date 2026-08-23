@@ -1021,6 +1021,45 @@ fn ureq_response_to_value(resp: ureq::Response) -> Value {
     ])
 }
 
+/// Arma y manda un email de verdad vía `lettre`, compartido por `smtp.send`
+/// (1 destinatario, texto plano -- sin cambios de comportamiento), y las dos
+/// variantes nuevas de la ronda `sendToMany`/`sendHtml` (GRAMMAR.md §3.63):
+/// `to` siempre es una lista (de 1 o más), `is_html` elige el `Content-Type`
+/// del cuerpo. Conexión y remitente salen del ENTORNO del proceso, nunca de
+/// argumentos del rpc (GRAMMAR.md §3.43) -- mismo criterio que
+/// `LINK_DATABASE_URL`: un `.link` no debería poder hardcodear ni filtrar
+/// credenciales de un relay SMTP, y dejar que cualquier caller elija el
+/// remitente abriría la puerta a spoofear el `From:` con datos de la
+/// request.
+fn send_email(to: &[String], subject: &str, body: &str, is_html: bool) -> Result<(), RuntimeError> {
+    if to.is_empty() {
+        return Err(err("smtp: 'to' no puede ser una lista vacía -- hace falta al menos un destinatario"));
+    }
+    let url = std::env::var("LINK_SMTP_URL")
+        .map_err(|_| err("smtp: falta la variable de entorno LINK_SMTP_URL (ej. 'smtps://usuario:clave@smtp.proveedor.com')"))?;
+    let from = std::env::var("LINK_SMTP_FROM").map_err(|_| err("smtp: falta la variable de entorno LINK_SMTP_FROM (la dirección remitente)"))?;
+
+    let from_mbox: lettre::message::Mailbox =
+        from.parse().map_err(|e| err(format!("smtp: LINK_SMTP_FROM ('{from}') no es una dirección válida: {e}")))?;
+
+    let mut builder = lettre::Message::builder().from(from_mbox);
+    for addr in to {
+        let mbox: lettre::message::Mailbox =
+            addr.parse().map_err(|e| err(format!("smtp: 'to' ('{addr}') no es una dirección válida: {e}")))?;
+        builder = builder.to(mbox);
+    }
+    builder = builder.subject(subject);
+    if is_html {
+        builder = builder.header(lettre::message::header::ContentType::TEXT_HTML);
+    }
+    let email = builder.body(body.to_string()).map_err(|e| err(format!("smtp: no se pudo armar el mensaje: {e}")))?;
+
+    use lettre::Transport;
+    let mailer = lettre::SmtpTransport::from_url(&url).map_err(|e| err(format!("smtp: LINK_SMTP_URL inválida: {e}")))?.build();
+    mailer.send(&email).map_err(|e| err(format!("smtp: no se pudo mandar el email: {e}")))?;
+    Ok(())
+}
+
 fn http_headers_from_value(items: &[Value]) -> Result<Vec<(String, String)>, RuntimeError> {
     items
         .iter()
@@ -1525,33 +1564,39 @@ fn call_method(
                 else {
                     return Err(err("smtp.send requiere 3 argumentos String (to, subject, body)"));
                 };
-                // Conexión y remitente salen del ENTORNO del proceso, nunca
-                // de argumentos del rpc (GRAMMAR.md §3.43) -- mismo criterio
-                // que `LINK_DATABASE_URL`: un `.link` no debería poder
-                // hardcodear ni filtrar credenciales de un relay SMTP, y
-                // dejar que cualquier caller elija el remitente abriría la
-                // puerta a spoofear el `From:` con datos de la request.
-                let url = std::env::var("LINK_SMTP_URL")
-                    .map_err(|_| err("smtp.send: falta la variable de entorno LINK_SMTP_URL (ej. 'smtps://usuario:clave@smtp.proveedor.com')"))?;
-                let from = std::env::var("LINK_SMTP_FROM")
-                    .map_err(|_| err("smtp.send: falta la variable de entorno LINK_SMTP_FROM (la dirección remitente)"))?;
-
-                let from_mbox: lettre::message::Mailbox =
-                    from.parse().map_err(|e| err(format!("smtp.send: LINK_SMTP_FROM ('{from}') no es una dirección válida: {e}")))?;
-                let to_mbox: lettre::message::Mailbox =
-                    to.parse().map_err(|e| err(format!("smtp.send: 'to' ('{to}') no es una dirección válida: {e}")))?;
-                let email = lettre::Message::builder()
-                    .from(from_mbox)
-                    .to(to_mbox)
-                    .subject(subject.as_str())
-                    .body(body.clone())
-                    .map_err(|e| err(format!("smtp.send: no se pudo armar el mensaje: {e}")))?;
-
-                use lettre::Transport;
-                let mailer = lettre::SmtpTransport::from_url(&url)
-                    .map_err(|e| err(format!("smtp.send: LINK_SMTP_URL inválida: {e}")))?
-                    .build();
-                mailer.send(&email).map_err(|e| err(format!("smtp.send: no se pudo mandar el email: {e}")))?;
+                send_email(std::slice::from_ref(to), subject, body, false)?;
+                Ok(Value::Null)
+            }
+            "sendToMany" => {
+                let (Some(Value::List(to)), Some(Value::Str(subject)), Some(Value::Str(body))) =
+                    (args.first(), args.get(1), args.get(2))
+                else {
+                    return Err(err("smtp.sendToMany requiere (to: String[], subject: String, body: String)"));
+                };
+                let to: Vec<String> = to
+                    .iter()
+                    .map(|v| match v {
+                        Value::Str(s) => Ok(s.clone()),
+                        other => Err(err(format!("smtp.sendToMany: 'to' tiene que ser una lista de String, se encontró {other:?}"))),
+                    })
+                    .collect::<Result<_, _>>()?;
+                send_email(&to, subject, body, false)?;
+                Ok(Value::Null)
+            }
+            "sendHtml" => {
+                let (Some(Value::List(to)), Some(Value::Str(subject)), Some(Value::Str(html))) =
+                    (args.first(), args.get(1), args.get(2))
+                else {
+                    return Err(err("smtp.sendHtml requiere (to: String[], subject: String, html: String)"));
+                };
+                let to: Vec<String> = to
+                    .iter()
+                    .map(|v| match v {
+                        Value::Str(s) => Ok(s.clone()),
+                        other => Err(err(format!("smtp.sendHtml: 'to' tiene que ser una lista de String, se encontró {other:?}"))),
+                    })
+                    .collect::<Result<_, _>>()?;
+                send_email(&to, subject, html, true)?;
                 Ok(Value::Null)
             }
             other => Err(err(format!("método desconocido sobre smtp: '{other}'"))),

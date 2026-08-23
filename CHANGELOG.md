@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.24.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`smtp.sendToMany()`/`smtp.sendHtml()`: varios destinatarios y cuerpo HTML.** `smtp.send` mandaba texto plano a UN destinatario -- mandar a varios significaba una llamada por destinatario (N conversaciones SMTP separadas), y no había forma de mandar HTML. Dos métodos nuevos, `send` sin cambios (mismo criterio que `getWithHeaders`/`getWithStatus`): `sendToMany(to: String[], subject, body)` manda UN mensaje con un `RCPT TO:` por destinatario; `sendHtml(to: String[], subject, html)` manda `Content-Type: text/html`, a uno o varios. Los dos siguen sacando conexión/remitente del entorno del proceso, nunca del rpc. Sigue sin adjuntos, cc/bcc, ni envío asíncrono -- los tres métodos son sincrónicos. Verificado contra un servidor SMTP real armado a mano en el test (`cli_smtp.rs`, habla EHLO/MAIL FROM/RCPT TO/DATA de verdad): dos destinatarios producen dos `RCPT TO` en la misma conversación, lista vacía falla limpio, el HTML llega con su Content-Type y sin escapar. 604 tests (3 nuevos). Detalle completo: GRAMMAR.md §3.63.
+
 ## [1.23.0] - 2026-08-23
 
 ### ✨ Nuevo

@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-601-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.23.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-604-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.24.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -34,9 +34,9 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 ## 📊 Status — what works and what does not
 
 This section is the ground truth. If any other section of this README disagrees with it,
-this section wins. Verified on 2026-08-23 by running the compiler, not by reading it.
+this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 601 automated tests:
+**Works today**, covered by 604 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
@@ -50,7 +50,7 @@ this section wins. Verified on 2026-08-23 by running the compiler, not by readin
 - Real pagination: `db.<c>.page(limit, offset)` pushes `LIMIT`/`OFFSET` into the actual SQL query (SQLite and Postgres both) instead of fetching the whole table and slicing in memory — same row order as `all()`, so pages never overlap or skip a row. `db.<c>.pageAfter(cursor, limit)` is a cursor-based alternative for sequential/infinite-scroll pagination — the cursor is the last-seen `id` (`null` for the first page), stable under concurrent inserts unlike `OFFSET`, which counts rows from the start on every call
 - Real aggregation: `db.<c>.sumBy(groupSelector, valueSelector)` / `countBy(groupSelector)` / `avgBy` / `maxBy` / `minBy` push a `GROUP BY` into actual SQL — MRR by plan, counts by status — instead of pulling every row into memory. Selectors must be a bare field access (`|o: Order| { o.planId }`); group-by is `String`/`Int`/`Bool`/`enum` only (no date truncation yet), the aggregated field must be `Int`/`Float`. Grouping by an `enum` field returns the real enum as the key, not a string
 - Per-client rate limiting: `@rate_limit("20/1m")` caps an rpc to N requests per time window per `(client IP, service, rpc)`, 429 on exceeding, token bucket with continuous refill
-- Sending email: `smtp.send(to, subject, body)` — connection (`LINK_SMTP_URL`) and sender (`LINK_SMTP_FROM`) come from the process environment, never from rpc arguments. TLS via pure-rustls, same stack as the PostgreSQL driver
+- Sending email: `smtp.send(to, subject, body)` — connection (`LINK_SMTP_URL`) and sender (`LINK_SMTP_FROM`) come from the process environment, never from rpc arguments. TLS via pure-rustls, same stack as the PostgreSQL driver. `smtp.sendToMany(to: String[], subject, body)` sends one message with one `RCPT TO` per recipient; `smtp.sendHtml(to: String[], subject, html)` sends an HTML body (`Content-Type: text/html`) to one or many recipients — `send` itself is unchanged
 - Configurable CORS and fixed security headers: `--cors-origin <origin>` (repeatable, or `LINK_CORS_ORIGINS`) switches from open `*` to a real allowlist (exact match, echoed literal + `Vary: Origin`); every response — including errors and `stream` SSE — carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`
 - `linkc fmt`, `linkc --help`, and the TypeScript client emitter for multi-service files all work correctly now
 - Real password hashing: `crypto.hashPassword` is Argon2id (RFC 9106) with a random per-password salt, in PHC format; `verifyPassword` compares in constant time and still accepts hashes written by the previous version so existing users are not locked out
@@ -66,7 +66,7 @@ this section wins. Verified on 2026-08-23 by running the compiler, not by readin
 | `@rate_limit` is per-process, in-memory | No persistence across restarts, no coordination across replicas if the same `.link` runs on more than one process; the client IP comes from the real TCP connection, never `X-Forwarded-For` (no trusted-proxy config yet, so behind a proxy this limits by the proxy's IP). |
 | `request.rawBody()` needs a JSON body | Argument parsing runs before any rpc, regardless of how many parameters it declares, so a non-JSON body (form-encoded, XML) never reaches the rpc — a JSON webhook payload with extra fields works fine. |
 | No CSP or HSTS | CSP depends on each page's actual content (no way to get a safe default without it); HSTS only makes sense over a connection that's already HTTPS, which `linkc serve` itself never is — both belong at the reverse proxy that terminates TLS in front of it. CORS allowlist entries are exact-match only, no wildcard subdomains. |
-| `smtp.send` is plain text, one recipient, blocking | No HTML body, no attachments, no cc/bcc; sending to several people means one call per recipient. It's synchronous — a slow relay makes the whole (single-threaded) server slow for that request. |
+| `smtp` has no attachments, cc/bcc, or async send | `smtp.send`/`sendToMany`/`sendHtml` cover plain-text and HTML bodies to one or many recipients (as of this round), but none of the three take an attachment or a cc/bcc list, and all three are synchronous — a slow relay makes the whole (single-threaded) server slow for that request. |
 | `--session-ttl` cleans up lazily | An expired session is only removed from memory the next time its token is used — one created and never touched again stays in memory until the process restarts. |
 | Full user struct is not auto-loaded into session | `auth.currentRole()` and `auth.currentUserId()` expose the authenticated role and numeric user id, but loading the full `User` struct into memory is done explicitly via `db.users.find(uid)`. |
 | Aggregation (`sumBy`/etc.) has no date bucketing or `Int64` support | Can't `GROUP BY` a truncated date (monthly cohorts, for example) — only bare `String`/`Int`/`Bool`/`enum` fields. `Int64` isn't a valid group or aggregate field yet either. |
@@ -258,7 +258,7 @@ wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_w
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **601 automated unit, integration and CLI tests**, including tests that
+Link is verified by **604 automated unit, integration and CLI tests**, including tests that
 spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
 example published in this repository's documentation:
 

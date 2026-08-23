@@ -24,13 +24,27 @@ service Sys {
     smtp.send(to, subject, body);
     "enviado"
   }
+
+  rpc notifyMany(to: String[], subject: String, body: String) -> String {
+    smtp.sendToMany(to, subject, body);
+    "enviado"
+  }
+
+  rpc notifyHtml(to: String[], subject: String, html: String) -> String {
+    smtp.sendHtml(to, subject, html);
+    "enviado"
+  }
 }
 "#;
 
 #[derive(Debug)]
 struct ReceivedMail {
     mail_from: String,
-    rcpt_to: String,
+    /// UNA entrada por comando `RCPT TO:` -- un mensaje a varios
+    /// destinatarios (§3.63) manda uno por destinatario antes de `DATA`, así
+    /// que un solo `String` (sobreescrito en cada comando) perdía a todos
+    /// menos el último.
+    rcpt_to: Vec<String>,
     data: String,
 }
 
@@ -70,7 +84,7 @@ fn handle_one_connection(stream: TcpStream, tx: Sender<ReceivedMail>) {
     let _ = write!(writer, "220 fake-smtp ready\r\n");
 
     let mut mail_from = String::new();
-    let mut rcpt_to = String::new();
+    let mut rcpt_to: Vec<String> = Vec::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -85,7 +99,7 @@ fn handle_one_connection(stream: TcpStream, tx: Sender<ReceivedMail>) {
             mail_from = cmd["MAIL FROM:".len()..].trim().to_string();
             let _ = write!(writer, "250 OK\r\n");
         } else if upper.starts_with("RCPT TO:") {
-            rcpt_to = cmd["RCPT TO:".len()..].trim().to_string();
+            rcpt_to.push(cmd["RCPT TO:".len()..].trim().to_string());
             let _ = write!(writer, "250 OK\r\n");
         } else if upper.starts_with("DATA") {
             let _ = write!(writer, "354 adelante\r\n");
@@ -102,6 +116,7 @@ fn handle_one_connection(stream: TcpStream, tx: Sender<ReceivedMail>) {
             }
             let _ = write!(writer, "250 OK: mensaje aceptado\r\n");
             let _ = tx.send(ReceivedMail { mail_from: mail_from.clone(), rcpt_to: rcpt_to.clone(), data });
+            rcpt_to.clear();
         } else if upper.starts_with("QUIT") {
             let _ = write!(writer, "221 bye\r\n");
             return;
@@ -240,9 +255,77 @@ fn smtp_send_delivers_a_real_message_over_a_real_smtp_conversation() {
 
     let mail = smtp.recv(Duration::from_secs(5)).expect("el servidor SMTP de mentira debió recibir un mensaje");
     assert_eq!(mail.mail_from, "<remitente@example.com>", "mail_from: {mail:?}");
-    assert_eq!(mail.rcpt_to, "<destino@example.com>", "rcpt_to: {mail:?}");
+    assert_eq!(mail.rcpt_to, vec!["<destino@example.com>".to_string()], "rcpt_to: {mail:?}");
     assert!(mail.data.contains("Subject: Hola desde c-script"), "data: {}", mail.data);
     assert!(mail.data.contains("Cuerpo del mensaje."), "data: {}", mail.data);
+}
+
+#[test]
+fn smtp_send_to_many_sends_one_rcpt_to_per_recipient() {
+    // GRAMMAR.md §3.63: la brecha real que motivó esto -- "mandar a varios
+    // destinatarios significa una llamada por destinatario" (README hasta
+    // esta ronda). Un `RCPT TO:` por destinatario, en la MISMA conversación
+    // SMTP, un solo mensaje -- no N llamadas separadas a `smtp.send`.
+    let smtp = FakeSmtp::start();
+    let temp = TempDir::new("send-many");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(
+        &src,
+        &[("LINK_SMTP_URL", &format!("smtp://127.0.0.1:{}", smtp.port)), ("LINK_SMTP_FROM", "remitente@example.com")],
+    );
+
+    let (status, body) = server.post(
+        "/Sys/notifyMany",
+        r#"{"to":["a@example.com","b@example.com"],"subject":"Aviso","body":"Cuerpo."}"#,
+    );
+    assert_eq!(status, 200, "body: {body}");
+
+    let mail = smtp.recv(Duration::from_secs(5)).expect("el servidor SMTP de mentira debió recibir un mensaje");
+    assert_eq!(
+        mail.rcpt_to,
+        vec!["<a@example.com>".to_string(), "<b@example.com>".to_string()],
+        "un RCPT TO por destinatario, en la misma conversación: {mail:?}"
+    );
+}
+
+#[test]
+fn smtp_send_to_many_rejects_an_empty_recipient_list() {
+    let smtp = FakeSmtp::start();
+    let temp = TempDir::new("send-many-empty");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(
+        &src,
+        &[("LINK_SMTP_URL", &format!("smtp://127.0.0.1:{}", smtp.port)), ("LINK_SMTP_FROM", "remitente@example.com")],
+    );
+
+    let (status, body) = server.post("/Sys/notifyMany", r#"{"to":[],"subject":"Aviso","body":"Cuerpo."}"#);
+    assert_eq!(status, 500, "una lista vacía de destinatarios tiene que fallar limpio: {body}");
+    assert!(body.contains("destinatario"), "mensaje inesperado: {body}");
+}
+
+#[test]
+fn smtp_send_html_sets_the_content_type_and_delivers_the_markup() {
+    // La otra brecha real: "sin cuerpo HTML" (README hasta esta ronda) --
+    // cualquier notificación transaccional real quiere texto con formato,
+    // no solo texto plano.
+    let smtp = FakeSmtp::start();
+    let temp = TempDir::new("send-html");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(
+        &src,
+        &[("LINK_SMTP_URL", &format!("smtp://127.0.0.1:{}", smtp.port)), ("LINK_SMTP_FROM", "remitente@example.com")],
+    );
+
+    let (status, body) = server.post(
+        "/Sys/notifyHtml",
+        &serde_json::json!({"to": ["destino@example.com"], "subject": "Bienvenido", "html": "<h1>Hola</h1><p>Gracias por sumarte.</p>"})
+            .to_string(),
+    );
+    assert_eq!(status, 200, "body: {body}");
+
+    let mail = smtp.recv(Duration::from_secs(5)).expect("el servidor SMTP de mentira debió recibir un mensaje");
+    assert!(mail.data.to_ascii_lowercase().contains("content-type: text/html"), "data: {}", mail.data);
+    assert!(mail.data.contains("<h1>Hola</h1>"), "el markup tiene que llegar tal cual, no escapado: {}", mail.data);
 }
 
 #[test]
