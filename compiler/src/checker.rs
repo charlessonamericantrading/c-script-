@@ -3120,6 +3120,14 @@ impl Checker {
                 self.check_expr(offset_arg, &Type::Int, env)?;
                 Ok(Type::List(Box::new(element_ty.clone())))
             }
+            "pageAfter" => {
+                let [cursor_arg, limit_arg] = args else {
+                    return Err(err("'pageAfter' toma exactamente 2 argumentos (cursor: Int?, limit: Int)"));
+                };
+                self.check_expr(cursor_arg, &Type::Optional(Box::new(Type::Int)), env)?;
+                self.check_expr(limit_arg, &Type::Int, env)?;
+                Ok(Type::List(Box::new(element_ty.clone())))
+            }
             "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.check_aggregate_by(element_ty, method, args, env),
 
             // Deliberadamente SIEMPRE un error acá, nunca una firma normal

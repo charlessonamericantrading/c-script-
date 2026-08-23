@@ -83,6 +83,10 @@ service Leads {
   rpc page(limit: Int, offset: Int) -> Lead[] {
     db.COLLECTION.page(limit, offset)
   }
+
+  rpc pageAfter(cursor: Int?, limit: Int) -> Lead[] {
+    db.COLLECTION.pageAfter(cursor, limit)
+  }
 }
 "#;
 
@@ -346,6 +350,43 @@ fn page_pushes_limit_offset_to_real_sql_against_postgres() {
 
     let err = server.try_rpc("Leads/page", r#"{"limit":2,"offset":-1}"#);
     assert!(err.is_err(), "offset negativo tiene que fallar, no mandarse tal cual al SQL de Postgres");
+}
+
+#[test]
+fn page_after_pushes_a_cursor_predicate_to_real_sql_against_postgres() {
+    // GRAMMAR.md §3.61: mismo espíritu que el test de arriba, pero para el
+    // cursor -- confirma que `WHERE "id" > cursor` corre de verdad contra
+    // Postgres, no solo contra SQLite (`db.rs`, unit test).
+    const COLLECTION: &str = "leads_page_after";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("page-after");
+    let src = temp.program(COLLECTION);
+    let server = Serve::start(&src, &url);
+
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        let row = server.rpc("Leads/create", &format!(r#"{{"email":"lead{i}@example.com","score":1.0}}"#));
+        ids.push(row["id"].as_i64().unwrap());
+    }
+
+    let page1 = server.rpc("Leads/pageAfter", r#"{"cursor":null,"limit":2}"#);
+    let page1_ids: Vec<i64> = page1.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(page1_ids, ids[0..2], "primera página: cursor null trae desde el principio");
+
+    let page2 = server.rpc("Leads/pageAfter", &format!(r#"{{"cursor":{},"limit":2}}"#, ids[1]));
+    let page2_ids: Vec<i64> = page2.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+    assert_eq!(page2_ids, ids[2..4], "segunda página: sigue justo después del cursor");
+
+    let past_the_end = server.rpc("Leads/pageAfter", &format!(r#"{{"cursor":{},"limit":2}}"#, ids[4]));
+    assert_eq!(past_the_end.as_array().unwrap().len(), 0, "cursor en el último id: lista vacía, no error");
+
+    let err = server.try_rpc("Leads/pageAfter", r#"{"cursor":null,"limit":-1}"#);
+    assert!(err.is_err(), "limit negativo tiene que fallar, no mandarse tal cual al SQL de Postgres");
 }
 
 const AGGREGATE_PROGRAM: &str = r#"

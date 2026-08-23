@@ -82,6 +82,7 @@
   - [3.58 `crypto`: costo de Argon2id configurable y señal de hash legado — RESUELTO](#358-crypto-costo-de-argon2id-configurable-y-señal-de-hash-legado--resuelto)
   - [3.59 PostgreSQL: acepta PK autoincremental de 32/16 bits, no solo `BIGSERIAL` — RESUELTO](#359-postgresql-acepta-pk-autoincremental-de-3216-bits-no-solo-bigserial--resuelto)
   - [3.60 `http.getWithStatus`/`http.postWithStatus`: código de estado y headers de la respuesta — RESUELTO](#360-httpgetwithstatushttppostwithstatus-código-de-estado-y-headers-de-la-respuesta--resuelto)
+  - [3.61 `db.<c>.pageAfter(cursor, limit)`: cursor de continuación — RESUELTO](#361-dbcpageaftercursor-limit-cursor-de-continuación--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3136,6 +3137,25 @@ rpc charge(amount: Int, apiKey: String) -> Bool {
 **Un 4xx/5xx deja de ser un error de runtime en estos dos métodos** -- es justo el dato que existen para exponer. `ureq::Error::Status` (la librería HTTP que usa el intérprete) trae la `Response` completa, no solo el código, así que se decodifica igual que el camino 2xx. Solo un error de RED de verdad (DNS, conexión rechazada, timeout) sigue siendo un error de runtime -- eso nunca fue algo que un programa pudiera "manejar" de forma significativa de todos modos.
 
 **Verificado** contra un servidor HTTP real armado a mano en el test (`cli_http.rs`, no un mock interno): un 2xx expone status/headers/body correctos; un 429 con header `Retry-After` llega completo como dato, sin que el rpc que lo llama falle; un 201 de un POST también. Nombres de header comparados sin distinguir mayúsculas -- HTTP no las distingue, y `ureq` normaliza a minúsculas al parsear.
+
+---
+
+### 3.61 `db.<c>.pageAfter(cursor, limit)`: cursor de continuación — RESUELTO
+
+Item de la tabla "Does not work yet" del README desde que `page` existe (§3.48): `db.<c>.page(limit, offset)` obliga al caller a calcular el próximo `offset` a mano (`offset + limit`), y un `OFFSET` cuenta filas desde el principio de la tabla EN CADA LLAMADA -- una fila insertada entre dos páginas puede hacer que la siguiente repita o se salte una fila. `page` queda exactamente igual (sigue siendo la opción correcta cuando hace falta saltar a una página arbitraria, ej. "página 40"); `pageAfter` es una forma nueva, para el caso de scroll infinito/paginación secuencial, donde esa estabilidad importa más que poder saltar.
+
+<!-- linkc:fragment -->
+```rust
+rpc feed(cursor: Int?, limit: Int) -> Item[] {
+  db.items.pageAfter(cursor, limit)
+}
+```
+
+**El cursor ES el `id` del último elemento visto** (`null` para la primera página) -- no un token opaco codificado aparte, a propósito: el `id` ya es un campo público del struct que el cliente ya recibió, así que envolverlo en una capa de codificación no agrega ninguna garantía real, solo ceremonia. Lo que hace a esto un cursor DE VERDAD no es que esté "ofuscado" -- es que `WHERE "id" > cursor ORDER BY "id" LIMIT n` no cuenta filas desde el principio como `OFFSET`, así que es estable bajo escritura concurrente: pasar el `id` del último elemento visto siempre da la página que sigue, sin importar cuántas filas se insertaron mientras tanto.
+
+**Límite honesto:** solo hacia adelante -- no hay forma de pedir "la página anterior" a partir de un cursor (para eso, `page(limit, offset)` sigue estando disponible), ni de saltar a una posición arbitraria sin recorrer.
+
+**Verificado:** un test unitario contra SQLite (`db.rs`) que además prueba explícitamente la propiedad de estabilidad -- inserta una fila nueva ENTRE dos llamadas a `pageAfter` y confirma que la segunda página no cambia -- más el mismo caso contra un PostgreSQL real en `pg_integration.rs`.
 
 ---
 

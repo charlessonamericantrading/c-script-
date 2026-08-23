@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.22.0] - 2026-08-23
+
+### ✨ Nuevo
+- **`db.<c>.pageAfter(cursor, limit)`: cursor de continuación.** Item de la tabla original del README sobre `page`: `page(limit, offset)` obliga a calcular el próximo `offset` a mano, y `OFFSET` cuenta filas desde el principio de la tabla EN CADA LLAMADA -- una fila insertada entre dos páginas puede hacer que la siguiente repita o se salte una fila. El cursor ES el `id` del último elemento visto (`null` para la primera página) -- no un token opaco codificado aparte, a propósito: el `id` ya es un campo público del struct, envolverlo no agrega ninguna garantía real. La propiedad real que esto resuelve es estabilidad bajo escritura concurrente, no "opacidad". `page` queda sin cambios, sigue siendo la opción correcta para saltar a una página arbitraria. Verificado con un test que inserta una fila nueva ENTRE dos llamadas a `pageAfter` y confirma que la página siguiente no se mueve -- contra SQLite (`db.rs`) y contra un PostgreSQL real (`pg_integration.rs`). 597 tests (2 nuevos). Detalle completo: GRAMMAR.md §3.61.
+
 ## [1.21.0] - 2026-08-23
 
 ### ✨ Nuevo

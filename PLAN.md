@@ -275,7 +275,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - Tipos `Timestamp` (ISO-8601 UTC) e `Int64` (mismo rango 64-bit sin pérdida de precisión en TS), más builtin `now() -> Timestamp` (GRAMMAR.md §3.30–§3.32).
 - Toolchain integral: `linkc build`, `serve`, `test`, `dev`, `lint`, `doc`, `docker`, `lsp`, `new`, `fmt`.
 
-**Evolución Post-1.0 (v1.1.0 a v1.21.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
+**Evolución Post-1.0 (v1.1.0 a v1.22.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
 - **PostgreSQL en Runtime** (v1.1.0/v1.4.0/v1.8.0, GRAMMAR.md §3.36/§3.40/§3.44): Soporte de base de datos PostgreSQL real (`--db postgres://...`), auto-migraciones de esquema no destructivas, TLS oportunista y obligatorio vía `rustls` puro (compatible con Supabase/Neon/RDS), auto-reconexión transparente tras corte y LISTEN/NOTIFY en hilo dedicado para sincronizar `stream` SSE entre múltiples instancias.
 - **Criptografía y Seguridad** (v1.1.0/v1.3.0/v1.5.0, GRAMMAR.md §3.34/§3.38/§3.41): Argon2id (RFC 9106) con sal aleatoria en formato PHC y verificación en tiempo constante; tokens de sesión y UUIDs alimentados por el CSPRNG del sistema operativo (`getrandom`); cálculo de HMAC-SHA256 para verificación de webhooks; CORS con allowlist configurable (`--cors-origin`) y cabeceras de seguridad estrictas fijas (`nosniff`, `DENY`, `no-referrer`).
 - **Extensibilidad Web y SEO** (v1.1.0/v1.2.0/v1.6.0/v1.9.0/v1.10.0, GRAMMAR.md §3.35/§3.37/§3.42/§3.45/§3.46): Decorador `@content_type("...")` para respuestas no-JSON (HTML, XML, CSV); URLs amigables `@route("/...")` con múltiples parámetros dinámicos y precedencia determinística; sanitización explícita `String.escapeHtml()`; y selección de status HTTP en éxito `response.setStatus(code)` (e.g. páginas 404 personalizadas o 201 Created).
@@ -284,6 +284,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - **Ergonomía del Lenguaje y Rutas Avanzadas** (v1.19.0, GRAMMAR.md §3.55–§3.57): Conversión explícita `.toString()` sobre `Int`/`Int64`/`Float`/`Bool` (primer método que existe sobre `Bool` en todo el lenguaje); `response.setStatus` ahora se rechaza en COMPILACIÓN dentro de un `stream` (antes era un no-op silencioso que solo se notaba en producción); segmento catch-all `:nombre*` en `@route` para rutas de profundidad variable (documentación, CMS), con precedencia determinística frente a rutas más específicas y detección de conflictos extendida.
 - **Seguridad Configurable y Adopción de Bases Existentes** (v1.20.0, GRAMMAR.md §3.58–§3.59): Costo de `crypto.hashPassword` configurable vía `--argon2-memory-kib`/`--argon2-iterations` (o sus env vars), sin cambiar el comportamiento por default; `crypto.isLegacyHash(hash) -> Bool` para migrar contraseñas viejas de forma proactiva; y una tabla PostgreSQL preexistente con `id SERIAL`/`IDENTITY` de 32 o 16 bits (no solo `BIGSERIAL`) ya no falla en el primer `insert` -- corrige un desacuerdo real entre la validación al conectar (que sí los aceptaba) y la lectura de la columna (que exigía el OID exacto de 64 bits).
 - **Inspección de Respuestas HTTP Salientes** (v1.21.0, GRAMMAR.md §3.60): `http.getWithStatus`/`http.postWithStatus` devuelven `{status: Int, headers: {...}[], body: String}` -- un 4xx/5xx de la API llamada deja de ser un error de runtime genérico y pasa a ser un dato que el programa puede inspeccionar (ej. reintentar solo en 429). `http.get`/`http.post`/`http.getWithHeaders`/`http.postWithHeaders` quedan sin cambios.
+- **Paginación por Cursor** (v1.22.0, GRAMMAR.md §3.61): `db.<c>.pageAfter(cursor, limit)` -- el cursor es el `id` del último elemento visto (`null` para la primera página), estable bajo escritura concurrente a diferencia de `page(limit, offset)`, que cuenta filas desde el principio en cada llamada. `page` queda sin cambios, sigue siendo la opción correcta para saltar a una página arbitraria.
 
 **Hitos "go / no-go":**
 - Fin de Fase 0: ✅ Demo E2E probada y verificada.
@@ -327,7 +328,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 ## 8. Hoja de Ruta Futura (Fase 4 · Hacia c-script 2.0)
 
-Con las Fases 0 a 3 completadas y el núcleo v1.21.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
+Con las Fases 0 a 3 completadas y el núcleo v1.22.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
 
 ### 8.1 Ecosistema y Distribución
 1. **Publicación en el registro npm**: Empaquetar y publicar `link-lang` en npm para permitir ejecución vía `npx linkc` o instalación global estándar.
@@ -336,9 +337,8 @@ Con las Fases 0 a 3 completadas y el núcleo v1.21.0 plenamente operativo, las s
 ### 8.2 Base de Datos y Consultas Avanzadas
 1. **Agregación con truncamiento temporal**: Soporte para agrupar por fechas truncadas (`date_trunc` para cohortes diarias/mensuales) en `sumBy`/`countBy`/etc.
 2. **Soporte de `Int64` en agregaciones**: Permitir campos `Int64` en las cláusulas de agrupación y suma/promedio.
-3. **Paginación por cursor**: Introducción de tokens de cursor opacos y determinísticos (`Cursor<T>`) para tablas de gran volumen.
-4. **Filtrado con pushdown a SQL (`db.<c>.filter(predicate)`)**: Un predicado estructural -- mismo criterio de "nombre por forma" que ya usa `sumBy`/etc. -- que se traduzca a una cláusula `WHERE` real, en vez de obligar a traer la tabla entera con `.all()` y filtrar en memoria.
-5. **Transacciones sobre múltiples escrituras `db.<c>`**: Hoy cada escritura es su propio commit implícito; falta una forma de agrupar varias escrituras relacionadas en una sola transacción con rollback ante error.
+3. **Filtrado con pushdown a SQL (`db.<c>.filter(predicate)`)**: Un predicado estructural -- mismo criterio de "nombre por forma" que ya usa `sumBy`/etc. -- que se traduzca a una cláusula `WHERE` real, en vez de obligar a traer la tabla entera con `.all()` y filtrar en memoria.
+4. **Transacciones sobre múltiples escrituras `db.<c>`**: Hoy cada escritura es su propio commit implícito; falta una forma de agrupar varias escrituras relacionadas en una sola transacción con rollback ante error.
 
 ### 8.3 Runtime y Comunicaciones
 1. **Limpieza proactiva de sesiones**: Implementar recolección periódica en segundo plano para sesiones expiradas bajo `--session-ttl`.

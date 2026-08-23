@@ -766,6 +766,18 @@ db { users: User[] }
                 }
                 self.select_rows_page(collection, columns, limit, offset).map(Value::List)
             }
+            "pageAfter" => {
+                let after = match args.first() {
+                    Some(Value::Int(n)) => Some(*n),
+                    Some(Value::Null) | None => None,
+                    _ => return Err(RuntimeError::new("pageAfter requiere un cursor Int? como primer argumento")),
+                };
+                let limit = as_int(args.get(1).ok_or_else(|| RuntimeError::new("pageAfter requiere 2 argumentos (cursor, limit)"))?)?;
+                if limit < 0 {
+                    return Err(RuntimeError::new(format!("db.<c>.pageAfter(_, {limit}): limit tiene que ser >= 0")));
+                }
+                self.select_rows_after(collection, columns, after, limit).map(Value::List)
+            }
             "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.select_grouped(collection, columns, method, &args).map(Value::List),
             "find" => {
                 let id = as_int(args.first().ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?)?;
@@ -1022,6 +1034,49 @@ db { users: User[] }
         let mut kinds = vec![ColumnKind::Int];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let params = vec![Cell::Int(limit), Cell::Int(offset)];
+
+        let rows = self
+            .backend
+            .query(&sql, &params, &kinds)
+            .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+        Ok(rows.iter().map(|cells| Value::Struct(self.row_to_fields(cells, columns))).collect())
+    }
+
+    /// `db.<c>.pageAfter(cursor, limit)` (GRAMMAR.md §3.61) -- cursor de
+    /// continuación en vez del `offset` manual de `page`. El cursor ES el
+    /// `id` del último elemento de la página anterior (`null` para la
+    /// primera): no un token opaco codificado aparte, a propósito -- el
+    /// `id` ya es un campo público del struct, inventar una capa de
+    /// codificación encima no agrega ninguna garantía real, solo ceremonia.
+    /// La diferencia real con `page(limit, offset)` no es la "opacidad" del
+    /// cursor, es que `WHERE "id" > cursor` es ESTABLE bajo inserciones
+    /// concurrentes -- un `OFFSET` cuenta filas desde el principio de la
+    /// tabla en cada llamada, así que una fila insertada ENTRE dos páginas
+    /// puede hacer que la página siguiente repita o se salte una fila; un
+    /// cursor por `id` nunca tiene ese problema, porque no cuenta filas, filtra
+    /// por una posición fija en el orden.
+    fn select_rows_after(&self, collection: &str, columns: &[ColumnPlan], after: Option<i64>, limit: i64) -> Result<Vec<Value>, RuntimeError> {
+        let mut col_list = vec!["\"id\"".to_string()];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        let sql = match after {
+            Some(_) => format!(
+                "SELECT {} FROM \"{collection}\" WHERE \"id\" > {} ORDER BY \"id\" LIMIT {}",
+                col_list.join(", "),
+                self.backend.placeholder(1),
+                self.backend.placeholder(2)
+            ),
+            None => format!(
+                "SELECT {} FROM \"{collection}\" ORDER BY \"id\" LIMIT {}",
+                col_list.join(", "),
+                self.backend.placeholder(1)
+            ),
+        };
+        let mut kinds = vec![ColumnKind::Int];
+        kinds.extend(columns.iter().map(ColumnPlan::kind));
+        let params: Vec<Cell> = match after {
+            Some(id) => vec![Cell::Int(id), Cell::Int(limit)],
+            None => vec![Cell::Int(limit)],
+        };
 
         let rows = self
             .backend
@@ -1360,6 +1415,65 @@ mod tests {
         );
         assert!(
             db.call("users", "page", vec![Value::Int(-1), Value::Int(0)]).is_err(),
+            "limit negativo tiene que fallar en vez de mandarse tal cual al SQL"
+        );
+    }
+
+    #[test]
+    fn test_db_page_after_pushes_a_cursor_predicate_to_sql() {
+        let program = crate::parser::parse(crate::lexer::tokenize("type User = { id: Int, name: String }\ndb { users: User[] }").unwrap()).unwrap();
+        let db = Db::new(&program, Path::new(":memory:"));
+
+        let mut ids = Vec::new();
+        for name in ["Ana", "Beto", "Cami", "Dani", "Ema"] {
+            let row = db.call("users", "insert", vec![Value::Struct(vec![("name".into(), Value::Str(name.into()))])]).unwrap();
+            let Value::Struct(fields) = row else { panic!("se esperaba struct") };
+            ids.push(fields.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap());
+        }
+
+        let ids_of = |v: Value| -> Vec<i64> {
+            let Value::List(items) = v else { panic!("se esperaba List") };
+            items
+                .into_iter()
+                .map(|item| {
+                    let Value::Struct(fields) = item else { panic!("se esperaba struct") };
+                    fields.into_iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(&v).unwrap()).unwrap()
+                })
+                .collect()
+        };
+
+        // Primera página: cursor null.
+        let page1 = db.call("users", "pageAfter", vec![Value::Null, Value::Int(2)]).unwrap();
+        assert_eq!(ids_of(page1), ids[0..2], "primera página: null trae desde el principio");
+
+        // Segunda página: el cursor es el id del último elemento visto.
+        let page2 = db.call("users", "pageAfter", vec![Value::Int(ids[1]), Value::Int(2)]).unwrap();
+        assert_eq!(ids_of(page2), ids[2..4], "segunda página: sigue justo después del cursor");
+
+        let last = db.call("users", "pageAfter", vec![Value::Int(ids[3]), Value::Int(2)]).unwrap();
+        assert_eq!(ids_of(last), ids[4..5], "última página parcial: lo que queda, no un error");
+
+        let past_the_end = db.call("users", "pageAfter", vec![Value::Int(ids[4]), Value::Int(2)]).unwrap();
+        assert_eq!(ids_of(past_the_end), Vec::<i64>::new(), "cursor en el último id: lista vacía, no un error");
+
+        // La propiedad que motiva el cursor sobre offset: una fila insertada
+        // ENTRE dos llamadas nunca desplaza la página siguiente -- a
+        // diferencia de `page(limit, offset)`, que cuenta desde el
+        // principio de la tabla en cada llamada.
+        let inserted_between =
+            db.call("users", "insert", vec![Value::Struct(vec![("name".into(), Value::Str("Fabi".into()))])]).unwrap();
+        let Value::Struct(fields) = inserted_between else { panic!("se esperaba struct") };
+        let new_id = fields.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap();
+        let page2_again = db.call("users", "pageAfter", vec![Value::Int(ids[1]), Value::Int(2)]).unwrap();
+        assert_eq!(
+            ids_of(page2_again),
+            ids[2..4],
+            "una fila nueva insertada DESPUÉS de la página 1 no corre la página 2 -- estable bajo escritura concurrente"
+        );
+        assert!(new_id > ids[4], "la fila nueva quedó al final por autoincremento, no en medio");
+
+        assert!(
+            db.call("users", "pageAfter", vec![Value::Null, Value::Int(-1)]).is_err(),
             "limit negativo tiene que fallar en vez de mandarse tal cual al SQL"
         );
     }
