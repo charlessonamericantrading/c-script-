@@ -334,12 +334,39 @@ Con las Fases 0 a 3 completadas y el núcleo v1.18.0 plenamente operativo, las s
 1. **Agregación con truncamiento temporal**: Soporte para agrupar por fechas truncadas (`date_trunc` para cohortes diarias/mensuales) en `sumBy`/`countBy`/etc.
 2. **Soporte de `Int64` en agregaciones**: Permitir campos `Int64` en las cláusulas de agrupación y suma/promedio.
 3. **Paginación por cursor**: Introducción de tokens de cursor opacos y determinísticos (`Cursor<T>`) para tablas de gran volumen.
+4. **Filtrado con pushdown a SQL (`db.<c>.filter(predicate)`)**: Un predicado estructural -- mismo criterio de "nombre por forma" que ya usa `sumBy`/etc. -- que se traduzca a una cláusula `WHERE` real, en vez de obligar a traer la tabla entera con `.all()` y filtrar en memoria.
+5. **Transacciones sobre múltiples escrituras `db.<c>`**: Hoy cada escritura es su propio commit implícito; falta una forma de agrupar varias escrituras relacionadas en una sola transacción con rollback ante error.
 
 ### 8.3 Runtime y Comunicaciones
 1. **Inspección de respuestas en `http.get`/`http.post`**: Exponer cabeceras de respuesta y códigos de estado HTTP numéricos para permitir lógica de reintentos selectiva (e.g. en 429 Too Many Requests).
 2. **Limpieza proactiva de sesiones**: Implementar recolección periódica en segundo plano para sesiones expiradas bajo `--session-ttl`.
 3. **Rate limiting distribuido**: Permitir configuración de proxies de confianza (`X-Forwarded-For`) y adaptadores para estado compartido (e.g. Redis) en despliegues con réplicas.
 4. **Mejoras en `smtp.send`**: Soporte para envío asíncrono no bloqueante, múltiples destinatarios y cuerpos HTML.
+
+### 8.4 Autenticación y Seguridad
+1. **Parámetros de Argon2id configurables**: Permitir que un servicio con requisitos de seguridad más altos suba el costo de memoria/iteraciones de `crypto.hashPassword`, hoy fijos al default de la crate `argon2` (GRAMMAR.md §3.34).
+2. **Señal de "hash legado" en `verifyPassword`**: Hoy devuelve solo `Bool`; quien quiera migrar contraseñas de forma proactiva a Argon2id tiene que inspeccionar el prefijo del hash guardado a mano (GRAMMAR.md §3.34).
+3. **Carga opcional del `User` completo en sesión**: `auth.currentRole()`/`currentUserId()` exponen rol e id, pero cargar el struct completo sigue requiriendo `db.users.find(uid)` explícito en cada rpc que lo necesite.
+4. **Auth externo conectable**: Hoy Link solo emite y valida sus propias sesiones opacas (`auth.createSession(WithId)`); no hay forma documentada de confiar en un JWT ya emitido por un backend externo -- bloquea adoptar Link dentro de una app con login preexistente sin correr dos sistemas de sesión en paralelo.
+
+### 8.5 Adopción de Sistemas Existentes
+1. **Aceptar PK autoincremental además de `BIGSERIAL`**: Hoy toda tabla generada o preexistente exige específicamente `BIGSERIAL`; rechaza `INTEGER GENERATED ALWAYS AS IDENTITY` o un `SERIAL` de 32 bits, bloqueando cualquier tabla ya existente con esos tipos.
+2. **Modo "adoptar tabla existente sin auto-migrar"**: Falta una forma de decirle a `linkc` "esta colección ya existe en la base, gestionala pero no la migres" -- hoy la única salida es que la tabla ya calce exactamente el esquema esperado.
+3. **`linkc introspect <db-url>`**: Herramienta de introspección que genere un `.link` de partida a partir de una base de datos ya existente, en vez de escribir cada tabla a mano.
+
+### 8.6 Lenguaje: Conversiones y Ergonomía
+1. **Conversión `Int -> String`**: No existe en ningún punto del lenguaje hoy -- ni siquiera para interpolar un número en un mensaje (`"código: " + n` no compila).
+2. **`response.setStatus` como error de compilación dentro de `stream`**: Hoy es un no-op silencioso (el status de una conexión SSE es fijo para toda su duración, GRAMMAR.md §3.46) -- debería rechazarse en el checker, no descubrirse en producción.
+
+### 8.7 `@route` y Sanitización
+1. **Segmento catch-all en `@route`** (`/docs/:rest*`): Bloquea rutas de profundidad variable (documentación, CMS) que hoy necesitan un rpc por cada nivel (GRAMMAR.md §3.42).
+2. **`@route` con query string y body**: Hoy todo parámetro de un `@route` tiene que venir del path -- sin esto, cualquier endpoint que además necesite un filtro por query string duplica el rpc (GRAMMAR.md §3.42).
+3. **Cobertura completa de contextos de inyección en `escapeHtml()`**: El método cubre el caso de texto/atributo entre comillas dobles, pero no todos los contextos HTML donde se puede interpolar un valor -- relevante para XSS, no solo estilo (GRAMMAR.md §3.45).
+
+### 8.8 Almacenamiento
+1. **Módulo `storage`/S3**: No existe ninguna integración de almacenamiento de archivos hoy -- ni presigned URLs, ni upload directo, nada. Bloquea cualquier caso de uso con archivos adjuntos.
+
+**Origen de 8.4–8.8** (23/08/2026): 15 gaps nuevos, verificados contra el código real (no contra la documentación), a partir de dos fuentes externas -- un reporte de adopción real (app financiera "MyFinance" sobre una base Postgres ya existente) y una auditoría propia de los "límites honestos" que cada sección `§3.X` de GRAMMAR.md ya se admite a sí misma. Quedaron fuera de esta ronda por ser más especializados o de menor demanda general (identificados, no descartados): WebSocket bidireccional, jobs en background/cron, caché a nivel de app, búsqueda full-text, subida de archivos multipart, retry/backoff para `smtp`/`http` salientes, export OpenTelemetry, GraphQL, i18n, y migraciones más allá de agregar columna (rename/retype/drop).
 
 ---
 
