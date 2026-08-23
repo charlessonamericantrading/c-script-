@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.21.0] - 2026-08-23
+
+### ✨ Nuevo
+- **`http.getWithStatus`/`http.postWithStatus`: código de estado y headers de la respuesta.** Último item de la tabla "Does not work yet" original del README sobre HTTP saliente (PLAN.md §8.3.1): `http.get`/`http.post`(`WithHeaders`) solo devolvían el body -- un 4xx/5xx se volvía error de runtime genérico, sin forma de reintentar selectivamente (ej. solo en 429). Dos métodos NUEVOS, mismos argumentos que sus pares `WithHeaders`, sin tocar los cuatro existentes. Devuelven un struct estructural SIN nombre reservado -- mismo criterio que ya usa el tipo de `headers` (v1.11.0): `{status: Int, headers: {name: String, value: String}[], body: String}`, cualquier `type` declarado con esos campos sirve. Un 4xx/5xx deja de ser error en estos dos métodos -- `ureq::Error::Status` ya trae la `Response` completa, no solo el código; solo un error de RED de verdad sigue siendo `Err`. Verificado contra un servidor HTTP real armado a mano en el test (`cli_http.rs`): 2xx con headers de respuesta, 429 con `Retry-After` como dato (sin que el rpc falle), 201 de un POST. 595 tests (3 nuevos). Detalle completo: GRAMMAR.md §3.60.
+
 ## [1.20.0] - 2026-08-23
 
 ### ✨ Nuevo

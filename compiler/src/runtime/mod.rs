@@ -999,6 +999,28 @@ fn escape_html(s: &str) -> String {
 /// (`http_header_type()`, checker.rs) vía subtipado estructural, así que el
 /// error de acá es defensivo, no un caso esperado en la práctica (mismo
 /// criterio que el `unwrap_or_else` de `@content_type` en server.rs).
+/// Arma el `{status, headers, body}` que `getWithStatus`/`postWithStatus`
+/// devuelven (GRAMMAR.md §3.60) a partir de una respuesta HTTP real -- se usa
+/// tanto para el camino 2xx (`Ok`) como para el 4xx/5xx (`Err(Status(..))`
+/// de `ureq`, que TAMBIÉN trae la `Response` completa, no solo el código).
+/// Los headers se leen ANTES de `into_string()` porque esa llamada consume
+/// `resp`.
+fn ureq_response_to_value(resp: ureq::Response) -> Value {
+    let status = resp.status() as i64;
+    let headers: Vec<Value> = resp
+        .headers_names()
+        .iter()
+        .filter_map(|name| resp.header(name).map(|value| (name.clone(), value.to_string())))
+        .map(|(name, value)| Value::Struct(vec![("name".to_string(), Value::Str(name)), ("value".to_string(), Value::Str(value))]))
+        .collect();
+    let body = resp.into_string().unwrap_or_default();
+    Value::Struct(vec![
+        ("status".to_string(), Value::Int(status)),
+        ("headers".to_string(), Value::List(headers)),
+        ("body".to_string(), Value::Str(body)),
+    ])
+}
+
 fn http_headers_from_value(items: &[Value]) -> Result<Vec<(String, String)>, RuntimeError> {
     items
         .iter()
@@ -1598,6 +1620,54 @@ fn call_method(
                         Ok(Value::Str(text))
                     }
                     Err(e) => Err(err(format!("error HTTP al hacer GET a {url}: {e}"))),
+                }
+            }
+            "getWithStatus" => {
+                let url = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.getWithStatus requiere un argumento URL String")),
+                };
+                let headers = match args.get(1) {
+                    Some(Value::List(items)) => http_headers_from_value(items)?,
+                    _ => return Err(err("http.getWithStatus requiere una lista de headers como segundo argumento")),
+                };
+                let mut req = ureq::get(url);
+                for (name, value) in &headers {
+                    req = req.set(name, value);
+                }
+                // A diferencia de `get`/`getWithHeaders`, un 4xx/5xx NO es un
+                // error de runtime acá -- es justamente el dato que este
+                // método existe para exponer. `ureq::Error::Status` trae la
+                // `Response` completa (status + headers + body), no solo el
+                // código; solo un error de RED de verdad (DNS, conexión
+                // rechazada, timeout) sigue siendo `Err`.
+                match req.call() {
+                    Ok(resp) => Ok(ureq_response_to_value(resp)),
+                    Err(ureq::Error::Status(_, resp)) => Ok(ureq_response_to_value(resp)),
+                    Err(e) => Err(err(format!("error de red al hacer GET a {url}: {e}"))),
+                }
+            }
+            "postWithStatus" => {
+                let url = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.postWithStatus requiere un argumento URL String")),
+                };
+                let body = match args.get(1) {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.postWithStatus requiere un argumento Body String")),
+                };
+                let headers = match args.get(2) {
+                    Some(Value::List(items)) => http_headers_from_value(items)?,
+                    _ => return Err(err("http.postWithStatus requiere una lista de headers como tercer argumento")),
+                };
+                let mut req = ureq::post(url);
+                for (name, value) in &headers {
+                    req = req.set(name, value);
+                }
+                match req.send_string(body) {
+                    Ok(resp) => Ok(ureq_response_to_value(resp)),
+                    Err(ureq::Error::Status(_, resp)) => Ok(ureq_response_to_value(resp)),
+                    Err(e) => Err(err(format!("error de red al hacer POST a {url}: {e}"))),
                 }
             }
             "postWithHeaders" => {

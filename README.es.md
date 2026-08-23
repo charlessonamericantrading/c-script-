@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-592-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.20.0-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-595-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.21.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,7 +36,7 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 23/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 592 pruebas automáticas:
+**Funciona hoy**, cubierto por 595 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - SQLite embebido con persistencia real entre reinicios y auto-migraciones no destructivas
@@ -46,7 +46,7 @@ gana esta. Verificado el 23/08/2026 corriendo el compilador, no leyéndolo.
 - Respuestas que no son JSON: `@content_type("text/html; charset=utf-8")` sobre un rpc que devuelve `String` manda ese cuerpo tal cual — páginas HTML, sitemaps XML, CSV — y se combina con `@requires(Role.Admin)` para páginas detrás de auth. `"...".escapeHtml()` sanitiza datos no confiables antes de meterlos en una página (no es automático -- se llama donde se interpola). `response.setStatus(code)` elige el status HTTP del camino de éxito (ej. una página 404 propia para un `@route` que no encontró nada, o 201 en un `create` JSON común) — los errores de transporte siguen saliendo siempre en JSON, sin cambios
 - URLs amigables: `@route("/blog/:slug")` le da a un rpc una URL limpia y rastreable por GET, además de (nunca en vez de) su dirección normal `/Servicio/rpc` — el cliente generado sigue usando esta última. Cualquier cantidad de segmentos `:parámetro`, en cualquier posición (`/blog/:categoria/:slug`), bindeados por nombre; una ruta más específica (más segmentos fijos) le gana determinísticamente a una totalmente dinámica que también matchearía
 - Verificar webhooks de terceros: `env.get(name)`, `request.rawBody()` / `request.header(name)` y `crypto.hmacSha256(secret, message)` le dan a un rpc todo lo necesario para chequear la firma de un callback de Stripe/GitHub/etc. antes de confiar en él
-- Llamar APIs de terceros: `http.get(url)` / `http.post(url, body)`, más `http.getWithHeaders(url, headers)` / `http.postWithHeaders(url, body, headers)` para llamadas que necesitan `Authorization` u otro header -- `headers` es cualquier `{name: String, value: String}[]` que declares vos, sin ningún tipo builtin de por medio. La respuesta es el body como `String`; un status que no sea 2xx se vuelve un error de runtime normal, no un panic
+- Llamar APIs de terceros: `http.get(url)` / `http.post(url, body)`, más `http.getWithHeaders(url, headers)` / `http.postWithHeaders(url, body, headers)` para llamadas que necesitan `Authorization` u otro header -- `headers` es cualquier `{name: String, value: String}[]` que declares vos, sin ningún tipo builtin de por medio. La respuesta es el body como `String`; un status que no sea 2xx se vuelve un error de runtime normal, no un panic. Cuando importa el status code o los headers de la respuesta (ej. reintentar solo en 429), `http.getWithStatus(url, headers)` / `http.postWithStatus(url, body, headers)` devuelven `{status: Int, headers: {name: String, value: String}[], body: String}` -- mismo principio de tipo estructural, un 4xx/5xx es un dato, no un error
 - Paginación real: `db.<c>.page(limit, offset)` empuja `LIMIT`/`OFFSET` al SQL de verdad (SQLite y Postgres, los dos) en vez de traer la tabla entera y cortarla en memoria -- mismo orden que `.all()`, así que las páginas nunca se solapan ni se saltean una fila
 - Agregación real: `db.<c>.sumBy(selectorDeGrupo, selectorDeValor)` / `countBy(selectorDeGrupo)` / `avgBy` / `maxBy` / `minBy` empujan un `GROUP BY` al SQL de verdad -- MRR por plan, conteos por estado -- en vez de traer cada fila a memoria. Los selectores tienen que ser un acceso de campo simple (`|o: Order| { o.planId }`); agrupar es solo por `String`/`Int`/`Bool`/`enum` (sin truncado de fechas todavía), el campo agregado tiene que ser `Int`/`Float`. Agrupar por un campo `enum` devuelve el enum real como key, no un string
 - Límite de requests por cliente: `@rate_limit("20/1m")` acota un rpc a N requests por ventana de tiempo, por `(ip del cliente, servicio, rpc)`, con 429 al exceder — token bucket con refill continuo
@@ -67,7 +67,6 @@ gana esta. Verificado el 23/08/2026 corriendo el compilador, no leyéndolo.
 | `request.rawBody()` necesita un body JSON | El parseo de argumentos corre antes que cualquier rpc, sin importar cuántos parámetros declare, así que un body que no sea JSON (form-encoded, XML) nunca llega al rpc — un payload de webhook en JSON con campos de más funciona bien. |
 | Sin CSP ni HSTS | CSP depende del contenido real de cada página (sin eso, no hay default seguro posible); HSTS solo tiene sentido sobre una conexión que YA es HTTPS, y `linkc serve` nunca lo es por sí mismo -- las dos le corresponden al reverse proxy que termina TLS delante. Las entradas del allowlist de CORS son match exacto únicamente, sin wildcards de subdominio. |
 | `smtp.send` es texto plano, un destinatario, bloqueante | Sin body HTML, sin adjuntos, sin cc/bcc; mandar a varios es una llamada por destinatario. Es sincrónico -- un relay lento hace lento a TODO el servidor (single-threaded) mientras dura esa request. |
-| `http.get`/`http.post` (con o sin headers) solo devuelven el body | Sin acceso al status code ni a los headers de la RESPUESTA -- un 4xx/5xx de la API llamada se vuelve un error de runtime genérico, no un valor sobre el que el programa pueda ramificar (ej. reintentar solo en 429). |
 | `db.<c>.page` no tiene cursor | El caller calcula el próximo `offset` a mano (`offset + limit`); sin token de continuación opaco, y sin total de páginas incorporado -- para eso, `count()`. |
 | `--session-ttl` limpia de forma perezosa | Una sesión vencida se borra de memoria recién la próxima vez que se usa su token -- una creada y nunca vuelta a usar queda en memoria hasta que el proceso reinicia. |
 | La estructura completa de usuario no se auto-carga en sesión | `auth.currentRole()` y `auth.currentUserId()` exponen el rol autenticado y el id numérico del usuario, pero cargar el struct `User` completo en memoria se hace explícitamente vía `db.users.find(uid)`. |
@@ -257,7 +256,7 @@ wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_w
 
 ## 🧪 Pruebas y Control de Calidad
 
-El compilador y el runtime de Link están verificados por **568 pruebas automáticas** unitarias,
+El compilador y el runtime de Link están verificados por **595 pruebas automáticas** unitarias,
 de integración y de CLI, incluidas pruebas que levantan el binario real como subproceso, manejan
 un servidor HTTP real, y compilan cada ejemplo de c-script publicado en la documentación de este repo:
 

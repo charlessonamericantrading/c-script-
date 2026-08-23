@@ -19,6 +19,7 @@ use std::time::Duration;
 
 const PROGRAM: &str = r#"
 type Header = { name: String, value: String }
+type Resp = { status: Int, headers: Header[], body: String }
 
 service Sys {
   rpc plainGet(url: String) -> String {
@@ -41,6 +42,14 @@ service Sys {
       Header { name: "Authorization", value: token },
       Header { name: "Content-Type", value: "application/json" },
     ])
+  }
+
+  rpc getStatus(url: String) -> Resp {
+    http.getWithStatus(url, [])
+  }
+
+  rpc postStatus(url: String, body: String) -> Resp {
+    http.postWithStatus(url, body, [])
   }
 }
 "#;
@@ -69,6 +78,14 @@ struct FakeHttp {
 
 impl FakeHttp {
     fn start() -> Self {
+        Self::start_with_response(200, "OK", br#"{"ok":true}"#, &[])
+    }
+
+    /// Como `start`, pero con el status/body/headers de respuesta que pida
+    /// el test -- necesario para probar `getWithStatus`/`postWithStatus`
+    /// (GRAMMAR.md §3.60), que existen justamente para que un 4xx/5xx real
+    /// llegue como DATO, no como error.
+    fn start_with_response(status: u16, reason: &'static str, body: &'static [u8], extra_headers: &'static [(&'static str, &'static str)]) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bindear puerto efímero");
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = channel();
@@ -76,7 +93,7 @@ impl FakeHttp {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 let tx = tx.clone();
-                std::thread::spawn(move || handle_one_connection(stream, tx));
+                std::thread::spawn(move || handle_one_connection(stream, tx, status, reason, body, extra_headers));
             }
         });
         FakeHttp { port, rx }
@@ -87,7 +104,14 @@ impl FakeHttp {
     }
 }
 
-fn handle_one_connection(stream: TcpStream, tx: Sender<ReceivedRequest>) {
+fn handle_one_connection(
+    stream: TcpStream,
+    tx: Sender<ReceivedRequest>,
+    status: u16,
+    reason: &str,
+    response_body: &[u8],
+    extra_headers: &[(&str, &str)],
+) {
     let mut writer = stream.try_clone().expect("clonar el stream");
     let mut reader = BufReader::new(stream);
 
@@ -120,12 +144,11 @@ fn handle_one_connection(stream: TcpStream, tx: Sender<ReceivedRequest>) {
     }
     let body = String::from_utf8_lossy(&body_buf).to_string();
 
-    let response_body = br#"{"ok":true}"#;
-    let _ = write!(
-        writer,
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        response_body.len()
-    );
+    let _ = write!(writer, "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n", response_body.len());
+    for (name, value) in extra_headers {
+        let _ = write!(writer, "{name}: {value}\r\n");
+    }
+    let _ = write!(writer, "Connection: close\r\n\r\n");
     let _ = writer.write_all(response_body);
 
     let _ = tx.send(ReceivedRequest { method, path, headers, body });
@@ -306,6 +329,69 @@ fn post_with_headers_sends_headers_and_body_together_on_a_real_request() {
     assert_eq!(req.header("Authorization"), Some("Bearer sk_test_456"), "headers: {:?}", req.headers);
     assert_eq!(req.header("Content-Type"), Some("application/json"), "headers: {:?}", req.headers);
     assert_eq!(req.body, "amount=1000&currency=usd");
+}
+
+#[test]
+fn get_with_status_exposes_the_2xx_status_code_and_response_headers() {
+    let upstream = FakeHttp::start_with_response(200, "OK", br#"{"ok":true}"#, &[("X-Request-Id", "abc123")]);
+    let temp = TempDir::new("status-2xx");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+
+    let url = format!("http://127.0.0.1:{}/ping", upstream.port);
+    let (status, body) = server.post("/Sys/getStatus", &serde_json::json!({"url": url}).to_string());
+    assert_eq!(status, 200, "el rpc en sí siempre responde 200: body {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["status"], 200, "status de la respuesta upstream: {resp}");
+    assert_eq!(resp["body"], r#"{"ok":true}"#);
+    // HTTP no distingue mayúsculas/minúsculas en nombres de header -- `ureq`
+    // los normaliza a minúsculas al parsear la respuesta, así que la
+    // comparación tiene que serlo también (mismo criterio que
+    // `ReceivedRequest::header` ya usa para los headers de la REQUEST).
+    let headers = resp["headers"].as_array().expect("headers es una lista");
+    assert!(
+        headers.iter().any(|h| h["name"].as_str().unwrap_or("").eq_ignore_ascii_case("X-Request-Id") && h["value"] == "abc123"),
+        "el header de la respuesta upstream tiene que estar en la lista: {headers:?}"
+    );
+}
+
+#[test]
+fn get_with_status_returns_a_4xx_as_data_not_as_a_runtime_error() {
+    // La brecha real que getWithStatus cierra (README "Does not work yet"
+    // hasta esta ronda): antes, un 429 de la API llamada se volvía un error
+    // de runtime genérico -- imposible reintentar SOLO en ese código.
+    let upstream = FakeHttp::start_with_response(429, "Too Many Requests", b"rate limited", &[("Retry-After", "30")]);
+    let temp = TempDir::new("status-4xx");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+
+    let url = format!("http://127.0.0.1:{}/v1/charges", upstream.port);
+    let (status, body) = server.post("/Sys/getStatus", &serde_json::json!({"url": url}).to_string());
+    assert_eq!(status, 200, "el 429 upstream NO tiene que tirar abajo el rpc: body {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["status"], 429, "el codigo real de la API llamada, como dato: {resp}");
+    assert_eq!(resp["body"], "rate limited");
+    let headers = resp["headers"].as_array().expect("headers es una lista");
+    assert!(
+        headers.iter().any(|h| h["name"].as_str().unwrap_or("").eq_ignore_ascii_case("Retry-After") && h["value"] == "30"),
+        "el header Retry-After tiene que llegar para poder implementar backoff: {headers:?}"
+    );
+}
+
+#[test]
+fn post_with_status_also_exposes_the_real_status_code() {
+    let upstream = FakeHttp::start_with_response(201, "Created", br#"{"id":42}"#, &[]);
+    let temp = TempDir::new("status-post");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+
+    let url = format!("http://127.0.0.1:{}/v1/charges", upstream.port);
+    let (status, body) =
+        server.post("/Sys/postStatus", &serde_json::json!({"url": url, "body": "amount=100"}).to_string());
+    assert_eq!(status, 200, "body: {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["status"], 201);
+    assert_eq!(resp["body"], r#"{"id":42}"#);
 }
 
 #[test]

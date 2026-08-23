@@ -81,6 +81,7 @@
   - [3.57 `@route` con segmento catch-all (`:nombre*`) — RESUELTO](#357-route-con-segmento-catch-all-nombre--resuelto)
   - [3.58 `crypto`: costo de Argon2id configurable y señal de hash legado — RESUELTO](#358-crypto-costo-de-argon2id-configurable-y-señal-de-hash-legado--resuelto)
   - [3.59 PostgreSQL: acepta PK autoincremental de 32/16 bits, no solo `BIGSERIAL` — RESUELTO](#359-postgresql-acepta-pk-autoincremental-de-3216-bits-no-solo-bigserial--resuelto)
+  - [3.60 `http.getWithStatus`/`http.postWithStatus`: código de estado y headers de la respuesta — RESUELTO](#360-httpgetwithstatushttppostwithstatus-código-de-estado-y-headers-de-la-respuesta--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3106,6 +3107,35 @@ Bug real encontrado auditando PLAN.md §8.5 (reporte de adopción de una app fin
 **Límite que sigue en pie:** las tablas que `linkc` GENERA siguen usando `BIGSERIAL` siempre (`postgres_emit.rs`) -- esto es solo sobre LEER una tabla que ya existía con otro ancho, nunca sobre crear una nueva con un ancho distinto.
 
 **Verificado:** un nuevo test en `pg_integration.rs` (`a_preexisting_table_with_a_32_bit_serial_id_accepts_inserts_and_reads`) crea una tabla a mano con `id SERIAL PRIMARY KEY` y confirma `insert`/`get`/`list` de punta a punta contra un Postgres real. **Sin verificar en esta sesión**: no había Postgres disponible en el entorno de desarrollo (ni Docker para levantar uno) -- el test corre de verdad recién en CI, que sí tiene la base levantada (`.github/workflows/ci.yml`, job `postgres`). El razonamiento sobre `try_get`/OIDs está confirmado por lectura cuidadosa del código y la documentación de `postgres`/`tokio-postgres`, no por ejecución real todavía.
+
+---
+
+### 3.60 `http.getWithStatus`/`http.postWithStatus`: código de estado y headers de la respuesta — RESUELTO
+
+Item de la tabla "Does not work yet" del README desde v1.11.0 (`http.getWithHeaders`/`postWithHeaders`, §3.47), reflejado también en PLAN.md §8.3.1: `http.get`/`http.post` (con o sin headers salientes) solo devolvían el body como `String` -- un 4xx/5xx de la API llamada se volvía un error de runtime genérico, sin forma de que el programa lo inspeccionara (por ejemplo, para reintentar solo ante un 429).
+
+<!-- linkc:fragment -->
+```rust
+type Header = { name: String, value: String }
+type ApiResponse = { status: Int, headers: Header[], body: String }
+
+rpc charge(amount: Int, apiKey: String) -> Bool {
+  let resp = http.postWithStatus("https://api.example.com/charges", "amount=" + amount.toString(), [
+    Header { name: "Authorization", value: "Bearer " + apiKey },
+  ]);
+  match (resp.status) {
+    200 => true,
+    429 => panic("rate limited, reintentar más tarde"),
+    _ => false,
+  }
+}
+```
+
+**Dos métodos nuevos**, no una sobrecarga de los cuatro existentes -- `http.get`/`http.post`/`http.getWithHeaders`/`http.postWithHeaders` quedan sin cambios, siguen devolviendo `String` y siguen convirtiendo un 4xx/5xx en error de runtime (quien no necesita inspeccionar el status sigue con la forma simple). `getWithStatus`/`postWithStatus` toman los mismos argumentos que sus pares `WithHeaders` (`headers: []` si no hace falta mandar ninguno) y devuelven un struct estructural, SIN nombre reservado por el lenguaje -- mismo criterio exacto que ya usa el tipo de `headers` (§3.47): cualquier `type` que el programa declare con los campos `status: Int`, `headers: {name: String, value: String}[]`, `body: String` sirve como destino.
+
+**Un 4xx/5xx deja de ser un error de runtime en estos dos métodos** -- es justo el dato que existen para exponer. `ureq::Error::Status` (la librería HTTP que usa el intérprete) trae la `Response` completa, no solo el código, así que se decodifica igual que el camino 2xx. Solo un error de RED de verdad (DNS, conexión rechazada, timeout) sigue siendo un error de runtime -- eso nunca fue algo que un programa pudiera "manejar" de forma significativa de todos modos.
+
+**Verificado** contra un servidor HTTP real armado a mano en el test (`cli_http.rs`, no un mock interno): un 2xx expone status/headers/body correctos; un 429 con header `Retry-After` llega completo como dato, sin que el rpc que lo llama falle; un 201 de un POST también. Nombres de header comparados sin distinguir mayúsculas -- HTTP no las distingue, y `ureq` normaliza a minúsculas al parsear.
 
 ---
 

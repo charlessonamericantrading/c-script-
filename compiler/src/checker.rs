@@ -57,6 +57,22 @@ fn http_header_type() -> Type {
     }
 }
 
+/// Lo que `http.getWithStatus`/`http.postWithStatus` (GRAMMAR.md §3.60)
+/// devuelven -- mismo criterio que `http_header_type`: estructural, SIN
+/// nombre, así que cualquier `type` que el programa declare con estos tres
+/// campos exactos sirve como destino, sin que el lenguaje tenga que inventar
+/// un `HttpResponse` propio.
+fn http_response_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "status".to_string(), optional: false, ty: Type::Int },
+            FieldType { name: "headers".to_string(), optional: false, ty: Type::List(Box::new(http_header_type())) },
+            FieldType { name: "body".to_string(), optional: false, ty: Type::String },
+        ],
+    }
+}
+
 impl CheckError {
     /// El PRIMER stamp gana: a medida que un error burbujea desde adentro
     /// hacia afuera (ej. de una sub-expresión hasta la sentencia que la
@@ -2816,6 +2832,27 @@ impl Checker {
                 self.check_expr(url, &Type::String, env)?;
                 self.check_expr(headers, &Type::List(Box::new(http_header_type())), env)?;
                 Some(Type::String)
+            }
+            (Type::Http, "getWithStatus") => {
+                let [url, headers] = args else {
+                    return Err(err(
+                        "'http.getWithStatus' toma exactamente 2 argumentos (url: String, headers: {name: String, value: String}[])",
+                    ));
+                };
+                self.check_expr(url, &Type::String, env)?;
+                self.check_expr(headers, &Type::List(Box::new(http_header_type())), env)?;
+                Some(http_response_type())
+            }
+            (Type::Http, "postWithStatus") => {
+                let [url, body, headers] = args else {
+                    return Err(err(
+                        "'http.postWithStatus' toma exactamente 3 argumentos (url: String, body: String, headers: {name: String, value: String}[])",
+                    ));
+                };
+                self.check_expr(url, &Type::String, env)?;
+                self.check_expr(body, &Type::String, env)?;
+                self.check_expr(headers, &Type::List(Box::new(http_header_type())), env)?;
+                Some(http_response_type())
             }
             (Type::Http, "postWithHeaders") => {
                 let [url, body, headers] = args else {
