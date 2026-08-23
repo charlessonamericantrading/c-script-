@@ -475,3 +475,125 @@ fn current_user_id_returns_stored_user_id_over_a_real_subprocess() {
     server.shutdown();
 }
 
+// GRAMMAR.md §3.64: auth externo -- confiar en un JWT HS256 ya emitido por un
+// backend existente, sin pasar por `auth.createSession(WithId)`. `--jwt-secret`
+// (extra_args de `ServeProcess`) es lo único que hace falta para habilitarlo.
+
+const JWT_PROGRAM: &str = r#"
+enum Role { Admin, Member }
+
+service Secured {
+  @requires(Role.Admin)
+  rpc adminOnly() -> String {
+    "solo admin"
+  }
+
+  @authenticated
+  rpc anyAuth() -> String {
+    "cualquier rol autenticado"
+  }
+
+  rpc whoAmI() -> String? {
+    auth.currentRole()
+  }
+
+  rpc myId() -> Int? {
+    auth.currentUserId()
+  }
+}
+"#;
+
+/// Arma un JWT HS256 DE VERDAD -- mismo algoritmo que produciría
+/// `jsonwebtoken` de Node o `PyJWT` de Python, no un atajo interno de este
+/// repo -- para probar interoperabilidad real, no un round-trip contra el
+/// propio código de este proyecto.
+fn make_jwt(secret: &str, alg: &str, claims_json: &str) -> String {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = format!(r#"{{"alg":"{alg}","typ":"JWT"}}"#);
+    let header_b64 = engine.encode(header.as_bytes());
+    let payload_b64 = engine.encode(claims_json.as_bytes());
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(signing_input.as_bytes());
+    let sig_b64 = engine.encode(mac.finalize().into_bytes());
+    format!("{signing_input}.{sig_b64}")
+}
+
+#[test]
+fn a_jwt_with_the_right_role_satisfies_requires_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program_and_args("jwt-role-ok", JWT_PROGRAM, &["--jwt-secret", "shh"]);
+
+    let jwt = make_jwt("shh", "HS256", r#"{"role":"Admin","sub":7}"#);
+    let (status, body) = server.post("/Secured/adminOnly", &json!({}), Some(&jwt));
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body, "solo admin");
+
+    server.shutdown();
+}
+
+#[test]
+fn a_jwt_with_the_wrong_role_is_rejected_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program_and_args("jwt-role-bad", JWT_PROGRAM, &["--jwt-secret", "shh"]);
+
+    let jwt = make_jwt("shh", "HS256", r#"{"role":"Member","sub":7}"#);
+    let (status, _) = server.post("/Secured/adminOnly", &json!({}), Some(&jwt));
+    assert_eq!(status, 403, "rol válido, pero no el que pide @requires(Role.Admin)");
+
+    server.shutdown();
+}
+
+#[test]
+fn a_jwt_satisfies_authenticated_regardless_of_its_role() {
+    let server = ServeProcess::start_with_program_and_args("jwt-authenticated", JWT_PROGRAM, &["--jwt-secret", "shh"]);
+
+    let jwt = make_jwt("shh", "HS256", r#"{"role":"Member","sub":1}"#);
+    let (status, body) = server.post("/Secured/anyAuth", &json!({}), Some(&jwt));
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body, "cualquier rol autenticado");
+
+    server.shutdown();
+}
+
+#[test]
+fn auth_current_role_and_current_user_id_read_jwt_claims_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program_and_args("jwt-claims", JWT_PROGRAM, &["--jwt-secret", "shh"]);
+
+    let jwt = make_jwt("shh", "HS256", r#"{"role":"Admin","sub":"123"}"#);
+    let (status, body) = server.post("/Secured/whoAmI", &json!({}), Some(&jwt));
+    assert_eq!(status, 200);
+    assert_eq!(body, "Admin");
+
+    let (status, body) = server.post("/Secured/myId", &json!({}), Some(&jwt));
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body, json!(123), "'sub' como string de dígitos tiene que parsear a Int");
+
+    server.shutdown();
+}
+
+#[test]
+fn a_jwt_with_an_invalid_signature_is_rejected_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program_and_args("jwt-bad-sig", JWT_PROGRAM, &["--jwt-secret", "shh"]);
+
+    let jwt = make_jwt("secreto-equivocado", "HS256", r#"{"role":"Admin","sub":1}"#);
+    let (status, _) = server.post("/Secured/adminOnly", &json!({}), Some(&jwt));
+    assert_eq!(status, 401, "firma que no matchea: indistinguible de 'sin token' a propósito");
+
+    server.shutdown();
+}
+
+#[test]
+fn without_jwt_secret_configured_a_jwt_shaped_token_is_just_unauthenticated() {
+    // Sin --jwt-secret: comportamiento IDÉNTICO al de antes de esta ronda --
+    // un token con forma de JWT no se verifica nunca, cae a "desconocido".
+    let server = ServeProcess::start_with_program("jwt-not-configured", JWT_PROGRAM);
+
+    let jwt = make_jwt("cualquier-secreto", "HS256", r#"{"role":"Admin","sub":1}"#);
+    let (status, _) = server.post("/Secured/adminOnly", &json!({}), Some(&jwt));
+    assert_eq!(status, 401);
+
+    server.shutdown();
+}
+

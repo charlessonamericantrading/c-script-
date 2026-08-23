@@ -137,6 +137,7 @@ pub fn serve(
     cors: CorsConfig,
     session_ttl: Option<Duration>,
     argon2_params: argon2::Params,
+    jwt_config: Option<(String, String, String)>,
 ) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
@@ -180,6 +181,13 @@ pub fn serve(
     let sessions = match session_ttl {
         Some(ttl) => SessionStore::with_ttl(ttl),
         None => SessionStore::new(),
+    };
+    // Auth externo (GRAMMAR.md §3.64): verificar JWTs HS256 emitidos por un
+    // backend YA existente, además de -- nunca en vez de -- las sesiones
+    // propias de arriba.
+    let sessions = match jwt_config {
+        Some((secret, role_claim, user_id_claim)) => sessions.with_jwt(secret, role_claim, user_id_claim),
+        None => sessions,
     };
     let backend = if db.is_postgres() { "PostgreSQL" } else { "SQLite" };
     // `@route` (GRAMMAR.md §3.37): armada UNA vez al arrancar, nunca por
@@ -699,8 +707,14 @@ fn check_auth_gate(
     };
     match annotation {
         Annotation::Authenticated => Ok(()),
+        // `role_enum == ""` es el sentinel de `SessionStore::role_for`
+        // (GRAMMAR.md §3.64) para "esta sesión viene de un JWT externo, sin
+        // ningún enum de c-script asociado" -- matchea por NOMBRE de
+        // variante nada más, sin la comparación de identidad de enum que sí
+        // aplica a una sesión creada por `auth.createSession(WithId)` desde
+        // este mismo programa.
         Annotation::Requires { enum_name, variant_names }
-            if &role_enum == enum_name && variant_names.iter().any(|v| v == &role_variant) =>
+            if (role_enum.is_empty() || &role_enum == enum_name) && variant_names.iter().any(|v| v == &role_variant) =>
         {
             Ok(())
         }

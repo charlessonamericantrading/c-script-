@@ -85,6 +85,7 @@
   - [3.61 `db.<c>.pageAfter(cursor, limit)`: cursor de continuación — RESUELTO](#361-dbcpageaftercursor-limit-cursor-de-continuación--resuelto)
   - [3.62 `@route` con parámetros de query string — RESUELTO](#362-route-con-parámetros-de-query-string--resuelto)
   - [3.63 `smtp.sendToMany()`/`smtp.sendHtml()`: varios destinatarios y cuerpo HTML — RESUELTO](#363-smtpsendtomanysmtpsendhtml-varios-destinatarios-y-cuerpo-html--resuelto)
+  - [3.64 Auth externo: confiar en un JWT ya emitido — RESUELTO, alcance acotado (HS256)](#364-auth-externo-confiar-en-un-jwt-ya-emitido--resuelto-alcance-acotado-hs256)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3217,6 +3218,55 @@ Los dos comparten la conexión/remitente desde el ENTORNO del proceso (`LINK_SMT
 **Límites honestos que siguen en pie:** sin adjuntos, sin `cc`/`bcc`, sin envío asíncrono -- los tres son sincrónicos, un relay lento sigue haciendo lento al servidor entero (de un solo hilo) mientras dura esa request. Nada de esto cambió respecto a `send`.
 
 **Verificado** contra un servidor SMTP real armado a mano en el test (`cli_smtp.rs`, habla el protocolo real: EHLO/MAIL FROM/RCPT TO/DATA), no un mock interno: `sendToMany` con dos destinatarios produce dos `RCPT TO:` en la MISMA conversación; una lista vacía falla limpio; `sendHtml` produce un mensaje con `Content-Type: text/html` y el markup sin escapar en el body.
+
+---
+
+### 3.64 Auth externo: confiar en un JWT ya emitido — RESUELTO, alcance acotado (HS256)
+
+Hasta esta ronda, Link solo emitía y validaba sus PROPIAS sesiones opacas (`auth.createSession(WithId)`, §3.14) -- no había forma de decirle "confiá en este JWT que mi backend Express/Node/lo-que-sea ya emitió". Eso bloqueaba CUALQUIER adopción de Link dentro de una app con login preexistente: la única salida era correr dos sistemas de sesión en paralelo, uno para los endpoints viejos y otro para los nuevos escritos en c-script.
+
+<!-- linkc:fragment -->
+```rust
+enum Role { Admin, Member }
+
+service Orders {
+  // El caller manda Authorization: Bearer <jwt-emitido-por-otro-backend>.
+  // Sin llamar auth.createSession en ningún lado -- el JWT YA autentica.
+  @requires(Role.Admin)
+  rpc cancel(id: Int) -> Void {
+    db.orders.delete(id);
+  }
+
+  rpc whoAmI() -> String? {
+    auth.currentRole() // lee el claim "role" del JWT, igual que de una sesión propia
+  }
+}
+```
+
+```
+linkc serve app.link 8787 --jwt-secret "$JWT_SIGNING_SECRET"
+```
+
+**Un flag de servidor, no una anotación del lenguaje** -- mismo criterio que `--session-ttl`/`--argon2-memory-kib`: el secreto de firma es una decisión de DESPLIEGUE (compartida con el backend que ya emite los JWTs), nunca algo que un `.link` deba poder hardcodear. Sin `--jwt-secret`/`LINK_JWT_SECRET`, el comportamiento es IDÉNTICO al de antes de esta ronda -- cero JWT se intenta verificar nunca.
+
+| Flag / env var | Default | Qué hace |
+|---|---|---|
+| `--jwt-secret` / `LINK_JWT_SECRET` | (ninguno -- feature apagada) | Secreto HMAC para verificar la firma. |
+| `--jwt-role-claim` / `LINK_JWT_ROLE_CLAIM` | `"role"` | Qué claim trae el nombre del rol (`"Admin"`, matcheado por NOMBRE contra el `enum` que pida `@requires`). |
+| `--jwt-user-id-claim` / `LINK_JWT_USER_ID_CLAIM` | `"sub"` | Qué claim trae el id de usuario -- acepta número JSON o string de dígitos (`"sub": "42"`, la convención real de OIDC). |
+
+**Convive con las sesiones propias, nunca las reemplaza.** `SessionStore::role_for`/`user_id_for` prueban primero la sesión creada por este mismo programa (`auth.createSessionWithId`); si el token no está ahí Y hay `--jwt-secret` configurado, lo intentan como JWT externo. `auth.createSession(WithId)` sigue funcionando exactamente igual para cualquier endpoint nuevo escrito directamente en c-script -- una migración real no reemplaza su login existente de un día para el otro.
+
+**Solo HS256 -- allowlist, no blocklist.** Cualquier otro valor de `alg` en el header del JWT (`"none"`, `"RS256"`, lo que sea) se rechaza explícitamente, ANTES de siquiera calcular una firma esperada. `"alg":"none"` es la vulnerabilidad de JWT más común y documentada que existe (un verificador que confía en lo que el propio token dice ser su algoritmo); aceptar RS256 verificado con una clave pensada para HMAC sería la misma clase de error de confusión de algoritmo. La firma se compara en tiempo constante (`constant_time_eq`, ya usado por `verifyPassword` desde §3.34) -- reusa la primitiva, no reinventa la comparación.
+
+**Sin ningún enum de c-script asociado a un token externo.** `role_for` devuelve `("", variante)` para una sesión JWT -- el `""` es un sentinel: `check_auth_gate` matchea `@requires(Role.Admin)` por NOMBRE de variante nada más, sin la comparación de identidad de `enum` que sí aplica a una sesión creada por este mismo programa (donde SÍ hay un `enum` real detrás). En la práctica esto solo importa si un programa declarara dos `enum` de rol distintos con una variante de nombre idéntico -- un caso patológico, documentado acá en vez de ignorado.
+
+**Límites honestos de esta ronda:**
+- **Solo HS256 (HMAC con secreto compartido).** Sin RS256/ES256 (clave pública/privada) ni JWKS (rotación de claves vía endpoint `.well-known`) -- eso es un proveedor de identidad completo (Auth0, Clerk, Cognito), una ronda mucho más grande. HS256 cubre el caso más común de una migración real: el MISMO backend que emite los JWTs es el que configura `--jwt-secret`, así que un secreto compartido no es una limitación operativa, es exactamente el modelo de confianza que ya existe.
+- **`exp` se respeta si está presente; sin `nbf`, `iss` ni `aud`.** Un JWT vencido (`exp` en el pasado) se rechaza; ninguno de los otros claims estándar de validación (`nbf`: "no válido antes de", `iss`: emisor esperado, `aud`: audiencia esperada) se chequea todavía.
+- **Verificación no cacheada.** Cada llamada a `role_for`/`user_id_for` recalcula el HMAC del JWT -- una request que llama a las dos (típico: `check_auth_gate` + `auth.currentUserId()` dentro del cuerpo) lo verifica dos veces. Barato (un HMAC-SHA256), pero real.
+
+**Verificado:** 11 tests unitarios en `session.rs` (JWT válido resuelve rol/id; `sub` como string de dígitos parsea a `Int`; nombres de claim configurables; firma con secreto equivocado rechazada; `alg:"none"` rechazado incluso con firma técnicamente válida; `alg:"RS256"` rechazado; JWT vencido rechazado; JWT sin `exp` nunca vence; entradas basura no paniquean; sin `--jwt-secret` un token con forma de JWT es simplemente desconocido; una sesión propia tiene precedencia) más 6 tests end-to-end contra un servidor real (`server_http.rs`): rol correcto satisface `@requires`, rol incorrecto da 403, cualquier rol satisface `@authenticated`, `auth.currentRole()`/`currentUserId()` leen los claims del JWT, firma inválida da 401, y sin `--jwt-secret` configurado un JWT sigue sin autenticar nada.
 
 ---
 

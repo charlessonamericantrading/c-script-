@@ -123,7 +123,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub')"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
 }
 
@@ -873,12 +873,20 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
 
+    let jwt_config = match resolve_jwt_config(args) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    runtime::server::serve(program, port, source, cors, session_ttl, argon2_params);
+    runtime::server::serve(program, port, source, cors, session_ttl, argon2_params, jwt_config);
     ExitCode::SUCCESS
 }
 
@@ -933,6 +941,37 @@ fn resolve_argon2_params(args: &[String]) -> Result<argon2::Params, String> {
     let iterations = read("--argon2-iterations", "LINK_ARGON2_ITERATIONS")?.unwrap_or(argon2::Params::DEFAULT_T_COST);
     argon2::Params::new(memory_kib, iterations, argon2::Params::DEFAULT_P_COST, None)
         .map_err(|e| format!("parámetros de Argon2id inválidos (memoria={memory_kib}KiB, iteraciones={iterations}): {e}"))
+}
+
+/// `--<flag> <valor>` si está, si no la variable de entorno `env`, si no
+/// `None` -- mismo orden de precedencia que el resto de `resolve_*` de este
+/// archivo.
+fn read_flag_or_env(args: &[String], flag: &str, env: &str) -> Result<Option<String>, String> {
+    let from_flag = match args.iter().position(|a| a == flag) {
+        Some(i) => match args.get(i + 1) {
+            Some(v) => Some(v.clone()),
+            None => return Err(format!("uso: {flag} <valor> (falta el valor)")),
+        },
+        None => None,
+    };
+    Ok(from_flag.or_else(|| std::env::var(env).ok().filter(|v| !v.trim().is_empty())))
+}
+
+/// Auth externo (GRAMMAR.md §3.64): verificar JWTs HS256 emitidos por un
+/// backend ya existente, además de -- nunca en vez de -- las sesiones
+/// propias de este lenguaje. `--jwt-secret`/`LINK_JWT_SECRET` es el único
+/// flag que de verdad importa: sin él, `None` entero -- el comportamiento es
+/// IDÉNTICO al de antes de esta ronda, cero JWT se intenta verificar nunca.
+/// `--jwt-role-claim`/`--jwt-user-id-claim` (o sus env vars) solo tienen
+/// sentido si `--jwt-secret` está, y tienen default (`"role"`/`"sub"`, este
+/// último por convención de OIDC) para el caso común.
+fn resolve_jwt_config(args: &[String]) -> Result<Option<(String, String, String)>, String> {
+    let Some(secret) = read_flag_or_env(args, "--jwt-secret", "LINK_JWT_SECRET")? else {
+        return Ok(None);
+    };
+    let role_claim = read_flag_or_env(args, "--jwt-role-claim", "LINK_JWT_ROLE_CLAIM")?.unwrap_or_else(|| "role".to_string());
+    let user_id_claim = read_flag_or_env(args, "--jwt-user-id-claim", "LINK_JWT_USER_ID_CLAIM")?.unwrap_or_else(|| "sub".to_string());
+    Ok(Some((secret, role_claim, user_id_claim)))
 }
 
 /// "Ns"/"Nm"/"Nh"/"Nd" (segundos/minutos/horas/días) -- mismo espíritu que

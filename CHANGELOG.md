@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.25.0] - 2026-08-24
+
+### ✨ Nuevo
+- **Auth externo: confiar en un JWT ya emitido, HS256.** Hasta esta ronda, Link solo emitía y validaba sus PROPIAS sesiones opacas -- bloqueaba CUALQUIER adopción dentro de una app con login preexistente sin correr dos sistemas de sesión en paralelo. `linkc serve --jwt-secret <secreto>` (o `LINK_JWT_SECRET`) verifica un JWT HS256 emitido por un backend existente -- junto con, nunca en vez de, las sesiones propias (`SessionStore::role_for`/`user_id_for` prueban la sesión propia primero, y solo intentan JWT si el token no está ahí y hay secreto configurado). `@requires`/`@authenticated`/`auth.currentRole()`/`auth.currentUserId()` funcionan igual sin importar cuál de los dos autenticó -- un sentinel (`enum_name` vacío) le dice a `check_auth_gate` que matchee por nombre de variante nada más, sin la comparación de identidad de enum que sí aplica a una sesión propia. `--jwt-role-claim`/`--jwt-user-id-claim` (default `role`/`sub`) eligen los claims; `sub` acepta número JSON o string de dígitos (convención real de OIDC). Sin dependencias nuevas -- `hmac`/`sha2`/`base64` ya estaban por `crypto.hmacSha256`/`base64.encode`. **Solo HS256, allowlist no blocklist**: `"alg":"none"` (la vulnerabilidad de JWT más común y documentada) y cualquier otro algoritmo se rechazan explícitamente antes de calcular una firma esperada; la comparación de firma reusa `constant_time_eq` (ya usado por `verifyPassword`). `exp` se respeta si está presente; sin `nbf`/`iss`/`aud` ni RS256/JWKS -- eso es un proveedor de identidad completo, ronda propia si hace falta. Verificado con 11 tests unitarios en `session.rs` (firma inválida, `alg:none`, `alg:RS256`, JWT vencido, JWT sin `exp`, entradas basura, precedencia de sesión propia, claims configurables) más 6 tests end-to-end contra un servidor real (`server_http.rs`). 621 tests (17 nuevos). Detalle completo: GRAMMAR.md §3.64.
+
 ## [1.24.0] - 2026-08-24
 
 ### ✨ Nuevo
