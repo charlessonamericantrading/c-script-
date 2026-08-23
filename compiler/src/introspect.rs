@@ -1,0 +1,240 @@
+//! `linkc introspect <db-url>` (GRAMMAR.md §3.66): genera un `.link` de
+//! partida a partir de una base PostgreSQL YA EXISTENTE, leyendo
+//! `information_schema` -- para no tener que escribir cada `type`/`db{...}`
+//! a mano cuando se adopta un sistema que ya tiene datos.
+//!
+//! Alcance deliberadamente acotado a PostgreSQL (no SQLite: el caso real que
+//! motiva esto -- "adoptar un sistema existente" -- casi siempre es sobre una
+//! base de producción ya corriendo, y eso es Postgres, no un archivo SQLite
+//! suelto). El resultado es un PUNTO DE PARTIDA para revisar a mano, no un
+//! `.link` listo para producción sin mirarlo: cualquier columna que este
+//! módulo no pueda mapear con confianza (JSONB de forma desconocida, un
+//! `timestamp`/`timestamptz` NATIVO -- el `Timestamp` de c-script necesita
+//! milisegundos en `BIGINT`, GRAMMAR.md §3.31, no el tipo nativo de Postgres)
+//! se emite igual, como `String`, con un comentario `/* TODO */` al lado que
+//! dice exactamente qué hace falta revisar -- nunca se omite una columna en
+//! silencio.
+//!
+//! Los nombres de campo son los nombres REALES de columna SQL, `snake_case`
+//! incluido -- c-script no tiene ningún mecanismo de alias campo->columna
+//! (el nombre del campo ES el nombre de columna que usa `insert`/`find`/etc.,
+//! `runtime/db.rs`), así que renombrar acá a `camelCase` rompería la
+//! conexión real con la tabla existente. Queda como ejercicio manual para
+//! quien quiera esa convención (y también renombrar la columna real).
+
+use crate::runtime::db::connect_postgres_client;
+
+/// Una columna real, ya leída de `information_schema.columns`.
+struct Column {
+    name: String,
+    pg_type: String,
+    nullable: bool,
+}
+
+/// Resultado de introspeccionar una tabla: el `type`/`db` que se puede
+/// generar con confianza, más cualquier advertencia sobre columnas que
+/// necesitan revisión manual.
+struct TableIntrospection {
+    link_type: String,
+    warnings: Vec<String>,
+}
+
+/// Mapea un `data_type` de `information_schema.columns` (siempre en
+/// minúsculas, la forma que Postgres ya normaliza) al tipo c-script más
+/// cercano -- `(tipo, advertencia)`. `advertencia` es `Some` cuando el mapeo
+/// es un placeholder que hay que revisar a mano, nunca cuando es exacto.
+fn map_pg_type(pg_type: &str, column_name: &str) -> (&'static str, Option<String>) {
+    match pg_type {
+        "bigint" | "integer" | "smallint" => ("Int", None),
+        "boolean" => ("Bool", None),
+        "double precision" | "real" | "numeric" => ("Float", None),
+        "text" | "character varying" | "character" | "citext" => ("String", None),
+        "uuid" => (
+            "String",
+            Some(format!("'{column_name}' es uuid -- se mapea a String (el valor de texto), no hay un tipo UUID dedicado")),
+        ),
+        "jsonb" | "json" => (
+            "String",
+            Some(format!(
+                "'{column_name}' es {pg_type} -- la FORMA real del JSON no se puede inferir de information_schema; \
+                 declará un 'type' propio para ese shape y reemplazá 'String' acá si corresponde"
+            )),
+        ),
+        "timestamp without time zone" | "timestamp with time zone" | "date" | "time without time zone" => (
+            "String",
+            Some(format!(
+                "'{column_name}' es {pg_type} (un tipo de fecha/hora NATIVO de Postgres) -- el 'Timestamp' de \
+                 c-script necesita milisegundos en BIGINT (GRAMMAR.md §3.31), no este tipo nativo; revisar a mano \
+                 (migrar la columna a BIGINT, o convertir en el propio rpc)"
+            )),
+        ),
+        other => (
+            "String",
+            Some(format!("'{column_name}' es '{other}', un tipo sin mapeo conocido -- revisado como String a mano")),
+        ),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// `snake_case`/`kebab-case` -> `PascalCase`, para el nombre del `type` --
+/// una tabla `blog_posts` da `type BlogPosts`, no `type Blog_posts`.
+fn to_pascal_case(table_name: &str) -> String {
+    table_name.split(|c| c == '_' || c == '-').filter(|s| !s.is_empty()).map(capitalize).collect()
+}
+
+fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableIntrospection, String> {
+    let pk_rows = client
+        .query(
+            "SELECT kcu.column_name \
+             FROM information_schema.table_constraints tc \
+             JOIN information_schema.key_column_usage kcu \
+               ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
+             WHERE tc.table_schema = 'public' AND tc.table_name = $1 AND tc.constraint_type = 'PRIMARY KEY'",
+            &[&table],
+        )
+        .map_err(|e| format!("no se pudo leer la clave primaria de '{table}': {e}"))?;
+    let pk_columns: Vec<String> = pk_rows.iter().map(|r| r.get::<_, String>(0)).collect();
+
+    let col_rows = client
+        .query(
+            "SELECT column_name, data_type, is_nullable \
+             FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 \
+             ORDER BY ordinal_position",
+            &[&table],
+        )
+        .map_err(|e| format!("no se pudo leer las columnas de '{table}': {e}"))?;
+    let columns: Vec<Column> = col_rows
+        .iter()
+        .map(|r| Column {
+            name: r.get::<_, String>(0),
+            pg_type: r.get::<_, String>(1),
+            nullable: r.get::<_, String>(2) == "YES",
+        })
+        .collect();
+
+    let mut warnings = Vec::new();
+    let mut fields = Vec::new();
+
+    if pk_columns.len() == 1 && pk_columns[0] == "id" {
+        // El caso normal: "id" es la única PK -- c-script siempre la declara
+        // como el primer campo, `Int` (GRAMMAR.md §3.59: BIGINT/integer/
+        // smallint decodifican los tres igual desde esta ronda).
+        fields.push("  id: Int,".to_string());
+    } else if pk_columns.is_empty() {
+        warnings.push(format!("la tabla '{table}' no tiene clave primaria -- c-script REQUIERE una columna \"id\" entera autoincremental; agregala antes de usar esta tabla"));
+        fields.push("  id: Int, // TODO: la tabla no tenía PK, agregar una columna \"id\" real".to_string());
+    } else if pk_columns != ["id"] {
+        warnings.push(format!(
+            "la clave primaria de '{table}' es {pk_columns:?}, no simplemente \"id\" -- c-script solo soporta una PK entera llamada \"id\"; revisar a mano"
+        ));
+        fields.push("  id: Int, // TODO: la PK real de esta tabla no es (solo) \"id\", revisar".to_string());
+    }
+
+    for col in &columns {
+        if col.name == "id" {
+            continue; // ya emitido arriba, siempre primero
+        }
+        let (base_ty, warning) = map_pg_type(&col.pg_type, &col.name);
+        if let Some(w) = warning {
+            warnings.push(w);
+        }
+        let ty = if col.nullable { format!("{base_ty}?") } else { base_ty.to_string() };
+        fields.push(format!("  {}: {},", col.name, ty));
+    }
+
+    let type_name = to_pascal_case(table);
+    let link_type = format!("type {type_name} = {{\n{}\n}}", fields.join("\n"));
+    Ok(TableIntrospection { link_type, warnings })
+}
+
+/// Genera un `.link` de partida desde TODAS las tablas base del schema
+/// `public` de la base en `url` -- `(contenido, advertencias)`. Nunca
+/// falla por una tabla individual rara: cada advertencia queda asociada a
+/// la tabla que la generó, para que el caller decida cómo mostrarlas
+/// (`main.rs` las manda a stderr, prefijadas con el nombre de tabla).
+pub fn generate_link_from_postgres(url: &str) -> Result<(String, Vec<String>), String> {
+    let mut client = connect_postgres_client(url)?;
+    let table_rows = client
+        .query(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+             ORDER BY table_name",
+            &[],
+        )
+        .map_err(|e| format!("no se pudo listar las tablas: {e}"))?;
+    let tables: Vec<String> = table_rows.iter().map(|r| r.get::<_, String>(0)).collect();
+    if tables.is_empty() {
+        return Err("el schema 'public' no tiene ninguna tabla -- nada para introspeccionar".to_string());
+    }
+
+    let mut type_blocks = Vec::new();
+    let mut db_lines = Vec::new();
+    let mut all_warnings = Vec::new();
+    for table in &tables {
+        let TableIntrospection { link_type, warnings } = introspect_table(&mut client, table)?;
+        type_blocks.push(link_type.clone());
+        let type_name = to_pascal_case(table);
+        db_lines.push(format!("  {table}: {type_name}[],"));
+        all_warnings.extend(warnings.into_iter().map(|w| format!("{table}: {w}")));
+    }
+
+    let header = "// Generado por 'linkc introspect' -- PUNTO DE PARTIDA, no un .link listo\n\
+                  // para producción sin revisar. Cualquier línea con '// TODO' o reportada\n\
+                  // como advertencia en stderr necesita una decisión manual.\n\n";
+    let content = format!("{header}{}\n\ndb {{\n{}\n}}\n", type_blocks.join("\n\n"), db_lines.join("\n"));
+    Ok((content, all_warnings))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_pg_type_covers_the_common_scalar_types_without_a_warning() {
+        assert_eq!(map_pg_type("bigint", "x").0, "Int");
+        assert_eq!(map_pg_type("integer", "x").0, "Int");
+        assert_eq!(map_pg_type("smallint", "x").0, "Int");
+        assert_eq!(map_pg_type("boolean", "x").0, "Bool");
+        assert_eq!(map_pg_type("double precision", "x").0, "Float");
+        assert_eq!(map_pg_type("numeric", "x").0, "Float");
+        assert_eq!(map_pg_type("text", "x").0, "String");
+        assert_eq!(map_pg_type("character varying", "x").0, "String");
+        for ty in ["bigint", "integer", "smallint", "boolean", "double precision", "numeric", "text", "character varying"] {
+            assert!(map_pg_type(ty, "x").1.is_none(), "'{ty}' no debería generar advertencia");
+        }
+    }
+
+    #[test]
+    fn map_pg_type_flags_jsonb_uuid_and_native_timestamps_with_a_warning() {
+        assert!(map_pg_type("jsonb", "meta").1.is_some());
+        assert!(map_pg_type("uuid", "external_id").1.is_some());
+        assert!(map_pg_type("timestamp with time zone", "created_at").1.is_some());
+        assert!(map_pg_type("timestamp without time zone", "created_at").1.is_some());
+        // Los tres siguen dando un tipo VÁLIDO (String) -- nunca se omite la
+        // columna del .link generado, aunque necesite revisión.
+        assert_eq!(map_pg_type("jsonb", "meta").0, "String");
+    }
+
+    #[test]
+    fn map_pg_type_falls_back_to_string_with_a_warning_for_anything_unknown() {
+        let (ty, warning) = map_pg_type("inet", "ip_address");
+        assert_eq!(ty, "String");
+        assert!(warning.is_some());
+    }
+
+    #[test]
+    fn to_pascal_case_converts_snake_and_kebab_case_table_names() {
+        assert_eq!(to_pascal_case("users"), "Users");
+        assert_eq!(to_pascal_case("blog_posts"), "BlogPosts");
+        assert_eq!(to_pascal_case("legacy-orders"), "LegacyOrders");
+        assert_eq!(to_pascal_case("a_b_c"), "ABC");
+    }
+}

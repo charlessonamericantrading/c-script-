@@ -27,6 +27,11 @@ pub mod route;
 // playground web, sin tocar el binario `linkc` normal.
 #[cfg(feature = "runtime")]
 pub mod runtime;
+// Mismo motivo que `runtime` arriba: `linkc introspect` habla PostgreSQL de
+// verdad (crate `postgres`), así que no puede vivir en el build wasm32 del
+// playground.
+#[cfg(feature = "runtime")]
+pub mod introspect;
 pub mod scaffold;
 pub mod token;
 pub mod types;

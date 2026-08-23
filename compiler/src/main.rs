@@ -87,6 +87,7 @@ fn main() -> ExitCode {
         Some("lint") => cmd_lint(&args[2..]),
         Some("doc") => cmd_doc(&args[2..]),
         Some("docker") => cmd_docker(&args[2..]),
+        Some("introspect") => cmd_introspect(&args[2..]),
         // `--help` es una peticion valida, no un error: va a stdout y sale 0.
         // Sin este brazo caia en `cmd_check("--help")`, que respondia con un
         // mensaje sobre archivos .link inexistentes.
@@ -122,6 +123,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)"));
     out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
+    out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
     out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub')"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
@@ -243,6 +245,34 @@ fn cmd_docker(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error al generar configuración Docker: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `linkc introspect <db-url>` (GRAMMAR.md §3.66): el `.link` generado va a
+/// STDOUT (para `> main.link`, o para revisarlo en la terminal antes de
+/// guardarlo); las advertencias -- columnas que necesitan revisión manual --
+/// van a STDERR, así que un `> main.link` no se las lleva puestas adentro
+/// del archivo por error.
+fn cmd_introspect(args: &[String]) -> ExitCode {
+    let Some(url) = args.first() else {
+        eprintln!("uso: linkc introspect <db-url>");
+        return ExitCode::FAILURE;
+    };
+    match linkc::introspect::generate_link_from_postgres(url) {
+        Ok((content, warnings)) => {
+            println!("{content}");
+            if !warnings.is_empty() {
+                eprintln!("linkc introspect: {} advertencia(s) -- revisar antes de usar en producción:", warnings.len());
+                for w in &warnings {
+                    eprintln!("  - {w}");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error al introspeccionar '{url}': {e}");
             ExitCode::FAILURE
         }
     }

@@ -1064,3 +1064,109 @@ fn a_write_on_one_instance_pushes_to_a_stream_connected_to_another() {
     assert_eq!(event["name"], "desde-B", "evento recibido: {event:?}");
     assert_eq!(event["id"], created["id"], "evento recibido: {event:?}");
 }
+
+// GRAMMAR.md §3.66: `linkc introspect <db-url>` genera un .link de partida
+// desde una base PostgreSQL YA EXISTENTE -- estos tests crean una tabla A
+// MANO (simulando un sistema adoptado, no generado por linkc) y confirman
+// que lo que sale de introspect compila Y conecta de verdad contra esa
+// MISMA tabla.
+
+#[test]
+fn introspect_generates_a_link_file_that_actually_works_against_the_real_table() {
+    const COLLECTION: &str = "legacy_customers";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"name\" TEXT NOT NULL, \
+                \"nickname\" TEXT, \
+                \"active\" BOOLEAN NOT NULL, \
+                \"balance\" DOUBLE PRECISION NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla 'legacy' a mano, como si ya existiera de otro sistema");
+    client
+        .execute(
+            &format!("INSERT INTO \"{COLLECTION}\" (name, nickname, active, balance) VALUES ('Ada', NULL, true, 42.5)"),
+            &[],
+        )
+        .expect("sembrar una fila real");
+
+    let output =
+        Command::new(env!("CARGO_BIN_EXE_linkc")).arg("introspect").arg(&url).output().expect("ejecutar linkc introspect");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let generated = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(generated.contains("type LegacyCustomers"), "{generated}");
+    assert!(generated.contains("id: Int,"), "{generated}");
+    assert!(generated.contains("name: String,"), "{generated}");
+    assert!(generated.contains("nickname: String?,"), "nullable tiene que salir como String?: {generated}");
+    assert!(generated.contains("active: Bool,"), "{generated}");
+    assert!(generated.contains("balance: Float,"), "{generated}");
+    assert!(generated.contains(&format!("{COLLECTION}: LegacyCustomers[]")), "{generated}");
+
+    // Verificación fuerte: el .link generado no solo "parece" correcto --
+    // compila Y conecta de verdad contra la MISMA tabla, leyendo el dato ya
+    // sembrado antes de que `linkc` supiera que esta tabla existía.
+    let mut full_program = generated;
+    full_program
+        .push_str(&format!("\nservice Check {{\n  rpc list() -> LegacyCustomers[] {{ db.{COLLECTION}.all() }}\n}}\n"));
+    let temp = TempDir::new("introspect-roundtrip");
+    let src = temp.write("app.link", &full_program);
+    let server = Serve::start(&src, &url);
+
+    let rows = server.rpc("Check/list", "{}");
+    let arr = rows.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "{arr:?}");
+    assert_eq!(arr[0]["name"], "Ada");
+    assert_eq!(arr[0]["nickname"], serde_json::Value::Null);
+    assert_eq!(arr[0]["active"], true);
+    assert_eq!(arr[0]["balance"], 42.5);
+}
+
+#[test]
+fn introspect_warns_about_columns_it_cannot_map_with_confidence() {
+    const COLLECTION: &str = "legacy_events";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"payload\" JSONB NOT NULL, \
+                \"happened_at\" TIMESTAMPTZ NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla con columnas 'raras' a mano");
+
+    let output =
+        Command::new(env!("CARGO_BIN_EXE_linkc")).arg("introspect").arg(&url).output().expect("ejecutar linkc introspect");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let generated = String::from_utf8_lossy(&output.stdout).to_string();
+    let warnings = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Sigue emitiendo un tipo VÁLIDO -- nunca omite la columna -- pero avisa.
+    assert!(generated.contains("payload: String,"), "{generated}");
+    // El nombre del campo es el nombre REAL de la columna SQL, snake_case
+    // incluido -- c-script no tiene ningún mecanismo de alias campo->columna
+    // (el nombre del campo ES el nombre de columna que usa insert/find/etc.,
+    // runtime/db.rs), así que "prolijizarlo" a camelCase acá rompería la
+    // conexión real con la tabla.
+    assert!(generated.contains("happened_at: String,"), "{generated}");
+    assert!(warnings.contains("payload") && warnings.to_lowercase().contains("jsonb"), "stderr: {warnings}");
+    assert!(warnings.contains("happened_at") && warnings.to_lowercase().contains("timestamp"), "stderr: {warnings}");
+}

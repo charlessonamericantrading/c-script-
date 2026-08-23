@@ -87,6 +87,7 @@
   - [3.63 `smtp.sendToMany()`/`smtp.sendHtml()`: varios destinatarios y cuerpo HTML — RESUELTO](#363-smtpsendtomanysmtpsendhtml-varios-destinatarios-y-cuerpo-html--resuelto)
   - [3.64 Auth externo: confiar en un JWT ya emitido — RESUELTO, alcance acotado (HS256)](#364-auth-externo-confiar-en-un-jwt-ya-emitido--resuelto-alcance-acotado-hs256)
   - [3.65 Agregación (`sumBy`/etc.): soporte de `Int64` — RESUELTO (fecha truncada sigue pendiente)](#365-agregación-sumbyetc-soporte-de-int64--resuelto-fecha-truncada-sigue-pendiente)
+  - [3.66 `linkc introspect`: generar un `.link` desde una base PostgreSQL existente — RESUELTO, alcance acotado](#366-linkc-introspect-generar-un-link-desde-una-base-postgresql-existente--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3290,6 +3291,36 @@ rpc totalByRegion() -> RegionTotal[] {
 **Límite que sigue en pie: sin truncado de fechas.** Agrupar por un `Timestamp` sigue sin aceptarse -- un `Timestamp` se guarda como milisegundos exactos (`BIGINT`, §3.31), así que agruparlo tal cual produciría un grupo por fila, nunca cohortes reales. Lo que hace falta es un método de truncado (`.truncateToMonth()`, por ejemplo) reconocido en la MISMA posición de selector, empujado a `DATE_TRUNC`/`strftime` según el backend -- una ronda aparte a propósito: los dos backends divergen de verdad acá (Postgres necesita convertir el `BIGINT` a un `timestamp` nativo con `to_timestamp`/`EXTRACT(EPOCH ...)` antes de truncar; SQLite trunca con `strftime` y devuelve texto, no milisegundos), y ese tipo de divergencia entre backends es exactamente la clase de bug que este proyecto viene encontrando y documentando desde §3.9 -- mejor una ronda propia con tests dedicados en los dos motores que apurarla acá.
 
 **Verificado:** un test de runtime contra SQLite (`runtime/mod.rs`) que agrupa y suma por un campo `Int64`, confirmando que el resultado es `Int64` de verdad (no solo que el valor numérico coincide) comparándolo contra `1200.toInt64()`; el mismo caso contra un PostgreSQL real (`pg_integration.rs`), donde además confirma que `key` y `value` viajan como STRING en el JSON, no como número -- la parte que un bug de etiquetado hubiera roto en silencio; y un test de compilación que confirma que el tipo del resultado tipa como `Int64`, no `Int`.
+
+---
+
+### 3.66 `linkc introspect`: generar un `.link` desde una base PostgreSQL existente — RESUELTO, alcance acotado
+
+Reporte real de adopción (app financiera "MyFinance" sobre una base Postgres ya existente): sin esto, adoptar Link dentro de un sistema con datos reales significaba escribir cada `type`/`db {...}` a mano, columna por columna, mirando el schema en otra ventana.
+
+```
+linkc introspect postgres://usuario:clave@host/base > main.link
+```
+
+Lee `information_schema` del schema `public` (tablas base + columnas + clave primaria) y emite un `.link` de partida: un `type` por tabla, más el bloque `db {...}` que las declara todas como colecciones. **Es un punto de partida para revisar a mano, no un `.link` listo para producción sin mirarlo** -- el archivo generado empieza con un comentario que lo dice, y cualquier columna que este comando no pueda mapear con confianza sale igual (nunca se omite una columna en silencio) como `String`, con una advertencia en STDERR y del lado del código explicando qué revisar.
+
+**Qué mapea con confianza (sin advertencia):** `bigint`/`integer`/`smallint` -> `Int` (los tres decodifican igual desde §3.59); `boolean` -> `Bool`; `double precision`/`real`/`numeric` -> `Float`; `text`/`character varying`/`character` -> `String`. Una columna `NULL`-able sale como `T?`.
+
+**Qué mapea con advertencia (sigue emitiendo un tipo válido, `String`, pero avisa):**
+- `jsonb`/`json`: la FORMA real del JSON no se puede inferir de `information_schema` -- hace falta declarar un `type` propio a mano si se necesita.
+- `uuid`: se mapea al texto tal cual, no hay un tipo UUID dedicado.
+- `timestamp`/`timestamptz`/`date`: el `Timestamp` de c-script necesita milisegundos en `BIGINT` (§3.31), no el tipo de fecha/hora NATIVO de Postgres -- una columna así no es directamente compatible, hace falta migrarla o convertir a mano.
+- Cualquier otro tipo sin mapeo conocido (`inet`, `cidr`, arrays, etc.).
+
+**Los nombres de campo son los nombres REALES de columna SQL, `snake_case` incluido -- a propósito.** c-script no tiene ningún mecanismo de alias campo↔columna (`insert`/`find`/etc. usan el nombre del campo COMO nombre de columna, `runtime/db.rs`), así que "prolijizar" a `camelCase` acá rompería la conexión real con la tabla. Queda como ejercicio manual para quien lo quiera (y también renombrar la columna real).
+
+**Límites honestos de esta ronda:**
+- **Solo PostgreSQL, nunca SQLite.** El caso real que motiva esto -- adoptar un sistema existente -- casi siempre es sobre una base de producción ya corriendo, y eso es Postgres.
+- **Solo tablas con una PK simple llamada `"id"`.** Sin PK, o una PK compuesta, o una PK que no se llama `"id"`: igual emite el `type` (con un campo `id: Int` placeholder y un comentario `// TODO`), pero avisa que hace falta revisar a mano -- c-script requiere exactamente una columna `"id"` entera autoincremental por colección.
+- **Sin foreign keys, índices, constraints de `CHECK`, ni valores default.** Solo columnas y su nullability.
+- **No genera ningún `service`.** El `.link` resultante tiene los `type`/`db` para conectar, pero cero `rpc` -- escribir el servicio sigue siendo trabajo del desarrollador, a propósito: no hay forma de adivinar qué operaciones necesita la app real.
+
+**Verificado** contra un PostgreSQL real (`pg_integration.rs`): una tabla creada A MANO (simulando un sistema ya existente, no generada por `linkc`) con columnas `NOT NULL`/nullable de varios tipos -- el `.link` generado no solo "parece" correcto, se guarda, se le agrega un `service` mínimo a mano, y `linkc serve` conecta de verdad contra la MISMA tabla y lee la fila sembrada antes de que `linkc` supiera que esa tabla existía. Un segundo test confirma que columnas `jsonb`/`timestamptz` generan la advertencia esperada en stderr sin romper la compilación del archivo.
 
 ---
 

@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.27.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc introspect <db-url>`: generar un `.link` desde una base PostgreSQL existente.** Reporte real de adopción (MyFinance): sin esto, adoptar Link sobre datos reales significaba escribir cada `type`/`db{...}` a mano, columna por columna. Lee `information_schema` del schema `public` y emite un `.link` de partida a stdout -- un `type` por tabla más el `db {...}` que las declara. `bigint`/`integer`/`smallint` -> `Int`, `boolean` -> `Bool`, `double precision`/`numeric` -> `Float`, `text`/`varchar` -> `String`, nullable -> `T?`, todos sin advertencia. `jsonb`/`json` (forma desconocida), `uuid`, y cualquier `timestamp`/`timestamptz`/`date` NATIVO (el `Timestamp` de c-script necesita milisegundos en `BIGINT`, no el tipo nativo de Postgres) salen igual como `String` -- nunca se omite una columna -- pero con una advertencia explícita en stderr. Los nombres de campo son los nombres REALES de columna SQL (`snake_case` incluido) a propósito: c-script no tiene alias campo↔columna, "prolijizar" a camelCase rompería la conexión con la tabla real. Alcance acotado: solo PostgreSQL, solo PK simple llamada `"id"`, sin FKs/índices/constraints, sin generar ningún `service`. Verificado contra un PostgreSQL real: una tabla creada A MANO (simulando un sistema ya adoptado) da un `.link` que, con un `service` mínimo agregado a mano, conecta de verdad y lee la fila sembrada antes de que `linkc` supiera que la tabla existía; más un test que confirma las advertencias de `jsonb`/`timestamptz`. 630 tests (6 nuevos). Detalle completo: GRAMMAR.md §3.66.
+
 ## [1.26.0] - 2026-08-24
 
 ### ✨ Nuevo

@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-624-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.26.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-630-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.27.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 624 automated tests:
+**Works today**, covered by 630 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `linkc introspect <postgres-url>` generates a starting `.link` (types + `db {...}`) from an existing PostgreSQL database's schema — for adopting a system with real data instead of writing every field by hand. A starting point to review, not production-ready as-is: any column it can't map with confidence (`jsonb`, `uuid`, a native `timestamp`/`timestamptz`) still gets a valid type (`String`) plus a warning on stderr, never silently dropped. PostgreSQL only, no `service` generated
 - Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
 - Live push over Server-Sent Events (`stream` + `db.<c>.subscribe()`)
 - Declarative auth: `@authenticated`, `@requires(Role.Admin)` (or `@requires(Role.Admin | Role.Agent)` for any of several roles, all from the same enum), session tokens from the OS CSPRNG. `linkc serve --session-ttl 7d` (or `LINK_SESSION_TTL`) makes sessions expire on their own — unset, they still live until `destroySession()` or a process restart, as before. `auth.currentRole() -> String?` reads which role authenticated the current request from inside an rpc body — lets a `Role.Admin | Role.Agent` endpoint behave differently per role, not just allow/deny; works with no auth annotation at all too, `null` if there's no valid session. `auth.createSessionWithId(role, userId)` associates the user id in the session, and `auth.currentUserId() -> Int?` inspects it from inside any rpc body (`null` if no session or created without id)
@@ -259,7 +260,7 @@ wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_w
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **624 automated unit, integration and CLI tests**, including tests that
+Link is verified by **630 automated unit, integration and CLI tests**, including tests that
 spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
 example published in this repository's documentation:
 

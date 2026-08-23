@@ -125,6 +125,7 @@ linkc build backend.link src/gen     # TypeScript contract, client, validators, 
 linkc test backend.link              # run the test blocks
 linkc serve backend.link 8787        # HTTP + SQLite + SSE
 linkc dev backend.link src/gen 8787  # rebuild and restart on change
+linkc introspect postgres://... > main.link  # generate a starting .link from an existing PostgreSQL schema
 ```
 
 ## Verified example
