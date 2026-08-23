@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-573-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.17.0-blue.svg" alt="Version" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.18.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -34,9 +34,9 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 ## 📊 Status — what works and what does not
 
 This section is the ground truth. If any other section of this README disagrees with it,
-this section wins. Verified on 2026-08-22 by running the compiler, not by reading it.
+this section wins. Verified on 2026-08-23 by running the compiler, not by reading it.
 
-**Works today**, covered by 573 automated tests:
+**Works today**, covered by 574 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
@@ -54,6 +54,7 @@ this section wins. Verified on 2026-08-22 by running the compiler, not by readin
 - Configurable CORS and fixed security headers: `--cors-origin <origin>` (repeatable, or `LINK_CORS_ORIGINS`) switches from open `*` to a real allowlist (exact match, echoed literal + `Vary: Origin`); every response — including errors and `stream` SSE — carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`
 - `linkc fmt`, `linkc --help`, and the TypeScript client emitter for multi-service files all work correctly now
 - Real password hashing: `crypto.hashPassword` is Argon2id (RFC 9106) with a random per-password salt, in PHC format; `verifyPassword` compares in constant time and still accepts hashes written by the previous version so existing users are not locked out
+- Numeric randomness and constant-time comparison for user code: `crypto.randomInt(min, max)` gives a uniform `Int` in that inclusive range from the OS CSPRNG (rejection-sampled against modulo bias) — enough for a real OTP, unlike `randomToken`'s hex alphabet; `crypto.timingSafeEqual(a, b)` exposes the same constant-time comparison `verifyPassword` already used internally, for comparing a webhook secret or API key without a timing side-channel
 - Generated TypeScript contract, typed client, runtime validators, React hooks, Zod schemas, OpenAPI 3.1
 
 **Does not work yet** — do not plan around these:

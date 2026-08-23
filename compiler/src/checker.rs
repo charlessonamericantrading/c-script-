@@ -2741,6 +2741,22 @@ impl Checker {
                 self.expect_no_args(args, "uuid")?;
                 Some(Type::String)
             }
+            (Type::Crypto, "randomInt") => {
+                let [min, max] = args else {
+                    return Err(err("'crypto.randomInt' toma exactamente 2 argumentos (min: Int, max: Int)"));
+                };
+                self.check_expr(min, &Type::Int, env)?;
+                self.check_expr(max, &Type::Int, env)?;
+                Some(Type::Int)
+            }
+            (Type::Crypto, "timingSafeEqual") => {
+                let [a, b] = args else {
+                    return Err(err("'crypto.timingSafeEqual' toma exactamente 2 argumentos (a: String, b: String)"));
+                };
+                self.check_expr(a, &Type::String, env)?;
+                self.check_expr(b, &Type::String, env)?;
+                Some(Type::Bool)
+            }
             (Type::Http, "get") => {
                 let [url] = args else {
                     return Err(err("'http.get' toma exactamente 1 argumento (url: String)"));

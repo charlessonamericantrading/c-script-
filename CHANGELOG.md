@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.18.0] - 2026-08-23
+
+### ✨ Nuevo
+- **`crypto.randomInt(min, max)` y `crypto.timingSafeEqual(a, b)`: aleatoriedad numérica y comparación segura para código de usuario.** Reporte real de adopción de una app financiera existente ("MyFinance") -- `crypto.randomToken`/`uuid` (v1.0, endurecidos en la auditoría del 20/08) ya usaban el CSPRNG del sistema, pero ninguno sirve para un OTP numérico: `randomToken` da hex (`0-9a-f`), no dígitos en un rango exacto. `randomInt(min, max)` da un `Int` uniforme en `[min, max]` (ambos incluidos) con rechazo de muestreo contra el sesgo de módulo -- un `u64` que caería en el resto no divisible se descarta en vez de aplicarle `%` directo. `timingSafeEqual` expone `constant_time_eq` (`subtle::ConstantTimeEq`), ya usado internamente desde la auditoría de `crypto` para el camino de hashes legados, pero nunca alcanzable desde código de usuario -- comparar un secreto de webhook o una API key con `==` de `String` reabre el mismo canal lateral que ya se había cerrado para contraseñas. Verificado con tests de runtime: rango respetado en los extremos, rango degenerado (`min == max`), variabilidad entre llamadas consecutivas con un rango de OTP de 6 dígitos, comparación igual a `==` en el caso feliz y `false` (sin crash) ante largos distintos. 574 tests (2 nuevos). Detalle completo: GRAMMAR.md §3.54.
+
 ## [1.17.0] - 2026-08-22
 
 ### ✨ Nuevo

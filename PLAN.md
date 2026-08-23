@@ -275,12 +275,12 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - Tipos `Timestamp` (ISO-8601 UTC) e `Int64` (mismo rango 64-bit sin pérdida de precisión en TS), más builtin `now() -> Timestamp` (GRAMMAR.md §3.30–§3.32).
 - Toolchain integral: `linkc build`, `serve`, `test`, `dev`, `lint`, `doc`, `docker`, `lsp`, `new`, `fmt`.
 
-**Evolución Post-1.0 (v1.1.0 a v1.17.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
+**Evolución Post-1.0 (v1.1.0 a v1.18.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
 - **PostgreSQL en Runtime** (v1.1.0/v1.4.0/v1.8.0, GRAMMAR.md §3.36/§3.40/§3.44): Soporte de base de datos PostgreSQL real (`--db postgres://...`), auto-migraciones de esquema no destructivas, TLS oportunista y obligatorio vía `rustls` puro (compatible con Supabase/Neon/RDS), auto-reconexión transparente tras corte y LISTEN/NOTIFY en hilo dedicado para sincronizar `stream` SSE entre múltiples instancias.
 - **Criptografía y Seguridad** (v1.1.0/v1.3.0/v1.5.0, GRAMMAR.md §3.34/§3.38/§3.41): Argon2id (RFC 9106) con sal aleatoria en formato PHC y verificación en tiempo constante; tokens de sesión y UUIDs alimentados por el CSPRNG del sistema operativo (`getrandom`); cálculo de HMAC-SHA256 para verificación de webhooks; CORS con allowlist configurable (`--cors-origin`) y cabeceras de seguridad estrictas fijas (`nosniff`, `DENY`, `no-referrer`).
 - **Extensibilidad Web y SEO** (v1.1.0/v1.2.0/v1.6.0/v1.9.0/v1.10.0, GRAMMAR.md §3.35/§3.37/§3.42/§3.45/§3.46): Decorador `@content_type("...")` para respuestas no-JSON (HTML, XML, CSV); URLs amigables `@route("/...")` con múltiples parámetros dinámicos y precedencia determinística; sanitización explícita `String.escapeHtml()`; y selección de status HTTP en éxito `response.setStatus(code)` (e.g. páginas 404 personalizadas o 201 Created).
 - **Integraciones y Operaciones** (v1.3.0/v1.7.0/v1.11.0, GRAMMAR.md §3.38/§3.43/§3.47): Lectura de entorno `env.get()`, inspección de cuerpo crudo y cabeceras entrantes `request.rawBody()` / `request.header()`; límite de peticiones `@rate_limit("N/ventana")` con token bucket continuo; envío de correos vía relay `smtp.send(to, subject, body)` con TLS; y peticiones HTTP salientes con cabeceras `http.getWithHeaders` / `http.postWithHeaders`.
-- **Motor de Consultas y Autorización Avanzada** (v1.12.0 a v1.17.0, GRAMMAR.md §3.48–§3.53): Paginación empujada a SQL nativo `db.<c>.page(limit, offset)`; agregación analítica nativa con `GROUP BY` en base de datos (`sumBy`, `countBy`, `avgBy`, `maxBy`, `minBy`) preservando tipos reales; autorización con OR de roles `@requires(Role.Admin | Role.Agent)`; expiración temporal de sesiones `--session-ttl` (o `LINK_SESSION_TTL`); e introspección de sesión `auth.currentRole() -> String?`, emisión con identidad `auth.createSessionWithId(role, userId)` y lectura de identificador `auth.currentUserId() -> Int?`.
+- **Motor de Consultas y Autorización Avanzada** (v1.12.0 a v1.18.0, GRAMMAR.md §3.48–§3.54): Paginación empujada a SQL nativo `db.<c>.page(limit, offset)`; agregación analítica nativa con `GROUP BY` en base de datos (`sumBy`, `countBy`, `avgBy`, `maxBy`, `minBy`) preservando tipos reales; autorización con OR de roles `@requires(Role.Admin | Role.Agent)`; expiración temporal de sesiones `--session-ttl` (o `LINK_SESSION_TTL`); introspección de sesión `auth.currentRole() -> String?`, emisión con identidad `auth.createSessionWithId(role, userId)` y lectura de identificador `auth.currentUserId() -> Int?`; y aleatoriedad numérica/comparación segura para código de usuario `crypto.randomInt(min, max)` / `crypto.timingSafeEqual(a, b)`.
 
 **Hitos "go / no-go":**
 - Fin de Fase 0: ✅ Demo E2E probada y verificada.
@@ -324,7 +324,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 ## 8. Hoja de Ruta Futura (Fase 4 · Hacia c-script 2.0)
 
-Con las Fases 0 a 3 completadas y el núcleo v1.17.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
+Con las Fases 0 a 3 completadas y el núcleo v1.18.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
 
 ### 8.1 Ecosistema y Distribución
 1. **Publicación en el registro npm**: Empaquetar y publicar `link-lang` en npm para permitir ejecución vía `npx linkc` o instalación global estándar.

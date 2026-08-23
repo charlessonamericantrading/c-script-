@@ -75,6 +75,7 @@
   - [3.51 `auth.currentRole()`: leer el rol del caller dentro de un cuerpo — RESUELTO](#351-authcurrentrole-leer-el-rol-del-caller-dentro-de-un-cuerpo--resuelto)
   - [3.52 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`: agregación con `GROUP BY` real, empujada a SQL — RESUELTO](#352-sumbycountbyavgbymaxbyminby-agregación-con-group-by-real-empujada-a-sql--resuelto)
   - [3.53 `auth.createSessionWithId()` y `auth.currentUserId()`: asociar e inspeccionar el id del caller — RESUELTO](#353-authcreatesessionwithid-y-authcurrentuserid-asociar-e-inspeccionar-el-id-del-caller--resuelto)
+  - [3.54 `crypto.randomInt()` y `crypto.timingSafeEqual()`: aleatoriedad numérica y comparación segura para código de usuario — RESUELTO](#354-cryptorandomint-y-cryptotimingsafeequal-aleatoriedad-numérica-y-comparación-segura-para-código-de-usuario--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -2937,6 +2938,47 @@ service Notes {
 Mismo principio de indistinguibilidad de siempre (§3.14, §3.50, §3.51) — un endpoint público o autenticado obtiene `null` si no hay sesión activa, si el token expiró bajo `--session-ttl`, o si la sesión se creó mediante `createSession(role)` sin id.
 
 **Verificado** contra un servidor real (`compiler/tests/server_http.rs`): login con `createSessionWithId`, recuperación exitosa de `currentUserId()` (`42`) y `currentRole()` (`"Member"`), bifurcación de lógica con `@authenticated`, y retorno de `null` en peticiones sin sesión o con sesiones creadas sin id. Más 3 tests de compilación en `checker.rs` (tipado de argumentos y retorno `Int?`) y tests unitarios en `session.rs`.
+
+---
+
+### 3.54 `crypto.randomInt()` y `crypto.timingSafeEqual()`: aleatoriedad numérica y comparación segura para código de usuario — RESUELTO
+
+Reporte real del 23/08/2026 (adopción de una app financiera existente, `MyFinance`): el módulo `crypto` ya generaba secretos con el CSPRNG del sistema (`randomToken`, `uuid` — §3.34) y comparaba en tiempo constante internamente (`verifyPassword` contra hashes legados), pero ninguna de las dos cosas estaba expuesta en la forma que un `rpc` de usuario necesita:
+
+1. **Sin generador numérico.** `crypto.randomToken(n)` devuelve hex (`0-9a-f`) — sirve para un token de sesión, no para un OTP de 6 dígitos, donde el alfabeto tiene que ser `0-9` y el rango exacto (`100000..999999`). Construir eso a mano desde `randomToken` significa parsear hex a entero e introducir sesgo a mano, exactamente el tipo de criptografía-artesanal que el resto del módulo evita.
+2. **`constant_time_eq` (`subtle::ConstantTimeEq`) era una función privada de `runtime/mod.rs`**, usada solo dentro de `verifyPassword` para comparar contra el hash legado. Comparar un secreto de webhook (`crypto.hmacSha256(secret, body) == signature`, patrón de §3.38) o una API key con `==` de `String` corta en el primer byte distinto — el mismo canal lateral que ya se había cerrado para contraseñas en §3.34, reabierto para cualquier otro secreto que el código de usuario compare.
+
+<!-- linkc:fragment -->
+```rust
+service Auth {
+  rpc requestOtp(userId: Int) -> Int {
+    let code = crypto.randomInt(100000, 999999);
+    // ... guardar `code` asociado a `userId` con expiracion ...
+    code
+  }
+}
+
+service Webhooks {
+  rpc receive(payload: String, signature: String) -> Bool {
+    let expected = crypto.hmacSha256(env.get("WEBHOOK_SECRET"), payload);
+    crypto.timingSafeEqual(expected, signature)
+  }
+}
+```
+
+**Lo que hay ahora:**
+
+| Función | Firma | Implementación |
+|---|---|---|
+| `crypto.randomInt(min, max)` | `(Int, Int) -> Int` | Entero uniforme en `[min, max]` (ambos incluidos) del CSPRNG del sistema, con rechazo de muestreo (`rejection sampling`) contra el sesgo de módulo: un `u64` que caería en el resto no divisible se descarta y se pide otro, en vez de aplicar `%` directo, que haría a los primeros valores del rango levemente más probables que los últimos. |
+| `crypto.timingSafeEqual(a, b)` | `(String, String) -> Bool` | Expone `constant_time_eq` (ya usado internamente desde §3.34) sobre los bytes UTF-8 de ambos strings — largos distintos devuelven `false` sin comparar contenido. |
+
+**Límites honestos de esta ronda:**
+- `randomInt` no genera `Float` ni `Int64` — solo `Int` (`i64`), que alcanza para OTPs, sorteos y muestreo; un rango que exceda `2^64` valores (prácticamente inalcanzable con `Int`) cae a un solo `u64` sin rechazo en vez de fallar, porque el sesgo es inmedible frente a un rango tan grande.
+- `timingSafeEqual` compara bytes, no números ni structs — comparar dos `Int` en tiempo constante no tiene el mismo problema (una CPU ya compara enteros de ancho fijo en tiempo constante) así que no hace falta una sobrecarga para ese caso.
+- No hay conversión `Int -> String` en el lenguaje todavía (nada de esta ronda la agrega), así que un OTP que necesite viajar como texto con ceros a la izquierda (`"042857"`) queda fuera de alcance por esa razón, no por `randomInt` en sí — el `rpc` de ejemplo arriba devuelve el código como `Int`.
+
+**Tests que fijan estas propiedades** (`runtime/mod.rs`, módulo de tests): `randomInt` cae siempre dentro de `[min, max]`, un rango de un solo valor siempre lo devuelve, tres llamadas seguidas con un rango de OTP no dan siempre el mismo valor; `timingSafeEqual` compara igual que `==` en el caso feliz y devuelve `false` (sin crashear) ante strings de largo distinto.
 
 ---
 

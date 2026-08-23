@@ -1353,6 +1353,48 @@ fn call_method(
                 );
                 Ok(Value::Str(s))
             }
+            "randomInt" => {
+                let (min, max) = match (args.first(), args.get(1)) {
+                    (Some(Value::Int(a)), Some(Value::Int(b))) => (*a, *b),
+                    _ => return Err(err("crypto.randomInt requiere dos argumentos Int (min, max)")),
+                };
+                if min > max {
+                    return Err(err("crypto.randomInt: min no puede ser mayor que max"));
+                }
+                // Rango inclusivo [min, max] del CSPRNG del sistema, sin sesgo de
+                // módulo: se descarta cualquier u64 que caiga en el resto que no
+                // divide exacto al tamaño del rango -- si no, los primeros valores
+                // del rango saldrían levemente más probables que los últimos. Hace
+                // falta para un OTP numérico de verdad (randomToken da hex, no
+                // dígitos), donde un sesgo mediría en intentos de fuerza bruta.
+                let range = (max as i128 - min as i128) as u128 + 1;
+                let offset = if range > u64::MAX as u128 {
+                    let bytes = os_random_bytes(8)?;
+                    u64::from_le_bytes(bytes.try_into().unwrap()) as u128
+                } else {
+                    let range = range as u64;
+                    let limit = u64::MAX - (u64::MAX % range);
+                    loop {
+                        let bytes = os_random_bytes(8)?;
+                        let n = u64::from_le_bytes(bytes.try_into().unwrap());
+                        if n < limit {
+                            break (n % range) as u128;
+                        }
+                    }
+                };
+                Ok(Value::Int((min as i128 + offset as i128) as i64))
+            }
+            "timingSafeEqual" => {
+                let (a, b) = match (args.first(), args.get(1)) {
+                    (Some(Value::Str(a)), Some(Value::Str(b))) => (a, b),
+                    _ => return Err(err("crypto.timingSafeEqual requiere dos argumentos String")),
+                };
+                // Expone `constant_time_eq` (ya usado internamente por
+                // `verifyPassword`) al código de usuario -- comparar un secreto de
+                // webhook o una API key con `==` filtra, vía cuánto tarda la
+                // respuesta, en qué posición difiere del valor esperado.
+                Ok(Value::Bool(constant_time_eq(a.as_bytes(), b.as_bytes())))
+            }
             other => Err(err(format!("método desconocido sobre crypto: '{other}'"))),
         },
         Value::Json => match method {
@@ -3885,6 +3927,37 @@ mod tests {
         let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
         let summary = run_program_tests(&program).expect("ejecucion de tests de crypto");
         assert_eq!(summary.passed, 1, "fallaron asserts de crypto: {summary:?}");
+    }
+
+    #[test]
+    fn crypto_random_int_and_timing_safe_equal() {
+        let code = r#"
+        test "randomInt y timingSafeEqual" {
+            // 1. Cae siempre dentro del rango pedido, extremos incluidos.
+            let n = crypto.randomInt(1, 6);
+            assert(n >= 1 && n <= 6, "cae dentro del rango [min, max]");
+
+            // 2. Rango degenerado: min == max siempre devuelve ese unico valor.
+            assert(crypto.randomInt(7, 7) == 7, "rango de un solo valor");
+
+            // 3. Sobre varias muestras de un OTP de 6 digitos no siempre sale
+            //    el mismo valor -- una implementacion sesgada (ej. al primer
+            //    valor del rango) pasaria el test de rango pero fallaria este.
+            let a = crypto.randomInt(100000, 999999);
+            let b = crypto.randomInt(100000, 999999);
+            let c = crypto.randomInt(100000, 999999);
+            assert(a != b || b != c, "no siempre el mismo valor en llamadas consecutivas");
+
+            // 4. timingSafeEqual compara como == en el caso feliz...
+            assert(crypto.timingSafeEqual("secreto123", "secreto123") == true);
+            assert(crypto.timingSafeEqual("secreto123", "otro-valor") == false);
+            // ...incluyendo largos distintos, sin crashear ni comparar mal.
+            assert(crypto.timingSafeEqual("corto", "un-valor-mas-largo") == false);
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests de randomInt/timingSafeEqual");
+        assert_eq!(summary.passed, 1, "fallaron asserts: {summary:?}");
     }
 
 }
