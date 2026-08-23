@@ -306,7 +306,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - **Cuña inicial**: Equipos full-stack TypeScript que buscan el rendimiento y robustez de un backend de sistemas sin sacrificar la inferencia de tipos inmediata en el frontend.
 - **"Time to wow" < 5 minutos**: `linkc new my-app` → modificar un campo en `main.link` → `tsc` del frontend falla al instante en desarrollo.
 - **Docs y plantillas**: Integración oficial con Next.js 14 App Router, Vite+React y Backend puro.
-- **Transparencia y Calidad**: Documentación probada por el propio compilador (`compiler/tests/docs_examples.rs`), 573 tests en CI continuo y límites documentados sin promesas falsas.
+- **Transparencia y Calidad**: Documentación probada por el propio compilador (`compiler/tests/docs_examples.rs`), 574 tests en CI continuo y límites documentados sin promesas falsas.
 
 ---
 
