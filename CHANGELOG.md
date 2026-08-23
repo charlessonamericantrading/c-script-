@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.19.0] - 2026-08-23
+
+### ✨ Nuevo
+- **`.toString()` sobre `Int`/`Int64`/`Float`/`Bool`, `response.setStatus` rechazado en compilación dentro de `stream`, y catch-all `:nombre*` en `@route`.** Tres gaps del roadmap PLAN.md §8.6/§8.7, cerrados en la misma ronda: (1) no existía NINGUNA conversión numérica/bool a `String` en el lenguaje -- ni para interpolar un contador en un mensaje de error; ahora cuatro métodos explícitos (`Bool.toString()` es el primer método que existe sobre `Bool`). (2) `response.setStatus` dentro de un `stream` documentaba ser un no-op desde su introducción (§3.46) pero tipaba sin quejarse -- ahora `Checker` gana un `Cell<bool>` (`in_stream_body`, mismo patrón de interior mutability que `hover_result`, §3.24) que lo rechaza en compilación, con el span exacto de la llamada. (3) `@route` solo capturaba un segmento por parámetro -- `:nombre*` como último segmento captura cero o más segmentos restantes unidos con `/`, siempre `String` (nunca `Int`, puede contener `/` y estar vacío). La detección de conflictos entre rutas (`route.rs::overlap_possible`) se generalizó para comparar solo el prefijo fijo compartido cuando hay catch-all de por medio, en vez de exigir igual longitud total -- conservador a propósito, prefiere un falso positivo a dejar pasar una ambigüedad real. `RoutePattern::matches` pasó de `Vec<&str>` a `Vec<String>` (un catch-all captura texto que no era un único slice del input). Verificado: 14 tests nuevos (conversiones, setStatus en stream vs rpc normal, parseo/matching/conflictos de catch-all, y 2 end-to-end contra un servidor real). 588 tests. Detalle completo: GRAMMAR.md §3.55–§3.57.
+
 ## [1.18.0] - 2026-08-23
 
 ### ✨ Nuevo

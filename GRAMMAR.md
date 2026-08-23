@@ -76,6 +76,9 @@
   - [3.52 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`: agregación con `GROUP BY` real, empujada a SQL — RESUELTO](#352-sumbycountbyavgbymaxbyminby-agregación-con-group-by-real-empujada-a-sql--resuelto)
   - [3.53 `auth.createSessionWithId()` y `auth.currentUserId()`: asociar e inspeccionar el id del caller — RESUELTO](#353-authcreatesessionwithid-y-authcurrentuserid-asociar-e-inspeccionar-el-id-del-caller--resuelto)
   - [3.54 `crypto.randomInt()` y `crypto.timingSafeEqual()`: aleatoriedad numérica y comparación segura para código de usuario — RESUELTO](#354-cryptorandomint-y-cryptotimingsafeequal-aleatoriedad-numérica-y-comparación-segura-para-código-de-usuario--resuelto)
+  - [3.55 `.toString()` sobre `Int`/`Int64`/`Float`/`Bool` — RESUELTO](#355-tostring-sobre-intint64floatbool--resuelto)
+  - [3.56 `response.setStatus` dentro de un `stream` — RESUELTO (ahora error de compilación)](#356-responsesetstatus-dentro-de-un-stream--resuelto-ahora-error-de-compilación)
+  - [3.57 `@route` con segmento catch-all (`:nombre*`) — RESUELTO](#357-route-con-segmento-catch-all-nombre--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -2979,6 +2982,82 @@ service Webhooks {
 - No hay conversión `Int -> String` en el lenguaje todavía (nada de esta ronda la agrega), así que un OTP que necesite viajar como texto con ceros a la izquierda (`"042857"`) queda fuera de alcance por esa razón, no por `randomInt` en sí — el `rpc` de ejemplo arriba devuelve el código como `Int`.
 
 **Tests que fijan estas propiedades** (`runtime/mod.rs`, módulo de tests): `randomInt` cae siempre dentro de `[min, max]`, un rango de un solo valor siempre lo devuelve, tres llamadas seguidas con un rango de OTP no dan siempre el mismo valor; `timingSafeEqual` compara igual que `==` en el caso feliz y devuelve `false` (sin crashear) ante strings de largo distinto.
+
+---
+
+### 3.55 `.toString()` sobre `Int`/`Int64`/`Float`/`Bool` — RESUELTO
+
+Auditoría del roadmap del 23/08/2026 (PLAN.md §8.6): hasta esta ronda no existía NINGUNA forma de convertir un número o un `Bool` a `String` en todo el lenguaje. No es un detalle de un caso de uso puntual -- bloquea algo tan básico como interpolar un contador en un mensaje de error, porque `'+'` exige `String + String` sin coerción implícita (§3.7): `"código: " + n` nunca compiló, para ningún `n` que no fuera ya un `String`.
+
+<!-- linkc:fragment -->
+```rust
+rpc describe(count: Int, active: Bool) -> String {
+  "hay " + count.toString() + " activo: " + active.toString()
+}
+```
+
+**Cuatro métodos nuevos, mismo criterio que `toInt64()`/`toIsoString()` (§3.30/§3.34): conversión EXPLÍCITA, nunca automática.**
+
+| Método | Resultado |
+|---|---|
+| `Int.toString()` | Igual que el `Display` estándar de Rust (`i64::to_string`) -- sin separador de miles, `-` para negativos. |
+| `Int64.toString()` | Idéntico, sobre el `i64` interno de `Int64`. |
+| `Float.toString()` | `f64::to_string` de Rust -- notación decimal para el rango normal, sin redondeo ni formato de moneda/precisión configurable. |
+| `Bool.toString()` | `"true"` / `"false"` literales. Primer método que existe sobre `Bool` en todo el lenguaje -- hasta esta ronda `Bool` no tenía NINGÚN método, ni siquiera este. |
+
+**Límite honesto:** ningún método de formato (separador de miles, notación científica, precisión decimal fija, padding de ceros a la izquierda) -- es el `Display` de Rust tal cual, sin capa de formato encima. Si hace falta, se construye a mano en el propio `.link` con las funciones de `String` que ya existen.
+
+**Tests que fijan esto** (`runtime/mod.rs`): las cuatro conversiones, incluyendo un negativo (`Int`) y que el resultado compone de verdad con `'+'` de `String` -- la propiedad que estaba bloqueada antes de esta ronda.
+
+---
+
+### 3.56 `response.setStatus` dentro de un `stream` — RESUELTO (ahora error de compilación)
+
+Mismo audit del 23/08/2026 (PLAN.md §8.6): `response.setStatus(code)` (§3.46) documentaba desde su propia introducción que es un no-op dentro de un `stream` -- el status de una conexión SSE es fijo para toda su duración, se decide una sola vez al abrir la respuesta. Lo que NO hacía hasta ahora es rechazarlo: tipaba sin ninguna queja, y el no-op solo se notaba en producción, cuando alguien esperaba que un `stream` respondiera 201 y seguía viendo 200.
+
+<!-- linkc:fragment -->
+```rust
+service Items {
+  stream watchAll() -> Item {
+    response.setStatus(201); // ahora: error de compilación
+    db.items.subscribe()
+  }
+}
+```
+
+**Mecanismo:** `Checker` gana un `Cell<bool>` (`in_stream_body`, interior mutability -- mismo motivo que `hover_result`, §3.24: el resto de `Checker` chequea con `&self` de punta a punta) que `check_rpc` prende mientras chequea el cuerpo de un `stream` -- nunca el de un `rpc` normal. El match arm de `(Type::Response, "setStatus")` lo consulta antes de tipar el argumento: si está prendido, el error sale ahí mismo, con el span de la llamada real (mismo mecanismo de `.with_span` que ya estampa cualquier otro error del checker).
+
+**Verificado:** dos tests en `checker.rs` -- el mismo cuerpo con `setStatus(201)` rechazado dentro de un `stream` y aceptado sin cambios dentro de un `rpc` normal (para probar que el chequeo es específico de `stream`, no una regresión sobre el caso de siempre).
+
+---
+
+### 3.57 `@route` con segmento catch-all (`:nombre*`) — RESUELTO
+
+Tercer gap del mismo audit (PLAN.md §8.7): `@route` (§3.37, generalizado a múltiples parámetros en §3.42) solo podía capturar UN segmento de path por parámetro. Cualquier ruta de profundidad variable -- documentación, un CMS, un proxy de archivos estáticos -- necesitaba un `rpc` por cada nivel posible, o quedaba fuera de `@route` por completo.
+
+<!-- linkc:fragment -->
+```rust
+service Docs {
+  @route("/docs/:rest*")
+  rpc page(rest: String) -> String {
+    // "/docs/api/v2/users" -> rest == "api/v2/users"
+    // "/docs"              -> rest == ""
+    renderDoc(rest)
+  }
+}
+```
+
+**Sintaxis:** `:nombre*` -- el nombre sigue las mismas reglas que un parámetro normal (identificador válido, sin repetirse dentro de la misma ruta), el `*` lo marca como catch-all. Solo puede ser el ÚLTIMO segmento de la ruta -- cualquier cosa después sería inalcanzable siempre, así que se rechaza en el parser (`route.rs::parse_route_pattern`), no en runtime.
+
+**Captura cero o más segmentos**, unidos con `"/"` en una sola `String` -- nunca `Int` (el texto puede contener `"/"` y estar vacío, ninguna de las dos cosas es un entero válido; el checker lo rechaza explícitamente si el parámetro del rpc no es `String`). `/docs` matchea con `rest == ""`, exactamente igual que `/docs/x/y/z` matchea con `rest == "x/y/z"`.
+
+**Precedencia con otras rutas -- se extiende, no se reemplaza, el criterio de especificidad de §3.42:** un catch-all cuenta como CERO segmentos literales fijos (igual que un `:param` normal), así que cualquier ruta con más literales gana determinísticamente. `/docs/changelog` (2 literales) le gana a `/docs/:rest*` (1 literal) para ese path exacto, aunque las dos podrían matchearlo.
+
+**Detección de conflictos, extendida:** dos patrones ya no necesitan la MISMA longitud total para competir -- un catch-all se puede estirar para cubrir cualquier cantidad de segmentos, así que `overlap_possible` ahora compara solo el prefijo fijo compartido (hasta el más corto de los dos) cuando cualquiera de los dos tiene catch-all. Deliberadamente conservador: prefiere marcar un conflicto que en la práctica nunca chocaría, antes que dejar pasar una ambigüedad real -- mismo criterio que el resto de `route.rs` desde que existe.
+
+**Cambio de tipo interno:** `RoutePattern::matches` pasó de devolver `Vec<&str>` (segmentos prestados) a `Vec<String>` -- un catch-all captura VARIOS segmentos originales unidos por algo que no estaba en el string de entrada, así que un `&str` prestado ya no alcanza para representar el resultado. Costo real: una asignación por parámetro capturado en cada request con `@route`, en un intérprete de un solo hilo -- no es el camino caliente que este proyecto optimiza.
+
+**Verificado:** 9 tests unitarios en `route.rs` (parseo, rechazo fuera de posición, matching de 0/1/muchos segmentos, conflicto entre dos catch-all, no-conflicto con prefijo literal distinto) más 2 tests end-to-end en `cli_route.rs` contra un servidor real (captura multi-segmento y precedencia del literal sobre el catch-all que también matchea).
 
 ---
 

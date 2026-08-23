@@ -436,7 +436,7 @@ pub(crate) fn eval_expr(
                     .map(|(_, v)| v)
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -1135,15 +1135,22 @@ fn call_method(
         Value::Int(n) => match method {
             "toFloat" => Ok(Value::Float(n as f64)),
             "toInt64" => Ok(Value::Int64(n)),
+            "toString" => Ok(Value::Str(n.to_string())),
             other => Err(err(format!("método desconocido sobre Int: '{other}'"))),
         },
         Value::Int64(n) => match method {
             "toInt" => Ok(Value::Int(n)),
+            "toString" => Ok(Value::Str(n.to_string())),
             other => Err(err(format!("método desconocido sobre Int64: '{other}'"))),
         },
         Value::Float(n) => match method {
             "toInt" => Ok(Value::Int(n as i64)), // trunca hacia cero, no redondea (GRAMMAR.md §3.8)
+            "toString" => Ok(Value::Str(n.to_string())),
             other => Err(err(format!("método desconocido sobre Float: '{other}'"))),
+        },
+        Value::Bool(b) => match method {
+            "toString" => Ok(Value::Str(b.to_string())),
+            other => Err(err(format!("método desconocido sobre Bool: '{other}'"))),
         },
         Value::Str(s) => match method {
             // chars().count(), no .len(): .len() cuenta bytes UTF-8, no
@@ -3873,6 +3880,33 @@ mod tests {
         let summary = run_program_tests(&program).expect("ejecucion de tests stdlib");
         assert_eq!(summary.total, 1);
         assert_eq!(summary.passed, 1, "todos los asserts de stdlib debieron pasar");
+    }
+
+    #[test]
+    fn int_int64_float_and_bool_convert_to_string() {
+        // GRAMMAR.md §3.55: hasta esta ronda no había NINGUNA forma de
+        // interpolar un número o un bool en un mensaje -- ni siquiera
+        // "codigo: " + n compilaba, porque '+' exige String+String sin
+        // coercion implicita (§3.7). Mismo patron que toInt64()/toIsoString():
+        // conversion EXPLICITA, nunca automatica.
+        let code = r#"
+        test "conversiones a String" {
+            assert(42.toString() == "42");
+            assert((-7).toString() == "-7");
+            let big: Int64 = 42.toInt64();
+            assert(big.toString() == "42");
+            assert(3.5.toString() == "3.5");
+            assert(true.toString() == "true");
+            assert(false.toString() == "false");
+            // Compone con '+' de String una vez convertido: eso es
+            // justamente lo que estaba bloqueado antes de esta ronda.
+            let n = 5;
+            assert("codigo: " + n.toString() == "codigo: 5");
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests de toString");
+        assert_eq!(summary.passed, 1, "fallaron asserts de toString: {summary:?}");
     }
 
     /// Que un round-trip de contraseña funcione no prueba NADA sobre seguridad:

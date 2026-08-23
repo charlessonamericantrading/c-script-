@@ -383,6 +383,14 @@ pub struct Checker {
     /// EXTERNO, no el más específico bajo el cursor. `probe_hover` compara
     /// anchos en vez de simplemente sobreescribir.
     hover_result: std::cell::RefCell<Option<(usize, Type)>>,
+    /// `true` mientras `check_rpc` chequea el cuerpo de un `stream` (nunca
+    /// un `rpc` normal) -- mismo motivo de interior mutability que
+    /// `hover_result`: el resto de `Checker` chequea con `&self`. Lo único
+    /// que lo consulta es `(Type::Response, "setStatus")`: el status de una
+    /// conexión SSE es fijo para toda su duración (GRAMMAR.md §3.46), así
+    /// que llamarlo desde un `stream` pasaba desapercibido en v0 -- un
+    /// no-op silencioso que un desarrollador solo descubría en producción.
+    in_stream_body: std::cell::Cell<bool>,
 }
 
 impl Checker {
@@ -401,6 +409,7 @@ impl Checker {
             consts: HashMap::new(),
             hover_target: None,
             hover_result: std::cell::RefCell::new(None),
+            in_stream_body: std::cell::Cell::new(false),
         };
         let mut errors = Vec::new();
 
@@ -1092,7 +1101,10 @@ impl Checker {
             }
             env.insert(p.name.clone(), immutable(pty));
         }
-        self.check_block(&r.body, &expected, &env)
+        let prev_in_stream = self.in_stream_body.replace(is_stream);
+        let result = self.check_block(&r.body, &expected, &env);
+        self.in_stream_body.set(prev_in_stream);
+        result
     }
 
     /// El cuerpo de `r` ya matcheó el shape reconocido de push real
@@ -1358,7 +1370,19 @@ impl Checker {
             // el segmento; cualquier otra cosa (Bool, Float, un struct) no
             // tiene una representación de un solo segmento sin ambigüedad.
             let param_ty = self.resolve_type(&param.ty)?;
-            if !matches!(param_ty, Type::String | Type::Int) {
+            let is_catchall = pattern.catchall_name() == Some(*name);
+            if is_catchall {
+                // El catch-all captura CERO o más segmentos unidos con "/"
+                // -- ese texto puede contener "/" y estar vacío, ninguna de
+                // las dos cosas es un `Int` válido, así que a diferencia de
+                // un `:param` normal acá NO se acepta `Int`.
+                if !matches!(param_ty, Type::String) {
+                    return Err(err(format!(
+                        "`@route(\"{raw}\")` en '{}': ':{name}*' es un catch-all, captura texto arbitrario (incluyendo '/'), así que el parámetro tiene que ser `String` -- es {param_ty}",
+                        r.name
+                    )));
+                }
+            } else if !matches!(param_ty, Type::String | Type::Int) {
                 return Err(err(format!(
                     "`@route(\"{raw}\")` en '{}': ':{name}' viene de un segmento de URL, así que el parámetro tiene que ser `String` o `Int` -- es {param_ty}",
                     r.name
@@ -2585,6 +2609,10 @@ impl Checker {
                 self.expect_no_args(args, "toInt")?;
                 Some(Type::Int)
             }
+            (Type::Int, "toString") | (Type::Int64, "toString") | (Type::Float, "toString") | (Type::Bool, "toString") => {
+                self.expect_no_args(args, "toString")?;
+                Some(Type::String)
+            }
             (Type::String, "length") => {
                 self.expect_no_args(args, "length")?;
                 Some(Type::Int)
@@ -2845,6 +2873,11 @@ impl Checker {
                 let [code_arg] = args else {
                     return Err(err("'response.setStatus' toma exactamente 1 argumento (code: Int)"));
                 };
+                if self.in_stream_body.get() {
+                    return Err(err(
+                        "'response.setStatus' no tiene efecto dentro de un 'stream': el status de una conexión SSE es fijo para toda su duración (GRAMMAR.md §3.46) -- llamalo desde un 'rpc' normal",
+                    ));
+                }
                 self.check_expr(code_arg, &Type::Int, env)?;
                 Some(Type::Void)
             }
@@ -4285,6 +4318,45 @@ type T = { id: Int, s: Status }")
         "#;
         let result = check_source(src);
         assert!(result.is_err(), "un stream que devuelve un User suelto (no List<User>) debería fallar");
+    }
+
+    #[test]
+    fn set_status_inside_a_stream_body_is_a_compile_error() {
+        // El status de una conexión SSE es fijo para toda su duración
+        // (GRAMMAR.md §3.46): antes de esta ronda, `response.setStatus`
+        // adentro de un `stream` tipaba sin quejarse y era un no-op
+        // silencioso en runtime -- un desarrollador solo lo descubría en
+        // producción. Ahora es un error de compilación.
+        let src = r#"
+            type Item = { id: Int }
+            db { items: Item[] }
+            service Items {
+                stream watchAll() -> Item {
+                    response.setStatus(201);
+                    db.items.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("setStatus") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn set_status_inside_a_normal_rpc_body_still_works() {
+        // Mismo cuerpo, pero en un `rpc` normal en vez de `stream` -- tiene
+        // que seguir tipando: el chequeo de arriba es específico de
+        // `stream`, no una regresión sobre el caso de siempre.
+        let src = r#"
+            service Items {
+                rpc create() -> Void {
+                    response.setStatus(201)
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
     }
 
     #[test]

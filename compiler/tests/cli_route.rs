@@ -324,6 +324,23 @@ service Blog {
 }
 "#;
 
+// GRAMMAR.md §3.42 (ronda catch-all): `:nombre*` como ÚLTIMO segmento
+// captura cero o más segmentos restantes, unidos con "/".
+
+const CATCHALL_PROGRAM: &str = r#"
+service Docs {
+  @route("/docs/:rest*")
+  rpc page(rest: String) -> String {
+    rest
+  }
+
+  @route("/docs/changelog")
+  rpc changelog() -> String {
+    "EL-CHANGELOG"
+  }
+}
+"#;
+
 #[test]
 fn a_route_with_multiple_params_captures_each_by_name() {
     let temp = TempDir::new("multi-param");
@@ -356,6 +373,45 @@ fn a_route_with_one_more_literal_segment_wins_over_a_fully_dynamic_one() {
     let (status, _, body) = server.get("/blog/rust/algo");
     assert_eq!(status, 200);
     assert_eq!(body, "\"rust/algo\"");
+}
+
+#[test]
+fn a_catchall_route_captures_zero_or_more_trailing_segments() {
+    let temp = TempDir::new("catchall-basic");
+    let src = temp.write("app.link", CATCHALL_PROGRAM);
+    let server = Serve::start(&src);
+
+    // Varios segmentos restantes, unidos con "/".
+    let (status, _, body) = server.get("/docs/api/v2/users");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"api/v2/users\"");
+
+    // Un solo segmento restante.
+    let (status, _, body) = server.get("/docs/intro");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"intro\"");
+
+    // Cero segmentos restantes: el catch-all captura string vacío, no deja
+    // de matchear.
+    let (status, _, body) = server.get("/docs");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"\"");
+}
+
+#[test]
+fn a_literal_route_wins_over_a_catchall_that_could_also_match() {
+    // "/docs/changelog" (2 segmentos literales) y "/docs/:rest*" (1
+    // segmento literal fijo, el resto es catch-all) matchean las dos
+    // "/docs/changelog" -- la más específica (más segmentos literales)
+    // tiene que ganar, mismo criterio que ya vale entre un literal y un
+    // `:param` normal (§3.37/§3.42).
+    let temp = TempDir::new("catchall-precedence");
+    let src = temp.write("app.link", CATCHALL_PROGRAM);
+    let server = Serve::start(&src);
+
+    let (status, _, body) = server.get("/docs/changelog");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"EL-CHANGELOG\"", "la ruta literal tiene que ganarle al catch-all");
 }
 
 #[test]
@@ -401,6 +457,18 @@ service B { @route("/blog/destacado/:slug") rpc q(slug: String) -> String { slug
     let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(!out.status.success());
     assert!(stderr.contains("String") && stderr.contains("Int"), "mensaje inesperado: {stderr}");
+
+    // Un catch-all que NO es el último segmento -- inalcanzable siempre.
+    let out = build(&temp, r#"service A { @route("/x/:rest*/y") rpc p(rest: String) -> String { rest } }"#);
+    let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "un catch-all en medio de la ruta debió rechazarse");
+    assert!(stderr.contains("último segmento"), "mensaje inesperado: {stderr}");
+
+    // Un catch-all tipado `Int` -- captura texto arbitrario, puede traer "/".
+    let out = build(&temp, r#"service A { @route("/x/:rest*") rpc p(rest: Int) -> String { "x" } }"#);
+    let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "un catch-all como Int debió rechazarse");
+    assert!(stderr.contains("catch-all") && stderr.contains("String"), "mensaje inesperado: {stderr}");
 
     // @route sobre un stream.
     let out = build(

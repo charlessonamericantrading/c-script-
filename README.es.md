@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-574-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.18.0-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-588-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.19.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,7 +36,7 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 23/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 574 pruebas automáticas:
+**Funciona hoy**, cubierto por 588 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - SQLite embebido con persistencia real entre reinicios y auto-migraciones no destructivas
@@ -55,6 +55,7 @@ gana esta. Verificado el 23/08/2026 corriendo el compilador, no leyéndolo.
 - `linkc fmt`, `linkc --help`, y el emisor de cliente TypeScript para archivos multi-service funcionan correctamente ahora
 - Hashing de contraseñas real: `crypto.hashPassword` es Argon2id (RFC 9106) con sal aleatoria por contraseña, en formato PHC; `verifyPassword` compara en tiempo constante y sigue aceptando los hashes de la versión anterior para no dejar afuera a los usuarios ya registrados
 - Aleatoriedad numérica y comparación en tiempo constante para código de usuario: `crypto.randomInt(min, max)` da un `Int` uniforme en ese rango inclusive desde el CSPRNG del sistema (con rechazo de muestreo contra el sesgo de módulo) — alcanza para un OTP de verdad, a diferencia del alfabeto hex de `randomToken`; `crypto.timingSafeEqual(a, b)` expone la misma comparación en tiempo constante que `verifyPassword` ya usaba internamente, para comparar un secreto de webhook o una API key sin filtrar nada por el tiempo de respuesta
+- `.toString()` sobre `Int`/`Int64`/`Float`/`Bool` — conversión explícita, nunca automática (mismo principio que `toInt64()`); `Bool` no tenía ni un solo método antes de esto. `response.setStatus` dentro de un `stream` ahora es error de compilación en vez de no-op silencioso. `@route` soporta un segmento catch-all final (`:nombre*`) que captura cero o más segmentos restantes del path unidos por `/`, para rutas de profundidad variable (documentación, un CMS) — siempre `String`, nunca `Int`, y siempre el último segmento de la ruta
 - Contrato TypeScript, cliente tipado, validadores runtime, hooks de React, schemas Zod y OpenAPI 3.1 generados
 
 **Todavía no funciona** — no planifiques sobre esto:

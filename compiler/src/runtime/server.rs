@@ -542,7 +542,7 @@ fn resolve_route<'a>(
         // zippearlos con los nombres da la asociación correcta.
         let mut args = serde_json::Map::new();
         for ((name, raw_segment), is_int) in entry.pattern.param_names().into_iter().zip(captured).zip(&entry.param_is_int) {
-            let decoded = percent_decode(raw_segment);
+            let decoded = percent_decode(&raw_segment);
             let value = if *is_int {
                 match decoded.parse::<i64>() {
                     Ok(n) => serde_json::Value::from(n),
