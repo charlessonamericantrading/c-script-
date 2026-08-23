@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.28.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc serve --adopt-existing` (o `LINK_ADOPT_EXISTING`): adoptar tablas existentes sin auto-migrar.** Hasta esta ronda, `linkc serve` siempre intentaba `CREATE TABLE`/`ALTER TABLE ADD COLUMN` (no destructivo, pero DDL al fin) al abrir cada colección declarada -- dos bloqueos reales para adoptar un sistema existente: un rol de base sin permiso de DDL (común en producción), y una tabla SQLite con columnas físicas que el `.link` no modela (`check_schema_matches` exigía coincidencia EXACTA y hacía panic ante cualquier columna de más). Con la flag, `linkc serve` nunca ejecuta DDL -- ni siquiera el no destructivo de siempre -- y en su lugar valida con SELECTs de solo lectura que cada columna DECLARADA exista: en SQLite además compara el tipo SQL esperado (`PRAGMA table_info`), en PostgreSQL solo la existencia por nombre (`information_schema.columns`, mismo criterio que el chequeo de `"id"` que ya existía fuera de este modo). Una columna física no declarada se ignora sin queja -- justo el caso de adoptar una tabla legacy. Una tabla o columna declarada faltante falla al conectar, con un mensaje que dice qué falta, nunca con un `CREATE`/`ALTER` silencioso. Límite honesto: todo o nada por proceso (no colección por colección), y no valida `NOT NULL` en SQLite ni tipo columna por columna en PostgreSQL más allá de `"id"` -- eso se descubre en la primera lectura que lo toque, con el error normal de decode. Verificado contra SQLite real (dos corridas consecutivas de `linkc serve` sobre el mismo archivo: la primera crea una tabla con una columna que la segunda no declara, la segunda arranca en modo adopción y la ignora) y contra un PostgreSQL real (tabla creada a mano con una columna sin modelar; columna declarada faltante falla limpio, sin panic). 639 tests (9 nuevos). Detalle completo: GRAMMAR.md §3.67.
+
 ## [1.27.0] - 2026-08-24
 
 ### ✨ Nuevo

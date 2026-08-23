@@ -198,6 +198,78 @@ fn check_schema_matches(connection: &Connection, collection: &str, columns: &[Co
     )))
 }
 
+/// `true` si `collection` existe como tabla física en este archivo SQLite --
+/// distinto de "`PRAGMA table_info` vino vacío" (`check_schema_matches` usa
+/// eso para decir "recién la creó el `CREATE TABLE IF NOT EXISTS` de arriba
+/// en esta misma llamada", que en modo adopción es justo el caso que NO
+/// puede pasar: acá nunca se ejecuta ese `CREATE TABLE`).
+fn sqlite_table_exists(connection: &Connection, collection: &str) -> bool {
+    connection
+        .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [collection], |_| Ok(()))
+        .is_ok()
+}
+
+/// Adopción de tabla existente (`--adopt-existing`/`LINK_ADOPT_EXISTING`,
+/// GRAMMAR.md §3.67): a diferencia de `check_schema_matches`, NUNCA ejecuta
+/// `CREATE TABLE` ni `ALTER TABLE ADD COLUMN` -- el punto entero de este modo
+/// es no tocar DDL, para bases donde el rol de la app puede no tener permiso
+/// de crear/alterar tablas, o donde la tabla ya trae columnas que este
+/// programa no modela y que hay que dejar intactas.
+///
+/// Solo valida que cada columna DECLARADA exista con un tipo compatible --
+/// una columna física de más (no declarada en el `.link`) se ignora sin
+/// queja, a propósito: es exactamente el caso de uso (adoptar una tabla
+/// legacy con columnas que este programa todavía no necesita leer). NOT NULL
+/// no se valida acá (límite honesto, GRAMMAR.md §3.67): una fila vieja con
+/// NULL en un campo que el `.link` declara requerido recién falla en la
+/// lectura que la toque, con el error normal de decode -- no al conectar.
+fn check_schema_for_adoption(connection: &Connection, collection: &str, columns: &[ColumnPlan], db_path: &str) -> Result<(), RuntimeError> {
+    if !sqlite_table_exists(connection, collection) {
+        return Err(RuntimeError::new(format!(
+            "la colección '{collection}' no existe como tabla en '{db_path}', pero --adopt-existing/LINK_ADOPT_EXISTING \
+             asume que las tablas ya existen y no intenta crearlas. Sacá la flag si querés que c-script cree la tabla, \
+             o creála a mano primero."
+        )));
+    }
+
+    let mut stmt = connection
+        .prepare(&format!("PRAGMA table_info(\"{collection}\")"))
+        .map_err(|e| RuntimeError::new(format!("no se pudo leer el schema de '{collection}' en '{db_path}': {e}")))?;
+    let raw: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+        .and_then(Iterator::collect)
+        .map_err(|e| RuntimeError::new(format!("no se pudo leer el schema de '{collection}' en '{db_path}': {e}")))?;
+    let actual: HashMap<String, String> = raw.into_iter().map(|(name, decl_type)| (name, decl_type.to_uppercase())).collect();
+
+    let mut missing = Vec::new();
+    let mut incompatible = Vec::new();
+    for col in columns {
+        match actual.get(&col.field.name) {
+            None => missing.push(col.field.name.clone()),
+            Some(actual_type) if actual_type != col.sql_type => {
+                incompatible.push(format!("'{}' declarado {} pero la tabla tiene {}", col.field.name, col.sql_type, actual_type))
+            }
+            Some(_) => {}
+        }
+    }
+
+    if missing.is_empty() && incompatible.is_empty() {
+        return Ok(());
+    }
+    let mut reasons = Vec::new();
+    if !missing.is_empty() {
+        reasons.push(format!("faltan columnas: [{}]", missing.join(", ")));
+    }
+    if !incompatible.is_empty() {
+        reasons.push(format!("tipos incompatibles: [{}]", incompatible.join(", ")));
+    }
+    Err(RuntimeError::new(format!(
+        "la colección '{collection}' en '{db_path}' no es compatible con lo que el programa declara ({}) -- \
+         en modo --adopt-existing no se auto-migra nada, hay que ajustar la tabla física a mano.",
+        reasons.join("; "),
+    )))
+}
+
 /// Equivalente de `check_schema_matches` para PostgreSQL, pero acotado a lo
 /// único que de verdad puede tirar abajo el servidor si se lo deja pasar: el
 /// tipo de "id" en una tabla que YA EXISTÍA antes de este `connect_postgres`.
@@ -247,6 +319,45 @@ fn validate_existing_id_column(backend: &Backend, collection: &str) -> Result<()
          clave primaria entera autoincremental (BIGSERIAL) -- típico al migrar desde un backend que usaba UUID como id. \
          No se puede usar esta tabla sin migrarla a mano: agregá una columna \"id\" BIGSERIAL nueva, o apuntá esta \
          colección a otro nombre de tabla."
+    ))
+}
+
+/// Equivalente de `check_schema_for_adoption` (SQLite) para PostgreSQL:
+/// modo `--adopt-existing`/`LINK_ADOPT_EXISTING` (GRAMMAR.md §3.67), llamado
+/// EN VEZ de `CREATE TABLE IF NOT EXISTS` + el loop de `ADD COLUMN` que
+/// `connect_postgres` corre normalmente -- ninguno de los dos se ejecuta acá,
+/// a propósito, porque el punto del modo adopción es no requerir permiso de
+/// DDL sobre la base ajena. Solo lee `information_schema.columns` (un SELECT
+/// común) para confirmar que cada columna DECLARADA existe -- no valida su
+/// tipo columna por columna como sí hace la versión de SQLite: acá alcanza
+/// con "existe", el mismo criterio que `validate_existing_id_column` ya usa
+/// para "id" (un tipo incompatible en una columna que no sea "id" se
+/// descubre en la primera lectura/escritura, con el error normal de
+/// `store.rs`, no acá -- límite honesto, documentado en GRAMMAR.md §3.67).
+fn validate_columns_exist_for_adoption(backend: &Backend, collection: &str, columns: &[ColumnPlan]) -> Result<(), String> {
+    let sql = format!("SELECT column_name FROM information_schema.columns WHERE table_name = {}", backend.placeholder(1));
+    let rows = backend
+        .query(&sql, &[Cell::Text(collection.to_string())], &[ColumnKind::Text])
+        .map_err(|e| format!("no se pudo verificar el esquema de '{collection}' en PostgreSQL: {e}"))?;
+
+    if rows.is_empty() {
+        return Err(format!(
+            "la colección '{collection}' no existe como tabla en PostgreSQL, pero --adopt-existing/LINK_ADOPT_EXISTING \
+             asume que las tablas ya existen y no intenta crearlas. Sacá la flag si querés que c-script cree la tabla, \
+             o creála a mano primero."
+        ));
+    }
+    let actual: HashSet<String> =
+        rows.into_iter().filter_map(|row| row.into_iter().next()).filter_map(|cell| if let Cell::Text(s) = cell { Some(s) } else { None }).collect();
+
+    let missing: Vec<&str> = columns.iter().map(|c| c.field.name.as_str()).filter(|name| !actual.contains(*name)).collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "la colección '{collection}' en PostgreSQL no tiene las columnas [{}] que el programa declara -- en modo \
+         --adopt-existing no se auto-migra nada, hay que agregarlas a mano.",
+        missing.join(", "),
     ))
 }
 
@@ -485,6 +596,24 @@ impl Db {
     /// anterior, etc.) -- mismo estilo que `server.rs::serve` ya usa dos
     /// líneas más arriba para el bind de `tiny_http`.
     pub fn new(program: &Program, db_path: &Path) -> Self {
+        Self::new_with_options(program, db_path, false)
+    }
+
+    /// Igual que `new`, más `adopt_existing` (`--adopt-existing`/
+    /// `LINK_ADOPT_EXISTING`, GRAMMAR.md §3.67): en vez de `CREATE TABLE IF
+    /// NOT EXISTS` + `check_schema_matches` (que exige que la tabla física
+    /// calce EXACTO, y auto-agrega columnas nullable faltantes), corre
+    /// `check_schema_for_adoption` -- nunca ejecuta DDL, solo valida que las
+    /// columnas declaradas existan con tipo compatible, ignorando cualquier
+    /// columna física de más. Parámetro nuevo en vez de sumar un tercer
+    /// método (`new_adopting`): esto NO es la clase de función con ~11
+    /// call-sites indirectos que justificó la interior-mutability de
+    /// `current_request`/`argon2_params` más abajo -- es un constructor,
+    /// se llama una sola vez por proceso real (`server.rs::serve`), así que
+    /// un parámetro más acá es barato. `new` sigue siendo la firma pública
+    /// de siempre, ahora un envoltorio con `false` (convención del proyecto:
+    /// método nuevo agregado, ninguna firma existente cambia).
+    pub fn new_with_options(program: &Program, db_path: &Path, adopt_existing: bool) -> Self {
         let (checker, symbol_errors) = Checker::build_symbols(program);
         if let Some(e) = symbol_errors.into_iter().next() {
             panic!("programa inválido al abrir la base de datos: {e}");
@@ -508,10 +637,14 @@ impl Db {
             };
             let cols: Vec<ColumnPlan> =
                 fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
-            connection
-                .execute(&create_table_sql(name, &cols), [])
-                .unwrap_or_else(|e| panic!("no se pudo crear la tabla '{name}' en '{db_path_display}': {e}"));
-            check_schema_matches(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
+            if adopt_existing {
+                check_schema_for_adoption(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
+            } else {
+                connection
+                    .execute(&create_table_sql(name, &cols), [])
+                    .unwrap_or_else(|e| panic!("no se pudo crear la tabla '{name}' en '{db_path_display}': {e}"));
+                check_schema_matches(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
+            }
             columns.insert(name.clone(), cols);
         }
 
@@ -528,10 +661,10 @@ impl Db {
         }
     }
 
-    /// Lo mismo que `new`, contra un PostgreSQL real (GRAMMAR.md §3.36). Todo
-    /// lo de arriba de esta capa -- `call`, `subscribe`, el plan de columnas,
-    /// la codificación JSON -- es exactamente el mismo código: lo único que
-    /// cambia es quién ejecuta el SQL.
+    /// Lo mismo que `new_with_options`, contra un PostgreSQL real (GRAMMAR.md
+    /// §3.36). Todo lo de arriba de esta capa -- `call`, `subscribe`, el plan
+    /// de columnas, la codificación JSON -- es exactamente el mismo código:
+    /// lo único que cambia es quién ejecuta el SQL.
     ///
     /// Devuelve `Result` y no hace panic como `new`: una base remota puede
     /// estar caída, tener otra contraseña o no existir todavía, y eso es una
@@ -543,7 +676,20 @@ impl Db {
     /// drena en su loop principal y reinyecta cada cambio con
     /// `Db::publish_remote`, para que un `stream` conectado a ESTA
     /// instancia vea también lo que escribió OTRA contra la misma base.
-    pub(crate) fn connect_postgres(program: &Program, url: &str) -> Result<(Self, Receiver<RemoteChange>), String> {
+    ///
+    /// `adopt_existing` (GRAMMAR.md §3.67): salta el `CREATE TABLE IF NOT
+    /// EXISTS` y el loop de `ADD COLUMN` -- ningún DDL, solo el SELECT de
+    /// siempre contra `information_schema` (`validate_existing_id_column`,
+    /// que ya corría sin condicionar nada) más
+    /// `validate_columns_exist_for_adoption` (nuevo, mismo criterio de
+    /// solo-lectura). El punto es poder adoptar una base donde el rol de la
+    /// app no tiene permiso de crear/alterar tablas -- una restricción real y
+    /// común en producción, no solo un gusto de organización del esquema.
+    pub(crate) fn connect_postgres_with_options(
+        program: &Program,
+        url: &str,
+        adopt_existing: bool,
+    ) -> Result<(Self, Receiver<RemoteChange>), String> {
         let (checker, symbol_errors) = Checker::build_symbols(program);
         if let Some(e) = symbol_errors.into_iter().next() {
             return Err(format!("programa inválido al abrir la base de datos: {e}"));
@@ -562,14 +708,16 @@ impl Db {
                 fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
             let non_id: Vec<FieldType> = cols.iter().map(|c| c.field.clone()).collect();
 
-            // El DDL sale del MISMO generador que usa `linkc build` para
-            // emitir schema.pg.sql. Si el runtime creara las tablas por su
-            // cuenta, el esquema que el proyecto documenta y el que la base
-            // realmente tiene podrían divergir -- que es la clase de bug que
-            // este repo ya encontró varias veces (GRAMMAR.md §3.9).
-            backend
-                .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(name, &non_id, &simple_enums))
-                .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
+            if !adopt_existing {
+                // El DDL sale del MISMO generador que usa `linkc build` para
+                // emitir schema.pg.sql. Si el runtime creara las tablas por su
+                // cuenta, el esquema que el proyecto documenta y el que la base
+                // realmente tiene podrían divergir -- que es la clase de bug que
+                // este repo ya encontró varias veces (GRAMMAR.md §3.9).
+                backend
+                    .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(name, &non_id, &simple_enums))
+                    .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
+            }
 
             // `CREATE TABLE IF NOT EXISTS` es un no-op sobre una tabla que ya
             // existía -- nunca mira si SU "id" es compatible. Encontrado en
@@ -580,22 +728,27 @@ impl Db {
             // Falla ACÁ, al conectar, con un mensaje que dice qué hacer --
             // mismo momento y mismo criterio que `check_schema_matches` ya
             // aplica para SQLite, adaptado a que Postgres no recrea tablas.
+            // Es un SELECT, no DDL, así que corre en los dos modos.
             validate_existing_id_column(&backend, name)?;
 
-            // Migración no destructiva: una tabla que ya existe de una versión
-            // anterior del programa gana las columnas nuevas. A diferencia de
-            // SQLite (que acá falla fuerte ante cualquier deriva de esquema,
-            // ver `check_schema_matches`), PostgreSQL es el backend donde ya
-            // hay datos de producción y volver a crear la tabla no es opción.
-            //
-            // La columna se agrega SIEMPRE nullable, aunque el tipo del campo
-            // sea requerido: `ADD COLUMN ... NOT NULL` sobre una tabla con
-            // filas fallaría, porque no hay valor que poner en las que ya
-            // están. Es un límite real y está documentado.
-            for field in &non_id {
-                backend
-                    .execute_ddl(&crate::codegen::postgres_emit::alter_table_add_column_postgres(name, field, &simple_enums))
-                    .map_err(|e| format!("no se pudo migrar la tabla '{name}': {e}"))?;
+            if adopt_existing {
+                validate_columns_exist_for_adoption(&backend, name, &cols)?;
+            } else {
+                // Migración no destructiva: una tabla que ya existe de una versión
+                // anterior del programa gana las columnas nuevas. A diferencia de
+                // SQLite (que acá falla fuerte ante cualquier deriva de esquema,
+                // ver `check_schema_matches`), PostgreSQL es el backend donde ya
+                // hay datos de producción y volver a crear la tabla no es opción.
+                //
+                // La columna se agrega SIEMPRE nullable, aunque el tipo del campo
+                // sea requerido: `ADD COLUMN ... NOT NULL` sobre una tabla con
+                // filas fallaría, porque no hay valor que poner en las que ya
+                // están. Es un límite real y está documentado.
+                for field in &non_id {
+                    backend
+                        .execute_ddl(&crate::codegen::postgres_emit::alter_table_add_column_postgres(name, field, &simple_enums))
+                        .map_err(|e| format!("no se pudo migrar la tabla '{name}': {e}"))?;
+                }
             }
             columns.insert(name.clone(), cols);
         }
@@ -1588,5 +1741,70 @@ mod tests {
             let at = found_fields.iter().find(|(n, _)| n == "at").map(|(_, v)| v.clone()).unwrap();
             assert_eq!(at, Value::Timestamp(ms), "Timestamp debe sobrevivir insert+find exacto en {ms}");
         }
+    }
+
+    // ---- modo adopción (`--adopt-existing`/`LINK_ADOPT_EXISTING`, GRAMMAR.md §3.67) ----
+
+    fn program_from(src: &str) -> Program {
+        crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn adopting_an_existing_table_with_extra_unmodeled_columns_works() {
+        let path = std::env::temp_dir().join("c_script_test_adopt_extra_column.db");
+        let _ = std::fs::remove_file(&path);
+
+        // Tabla "legacy": tiene una columna que el .link de abajo NUNCA declara.
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute(
+                "CREATE TABLE \"items\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"name\" TEXT NOT NULL, \"legacy_note\" TEXT)",
+                [],
+            )
+            .unwrap();
+            raw.execute("INSERT INTO \"items\" (\"name\", \"legacy_note\") VALUES ('Ada', 'columna que este programa no conoce')", [])
+                .unwrap();
+        }
+
+        let program = program_from("type Item = { id: Int, name: String } db { items: Item[] }");
+        let db = Db::new_with_options(&program, &path, true);
+        let Value::List(rows) = db.call("items", "all", vec![]).unwrap() else { panic!("se esperaba lista") };
+        assert_eq!(rows.len(), 1, "adoptar no crea la tabla ni la vacía -- la fila preexistente sigue ahí");
+        let Value::Struct(fields) = &rows[0] else { panic!("se esperaba struct") };
+        assert_eq!(fields.iter().find(|(n, _)| n == "name").map(|(_, v)| v.clone()), Some(Value::Str("Ada".to_string())));
+        assert!(
+            !fields.iter().any(|(n, _)| n == "legacy_note"),
+            "una columna física no declarada en el .link se ignora, nunca se filtra al Value"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[should_panic(expected = "no existe como tabla")]
+    fn adopting_a_table_that_does_not_exist_fails_instead_of_creating_it() {
+        let path = std::env::temp_dir().join("c_script_test_adopt_missing_table.db");
+        let _ = std::fs::remove_file(&path);
+        let program = program_from("type Item = { id: Int, name: String } db { items: Item[] }");
+        let _ = Db::new_with_options(&program, &path, true);
+    }
+
+    #[test]
+    #[should_panic(expected = "faltan columnas")]
+    fn adopting_a_table_missing_a_declared_column_fails_even_when_the_field_is_optional() {
+        let path = std::env::temp_dir().join("c_script_test_adopt_missing_column.db");
+        let _ = std::fs::remove_file(&path);
+
+        // Sin `note`: en modo normal, un campo OPCIONAL faltante se
+        // auto-agregaría con ALTER TABLE ADD COLUMN sin drama. En modo
+        // adopción esto tiene que fallar igual -- el punto entero es no
+        // ejecutar NINGÚN DDL, ni siquiera uno no destructivo.
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute("CREATE TABLE \"items\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"name\" TEXT NOT NULL)", []).unwrap();
+        }
+
+        let program = program_from("type Item = { id: Int, name: String, note?: String } db { items: Item[] }");
+        let _ = Db::new_with_options(&program, &path, true);
     }
 }

@@ -169,6 +169,14 @@ struct Serve {
 
 impl Serve {
     fn start(src: &PathBuf, url: &str) -> Self {
+        Self::start_with_args(src, url, &[])
+    }
+
+    /// Igual que `start`, más flags extra de `linkc serve` (ej.
+    /// `--adopt-existing`, GRAMMAR.md §3.67) -- parámetro nuevo, no un
+    /// tercer método: mismo criterio que `Db::new_with_options` en
+    /// `runtime/db.rs`.
+    fn start_with_args(src: &PathBuf, url: &str, extra_args: &[&str]) -> Self {
         let port = free_port();
         // La salida del servidor va a archivos, no a /dev/null: cuando esto
         // falla, el motivo lo tiene el proceso hijo, y tirarlo obliga a
@@ -181,6 +189,7 @@ impl Serve {
             .arg("serve")
             .arg(src)
             .arg(port.to_string())
+            .args(extra_args)
             .env("LINK_DATABASE_URL", url)
             .stdout(std::fs::File::create(&out_path).expect("crear el log de stdout"))
             .stderr(std::fs::File::create(&err_path).expect("crear el log de stderr"))
@@ -1169,4 +1178,103 @@ fn introspect_warns_about_columns_it_cannot_map_with_confidence() {
     assert!(generated.contains("happened_at: String,"), "{generated}");
     assert!(warnings.contains("payload") && warnings.to_lowercase().contains("jsonb"), "stderr: {warnings}");
     assert!(warnings.contains("happened_at") && warnings.to_lowercase().contains("timestamp"), "stderr: {warnings}");
+}
+
+// ---- modo adopción (`--adopt-existing`/`LINK_ADOPT_EXISTING`, GRAMMAR.md §3.67) ----
+
+#[test]
+fn adopt_existing_never_runs_ddl_and_ignores_an_unmodeled_column_against_real_postgres() {
+    // Simula el caso real que motiva esto: una tabla de producción con una
+    // columna que este programa nunca va a modelar, y (a propósito) SIN
+    // otorgarle a este test ningún permiso de CREATE/ALTER que --adopt-existing
+    // no debería necesitar -- si el connect ejecutara CUALQUIER DDL contra
+    // esta tabla, este test lo notaría por construcción: la tabla ya existe
+    // con exactamente las columnas de abajo, `linkc serve` solo puede
+    // arrancar en verde si de verdad no toca nada.
+    const COLLECTION: &str = "legacy_customers_adopt";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"name\" TEXT NOT NULL, \
+                \"legacy_note\" TEXT\
+            )"
+        ))
+        .expect("crear la tabla legacy a mano, con una columna que el .link de abajo no va a declarar");
+    client
+        .execute(&format!("INSERT INTO \"{COLLECTION}\" (name, legacy_note) VALUES ($1, $2)"), &[&"Ada", &"columna sin modelar"])
+        .expect("sembrar una fila preexistente");
+
+    let temp = TempDir::new("adopt-extra-column");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+    let listed = server.rpc("Items/list", "{}");
+    let rows = listed.as_array().expect("se esperaba una lista");
+    assert_eq!(rows.len(), 1, "la fila sembrada a mano tiene que seguir ahí -- adoptar no crea ni vacía la tabla");
+    assert_eq!(rows[0]["name"], "Ada");
+    assert!(rows[0].get("legacy_note").is_none(), "una columna no declarada no debe filtrarse a la respuesta");
+}
+
+#[test]
+fn adopt_existing_fails_fast_against_real_postgres_when_a_declared_column_is_missing() {
+    const COLLECTION: &str = "legacy_items_missing_col";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!("CREATE TABLE \"{COLLECTION}\" (\"id\" BIGSERIAL PRIMARY KEY, \"name\" TEXT NOT NULL)"))
+        .expect("crear la tabla SIN 'note'");
+
+    let temp = TempDir::new("adopt-missing-column");
+    // "note?" opcional: en modo normal, connect_postgres la agregaría con
+    // `ADD COLUMN ... NULL` sin drama. En modo adopción tiene que fallar
+    // igual -- el punto es no ejecutar NINGÚN DDL, ni siquiera uno no
+    // destructivo.
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String, note?: String }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("serve")
+        .arg(&src)
+        .arg(free_port().to_string())
+        .arg("--adopt-existing")
+        .env("LINK_DATABASE_URL", &url)
+        .output()
+        .expect("ejecutar linkc serve");
+
+    assert!(!out.status.success(), "una columna declarada faltante tiene que fallar incluso si es opcional");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("note"), "el error tiene que nombrar la columna faltante: {stderr}");
+    assert!(!stderr.contains("panicked at"), "tiene que fallar LIMPIO, no crashear el proceso: {stderr}");
 }

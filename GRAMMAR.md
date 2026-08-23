@@ -88,6 +88,7 @@
   - [3.64 Auth externo: confiar en un JWT ya emitido — RESUELTO, alcance acotado (HS256)](#364-auth-externo-confiar-en-un-jwt-ya-emitido--resuelto-alcance-acotado-hs256)
   - [3.65 Agregación (`sumBy`/etc.): soporte de `Int64` — RESUELTO (fecha truncada sigue pendiente)](#365-agregación-sumbyetc-soporte-de-int64--resuelto-fecha-truncada-sigue-pendiente)
   - [3.66 `linkc introspect`: generar un `.link` desde una base PostgreSQL existente — RESUELTO, alcance acotado](#366-linkc-introspect-generar-un-link-desde-una-base-postgresql-existente--resuelto-alcance-acotado)
+  - [3.67 `--adopt-existing`: adoptar tablas sin auto-migrar — RESUELTO](#367---adopt-existing-adoptar-tablas-sin-auto-migrar--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3321,6 +3322,35 @@ Lee `information_schema` del schema `public` (tablas base + columnas + clave pri
 - **No genera ningún `service`.** El `.link` resultante tiene los `type`/`db` para conectar, pero cero `rpc` -- escribir el servicio sigue siendo trabajo del desarrollador, a propósito: no hay forma de adivinar qué operaciones necesita la app real.
 
 **Verificado** contra un PostgreSQL real (`pg_integration.rs`): una tabla creada A MANO (simulando un sistema ya existente, no generada por `linkc`) con columnas `NOT NULL`/nullable de varios tipos -- el `.link` generado no solo "parece" correcto, se guarda, se le agrega un `service` mínimo a mano, y `linkc serve` conecta de verdad contra la MISMA tabla y lee la fila sembrada antes de que `linkc` supiera que esa tabla existía. Un segundo test confirma que columnas `jsonb`/`timestamptz` generan la advertencia esperada en stderr sin romper la compilación del archivo.
+
+---
+
+### 3.67 `--adopt-existing`: adoptar tablas sin auto-migrar — RESUELTO
+
+Hasta esta ronda, `linkc serve` SIEMPRE intentaba `CREATE TABLE IF NOT EXISTS` (SQLite y PostgreSQL) y auto-migrar con `ALTER TABLE ADD COLUMN` (columnas opcionales faltantes en SQLite; todas las columnas, siempre, en PostgreSQL) al abrir cada colección declarada. Dos bloqueos reales para adoptar un sistema existente que eso dejaba sin resolver:
+
+1. **Un rol de base sin permiso de DDL.** Una restricción común en producción: la cuenta que usa la app tiene `SELECT`/`INSERT`/`UPDATE`/`DELETE`, pero no `CREATE`/`ALTER` -- y `linkc serve` ni siquiera arrancaba, aunque el schema ya matcheara exacto y no hiciera falta migrar nada de verdad.
+2. **Una tabla SQLite con columnas físicas que el `.link` no modela.** `check_schema_matches` exige coincidencia EXACTA entre lo declarado y lo que ya existe -- una tabla legacy con una columna de más (que el programa nunca va a leer) hacía panic al arrancar.
+
+```
+linkc serve app.link 8787 --db postgres://usuario:clave@host/base --adopt-existing
+```
+
+`--adopt-existing` (o `LINK_ADOPT_EXISTING` con cualquier valor no vacío) le dice a `linkc serve` que asuma que TODAS las tablas ya existen: nunca ejecuta `CREATE TABLE` ni `ALTER TABLE`, ni siquiera uno no destructivo. En su lugar valida, con SELECTs de solo lectura, que cada columna DECLARADA en el `.link` exista en la tabla física:
+
+| Backend | Qué valida en modo adopción | Qué ignora |
+|---|---|---|
+| SQLite | Cada columna declarada existe con el tipo SQL esperado (`PRAGMA table_info`) | Cualquier columna física no declarada en el `.link` |
+| PostgreSQL | Cada columna declarada existe por nombre (`information_schema.columns`), más el chequeo de siempre de que `"id"` sea un entero (§3.59) | Tipo columna por columna (más allá de `"id"`) -- mismo criterio que `validate_existing_id_column` ya aplicaba fuera de este modo |
+
+Si falta una tabla entera, o falta una columna declarada, `linkc serve` no arranca -- con un mensaje que dice exactamente qué falta, nunca con el `CREATE TABLE`/`ALTER TABLE` silencioso que el modo normal haría.
+
+**Límites honestos:**
+- **Todo o nada por proceso.** La flag aplica a TODAS las colecciones que el programa declara, no colección por colección -- si algunas tablas son nuevas (y sí necesitan crearse) y otras son legacy (y no), hoy hace falta separarlas en dos programas/procesos.
+- **No valida `NOT NULL` en SQLite, ni tipo columna por columna en PostgreSQL más allá de `"id"`.** Una fila vieja con `NULL` en un campo que el `.link` declara requerido, o un tipo de columna incompatible, recién falla en la primera lectura que la toque -- con el error normal de decode, no al conectar. Mismo criterio que `validate_existing_id_column` ya documentaba para PostgreSQL fuera de este modo.
+- **Una columna declarada opcional pero ausente en la tabla física también falla.** A propósito: el punto entero de este modo es no tocar DDL, así que ni siquiera el `ALTER TABLE ADD COLUMN` no destructivo que el modo normal haría para un campo opcional corre acá.
+
+**Verificado**: `runtime/db.rs` (SQLite, contra un archivo real -- tabla con una columna extra se adopta igual, tabla faltante y columna declarada faltante fallan con el mensaje esperado), `cli_adopt_existing.rs` (dos corridas reales y consecutivas de `linkc serve` sobre el MISMO archivo SQLite: la primera crea la tabla normalmente con una columna que la segunda no declara, la segunda arranca en modo adopción y la ignora; más el flag y la env var probados por separado) y `pg_integration.rs` contra un PostgreSQL real (tabla creada a mano con una columna sin modelar, `linkc serve --adopt-existing` arranca y la ignora; una columna declarada faltante falla limpio, sin panic).
 
 ---
 

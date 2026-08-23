@@ -125,7 +125,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub')"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--adopt-existing]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
 }
 
@@ -860,7 +860,9 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--cors-origin <origen>] [--session-ttl <duración>]");
+        eprintln!(
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--cors-origin <origen>] [--session-ttl <duración>] [--adopt-existing]"
+        );
         return ExitCode::FAILURE;
     };
     let Ok(port) = port_str.parse::<u16>() else {
@@ -911,13 +913,25 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
 
+    let adopt_existing = resolve_adopt_existing(args);
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    runtime::server::serve(program, port, source, cors, session_ttl, argon2_params, jwt_config);
+    runtime::server::serve(program, port, source, cors, session_ttl, argon2_params, jwt_config, adopt_existing);
     ExitCode::SUCCESS
+}
+
+/// Adopción de tabla existente (`--adopt-existing`/`LINK_ADOPT_EXISTING`,
+/// GRAMMAR.md §3.67): un flag booleano, no un valor -- por eso no reusa
+/// `read_flag_or_env` (pensado para `--flag <valor>`). Presente en la línea
+/// de comandos (sin importar qué venga después, si algo viene) o la env var
+/// puesta a cualquier valor no vacío: `true`. Ninguno de los dos: `false`,
+/// el comportamiento de siempre (`linkc serve` crea/migra tablas).
+fn resolve_adopt_existing(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--adopt-existing") || std::env::var("LINK_ADOPT_EXISTING").ok().filter(|v| !v.trim().is_empty()).is_some()
 }
 
 /// Cuánto vive una sesión antes de expirar sola (GRAMMAR.md §3.50), en orden

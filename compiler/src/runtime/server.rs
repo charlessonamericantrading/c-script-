@@ -138,6 +138,7 @@ pub fn serve(
     session_ttl: Option<Duration>,
     argon2_params: argon2::Params,
     jwt_config: Option<(String, String, String)>,
+    adopt_existing: bool,
 ) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
@@ -157,12 +158,12 @@ pub fn serve(
     // que ahí es `None` y el loop se queda con el `incoming_requests()`
     // bloqueante de siempre, sin overhead de polling.
     let (db, remote_changes) = match source {
-        DbSource::SqliteFile(db_path) => (Db::new(&program, &db_path), None),
+        DbSource::SqliteFile(db_path) => (Db::new_with_options(&program, &db_path, adopt_existing), None),
         // A diferencia de abrir un archivo local, conectarse a una base remota
         // falla por motivos operativos normales (está caída, la clave cambió,
         // la base no existe todavía). Eso merece un mensaje que se entienda y
         // un exit code, no el panic que usa el camino de SQLite.
-        DbSource::Postgres(url) => match Db::connect_postgres(&program, &url) {
+        DbSource::Postgres(url) => match Db::connect_postgres_with_options(&program, &url, adopt_existing) {
             Ok((db, rx)) => (db, Some(rx)),
             Err(e) => {
                 eprintln!("error: {e}");
