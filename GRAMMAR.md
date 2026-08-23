@@ -2393,12 +2393,16 @@ escaparía de nuevo, dejando `&amp;lt;` en vez de `&lt;`.
   sin pasarlos por `.escapeHtml()` sigue compilando y sirviendo esa página
   tal cual, vulnerable. La herramienta existe; usarla en el lugar correcto
   sigue siendo responsabilidad de quien escribe el rpc.
-- **Solo texto de nodo/atributo entre comillas dobles, no todos los
-  contextos HTML.** El escape de acá alcanza para interpolar dentro del
-  texto de una etiqueta o dentro de un atributo `"..."` -- NO cubre
-  interpolar directo dentro de un bloque `<script>`/`<style>`, ni un
-  atributo sin comillas (`onerror=comentario`, sin `"`): esos contextos
-  necesitan reglas de escape distintas que esto no aplica.
+- **Solo texto de nodo y atributo ENTRE COMILLAS -- dobles o simples, las
+  dos (corrección del 23/08/2026: una versión anterior de este párrafo
+  decía "solo comillas dobles", pero `'` también se escapa a `&#39;`, así
+  que un atributo `'...'` es igual de seguro) --, no todos los contextos
+  HTML.** NO cubre interpolar directo dentro de un bloque `<script>`/
+  `<style>` (ahí hace falta escape de JS/CSS, no de HTML -- son reglas
+  completamente distintas, ningún escapador de HTML las resuelve), ni un
+  atributo sin comillas (`onerror=comentario`, sin `"` ni `'`): la mitigación
+  correcta para ese último caso es no escribir atributos sin comillas, no
+  un escape más agresivo.
 - **Sin sanitización de HTML "permitido a medias"** (dejar pasar `<b>` pero
   no `<script>`, el caso de un editor de texto enriquecido). Esto es
   escape TOTAL -- todo interpolado se vuelve texto plano visible, nunca
