@@ -83,6 +83,7 @@
   - [3.59 PostgreSQL: acepta PK autoincremental de 32/16 bits, no solo `BIGSERIAL` — RESUELTO](#359-postgresql-acepta-pk-autoincremental-de-3216-bits-no-solo-bigserial--resuelto)
   - [3.60 `http.getWithStatus`/`http.postWithStatus`: código de estado y headers de la respuesta — RESUELTO](#360-httpgetwithstatushttppostwithstatus-código-de-estado-y-headers-de-la-respuesta--resuelto)
   - [3.61 `db.<c>.pageAfter(cursor, limit)`: cursor de continuación — RESUELTO](#361-dbcpageaftercursor-limit-cursor-de-continuación--resuelto)
+  - [3.62 `@route` con parámetros de query string — RESUELTO](#362-route-con-parámetros-de-query-string--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3156,6 +3157,35 @@ rpc feed(cursor: Int?, limit: Int) -> Item[] {
 **Límite honesto:** solo hacia adelante -- no hay forma de pedir "la página anterior" a partir de un cursor (para eso, `page(limit, offset)` sigue estando disponible), ni de saltar a una posición arbitraria sin recorrer.
 
 **Verificado:** un test unitario contra SQLite (`db.rs`) que además prueba explícitamente la propiedad de estabilidad -- inserta una fila nueva ENTRE dos llamadas a `pageAfter` y confirma que la segunda página no cambia -- más el mismo caso contra un PostgreSQL real en `pg_integration.rs`.
+
+---
+
+### 3.62 `@route` con parámetros de query string — RESUELTO
+
+Hasta esta ronda, `@route` (§3.37/§3.42) exigía que el rpc tuviera EXACTAMENTE los parámetros que la ruta declara -- ni de más ni de menos. Eso significaba que cualquier endpoint que además necesitara un filtro (`?estado=activo`, `?page=2`) tenía que duplicar el rpc completo solo para agregar ese parámetro, porque `@route` no tenía forma de leer nada fuera del path.
+
+<!-- linkc:fragment -->
+```rust
+type SearchResult = { q: String, page: Int? }
+
+service Search {
+  @route("/search")
+  rpc search(q: String, page: Int?) -> SearchResult {
+    // GET /search?q=rust&page=2  ->  q="rust", page=2
+    // GET /search?q=rust         ->  q="rust", page=null (opcional, no 400)
+    // GET /search                ->  400: falta 'q' (obligatorio)
+    SearchResult { q: q, page: page }
+  }
+}
+```
+
+**La regla es simple: cualquier parámetro del rpc que NO esté nombrado en el path se lee de la query string, por nombre.** `String`/`Int` obligatorio (400 si falta), o `String?`/`Int?` si puede estar ausente sin que eso sea un error (`null` en ese caso). Los parámetros de PATH siguen siendo exactamente como antes -- esto solo agrega los que sobran. **`body` sigue sin leerse, a propósito**, no por falta de tiempo: la URL de `@route` existe para que un crawler (o cualquier link compartido) la abra con un GET normal, y un GET nunca trae body -- soportarlo ahí no tendría con qué activarse nunca.
+
+**Un bug real encontrado escribiendo esta ronda, no solo la ausencia de la feature:** antes de esto, el path completo (incluyendo un eventual `?...`) se partía en segmentos directamente. Una URL tan común como `/blog/hola-mundo?utm_source=twitter` -- cualquier link real recibe parámetros de tracking tarde o temprano -- capturaba `"hola-mundo?utm_source=twitter"` ENTERO como valor de `:slug`, corrompiendo el parámetro. Ahora la query string se separa ANTES de partir en segmentos, así que esto se arregló para TODA ruta con `@route`, tenga o no parámetros de query declarados -- y de paso también para el `/Service/rpc` normal, que tenía la misma vulnerabilidad latente (nunca ejercitada en la práctica, porque el cliente TypeScript generado nunca agrega query string a un POST).
+
+**Decodificación:** `+` significa espacio en un valor de query string (`application/x-www-form-urlencoded`) -- a diferencia de un segmento de path, donde `+` es un caracter literal. `%XX` se decodifica igual en los dos casos. Un query param no declarado por el rpc (como `utm_source` en el ejemplo de arriba) se ignora sin error -- ni bloquea, ni se cuela en ningún lado.
+
+**Verificado** contra un servidor real (`cli_route.rs`): query param obligatorio y opcional leídos por nombre; falta el obligatorio -> 400 nombrando cuál; un `Int` inválido -> 400; la query string ya NO corrompe el segmento de path capturado (el test que fija el bug de arriba); un query param desconocido no pisa uno real; `+`/`%XX` decodificados correctamente.
 
 ---
 

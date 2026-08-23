@@ -443,6 +443,11 @@ struct RouteEntry {
     service_name: String,
     rpc_name: String,
     param_is_int: Vec<bool>,
+    /// `(nombre, es_int, opcional)` para cada parámetro del rpc que NO está
+    /// en el path (GRAMMAR.md §3.62) -- se lee de la query string por
+    /// nombre. El checker ya garantizó que cada uno es `String`/`Int`/
+    /// `String?`/`Int?`.
+    query_params: Vec<(String, bool, bool)>,
 }
 
 /// Arma la tabla de `@route` UNA vez al arrancar, nunca por request,
@@ -483,7 +488,23 @@ fn build_route_table(program: &Program) -> Vec<RouteEntry> {
                     matches!(ty, crate::types::Type::Int)
                 })
                 .collect();
-            table.push(RouteEntry { pattern, service_name: s.name.clone(), rpc_name: r.name.clone(), param_is_int });
+            let path_param_names = pattern.param_names();
+            let query_params: Vec<(String, bool, bool)> = r
+                .params
+                .iter()
+                .filter(|p| !path_param_names.contains(&p.name.as_str()))
+                .map(|p| {
+                    let ty = checker
+                        .resolve_type(&p.ty)
+                        .unwrap_or_else(|e| panic!("tipo de parámetro de @route no resolvió en serve() habiendo pasado el checker: {e}"));
+                    let (inner, optional) = match &ty {
+                        crate::types::Type::Optional(inner) => (inner.as_ref().clone(), true),
+                        other => (other.clone(), false),
+                    };
+                    (p.name.clone(), matches!(inner, crate::types::Type::Int), optional)
+                })
+                .collect();
+            table.push(RouteEntry { pattern, service_name: s.name.clone(), rpc_name: r.name.clone(), param_is_int, query_params });
         }
     }
     table.sort_by_key(|e| std::cmp::Reverse(e.pattern.specificity()));
@@ -518,6 +539,31 @@ fn percent_decode(segment: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Igual que `percent_decode`, pero para un valor de QUERY STRING, no de
+/// path: `+` significa espacio (`application/x-www-form-urlencoded`), a
+/// diferencia de un segmento de path, donde no tiene ningún significado
+/// especial. Antes de la ronda de query string (§3.62) esta distinción no
+/// existía porque nada decodificaba query strings todavía.
+fn percent_decode_query_value(segment: &str) -> String {
+    percent_decode(&segment.replace('+', " "))
+}
+
+/// `a=1&b=hola%20mundo` -> `{"a": "1", "b": "hola mundo"}`. Un par sin `=`
+/// (`?flag`) vale como clave con valor `""` -- no es un caso que este
+/// lenguaje necesite distinguir de "vino vacío". Claves repetidas: gana la
+/// ÚLTIMA (mismo criterio simple que `HashMap::insert`), no hay soporte para
+/// arrays de query params -- fuera de alcance a propósito, un query param
+/// de `@route` es siempre `String`/`Int` escalar (GRAMMAR.md §3.62).
+fn parse_query_string(qs: &str) -> std::collections::HashMap<String, String> {
+    qs.split('&')
+        .filter(|pair| !pair.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (percent_decode_query_value(k), percent_decode_query_value(v))
+        })
+        .collect()
+}
+
 /// Resuelve (servicio, rpc, args) para esta request -- por una `@route` si el
 /// path matchea alguna, si no por el `/Service/rpc` de siempre leyendo
 /// `body` como el JSON de argumentos (GRAMMAR.md §3.37). Las dos direcciones
@@ -528,14 +574,21 @@ fn percent_decode(segment: &str) -> String {
 ///
 /// `Err(None)`: ninguna `@route` matcheó, y el path tampoco tiene la forma
 /// `/Service/rpc` -- 404. `Err(Some(msg))`: una `@route` matcheó pero el
-/// segmento capturado no convierte al tipo del parámetro, o (mismo camino de
-/// siempre) el body de un `/Service/rpc` no es JSON válido -- 400 en los
-/// dos casos.
+/// segmento capturado (o un query param) no convierte al tipo del parámetro,
+/// o falta un query param obligatorio, o (mismo camino de siempre) el body
+/// de un `/Service/rpc` no es JSON válido -- 400 en todos los casos.
 fn resolve_route<'a>(
     path: &'a str,
     body: &str,
     route_table: &'a [RouteEntry],
 ) -> Result<(&'a str, &'a str, serde_json::Value), Option<String>> {
+    // La query string se separa ACÁ, antes de partir en segmentos -- sin
+    // esto, un pedido tan común como `/blog/hola-mundo?utm_source=twitter`
+    // (cualquier URL real recibe parámetros de tracking tarde o temprano)
+    // hacía que "hola-mundo?utm_source=twitter" ENTERO se capturara como el
+    // valor de `:slug` -- un bug real, no solo la ausencia de la feature
+    // que este bloque agrega (§3.62).
+    let (path, query_string) = path.split_once('?').map_or((path, None), |(p, q)| (p, Some(q)));
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     // `route_table` ya viene ordenada por especificidad descendente
     // (`build_route_table`), así que el PRIMER match de esta única pasada
@@ -567,6 +620,38 @@ fn resolve_route<'a>(
                 serde_json::Value::String(decoded)
             };
             args.insert(name.to_string(), value);
+        }
+        // Query string (§3.62): cualquier parámetro del rpc que no vino del
+        // path. Ausente + opcional -> `null`, mismo criterio que cualquier
+        // otro campo opcional del lenguaje; ausente + obligatorio -> 400.
+        if !entry.query_params.is_empty() {
+            let query_map = query_string.map(parse_query_string).unwrap_or_default();
+            for (name, is_int, optional) in &entry.query_params {
+                match query_map.get(name) {
+                    Some(raw) => {
+                        let decoded = percent_decode_query_value(raw);
+                        let value = if *is_int {
+                            match decoded.parse::<i64>() {
+                                Ok(n) => serde_json::Value::from(n),
+                                Err(_) => {
+                                    return Err(Some(format!(
+                                        "parámetro de query '{name}' inválido: se esperaba un entero, se recibió '{decoded}'"
+                                    )));
+                                }
+                            }
+                        } else {
+                            serde_json::Value::String(decoded)
+                        };
+                        args.insert(name.clone(), value);
+                    }
+                    None if *optional => {
+                        args.insert(name.clone(), serde_json::Value::Null);
+                    }
+                    None => {
+                        return Err(Some(format!("falta el parámetro de query obligatorio '{name}'")));
+                    }
+                }
+            }
         }
         return Ok((&entry.service_name, &entry.rpc_name, serde_json::Value::Object(args)));
     }

@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.23.0] - 2026-08-23
+
+### ✨ Nuevo
+- **`@route` lee parámetros extra de la query string.** Hasta esta ronda, un rpc con `@route` tenía que tomar EXACTAMENTE los parámetros del path, ni de más -- cualquier filtro (`?estado=activo`) obligaba a duplicar el rpc completo. Ahora cualquier parámetro del rpc que no esté nombrado en el path se lee de la query string por nombre: `String`/`Int` obligatorio (400 si falta), `String?`/`Int?` opcional (`null` si no vino). `body` sigue sin leerse, a propósito -- la URL de `@route` es para que un crawler la abra con GET simple.
+
+### 🐛 Arreglado
+- **La query string se colaba entera dentro del último segmento de path capturado.** `/blog/hola-mundo?utm_source=twitter` -- una URL perfectamente normal, cualquier link compartido trae parámetros de tracking -- corrompía `:slug` con `"hola-mundo?utm_source=twitter"` completo, porque el path se partía en segmentos ANTES de separar la query string. Se arregló para toda ruta con `@route` (tenga o no parámetros de query declarados) y de paso también para el `/Service/rpc` normal, que tenía la misma vulnerabilidad latente sin ejercitar en la práctica.
+
+Verificado contra un servidor real (`cli_route.rs`): query param obligatorio/opcional, 400 con el nombre del que falta, `Int` inválido, el bug de corrupción del slug fijado explícitamente, un query param desconocido sin efecto, decodificación `+`/`%XX`. 601 tests (4 nuevos). Detalle completo: GRAMMAR.md §3.62.
+
 ## [1.22.0] - 2026-08-23
 
 ### ✨ Nuevo

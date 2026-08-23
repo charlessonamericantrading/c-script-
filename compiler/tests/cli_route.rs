@@ -341,6 +341,27 @@ service Docs {
 }
 "#;
 
+// GRAMMAR.md §3.62: cualquier parámetro del rpc que NO esté en el path se
+// lee de la query string por nombre -- `String`/`Int` obligatorio, o
+// `String?`/`Int?` si puede estar ausente sin que eso sea un error.
+
+const QUERY_PROGRAM: &str = r#"
+type SearchResult = { q: String, page: Int? }
+type PostResult = { slug: String, src: String? }
+
+service Search {
+  @route("/search")
+  rpc search(q: String, page: Int?) -> SearchResult {
+    SearchResult { q: q, page: page }
+  }
+
+  @route("/blog/:slug")
+  rpc post(slug: String, src: String?) -> PostResult {
+    PostResult { slug: slug, src: src }
+  }
+}
+"#;
+
 #[test]
 fn a_route_with_multiple_params_captures_each_by_name() {
     let temp = TempDir::new("multi-param");
@@ -415,6 +436,86 @@ fn a_literal_route_wins_over_a_catchall_that_could_also_match() {
 }
 
 #[test]
+fn a_required_and_an_optional_query_param_are_read_by_name() {
+    let temp = TempDir::new("query-basic");
+    let src = temp.write("app.link", QUERY_PROGRAM);
+    let server = Serve::start(&src);
+
+    let (status, _, body) = server.get("/search?q=rust&page=2");
+    assert_eq!(status, 200);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["q"], "rust");
+    assert_eq!(json["page"], 2);
+
+    // El query param opcional, ausente: `null`, no un error.
+    let (status, _, body) = server.get("/search?q=rust");
+    assert_eq!(status, 200, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["q"], "rust");
+    assert!(json["page"].is_null(), "page ausente tiene que ser null: {json}");
+}
+
+#[test]
+fn a_missing_required_query_param_is_a_400_and_a_bad_int_too() {
+    let temp = TempDir::new("query-errors");
+    let src = temp.write("app.link", QUERY_PROGRAM);
+    let server = Serve::start(&src);
+
+    let (status, _, body) = server.get("/search");
+    assert_eq!(status, 400);
+    assert!(body.contains("'q'"), "el error tiene que nombrar el parámetro que falta: {body}");
+
+    let (status, _, body) = server.get("/search?q=rust&page=no-es-un-numero");
+    assert_eq!(status, 400);
+    assert!(body.contains("'page'") && body.contains("entero"), "mensaje inesperado: {body}");
+}
+
+#[test]
+fn a_query_string_alongside_a_path_param_does_not_corrupt_the_captured_segment() {
+    // El bug real que motivó separar la query string ANTES de partir en
+    // segmentos: sin eso, "/blog/hola-mundo?utm_source=twitter" -- una URL
+    // perfectamente normal, cualquier link compartido en redes trae
+    // parámetros de tracking -- capturaba "hola-mundo?utm_source=twitter"
+    // ENTERO como el valor de :slug.
+    let temp = TempDir::new("query-no-corrupt");
+    let src = temp.write("app.link", QUERY_PROGRAM);
+    let server = Serve::start(&src);
+
+    // "utm_source" no es un parámetro declarado del rpc -- tiene que
+    // ignorarse sin error, exactamente como cualquier query param
+    // desconocido que un navegador/crawler agregue por su cuenta.
+    let (status, _, body) = server.get("/blog/hola-mundo?src=twitter&utm_source=twitter_ads");
+    assert_eq!(status, 200, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["slug"], "hola-mundo", "la query string no puede colarse en el segmento capturado: {json}");
+    assert_eq!(json["src"], "twitter", "un query param desconocido (utm_source) no debe pisar uno real");
+
+    // Sin query string en absoluto: el camino de siempre, sin regresión.
+    let (status, _, body) = server.get("/blog/hola-mundo");
+    assert_eq!(status, 200);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["slug"], "hola-mundo");
+    assert!(json["src"].is_null());
+}
+
+#[test]
+fn query_values_are_percent_and_plus_decoded() {
+    let temp = TempDir::new("query-decode");
+    let src = temp.write("app.link", QUERY_PROGRAM);
+    let server = Serve::start(&src);
+
+    let (status, _, body) = server.get("/search?q=hello+world&page=1");
+    assert_eq!(status, 200, "body: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["q"], "hello world", "'+' en query string significa espacio: {json}");
+
+    let (status, _, body) = server.get("/search?q=caf%C3%A9&page=1");
+    assert_eq!(status, 200);
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["q"], "café", "%XX se decodifica igual que en un segmento de path: {json}");
+}
+
+#[test]
 fn the_checker_rejects_what_cannot_work() {
     let temp = TempDir::new("checker-rejects");
 
@@ -469,6 +570,20 @@ service B { @route("/blog/destacado/:slug") rpc q(slug: String) -> String { slug
     let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert!(!out.status.success(), "un catch-all como Int debió rechazarse");
     assert!(stderr.contains("catch-all") && stderr.contains("String"), "mensaje inesperado: {stderr}");
+
+    // Un parámetro extra (query string, §3.62) con un tipo que no puede
+    // venir de texto -- Bool no es String/Int/String?/Int?.
+    let out = build(&temp, r#"service A { @route("/x") rpc p(activo: Bool) -> String { "x" } }"#);
+    let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "un query param Bool debió rechazarse");
+    assert!(stderr.contains("query string"), "mensaje inesperado: {stderr}");
+
+    // Un rpc con MENOS parámetros que los que la ruta pide sigue rechazado
+    // -- de más ahora se acepta (query string), de menos nunca.
+    let out = build(&temp, r#"service A { @route("/x/:id/:slug") rpc p(id: Int) -> String { "x" } }"#);
+    let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "le falta ':slug' al rpc, tiene que rechazarse");
+    assert!(stderr.contains("le faltan") || stderr.contains("faltan"), "mensaje inesperado: {stderr}");
 
     // @route sobre un stream.
     let out = build(

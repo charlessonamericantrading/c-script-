@@ -275,7 +275,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - Tipos `Timestamp` (ISO-8601 UTC) e `Int64` (mismo rango 64-bit sin pérdida de precisión en TS), más builtin `now() -> Timestamp` (GRAMMAR.md §3.30–§3.32).
 - Toolchain integral: `linkc build`, `serve`, `test`, `dev`, `lint`, `doc`, `docker`, `lsp`, `new`, `fmt`.
 
-**Evolución Post-1.0 (v1.1.0 a v1.22.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
+**Evolución Post-1.0 (v1.1.0 a v1.23.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
 - **PostgreSQL en Runtime** (v1.1.0/v1.4.0/v1.8.0, GRAMMAR.md §3.36/§3.40/§3.44): Soporte de base de datos PostgreSQL real (`--db postgres://...`), auto-migraciones de esquema no destructivas, TLS oportunista y obligatorio vía `rustls` puro (compatible con Supabase/Neon/RDS), auto-reconexión transparente tras corte y LISTEN/NOTIFY en hilo dedicado para sincronizar `stream` SSE entre múltiples instancias.
 - **Criptografía y Seguridad** (v1.1.0/v1.3.0/v1.5.0, GRAMMAR.md §3.34/§3.38/§3.41): Argon2id (RFC 9106) con sal aleatoria en formato PHC y verificación en tiempo constante; tokens de sesión y UUIDs alimentados por el CSPRNG del sistema operativo (`getrandom`); cálculo de HMAC-SHA256 para verificación de webhooks; CORS con allowlist configurable (`--cors-origin`) y cabeceras de seguridad estrictas fijas (`nosniff`, `DENY`, `no-referrer`).
 - **Extensibilidad Web y SEO** (v1.1.0/v1.2.0/v1.6.0/v1.9.0/v1.10.0, GRAMMAR.md §3.35/§3.37/§3.42/§3.45/§3.46): Decorador `@content_type("...")` para respuestas no-JSON (HTML, XML, CSV); URLs amigables `@route("/...")` con múltiples parámetros dinámicos y precedencia determinística; sanitización explícita `String.escapeHtml()`; y selección de status HTTP en éxito `response.setStatus(code)` (e.g. páginas 404 personalizadas o 201 Created).
@@ -285,6 +285,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - **Seguridad Configurable y Adopción de Bases Existentes** (v1.20.0, GRAMMAR.md §3.58–§3.59): Costo de `crypto.hashPassword` configurable vía `--argon2-memory-kib`/`--argon2-iterations` (o sus env vars), sin cambiar el comportamiento por default; `crypto.isLegacyHash(hash) -> Bool` para migrar contraseñas viejas de forma proactiva; y una tabla PostgreSQL preexistente con `id SERIAL`/`IDENTITY` de 32 o 16 bits (no solo `BIGSERIAL`) ya no falla en el primer `insert` -- corrige un desacuerdo real entre la validación al conectar (que sí los aceptaba) y la lectura de la columna (que exigía el OID exacto de 64 bits).
 - **Inspección de Respuestas HTTP Salientes** (v1.21.0, GRAMMAR.md §3.60): `http.getWithStatus`/`http.postWithStatus` devuelven `{status: Int, headers: {...}[], body: String}` -- un 4xx/5xx de la API llamada deja de ser un error de runtime genérico y pasa a ser un dato que el programa puede inspeccionar (ej. reintentar solo en 429). `http.get`/`http.post`/`http.getWithHeaders`/`http.postWithHeaders` quedan sin cambios.
 - **Paginación por Cursor** (v1.22.0, GRAMMAR.md §3.61): `db.<c>.pageAfter(cursor, limit)` -- el cursor es el `id` del último elemento visto (`null` para la primera página), estable bajo escritura concurrente a diferencia de `page(limit, offset)`, que cuenta filas desde el principio en cada llamada. `page` queda sin cambios, sigue siendo la opción correcta para saltar a una página arbitraria.
+- **`@route` con Query String** (v1.23.0, GRAMMAR.md §3.62): cualquier parámetro del rpc que no esté en el path se lee de la query string por nombre (`String`/`Int` obligatorio, `String?`/`Int?` opcional). De paso, corrigió un bug real: la query string se coleaba entera dentro del último segmento de path capturado (ej. `/blog/slug?utm_source=x` corrompía `:slug`) -- ahora se separa antes de partir en segmentos, para toda ruta, tenga o no parámetros de query declarados.
 
 **Hitos "go / no-go":**
 - Fin de Fase 0: ✅ Demo E2E probada y verificada.
@@ -328,7 +329,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 ## 8. Hoja de Ruta Futura (Fase 4 · Hacia c-script 2.0)
 
-Con las Fases 0 a 3 completadas y el núcleo v1.22.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
+Con las Fases 0 a 3 completadas y el núcleo v1.23.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
 
 ### 8.1 Ecosistema y Distribución
 1. **Publicación en el registro npm**: Empaquetar y publicar `link-lang` en npm para permitir ejecución vía `npx linkc` o instalación global estándar.
@@ -354,13 +355,12 @@ Con las Fases 0 a 3 completadas y el núcleo v1.22.0 plenamente operativo, las s
 2. **`linkc introspect <db-url>`**: Herramienta de introspección que genere un `.link` de partida a partir de una base de datos ya existente, en vez de escribir cada tabla a mano.
 
 ### 8.6 `@route` y Sanitización
-1. **`@route` con query string y body**: Hoy todo parámetro de un `@route` tiene que venir del path -- sin esto, cualquier endpoint que además necesite un filtro por query string duplica el rpc (GRAMMAR.md §3.42).
-2. **Cobertura completa de contextos de inyección en `escapeHtml()`**: El método cubre el caso de texto/atributo entre comillas dobles, pero no todos los contextos HTML donde se puede interpolar un valor -- relevante para XSS, no solo estilo (GRAMMAR.md §3.45).
+1. **Cobertura completa de contextos de inyección en `escapeHtml()`**: El método cubre el caso de texto/atributo entre comillas dobles, pero no todos los contextos HTML donde se puede interpolar un valor -- relevante para XSS, no solo estilo (GRAMMAR.md §3.45).
 
 ### 8.7 Almacenamiento
 1. **Módulo `storage`/S3**: No existe ninguna integración de almacenamiento de archivos hoy -- ni presigned URLs, ni upload directo, nada. Bloquea cualquier caso de uso con archivos adjuntos.
 
-**Origen de 8.4–8.7** (23/08/2026): 15 gaps nuevos, verificados contra el código real (no contra la documentación), a partir de dos fuentes externas -- un reporte de adopción real (app financiera "MyFinance" sobre una base Postgres ya existente) y una auditoría propia de los "límites honestos" que cada sección `§3.X` de GRAMMAR.md ya se admite a sí misma. Quedaron fuera de esta ronda por ser más especializados o de menor demanda general (identificados, no descartados): WebSocket bidireccional, jobs en background/cron, caché a nivel de app, búsqueda full-text, subida de archivos multipart, retry/backoff para `smtp`/`http` salientes, export OpenTelemetry, GraphQL, i18n, y migraciones más allá de agregar columna (rename/retype/drop). Conversión `.toString()`, `response.setStatus` en `stream` y el catch-all de `@route` (originalmente 8.6/8.7.1) se implementaron el 23/08/2026 -- ver v1.19.0 y GRAMMAR.md §3.55–§3.57. Argon2id configurable, señal de hash legado (originalmente 8.4.1/8.4.2) y aceptar PK autoincremental de 32/16 bits (originalmente 8.5.1) se implementaron el mismo día -- ver v1.20.0 y GRAMMAR.md §3.58–§3.59.
+**Origen de 8.4–8.7** (23/08/2026): 15 gaps nuevos, verificados contra el código real (no contra la documentación), a partir de dos fuentes externas -- un reporte de adopción real (app financiera "MyFinance" sobre una base Postgres ya existente) y una auditoría propia de los "límites honestos" que cada sección `§3.X` de GRAMMAR.md ya se admite a sí misma. Quedaron fuera de esta ronda por ser más especializados o de menor demanda general (identificados, no descartados): WebSocket bidireccional, jobs en background/cron, caché a nivel de app, búsqueda full-text, subida de archivos multipart, retry/backoff para `smtp`/`http` salientes, export OpenTelemetry, GraphQL, i18n, y migraciones más allá de agregar columna (rename/retype/drop). Conversión `.toString()`, `response.setStatus` en `stream` y el catch-all de `@route` (originalmente 8.6/8.7.1) se implementaron el 23/08/2026 -- ver v1.19.0 y GRAMMAR.md §3.55–§3.57. Argon2id configurable, señal de hash legado (originalmente 8.4.1/8.4.2) y aceptar PK autoincremental de 32/16 bits (originalmente 8.5.1) se implementaron el mismo día -- ver v1.20.0 y GRAMMAR.md §3.58–§3.59. `@route` con query string (originalmente 8.6.1) se implementó el mismo día -- ver v1.23.0 y GRAMMAR.md §3.62.
 
 ---
 

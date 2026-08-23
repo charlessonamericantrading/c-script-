@@ -1357,18 +1357,19 @@ impl Checker {
         }
         let pattern = crate::route::parse_route_pattern(raw).map_err(|e| err(format!("`@route(\"{raw}\")` en '{}': {e}", r.name)))?;
 
-        // El rpc tiene que tomar EXACTAMENTE los parámetros que la ruta
-        // declara -- ni de más (v0 no lee query string ni body en un rpc
-        // con @route, a propósito: así la URL sirve tal cual para un
-        // crawler, sin depender de un POST con JSON) ni de menos, y cada
-        // uno con el MISMO nombre. El orden de los parámetros del rpc no
-        // tiene por qué coincidir con el orden en que aparecen en la ruta
-        // -- lo que importa es el nombre, que es como se bindea el valor
-        // capturado (GRAMMAR.md §3.42).
+        // El rpc tiene que tomar AL MENOS los parámetros que la ruta declara
+        // -- de menos, no (§3.42: cada uno con el MISMO nombre; el orden del
+        // rpc no tiene por qué coincidir con el de la ruta). De MÁS sí se
+        // acepta desde la ronda de query string (§3.62): cualquier parámetro
+        // del rpc que no venga del path se lee de la query string por
+        // nombre -- útil para un filtro (`?estado=activo`) sin tener que
+        // duplicar el rpc completo solo para eso. Body sigue sin leerse,
+        // a propósito: la URL de `@route` sirve tal cual para un crawler,
+        // que nunca manda un POST con JSON.
         let route_params = pattern.param_names();
-        if r.params.len() != route_params.len() {
+        if r.params.len() < route_params.len() {
             return Err(err(format!(
-                "`@route(\"{raw}\")` en '{}': la ruta declara {} parámetro(s) ({}), pero el rpc toma {} -- tienen que coincidir exacto",
+                "`@route(\"{raw}\")` en '{}': la ruta declara {} parámetro(s) ({}), pero el rpc toma solo {} -- le faltan",
                 r.name,
                 route_params.len(),
                 route_params.iter().map(|n| format!(":{n}")).collect::<Vec<_>>().join(", "),
@@ -1402,6 +1403,28 @@ impl Checker {
                 return Err(err(format!(
                     "`@route(\"{raw}\")` en '{}': ':{name}' viene de un segmento de URL, así que el parámetro tiene que ser `String` o `Int` -- es {param_ty}",
                     r.name
+                )));
+            }
+        }
+        // Cualquier parámetro del rpc que NO esté en la ruta viene de la
+        // query string (§3.62) -- mismo criterio de tipo que un segmento de
+        // path (texto, `Int` se acepta parseando), pero además puede ser
+        // `String?`/`Int?`: a diferencia de un segmento de path, un query
+        // param puede estar simplemente AUSENTE de la URL sin que eso sea un
+        // 404 -- `null` en ese caso, no un error.
+        for param in &r.params {
+            if route_params.contains(&param.name.as_str()) {
+                continue;
+            }
+            let param_ty = self.resolve_type(&param.ty)?;
+            let inner = match &param_ty {
+                Type::Optional(inner) => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(inner, Type::String | Type::Int) {
+                return Err(err(format!(
+                    "`@route(\"{raw}\")` en '{}': '{}' no está en la ruta, así que viene de la query string -- tiene que ser `String`, `Int`, `String?` o `Int?` -- es {param_ty}",
+                    r.name, param.name
                 )));
             }
         }
