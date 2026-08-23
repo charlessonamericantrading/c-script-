@@ -171,7 +171,18 @@ impl Backend {
                 // `try_get` es la variante que no panickea: defensa en
                 // profundidad, no confiar en que la validación de arriba sea la
                 // única puerta.
-                row.try_get::<_, i64>(0).map_err(|e| e.to_string())
+                //
+                // `validate_existing_id_column` (db.rs) acepta "bigint",
+                // "integer" Y "smallint" -- una tabla preexistente con "id"
+                // `SERIAL`/`INTEGER GENERATED ALWAYS AS IDENTITY` (int4, no
+                // int8) pasa esa validación al conectar. `try_get::<_, i64>`
+                // exige que el OID de la columna sea EXACTAMENTE int8 --
+                // contra un int4/int2 real devolvía error en CADA insert,
+                // pese a que el connect había aceptado la tabla (el mismo
+                // desacuerdo entre capas que GRAMMAR.md §3.9 viene
+                // documentando desde v1.0). `postgres_int_cell` prueba los
+                // tres anchos que esa validación ya reconoce como válidos.
+                postgres_int_cell(&row, 0)?.ok_or_else(|| "\"id\" devuelto por RETURNING es NULL".to_string())
             }
         }
     }
@@ -255,9 +266,27 @@ fn sqlite_cell(row: &rusqlite::Row, i: usize, kind: ColumnKind) -> rusqlite::Res
     })
 }
 
+/// Lee una columna entera de Postgres tolerando los tres anchos que
+/// `validate_existing_id_column` ya acepta para "id" de una tabla preexistente
+/// (`bigint`/int8, `integer`/int4, `smallint`/int2, GRAMMAR.md §3.55) -- pero
+/// se usa para CUALQUIER columna `ColumnKind::Int`, no solo "id": una tabla
+/// adoptada de otro backend puede tener perfectamente un campo `Int` normal
+/// guardado como `INTEGER` en vez de `BIGINT`. `try_get` exige que el OID de
+/// la columna matchee EXACTO al tipo Rust pedido -- de ahí probar los tres en
+/// orden en vez de uno solo.
+fn postgres_int_cell(row: &postgres::Row, i: usize) -> Result<Option<i64>, String> {
+    if let Ok(v) = row.try_get::<_, Option<i64>>(i) {
+        return Ok(v);
+    }
+    if let Ok(v) = row.try_get::<_, Option<i32>>(i) {
+        return Ok(v.map(i64::from));
+    }
+    row.try_get::<_, Option<i16>>(i).map(|v| v.map(i64::from)).map_err(|e| e.to_string())
+}
+
 fn postgres_cell(row: &postgres::Row, i: usize, kind: ColumnKind) -> Result<Cell, String> {
     Ok(match kind {
-        ColumnKind::Int => match row.try_get::<_, Option<i64>>(i).map_err(|e| e.to_string())? {
+        ColumnKind::Int => match postgres_int_cell(row, i)? {
             Some(n) => Cell::Int(n),
             None => Cell::Null,
         },

@@ -275,13 +275,14 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - Tipos `Timestamp` (ISO-8601 UTC) e `Int64` (mismo rango 64-bit sin pérdida de precisión en TS), más builtin `now() -> Timestamp` (GRAMMAR.md §3.30–§3.32).
 - Toolchain integral: `linkc build`, `serve`, `test`, `dev`, `lint`, `doc`, `docker`, `lsp`, `new`, `fmt`.
 
-**Evolución Post-1.0 (v1.1.0 a v1.19.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
+**Evolución Post-1.0 (v1.1.0 a v1.20.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
 - **PostgreSQL en Runtime** (v1.1.0/v1.4.0/v1.8.0, GRAMMAR.md §3.36/§3.40/§3.44): Soporte de base de datos PostgreSQL real (`--db postgres://...`), auto-migraciones de esquema no destructivas, TLS oportunista y obligatorio vía `rustls` puro (compatible con Supabase/Neon/RDS), auto-reconexión transparente tras corte y LISTEN/NOTIFY en hilo dedicado para sincronizar `stream` SSE entre múltiples instancias.
 - **Criptografía y Seguridad** (v1.1.0/v1.3.0/v1.5.0, GRAMMAR.md §3.34/§3.38/§3.41): Argon2id (RFC 9106) con sal aleatoria en formato PHC y verificación en tiempo constante; tokens de sesión y UUIDs alimentados por el CSPRNG del sistema operativo (`getrandom`); cálculo de HMAC-SHA256 para verificación de webhooks; CORS con allowlist configurable (`--cors-origin`) y cabeceras de seguridad estrictas fijas (`nosniff`, `DENY`, `no-referrer`).
 - **Extensibilidad Web y SEO** (v1.1.0/v1.2.0/v1.6.0/v1.9.0/v1.10.0, GRAMMAR.md §3.35/§3.37/§3.42/§3.45/§3.46): Decorador `@content_type("...")` para respuestas no-JSON (HTML, XML, CSV); URLs amigables `@route("/...")` con múltiples parámetros dinámicos y precedencia determinística; sanitización explícita `String.escapeHtml()`; y selección de status HTTP en éxito `response.setStatus(code)` (e.g. páginas 404 personalizadas o 201 Created).
 - **Integraciones y Operaciones** (v1.3.0/v1.7.0/v1.11.0, GRAMMAR.md §3.38/§3.43/§3.47): Lectura de entorno `env.get()`, inspección de cuerpo crudo y cabeceras entrantes `request.rawBody()` / `request.header()`; límite de peticiones `@rate_limit("N/ventana")` con token bucket continuo; envío de correos vía relay `smtp.send(to, subject, body)` con TLS; y peticiones HTTP salientes con cabeceras `http.getWithHeaders` / `http.postWithHeaders`.
 - **Motor de Consultas y Autorización Avanzada** (v1.12.0 a v1.18.0, GRAMMAR.md §3.48–§3.54): Paginación empujada a SQL nativo `db.<c>.page(limit, offset)`; agregación analítica nativa con `GROUP BY` en base de datos (`sumBy`, `countBy`, `avgBy`, `maxBy`, `minBy`) preservando tipos reales; autorización con OR de roles `@requires(Role.Admin | Role.Agent)`; expiración temporal de sesiones `--session-ttl` (o `LINK_SESSION_TTL`); introspección de sesión `auth.currentRole() -> String?`, emisión con identidad `auth.createSessionWithId(role, userId)` y lectura de identificador `auth.currentUserId() -> Int?`; y aleatoriedad numérica/comparación segura para código de usuario `crypto.randomInt(min, max)` / `crypto.timingSafeEqual(a, b)`.
 - **Ergonomía del Lenguaje y Rutas Avanzadas** (v1.19.0, GRAMMAR.md §3.55–§3.57): Conversión explícita `.toString()` sobre `Int`/`Int64`/`Float`/`Bool` (primer método que existe sobre `Bool` en todo el lenguaje); `response.setStatus` ahora se rechaza en COMPILACIÓN dentro de un `stream` (antes era un no-op silencioso que solo se notaba en producción); segmento catch-all `:nombre*` en `@route` para rutas de profundidad variable (documentación, CMS), con precedencia determinística frente a rutas más específicas y detección de conflictos extendida.
+- **Seguridad Configurable y Adopción de Bases Existentes** (v1.20.0, GRAMMAR.md §3.58–§3.59): Costo de `crypto.hashPassword` configurable vía `--argon2-memory-kib`/`--argon2-iterations` (o sus env vars), sin cambiar el comportamiento por default; `crypto.isLegacyHash(hash) -> Bool` para migrar contraseñas viejas de forma proactiva; y una tabla PostgreSQL preexistente con `id SERIAL`/`IDENTITY` de 32 o 16 bits (no solo `BIGSERIAL`) ya no falla en el primer `insert` -- corrige un desacuerdo real entre la validación al conectar (que sí los aceptaba) y la lectura de la columna (que exigía el OID exacto de 64 bits).
 
 **Hitos "go / no-go":**
 - Fin de Fase 0: ✅ Demo E2E probada y verificada.
@@ -325,7 +326,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 ## 8. Hoja de Ruta Futura (Fase 4 · Hacia c-script 2.0)
 
-Con las Fases 0 a 3 completadas y el núcleo v1.19.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
+Con las Fases 0 a 3 completadas y el núcleo v1.20.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
 
 ### 8.1 Ecosistema y Distribución
 1. **Publicación en el registro npm**: Empaquetar y publicar `link-lang` en npm para permitir ejecución vía `npx linkc` o instalación global estándar.
@@ -345,15 +346,12 @@ Con las Fases 0 a 3 completadas y el núcleo v1.19.0 plenamente operativo, las s
 4. **Mejoras en `smtp.send`**: Soporte para envío asíncrono no bloqueante, múltiples destinatarios y cuerpos HTML.
 
 ### 8.4 Autenticación y Seguridad
-1. **Parámetros de Argon2id configurables**: Permitir que un servicio con requisitos de seguridad más altos suba el costo de memoria/iteraciones de `crypto.hashPassword`, hoy fijos al default de la crate `argon2` (GRAMMAR.md §3.34).
-2. **Señal de "hash legado" en `verifyPassword`**: Hoy devuelve solo `Bool`; quien quiera migrar contraseñas de forma proactiva a Argon2id tiene que inspeccionar el prefijo del hash guardado a mano (GRAMMAR.md §3.34).
-3. **Carga opcional del `User` completo en sesión**: `auth.currentRole()`/`currentUserId()` exponen rol e id, pero cargar el struct completo sigue requiriendo `db.users.find(uid)` explícito en cada rpc que lo necesite.
-4. **Auth externo conectable**: Hoy Link solo emite y valida sus propias sesiones opacas (`auth.createSession(WithId)`); no hay forma documentada de confiar en un JWT ya emitido por un backend externo -- bloquea adoptar Link dentro de una app con login preexistente sin correr dos sistemas de sesión en paralelo.
+1. **Carga opcional del `User` completo en sesión**: `auth.currentRole()`/`currentUserId()` exponen rol e id, pero cargar el struct completo sigue requiriendo `db.users.find(uid)` explícito en cada rpc que lo necesite.
+2. **Auth externo conectable**: Hoy Link solo emite y valida sus propias sesiones opacas (`auth.createSession(WithId)`); no hay forma documentada de confiar en un JWT ya emitido por un backend externo -- bloquea adoptar Link dentro de una app con login preexistente sin correr dos sistemas de sesión en paralelo.
 
 ### 8.5 Adopción de Sistemas Existentes
-1. **Aceptar PK autoincremental además de `BIGSERIAL`**: Hoy toda tabla generada o preexistente exige específicamente `BIGSERIAL`; rechaza `INTEGER GENERATED ALWAYS AS IDENTITY` o un `SERIAL` de 32 bits, bloqueando cualquier tabla ya existente con esos tipos.
-2. **Modo "adoptar tabla existente sin auto-migrar"**: Falta una forma de decirle a `linkc` "esta colección ya existe en la base, gestionala pero no la migres" -- hoy la única salida es que la tabla ya calce exactamente el esquema esperado.
-3. **`linkc introspect <db-url>`**: Herramienta de introspección que genere un `.link` de partida a partir de una base de datos ya existente, en vez de escribir cada tabla a mano.
+1. **Modo "adoptar tabla existente sin auto-migrar"**: Falta una forma de decirle a `linkc` "esta colección ya existe en la base, gestionala pero no la migres" -- hoy la única salida es que la tabla ya calce exactamente el esquema esperado.
+2. **`linkc introspect <db-url>`**: Herramienta de introspección que genere un `.link` de partida a partir de una base de datos ya existente, en vez de escribir cada tabla a mano.
 
 ### 8.6 `@route` y Sanitización
 1. **`@route` con query string y body**: Hoy todo parámetro de un `@route` tiene que venir del path -- sin esto, cualquier endpoint que además necesite un filtro por query string duplica el rpc (GRAMMAR.md §3.42).
@@ -362,7 +360,7 @@ Con las Fases 0 a 3 completadas y el núcleo v1.19.0 plenamente operativo, las s
 ### 8.7 Almacenamiento
 1. **Módulo `storage`/S3**: No existe ninguna integración de almacenamiento de archivos hoy -- ni presigned URLs, ni upload directo, nada. Bloquea cualquier caso de uso con archivos adjuntos.
 
-**Origen de 8.4–8.7** (23/08/2026): 15 gaps nuevos, verificados contra el código real (no contra la documentación), a partir de dos fuentes externas -- un reporte de adopción real (app financiera "MyFinance" sobre una base Postgres ya existente) y una auditoría propia de los "límites honestos" que cada sección `§3.X` de GRAMMAR.md ya se admite a sí misma. Quedaron fuera de esta ronda por ser más especializados o de menor demanda general (identificados, no descartados): WebSocket bidireccional, jobs en background/cron, caché a nivel de app, búsqueda full-text, subida de archivos multipart, retry/backoff para `smtp`/`http` salientes, export OpenTelemetry, GraphQL, i18n, y migraciones más allá de agregar columna (rename/retype/drop). Conversión `.toString()`, `response.setStatus` en `stream` y el catch-all de `@route` (originalmente 8.6/8.7.1) se implementaron el 23/08/2026 -- ver v1.19.0 en la lista de arriba y GRAMMAR.md §3.55–§3.57.
+**Origen de 8.4–8.7** (23/08/2026): 15 gaps nuevos, verificados contra el código real (no contra la documentación), a partir de dos fuentes externas -- un reporte de adopción real (app financiera "MyFinance" sobre una base Postgres ya existente) y una auditoría propia de los "límites honestos" que cada sección `§3.X` de GRAMMAR.md ya se admite a sí misma. Quedaron fuera de esta ronda por ser más especializados o de menor demanda general (identificados, no descartados): WebSocket bidireccional, jobs en background/cron, caché a nivel de app, búsqueda full-text, subida de archivos multipart, retry/backoff para `smtp`/`http` salientes, export OpenTelemetry, GraphQL, i18n, y migraciones más allá de agregar columna (rename/retype/drop). Conversión `.toString()`, `response.setStatus` en `stream` y el catch-all de `@route` (originalmente 8.6/8.7.1) se implementaron el 23/08/2026 -- ver v1.19.0 y GRAMMAR.md §3.55–§3.57. Argon2id configurable, señal de hash legado (originalmente 8.4.1/8.4.2) y aceptar PK autoincremental de 32/16 bits (originalmente 8.5.1) se implementaron el mismo día -- ver v1.20.0 y GRAMMAR.md §3.58–§3.59.
 
 ---
 

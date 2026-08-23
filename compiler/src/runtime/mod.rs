@@ -1290,12 +1290,20 @@ fn call_method(
                 // configurable (Argon2id es el que recomienda el RFC 9106 para
                 // contraseñas) es la diferencia entre "hashear" y "resistir a
                 // quien se robó la base".
+                //
+                // Los parámetros de costo (m/t/p) salen de `db.argon2_params()`
+                // -- default de la crate hasta que `--argon2-memory-kib`/
+                // `--argon2-iterations` los suba (GRAMMAR.md §3.55). El hash
+                // PHC resultante los EMBEBE (`$argon2id$v=19$m=...,t=...,p=...$`),
+                // así que `verifyPassword` no necesita saber cuáles eran --
+                // los lee del propio hash guardado.
                 use argon2::password_hash::{PasswordHasher, SaltString};
                 use argon2::Argon2;
                 let salt_bytes = os_random_bytes(16)?;
                 let salt = SaltString::encode_b64(&salt_bytes)
                     .map_err(|e| err(format!("no se pudo generar la sal: {e}")))?;
-                let hash = Argon2::default()
+                let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, db.argon2_params());
+                let hash = argon2
                     .hash_password(pwd.as_bytes(), &salt)
                     .map_err(|e| err(format!("no se pudo hashear la contraseña: {e}")))?;
                 Ok(Value::Str(hash.to_string()))
@@ -1344,6 +1352,18 @@ fn call_method(
                         .verify_password(pwd.as_bytes(), &parsed)
                         .is_ok(),
                 ))
+            }
+            "isLegacyHash" => {
+                let hash = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("crypto.isLegacyHash requiere un argumento String")),
+                };
+                // "Legado" es exactamente lo que `verifyPassword` sigue
+                // aceptando por compatibilidad (`sha256$<sal>$<hex>`, §3.34)
+                // -- cualquier otra cosa que no sea un hash Argon2id de
+                // verdad tampoco cuenta como "legado migrable": es un valor
+                // que ni siquiera `verifyPassword` va a reconocer.
+                Ok(Value::Bool(hash.starts_with("sha256$")))
             }
             "uuid" => {
                 // UUIDv4 de verdad: 122 bits del CSPRNG del sistema. Antes era
@@ -3942,6 +3962,12 @@ mod tests {
             let legado = "sha256$link_salt_2026$" + hex;
             assert(crypto.verifyPassword("clave-vieja", legado), "un hash legado valido verifica");
             assert(crypto.verifyPassword("otra-clave", legado) == false, "y uno que no corresponde, no");
+
+            // 4b. crypto.isLegacyHash(): distingue el formato legado del
+            //     Argon2id real -- la señal que faltaba para migrar
+            //     proactivamente en vez de mirar el prefijo a mano.
+            assert(crypto.isLegacyHash(legado), "sha256$... es legado");
+            assert(crypto.isLegacyHash(a) == false, "un hash Argon2id real no es legado");
 
             // 5. Dos tokens seguidos son distintos. Antes salian de SHA-256 del
             //    reloj: dos llamadas en el mismo nanosegundo devolvian el mismo

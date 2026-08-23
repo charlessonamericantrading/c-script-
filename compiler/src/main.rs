@@ -123,7 +123,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>] [--session-ttl <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d')"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
 }
 
@@ -865,12 +865,20 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
 
+    let argon2_params = match resolve_argon2_params(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    runtime::server::serve(program, port, source, cors, session_ttl);
+    runtime::server::serve(program, port, source, cors, session_ttl, argon2_params);
     ExitCode::SUCCESS
 }
 
@@ -897,6 +905,34 @@ fn resolve_session_ttl(args: &[String]) -> Result<Option<std::time::Duration>, S
         return Ok(None);
     };
     parse_duration(&value).map(Some)
+}
+
+/// Costo de `crypto.hashPassword` (GRAMMAR.md §3.55): `--argon2-memory-kib`/
+/// `LINK_ARGON2_MEMORY_KIB` y `--argon2-iterations`/`LINK_ARGON2_ITERATIONS`,
+/// mismo orden de precedencia que `resolve_session_ttl`. Ninguno de los dos
+/// puesto: el default de la crate (`Params::default()`, ~19 MiB / 2
+/// iteraciones), el comportamiento de siempre. La paralelización (`p_cost`)
+/// queda deliberadamente fuera de esta ronda -- el intérprete es de un solo
+/// hilo, así que no hay ningún hilo extra que se beneficie de subirla.
+fn resolve_argon2_params(args: &[String]) -> Result<argon2::Params, String> {
+    let read = |flag: &str, env: &str| -> Result<Option<u32>, String> {
+        let from_flag = match args.iter().position(|a| a == flag) {
+            Some(i) => match args.get(i + 1) {
+                Some(v) => Some(v.clone()),
+                None => return Err(format!("uso: {flag} <número> (falta el valor)")),
+            },
+            None => None,
+        };
+        let raw = from_flag.or_else(|| std::env::var(env).ok().filter(|v| !v.trim().is_empty()));
+        match raw {
+            Some(v) => v.parse::<u32>().map(Some).map_err(|_| format!("{flag}/{env}: '{v}' no es un entero positivo")),
+            None => Ok(None),
+        }
+    };
+    let memory_kib = read("--argon2-memory-kib", "LINK_ARGON2_MEMORY_KIB")?.unwrap_or(argon2::Params::DEFAULT_M_COST);
+    let iterations = read("--argon2-iterations", "LINK_ARGON2_ITERATIONS")?.unwrap_or(argon2::Params::DEFAULT_T_COST);
+    argon2::Params::new(memory_kib, iterations, argon2::Params::DEFAULT_P_COST, None)
+        .map_err(|e| format!("parámetros de Argon2id inválidos (memoria={memory_kib}KiB, iteraciones={iterations}): {e}"))
 }
 
 /// "Ns"/"Nm"/"Nh"/"Nd" (segundos/minutos/horas/días) -- mismo espíritu que

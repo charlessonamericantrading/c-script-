@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.20.0] - 2026-08-23
+
+### ✨ Nuevo
+- **Costo de Argon2id configurable (`--argon2-memory-kib`/`--argon2-iterations`) y `crypto.isLegacyHash()`.** Dos gaps de PLAN.md §8.4. El costo de `crypto.hashPassword` era fijo al default de la crate; ahora es configurable vía flag de servidor (mismo criterio que `--session-ttl`/`--cors-origin`, no un parámetro nuevo del lenguaje) sin tocar `verifyPassword` -- el formato PHC embebe sus propios parámetros en el hash. Mecanismo: `Db` gana un `RefCell<argon2::Params>` (mismo patrón que `current_request`/`response_status_override`, aditivo puro, sin enhebrar un parámetro nuevo por ~11 firmas). `crypto.isLegacyHash(hash) -> Bool` distingue el formato legado (`sha256$...`) del Argon2id real, para re-hashear proactivamente en el login. Verificado contra un servidor real (`cli_argon2.rs`): sin flags, default de la crate embebido en el hash; con flags, esos valores exactos; un valor no numérico falla ANTES de arrancar.
+
+### 🐛 Arreglado
+- **PostgreSQL: una tabla preexistente con "id" `SERIAL`/`IDENTITY` (32/16 bits) fallaba en el primer insert, pese a que `validate_existing_id_column` ya la aceptaba al conectar.** `insert_returning_id`/`postgres_cell` (`runtime/store.rs`) leían la columna con `try_get::<_, i64>`, que exige el OID exacto `int8` -- un desacuerdo real entre la capa de validación (que acepta `bigint`/`integer`/`smallint` desde que existe) y la capa de lectura (que solo toleraba la primera). El comentario junto al `try_get` afirmaba "esto nunca dispara" apoyándose en una validación que, leída con cuidado, ya aceptaba justo el caso que lo disparaba. `postgres_int_cell` ahora prueba `int8`→`int4`→`int2` en orden, y se generalizó a CUALQUIER columna `Int`, no solo `"id"`. **Sin verificar contra Postgres real en esta sesión** (sin Docker/Postgres disponible en el entorno) -- el test nuevo (`pg_integration.rs`) corre de verdad en CI.
+
+592 tests (4 nuevos: 3 en `cli_argon2.rs`, 1 en `pg_integration.rs` que corre solo en CI). Detalle completo: GRAMMAR.md §3.58–§3.59.
+
 ## [1.19.0] - 2026-08-23
 
 ### ✨ Nuevo

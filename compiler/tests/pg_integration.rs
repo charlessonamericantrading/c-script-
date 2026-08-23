@@ -642,6 +642,61 @@ fn a_preexisting_table_with_a_non_integer_id_fails_at_connect_not_at_first_inser
 }
 
 #[test]
+fn a_preexisting_table_with_a_32_bit_serial_id_accepts_inserts_and_reads() {
+    // GRAMMAR.md §3.58: `validate_existing_id_column` (arriba) ya aceptaba
+    // "integer"/"smallint" además de "bigint" al CONECTAR -- pero
+    // `insert_returning_id`/`postgres_cell` (runtime/store.rs) exigían el OID
+    // EXACTO int8. Una tabla real con "id" `SERIAL` (int4, típico al migrar
+    // desde otro backend que no usaba BIGSERIAL) pasaba la conexión sin
+    // queja y fallaba en el primer insert -- el mismo desacuerdo entre capas
+    // que §3.9 viene documentando desde v1.0, solo que acá ninguna de las
+    // dos capas panickeaba, así que quedó sin test hasta esta ronda. Crea la
+    // tabla A MANO con "id" SERIAL (no BIGSERIAL) y confirma insert + get +
+    // list de punta a punta contra Postgres real.
+    const COLLECTION: &str = "items_serial_id";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!("CREATE TABLE \"{COLLECTION}\" (\"id\" SERIAL PRIMARY KEY, \"name\" TEXT NOT NULL)"))
+        .expect("crear la tabla preexistente con id SERIAL (int4, no BIGSERIAL)");
+
+    let temp = TempDir::new("serial-id");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String }}
+type NewItem = {{ name: String }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{
+  rpc create(name: String) -> Item {{ db.{COLLECTION}.insert(NewItem {{ name: name }}) }}
+  rpc list() -> Item[] {{ db.{COLLECTION}.all() }}
+  rpc get(id: Int) -> Item? {{ db.{COLLECTION}.find(id) }}
+}}
+"#
+        ),
+    );
+
+    let server = Serve::start(&src, &url);
+
+    let created = server.rpc("Items/create", r#"{"name":"primero"}"#);
+    let id = created["id"].as_i64().expect("insert devuelve un id numérico, no un error de decodificación");
+    assert_eq!(created["name"], "primero");
+
+    let fetched = server.rpc("Items/get", &format!(r#"{{"id":{id}}}"#));
+    assert_eq!(fetched["name"], "primero", "leer de vuelta la fila insertada por id");
+
+    let listed = server.rpc("Items/list", "{}");
+    assert_eq!(listed.as_array().map(|a| a.len()), Some(1), "list() también decodifica el id de 32 bits");
+}
+
+#[test]
 fn a_bad_connection_url_fails_with_a_message_instead_of_a_panic() {
     // Este no necesita base: prueba justamente el camino en que no hay ninguna.
     let temp = TempDir::new("badurl");

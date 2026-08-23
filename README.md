@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-588-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.19.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-592-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.20.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,7 +36,7 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-23 by running the compiler, not by reading it.
 
-**Works today**, covered by 588 automated tests:
+**Works today**, covered by 592 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
@@ -56,6 +56,7 @@ this section wins. Verified on 2026-08-23 by running the compiler, not by readin
 - Real password hashing: `crypto.hashPassword` is Argon2id (RFC 9106) with a random per-password salt, in PHC format; `verifyPassword` compares in constant time and still accepts hashes written by the previous version so existing users are not locked out
 - Numeric randomness and constant-time comparison for user code: `crypto.randomInt(min, max)` gives a uniform `Int` in that inclusive range from the OS CSPRNG (rejection-sampled against modulo bias) — enough for a real OTP, unlike `randomToken`'s hex alphabet; `crypto.timingSafeEqual(a, b)` exposes the same constant-time comparison `verifyPassword` already used internally, for comparing a webhook secret or API key without a timing side-channel
 - `.toString()` on `Int`/`Int64`/`Float`/`Bool` — explicit conversion, never automatic (same principle as `toInt64()`); `Bool` didn't have a single method before this. `response.setStatus` inside a `stream` is now a compile error instead of a silent no-op. `@route` supports a trailing catch-all segment (`:name*`) that captures zero or more remaining path segments joined by `/`, for variable-depth routes (docs, a CMS) — always `String`, never `Int`, and always the route's last segment
+- Configurable password-hashing cost: `linkc serve --argon2-memory-kib <N> --argon2-iterations <N>` (or `LINK_ARGON2_MEMORY_KIB`/`LINK_ARGON2_ITERATIONS`) raises `crypto.hashPassword`'s Argon2id cost above the crate default; unset, behavior is unchanged. `crypto.isLegacyHash(hash: String) -> Bool` tells a caller whether a stored hash is the pre-Argon2id legacy format, for proactive rehashing on login instead of eyeballing the prefix. A PostgreSQL table with a preexisting 32- or 16-bit autoincrement id (`SERIAL`/`IDENTITY`, not just `BIGSERIAL`) no longer fails on its first insert — connecting already accepted it, reading the id column now does too
 - Generated TypeScript contract, typed client, runtime validators, React hooks, Zod schemas, OpenAPI 3.1
 
 **Does not work yet** — do not plan around these:

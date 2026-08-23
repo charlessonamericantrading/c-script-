@@ -79,6 +79,8 @@
   - [3.55 `.toString()` sobre `Int`/`Int64`/`Float`/`Bool` — RESUELTO](#355-tostring-sobre-intint64floatbool--resuelto)
   - [3.56 `response.setStatus` dentro de un `stream` — RESUELTO (ahora error de compilación)](#356-responsesetstatus-dentro-de-un-stream--resuelto-ahora-error-de-compilación)
   - [3.57 `@route` con segmento catch-all (`:nombre*`) — RESUELTO](#357-route-con-segmento-catch-all-nombre--resuelto)
+  - [3.58 `crypto`: costo de Argon2id configurable y señal de hash legado — RESUELTO](#358-crypto-costo-de-argon2id-configurable-y-señal-de-hash-legado--resuelto)
+  - [3.59 PostgreSQL: acepta PK autoincremental de 32/16 bits, no solo `BIGSERIAL` — RESUELTO](#359-postgresql-acepta-pk-autoincremental-de-3216-bits-no-solo-bigserial--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3058,6 +3060,52 @@ service Docs {
 **Cambio de tipo interno:** `RoutePattern::matches` pasó de devolver `Vec<&str>` (segmentos prestados) a `Vec<String>` -- un catch-all captura VARIOS segmentos originales unidos por algo que no estaba en el string de entrada, así que un `&str` prestado ya no alcanza para representar el resultado. Costo real: una asignación por parámetro capturado en cada request con `@route`, en un intérprete de un solo hilo -- no es el camino caliente que este proyecto optimiza.
 
 **Verificado:** 9 tests unitarios en `route.rs` (parseo, rechazo fuera de posición, matching de 0/1/muchos segmentos, conflicto entre dos catch-all, no-conflicto con prefijo literal distinto) más 2 tests end-to-end en `cli_route.rs` contra un servidor real (captura multi-segmento y precedencia del literal sobre el catch-all que también matchea).
+
+---
+
+### 3.58 `crypto`: costo de Argon2id configurable y señal de hash legado — RESUELTO
+
+Dos gaps de PLAN.md §8.4, cerrados en la misma ronda -- ambos documentados como límite honesto desde la auditoría original de `crypto` (§3.34):
+
+**1. Costo de Argon2id configurable.** Antes de esta ronda, `crypto.hashPassword` siempre corría con el default de la crate (`m=19456` KiB, `t=2`) sin ninguna forma de subirlo. Como el costo es una decisión de POSTURA DE SEGURIDAD del despliegue -- no algo que varíe llamada por llamada dentro de un mismo programa -- se resolvió como flag de servidor, mismo criterio que `--session-ttl`/`--cors-origin`, no como parámetro nuevo de `hashPassword`:
+
+```
+linkc serve app.link 8787 --argon2-memory-kib 65536 --argon2-iterations 3
+```
+
+(o `LINK_ARGON2_MEMORY_KIB`/`LINK_ARGON2_ITERATIONS`). Sin ninguno de los dos, el comportamiento es idéntico al de siempre.
+
+**Mecanismo:** `Db` gana un `RefCell<argon2::Params>` -- mismo criterio que `current_request`/`response_status_override` (§3.38/§3.46): vive en `Db` en vez de enhebrarse como parámetro nuevo por las ~11 firmas que ya cargan `db`/`sessions`/`current_token` a través de todo el árbol de evaluación (`eval_expr`, `call_method`, ...), porque `db: &Db` ya está disponible en cualquier punto de ese árbol. `server.rs` lo fija UNA sola vez al arrancar, antes de aceptar la primera request; `crypto.hashPassword` lo lee en cada llamada. `verifyPassword` NO lo necesita -- el formato PHC (`$argon2id$v=19$m=...,t=...,p=...$`) embebe sus propios parámetros en el hash guardado, así que verificar sigue funcionando sin importar con qué costo se hasheó.
+
+**2. `crypto.isLegacyHash(hash: String) -> Bool`.** `verifyPassword` sigue aceptando el formato legado (`sha256$<sal>$<hex>`) por compatibilidad, pero no había forma de preguntarle a un hash guardado si es de ese formato sin mirar el prefijo a mano. Ahora, el patrón de re-hasheo proactivo es directo:
+
+<!-- linkc:fragment -->
+```rust
+rpc login(email: String, password: String) -> String {
+  let user = db.users.findWhere(|u: User| { u.email == email })[0];
+  if (!crypto.verifyPassword(password, user.passwordHash)) {
+    panic("credenciales inválidas");
+  }
+  if (crypto.isLegacyHash(user.passwordHash)) {
+    // ... db.users.update(user.id, Patch { passwordHash: crypto.hashPassword(password) }) ...
+  }
+  auth.createSessionWithId(user.role, user.id)
+}
+```
+
+**Verificado:** el costo configurable, contra un servidor real (`cli_argon2.rs`) -- sin flags el hash embebe el default de la crate (`m=19456,t=2`), con `--argon2-memory-kib 8192 --argon2-iterations 3` el hash embebe exactamente esos valores, y un valor no numérico falla ANTES de arrancar (nunca llega a escuchar el puerto). `isLegacyHash` se agregó al mismo test de propiedades de `crypto` que ya fija el resto de esta familia (`runtime/mod.rs`): distingue un hash legado real de un Argon2id real.
+
+---
+
+### 3.59 PostgreSQL: acepta PK autoincremental de 32/16 bits, no solo `BIGSERIAL` — RESUELTO
+
+Bug real encontrado auditando PLAN.md §8.5 (reporte de adopción de una app financiera sobre una base Postgres ya existente): `validate_existing_id_column` (`runtime/db.rs`, agregada para el caso de `id UUID`) ya aceptaba `bigint`, `integer` Y `smallint` como tipos válidos de "id" para una tabla preexistente -- pero `insert_returning_id`/`postgres_cell` (`runtime/store.rs`) leían esa columna con `try_get::<_, i64>`, que exige que el OID de la columna sea EXACTAMENTE `int8`. Una tabla real con `id SERIAL` (`int4`, típico al migrar desde un backend que no usaba `BIGSERIAL`) pasaba la conexión sin ninguna queja -- y fallaba en el primer `insert`, con un error de tipo que ninguna de las dos capas documentaba de este lado. El comentario que quedó al lado de ese `try_get` incluso afirmaba "esto nunca dispara" apoyándose en una validación que, leída con cuidado, ya aceptaba justamente el caso que lo disparaba -- el mismo patrón de "dos capas que discrepan" que este documento viene registrando desde §3.9.
+
+**La corrección** generaliza `postgres_cell` (no solo el camino de `insert_returning_id`, que fue donde se encontró el bug) con un helper que prueba `int8` → `int4` → `int2` en orden, aceptando cualquiera de los tres anchos que `validate_existing_id_column` ya reconocía como válidos -- y que además importa para CUALQUIER columna `Int` de una tabla adoptada, no solo `"id"`: un campo `Int` normal guardado como `INTEGER` en vez de `BIGINT` tenía exactamente el mismo problema.
+
+**Límite que sigue en pie:** las tablas que `linkc` GENERA siguen usando `BIGSERIAL` siempre (`postgres_emit.rs`) -- esto es solo sobre LEER una tabla que ya existía con otro ancho, nunca sobre crear una nueva con un ancho distinto.
+
+**Verificado:** un nuevo test en `pg_integration.rs` (`a_preexisting_table_with_a_32_bit_serial_id_accepts_inserts_and_reads`) crea una tabla a mano con `id SERIAL PRIMARY KEY` y confirma `insert`/`get`/`list` de punta a punta contra un Postgres real. **Sin verificar en esta sesión**: no había Postgres disponible en el entorno de desarrollo (ni Docker para levantar uno) -- el test corre de verdad recién en CI, que sí tiene la base levantada (`.github/workflows/ci.yml`, job `postgres`). El razonamiento sobre `try_get`/OIDs está confirmado por lectura cuidadosa del código y la documentación de `postgres`/`tokio-postgres`, no por ejecución real todavía.
 
 ---
 

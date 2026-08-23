@@ -294,6 +294,17 @@ pub struct Db {
     /// su propio eco (el cambio ya se publicó local, en `publish`, antes de
     /// mandar el NOTIFY). Con SQLite es un string que nunca se usa.
     instance_id: String,
+    /// Costo de `crypto.hashPassword` (GRAMMAR.md §3.55, ronda "Argon2id
+    /// configurable"): default de la crate hasta que `server.rs` lo
+    /// sobreescribe UNA vez al arrancar, según `--argon2-memory-kib`/
+    /// `--argon2-iterations` (o sus env vars). Vive acá -- no como un
+    /// parámetro nuevo enhebrado por `call_method`/`eval_expr`/... -- mismo
+    /// motivo que `current_request`/`response_status_override`: `db: &Db`
+    /// ya está disponible en cualquier punto del árbol de evaluación.
+    /// `verifyPassword` NO lo necesita: el formato PHC embebe sus propios
+    /// `m`/`t`/`p` en el hash guardado, así que verificar un hash viejo con
+    /// otros parámetros sigue funcionando sin tocar esto.
+    argon2_params: RefCell<argon2::Params>,
 }
 
 /// Un cambio anunciado por OTRA instancia de `linkc serve` contra la misma
@@ -513,6 +524,7 @@ impl Db {
             current_request: RefCell::new(None),
             response_status_override: std::cell::Cell::new(None),
             instance_id: random_instance_id(),
+            argon2_params: RefCell::new(argon2::Params::default()),
         }
     }
 
@@ -601,9 +613,28 @@ impl Db {
                 current_request: RefCell::new(None),
                 response_status_override: std::cell::Cell::new(None),
                 instance_id,
+                argon2_params: RefCell::new(argon2::Params::default()),
             },
             remote_rx,
         ))
+    }
+
+    /// Fija el costo de `crypto.hashPassword` para lo que quede de vida del
+    /// proceso (GRAMMAR.md §3.55) -- `server.rs` lo llama UNA sola vez, antes
+    /// de aceptar la primera request, con lo que haya resuelto de
+    /// `--argon2-memory-kib`/`--argon2-iterations` (o sus env vars). Nunca se
+    /// vuelve a llamar durante la vida del servidor.
+    pub(crate) fn set_argon2_params(&self, params: argon2::Params) {
+        *self.argon2_params.borrow_mut() = params;
+    }
+
+    /// Los parámetros de costo configurados -- los lee `crypto.hashPassword`
+    /// en `runtime/mod.rs` en cada llamada. `argon2::Params` no es `Copy`
+    /// (guarda un `Option<Vec<u8>>` para el "secret" opcional que este
+    /// proyecto no usa), así que clona en vez de prestar: el costo es
+    /// insignificante comparado con el propio hasheo (~15ms, §3.34).
+    pub(crate) fn argon2_params(&self) -> argon2::Params {
+        self.argon2_params.borrow().clone()
     }
 
     /// Fixture SOLO para tests y para el demo wasm (`bin/wasm_demo.rs`) --

@@ -2765,6 +2765,13 @@ impl Checker {
                 self.check_expr(hash, &Type::String, env)?;
                 Some(Type::Bool)
             }
+            (Type::Crypto, "isLegacyHash") => {
+                let [hash] = args else {
+                    return Err(err("'crypto.isLegacyHash' toma exactamente 1 argumento (hash: String)"));
+                };
+                self.check_expr(hash, &Type::String, env)?;
+                Some(Type::Bool)
+            }
             (Type::Crypto, "uuid") => {
                 self.expect_no_args(args, "uuid")?;
                 Some(Type::String)

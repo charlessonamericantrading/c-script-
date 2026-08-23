@@ -130,7 +130,14 @@ impl CorsConfig {
     }
 }
 
-pub fn serve(program: Program, port: u16, source: DbSource, cors: CorsConfig, session_ttl: Option<Duration>) {
+pub fn serve(
+    program: Program,
+    port: u16,
+    source: DbSource,
+    cors: CorsConfig,
+    session_ttl: Option<Duration>,
+    argon2_params: argon2::Params,
+) {
     let server = tiny_http::Server::http(("0.0.0.0", port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
@@ -163,6 +170,10 @@ pub fn serve(program: Program, port: u16, source: DbSource, cors: CorsConfig, se
             }
         },
     };
+    // GRAMMAR.md §3.55: costo de `crypto.hashPassword` para lo que quede de
+    // vida del proceso -- default de la crate si no se pasó ningún flag/env
+    // var (ver `resolve_argon2_params` en `main.rs`).
+    db.set_argon2_params(argon2_params);
     // Auth v0 (GRAMMAR.md §3.14): vive mientras el proceso corre, igual que
     // `db` -- sin persistencia entre reinicios. Sin expiración por default;
     // `--session-ttl`/`LINK_SESSION_TTL` (GRAMMAR.md §3.50) la agrega.
