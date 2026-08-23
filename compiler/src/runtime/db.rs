@@ -1101,8 +1101,8 @@ db { users: User[] }
             .find(|c| c.field.name == key_field)
             .ok_or_else(|| RuntimeError::new(format!("'{method}': '{key_field}' no es una columna real de '{collection}'")))?;
 
-        let (value_expr, value_kind) = if method == "countBy" {
-            ("COUNT(*)".to_string(), ColumnKind::Int)
+        let (value_expr, value_kind, value_field_ty) = if method == "countBy" {
+            ("COUNT(*)".to_string(), ColumnKind::Int, Type::Int)
         } else {
             let value_field = closure_field_name(args.get(1), "de valor")?;
             let value_col = columns
@@ -1139,20 +1139,19 @@ db { users: User[] }
                 ColumnKind::Float => "DOUBLE PRECISION",
                 other => panic!("select_grouped: un selector de valor numérico no debería resolver a {other:?}"),
             };
-            (format!("CAST({sql_fn}(\"{value_field}\") AS {cast_as})"), kind)
+            // AVG siempre da Float, sin importar el tipo de la columna de
+            // origen (mismo motivo que el CAST de arriba); SUM/MAX/MIN
+            // preservan el tipo LÓGICO real de la columna -- Int64, no solo
+            // Int, desde la ronda de GRAMMAR.md §3.65 (antes esto asumía
+            // Int siempre, así que un `sumBy` sobre una columna Int64
+            // devolvía un `Value::Int` mal etiquetado en vez de
+            // `Value::Int64`).
+            let result_ty = if method == "avgBy" { Type::Float } else { value_col.field.ty.clone() };
+            (format!("CAST({sql_fn}(\"{value_field}\") AS {cast_as})"), kind, result_ty)
         };
 
         let key_ty = key_col.field.ty.clone();
-        // El valor (SUM/COUNT/AVG/MAX/MIN) nunca es un enum -- el checker
-        // exige Int/Float para el selector de valor, y count/avg producen
-        // Int/Float por construcción -- así que alcanza con derivar el
-        // `Type` directo del `ColumnKind` calculado arriba, sin necesitar
-        // el `FieldType` real de ninguna columna.
-        let value_ty = match value_kind {
-            ColumnKind::Int => Type::Int,
-            ColumnKind::Float => Type::Float,
-            other => panic!("select_grouped: una agregación no debería producir un value de tipo {other:?}"),
-        };
+        let value_ty = value_field_ty;
         let sql =
             format!("SELECT \"{key_field}\" AS \"key\", {value_expr} AS \"value\" FROM \"{collection}\" GROUP BY \"{key_field}\"");
         let kinds = vec![key_col.kind(), value_kind];
@@ -1309,6 +1308,12 @@ fn scalar_cell_to_value(ty: &Type, cell: &Cell) -> Value {
         (Type::Enum(name), Cell::Text(variant)) => {
             Value::Variant { enum_name: name.clone(), variant: variant.clone(), fields: Vec::new() }
         }
+        // ANTES de la rama genérica de abajo: `Int` e `Int64` comparten
+        // `ColumnKind::Int` (mismo `BIGINT`/`INTEGER PRIMARY KEY` de
+        // storage, GRAMMAR.md §3.65) así que la única forma de saber cuál
+        // de los dos `Value` armar es mirando el `Type` declarado, no la
+        // `Cell` -- que es idéntica para los dos.
+        (Type::Int64, Cell::Int(n)) => Value::Int64(*n),
         (_, Cell::Int(n)) => Value::Int(*n),
         (_, Cell::Float(f)) => Value::Float(*f),
         (_, Cell::Text(t)) => Value::Str(t.clone()),

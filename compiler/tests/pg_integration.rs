@@ -455,6 +455,61 @@ fn aggregate_by_pushes_group_by_to_real_sql_against_postgres() {
     assert_eq!(count_by_key.get("Enterprise"), Some(&2), "{count_by_key:?}");
 }
 
+const INT64_AGGREGATE_PROGRAM: &str = r#"
+type Sale = { id: Int, region: Int64, amount: Int64 }
+type RegionTotal = { key: Int64, value: Int64 }
+
+db { COLLECTION: Sale[], }
+
+service Sales {
+  rpc create(region: Int64, amount: Int64) -> Sale {
+    db.COLLECTION.insert(Sale { id: 0, region: region, amount: amount })
+  }
+
+  rpc totalByRegion() -> RegionTotal[] {
+    db.COLLECTION.sumBy(|s: Sale| { s.region }, |s: Sale| { s.amount })
+  }
+}
+"#;
+
+#[test]
+fn aggregation_by_int64_key_and_value_pushes_group_by_to_real_sql_against_postgres() {
+    // GRAMMAR.md §3.65: antes de esta ronda, Int64 estaba rechazado como key
+    // Y como value en sumBy/etc. -- este test es el lado Postgres del que ya
+    // existe contra SQLite (runtime/mod.rs). Importa especialmente contra
+    // Postgres porque Int64 viaja como STRING en el JSON (§3.30, para no
+    // perder precisión arriba de 2^53) -- si `scalar_cell_to_value` hubiera
+    // seguido etiquetando el resultado como `Value::Int`, esto habría
+    // serializado como número, no como string, y roto cualquier cliente que
+    // esperara la forma documentada.
+    const COLLECTION: &str = "sales_int64_aggregate";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("int64-aggregate");
+    let src = temp.write("app.link", &INT64_AGGREGATE_PROGRAM.replace("COLLECTION", COLLECTION));
+    let server = Serve::start(&src, &url);
+
+    server.rpc("Sales/create", r#"{"region":"1","amount":"500"}"#);
+    server.rpc("Sales/create", r#"{"region":"1","amount":"700"}"#);
+    server.rpc("Sales/create", r#"{"region":"2","amount":"300"}"#);
+
+    let totals = server.rpc("Sales/totalByRegion", "{}");
+    let rows = totals.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "una fila por region distinta: {rows:?}");
+    for row in rows {
+        assert!(row["key"].is_string(), "Int64 viaja como string en el JSON: {row:?}");
+        assert!(row["value"].is_string(), "el VALUE agregado también, si de verdad es Int64: {row:?}");
+    }
+    let by_key: std::collections::HashMap<String, i64> =
+        rows.iter().map(|r| (r["key"].as_str().unwrap().to_string(), r["value"].as_str().unwrap().parse().unwrap())).collect();
+    assert_eq!(by_key.get("1"), Some(&1200), "{by_key:?}");
+    assert_eq!(by_key.get("2"), Some(&300), "{by_key:?}");
+}
+
 #[test]
 fn rows_survive_a_restart_and_are_readable_from_plain_sql() {
     const COLLECTION: &str = "leads_persist";

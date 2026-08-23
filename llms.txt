@@ -104,9 +104,11 @@ difference between code that compiles and code that does not.
     a bare field access — with the closure braces (rule 2 still applies: no `-> Type`).
     `|o: Order| { o.amount + 1 }` or any other derived expression, method call, or nested
     access is rejected at compile time: it can't be pushed to SQL. Group-by is restricted to
-    `String`/`Int`/`Bool`/`enum` fields (no `Float`, no date truncation yet); the aggregated
-    field for `sumBy`/`avgBy`/`maxBy`/`minBy` must be `Int` or `Float`. Neither selector may
-    point at an optional field (`f?: T` or `f: T?`).
+    `String`/`Int`/`Int64`/`Bool`/`enum` fields (no `Float`, no date truncation yet — see
+    GRAMMAR.md §3.65); the aggregated field for `sumBy`/`avgBy`/`maxBy`/`minBy` must be
+    `Int`/`Int64`/`Float` — an `Int64` result stays `Int64` (string on the wire, §3.30), never
+    silently narrowed to `Int`. Neither selector may point at an optional field (`f?: T` or
+    `f: T?`).
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `page(limit: Int, offset: Int) -> T[]` (LIMIT/OFFSET pushed to real SQL, not `all().take(n)`

@@ -3942,6 +3942,46 @@ mod tests {
     }
 
     #[test]
+    fn aggregation_supports_int64_as_group_key_and_as_aggregated_value() {
+        // GRAMMAR.md §3.65: antes de esta ronda, Int64 estaba EXPLÍCITAMENTE
+        // rechazado como key y como value en sumBy/etc. -- y si hubiera
+        // colado, `scalar_cell_to_value` tampoco distinguía Int64 de Int,
+        // así que el valor real hubiera llegado mal etiquetado (Value::Int
+        // en vez de Value::Int64). Este test fija las dos cosas: que
+        // compila Y que el tipo del resultado es Int64 de verdad, no un Int
+        // que solo "parece" andar porque el valor cabe en los dos.
+        let code = r#"
+        type Sale = { id: Int, region: Int64, amount: Int64 }
+        type RegionTotal = { key: Int64, value: Int64 }
+        db { sales: Sale[] }
+
+        service Sales {
+            rpc create(region: Int64, amount: Int64) -> Sale {
+                db.sales.insert(Sale { id: 0, region: region, amount: amount })
+            }
+        }
+
+        test "Int64 como key y como value en sumBy" {
+            Sales.create(1.toInt64(), 500.toInt64());
+            Sales.create(1.toInt64(), 700.toInt64());
+            Sales.create(2.toInt64(), 300.toInt64());
+
+            let byRegion = db.sales.sumBy(|s: Sale| { s.region }, |s: Sale| { s.amount });
+            assert(byRegion.length() == 2, "una fila por region distinta");
+
+            let total = db.sales.sumBy(|s: Sale| { s.region }, |s: Sale| { s.amount })
+                .filter(|row: RegionTotal| { row.key == 1.toInt64() })[0]
+                .value;
+            assert(total == 1200.toInt64(), "500+700 para la region 1, como Int64 real");
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests");
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.passed, 1, "{:?}", summary.failed);
+    }
+
+    #[test]
     fn math_and_crypto_and_string_methods_work_in_runtime() {
         let code = r#"
         test "stdlib builtins math, crypto and strings" {

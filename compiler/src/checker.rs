@@ -3321,17 +3321,17 @@ impl Checker {
         }
 
         let (key_field, key_ty) = self.field_selector(element_ty, &args[0], method, "de agrupación")?;
-        if !matches!(key_ty, Type::String | Type::Int | Type::Bool | Type::Enum(_)) {
+        if !matches!(key_ty, Type::String | Type::Int | Type::Int64 | Type::Bool | Type::Enum(_)) {
             return Err(err(format!(
-                "'{method}': el campo de agrupación '{key_field}' es {key_ty} -- solo se puede agrupar por String, Int, Bool o un enum (fechas/horas necesitan truncar antes, que todavía no está soportado; Float e Int64 tampoco, GRAMMAR.md §3.52)"
+                "'{method}': el campo de agrupación '{key_field}' es {key_ty} -- solo se puede agrupar por String, Int, Int64, Bool o un enum (fechas/horas necesitan truncar antes, que todavía no está soportado; Float tampoco, GRAMMAR.md §3.52/§3.65)"
             )));
         }
 
         let value_ty = if needs_value {
             let (value_field, field_ty) = self.field_selector(element_ty, &args[1], method, "de valor")?;
-            if !matches!(field_ty, Type::Int | Type::Float) {
+            if !matches!(field_ty, Type::Int | Type::Int64 | Type::Float) {
                 return Err(err(format!(
-                    "'{method}': el campo de valor '{value_field}' es {field_ty} -- tiene que ser Int o Float (Int64 todavía no está soportado, GRAMMAR.md §3.52)"
+                    "'{method}': el campo de valor '{value_field}' es {field_ty} -- tiene que ser Int, Int64 o Float (GRAMMAR.md §3.65)"
                 )));
             }
             Some(field_ty)
@@ -5517,7 +5517,23 @@ type T = { id: Int, s: Status }")
             }
         "#;
         let msg = format!("{:?}", check_source(src).unwrap_err());
-        assert!(msg.contains("tiene que ser Int o Float"), "{msg}");
+        assert!(msg.contains("tiene que ser Int, Int64 o Float"), "{msg}");
+    }
+
+    #[test]
+    fn aggregate_by_accepts_int64_as_group_key_and_as_value_field() {
+        // GRAMMAR.md §3.65: antes de esta ronda, Int64 se rechazaba en las
+        // dos posiciones -- ahora tipa en las dos, con el resultado
+        // preservando Int64 (no degradado a Int).
+        let src = r#"
+            type Sale = { id: Int, region: Int64, amount: Int64 }
+            type RegionTotal = { key: Int64, value: Int64 }
+            db { sales: Sale[] }
+            service S {
+                rpc totals() -> RegionTotal[] { db.sales.sumBy(|s: Sale| { s.region }, |s: Sale| { s.amount }) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 
     #[test]

@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.26.0] - 2026-08-24
+
+### ✨ Nuevo
+- **Agregación (`sumBy`/etc.): soporte de `Int64` como campo de agrupación y de valor.** Hasta esta ronda, `Int64` estaba rechazado en las dos posiciones -- un programa con IDs/montos declarados `Int64` no podía agregarlos en absoluto.
+
+### 🐛 Arreglado
+- **`scalar_cell_to_value` nunca distinguía `Int64` de `Int`.** `Int`/`Int64` comparten `ColumnKind::Int` (mismo `BIGINT` de storage) -- la función solo miraba la `Cell`, nunca el `Type` declarado, así que un resultado agregado `Int64` habría llegado etiquetado `Value::Int` y por lo tanto serializado como NÚMERO en el JSON, rompiendo la promesa de §3.30 (`Int64` siempre viaja como string, para no perder precisión arriba de 2^53). No era un bug ejercitable antes de esta ronda (el checker ya rechazaba `Int64` ahí), pero sí lo hubiera sido en cuanto se abriera la puerta -- corregido junto con la feature, no después.
+
+Truncado de fechas para agregación sigue pendiente como ronda propia (PLAN.md §8.2.1) -- los dos backends divergen de verdad para truncar un `Timestamp` (milisegundos en `BIGINT`) a un día/mes/año real.
+
+Verificado con un test de runtime contra SQLite que confirma el resultado es `Int64` de verdad (no solo que el número coincide), el mismo caso contra un PostgreSQL real confirmando que viaja como string en el JSON, y un test de compilación. 624 tests (3 nuevos). Detalle completo: GRAMMAR.md §3.65.
+
 ## [1.25.0] - 2026-08-24
 
 ### ✨ Nuevo

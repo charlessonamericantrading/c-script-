@@ -275,7 +275,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - Tipos `Timestamp` (ISO-8601 UTC) e `Int64` (mismo rango 64-bit sin pérdida de precisión en TS), más builtin `now() -> Timestamp` (GRAMMAR.md §3.30–§3.32).
 - Toolchain integral: `linkc build`, `serve`, `test`, `dev`, `lint`, `doc`, `docker`, `lsp`, `new`, `fmt`.
 
-**Evolución Post-1.0 (v1.1.0 a v1.25.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
+**Evolución Post-1.0 (v1.1.0 a v1.26.0) — Capacidades Enterprise y Cierre de Gaps Reales:**
 - **PostgreSQL en Runtime** (v1.1.0/v1.4.0/v1.8.0, GRAMMAR.md §3.36/§3.40/§3.44): Soporte de base de datos PostgreSQL real (`--db postgres://...`), auto-migraciones de esquema no destructivas, TLS oportunista y obligatorio vía `rustls` puro (compatible con Supabase/Neon/RDS), auto-reconexión transparente tras corte y LISTEN/NOTIFY en hilo dedicado para sincronizar `stream` SSE entre múltiples instancias.
 - **Criptografía y Seguridad** (v1.1.0/v1.3.0/v1.5.0, GRAMMAR.md §3.34/§3.38/§3.41): Argon2id (RFC 9106) con sal aleatoria en formato PHC y verificación en tiempo constante; tokens de sesión y UUIDs alimentados por el CSPRNG del sistema operativo (`getrandom`); cálculo de HMAC-SHA256 para verificación de webhooks; CORS con allowlist configurable (`--cors-origin`) y cabeceras de seguridad estrictas fijas (`nosniff`, `DENY`, `no-referrer`).
 - **Extensibilidad Web y SEO** (v1.1.0/v1.2.0/v1.6.0/v1.9.0/v1.10.0, GRAMMAR.md §3.35/§3.37/§3.42/§3.45/§3.46): Decorador `@content_type("...")` para respuestas no-JSON (HTML, XML, CSV); URLs amigables `@route("/...")` con múltiples parámetros dinámicos y precedencia determinística; sanitización explícita `String.escapeHtml()`; y selección de status HTTP en éxito `response.setStatus(code)` (e.g. páginas 404 personalizadas o 201 Created).
@@ -288,6 +288,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 - **`@route` con Query String** (v1.23.0, GRAMMAR.md §3.62): cualquier parámetro del rpc que no esté en el path se lee de la query string por nombre (`String`/`Int` obligatorio, `String?`/`Int?` opcional). De paso, corrigió un bug real: la query string se coleaba entera dentro del último segmento de path capturado (ej. `/blog/slug?utm_source=x` corrompía `:slug`) -- ahora se separa antes de partir en segmentos, para toda ruta, tenga o no parámetros de query declarados.
 - **`smtp` a Varios Destinatarios y HTML** (v1.24.0, GRAMMAR.md §3.63): `smtp.sendToMany(to, subject, body)` manda un mensaje con un `RCPT TO` por destinatario; `smtp.sendHtml(to, subject, html)` manda cuerpo HTML. `send` queda sin cambios. Envío asíncrono sigue pendiente (§8.3.3).
 - **Auth Externo (JWT HS256)** (v1.25.0, GRAMMAR.md §3.64): `linkc serve --jwt-secret <secreto>` verifica un JWT ya emitido por un backend existente, junto con -- nunca en vez de -- las sesiones propias. `@requires`/`@authenticated`/`auth.currentRole()`/`currentUserId()` funcionan igual sin importar cuál de los dos autenticó. Solo HS256 (allowlist, no blocklist -- `"alg":"none"` y cualquier otro se rechazan); sin RS256/JWKS, eso queda para una ronda propia si hace falta un proveedor de identidad completo.
+- **Agregación: soporte de `Int64`** (v1.26.0, GRAMMAR.md §3.65): `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` aceptan `Int64` como campo de agrupación Y de valor -- de paso corrigió un bug real (`scalar_cell_to_value` nunca distinguía `Int64` de `Int` a nivel de storage, así que un resultado `Int64` habría llegado mal etiquetado y serializado como número en vez de string). Truncado de fechas sigue pendiente, ronda propia (§8.2.1) -- los dos backends divergen de verdad para truncar.
 
 **Hitos "go / no-go":**
 - Fin de Fase 0: ✅ Demo E2E probada y verificada.
@@ -331,17 +332,16 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 
 ## 8. Hoja de Ruta Futura (Fase 4 · Hacia c-script 2.0)
 
-Con las Fases 0 a 3 completadas y el núcleo v1.25.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
+Con las Fases 0 a 3 completadas y el núcleo v1.26.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
 
 ### 8.1 Ecosistema y Distribución
 1. **Publicación en el registro npm**: Empaquetar y publicar `link-lang` en npm para permitir ejecución vía `npx linkc` o instalación global estándar.
 2. **Ampliación del Playground Web**: Soporte para resolución de múltiples archivos y ejecución simulada de tests en el navegador mediante `wasm32-unknown-unknown`.
 
 ### 8.2 Base de Datos y Consultas Avanzadas
-1. **Agregación con truncamiento temporal**: Soporte para agrupar por fechas truncadas (`date_trunc` para cohortes diarias/mensuales) en `sumBy`/`countBy`/etc.
-2. **Soporte de `Int64` en agregaciones**: Permitir campos `Int64` en las cláusulas de agrupación y suma/promedio.
-3. **Filtrado con pushdown a SQL (`db.<c>.filter(predicate)`)**: Un predicado estructural -- mismo criterio de "nombre por forma" que ya usa `sumBy`/etc. -- que se traduzca a una cláusula `WHERE` real, en vez de obligar a traer la tabla entera con `.all()` y filtrar en memoria.
-4. **Transacciones sobre múltiples escrituras `db.<c>`**: Hoy cada escritura es su propio commit implícito; falta una forma de agrupar varias escrituras relacionadas en una sola transacción con rollback ante error.
+1. **Agregación con truncamiento temporal**: Soporte para agrupar por fechas truncadas (`date_trunc` para cohortes diarias/mensuales) en `sumBy`/`countBy`/etc. -- deliberadamente separado del soporte de `Int64` (ya resuelto, GRAMMAR.md §3.65): los dos backends divergen de verdad para truncar una fecha (Postgres necesita `to_timestamp`/`EXTRACT(EPOCH ...)` antes de `DATE_TRUNC`; SQLite trunca con `strftime` y devuelve texto, no milisegundos), así que necesita su propia ronda con tests dedicados en los dos motores.
+2. **Filtrado con pushdown a SQL (`db.<c>.filter(predicate)`)**: Un predicado estructural -- mismo criterio de "nombre por forma" que ya usa `sumBy`/etc. -- que se traduzca a una cláusula `WHERE` real, en vez de obligar a traer la tabla entera con `.all()` y filtrar en memoria.
+3. **Transacciones sobre múltiples escrituras `db.<c>`**: Hoy cada escritura es su propio commit implícito; falta una forma de agrupar varias escrituras relacionadas en una sola transacción con rollback ante error.
 
 ### 8.3 Runtime y Comunicaciones
 1. **Limpieza proactiva de sesiones**: Implementar recolección periódica en segundo plano para sesiones expiradas bajo `--session-ttl`.

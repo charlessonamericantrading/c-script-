@@ -86,6 +86,7 @@
   - [3.62 `@route` con parámetros de query string — RESUELTO](#362-route-con-parámetros-de-query-string--resuelto)
   - [3.63 `smtp.sendToMany()`/`smtp.sendHtml()`: varios destinatarios y cuerpo HTML — RESUELTO](#363-smtpsendtomanysmtpsendhtml-varios-destinatarios-y-cuerpo-html--resuelto)
   - [3.64 Auth externo: confiar en un JWT ya emitido — RESUELTO, alcance acotado (HS256)](#364-auth-externo-confiar-en-un-jwt-ya-emitido--resuelto-alcance-acotado-hs256)
+  - [3.65 Agregación (`sumBy`/etc.): soporte de `Int64` — RESUELTO (fecha truncada sigue pendiente)](#365-agregación-sumbyetc-soporte-de-int64--resuelto-fecha-truncada-sigue-pendiente)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3267,6 +3268,28 @@ linkc serve app.link 8787 --jwt-secret "$JWT_SIGNING_SECRET"
 - **Verificación no cacheada.** Cada llamada a `role_for`/`user_id_for` recalcula el HMAC del JWT -- una request que llama a las dos (típico: `check_auth_gate` + `auth.currentUserId()` dentro del cuerpo) lo verifica dos veces. Barato (un HMAC-SHA256), pero real.
 
 **Verificado:** 11 tests unitarios en `session.rs` (JWT válido resuelve rol/id; `sub` como string de dígitos parsea a `Int`; nombres de claim configurables; firma con secreto equivocado rechazada; `alg:"none"` rechazado incluso con firma técnicamente válida; `alg:"RS256"` rechazado; JWT vencido rechazado; JWT sin `exp` nunca vence; entradas basura no paniquean; sin `--jwt-secret` un token con forma de JWT es simplemente desconocido; una sesión propia tiene precedencia) más 6 tests end-to-end contra un servidor real (`server_http.rs`): rol correcto satisface `@requires`, rol incorrecto da 403, cualquier rol satisface `@authenticated`, `auth.currentRole()`/`currentUserId()` leen los claims del JWT, firma inválida da 401, y sin `--jwt-secret` configurado un JWT sigue sin autenticar nada.
+
+---
+
+### 3.65 Agregación (`sumBy`/etc.): soporte de `Int64` — RESUELTO (fecha truncada sigue pendiente)
+
+Hasta esta ronda, `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (§3.52) rechazaban `Int64` tanto como campo de agrupación como campo de valor -- un programa con IDs o montos declarados `Int64` (el tipo correcto para cualquier valor que pueda superar 2^53, GRAMMAR.md §3.30) no podía usar agregación real sobre ellos en absoluto.
+
+<!-- linkc:fragment -->
+```rust
+type Sale = { id: Int, region: Int64, amount: Int64 }
+type RegionTotal = { key: Int64, value: Int64 }
+
+rpc totalByRegion() -> RegionTotal[] {
+  db.sales.sumBy(|s: Sale| { s.region }, |s: Sale| { s.amount })
+}
+```
+
+**Un bug real encontrado auditando el gap, no solo la ausencia de la feature:** `scalar_cell_to_value` (`runtime/db.rs`, la función que reconstruye un `Value` a partir de una fila de SQL) nunca distinguía `Int64` de `Int` -- ambos comparten `ColumnKind::Int` (mismo `BIGINT` de storage), así que la única forma de saber cuál armar es mirar el `Type` declarado, no la celda SQL, que es idéntica para los dos. Si `Int64` hubiera colado como key o value ANTES de esta ronda (no colaba, el checker ya lo rechazaba), el resultado habría llegado etiquetado `Value::Int` -- y por lo tanto serializado como NÚMERO en el JSON, rompiendo la promesa de §3.30 de que `Int64` siempre viaja como STRING para no perder precisión. La ronda cierra las dos cosas juntas: el checker ahora acepta `Int64`, y el runtime lo etiqueta bien.
+
+**Límite que sigue en pie: sin truncado de fechas.** Agrupar por un `Timestamp` sigue sin aceptarse -- un `Timestamp` se guarda como milisegundos exactos (`BIGINT`, §3.31), así que agruparlo tal cual produciría un grupo por fila, nunca cohortes reales. Lo que hace falta es un método de truncado (`.truncateToMonth()`, por ejemplo) reconocido en la MISMA posición de selector, empujado a `DATE_TRUNC`/`strftime` según el backend -- una ronda aparte a propósito: los dos backends divergen de verdad acá (Postgres necesita convertir el `BIGINT` a un `timestamp` nativo con `to_timestamp`/`EXTRACT(EPOCH ...)` antes de truncar; SQLite trunca con `strftime` y devuelve texto, no milisegundos), y ese tipo de divergencia entre backends es exactamente la clase de bug que este proyecto viene encontrando y documentando desde §3.9 -- mejor una ronda propia con tests dedicados en los dos motores que apurarla acá.
+
+**Verificado:** un test de runtime contra SQLite (`runtime/mod.rs`) que agrupa y suma por un campo `Int64`, confirmando que el resultado es `Int64` de verdad (no solo que el valor numérico coincide) comparándolo contra `1200.toInt64()`; el mismo caso contra un PostgreSQL real (`pg_integration.rs`), donde además confirma que `key` y `value` viajan como STRING en el JSON, no como número -- la parte que un bug de etiquetado hubiera roto en silencio; y un test de compilación que confirma que el tipo del resultado tipa como `Int64`, no `Int`.
 
 ---
 
