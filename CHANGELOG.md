@@ -3,6 +3,19 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.67.0] - 2026-08-24
+
+### 🐛 Arreglado
+- **`Float` decodifica `numeric`/`decimal` nativo de Postgres.** Tercer reporte de MyFinance, verificando en su propio esquema real el fix de fechas de v1.55.0: "todos los importes monetarios del schema real son `numeric`, nunca `float` -- Float no los decodifica". `numeric` es un formato binario de precisión arbitraria que `postgres-types` no sabe leer como `f64` -- decodificado a mano (mismo espíritu que el fix de fechas, sin sumar `rust_decimal`). Solo lectura por ahora. GRAMMAR.md §3.103.
+- **Escritura de `Int` contra una columna Postgres no-`BIGINT` (`SERIAL`/`SMALLINT`).** Encontrado auditando por qué CI llevaba varios pushes en rojo -- ver la nota de proceso abajo. `i64::to_sql` (crate `postgres-types`) ignora el ancho real de columna y siempre manda 8 bytes; contra una columna `int4`/`int2` (típico al adoptar una tabla `SERIAL`) eso corrompe el protocolo binario. `Cell::to_sql` ahora despacha por el `ty` real que pide el servidor. GRAMMAR.md §3.104.
+
+### 📝 Nota de proceso (importante)
+Auditando por qué `gh run list` mostraba **~10 pushes consecutivos en rojo** (desde v1.58.0), aparecieron dos causas separadas, ninguna relacionada con features nuevas de esta sesión:
+1. **`examples/users.link.snap` sin regenerar desde v1.48.0** -- el snapshot embebe el número de versión exacto, así que cada bump posterior lo dejaba desincronizado. Regenerado (`linkc test ... --update`).
+2. **`pg_integration.rs` nunca corrió contra un Postgres real localmente esta sesión** (no había uno disponible en el entorno) -- varios "Verificado" en GRAMMAR.md se apoyaban en lectura de código, no en ejecución real. Al conseguir acceso a un Postgres local se encontraron y arreglaron: el bug de escritura de arriba (real, de producto) y **4 bugs de TESTS** (no del compilador) que tampoco habían corrido nunca: un test de `Timestamp` con nombres de campo en camelCase contra columnas físicas en snake_case; un test de `@check` comparando `postgres::Error::Display` (que siempre es el literal `"db error"`, nunca el detalle real) en vez de `.as_db_error()`; un test de aviso de colisión con un campo requerido que quedaba `NULL` tras la migración de la segunda tabla, disparando un guard correcto pero ajeno a lo que ese test probaba; y un test de `linkc introspect` que reusaba el `db {...}` de la base ENTERA (introspect no filtra por tabla) en vez de acotarse a la tabla bajo prueba, sensible a qué otras tablas hubiera creado algún otro test corriendo en paralelo.
+
+"Tests verdes localmente" y "CI verde" no son la misma promesa -- solo la segunda lo es de verdad. 911 tests, todos verificados contra Postgres real en esta ronda, no solo por lectura de código.
+
 ## [1.66.0] - 2026-08-24
 
 ### ✨ Nuevo

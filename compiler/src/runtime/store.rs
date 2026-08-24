@@ -334,6 +334,60 @@ impl<'a> postgres::types::FromSql<'a> for PgDateDays {
     }
 }
 
+/// Decodifica el binario CRUDO que Postgres manda para `numeric` -- GRAMMAR.md
+/// §3.103. A diferencia de `float4`/`float8` (IEEE754 de ancho fijo, que
+/// `postgres-types` ya sabe leer como `f64`), `numeric` es un formato de
+/// PRECISIÓN ARBITRARIA propio del protocolo: `int16 ndigits`, `int16
+/// weight`, `int16 sign` (`0x0000` positivo, `0x4000` negativo, `0xC000`
+/// `NaN`), `int16 dscale` (escala de display, no hace falta para el valor),
+/// y `ndigits` dígitos de BASE 10000 (no base 10), cada uno un `int16`. El
+/// valor es `signo * Σ dígito[i] * 10000^(weight - i)`. Mismo espíritu que
+/// `PgTimestampMicros`/`PgDateDays` arriba: un formato chico y documentado
+/// por el propio protocolo no amerita sumar una dependencia nueva
+/// (`rust_decimal` u otra) solo para esto -- y como el destino declarado en
+/// c-script es `Float` (`f64`), no un tipo decimal propio, decodificar
+/// directo a `f64` no pierde nada que `Float` ya no perdiera de por sí.
+struct PgNumeric(f64);
+
+impl<'a> postgres::types::FromSql<'a> for PgNumeric {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 8 {
+            return Err(format!("'{ty}': numeric truncado, se esperaban al menos 8 bytes de cabecera, llegaron {}", raw.len()).into());
+        }
+        let ndigits = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+        let weight = i16::from_be_bytes([raw[2], raw[3]]) as i32;
+        let sign = u16::from_be_bytes([raw[4], raw[5]]);
+        // `dscale` (raw[6..8]) es la escala de DISPLAY (cuántos decimales
+        // mostraría Postgres) -- no afecta el valor numérico en sí, así que
+        // no hace falta leerla para convertir a `f64`.
+        let expected_len = 8 + ndigits * 2;
+        if raw.len() < expected_len {
+            return Err(format!("'{ty}': numeric truncado, se esperaban {expected_len} bytes, llegaron {}", raw.len()).into());
+        }
+        if sign != 0x0000 && sign != 0x4000 {
+            // `0xC000` (NaN) y `0xD000`/`0xF000` (Infinity/-Infinity, Postgres
+            // 14+) no tienen un `Float` real que los represente sin perder la
+            // distinción "no es un número" -- se rechaza en vez de adivinar
+            // (ej. devolver 0.0 en silencio).
+            return Err(format!("'{ty}': numeric con signo 0x{sign:04x} (NaN/Infinity) no se puede representar como Float").into());
+        }
+        let mut value = 0f64;
+        for i in 0..ndigits {
+            let offset = 8 + i * 2;
+            let digit = i16::from_be_bytes([raw[offset], raw[offset + 1]]) as f64;
+            value += digit * 10f64.powi((weight - i as i32) * 4);
+        }
+        if sign == 0x4000 {
+            value = -value;
+        }
+        Ok(PgNumeric(value))
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        matches!(*ty, postgres::types::Type::NUMERIC)
+    }
+}
+
 /// Una columna `Timestamp` (GRAMMAR.md §3.31/§3.91) contra Postgres puede
 /// ser físicamente UNA de dos cosas MUY distintas -- se prueban en orden,
 /// mismo criterio que `postgres_int_cell` con los tres anchos de entero:
@@ -364,6 +418,24 @@ fn postgres_timestamp_cell(row: &postgres::Row, i: usize) -> Result<Option<i64>,
         .map_err(|e| e.to_string())
 }
 
+/// Una columna `Float` (GRAMMAR.md §3.103) contra Postgres puede ser
+/// físicamente `float4`/`float8` (la convención propia de c-script, lo que
+/// `linkc build` crea) O `numeric` NATIVO (una tabla ya existente, adoptada
+/// -- el caso normal para cualquier columna de DINERO, donde `numeric` es
+/// el tipo correcto y `float8` NO, por el error de redondeo binario que
+/// justamente evita). Mismo criterio de "probar en orden" que
+/// `postgres_int_cell`/`postgres_timestamp_cell`: `try_get` exige que el
+/// OID matchee EXACTO, así que antes de esta ronda una columna `numeric`
+/// declarada `Float` fallaba al leer la primera fila real -- "'{ty}' no
+/// implementa FromSql para numeric", con `String` fallando igual por el
+/// motivo opuesto (el wire binario de `numeric` tampoco es texto UTF-8).
+fn postgres_float_cell(row: &postgres::Row, i: usize) -> Result<Option<f64>, String> {
+    if let Ok(v) = row.try_get::<_, Option<f64>>(i) {
+        return Ok(v);
+    }
+    row.try_get::<_, Option<PgNumeric>>(i).map(|v| v.map(|PgNumeric(f)| f)).map_err(|e| e.to_string())
+}
+
 fn postgres_cell(row: &postgres::Row, i: usize, kind: ColumnKind) -> Result<Cell, String> {
     Ok(match kind {
         ColumnKind::Int => match postgres_int_cell(row, i)? {
@@ -374,7 +446,7 @@ fn postgres_cell(row: &postgres::Row, i: usize, kind: ColumnKind) -> Result<Cell
             Some(n) => Cell::Int(n),
             None => Cell::Null,
         },
-        ColumnKind::Float => match row.try_get::<_, Option<f64>>(i).map_err(|e| e.to_string())? {
+        ColumnKind::Float => match postgres_float_cell(row, i)? {
             Some(f) => Cell::Float(f),
             None => Cell::Null,
         },
@@ -419,7 +491,31 @@ impl postgres::types::ToSql for Cell {
     ) -> Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
         match self {
             Cell::Null => Ok(postgres::types::IsNull::Yes),
-            Cell::Int(n) => n.to_sql(ty, out),
+            // GRAMMAR.md §3.104: `i64::to_sql` (la impl de `postgres-types`
+            // para el tipo Rust `i64`, vía su macro `simple_to!`) IGNORA el
+            // `ty` que se le pasa -- siempre serializa 8 bytes de `int8`, sin
+            // importar qué ancho pidió el servidor. Contra una tabla
+            // PREEXISTENTE con "id" `SERIAL`/`SMALLINT` (int4/int2, §3.59) el
+            // servidor infiere `$1` como ESE ancho en `WHERE "id" = $1` --
+            // mandar 8 bytes ahí corrompe el protocolo binario ("db error"
+            // genérico, sin detalle útil). El lado de LECTURA
+            // (`postgres_int_cell`, arriba) ya prueba los tres anchos; acá,
+            // en escritura, el ancho lo dice el propio `ty` que el servidor
+            // manda -- no hace falta probar, alcanza con despachar por él.
+            // Un valor que no entra en el ancho pedido (im probable para
+            // "id", posible para otro campo `Int` normal) es un error claro
+            // en vez de un truncado silencioso.
+            Cell::Int(n) => match *ty {
+                postgres::types::Type::INT2 => {
+                    let n16: i16 = (*n).try_into().map_err(|_| format!("{n} no entra en un entero de 16 bits (columna '{ty}')"))?;
+                    n16.to_sql(ty, out)
+                }
+                postgres::types::Type::INT4 => {
+                    let n32: i32 = (*n).try_into().map_err(|_| format!("{n} no entra en un entero de 32 bits (columna '{ty}')"))?;
+                    n32.to_sql(ty, out)
+                }
+                _ => n.to_sql(ty, out),
+            },
             Cell::Float(f) => f.to_sql(ty, out),
             Cell::Text(s) => s.to_sql(ty, out),
             Cell::Bool(b) => b.to_sql(ty, out),

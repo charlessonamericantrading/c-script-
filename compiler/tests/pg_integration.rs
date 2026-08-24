@@ -1264,9 +1264,26 @@ fn introspect_generates_a_link_file_that_actually_works_against_the_real_table()
     // Verificación fuerte: el .link generado no solo "parece" correcto --
     // compila Y conecta de verdad contra la MISMA tabla, leyendo el dato ya
     // sembrado antes de que `linkc` supiera que esta tabla existía.
-    let mut full_program = generated;
-    full_program
-        .push_str(&format!("\nservice Check {{\n  rpc list() -> LegacyCustomers[] {{ db.{COLLECTION}.all() }}\n}}\n"));
+    //
+    // `linkc introspect <url>` (sin filtro de tabla) escanea la base
+    // ENTERA, no solo `{COLLECTION}` -- corriendo en paralelo con otros
+    // tests de este archivo que crean SUS PROPIAS tablas en la misma base
+    // (`cargo test` no serializa por default, CI tampoco fija
+    // `--test-threads=1`), `generated` puede traer de arrastre otras
+    // colecciones ajenas en su `db {{ ... }}` -- si alguna de esas tablas
+    // no es apta para c-script (ej. un "id" `uuid`, GRAMMAR.md §3.59), el
+    // `Serve::start` de ESTE test fallaría por una tabla que no tiene nada
+    // que ver con lo que se está probando acá. Se extrae SOLO el bloque
+    // `type LegacyCustomers = {{ ... }}` del output real de introspect (la
+    // parte que de verdad se quiere verificar) y se arma un programa
+    // mínimo propio alrededor, en vez de reusar el `db {{ ... }}` de
+    // introspect tal cual.
+    let type_start = generated.find("type LegacyCustomers").expect("el tipo generado tiene que estar en el output");
+    let type_end = generated[type_start..].find('}').map(|i| type_start + i + 1).expect("el tipo generado tiene que cerrar con '}'");
+    let legacy_customers_type = &generated[type_start..type_end];
+    let full_program = format!(
+        "{legacy_customers_type}\ndb {{ {COLLECTION}: LegacyCustomers[] }}\nservice Check {{\n  rpc list() -> LegacyCustomers[] {{ db.{COLLECTION}.all() }}\n}}\n"
+    );
     let temp = TempDir::new("introspect-roundtrip");
     let src = temp.write("app.link", &full_program);
     let server = Serve::start(&src, &url);
@@ -1425,7 +1442,7 @@ fn a_timestamp_field_decodes_a_native_postgres_date_and_timestamptz_column() {
         "app.link",
         &format!(
             r#"
-type Factura = {{ id: Int, fechaEmision: Timestamp, createdAt: Timestamp, updatedAt: Timestamp }}
+type Factura = {{ id: Int, fecha_emision: Timestamp, created_at: Timestamp, updated_at: Timestamp }}
 db {{ {COLLECTION}: Factura[] }}
 service Facturas {{ rpc list() -> Factura[] {{ db.{COLLECTION}.all() }} }}
 "#
@@ -1436,9 +1453,74 @@ service Facturas {{ rpc list() -> Factura[] {{ db.{COLLECTION}.all() }} }}
     let listed = server.rpc("Facturas/list", "{}");
     let rows = listed.as_array().expect("se esperaba una lista");
     assert_eq!(rows.len(), 1, "body: {listed:?}");
-    assert_eq!(rows[0]["fechaEmision"], "2026-08-24T00:00:00.000Z", "date nativo: {rows:?}");
-    assert_eq!(rows[0]["createdAt"], "2026-08-24T14:30:00.000Z", "timestamptz nativo: {rows:?}");
-    assert_eq!(rows[0]["updatedAt"], "2026-08-24T14:30:00.000Z", "timestamp (sin tz) nativo: {rows:?}");
+    assert_eq!(rows[0]["fecha_emision"], "2026-08-24T00:00:00.000Z", "date nativo: {rows:?}");
+    assert_eq!(rows[0]["created_at"], "2026-08-24T14:30:00.000Z", "timestamptz nativo: {rows:?}");
+    assert_eq!(rows[0]["updated_at"], "2026-08-24T14:30:00.000Z", "timestamp (sin tz) nativo: {rows:?}");
+}
+
+// GRAMMAR.md §3.103: un campo `Float` decodifica correctamente contra una
+// columna `numeric`/`decimal` NATIVA de Postgres, no solo contra
+// `float4`/`float8` -- segundo bug real encontrado por MyFinance verificando
+// EN SU PROPIO ESQUEMA el fix de fechas de §3.91: "Float no decodifica
+// columnas numeric de Postgres -- error deserializing column 1". Cierto:
+// `numeric` es un formato binario de precisión arbitraria, TOTALMENTE
+// distinto de IEEE754 (`postgres-types` no implementa `FromSql<f64>` para
+// él) -- y es justo el tipo que casi cualquier columna de DINERO real usa
+// (nunca `float8`, por el error de redondeo binario que `numeric` evita).
+#[test]
+fn a_float_field_decodes_a_native_postgres_numeric_column() {
+    const COLLECTION: &str = "facturas_numeric_nativo";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"subtotal\" numeric(12,2) NOT NULL, \
+                \"descuento\" numeric(12,2) NOT NULL, \
+                \"total\" numeric NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla legacy a mano, con columnas numeric NATIVAS de Postgres");
+    // Sembrada con SQL crudo -- exactamente como llegan los datos reales de
+    // un sistema de facturación/contabilidad ya en producción. Incluye un
+    // valor negativo (descuento) y un entero exacto (total), no solo el caso
+    // fácil de un positivo con decimales.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO \"{COLLECTION}\" (subtotal, descuento, total) VALUES \
+                 (1234.56, -78.90, 1000)"
+            ),
+            &[],
+        )
+        .expect("sembrar una fila con SQL crudo, columnas numeric nativas");
+
+    let temp = TempDir::new("native-numeric");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Factura = {{ id: Int, subtotal: Float, descuento: Float, total: Float }}
+db {{ {COLLECTION}: Factura[] }}
+service Facturas {{ rpc list() -> Factura[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+    let listed = server.rpc("Facturas/list", "{}");
+    let rows = listed.as_array().expect("se esperaba una lista");
+    assert_eq!(rows.len(), 1, "body: {listed:?}");
+    assert_eq!(rows[0]["subtotal"], serde_json::json!(1234.56), "numeric positivo con decimales: {rows:?}");
+    assert_eq!(rows[0]["descuento"], serde_json::json!(-78.9), "numeric NEGATIVO: {rows:?}");
+    assert_eq!(rows[0]["total"], serde_json::json!(1000.0), "numeric entero exacto, sin escala declarada: {rows:?}");
 }
 
 #[test]
@@ -1716,11 +1798,16 @@ service Items {{ rpc create(orderTotal: Float) -> Item {{ db.{COLLECTION}.insert
     // "b.link" declara la MISMA colección, pero sin NINGÚN nombre de
     // columna en común con "a.link" -- exactamente el shape de una
     // colisión de nombre accidental entre dos programas no relacionados.
+    // `sessionId` opcional (`String?`) a propósito: la fila que "a.link" ya
+    // insertó no tiene esa columna, así que la migración no destructiva la
+    // agrega NULL -- si el campo fuera requerido, `all()` fallaría con el
+    // guard de "fila con NULL en un campo requerido" (§9.1.1), un chequeo
+    // real y deliberado, pero DISTINTO de lo que este test verifica.
     let link_b = temp.write(
         "b.link",
         &format!(
             r#"
-type Item = {{ id: Int, sessionId: String }}
+type Item = {{ id: Int, sessionId: String? }}
 db {{ {COLLECTION}: Item[] }}
 service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
 "#
@@ -1817,7 +1904,16 @@ service Reviews {{ rpc add(rating: Int) -> Review {{ db.{COLLECTION}.insert(Revi
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
     let raw_insert = client.execute(&format!("INSERT INTO \"{COLLECTION}\" (rating) VALUES (99)"), &[]);
     let err = raw_insert.expect_err("un INSERT crudo que viola @check debe rechazarse a nivel de Postgres, sin pasar por Rust");
-    assert!(format!("{err}").to_lowercase().contains("check"), "{err}");
+    // `postgres::Error`'s `Display` (`"{err}"`) SIEMPRE es el literal fijo
+    // "db error" para cualquier error que vino del servidor (`Kind::Db` en
+    // tokio-postgres, ver su propio `impl Display`) -- NUNCA incluye el
+    // mensaje real, en ningún locale. El detalle real vive en
+    // `.as_db_error()`. "check" aparece en el mensaje real sin importar el
+    // idioma del servidor (queda como término técnico incluso en un
+    // Postgres con `lc_messages` en español: "...viola la restricción
+    // «check» «..._check»").
+    let detail = err.as_db_error().map(|db| db.message().to_lowercase()).unwrap_or_default();
+    assert!(detail.contains("check"), "detalle real del error: {detail:?} (err: {err})");
 }
 
 /// GRAMMAR.md §3.97: `linkc migrate --dry-run` sobre una colección cuya
