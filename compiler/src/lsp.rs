@@ -783,6 +783,7 @@ fn get_hover_for_word(word: &str, source: &str, full_program: Option<&Program>) 
         "authenticated" => Some("Annotation `@authenticated`\n\nRequires a valid authenticated session."),
         "requires" => Some("Annotation `@requires(Role)`\n\nRequires a session with the specified Role."),
         "deprecated" => Some("Annotation `@deprecated(\"reason\")`\n\nMarks an rpc/stream or a struct field as deprecated. Propagated as a JSDoc `@deprecated` comment in the generated `.d.ts`, and as `deprecated: true` in the generated OpenAPI document. Purely informational -- does not change runtime behavior."),
+        "cache_control" => Some("Annotation `@cache_control(\"public, max-age=3600\")`\n\nSets a real `Cache-Control` header on the success response of an rpc -- raw HTTP value, not validated beyond non-empty. Rejected on a `stream` (an SSE connection is never cached)."),
         _ => None,
     };
 

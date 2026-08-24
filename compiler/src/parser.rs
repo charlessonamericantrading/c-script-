@@ -646,9 +646,15 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::Deprecated(value)
                 }
+                "cache_control" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let value = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::CacheControl(value)
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")' o '@deprecated(\"motivo\")')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")' o '@cache_control(\"public, max-age=N\")')"
                     )))
                 }
             };

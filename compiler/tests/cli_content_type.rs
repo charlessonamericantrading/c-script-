@@ -248,6 +248,85 @@ impl Serve {
         reader.read_exact(&mut buf).ok();
         (status, location)
     }
+
+    /// Como `get`, pero devuelve el header `Cache-Control` en vez del body --
+    /// para el caso combinado con `@route` (`@cache_control` sobre un rpc
+    /// que también se sirve por GET, GRAMMAR.md §3.113).
+    fn get_cache_control(&self, path: &str) -> Option<String> {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("conectar");
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+            self.port
+        );
+        stream.write_all(request.as_bytes()).expect("escribir request");
+        stream.flush().ok();
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("línea de estado");
+
+        let mut cache_control = None;
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("header");
+            if n == 0 || line.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.trim().split_once(':') {
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "cache-control" => cache_control = Some(v.trim().to_string()),
+                    "content-length" => content_length = v.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf).ok();
+        cache_control
+    }
+
+    /// Como `post_redirect`, pero devuelve el header `Cache-Control` --
+    /// para `@cache_control("...")` (GRAMMAR.md §3.113).
+    fn post_cache_control(&self, path: &str, body: &str) -> (u16, Option<String>) {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("conectar");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.port,
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).expect("escribir request");
+        stream.flush().ok();
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("línea de estado");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("estado HTTP inesperado: {status_line:?}"));
+
+        let mut cache_control = None;
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("header");
+            if n == 0 || line.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.trim().split_once(':') {
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "cache-control" => cache_control = Some(v.trim().to_string()),
+                    "content-length" => content_length = v.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf).ok();
+        (status, cache_control)
+    }
 }
 
 impl Drop for Serve {
@@ -562,4 +641,72 @@ service Web {
     let (status, location) = server.post_redirect("/Web/permanent", "{}");
     assert_eq!(status, 301);
     assert_eq!(location.as_deref(), Some("https://example.com/nuevo"));
+}
+
+#[test]
+fn cache_control_annotation_sets_the_real_header_only_on_success() {
+    // GRAMMAR.md §3.113: `@cache_control("...")` tiene que aparecer como
+    // header HTTP real (no solo un valor que el checker haya aceptado), y
+    // TIENE que faltar en una respuesta de error -- una falla nunca debe
+    // quedar cacheada con la política pensada para el camino de éxito.
+    let temp = TempDir::new("cache-control");
+    let out = build(
+        &temp,
+        r#"
+service Web {
+  @cache_control("public, max-age=3600")
+  rpc cached() -> String { "ok" }
+
+  @cache_control("public, max-age=60")
+  rpc alwaysFails() -> Void { panic("siempre falla") }
+
+  rpc uncached() -> String { "ok" }
+}
+"#,
+    );
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&temp.0.join("app.link"));
+
+    let (status, cache_control) = server.post_cache_control("/Web/cached", "{}");
+    assert_eq!(status, 200);
+    assert_eq!(cache_control.as_deref(), Some("public, max-age=3600"));
+
+    // Sin la anotación: sin header, como siempre.
+    let (status, cache_control) = server.post_cache_control("/Web/uncached", "{}");
+    assert_eq!(status, 200);
+    assert_eq!(cache_control, None);
+
+    // CON la anotación, pero el rpc falla: el header NO debe aparecer.
+    let (status, cache_control) = server.post_cache_control("/Web/alwaysFails", "{}");
+    assert_eq!(status, 500);
+    assert_eq!(cache_control, None, "una respuesta de error no debe llevar el Cache-Control del camino de éxito");
+}
+
+#[test]
+fn cache_control_combines_with_route_and_content_type_for_a_real_sitemap() {
+    // El caso real que motiva esto: un sitemap.xml servido con `@route` +
+    // `@content_type`, más `@cache_control` para que un CDN/crawler no lo
+    // vuelva a pedir en cada visita -- las tres anotaciones combinadas,
+    // GET real (no `/Servicio/rpc`).
+    let temp = TempDir::new("cache-control-route");
+    let out = build(
+        &temp,
+        r#"
+service Site {
+  @route("/sitemap.xml")
+  @content_type("application/xml")
+  @cache_control("public, max-age=86400")
+  rpc sitemap() -> String { "<urlset></urlset>" }
+}
+"#,
+    );
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&temp.0.join("app.link"));
+    let (status, content_type, body) = server.get("/sitemap.xml");
+    assert_eq!(status, 200);
+    assert_eq!(content_type, "application/xml");
+    assert_eq!(body, "<urlset></urlset>");
+    assert_eq!(server.get_cache_control("/sitemap.xml").as_deref(), Some("public, max-age=86400"));
 }

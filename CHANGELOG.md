@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.76.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`@cache_control("...")` por rpc.** Segundo ítem resuelto de PLAN.md §9.9 (SEO y descubribilidad para IA). Header `Cache-Control` declarativo -- dimensión ortogonal, se combina con `@route`/`@content_type`/auth/`@rate_limit` sin restricción. Solo en el camino de éxito (una respuesta de error nunca hereda la política de caché del éxito, mismo criterio que `@content_type`/`response.redirect`). Rechazado sobre un `stream` -- error de compilación, una conexión SSE nunca es cacheable de forma sensata. Mecanismo estático (`Annotation::CacheControl`, resuelto del AST vía `server.rs::declared_cache_control`), mismo patrón que `ContentType`/`RateLimit`/`Deprecated`.
+
+953 tests (6 nuevos): 4 de tipos en `checker.rs` (combina con `@route`, vacío/duplicado rechazados, rechazado dentro de un `stream`) + 2 end-to-end en `cli_content_type.rs` contra un `linkc serve` real -- el header presente en éxito, ausente en un error forzado del mismo rpc, y el caso combinado real (`@route`+`@content_type`+`@cache_control` sobre un sitemap) con los tres headers correctos a la vez. Detalle completo: GRAMMAR.md §3.113.
+
 ## [1.75.0] - 2026-08-25
 
 ### 📝 Documentado (existía sin documentar ni probar)

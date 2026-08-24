@@ -535,7 +535,7 @@ fn handle_request(
         return;
     }
 
-    let (status, response_body, response_type, response_location) =
+    let (status, response_body, response_type, response_location, response_cache_control) =
         handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, args_json);
     // `response_body` en una falla es `{"error": "<mensaje>"}`
     // (`error_json`, más abajo) -- se extrae el mensaje solo para el
@@ -552,7 +552,14 @@ fn handle_request(
     } else {
         String::new()
     };
-    let _ = request.respond(cors_response_with_type(status, response_body, &response_type, &cors_headers, response_location.as_deref()));
+    let _ = request.respond(cors_response_with_type(
+        status,
+        response_body,
+        &response_type,
+        &cors_headers,
+        response_location.as_deref(),
+        response_cache_control.as_deref(),
+    ));
     log_done(req_id, Some(&method), status, start, &extra);
     // Defensa en profundidad, no carga estructural: el `set_request_context`
     // de arriba ya garantiza que la PRÓXIMA request nunca ve el contexto de
@@ -895,7 +902,7 @@ fn check_auth_gate(
         Annotation::Requires { .. } => Err((403, "no tenés permiso para esta operación")),
         // `required_auth` solo devuelve anotaciones de auth: si estas
         // llegaran a matchear, el bug está allá arriba, no acá.
-        Annotation::ContentType(_) | Annotation::Route(_) | Annotation::RateLimit(_) | Annotation::Deprecated(_) => Ok(()),
+        Annotation::ContentType(_) | Annotation::Route(_) | Annotation::RateLimit(_) | Annotation::Deprecated(_) | Annotation::CacheControl(_) => Ok(()),
     }
 }
 
@@ -918,6 +925,24 @@ fn declared_content_type(program: &Program, service_name: &str, rpc_name: &str) 
     })
 }
 
+/// Como `declared_content_type`, para `@cache_control("...")` (GRAMMAR.md
+/// §3.113) -- estático (viene del AST, no de un override por request como
+/// `response.redirect`), así que se resuelve UNA vez por request igual que
+/// el Content-Type declarado.
+fn declared_cache_control(program: &Program, service_name: &str, rpc_name: &str) -> Option<String> {
+    program.items.iter().find_map(|item| match item {
+        crate::ast::Item::Service(s) if s.name == service_name => {
+            s.members.iter().find_map(|m| match m {
+                crate::ast::Member::Rpc(r) if r.name == rpc_name => {
+                    r.cache_control().map(str::to_string)
+                }
+                _ => None,
+            })
+        }
+        _ => None,
+    })
+}
+
 /// `args_json` ya viene resuelto por `resolve_route` -- del body si la
 /// request usó la dirección `/Service/rpc` de siempre, o de un segmento de
 /// URL si usó una `@route` (GRAMMAR.md §3.37). Esta función no sabe ni le
@@ -930,7 +955,7 @@ fn handle_rpc(
     service_name: &str,
     rpc_name: &str,
     args_json: serde_json::Value,
-) -> (u16, String, String, Option<String>) {
+) -> (u16, String, String, Option<String>, Option<String>) {
     match invoke_rpc_with_sessions(program, service_name, rpc_name, &args_json, db, sessions, token) {
         Ok(result) => {
             // `response.setStatus(code)` (GRAMMAR.md §3.46) / `response.
@@ -941,15 +966,16 @@ fn handle_rpc(
             // que `clear_request_context` lo limpie al final de la request).
             let status = db.take_response_status().unwrap_or(200);
             let location = db.take_response_location();
+            let cache_control = declared_cache_control(program, service_name, rpc_name);
             match declared_content_type(program, service_name, rpc_name) {
                 // El checker ya garantizó que un rpc con `@content_type` devuelve
                 // `String`, así que `as_str()` acá siempre acierta; el fallback
                 // existe para no inventar un panic si esa invariante se rompiera.
                 Some(ct) => {
                     let text = result.as_str().map(str::to_string).unwrap_or_else(|| result.to_string());
-                    (status, text, ct, location)
+                    (status, text, ct, location, cache_control)
                 }
-                None => (status, result.to_string(), JSON_CONTENT_TYPE.to_string(), location),
+                None => (status, result.to_string(), JSON_CONTENT_TYPE.to_string(), location, cache_control),
             }
         }
         // Un error SIEMPRE sale como JSON, aunque el rpc declare otro
@@ -958,11 +984,14 @@ fn handle_rpc(
         // contrato justo cuando algo ya salió mal. Un `Location` que un rpc
         // haya pedido ANTES de fallar tampoco se usa -- mismo motivo que el
         // status: una respuesta de error nunca lleva el resultado a medio
-        // camino que el cuerpo haya intentado armar.
+        // camino que el cuerpo haya intentado armar. Un `Cache-Control`
+        // declarado tampoco se agrega -- una respuesta de error nunca debe
+        // quedar cacheada con la política pensada para el camino de éxito.
         Err(e) => (
             status_for(&e),
             error_json(&e.to_string()),
             JSON_CONTENT_TYPE.to_string(),
+            None,
             None,
         ),
     }
@@ -1171,7 +1200,7 @@ fn error_json(message: &str) -> String {
 const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 fn cors_response(status: u16, body: String, cors: &CorsHeaders) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    cors_response_with_type(status, body, JSON_CONTENT_TYPE, cors, None)
+    cors_response_with_type(status, body, JSON_CONTENT_TYPE, cors, None, None)
 }
 
 /// Igual que `cors_response` pero con el Content-Type que pidió el rpc
@@ -1193,12 +1222,20 @@ fn cors_response(status: u16, body: String, cors: &CorsHeaders) -> tiny_http::Re
 /// principal del accept-loop -- el runtime ya rechazó CR/LF antes de
 /// guardar el override, así que en la práctica esto solo protegería contra
 /// un caso que `response.redirect` no debería dejar pasar en absoluto.
+///
+/// `cache_control`: el header `Cache-Control` de `@cache_control("...")`
+/// (GRAMMAR.md §3.113), `None` en cualquier respuesta que no sea un éxito
+/// de un rpc que la declare (incluido TODO camino de error, mismo criterio
+/// que `location`). El checker ya rechaza un valor vacío en compilación,
+/// así que acá solo queda el mismo resguardo defensivo de "no tirar el
+/// proceso" que el resto de los headers armados a partir de un `String`.
 fn cors_response_with_type(
     status: u16,
     body: String,
     content_type_value: &str,
     cors: &CorsHeaders,
     location: Option<&str>,
+    cache_control: Option<&str>,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type_value.as_bytes())
         .unwrap_or_else(|_| {
@@ -1208,6 +1245,11 @@ fn cors_response_with_type(
     if let Some(url) = location {
         if let Ok(location_header) = tiny_http::Header::from_bytes(&b"Location"[..], url.as_bytes()) {
             response = response.with_header(location_header);
+        }
+    }
+    if let Some(value) = cache_control {
+        if let Ok(cache_control_header) = tiny_http::Header::from_bytes(&b"Cache-Control"[..], value.as_bytes()) {
+            response = response.with_header(cache_control_header);
         }
     }
 

@@ -1526,6 +1526,44 @@ impl Checker {
         Ok(())
     }
 
+    /// `@cache_control("...")` (GRAMMAR.md §3.113) -- dimensión ORTOGONAL,
+    /// se combina con cualquier otra anotación (mismo criterio que
+    /// `check_rate_limit_annotation`). Rechazado sobre un `stream`, mismo
+    /// motivo exacto que `response.redirect`/`response.setStatus` dentro de
+    /// un `stream` (§3.46/§3.111): una conexión SSE nunca es cacheable de
+    /// forma sensata, así que declarar un `Cache-Control` ahí no tendría
+    /// ningún efecto real -- error de compilación en vez de un no-op
+    /// silencioso que solo se nota mirando los headers en producción.
+    fn check_cache_control_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        let values: Vec<&String> = r
+            .annotations
+            .iter()
+            .filter_map(|a| match a {
+                Annotation::CacheControl(v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        if values.len() > 1 {
+            return Err(err(format!(
+                "'{}' declara `@cache_control` más de una vez: una respuesta tiene un solo header Cache-Control",
+                r.name
+            )));
+        }
+        let Some(value) = values.first() else {
+            return Ok(());
+        };
+        if value.trim().is_empty() {
+            return Err(err(format!("`@cache_control(\"\")` en '{}': el valor no puede estar vacío", r.name)));
+        }
+        if is_stream {
+            return Err(err(format!(
+                "`@cache_control` en el stream '{}': una conexión SSE nunca es cacheable de forma sensata (GRAMMAR.md §3.113) -- llamalo desde un 'rpc' normal",
+                r.name
+            )));
+        }
+        Ok(())
+    }
+
     /// `@validate(...)` (GRAMMAR.md §3.73) sobre cada campo de `fields` --
     /// llamado tanto para un `type X = { ... }` como para los campos de cada
     /// variante de un `enum` (comparten `Field`, ver `ast.rs`). Dos cosas se
@@ -1779,6 +1817,7 @@ impl Checker {
         self.check_annotation_combination(r, is_stream)?;
         self.check_route_annotation(r, is_stream)?;
         self.check_rate_limit_annotation(r)?;
+        self.check_cache_control_annotation(r, is_stream)?;
         let Some(Annotation::Requires { enum_name, variant_names }) = r.auth() else {
             return Ok(());
         };
@@ -5144,6 +5183,64 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn cache_control_annotation_type_checks_and_combines_with_route() {
+        // Dimensión ortogonal (GRAMMAR.md §3.113) -- se combina libremente
+        // con `@route`, mismo criterio que `@rate_limit`.
+        let src = r#"
+            service Blog {
+                @route("/sitemap.xml")
+                @content_type("application/xml")
+                @cache_control("public, max-age=3600")
+                rpc sitemap() -> String { "<urlset></urlset>" }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn cache_control_rejects_an_empty_value() {
+        let src = r#"
+            service S {
+                @cache_control("")
+                rpc f() -> String { "x" }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn cache_control_rejects_being_declared_twice() {
+        let src = r#"
+            service S {
+                @cache_control("public")
+                @cache_control("private")
+                rpc f() -> String { "x" }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn cache_control_inside_a_stream_is_a_compile_error() {
+        // Mismo motivo que `response.setStatus`/`response.redirect` dentro
+        // de un `stream` (§3.46/§3.111): una conexión SSE nunca es
+        // cacheable de forma sensata.
+        let src = r#"
+            type Item = { id: Int }
+            db { items: Item[] }
+            service Items {
+                @cache_control("public, max-age=60")
+                stream watchAll() -> Item { db.items.all() }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("cache_control") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
     }
 
     #[test]

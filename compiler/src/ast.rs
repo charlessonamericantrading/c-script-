@@ -412,6 +412,18 @@ impl RpcDecl {
             _ => None,
         })
     }
+
+    /// El valor declarado con `@cache_control("...")`, si hay -- texto
+    /// crudo, sin parsear (GRAMMAR.md §3.113). Mismo criterio que
+    /// `rate_limit()`: el checker valida que no esté vacío, nunca la
+    /// gramática interna de `Cache-Control` (`public`, `max-age=N`, etc. --
+    /// eso es responsabilidad de HTTP, no de c-script).
+    pub fn cache_control(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::CacheControl(value) => Some(value.as_str()),
+            _ => None,
+        })
+    }
 }
 
 /// Anotaciones de un rpc/stream. Se permiten varias, pero no cualquier
@@ -442,6 +454,11 @@ pub enum Annotation {
     /// nada en runtime: sigue funcionando igual, es puramente informativo
     /// para quien consume el contrato generado.
     Deprecated(String),
+    /// `@cache_control("public, max-age=3600")` -- header `Cache-Control`
+    /// declarativo en la respuesta de ÉXITO de un rpc normal (nunca un
+    /// `stream`, GRAMMAR.md §3.113). Texto crudo, tal cual el valor de
+    /// HTTP: c-script no valida su gramática interna.
+    CacheControl(String),
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

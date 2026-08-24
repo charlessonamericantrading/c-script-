@@ -134,6 +134,7 @@
   - [3.110 `crypto.awsS3PresignedUrl(...)`: URLs firmadas reales para Amazon S3 — RESUELTO, alcance acotado](#3110-cryptoawss3presignedurl-urls-firmadas-reales-para-amazon-s3--resuelto-alcance-acotado)
   - [3.111 `response.redirect(url, permanent)`: redirects HTTP reales — RESUELTO](#3111-responseredirecturl-permanent-redirects-http-reales--resuelto)
   - [3.112 `base64.encode`/`base64.decode` — YA EXISTÍA, sin documentar ni probar hasta ahora](#3112-base64encodebase64decode--ya-existía-sin-documentar-ni-probar-hasta-ahora)
+  - [3.113 `@cache_control("...")` por rpc — RESUELTO](#3113-cache_control-por-rpc--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4922,6 +4923,29 @@ rpc callTwilio(accountSid: String, authToken: String, body: String) -> String {
 - **Google Cloud Storage (URLs firmadas V4)**: gap más grande -- la firma es RSA-SHA256 sobre la clave privada de una cuenta de servicio (formato PEM/PKCS8), no HMAC. Necesitaría sumar una crate de firma RSA (excepción nueva a "cero dependencias", como `regex` en su momento) y parsear una clave privada real -- una decisión de alcance propia, no una extensión chica de lo que ya existe.
 - **SQS**: usa el MISMO AWS Signature V4 que S3 (§3.110) para autenticar, pero como llamadas de API firmadas (headers), no como URLs presignadas -- `awsS3PresignedUrl` no cubre este caso tal cual, haría falta generalizar la derivación de firma a un primitivo que no esté atado a "armar una URL de S3". Candidato para cuando aparezca evidencia real de demanda.
 - **RabbitMQ**: protocolo AMQP binario y con estado -- una categoría totalmente distinta a firmar requests HTTP, necesitaría implementar el protocolo de transporte entero. Bloqueado/diferido, misma categoría que otras integraciones de protocolo completo en PLAN.md §9.12.
+
+---
+
+### 3.113 `@cache_control("...")` por rpc — RESUELTO
+
+PLAN.md §9.9 ítem 6 (SEO y descubribilidad para IA): un CDN o un crawler de IA que respeta cachés necesita saber cuánto tiempo puede confiar en una respuesta sin volver a pedirla -- antes de esto, `linkc serve` no tenía forma de declarar ningún `Cache-Control`, así que toda respuesta salía sin ese header (equivalente a "no cachear nunca", el default más conservador y también el más caro para contenido que cambia poco, como un `sitemap.xml` o una página de blog).
+
+```
+@route("/sitemap.xml")
+@content_type("application/xml")
+@cache_control("public, max-age=86400")
+rpc sitemap() -> String { sitemapXml(allUrls()) }
+```
+
+**`@cache_control("public, max-age=3600")` fija el header `Cache-Control` de la respuesta de ÉXITO de un rpc**, texto crudo sin parsear -- c-script no valida la gramática interna de `Cache-Control` (`public`/`private`/`no-store`/`max-age=N`/etc.), eso es responsabilidad de HTTP, mismo criterio que `@content_type` no valida tipos MIME. Dimensión ORTOGONAL: se combina libremente con `@route`, `@content_type`, `@requires`/`@authenticated`, `@rate_limit` -- mismo criterio que `@rate_limit` (§3.39), que tampoco restringe con qué otras anotaciones convive.
+
+**Solo en el camino de ÉXITO, nunca en una respuesta de error** -- mismo criterio exacto que `@content_type` (§3.35) y `response.redirect` (§3.111): una respuesta de error (400/401/403/404/429/500) nunca debería quedar cacheada con la política pensada para el caso feliz, así que el header simplemente no se agrega ahí, sin importar qué haya declarado el rpc.
+
+**Rechazado sobre un `stream`**, mismo motivo que `response.setStatus`/`response.redirect` dentro de un `stream` (§3.46/§3.111): una conexión SSE nunca es cacheable de forma sensata (es un flujo de eventos en vivo, no un recurso con un valor fijo que reusar) -- error de COMPILACIÓN, no un no-op silencioso.
+
+**Mecanismo interno**: `Annotation::CacheControl(String)`, mismo patrón que `ContentType`/`Route`/`RateLimit`/`Deprecated` -- parser (`parse_optional_annotation`), accessor (`RpcDecl::cache_control()`), validación dedicada (`check_cache_control_annotation`, vacío/duplicado/`stream` rechazados). A diferencia de `response.redirect` (un override que el CUERPO del rpc fija en runtime, `Db::response_location_override`), esto es ESTÁTICO -- viene directo del AST, así que `server.rs::declared_cache_control` lo resuelve igual que `declared_content_type`, sin pasar por ningún mecanismo de `Cell`/`RefCell` por request.
+
+**Verificado**: 4 tests de tipos en `checker.rs` (combina con `@route`, vacío rechazado, declarado dos veces rechazado, rechazado dentro de un `stream` con el mismo mensaje que `setStatus`/`redirect`) + 2 end-to-end en `cli_content_type.rs` contra un servidor `linkc serve` REAL -- el header aparece exacto en el camino de éxito, FALTA por completo cuando el mismo rpc anotado falla (`panic` forzado, confirma que un 500 nunca hereda la política de caché del éxito), y el caso real combinado (`@route`+`@content_type`+`@cache_control` juntos sobre un sitemap servido por GET) da el header correcto además del Content-Type y el body ya cubiertos por §3.35.
 
 ---
 

@@ -323,14 +323,15 @@ fn render_service(s: &ServiceDecl) -> String {
                     Some(Annotation::Authenticated) => {
                         r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string()
                     }
-                    // `auth()` nunca devuelve ContentType, Route, RateLimit
-                    // ni Deprecated; el brazo existe para que agregar una
-                    // anotación nueva rompa acá y no pase de largo mostrando
-                    // "Público" por descarte.
+                    // `auth()` nunca devuelve ContentType, Route, RateLimit,
+                    // Deprecated ni CacheControl; el brazo existe para que
+                    // agregar una anotación nueva rompa acá y no pase de
+                    // largo mostrando "Público" por descarte.
                     Some(Annotation::ContentType(_))
                     | Some(Annotation::Route(_))
                     | Some(Annotation::RateLimit(_))
                     | Some(Annotation::Deprecated(_))
+                    | Some(Annotation::CacheControl(_))
                     | None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
                 };
                 let rate_limit_badge = match r.rate_limit() {
