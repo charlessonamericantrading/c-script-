@@ -1237,6 +1237,47 @@ fn call_method(
                 }
                 Ok(Value::Int(count))
             }
+            // GRAMMAR.md §3.75: `matchFn` corre en el intérprete sobre
+            // TODAS las filas (mismo criterio que `findWhere`/`deleteWhere`
+            // arriba -- no empujado a SQL, ver PLAN.md §9.3.4), se queda con
+            // la PRIMERA que matchea. `updateFn` se llama con la fila
+            // EXISTENTE completa y devuelve un valor `Omit<T,"id">`
+            // COMPLETO (no un `Patch<T>` parcial -- ver el porqué en
+            // checker.rs::check_db_method) que se aplica entero vía
+            // `applyPatch` sobre el MISMO id -- nunca borra e inserta de
+            // nuevo, así que el id de la fila actualizada no cambia.
+            "upsert" => {
+                let mut it = args.into_iter();
+                let (Some(match_fn), Some(insert_value), Some(update_fn)) = (it.next(), it.next(), it.next()) else {
+                    return Err(err("'upsert' requiere 3 argumentos (matchFn, insertValue, updateFn)"));
+                };
+                let all_val = db.call(&coll, "all", vec![])?;
+                let Value::List(items) = all_val else {
+                    return Err(err("'upsert': no se pudo leer la colección"));
+                };
+                let mut existing = None;
+                for item in items {
+                    if as_bool(&call_callable(match_fn.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)? {
+                        existing = Some(item);
+                        break;
+                    }
+                }
+                match existing {
+                    Some(row) => {
+                        let Value::Struct(row_fields) = &row else {
+                            return Err(err("'upsert': la fila existente no es un struct"));
+                        };
+                        let Some((_, Value::Int(id))) = row_fields.iter().find(|(n, _)| n == "id") else {
+                            return Err(err("'upsert': la fila existente no tiene 'id'"));
+                        };
+                        let id = *id;
+                        let new_value =
+                            call_callable(update_fn, vec![row], db, fns, checker, sessions, current_token, step_budget)?;
+                        db.call(&coll, "applyPatch", vec![Value::Int(id), new_value])
+                    }
+                    None => db.call(&coll, "insert", vec![insert_value]),
+                }
+            }
             _ => db.call(&coll, method, args),
         },
 
@@ -3678,6 +3719,63 @@ mod tests {
         let a = invoke_rpc(&program, "S", "create", &json!({}), &db).unwrap();
         let b = invoke_rpc(&program, "S", "create", &json!({}), &db).unwrap();
         assert_ne!(a["token"], b["token"], "cada construcción evalúa su propio default");
+    }
+
+    // ---- db.<c>.upsert(matchFn, insertValue, updateFn) (GRAMMAR.md §3.75) ----
+
+    #[test]
+    fn upsert_inserts_when_no_row_matches() {
+        let program = program_from(
+            r#"
+            type Counter = { id: Int, name: String, count: Int }
+            type NewCounter = { name: String, count: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(name: String) -> Counter {
+                    db.counters.upsert(
+                        |c: Counter| { c.name == name },
+                        NewCounter { name: name, count: 1 },
+                        |c: Counter| { NewCounter { name: c.name, count: c.count + 1 } }
+                    )
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "bump", &json!({"name": "clics"}), &db).unwrap();
+        assert_eq!(created["name"], json!("clics"));
+        assert_eq!(created["count"], json!(1));
+    }
+
+    /// El segundo `upsert` sobre el MISMO `name` tiene que actualizar la
+    /// fila existente -- mismo `id`, `count` incrementado vía `updateFn`,
+    /// nunca una fila nueva.
+    #[test]
+    fn upsert_updates_the_same_row_in_place_when_a_row_matches() {
+        let program = program_from(
+            r#"
+            type Counter = { id: Int, name: String, count: Int }
+            type NewCounter = { name: String, count: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(name: String) -> Counter {
+                    db.counters.upsert(
+                        |c: Counter| { c.name == name },
+                        NewCounter { name: name, count: 1 },
+                        |c: Counter| { NewCounter { name: c.name, count: c.count + 1 } }
+                    )
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let first = invoke_rpc(&program, "S", "bump", &json!({"name": "clics"}), &db).unwrap();
+        let second = invoke_rpc(&program, "S", "bump", &json!({"name": "clics"}), &db).unwrap();
+        assert_eq!(first["id"], second["id"], "misma fila, mismo id");
+        assert_eq!(second["count"], json!(2));
+
+        let all = invoke_rpc(&program, "S", "bump", &json!({"name": "otro"}), &db).unwrap();
+        assert_ne!(all["id"], second["id"], "un name distinto SÍ inserta una fila nueva");
     }
 
     // ---- validación tipada del borde (auditoría) ----

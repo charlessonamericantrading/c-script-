@@ -96,6 +96,7 @@
   - [3.72 Docstrings `///` propagados a OpenAPI y al `.d.ts` — RESUELTO](#372-docstrings--propagados-a-openapi-y-al-dts--resuelto)
   - [3.73 `@validate(email)` / `@validate(regex, "...")` sobre un campo — RESUELTO](#373-validateemail--validateregex--sobre-un-campo--resuelto)
   - [3.74 Valores por defecto en campos de `struct` — RESUELTO](#374-valores-por-defecto-en-campos-de-struct--resuelto)
+  - [3.75 `db.<c>.upsert(matchFn, insertValue, updateFn)` — RESUELTO](#375-dbcupsertmatchfn-insertvalue-updatefn--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -782,7 +783,7 @@ fn makeUser(input: NewUser) -> NewUserRecord {
 // db.users.insert(makeUser(input)) -- NewUserRecord <: Omit<User,"id"> por subtipado estructural
 ```
 
-**Métodos:** `all() -> T[]`, `find(id: Int) -> T?`, `insert(x: Omit<T,"id">) -> T`, `applyPatch(id: Int, p: Patch<T>) -> T` — resueltos contra el tipo de elemento de verdad (`Type::DbCollection`, checker.rs). Un nombre de colección o de método desconocido ya es un error del checker (`db.usres.fnid(1)`, con AMBOS typo'd, se rechaza en tiempo de chequeo), no algo que se descubre recién en runtime.
+**Métodos:** `all() -> T[]`, `find(id: Int) -> T?`, `insert(x: Omit<T,"id">) -> T`, `applyPatch(id: Int, p: Patch<T>) -> T`, `findWhere(f: (T) -> Bool) -> T[]`, `deleteWhere(f: (T) -> Bool) -> Int`, `count() -> Int`, `page(limit: Int, offset: Int) -> T[]`, `pageAfter(cursor: Int?, limit: Int) -> T[]`, `upsert(matchFn: (T) -> Bool, insertValue: Omit<T,"id">, updateFn: (T) -> Omit<T,"id">) -> T` (§3.75), `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` — resueltos contra el tipo de elemento de verdad (`Type::DbCollection`, checker.rs). Un nombre de colección o de método desconocido ya es un error del checker (`db.usres.fnid(1)`, con AMBOS typo'd, se rechaza en tiempo de chequeo), no algo que se descubre recién en runtime.
 
 **Runtime: en memoria al principio, generalizado.** `runtime/db.rs`'s `Db` pasó de estar hardcodeado a una única colección `"users"` a un `HashMap` con una entrada por colección declarada. Se eliminó el hack que le ponía un default a `deletedAt` en `insert` — bajo la regla `Omit<T,"id">`, `deletedAt` (requerido, nullable) es un campo obligado del argumento; quien inserta pasa `deletedAt: null` explícito, consistente con "sin coerción implícita en ningún lado" (§3.7). **Actualización: RESUELTO.** El storage detrás ya no es en memoria -- ver §3.17: `Db` corre sobre SQLite real, con persistencia genuina entre reinicios de `linkc serve`.
 
@@ -3723,6 +3724,49 @@ test "un campo con default se completa solo cuando el literal no lo menciona" {
 - **Sin `DEFAULT` a nivel de columna SQL.** El valor se completa en el intérprete, ANTES de que la fila llegue a SQLite/Postgres -- la columna generada sigue sin ningún `DEFAULT` propio. Un `INSERT` que bypasee el runtime de Link (una migración manual, por ejemplo) no se beneficia de este default.
 
 **Verificado**: 2 tests en `parser.rs` (`= expr` parsea después del tipo, ausente da `None`), 4 en `checker.rs` (tipa limpio, rechaza un default de tipo equivocado, omitir un campo CON default tipa pero omitir uno SIN default sigue fallando, funciona sobre un campo de variante de enum), 3 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (se completa al construir, un valor explícito lo pisa, `crypto.uuid()` como default dio dos valores DISTINTOS en dos construcciones separadas -- confirma evaluación fresca, no una sola vez), 2 en `ts_emit.rs` (campo con default sale opcional en la interfaz, uno sin default sigue requerido), 2 en `openapi_emit.rs` (`"default"` para un literal simple, ausente pero igual fuera de `required` para `crypto.uuid()`) y 1 en `zod_emit.rs` (`.optional()`). Verificado también a mano contra un servidor HTTP real (`curl`): crear sin mandar el campo devuelve el default, mandándolo explícito lo pisa.
+
+---
+
+### 3.75 `db.<c>.upsert(matchFn, insertValue, updateFn)` — RESUELTO
+
+El caso "si existe actualizá, si no insertá" no tenía método propio -- confirmado como patrón reimplementado a mano (buscar con `findWhere`, borrar, reinsertar con el mismo id) en varios servicios reales. Reinsertar con el mismo id es además un problema real por sí mismo: en SQLite/Postgres con autoincrement, un borrado+inserción normalmente NO reproduce el mismo id (el contador sigue subiendo), así que esa implementación a mano ya arrastraba un bug de identidad estable, no solo boilerplate.
+
+<!-- linkc:check -->
+```rust
+type Counter = { id: Int, name: String, count: Int }
+type NewCounter = { name: String, count: Int }
+
+db { counters: Counter[] }
+
+service Counters {
+  rpc bump(name: String) -> Counter {
+    db.counters.upsert(
+      |c: Counter| { c.name == name },
+      NewCounter { name: name, count: 1 },
+      |c: Counter| { NewCounter { name: c.name, count: c.count + 1 } }
+    )
+  }
+}
+
+test "la primera vez inserta, la segunda actualiza la MISMA fila" {
+  let a = Counters.bump("clics");
+  assert(a.count == 1, "primera vez: cuenta en 1");
+  let b = Counters.bump("clics");
+  assert(b.id == a.id, "misma fila, no una nueva");
+  assert(b.count == 2, "updateFn incrementa sobre la fila existente");
+}
+```
+
+**Tres argumentos: `matchFn: (T) -> Bool`, `insertValue: Omit<T,"id">`, `updateFn: (T) -> Omit<T,"id">`.** `matchFn` corre en el intérprete sobre TODAS las filas de la colección (mismo criterio que `findWhere`/`deleteWhere` -- no empujado a SQL todavía, PLAN.md §9.3.4) y se queda con la PRIMERA que matchea. Sin match: se inserta `insertValue` (una fila nueva, id autoincrement normal). Con match: se llama `updateFn` con la fila EXISTENTE completa, y el valor que devuelve se aplica ENTERO sobre el MISMO id (vía el mismo mecanismo que `applyPatch`) -- nunca borra e inserta de nuevo, así que el id de la fila actualizada NO cambia, a diferencia del workaround manual que reemplazaba.
+
+**`updateFn` devuelve `Omit<T,"id">` completo, no `Patch<T>` parcial -- decisión deliberada, no una limitación por descuido.** `Patch<T>` no tiene sintaxis de literal en el lenguaje (GRAMMAR.md §3.4): solo llega ya decodificado del wire como parámetro de un `rpc`, nunca se puede CONSTRUIR desde adentro de un cuerpo de función. Un `updateFn: (T) -> Patch<T>` sería, literalmente, imposible de escribir -- no hay ninguna expresión que produzca ese tipo. Devolver el shape insertable completo (`NewCounter { ... }`, un literal común y corriente) sí es constructible, y sigue permitiendo que la actualización DEPENDA de los otros campos de la fila existente (`c.count + 1`, no un valor estático) -- que es la ventaja real de pedir una función en vez de un valor fijo.
+
+**Límites honestos:**
+- **`matchFn` no baja a SQL.** Sobre una colección grande, cada `upsert` trae la tabla ENTERA a memoria para evaluar el predicado -- mismo límite ya documentado para `findWhere`/`deleteWhere` (PLAN.md §9.3.4), no es un límite nuevo de `upsert` específicamente.
+- **Sin control sobre CUÁL fila gana si `matchFn` matchea más de una.** Se queda con la primera en el orden que devuelve `all()` (mismo `ORDER BY "id"` de siempre) -- si el predicado no es lo bastante específico para matchear a lo sumo una fila, cuál se actualiza es determinístico pero no necesariamente el que el autor esperaba.
+- **No atómico frente a una escritura concurrente entre el `matchFn` y el `applyPatch`/`insert`.** El intérprete es single-threaded (una request en vuelo a la vez, GRAMMAR.md §3.36), así que dentro de UN proceso no hay carrera real -- pero con más de una instancia de `linkc serve` contra la misma base (§3.44), dos `upsert` simultáneos sobre el mismo `matchFn` podrían insertar dos filas en vez de una.
+
+**Verificado**: 3 tests en `checker.rs` (tipa limpio con las tres firmas correctas, rechaza un `updateFn` que devuelve un tipo que no es el shape insertable, rechaza menos de 3 argumentos) y 2 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (sin match inserta con `count: 1`, con match actualiza la MISMA fila -- mismo id, `count` incrementado vía `updateFn` -- y un `matchFn` distinto sí inserta una fila nueva con id distinto). Verificado también a mano contra un servidor HTTP real (`curl`): primer `bump` inserta id=1 count=1, segundo `bump` con el mismo nombre actualiza a id=1 count=2, un nombre distinto inserta id=2.
 
 ---
 

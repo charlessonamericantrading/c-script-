@@ -3465,6 +3465,33 @@ impl Checker {
             }
             "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.check_aggregate_by(element_ty, method, args, env),
 
+            // GRAMMAR.md §3.75. `updateFn` devuelve `Omit<T,"id">` (un
+            // VALOR completo), no `Patch<T>` -- a propósito: `Patch<T>` no
+            // tiene sintaxis de literal en el lenguaje (solo llega
+            // decodificado del wire como parámetro de rpc, GRAMMAR.md §3.4),
+            // así que un `updateFn` que "devolviera un Patch<T>" sería
+            // imposible de escribir DESDE ADENTRO de un cuerpo de rpc/fn --
+            // no hay forma de construir ese valor ahí. Devolver el shape
+            // insertable completo sí es constructible (`NewX { ... }`, un
+            // literal común) y sigue permitiendo que el update dependa de
+            // los otros campos de la fila existente (ej. incrementar un
+            // contador), que es la ventaja real de una función sobre un
+            // valor estático.
+            "upsert" => {
+                let [match_arg, insert_arg, update_arg] = args else {
+                    return Err(err(
+                        "'upsert' toma exactamente 3 argumentos (matchFn: (T) -> Bool, insertValue: Omit<T,\"id\">, updateFn: (T) -> Omit<T,\"id\">)",
+                    ));
+                };
+                let pred_ty = Type::Function(vec![element_ty.clone()], Box::new(Type::Bool));
+                self.check_expr(match_arg, &pred_ty, env)?;
+                let insertable = self.omit_id_field(element_ty)?;
+                self.check_expr(insert_arg, &insertable, env)?;
+                let update_ty = Type::Function(vec![element_ty.clone()], Box::new(insertable));
+                self.check_expr(update_arg, &update_ty, env)?;
+                Ok(element_ty.clone())
+            }
+
             // Deliberadamente SIEMPRE un error acá, nunca una firma normal
             // y libremente componible como las de arriba (GRAMMAR.md
             // §3.16): la única forma de que `subscribe()` tipe en TODO el
@@ -3480,7 +3507,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch/delete/deleteWhere/findWhere/count/page/sumBy/countBy/avgBy/maxBy/minBy/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch/delete/deleteWhere/findWhere/count/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/subscribe)"
             ))),
         }
     }
@@ -6299,5 +6326,64 @@ type T = { id: Int, s: Status }")
     fn a_default_on_an_enum_variant_field_typechecks() {
         let src = r#"enum Event { Created { status: String = "new" } }"#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    // ---- db.<c>.upsert(matchFn, insertValue, updateFn) (GRAMMAR.md §3.75) ----
+
+    #[test]
+    fn upsert_with_the_right_shapes_typechecks() {
+        let src = r#"
+            type Counter = { id: Int, name: String, count: Int }
+            type NewCounter = { name: String, count: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(name: String) -> Counter {
+                    db.counters.upsert(
+                        |c: Counter| { c.name == name },
+                        NewCounter { name: name, count: 1 },
+                        |c: Counter| { NewCounter { name: c.name, count: c.count + 1 } }
+                    )
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    /// `updateFn` tiene que devolver `Omit<T,"id">` COMPLETO, no `Patch<T>`
+    /// -- ver el porqué en `check_db_method`. Un `updateFn` que devuelve un
+    /// tipo distinto (acá, `Int`) se rechaza como cualquier otro argumento
+    /// de tipo función equivocado.
+    #[test]
+    fn upsert_rejects_an_update_fn_with_the_wrong_return_shape() {
+        let src = r#"
+            type Counter = { id: Int, name: String, count: Int }
+            type NewCounter = { name: String, count: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(name: String) -> Counter {
+                    db.counters.upsert(
+                        |c: Counter| { c.name == name },
+                        NewCounter { name: name, count: 1 },
+                        |c: Counter| { c.count }
+                    )
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn upsert_with_the_wrong_number_of_arguments_is_rejected() {
+        let src = r#"
+            type Counter = { id: Int, name: String, count: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(name: String) -> Counter {
+                    db.counters.upsert(|c: Counter| { c.name == name })
+                }
+            }
+        "#;
+        let errs = check_source(src).expect_err("upsert con menos de 3 argumentos debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("toma exactamente 3 argumentos")), "{errs:?}");
     }
 }

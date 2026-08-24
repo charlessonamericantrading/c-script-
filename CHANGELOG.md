@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.40.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`db.<c>.upsert(matchFn, insertValue, updateFn)`.** El caso "si existe actualizá, si no insertá" era boilerplate repetido a mano (buscar con `findWhere`, borrar, reinsertar con el mismo id) -- y esa implementación manual arrastraba un bug de identidad real: borrar+reinsertar normalmente NO reproduce el mismo id autoincrement en SQLite/Postgres. `matchFn: (T) -> Bool` corre en el intérprete sobre toda la colección y se queda con la primera fila que matchea (mismo límite ya documentado para `findWhere`/`deleteWhere`: no empujado a SQL todavía). Sin match: inserta `insertValue: Omit<T,"id">`. Con match: llama `updateFn` con la fila EXISTENTE completa y aplica el resultado ENTERO sobre el MISMO id (vía el mismo mecanismo de `applyPatch`) -- nunca borra e inserta de nuevo. `updateFn` devuelve `Omit<T,"id">` completo, no `Patch<T>` parcial -- decisión deliberada, no un descuido: `Patch<T>` no tiene sintaxis de literal en el lenguaje (solo llega decodificado del wire como parámetro de rpc), así que una función que "devolviera un Patch<T>" sería, literalmente, imposible de escribir desde un cuerpo de función. Devolver el shape insertable completo sí es constructible con un literal común, y sigue permitiendo que la actualización dependa de los otros campos de la fila existente (`count + 1`, no un valor estático).
+
+740 tests (5 nuevos): 3 en `checker.rs` (tipa limpio con las tres firmas correctas, rechaza un `updateFn` de shape equivocado, rechaza menos de 3 argumentos) y 2 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (sin match inserta, con match actualiza la MISMA fila -- mismo id, campo incrementado -- y un match distinto sí inserta una fila nueva). Verificado también a mano contra un servidor HTTP real (`curl`): primer bump inserta id=1, segundo bump con el mismo nombre actualiza a id=1 con el contador incrementado, un nombre distinto inserta id=2. Detalle completo: GRAMMAR.md §3.75.
+
 ## [1.39.0] - 2026-08-24
 
 ### ✨ Nuevo
