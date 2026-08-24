@@ -100,6 +100,33 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
         }
     }
 
+    // `@index`/`@unique` (GRAMMAR.md §3.80) -- `Type::Struct` (resuelto,
+    // arriba) no conserva anotaciones; se cruza con `program.items` (que sí
+    // tiene `ast::Field` con anotaciones) por el nombre que
+    // `Type::Struct{name: Some(...)}` de un elemento de colección siempre
+    // conserva -- mismo criterio que `index_fields_by_collection` en
+    // `runtime/db.rs` (duplicado acá porque este módulo genera el DDL
+    // ESTÁTICO para `linkc build`, sin instanciar ningún `Db` real).
+    for (coll_name, elem_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = elem_ty else { continue };
+        for item in &program.items {
+            let crate::ast::Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let crate::ast::TypeExpr::Struct(ast_fields) = &t.ty else { continue };
+            for f in ast_fields {
+                if let Some(unique) = f.index() {
+                    let unique_kw = if unique { "UNIQUE " } else { "" };
+                    statements.push(format!(
+                        "CREATE {unique_kw}INDEX IF NOT EXISTS \"idx_{coll_name}_{}\" ON \"{coll_name}\"(\"{}\");",
+                        f.name, f.name
+                    ));
+                }
+            }
+        }
+    }
+
     Ok(statements.join("\n\n"))
 }
 
@@ -239,6 +266,30 @@ mod tests {
             alter_table_add_column_postgres("users", &field, &simple_enums),
             "ALTER TABLE \"users\" ADD COLUMN IF NOT EXISTS \"avatar_url\" TEXT;"
         );
+    }
+
+    /// `@index`/`@unique` (GRAMMAR.md §3.80) -- el DDL estático que
+    /// `linkc build` emite para Postgres, aparte del que crea el runtime al
+    /// arrancar (`create_index_statements` en `runtime/db.rs`).
+    #[test]
+    fn index_and_unique_annotations_emit_create_index_statements() {
+        let code = r#"
+        type User = { id: Int, @unique email: String, @index country: String, name: String }
+        db { users: User[] }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let ddl = generate_postgres_ddl(&program).unwrap();
+
+        assert!(
+            ddl.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_users_email\" ON \"users\"(\"email\");"),
+            "{ddl}"
+        );
+        assert!(
+            ddl.contains("CREATE INDEX IF NOT EXISTS \"idx_users_country\" ON \"users\"(\"country\");"),
+            "{ddl}"
+        );
+        assert!(!ddl.contains("idx_users_name"), "'name' no lleva anotación, no debería generar índice: {ddl}");
     }
 
     #[test]

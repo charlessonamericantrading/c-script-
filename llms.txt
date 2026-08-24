@@ -59,6 +59,7 @@ Works, verified by running it:
 - `db.<c>.insertMany(items: Omit<T,"id">[]) -> T[]`: each item goes through the same real `insert` (one autocommit SQL statement per row) in order — saves the N sequential HTTP round trips from the client for a backfill, not the cost of N inserts against the database (still N separate `INSERT` statements, not one batch statement). No wrapping transaction — if item 3 of 5 fails, the first two stay inserted, no automatic rollback.
 - Native soft-delete: `@softDelete` on a `Timestamp?` field (only) turns `delete(id)` from a real `DELETE` into an idempotent `UPDATE` — sets the field to `now()`, `AND "<field>" IS NULL` in the WHERE so a second `delete` on an already-deleted row is a no-op returning `false`, never re-touching the timestamp or re-publishing a `stream` event. Every read that returns a LIST or a COUNT filters automatically: `all()`, `page()`, `pageAfter()`, `count()`, `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`, and `findWhere`/`deleteWhere` (which get it FREE, no extra code — they call `all()` internally). At most ONE `@softDelete` field per struct — two would be ambiguous, a compile error naming both. `= null` (the field-default mechanism, rule 15) is what avoids having to pass the field by hand on every `insert`. See rule 17 for the one big gotcha.
 - Automatic `createdAt`/`updatedAt`: NO magic field names anywhere. `createdAt: Timestamp = now()` already works with two features that already existed before this — the `now()` builtin and a plain field default (rule 15) — no new syntax needed for "set once at creation." `@autoUpdate` on a `Timestamp` field (and only `Timestamp` — anything else is a compile error) is the one new piece: it forces that field to `now()` on every `applyPatch` and on `upsert`'s update path, EVEN when the patch doesn't mention it at all. A field named `updatedAt` without `@autoUpdate` is never touched automatically, and `@autoUpdate` works on a field with any name, not just `updatedAt` — see GRAMMAR.md §3.77.
+- Declarative single-field indexes: `@index`/`@unique` on a struct field — see rule 18 for the full contract (no composite indexes yet, no field-type restriction, 400 not 500 on a `@unique` violation). GRAMMAR.md §3.80.
 - Sending email: `smtp.send(to: String, subject: String, body: String) -> Void`. Connection and sender come from the process environment (`LINK_SMTP_URL`, `LINK_SMTP_FROM`), never from rpc arguments — see GRAMMAR.md §3.43. `smtp.sendToMany(to: String[], subject: String, body: String) -> Void` sends ONE message with one `RCPT TO` per recipient; `smtp.sendHtml(to: String[], subject: String, html: String) -> Void` sends an HTML body (`Content-Type: text/html`) to one or many recipients — see GRAMMAR.md §3.63. All three: no attachments, no cc/bcc, synchronous (blocks the single-threaded server for that request).
 - Calling third-party APIs: `http.get(url: String) -> String` / `http.post(url: String, body: String) -> String` (unchanged), plus `http.getWithHeaders(url: String, headers) -> String` / `http.postWithHeaders(url: String, body: String, headers) -> String` for calls that need `Authorization` or any other header. `headers` is `{name: String, value: String}[]` — structural, not a builtin type, so any struct you declare with those two fields works. Response is only the body as `String`; a non-2xx becomes a runtime error (not a value with the status code) — see GRAMMAR.md §3.47. `http.getWithStatus(url: String, headers) -> {status: Int, headers: {name:String,value:String}[], body: String}` / `http.postWithStatus(url: String, body: String, headers) -> same` — two ADDITIONAL methods (the four above are unchanged) that return the status code and response headers as data instead of turning a non-2xx into a runtime error; the return type is structural too, no builtin name — see GRAMMAR.md §3.60.
 - `db.<collection>.page(limit: Int, offset: Int) -> T[]`: real pagination — `LIMIT`/`OFFSET` pushed into the actual SQL query on both SQLite and Postgres, not `all().take(n)` (which fetches the whole table first). Same `ORDER BY "id"` as `all()` so pages don't overlap or skip rows. Negative `limit`/`offset` is a runtime error (rejected before reaching SQL, since SQLite and Postgres treat a negative value differently); an `offset` past the end is an empty list, not an error — see GRAMMAR.md §3.48. `db.<collection>.pageAfter(cursor: Int?, limit: Int) -> T[]`: cursor-based alternative for sequential/infinite-scroll pagination — the cursor is the last-seen `id` (`null` for the first page); unlike `OFFSET`, `WHERE "id" > cursor` is stable under concurrent inserts (a row written between two calls never shifts the next page) — see GRAMMAR.md §3.61.
@@ -128,15 +129,18 @@ difference between code that compiles and code that does not.
     vs `Int`. Call `.toString()` first to get a plain `String` (then any `String` method works
     on it normally). A `Uuid`-typed field/param rejects anything that isn't the canonical
     `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form (8-4-4-4-12 hex) — see GRAMMAR.md §3.70.
-13. **A struct field accepts exactly TWO annotations — `@deprecated("reason")` and
-    `@validate(...)` — nothing else.** `RpcDecl` has a general `Vec<Annotation>`
-    (`@authenticated`/`@route`/`@rate_limit`/etc. all combine freely there), but `Field` does
-    not — writing `@authenticated legacyPhone: String` on a struct field is a parse error, not
-    something the checker rejects later. At most one of each per field (a second `@deprecated`
-    or `@validate` on the same field is also a parse error). `@deprecated` is purely
-    informational: never affects type-checking, structural subtyping, or runtime behavior —
-    only JSDoc + `openapi.json` metadata (GRAMMAR.md §3.71). `@validate` is NOT purely
-    informational — see rule 14.
+13. **A struct field accepts a FIXED set of annotations — `@deprecated("reason")`,
+    `@validate(...)`, `@autoUpdate`, `@softDelete`, `@index`, `@unique` — nothing else.**
+    `RpcDecl` has a general `Vec<Annotation>` (`@authenticated`/`@route`/`@rate_limit`/etc. all
+    combine freely there), but `Field` does not — writing `@authenticated legacyPhone: String`
+    on a struct field is a parse error, not something the checker rejects later. At most one of
+    each per field (a second `@deprecated`/`@validate`/`@autoUpdate`/`@softDelete` on the same
+    field is a parse error), and `@index`/`@unique` count as the SAME slot — at most one of the
+    two together, also rejected in the parser (rule 18). All the different kinds combine freely
+    with each other on the same field (`@unique @deprecated("...") email: String` is fine).
+    `@deprecated` is purely informational: never affects type-checking, structural subtyping, or
+    runtime behavior — only JSDoc + `openapi.json` metadata (GRAMMAR.md §3.71). `@validate` is
+    NOT purely informational — see rule 14.
 14. **`@validate(email)` / `@validate(regex, "...")` only goes on a `String`/`String?` field,
     and is REAL enforcement, not just documentation.** `Int`/`Bool`/anything else is a compile
     error. A malformed regex pattern fails `linkc build` itself (compiled with the `regex`
@@ -189,6 +193,18 @@ difference between code that compiles and code that does not.
     single-row `find(id)` never does. No `includeDeleted` escape hatch on the filtered methods
     either — direct `find(id)` is the only way to see a soft-deleted row today. See GRAMMAR.md
     §3.78.
+18. **`@index`/`@unique` are single-FIELD only — no composite (multi-field) index/constraint
+    yet, and neither annotation requires a particular field type** (unlike `@autoUpdate`/
+    `@softDelete`, which are restricted to `Timestamp`/`Timestamp?`). At most one of the two per
+    field. The index is created for real at startup in BOTH backends —
+    `CREATE [UNIQUE] INDEX IF NOT EXISTS "idx_<table>_<field>" ...`, idempotent, same
+    deterministic name every restart — and `linkc build` emits the identical statement in the
+    static Postgres DDL. A `@unique` violation on `insert`/`applyPatch` (and `upsert`'s update
+    path) comes back as a 400, matched against the literal message SQLite
+    (`UNIQUE constraint failed`) and Postgres (`duplicate key value violates unique
+    constraint`) return for that specific case — any other SQL failure is still a plain 500.
+    `--adopt-existing` never runs this DDL, same rule as the rest of the schema in adopt mode.
+    See GRAMMAR.md §3.80.
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `page(limit: Int, offset: Int) -> T[]` (LIMIT/OFFSET pushed to real SQL, not `all().take(n)`

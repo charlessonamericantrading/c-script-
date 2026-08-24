@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.45.0] - 2026-08-24
+
+### ✨ Nuevo
+- **Índices declarativos de un solo campo: `@index`/`@unique`.** Hasta esta ronda la única columna indexada de cualquier tabla era la PK (`id`) -- cualquier otra búsqueda frecuente hacía un table scan completo, y no había forma de pedirle a la base una restricción de unicidad real: prevenir un email repetido solo se podía hacer a mano, con una lectura previa expuesta a una carrera entre dos requests concurrentes. `@index` (sin paréntesis, sobre cualquier campo) y `@unique` (índice + restricción de unicidad) son dos anotaciones de campo nuevas -- a lo sumo UNA de las dos por campo, rechazado en el parser si se repiten o se combinan (mismo criterio de forma que `@autoUpdate`/`@softDelete`). A diferencia de esas dos, ninguna exige un tipo de campo particular: un índice SQL tiene sentido sobre casi cualquier columna. El índice se crea de verdad al arrancar en LOS DOS backends (`CREATE [UNIQUE] INDEX IF NOT EXISTS "idx_<tabla>_<campo>" ...`, idempotente, mismo nombre determinístico en cada arranque), y `linkc build` emite la MISMA sentencia en el DDL estático que genera para Postgres. Una violación de `@unique` en `insert`/`applyPatch` (y por lo tanto en la rama de update de `upsert`) se traduce a 400, no a un 500 genérico -- detectando el mensaje específico que SQLite (`UNIQUE constraint failed`) y Postgres (`duplicate key value violates unique constraint`) devuelven para esta violación puntual; cualquier otra falla de SQL sigue siendo un 500. `--adopt-existing` nunca ejecuta este DDL, ni siquiera para un campo anotado -- mismo criterio ya establecido para el resto del schema en modo adopción.
+
+  Límite deliberado de esta ronda: solo índices/constraints de UN campo. Un índice o `@unique` COMPUESTO (de varios campos a la vez) queda pendiente -- necesitaría una anotación a nivel de `type`, no de campo, que hoy no existe.
+
+773 tests (9 nuevos): 4 en `checker.rs`/`parser.rs` (`@index`/`@unique` tipan limpio sobre cualquier tipo de campo, una segunda `@index` o `@unique` en el mismo campo es error de parser, combinar las dos en el mismo campo también), 4 en `runtime/db.rs` contra SQLite real (`@unique` crea un índice `UNIQUE` de verdad -- verificado leyendo `sqlite_master` -- y rechaza un segundo `insert`/`applyPatch` con el mismo valor devolviendo 400; `@index` sin `unique` no bloquea valores repetidos; `--adopt-existing` no crea el índice aunque el campo esté anotado) y 1 en `postgres_emit.rs` (el DDL estático de `linkc build` emite `CREATE UNIQUE INDEX`/`CREATE INDEX` con el mismo nombre determinístico que usa el runtime). Detalle completo: GRAMMAR.md §3.80.
+
 ## [1.44.0] - 2026-08-24
 
 ### ✨ Nuevo

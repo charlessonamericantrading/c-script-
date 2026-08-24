@@ -451,9 +451,20 @@ impl Parser {
                     }
                     annotations.push(FieldAnnotation::SoftDelete);
                 }
+                // `@index`/`@unique` (GRAMMAR.md §3.80) -- sin paréntesis,
+                // a lo sumo UNO de los dos por campo (los dos piden un
+                // índice, `@unique` además una restricción de unicidad --
+                // combinarlos sería redundante, no un error del checker,
+                // rechazado acá mismo por forma).
+                "index" | "unique" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::Index { .. })) {
+                        return Err(self.error("'@index'/'@unique' repetido (o combinado) sobre el mismo campo -- un campo tiene a lo sumo uno de los dos".to_string()));
+                    }
+                    annotations.push(FieldAnnotation::Index { unique: name == "unique" });
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate' o '@softDelete')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index' o '@unique')"
                     )))
                 }
             }

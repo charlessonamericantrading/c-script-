@@ -146,6 +146,76 @@ fn soft_delete_fields_by_collection(program: &Program, checker: &Checker) -> Has
     result
 }
 
+/// Nombre de colección -> lista de `(campo, unique)` para cada campo con
+/// `@index`/`@unique` de su tipo de elemento (GRAMMAR.md §3.80) -- mismo
+/// cruce `checker.db_collections()` + `program.items` que
+/// `soft_delete_fields_by_collection`, mismo motivo (las anotaciones viven
+/// en `ast::Field`, no en el `Type` ya resuelto).
+fn index_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<(String, bool)>> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let TypeExpr::Struct(fields) = &t.ty else { continue };
+            let indexed: Vec<(String, bool)> =
+                fields.iter().filter_map(|f| f.index().map(|unique| (f.name.clone(), unique))).collect();
+            if !indexed.is_empty() {
+                result.insert(coll_name.clone(), indexed);
+            }
+        }
+    }
+    result
+}
+
+/// `CREATE [UNIQUE] INDEX IF NOT EXISTS ...` para cada campo `@index`/
+/// `@unique` de `collection` (GRAMMAR.md §3.80) -- `IF NOT EXISTS` hace la
+/// creación idempotente, así que corre en CADA arranque sin necesitar
+/// detectar "¿ya existía?" (a diferencia de `ADD COLUMN`, que sí necesita
+/// ese chequeo porque no es idempotente por sí solo). Nombre de índice
+/// determinístico (`idx_<tabla>_<campo>`) para que dos arranques sucesivos
+/// generen el MISMO nombre -- si generara uno al azar, cada arranque
+/// crearía un índice nuevo en vez de reconocer el que ya existe.
+fn create_index_statements(collection: &str, indexed: &[(String, bool)]) -> Vec<String> {
+    indexed
+        .iter()
+        .map(|(field, unique)| {
+            let unique_kw = if *unique { "UNIQUE " } else { "" };
+            format!("CREATE {unique_kw}INDEX IF NOT EXISTS \"idx_{collection}_{field}\" ON \"{collection}\"(\"{field}\")")
+        })
+        .collect()
+}
+
+/// ¿Es este el texto con el que SQLite o Postgres reportan una violación de
+/// `UNIQUE`/`@unique` (GRAMMAR.md §3.80)? `Backend::execute`/
+/// `insert_returning_id` devuelven `Result<_, String>` -- el error ya
+/// perdió cualquier forma estructurada para cuando llega acá, así que la
+/// única señal disponible es la frase fija que cada motor usa para este
+/// caso (la forma PÚBLICA en la que reportan el error, estable en la
+/// práctica, aunque siga siendo texto y no un tipo). Encontrado probando
+/// contra un servidor real: sin este chequeo, una violación de `@unique`
+/// -- error del CLIENTE, mandó un valor repetido -- salía como 500 (`insert
+/// falló: UNIQUE constraint failed: ...`), no como el 400 que le
+/// corresponde.
+fn is_unique_violation(msg: &str) -> bool {
+    msg.contains("UNIQUE constraint failed") || msg.contains("duplicate key value violates unique constraint")
+}
+
+/// Envuelve el error de una escritura fallida (`insert`/`applyPatch`) --
+/// `RuntimeError::bad_request` (400) si es una violación de `@unique`
+/// (ver `is_unique_violation`), `RuntimeError::new` (500) para cualquier
+/// otra falla de SQL genuina (columna inexistente, base caída, etc.).
+fn write_error(action: &str, e: String) -> RuntimeError {
+    if is_unique_violation(&e) {
+        RuntimeError::bad_request(format!("ya existe una fila con ese valor único (@unique, GRAMMAR.md §3.80) -- {e}"))
+    } else {
+        RuntimeError::new(format!("{action} falló: {e}"))
+    }
+}
+
 fn create_table_sql(collection: &str, columns: &[ColumnPlan]) -> String {
     let mut defs = vec!["\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
 
@@ -675,6 +745,10 @@ impl Db {
             let cols: Vec<ColumnPlan> =
                 fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
             if adopt_existing {
+                // GRAMMAR.md §3.80: `--adopt-existing` nunca ejecuta DDL,
+                // punto -- ni `@index`/`@unique` es la excepción. Un índice
+                // declarado sobre una colección adoptada simplemente no se
+                // crea; documentado, no un olvido.
                 check_schema_for_adoption(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             } else {
                 connection
@@ -683,6 +757,15 @@ impl Db {
                 check_schema_matches(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             }
             columns.insert(name.clone(), cols);
+        }
+        if !adopt_existing {
+            for (name, indexed) in index_fields_by_collection(program, &checker) {
+                for stmt in create_index_statements(&name, &indexed) {
+                    connection
+                        .execute(&stmt, [])
+                        .unwrap_or_else(|e| panic!("no se pudo crear un índice sobre '{name}' en '{db_path_display}': {e}"));
+                }
+            }
         }
         let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
 
@@ -790,6 +873,15 @@ impl Db {
                 }
             }
             columns.insert(name.clone(), cols);
+        }
+        if !adopt_existing {
+            // Mismo criterio que el lado SQLite: `--adopt-existing` nunca
+            // ejecuta DDL, ni siquiera para un índice declarado.
+            for (name, indexed) in index_fields_by_collection(program, &checker) {
+                for stmt in create_index_statements(&name, &indexed) {
+                    backend.execute_ddl(&stmt).map_err(|e| format!("no se pudo crear un índice sobre '{name}': {e}"))?;
+                }
+            }
         }
 
         let instance_id = random_instance_id();
@@ -995,10 +1087,7 @@ db { users: User[] }
                     let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
                     format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "))
                 };
-                let new_id = self
-                    .backend
-                    .insert_returning_id(&sql, &params)
-                    .map_err(|e| RuntimeError::new(format!("insert falló: {e}")))?;
+                let new_id = self.backend.insert_returning_id(&sql, &params).map_err(|e| write_error("insert", e))?;
                 let inserted = self
                     .select_rows(collection, columns, Some(new_id))?
                     .into_iter()
@@ -1027,9 +1116,7 @@ db { users: User[] }
                     let id_placeholder = self.backend.placeholder(params.len() + 1);
                     params.push(Cell::Int(id));
                     let sql = format!("UPDATE \"{collection}\" SET {} WHERE \"id\" = {id_placeholder}", set_clauses.join(", "));
-                    self.backend
-                        .execute(&sql, &params)
-                        .map_err(|e| RuntimeError::new(format!("applyPatch falló: {e}")))?;
+                    self.backend.execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
                 }
                 // Reconsultar por id, tanto si hubo UPDATE como si el patch
                 // no traía ningún campo escribible -- "no encontrado" en
@@ -1947,5 +2034,110 @@ mod tests {
 
         let program = program_from("type Item = { id: Int, name: String, note?: String } db { items: Item[] }");
         let _ = Db::new_with_options(&program, &path, true);
+    }
+
+    // ---- índices declarativos: `@index`/`@unique` (GRAMMAR.md §3.80) ----
+
+    #[test]
+    fn unique_field_creates_a_real_sqlite_unique_index_and_rejects_duplicate_inserts() {
+        let path = std::env::temp_dir().join("c_script_test_unique_index.db");
+        let _ = std::fs::remove_file(&path);
+        let program = program_from("type User = { id: Int, @unique email: String } db { users: User[] }");
+        let db = Db::new(&program, &path);
+
+        db.call("users", "insert", vec![Value::Struct(vec![("email".into(), Value::Str("a@x.com".into()))])])
+            .unwrap();
+        let dup = db.call("users", "insert", vec![Value::Struct(vec![("email".into(), Value::Str("a@x.com".into()))])]);
+        let err = dup.expect_err("un segundo insert con el mismo email ya usado debe rechazarse");
+        assert_eq!(
+            err.kind,
+            crate::runtime::ErrorKind::BadRequest,
+            "una violación de @unique es un error del CLIENTE (400), no del servidor: {err:?}"
+        );
+
+        drop(db);
+        let raw = Connection::open(&path).unwrap();
+        let sql: String = raw
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_users_email'", [], |r| r.get(0))
+            .expect("el índice único debe existir de verdad en SQLite, no solo aplicarse desde el intérprete");
+        assert!(sql.to_uppercase().contains("UNIQUE"), "{sql}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unique_violation_on_apply_patch_is_rejected_as_bad_request() {
+        let path = std::env::temp_dir().join("c_script_test_unique_index_patch.db");
+        let _ = std::fs::remove_file(&path);
+        let program = program_from("type User = { id: Int, @unique email: String } db { users: User[] }");
+        let db = Db::new(&program, &path);
+
+        db.call("users", "insert", vec![Value::Struct(vec![("email".into(), Value::Str("a@x.com".into()))])])
+            .unwrap();
+        let b = db
+            .call("users", "insert", vec![Value::Struct(vec![("email".into(), Value::Str("b@x.com".into()))])])
+            .unwrap();
+        let Value::Struct(fields) = &b else { panic!("se esperaba struct") };
+        let b_id = fields.iter().find(|(n, _)| n == "id").map(|(_, v)| as_int(v).unwrap()).unwrap();
+
+        let patched = db.call(
+            "users",
+            "applyPatch",
+            vec![Value::Int(b_id), Value::Struct(vec![("email".into(), Value::Str("a@x.com".into()))])],
+        );
+        let err = patched.expect_err("pisar el email de 'b' con el de 'a' (ya único) debe rechazarse");
+        assert_eq!(err.kind, crate::runtime::ErrorKind::BadRequest, "{err:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_plain_index_field_does_not_block_duplicate_values() {
+        // `@index` (sin `unique: true`) solo acelera lecturas -- a
+        // diferencia de `@unique`, dos filas con el mismo valor son
+        // perfectamente válidas.
+        let path = std::env::temp_dir().join("c_script_test_plain_index.db");
+        let _ = std::fs::remove_file(&path);
+        let program = program_from("type User = { id: Int, @index country: String } db { users: User[] }");
+        let db = Db::new(&program, &path);
+
+        db.call("users", "insert", vec![Value::Struct(vec![("country".into(), Value::Str("AR".into()))])]).unwrap();
+        db.call("users", "insert", vec![Value::Struct(vec![("country".into(), Value::Str("AR".into()))])])
+            .expect("un índice no-único no debe rechazar valores repetidos");
+
+        drop(db);
+        let raw = Connection::open(&path).unwrap();
+        let sql: String = raw
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_users_country'", [], |r| r.get(0))
+            .expect("el índice debe existir de verdad en SQLite");
+        assert!(!sql.to_uppercase().contains("UNIQUE"), "{sql}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn adopt_existing_never_creates_an_index_even_when_the_field_is_annotated() {
+        let path = std::env::temp_dir().join("c_script_test_adopt_no_index.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute(
+                "CREATE TABLE \"users\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"email\" TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let program = program_from("type User = { id: Int, @unique email: String } db { users: User[] }");
+        let db = Db::new_with_options(&program, &path, true);
+        drop(db);
+
+        let raw = Connection::open(&path).unwrap();
+        let count: i64 = raw
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_users_email'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "--adopt-existing nunca ejecuta DDL, ni siquiera para un índice declarado");
+
+        let _ = std::fs::remove_file(&path);
     }
 }

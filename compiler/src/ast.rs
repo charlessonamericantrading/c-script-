@@ -197,6 +197,17 @@ impl Field {
     pub fn soft_delete(&self) -> bool {
         self.annotations.iter().any(|a| matches!(a, FieldAnnotation::SoftDelete))
     }
+
+    /// ¿Lleva `@index` o `@unique`? (GRAMMAR.md §3.80) -- `true` para
+    /// `unique` en el segundo elemento si es `@unique`, `false` para
+    /// `@index` plano. A lo sumo uno de los dos por campo -- el parser ya
+    /// lo exige (ver `parse_field_annotations`).
+    pub fn index(&self) -> Option<bool> {
+        self.annotations.iter().find_map(|a| match a {
+            FieldAnnotation::Index { unique } => Some(*unique),
+            _ => None,
+        })
+    }
 }
 
 impl PartialEq for Field {
@@ -223,6 +234,12 @@ pub enum FieldAnnotation {
     /// `@softDelete` (sin paréntesis) -- solo sobre un campo `Timestamp?`.
     /// Ver GRAMMAR.md §3.78.
     SoftDelete,
+    /// `@index` (`unique: false`) o `@unique` (`unique: true`), sin
+    /// paréntesis -- índice de un solo campo (GRAMMAR.md §3.80). Un
+    /// índice/constraint COMPUESTO (de varios campos) queda afuera de esta
+    /// ronda -- necesitaría una anotación a nivel de `type`, no de campo,
+    /// que hoy no existe (`TypeDecl` no tiene `annotations`).
+    Index { unique: bool },
 }
 
 /// Las dos formas de `@validate(...)` que un campo `String`/`String?` admite

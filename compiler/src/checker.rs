@@ -6584,4 +6584,42 @@ type T = { id: Int, s: Status }")
         let err = parse(tokens).expect_err("dos @softDelete en el mismo campo debe rechazarse");
         assert!(format!("{err:?}").contains("repetido"), "{err:?}");
     }
+
+    // ---- índices declarativos: `@index`/`@unique` (GRAMMAR.md §3.80) ----
+
+    #[test]
+    fn index_and_unique_annotations_typecheck_on_any_field_type() {
+        // A diferencia de `@autoUpdate`/`@softDelete`, ninguno de los dos
+        // exige un tipo particular -- un índice SQL tiene sentido sobre
+        // casi cualquier columna.
+        let src = "type User = { id: Int, @unique email: String, @index age: Int? }";
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn a_second_index_annotation_on_the_same_field_is_a_parse_error() {
+        let src = "type User = { id: Int, @index @index email: String }";
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("dos '@index' en el mismo campo debe rechazarse");
+        assert!(format!("{err:?}").contains("repetido"), "{err:?}");
+    }
+
+    #[test]
+    fn a_second_unique_annotation_on_the_same_field_is_a_parse_error() {
+        let src = "type User = { id: Int, @unique @unique email: String }";
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("dos '@unique' en el mismo campo debe rechazarse");
+        assert!(format!("{err:?}").contains("repetido"), "{err:?}");
+    }
+
+    #[test]
+    fn combining_index_and_unique_on_the_same_field_is_a_parse_error() {
+        // Los dos piden un índice -- `@unique` además una restricción de
+        // unicidad -- combinarlos sería redundante, rechazado por forma
+        // (no un error del checker).
+        let src = "type User = { id: Int, @index @unique email: String }";
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("'@index' + '@unique' en el mismo campo debe rechazarse");
+        assert!(format!("{err:?}").contains("repetido"), "{err:?}");
+    }
 }

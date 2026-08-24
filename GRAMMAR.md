@@ -101,6 +101,7 @@
   - [3.77 `createdAt`/`updatedAt` automáticos: `= now()` + `@autoUpdate` — RESUELTO](#377-createdatupdatedat-automáticos--now--autoupdate--resuelto)
   - [3.78 Soft-delete nativo: `@softDelete` — RESUELTO](#378-soft-delete-nativo-softdelete--resuelto)
   - [3.79 `linkc build --diff <archivo-anterior>` — RESUELTO](#379-linkc-build---diff-archivo-anterior--resuelto)
+  - [3.80 Índices declarativos: `@index`/`@unique` — RESUELTO](#380-índices-declarativos-indexunique--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3928,6 +3929,52 @@ linkc build app.link gen --diff /tmp/contract-base.d.ts
 - **Diff de texto plano, no un diff semántico de tipos.** No distingue "se agregó un campo opcional" (cambio compatible hacia atrás) de "se cambió el tipo de un campo existente" (cambio que rompe) -- ambos aparecen igual, como líneas `-`/`+`; es una persona la que decide qué tan grave es cada cambio, mirando el diff.
 
 **Verificado**: `cli_build_diff.rs` con el binario real como subproceso (agregar un campo muestra exactamente la línea `+` que corresponde, sin ningún cambio real muestra "no cambió", un archivo de comparación inexistente no hace fallar el build -- solo avisa por stderr, y `linkc build` sin `--diff` sigue funcionando exactamente igual que antes de esta ronda).
+
+---
+
+### 3.80 Índices declarativos: `@index`/`@unique` — RESUELTO
+
+Hasta esta ronda, la única columna indexada de cualquier tabla era la PK (`id`) -- cualquier otra búsqueda frecuente (`findWhere(|u: User| { u.email == e })` sobre una tabla grande) hacía un table scan completo, y no había forma de pedirle a la base una restricción de unicidad real: un email repetido solo se podía prevenir a mano, con una lectura previa que además queda expuesta a una carrera entre dos requests concurrentes.
+
+<!-- linkc:check -->
+```rust
+type User = {
+  id: Int,
+  @unique email: String,
+  @index country: String,
+  name: String,
+}
+type NewUser = { email: String, country: String, name: String }
+
+db { users: User[] }
+
+service Users {
+  rpc create(email: String, country: String, name: String) -> User {
+    db.users.insert(NewUser { email: email, country: country, name: name })
+  }
+}
+
+test "un email nuevo se acepta -- el indice unico no molesta al camino feliz" {
+  let u = Users.create("ada@ejemplo.com", "AR", "Ada");
+  assert(u.email == "ada@ejemplo.com", "el insert normal sigue funcionando igual");
+}
+```
+
+**Dos anotaciones de campo, sin paréntesis -- `@index` (no exige unicidad) y `@unique` (índice + restricción de unicidad).** A lo sumo UNA de las dos por campo -- combinarlas sería redundante (`@unique` ya implica un índice), rechazado en el PARSER, no en el checker (mismo criterio de forma que `@autoUpdate`/`@softDelete`, §3.77/§3.78). A diferencia de esas dos, ninguna exige un tipo de campo particular -- un índice SQL tiene sentido sobre casi cualquier columna, así que `@index`/`@unique` tipan limpio sobre `Int`, `String?`, un enum simple, lo que sea.
+
+**El índice se crea de verdad al arrancar, en LOS DOS backends.** `Db::new`/`Db::new_with_options` (SQLite) y el lado Postgres del mismo constructor ejecutan `CREATE [UNIQUE] INDEX IF NOT EXISTS "idx_<tabla>_<campo>" ON "<tabla>"("<campo>")` por cada campo anotado, una vez por arranque -- `IF NOT EXISTS` lo hace idempotente, así que correr el servidor de nuevo no falla ni duplica nada. `linkc build` emite la MISMA sentencia (mismo nombre determinístico de índice) en el DDL estático que genera para Postgres, para que aplicar ese DDL a mano deje la base en el mismo estado que `linkc serve` hubiera creado sola.
+
+**Una violación de `@unique` es un 400, no un 500.** `insert`/`applyPatch` (y por lo tanto `upsert` en su rama de update) atrapan el mensaje de error específico que SQLite (`UNIQUE constraint failed`) y Postgres (`duplicate key value violates unique constraint`) devuelven para este caso puntual y lo traducen a `RuntimeError::bad_request` -- un email repetido es un error del CLIENTE (mandó un valor que ya existe), nunca "el servidor se rompió". Cualquier otra falla de SQL (columna inexistente, base caída) sigue siendo un 500 genuino, sin cambios.
+
+**`--adopt-existing` nunca ejecuta este DDL, ni siquiera para un campo anotado.** Mismo criterio ya establecido para el resto del schema (§3.67): en modo adopción NINGÚN DDL corre, así que un índice declarado sobre una colección adoptada simplemente no se crea -- si la tabla real ya lo necesita, es responsabilidad de quien administra esa base agregarlo por fuera.
+
+**Límites honestos:**
+- **Solo índices/constraints de UN campo.** Un índice o unique COMPUESTO (`@unique(["email", "tenantId"])`, por ejemplo) queda fuera de esta ronda -- necesitaría una anotación a nivel de `type`, no de campo, que hoy no existe (`TypeDecl` no tiene `annotations`).
+- **Sin `@check` declarativo.** Una restricción de forma más general que unicidad (`price > 0`, por ejemplo) no es parte de esta ronda -- ver PLAN.md §9.3.
+- **El nombre del índice es siempre `idx_<tabla>_<campo>`, no configurable.** Dos colecciones con el mismo nombre de campo anotado (`users.email` y `admins.email`, por ejemplo) generan nombres de índice distintos porque el nombre de TABLA ya entra en la fórmula -- no hay colisión real en la práctica, pero tampoco forma de elegir un nombre propio.
+- **Índice sobre una columna JSON-serializada (struct/lista/map/genérico) es válido pero de utilidad dudosa.** El campo se guarda igual como TEXT con el JSON serializado (`ColumnPlan::for_field`) -- SQLite/Postgres indexan esa columna sin problema (y `serde_json` sin la feature `preserve_order` serializa las claves de un objeto siempre en el mismo orden, así que `@unique` sobre un `Map<K,V>` es correcto), pero comparar/ordenar por el texto de un JSON casi nunca es lo que alguien quiere de un índice.
+
+**Verificado**: 4 tests en `checker.rs`/`parser.rs` (`@index`/`@unique` tipan limpio sobre cualquier tipo de campo, una segunda `@index` o `@unique` en el mismo campo es error de parser, combinar las dos en el mismo campo también), 4 en `runtime/db.rs` contra SQLite real (`@unique` crea un índice `UNIQUE` de verdad -- verificado leyendo `sqlite_master` -- y rechaza un segundo `insert`/`applyPatch` con el mismo valor devolviendo 400; `@index` sin `unique` no bloquea valores repetidos; `--adopt-existing` no crea el índice aunque el campo esté anotado) y 1 en `postgres_emit.rs` (el DDL estático de `linkc build` emite `CREATE UNIQUE INDEX`/`CREATE INDEX` con el mismo nombre determinístico que usa el runtime).
 
 ---
 

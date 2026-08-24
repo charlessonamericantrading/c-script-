@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.44.0-blue.svg" alt="Version" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.45.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 764 automated tests:
+**Works today**, covered by 773 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- Declarative single-field indexes: `@index`/`@unique` on a struct field — neither requires a particular field type. The index is created for real on startup in both backends (`CREATE [UNIQUE] INDEX IF NOT EXISTS`, idempotent, deterministic name), and `linkc build` emits the same statement in the static Postgres DDL. A `@unique` violation on `insert`/`applyPatch` (and on `upsert`'s update path) is translated to a 400, not a generic 500 — matched against the exact message SQLite/Postgres return for that specific violation. `--adopt-existing` never runs this DDL either, same rule as the rest of the schema. Composite (multi-field) indexes/constraints aren't supported yet — only single-field
 - `linkc build --diff <file>`: compares the freshly generated `contract.d.ts` against a saved copy (typically `git show <rev>:path > file` before the build) — for reviewing exactly what changed in the public contract on a PR. Reuses the same LCS diff `linkc test` already had for showing why a snapshot changed. Purely informational, never fails the build — an unreadable comparison file just prints a warning to stderr
 - Native soft-delete: `@softDelete` on a `Timestamp?` field turns `delete(id)` into an idempotent `UPDATE` (sets the field to `now()`, `AND "<field>" IS NULL` in the WHERE so a second call is a no-op returning `false`, never a real `DELETE`). Every read that returns a list or a count — `all()`, `page()`, `pageAfter()`, `count()`, the `*By` aggregates, and `findWhere`/`deleteWhere` (which reuse `all()` internally, no extra code needed) — filters it out automatically. `find(id)` deliberately does not filter — a soft-deleted row stays reachable by direct id lookup, same tradeoff Django/Rails make, and needed so `insert`/`applyPatch`'s own post-write re-fetch never explodes if a patch happens to touch that field
 - Automatic `createdAt`/`updatedAt`: no magic field names — `createdAt: Timestamp = now()` (an existing default composed with the existing `now()` builtin) already covers "set once at creation." `@autoUpdate` on a `Timestamp` field (only) is the one new piece — it forces that field to `now()` on every `applyPatch`/`upsert`-update, even when the patch doesn't mention it, while a field without the annotation is never touched automatically
