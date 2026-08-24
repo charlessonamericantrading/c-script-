@@ -89,6 +89,7 @@
   - [3.65 Agregación (`sumBy`/etc.): soporte de `Int64` — RESUELTO (fecha truncada sigue pendiente)](#365-agregación-sumbyetc-soporte-de-int64--resuelto-fecha-truncada-sigue-pendiente)
   - [3.66 `linkc introspect`: generar un `.link` desde una base PostgreSQL existente — RESUELTO, alcance acotado](#366-linkc-introspect-generar-un-link-desde-una-base-postgresql-existente--resuelto-alcance-acotado)
   - [3.67 `--adopt-existing`: adoptar tablas sin auto-migrar — RESUELTO](#367---adopt-existing-adoptar-tablas-sin-auto-migrar--resuelto)
+  - [3.68 NULL en una columna requerida tras una migración de PostgreSQL: error limpio, no `null` silencioso — RESUELTO](#368-null-en-una-columna-requerida-tras-una-migración-de-postgresql-error-limpio-no-null-silencioso--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -952,7 +953,21 @@ Con auth v0, los 3 prerrequisitos de LSP, y push real + loop (§3.15/§3.16) ya 
 
 **`x?: T?` necesita 3 estados; una columna SQL solo tiene un bit de NULL.** Este es el único caso que se fuerza a `TEXT` (envuelto en JSON) aunque `T` sea nativo, específicamente para ganar un tercer estado: SQL `NULL` = clave ausente; el texto `"null"` (el JSON de `Value::Null`) = clave presente con valor null; cualquier otro texto = clave presente con un valor real. Sale gratis de `value_to_json`/`json_to_typed_value` sin ningún código especial -- `value_to_json(Value::Null)` YA serializa a `"null"`.
 
-**Schema incompatible entre corridas: falla fuerte, nunca migra.** Al abrir, después del `CREATE TABLE IF NOT EXISTS`, se compara vía `PRAGMA table_info` el schema real de la tabla contra el que el programa actual declara (como conjunto, no por posición). Cualquier diferencia -- una columna de más, de menos, o de otro tipo -- hace panic ANTES de aceptar ninguna request, nombrando el archivo, la colección, y el diff exacto (esperado vs. encontrado), terminando en "borrá el archivo y volvé a intentar". Simétrico a propósito: incluso un cambio puramente aditivo falla igual, en vez de auto-`ALTER TABLE` solo para ese caso -- mezclar "esto se auto-arregla, esto no" es más sorpresa y más código que un único criterio parejo, y sigue el mismo criterio de v0 que el resto de esta sección (§3.12: "la forma más chica y honesta"). Detalle real: `id INTEGER PRIMARY KEY` reporta `notnull=0` en `PRAGMA table_info` aunque nunca pueda ser NULL de verdad -- la comparación trata esto como un caso especial, o cualquier reinicio detectaría un mismatch falso desde el primer arranque.
+**Schema incompatible entre corridas: falla fuerte, nunca migra -- con una única excepción aditiva.** Al abrir, después del `CREATE TABLE IF NOT EXISTS`, se compara vía `PRAGMA table_info` el schema real de la tabla contra el que el programa actual declara (como conjunto, no por posición). Cualquier diferencia hace panic ANTES de aceptar ninguna request, nombrando el archivo, la colección, y el diff exacto (esperado vs. encontrado), terminando en "borrá el archivo y volvé a intentar" -- salvo el único caso donde SÍ auto-migra sin destruir nada: una columna nueva y OPCIONAL (`x?: T`/`x: T?`, nunca requerida) que el `.link` actual declara pero la tabla física todavía no tiene se agrega con `ALTER TABLE ADD COLUMN`, sin tocar filas existentes. Detalle real: `id INTEGER PRIMARY KEY` reporta `notnull=0` en `PRAGMA table_info` aunque nunca pueda ser NULL de verdad -- la comparación trata esto como un caso especial, o cualquier reinicio detectaría un mismatch falso desde el primer arranque.
+
+**Matriz de comportamiento completa** (PLAN.md §9.1.1, pedida explícitamente en dos reportes de adopción real -- el README solo documentaba antes el caso aditivo):
+
+| Cambio en el `.link` | SQLite (`linkc serve`) | PostgreSQL (`linkc serve --db postgres://...`) |
+|---|---|---|
+| Columna nueva, opcional | Se auto-agrega (`ALTER TABLE ADD COLUMN`), sin pérdida de datos | Se auto-agrega, siempre nullable |
+| Columna nueva, **requerida** | Falla al conectar (no hay forma de rellenar filas viejas) | Se auto-agrega igual, pero SIEMPRE nullable -- una fila vieja queda con `NULL` ahí; leerla ahora da un error de runtime limpio, no un `null` silencioso (§3.68) |
+| Columna eliminada del `.link` | Falla al conectar (columna física de más) | Se ignora en silencio -- queda huérfana, nunca se borra ni se lee |
+| Columna renombrada | Falla al conectar (la vieja queda de más, la nueva falta) | La vieja queda huérfana; la nueva se auto-agrega nullable -- los datos NO se migran de una a otra |
+| Cambio de tipo de una columna existente | Falla al conectar | No se detecta al conectar (`ADD COLUMN IF NOT EXISTS` es no-op sobre una columna que ya existe); el tipo real sigue siendo el viejo, una lectura/escritura con el tipo nuevo puede fallar según la conversión SQL |
+| Campo requerido → opcional | Falla al conectar (la columna física sigue `NOT NULL`, inofensivo pero el schema no calza) | Sin problema -- una columna `NOT NULL` siempre satisface un campo que ahora es opcional |
+| Campo opcional → requerido | Falla al conectar (la columna física sigue nullable) | No se detecta al conectar; una fila vieja con `NULL` ahí da el mismo error de runtime limpio que la fila arriba (§3.68) |
+
+`--adopt-existing` (§3.67) no cambia ninguna fila de esta tabla -- ese modo se salta el auto-migrate por completo, así que un desacuerdo de columna nueva/requerida se descubre siempre al conectar (nunca al leer), con su propio mensaje.
 
 **El argumento de concurrencia de §3.16 se mantiene sin cambios.** Un `SELECT`/`INSERT` de `rusqlite` es una llamada de Rust sincrónica normal, sin `.await`, que corre entera en el hilo que la llama -- ni distinto de clonar un `Vec` en ese sentido. El single-threading del servidor sigue siendo el lock de `Db::subscribe`; lo único que cambia es cuánto tarda cada llamada (I/O real de disco), no si algo puede colarse en el medio. Se activa `PRAGMA busy_timeout` y, si el archivo lo permite (no aplica a `:memory:`), `journal_mode=WAL` -- higiene operativa que permite inspeccionar el archivo con `sqlite3` mientras el servidor sigue corriendo, sin cambiar ningún argumento de corrección.
 
@@ -964,7 +979,7 @@ Con auth v0, los 3 prerrequisitos de LSP, y push real + loop (§3.15/§3.16) ya 
 
 **Fuera de alcance, a propósito:**
 - `delete`/`deleteWhere`/`findWhere` -- no existían al escribir esta sección; agregados en §3.18, que también corrige el mapeo de `id` de arriba.
-- Migraciones reales tipo `ALTER TABLE` -- ver arriba, falla fuerte en vez de auto-migrar.
+- Migraciones reales tipo `ALTER TABLE` más allá de agregar una columna opcional nueva (drop/rename/retype/cambiar nullability) -- ver la matriz de arriba, fallan fuerte en vez de auto-migrar.
 - Índices más allá de `id` -- no hace falta ninguno hoy porque el lenguaje no tiene ningún mecanismo de query además de `find(id)`/`all()`/`findWhere` + `.filter()` del lado interpretado.
 - Acceso concurrente desde múltiples procesos `linkc serve` al mismo archivo -- `busy_timeout`/WAL mitigan, no se verifica exhaustivamente.
 - Cualquier motor que no sea SQLite (Postgres/MySQL) -- decisión explícita arriba, no una limitación técnica de último momento.
@@ -3351,6 +3366,40 @@ Si falta una tabla entera, o falta una columna declarada, `linkc serve` no arran
 - **Una columna declarada opcional pero ausente en la tabla física también falla.** A propósito: el punto entero de este modo es no tocar DDL, así que ni siquiera el `ALTER TABLE ADD COLUMN` no destructivo que el modo normal haría para un campo opcional corre acá.
 
 **Verificado**: `runtime/db.rs` (SQLite, contra un archivo real -- tabla con una columna extra se adopta igual, tabla faltante y columna declarada faltante fallan con el mensaje esperado), `cli_adopt_existing.rs` (dos corridas reales y consecutivas de `linkc serve` sobre el MISMO archivo SQLite: la primera crea la tabla normalmente con una columna que la segunda no declara, la segunda arranca en modo adopción y la ignora; más el flag y la env var probados por separado) y `pg_integration.rs` contra un PostgreSQL real (tabla creada a mano con una columna sin modelar, `linkc serve --adopt-existing` arranca y la ignora; una columna declarada faltante falla limpio, sin panic).
+
+---
+
+### 3.68 NULL en una columna requerida tras una migración de PostgreSQL: error limpio, no `null` silencioso — RESUELTO
+
+Auditando el comportamiento real de auto-migrate para PLAN.md §9.1.1 (matriz de comportamiento pedida en dos reportes de adopción reales) apareció un bug genuino, no solo un gap de documentación: `connect_postgres` (GRAMMAR.md §3.36) agrega SIEMPRE una columna nueva como `NULLABLE` -- nunca puede saber qué backfillear en filas ya existentes, sin importar si el campo es requerido en el `.link` actual. Una fila insertada ANTES de declarar ese campo requerido queda con `NULL` en esa columna. Hasta esta ronda, `row_to_fields` (`runtime/db.rs`) decodificaba ese `NULL` en silencio como `Value::Null` -- el cliente TypeScript recibía `null` en un campo que su propio contrato generado declara `string` (no `string | null`), sin ningún error en ningún lado. Exactamente la clase de "los dos extremos no están de acuerdo" que este proyecto viene evitando desde §3.9.
+
+<!-- linkc:check -->
+```
+type Item = { id: Int, name: String, note: String }
+db { items: Item[] }
+
+service Items {
+  rpc list() -> Item[] { db.items.all() }
+}
+```
+
+Si la tabla física de `items` tiene una fila con `NULL` en `note` (típico tras un `note: String?` -> `note: String` sobre datos ya existentes), `Items/list` ahora devuelve un error de runtime normal -- un 5xx JSON como cualquier otro, nunca un `null` silencioso ni un panic que tumbe el proceso -- que nombra la colección, el `id` de la fila y el campo.
+
+| Caso | Antes de esta ronda | Ahora |
+|---|---|---|
+| Campo nativo (`Int`/`String`/etc.) requerido, columna física `NULL` | `Value::Null` silencioso, `"note": null` en el JSON de un campo `string` | `RuntimeError` limpio, 5xx, nombra colección/id/campo |
+| Campo requerido cuyo tipo es un struct/enum-con-datos/lista/etc. (columna JSON), columna física `NULL` | Mismo `Value::Null` silencioso | Mismo `RuntimeError` limpio |
+| Campo `T?` o `x?: T` (nullable/opcional de verdad) | `Value::Null` o clave ausente, correcto | Sin cambios -- sigue siendo el comportamiento correcto |
+
+**Por qué un error de runtime normal y no un panic.** `handle_rpc` corre sincrónico en el hilo principal del accept-loop (`server.rs`) -- un panic ahí no tira abajo solo esa request, tira abajo el PROCESO ENTERO, el mismo motivo por el que el bug de `id UUID` (§3.36) y el de `id SERIAL` de 32 bits (§3.59) se corrigieron como errores limpios en vez de panics. `row_to_fields` pasó de devolver `Vec<(String, Value)>` a `Result<Vec<(String, Value)>, RuntimeError>`; solo tiene 3 call sites (`select_rows`/`select_rows_page`/`select_rows_after`), los tres ya propagaban `RuntimeError` con `?` para errores de SQL, así que el cambio fue aditivo en la práctica.
+
+**Por qué esto casi nunca pasa en SQLite.** El `CREATE TABLE`/`check_schema_matches` de SQLite (§3.17, con la matriz de comportamiento completa) exige coincidencia EXACTA de schema en cada arranque -- un campo que pasa de opcional a requerido ya falla AL CONECTAR, antes de que cualquier request pueda leer una fila con este problema. El camino solo es alcanzable de verdad en PostgreSQL, donde el auto-migrate SÍ deja pasar el connect.
+
+**Límites honestos:**
+- No hay backfill automático -- el error dice qué fila y qué campo, corregirlo (a mano, o con un `UPDATE` propio) sigue siendo responsabilidad del operador.
+- `--adopt-existing` (§3.67) no cambia nada acá: sigue validando solo que la columna EXISTA, nunca sus valores reales.
+
+**Verificado**: 5 tests nuevos en `runtime/mod.rs` confirman la matriz completa de auto-migrate contra SQLite real (columna eliminada, renombrada, tipo cambiado, requerido→opcional, opcional→requerido -- las 5 fallan al conectar, con el mismo mensaje ya documentado en §3.17); 1 test nuevo en `pg_integration.rs` contra un PostgreSQL real siembra una fila con `NULL` a mano (simulando datos de antes de la migración), confirma que `list()` falla con un error que nombra el campo -- nunca un panic -- y que el servidor sigue respondiendo 200 normal a la request SIGUIENTE contra una fila sin el problema.
 
 ---
 

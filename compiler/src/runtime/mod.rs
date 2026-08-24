@@ -3799,6 +3799,92 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    // ---- matriz de comportamiento de auto-migrate (PLAN.md §9.1.1): las 4
+    // clases de cambio de schema que NO son "agregar una columna opcional
+    // nueva" -- todas fallan fuerte, con el mismo criterio ya documentado en
+    // GRAMMAR.md §3.17 para SQLite. Cada test confirma un caso puntual con
+    // el mensaje real, no solo "algo falló".
+
+    #[test]
+    #[should_panic(expected = "schema incompatible que no se puede migrar automáticamente")]
+    fn reopening_after_dropping_a_column_from_the_link_panics_instead_of_orphaning_it_silently() {
+        let path = std::env::temp_dir().join("c_script_test_schema_dropped_column.db");
+        let _ = std::fs::remove_file(&path);
+
+        let original = program_from("type Item = { id: Int, name: String, legacy?: String } db { items: Item[] }");
+        drop(Db::new(&original, &path));
+
+        // "legacy" ya no está declarada -- la columna física queda huérfana,
+        // y eso por sí solo es suficiente para que la comparación de schema
+        // (por CONJUNTO, no solo por columnas faltantes) falle.
+        let dropped = program_from("type Item = { id: Int, name: String } db { items: Item[] }");
+        let _ = Db::new(&dropped, &path);
+    }
+
+    #[test]
+    #[should_panic(expected = "schema incompatible que no se puede migrar automáticamente")]
+    fn renaming_a_column_panics_because_the_old_name_stays_orphaned_even_if_the_new_one_could_auto_add() {
+        let path = std::env::temp_dir().join("c_script_test_schema_renamed_column.db");
+        let _ = std::fs::remove_file(&path);
+
+        let original = program_from("type Item = { id: Int, note?: String } db { items: Item[] }");
+        drop(Db::new(&original, &path));
+
+        // "note" -> "comment": aunque "comment" sea opcional (auto-agregable
+        // por sí sola), "note" sigue existiendo físicamente y ya no está
+        // declarada -- el mismo caso que el drop de arriba, disparado por un
+        // rename en vez de una eliminación. No hay detección de rename: para
+        // el runtime esto es indistinguible de "borré una columna y agregué
+        // otra sin relación".
+        let renamed = program_from("type Item = { id: Int, comment?: String } db { items: Item[] }");
+        let _ = Db::new(&renamed, &path);
+    }
+
+    #[test]
+    #[should_panic(expected = "schema incompatible que no se puede migrar automáticamente")]
+    fn changing_a_columns_type_panics_instead_of_altering_it() {
+        let path = std::env::temp_dir().join("c_script_test_schema_type_change.db");
+        let _ = std::fs::remove_file(&path);
+
+        let original = program_from("type Item = { id: Int, userId: Int } db { items: Item[] }");
+        drop(Db::new(&original, &path));
+
+        // Int -> String sobre una columna EXISTENTE: el loop de auto-migrate
+        // solo agrega columnas FALTANTES, nunca altera el tipo de una que ya
+        // existe -- confirma el caso real reportado (userId: Int -> String).
+        let retyped = program_from("type Item = { id: Int, userId: String } db { items: Item[] }");
+        let _ = Db::new(&retyped, &path);
+    }
+
+    #[test]
+    #[should_panic(expected = "schema incompatible que no se puede migrar automáticamente")]
+    fn making_a_required_field_optional_panics_because_the_column_stays_not_null() {
+        let path = std::env::temp_dir().join("c_script_test_schema_required_to_optional.db");
+        let _ = std::fs::remove_file(&path);
+
+        let original = program_from("type Item = { id: Int, name: String } db { items: Item[] }");
+        drop(Db::new(&original, &path));
+
+        // La columna física sigue NOT NULL -- el auto-migrate no toca
+        // constraints de una columna que ya existe, solo agrega las que
+        // faltan.
+        let optional = program_from("type Item = { id: Int, name?: String } db { items: Item[] }");
+        let _ = Db::new(&optional, &path);
+    }
+
+    #[test]
+    #[should_panic(expected = "schema incompatible que no se puede migrar automáticamente")]
+    fn making_an_optional_field_required_panics_because_the_column_stays_nullable() {
+        let path = std::env::temp_dir().join("c_script_test_schema_optional_to_required.db");
+        let _ = std::fs::remove_file(&path);
+
+        let original = program_from("type Item = { id: Int, name?: String } db { items: Item[] }");
+        drop(Db::new(&original, &path));
+
+        let required = program_from("type Item = { id: Int, name: String } db { items: Item[] }");
+        let _ = Db::new(&required, &path);
+    }
+
     // ---- test runner integrado y aislamiento (PLAN.md §5, Eje 2) ----
 
     #[test]

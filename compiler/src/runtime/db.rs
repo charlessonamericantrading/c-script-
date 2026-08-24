@@ -1163,7 +1163,7 @@ db { users: User[] }
             .backend
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
-        Ok(rows.iter().map(|cells| Value::Struct(self.row_to_fields(cells, columns))).collect())
+        rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
     }
 
     /// `db.<c>.page(limit, offset)` (GRAMMAR.md §3.48) -- a diferencia de
@@ -1192,7 +1192,7 @@ db { users: User[] }
             .backend
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
-        Ok(rows.iter().map(|cells| Value::Struct(self.row_to_fields(cells, columns))).collect())
+        rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
     }
 
     /// `db.<c>.pageAfter(cursor, limit)` (GRAMMAR.md §3.61) -- cursor de
@@ -1235,7 +1235,7 @@ db { users: User[] }
             .backend
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
-        Ok(rows.iter().map(|cells| Value::Struct(self.row_to_fields(cells, columns))).collect())
+        rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
     }
 
     /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.52) --
@@ -1327,12 +1327,40 @@ db { users: User[] }
     /// pares `(nombre, Value)` de un `Value::Struct` -- inversa de
     /// `write_param`. Las celdas llegan en el mismo orden que emitió el SELECT
     /// (`select_rows`), que es el orden de `columns` con `"id"` adelante.
-    fn row_to_fields(&self, cells: &[Cell], columns: &[ColumnPlan]) -> Vec<(String, Value)> {
+    ///
+    /// Devuelve `Result`, no un `Vec` liso (PLAN.md §9.1.1): un campo
+    /// REQUERIDO (no `T?`, no `x?: T`) que la base devuelve `NULL` es un
+    /// desacuerdo real entre lo que el `.link` promete y lo que la fila
+    /// física tiene -- típico tras migrar `x: T` -> `x?: T`/`T?` -> `x: T`
+    /// en PostgreSQL, donde `connect_postgres` SIEMPRE agrega una columna
+    /// nueva nullable (nunca puede saber qué poner en filas viejas) sin
+    /// importar si el campo es requerido en el `.link` actual, así que una
+    /// fila insertada ANTES de ese cambio queda con `NULL` en una columna
+    /// que el contrato TypeScript declara no-nullable. Antes de esta ronda
+    /// esto decodificaba silenciosamente a `Value::Null` -- el cliente
+    /// tipado recibía `null` en un campo `string` sin ningún error en
+    /// ningún lado, exactamente la clase de "los dos extremos no están de
+    /// acuerdo" que este proyecto viene evitando desde §3.9. Ahora es un
+    /// error de runtime limpio (5xx JSON normal, nunca un panic que
+    /// tumbe el proceso entero -- `handle_rpc` corre sincrónico en el hilo
+    /// principal del accept-loop, server.rs) que nombra la colección y el
+    /// campo.
+    fn row_to_fields(&self, collection: &str, cells: &[Cell], columns: &[ColumnPlan]) -> Result<Vec<(String, Value)>, RuntimeError> {
         let mut out = Vec::with_capacity(columns.len() + 1);
         let Some(Cell::Int(id)) = cells.first() else {
             panic!("la columna 'id' es la clave primaria: siempre es un entero no nulo, y llegó {:?}", cells.first());
         };
         out.push(("id".to_string(), Value::Int(*id)));
+
+        let null_but_required = |field_name: &str| {
+            RuntimeError::new(format!(
+                "la colección '{collection}' tiene una fila (id={id}) con NULL en '{field_name}', pero el programa actual \
+                 declara ese campo requerido (no `T?` ni `x?: T`) -- típico tras una migración de PostgreSQL, que siempre \
+                 agrega una columna nueva como nullable sin importar si el campo es requerido en el `.link` (ver \
+                 GRAMMAR.md §9.1.1): una fila insertada ANTES del cambio de tipo/opcionalidad queda con NULL ahí. \
+                 Backfilleá esa columna a mano o volvé el campo a opcional."
+            ))
+        };
 
         for (col, cell) in columns.iter().zip(cells.iter().skip(1)) {
             if col.json {
@@ -1340,11 +1368,12 @@ db { users: User[] }
                     // NULL en una columna JSON SIEMPRE significa "clave
                     // ausente" -- solo alcanzable si `field.optional` (ver
                     // `write_param`, nunca escribimos NULL acá si la clave es
-                    // requerida). El `Value::Null` defensivo de abajo no
-                    // debería ser alcanzable en la práctica.
+                    // requerida). Si la clave NO es opcional y de todos modos
+                    // llegó NULL, es el mismo desacuerdo real que el campo
+                    // nativo de abajo -- error limpio, no `Value::Null` silencioso.
                     Cell::Null => {
                         if !col.field.optional {
-                            out.push((col.field.name.clone(), Value::Null));
+                            return Err(null_but_required(&col.field.name));
                         }
                     }
                     Cell::Json(parsed) => {
@@ -1391,12 +1420,15 @@ db { users: User[] }
                 // opcional, si no la columna es nullable-por-tipo (`x: T?`) y
                 // NULL significa `Value::Null` con la clave presente. `x?: T?`
                 // con T nativo nunca llega acá -- ColumnPlan::for_field lo
-                // fuerza a `json` para tener el 3er estado.
+                // fuerza a `json` para tener el 3er estado. Si la clave NO es
+                // opcional NI el tipo declarado es `T?`, un NULL acá es el
+                // mismo desacuerdo real de arriba -- error limpio.
                 None if col.field.optional => {}
-                None => out.push((col.field.name.clone(), Value::Null)),
+                None if matches!(col.field.ty, Type::Optional(_)) => out.push((col.field.name.clone(), Value::Null)),
+                None => return Err(null_but_required(&col.field.name)),
             }
         }
-        out
+        Ok(out)
     }
 
     /// Valor a bindear para `col`, dado el valor del `Value::Struct` de entrada

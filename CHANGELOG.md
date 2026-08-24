@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.29.0] - 2026-08-24
+
+### 🐛 Arreglado
+- **PostgreSQL: NULL en una columna requerida ya no se serializa como `null` en silencio.** Auditando la matriz de comportamiento de auto-migrate (pedida en dos reportes de adopción real) apareció un bug genuino: `connect_postgres` siempre agrega una columna nueva como `NULLABLE` sin importar si el campo es requerido en el `.link` -- una fila insertada antes de ese cambio queda con `NULL` ahí, y hasta esta ronda `row_to_fields` decodificaba eso en silencio como `Value::Null`, mandando `null` a un cliente TypeScript cuyo contrato declara ese campo `string` (no `string | null`). Ahora es un error de runtime limpio -- 5xx JSON normal, nunca un panic que tumbe el proceso entero -- que nombra la colección, el id de la fila y el campo. `row_to_fields` pasó de `Vec<(String, Value)>` a `Result<Vec<(String, Value)>, RuntimeError>`.
+
+### 📝 Documentación
+- **Matriz de comportamiento completa de auto-migrate** (GRAMMAR.md §3.17): columna nueva/eliminada/renombrada, cambio de tipo, y campo requerido↔opcional, para SQLite y PostgreSQL por separado -- el README solo documentaba antes el caso aditivo. Verificada con 5 tests nuevos contra SQLite real (los 5 casos que no son "agregar columna opcional nueva" fallan al conectar) y 1 test nuevo contra un PostgreSQL real para el bug de arriba.
+
+645 tests (6 nuevos). Detalle completo: GRAMMAR.md §3.17 y §3.68.
+
 ## [1.28.0] - 2026-08-24
 
 ### ✨ Nuevo

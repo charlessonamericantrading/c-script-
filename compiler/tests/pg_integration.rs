@@ -1278,3 +1278,74 @@ service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
     assert!(stderr.contains("note"), "el error tiene que nombrar la columna faltante: {stderr}");
     assert!(!stderr.contains("panicked at"), "tiene que fallar LIMPIO, no crashear el proceso: {stderr}");
 }
+
+// ---- matriz de comportamiento de auto-migrate: caso PostgreSQL real que
+// SQLite no puede reproducir por construcción (PLAN.md §9.1.1) ----
+
+#[test]
+fn a_row_with_null_in_a_column_the_link_now_declares_required_fails_that_one_read_without_killing_the_server() {
+    // `connect_postgres` SIEMPRE agrega una columna nueva NULLABLE (nunca
+    // puede saber qué backfillear en filas viejas), sin importar si el
+    // campo es requerido en el `.link` actual -- documentado como límite
+    // real desde antes de esta ronda. Antes de esta ronda, una fila vieja
+    // con NULL ahí decodificaba en SILENCIO a `Value::Null`: el cliente
+    // tipado recibía `null` en un campo que el contrato TypeScript declara
+    // `string` (no `string | null`), sin ningún error en ningún lado --
+    // exactamente la clase de "los dos extremos no están de acuerdo" que
+    // este proyecto viene evitando desde §3.9. Este test crea esa fila a
+    // mano (simulando datos de antes de una migración real) y confirma que
+    // ahora sale un error de runtime limpio -- nunca un panic que tumbe el
+    // proceso entero -- Y que el servidor sigue respondiendo normalmente a
+    // la request SIGUIENTE contra una fila sin ese problema.
+    const COLLECTION: &str = "items_null_required";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\"id\" BIGSERIAL PRIMARY KEY, \"name\" TEXT NOT NULL, \"note\" TEXT)"
+        ))
+        .expect("crear la tabla con 'note' NULLABLE -- como quedaría tras un ADD COLUMN real");
+    client
+        .execute(&format!("INSERT INTO \"{COLLECTION}\" (name, note) VALUES ($1, NULL)"), &[&"fila-vieja-sin-note"])
+        .expect("sembrar una fila con NULL en 'note', como una fila insertada antes de declarar el campo requerido");
+    client
+        .execute(&format!("INSERT INTO \"{COLLECTION}\" (name, note) VALUES ($1, $2)"), &[&"fila-nueva-con-note", &"tiene valor"])
+        .expect("sembrar una segunda fila SIN el problema");
+
+    let temp = TempDir::new("null-required");
+    // "note" declarado REQUERIDO -- la columna física sigue nullable.
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String, note: String }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{
+  rpc list() -> Item[] {{ db.{COLLECTION}.all() }}
+  rpc get(id: Int) -> Item? {{ db.{COLLECTION}.find(id) }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&src, &url);
+
+    // `list()` (que trae las dos filas) tiene que fallar limpio -- ninguna
+    // fila con un problema puede filtrarse a un `Item[]` parcialmente
+    // decodificado.
+    let list_err = server.try_rpc("Items/list", "{}").expect_err("una fila con NULL en un campo requerido no puede listarse en éxito");
+    assert!(list_err.contains("note"), "el error tiene que nombrar el campo: {list_err}");
+    assert!(!list_err.contains("panicked at"), "tiene que ser un error de runtime limpio, no un panic: {list_err}");
+
+    // El servidor sigue vivo: una request contra la fila SIN el problema
+    // responde 200 normal -- confirma que el error de arriba fue un 5xx de
+    // ESA request, no un panic que tiró abajo el proceso entero.
+    let good = server.rpc("Items/get", r#"{"id":2}"#);
+    assert_eq!(good["name"], "fila-nueva-con-note");
+    assert_eq!(good["note"], "tiene valor");
+}
