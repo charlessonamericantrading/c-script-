@@ -91,7 +91,12 @@ impl ColumnPlan {
             other => other,
         };
         match effective_ty {
-            Type::Int | Type::Int64 | Type::Timestamp => ColumnKind::Int,
+            Type::Int | Type::Int64 => ColumnKind::Int,
+            // GRAMMAR.md §3.91: aparte de `Int`/`Int64` -- del lado Postgres
+            // puede ser un `BIGINT` propio de c-script O un `date`/
+            // `timestamp`/`timestamptz` nativo de una tabla adoptada, ver
+            // `ColumnKind::Timestamp`.
+            Type::Timestamp => ColumnKind::Timestamp,
             Type::Float => ColumnKind::Float,
             Type::Bool => ColumnKind::Bool,
             Type::String | Type::Uuid | Type::Enum(_) => ColumnKind::Text,

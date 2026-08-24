@@ -1179,13 +1179,17 @@ fn introspect_generates_a_link_file_that_actually_works_against_the_real_table()
                 \"name\" TEXT NOT NULL, \
                 \"nickname\" TEXT, \
                 \"active\" BOOLEAN NOT NULL, \
-                \"balance\" DOUBLE PRECISION NOT NULL\
+                \"balance\" DOUBLE PRECISION NOT NULL, \
+                \"signup_date\" DATE NOT NULL\
             )"
         ))
         .expect("crear la tabla 'legacy' a mano, como si ya existiera de otro sistema");
     client
         .execute(
-            &format!("INSERT INTO \"{COLLECTION}\" (name, nickname, active, balance) VALUES ('Ada', NULL, true, 42.5)"),
+            &format!(
+                "INSERT INTO \"{COLLECTION}\" (name, nickname, active, balance, signup_date) \
+                 VALUES ('Ada', NULL, true, 42.5, '2026-08-24'::date)"
+            ),
             &[],
         )
         .expect("sembrar una fila real");
@@ -1201,6 +1205,10 @@ fn introspect_generates_a_link_file_that_actually_works_against_the_real_table()
     assert!(generated.contains("nickname: String?,"), "nullable tiene que salir como String?: {generated}");
     assert!(generated.contains("active: Bool,"), "{generated}");
     assert!(generated.contains("balance: Float,"), "{generated}");
+    // GRAMMAR.md §3.91: un `date` nativo mapea a `Timestamp`, sin
+    // advertencia -- y decodifica de verdad más abajo, no solo "parece"
+    // el tipo correcto en el .link generado.
+    assert!(generated.contains("signup_date: Timestamp,"), "{generated}");
     assert!(generated.contains(&format!("{COLLECTION}: LegacyCustomers[]")), "{generated}");
 
     // Verificación fuerte: el .link generado no solo "parece" correcto --
@@ -1220,6 +1228,7 @@ fn introspect_generates_a_link_file_that_actually_works_against_the_real_table()
     assert_eq!(arr[0]["nickname"], serde_json::Value::Null);
     assert_eq!(arr[0]["active"], true);
     assert_eq!(arr[0]["balance"], 42.5);
+    assert_eq!(arr[0]["signup_date"], "2026-08-24T00:00:00.000Z", "{arr:?}");
 }
 
 #[test]
@@ -1238,7 +1247,7 @@ fn introspect_warns_about_columns_it_cannot_map_with_confidence() {
             "CREATE TABLE \"{COLLECTION}\" (\
                 \"id\" BIGSERIAL PRIMARY KEY, \
                 \"payload\" JSONB NOT NULL, \
-                \"happened_at\" TIMESTAMPTZ NOT NULL\
+                \"opens_at\" TIME NOT NULL\
             )"
         ))
         .expect("crear la tabla con columnas 'raras' a mano");
@@ -1256,9 +1265,13 @@ fn introspect_warns_about_columns_it_cannot_map_with_confidence() {
     // (el nombre del campo ES el nombre de columna que usa insert/find/etc.,
     // runtime/db.rs), así que "prolijizarlo" a camelCase acá rompería la
     // conexión real con la tabla.
-    assert!(generated.contains("happened_at: String,"), "{generated}");
+    // `TIME` (sin fecha) sigue sin mapeo exacto -- a diferencia de
+    // `date`/`timestamp`/`timestamptz`, que desde GRAMMAR.md §3.91 mapean
+    // a `Timestamp` sin advertencia (ver
+    // `introspect_generates_a_link_file_that_actually_works_against_the_real_table`).
+    assert!(generated.contains("opens_at: String,"), "{generated}");
     assert!(warnings.contains("payload") && warnings.to_lowercase().contains("jsonb"), "stderr: {warnings}");
-    assert!(warnings.contains("happened_at") && warnings.to_lowercase().contains("timestamp"), "stderr: {warnings}");
+    assert!(warnings.contains("opens_at") && warnings.to_lowercase().contains("time"), "stderr: {warnings}");
 }
 
 // ---- modo adopción (`--adopt-existing`/`LINK_ADOPT_EXISTING`, GRAMMAR.md §3.67) ----
@@ -1312,6 +1325,70 @@ service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
     assert_eq!(rows.len(), 1, "la fila sembrada a mano tiene que seguir ahí -- adoptar no crea ni vacía la tabla");
     assert_eq!(rows[0]["name"], "Ada");
     assert!(rows[0].get("legacy_note").is_none(), "una columna no declarada no debe filtrarse a la respuesta");
+}
+
+// GRAMMAR.md §3.91: un campo `Timestamp` decodifica correctamente contra
+// una columna `date`/`timestamp`/`timestamptz` NATIVA de Postgres, no solo
+// contra el `BIGINT` propio de c-script -- encontrado auditando un reporte
+// de adopción real (MyFinance): antes de esta ronda, una tabla YA
+// EXISTENTE con columnas de fecha nativas (el caso normal al adoptar un
+// sistema en producción) fallaba al leer la primera fila real, sin importar
+// si el campo se declaraba `Timestamp` (ninguno de los anchos de entero de
+// `postgres_int_cell` matchea el OID de un tipo temporal nativo) o `String`
+// (el wire binario de un `timestamp` tampoco es texto UTF-8 válido).
+#[test]
+fn a_timestamp_field_decodes_a_native_postgres_date_and_timestamptz_column() {
+    const COLLECTION: &str = "facturas_fecha_nativa";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"fecha_emision\" date NOT NULL, \
+                \"created_at\" timestamptz NOT NULL, \
+                \"updated_at\" timestamp NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla legacy a mano, con columnas de fecha NATIVAS de Postgres");
+    // Sembrada con SQL crudo -- exactamente como llegan los datos reales de
+    // un sistema que YA estaba en producción antes de adoptarlo, nunca
+    // escritos por el propio c-script.
+    client
+        .execute(
+            &format!(
+                "INSERT INTO \"{COLLECTION}\" (fecha_emision, created_at, updated_at) VALUES \
+                 ('2026-08-24'::date, '2026-08-24T14:30:00Z'::timestamptz, '2026-08-24T14:30:00'::timestamp)"
+            ),
+            &[],
+        )
+        .expect("sembrar una fila con SQL crudo, columnas de fecha nativas");
+
+    let temp = TempDir::new("native-timestamp");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Factura = {{ id: Int, fechaEmision: Timestamp, createdAt: Timestamp, updatedAt: Timestamp }}
+db {{ {COLLECTION}: Factura[] }}
+service Facturas {{ rpc list() -> Factura[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+    let listed = server.rpc("Facturas/list", "{}");
+    let rows = listed.as_array().expect("se esperaba una lista");
+    assert_eq!(rows.len(), 1, "body: {listed:?}");
+    assert_eq!(rows[0]["fechaEmision"], "2026-08-24T00:00:00.000Z", "date nativo: {rows:?}");
+    assert_eq!(rows[0]["createdAt"], "2026-08-24T14:30:00.000Z", "timestamptz nativo: {rows:?}");
+    assert_eq!(rows[0]["updatedAt"], "2026-08-24T14:30:00.000Z", "timestamp (sin tz) nativo: {rows:?}");
 }
 
 #[test]

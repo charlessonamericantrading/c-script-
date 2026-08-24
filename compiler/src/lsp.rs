@@ -1277,6 +1277,7 @@ pub fn get_completions(source: &str, line0: usize, col0: usize, full_program: Op
 
     let builtin_fns = [
         ("now", "Built-in: Get current Timestamp in UTC"),
+        ("dateFromParts", "Built-in: Construct a Timestamp from calendar parts dateFromParts(year, month, day, hour, minute, second)"),
         ("assert", "Built-in: Assert condition assert(cond, [msg])"),
         ("panic", "Built-in: Panic and terminate execution with message"),
     ];

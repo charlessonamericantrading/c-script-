@@ -2605,6 +2605,17 @@ impl Checker {
                 if name == "now" {
                     return Ok(Type::Function(vec![], Box::new(Type::Timestamp)));
                 }
+                // GRAMMAR.md §3.90: cierra el límite que quedaba abierto en
+                // §3.31 ("un Timestamp solo llega de un rpc o de la base,
+                // nunca se CONSTRUYE arbitrariamente adentro del backend")
+                // -- `now()` solo da el INSTANTE actual, esto da cualquier
+                // fecha/hora de calendario (ej. el límite de un trimestre).
+                if name == "dateFromParts" {
+                    return Ok(Type::Function(
+                        vec![Type::Int, Type::Int, Type::Int, Type::Int, Type::Int, Type::Int],
+                        Box::new(Type::Timestamp),
+                    ));
+                }
                 if name == "assert" {
                     return Ok(Type::Function(vec![Type::Bool], Box::new(Type::Void)));
                 }
@@ -2623,7 +2634,7 @@ impl Checker {
                 if let Some((params, ret)) = self.fns.get(name) {
                     return Ok(Type::Function(params.clone(), Box::new(ret.clone())));
                 }
-                let mut candidates: Vec<&str> = vec!["db", "auth", "now", "assert", "panic"];
+                let mut candidates: Vec<&str> = vec!["db", "auth", "now", "dateFromParts", "assert", "panic"];
                 candidates.extend(env.keys().map(String::as_str));
                 candidates.extend(self.consts.keys().map(String::as_str));
                 candidates.extend(self.fns.keys().map(String::as_str));
@@ -4441,6 +4452,24 @@ type T = { id: Int, s: Status }")
         assert!(check_source("fn current() -> Timestamp { let f = now; f() }").is_ok());
         assert!(check_source("fn bad() -> Timestamp { now(123) }").is_err());
         assert!(check_source("fn bad_ret() -> Int { now() }").is_err());
+    }
+
+    /// `dateFromParts(year, month, day, hour, minute, second) -> Timestamp`
+    /// (GRAMMAR.md §3.90).
+    #[test]
+    fn date_from_parts_builtin_takes_six_ints_and_returns_timestamp() {
+        assert!(check_source("fn boundary() -> Timestamp { dateFromParts(2026, 1, 1, 0, 0, 0) }").is_ok());
+        // Como `now`, referenciable como valor de primera clase.
+        assert!(check_source("fn boundary() -> Timestamp { let f = dateFromParts; f(2026, 1, 1, 0, 0, 0) }").is_ok());
+
+        let too_few = check_source("fn bad() -> Timestamp { dateFromParts(2026, 1, 1) }");
+        assert!(too_few.is_err());
+
+        let wrong_type = check_source("fn bad() -> Timestamp { dateFromParts(\"2026\", 1, 1, 0, 0, 0) }");
+        assert!(wrong_type.is_err());
+
+        let wrong_ret = check_source("fn bad() -> Int { dateFromParts(2026, 1, 1, 0, 0, 0) }");
+        assert!(wrong_ret.is_err());
     }
 
     #[test]

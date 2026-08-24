@@ -425,6 +425,9 @@ pub(crate) fn eval_expr(
             if name == "now" {
                 return Ok(Value::FnRef("now".to_string()));
             }
+            if name == "dateFromParts" {
+                return Ok(Value::FnRef("dateFromParts".to_string()));
+            }
             if name == "assert" {
                 return Ok(Value::FnRef("assert".to_string()));
             }
@@ -470,6 +473,10 @@ pub(crate) fn eval_expr(
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
                         return Ok(Value::Timestamp(now_ms));
+                    }
+                    if name == "dateFromParts" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_date_from_parts(arg_vs);
                     }
                     if name == "assert" {
                         let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
@@ -1042,6 +1049,9 @@ fn call_callable(
                     .unwrap_or(0);
                 return Ok(Value::Timestamp(now_ms));
             }
+            if name == "dateFromParts" && !fns.contains_key("dateFromParts") {
+                return call_date_from_parts(arg_vs);
+            }
             if name == "assert" && !fns.contains_key("assert") {
                 let cond = match arg_vs.first() {
                     Some(Value::Bool(b)) => *b,
@@ -1190,6 +1200,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.ct_eq(b).into()
+}
+
+/// `dateFromParts(year, month, day, hour, minute, second) -> Timestamp`
+/// (GRAMMAR.md §3.90) -- compartido entre los dos caminos de llamada
+/// (`Expr::Call` directo y `call_callable` cuando se lo pasa como valor de
+/// primera clase, ej. `now`), mismo criterio que el resto de los builtins
+/// sin receptor. Una fecha inválida (mes 13, 30 de febrero, ...) es un
+/// `bad_request` (400) -- error del CALLER, no un bug del servidor.
+fn call_date_from_parts(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
+    let [year, month, day, hour, minute, second]: [Value; 6] = arg_vs
+        .try_into()
+        .map_err(|_| err("'dateFromParts' requiere 6 argumentos (year, month, day, hour, minute, second)"))?;
+    let ms = timestamp::date_from_parts(as_int(&year)?, as_int(&month)?, as_int(&day)?, as_int(&hour)?, as_int(&minute)?, as_int(&second)?)
+        .map_err(RuntimeError::bad_request)?;
+    Ok(Value::Timestamp(ms))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4262,6 +4287,68 @@ mod tests {
         assert!(parsed.is_some(), "now() devolvió un timestamp inválido: {s}");
         // Debe ser posterior al año 2024 (milisegundos > 1_700_000_000_000)
         assert!(parsed.unwrap() > 1_700_000_000_000);
+    }
+
+    /// `dateFromParts` (GRAMMAR.md §3.90): el caso real que lo motivó -- un
+    /// rpc que calcula el límite de un trimestre a partir de `año`/
+    /// `trimestre`, algo imposible de escribir antes de esta ronda (§3.31
+    /// documentaba "sin construcción desde código fuente" como límite
+    /// deliberado).
+    #[test]
+    fn date_from_parts_builds_a_quarter_boundary_end_to_end() {
+        let tokens = crate::lexer::tokenize(
+            r#"
+            service S {
+                rpc quarterStart(year: Int, quarter: Int) -> Timestamp {
+                    let month = (quarter - 1) * 3 + 1;
+                    dateFromParts(year, month, 1, 0, 0, 0)
+                }
+            }
+        "#,
+        )
+        .unwrap();
+        let program = crate::parser::parse(tokens).unwrap();
+        let db = Db::seeded();
+
+        let q1 = invoke_rpc(&program, "S", "quarterStart", &json!({"year": 2026, "quarter": 1}), &db).unwrap();
+        assert_eq!(q1, json!("2026-01-01T00:00:00.000Z"));
+
+        let q3 = invoke_rpc(&program, "S", "quarterStart", &json!({"year": 2026, "quarter": 3}), &db).unwrap();
+        assert_eq!(q3, json!("2026-07-01T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn date_from_parts_is_usable_as_a_first_class_value() {
+        let tokens = crate::lexer::tokenize(
+            r#"
+            service S {
+                rpc build() -> Timestamp {
+                    let f = dateFromParts;
+                    f(2026, 1, 1, 0, 0, 0)
+                }
+            }
+        "#,
+        )
+        .unwrap();
+        let program = crate::parser::parse(tokens).unwrap();
+        let res = invoke_rpc(&program, "S", "build", &json!({}), &Db::seeded()).unwrap();
+        assert_eq!(res, json!("2026-01-01T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn date_from_parts_rejects_an_invalid_calendar_date_as_a_bad_request() {
+        let tokens = crate::lexer::tokenize(
+            r#"
+            service S {
+                rpc bad() -> Timestamp { dateFromParts(2026, 2, 30, 0, 0, 0) }
+            }
+        "#,
+        )
+        .unwrap();
+        let program = crate::parser::parse(tokens).unwrap();
+        let e = invoke_rpc(&program, "S", "bad", &json!({}), &Db::seeded()).expect_err("30 de febrero no existe");
+        assert_eq!(e.kind, ErrorKind::BadRequest, "una fecha inválida es error del CALLER, no del servidor: {e}");
+        assert!(e.message.contains("2026-02-30"), "{e}");
     }
 
     #[test]

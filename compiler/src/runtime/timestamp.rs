@@ -105,6 +105,70 @@ pub(crate) fn parse_iso8601_millis(s: &str) -> Option<i64> {
     Some(days * MS_PER_DAY + hour * MS_PER_HOUR + min * MS_PER_MIN + sec * MS_PER_SEC + ms)
 }
 
+/// Cuántos días separan el epoch de POSTGRES (2000-01-01, el que usan sus
+/// tipos binarios `date`/`timestamp`/`timestamptz`) del epoch de c-script
+/// (1970-01-01, GRAMMAR.md §3.31) -- calculado con `days_from_civil`, no un
+/// número mágico hardcodeado, así que queda claro DE DÓNDE sale (y un test
+/// lo fija contra el valor público conocido, 10957).
+const PG_EPOCH_DAYS_SINCE_UNIX_EPOCH: i64 = 10_957;
+
+/// Milisegundos-desde-1970 (la representación interna de `Timestamp`,
+/// GRAMMAR.md §3.31) a partir de microsegundos-desde-2000-01-01 -- la forma
+/// binaria EXACTA en la que Postgres guarda `timestamp`/`timestamptz`
+/// (GRAMMAR.md §3.91). `div_euclid`, no `/` cruda -- mismo motivo que
+/// `format_iso8601_millis`: para un valor negativo (una fecha anterior al
+/// año 2000), la división truncada redondearía hacia 0 en vez de hacia
+/// abajo.
+pub(crate) fn millis_from_pg_timestamp_micros(micros: i64) -> i64 {
+    micros.div_euclid(1000) + PG_EPOCH_DAYS_SINCE_UNIX_EPOCH * MS_PER_DAY
+}
+
+/// Como `millis_from_pg_timestamp_micros`, para la forma binaria de un
+/// `date` nativo de Postgres -- días (no microsegundos) desde 2000-01-01.
+pub(crate) fn millis_from_pg_date_days(days: i32) -> i64 {
+    (i64::from(days) + PG_EPOCH_DAYS_SINCE_UNIX_EPOCH) * MS_PER_DAY
+}
+
+/// `dateFromParts(year, month, day, hour, minute, second) -> Timestamp`
+/// (GRAMMAR.md §3.90): construye un `Timestamp` arbitrario a partir de sus
+/// componentes de calendario -- cierra el límite que §3.31 dejaba abierto a
+/// propósito ("un `Timestamp` solo llega de un `rpc` o de la base, nunca se
+/// construye"). Reusa `parse_iso8601_millis` armando el string de forma fija
+/// (milisegundos siempre `.000`) en vez de reimplementar la validación de
+/// calendario -- un solo lugar decide qué fecha "existe de verdad".
+///
+/// Rangos validados ACÁ (antes de llegar a `parse_iso8601_millis`) para dar
+/// un mensaje que nombra CUÁL campo está mal, en vez del `None` genérico
+/// que ese parser da: `parse_iso8601_millis` solo detecta un día que no
+/// existe DENTRO de un mes válido (30 de febrero), no un mes 13 o una hora
+/// 25, que romperían el formato de ancho fijo antes de llegar a esa
+/// comprobación.
+pub(crate) fn date_from_parts(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Result<i64, String> {
+    // Mismo límite de 4 dígitos que el parseo de un Timestamp que llega por
+    // el wire (GRAMMAR.md §3.31) -- consistente en los dos sentidos.
+    if !(0..=9999).contains(&year) {
+        return Err(format!("dateFromParts: 'year' debe estar entre 0 y 9999, se recibió {year}"));
+    }
+    if !(1..=12).contains(&month) {
+        return Err(format!("dateFromParts: 'month' debe estar entre 1 y 12, se recibió {month}"));
+    }
+    if !(1..=31).contains(&day) {
+        return Err(format!("dateFromParts: 'day' debe estar entre 1 y 31, se recibió {day}"));
+    }
+    if !(0..=23).contains(&hour) {
+        return Err(format!("dateFromParts: 'hour' debe estar entre 0 y 23, se recibió {hour}"));
+    }
+    if !(0..=59).contains(&minute) {
+        return Err(format!("dateFromParts: 'minute' debe estar entre 0 y 59, se recibió {minute}"));
+    }
+    if !(0..=59).contains(&second) {
+        return Err(format!("dateFromParts: 'second' debe estar entre 0 y 59, se recibió {second}"));
+    }
+    let s = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.000Z");
+    parse_iso8601_millis(&s)
+        .ok_or_else(|| format!("dateFromParts: '{year:04}-{month:02}-{day:02}' no es una fecha de calendario que exista (ej. 30 de febrero)"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +225,108 @@ mod tests {
         ] {
             assert_eq!(parse_iso8601_millis(bad), None, "'{bad}' no debería parsear");
         }
+    }
+
+    // ---- decodificación de `date`/`timestamp` nativos de Postgres (GRAMMAR.md §3.91) ----
+
+    #[test]
+    fn pg_epoch_constant_matches_the_calendar_algorithm() {
+        // El literal hardcodeado (10957, para no recalcularlo en cada
+        // conversión) tiene que coincidir con lo que el propio algoritmo de
+        // calendario da -- si alguien lo escribió mal a mano, este test lo
+        // atrapa.
+        assert_eq!(PG_EPOCH_DAYS_SINCE_UNIX_EPOCH, days_from_civil(2000, 1, 1));
+    }
+
+    #[test]
+    fn pg_timestamp_micros_at_its_own_epoch_matches_the_known_unix_millis() {
+        // 2000-01-01T00:00:00Z en milisegundos-desde-1970 es un valor
+        // públicamente conocido (946684800000) -- ancla independiente,
+        // aparte de la propia constante que se está probando.
+        assert_eq!(millis_from_pg_timestamp_micros(0), 946_684_800_000);
+        assert_eq!(format_iso8601_millis(millis_from_pg_timestamp_micros(0)), "2000-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn pg_timestamp_micros_before_its_epoch_is_negative_and_correct() {
+        // Un valor negativo de postgres (antes de su propio epoch) tiene
+        // que seguir dando la fecha correcta, no redondear mal por usar
+        // división truncada en vez de div_euclid.
+        let one_day_before = -86_400_000_000i64; // -1 día en microsegundos
+        assert_eq!(format_iso8601_millis(millis_from_pg_timestamp_micros(one_day_before)), "1999-12-31T00:00:00.000Z");
+    }
+
+    #[test]
+    fn pg_timestamp_micros_truncates_to_millisecond_precision() {
+        // c-script solo tiene precisión de milisegundos (GRAMMAR.md §3.31)
+        // -- microsegundos de más se truncan, no se redondean ni fallan.
+        let half_a_millisecond = 500; // microsegundos, relativo al epoch de Postgres
+        assert_eq!(millis_from_pg_timestamp_micros(half_a_millisecond), 946_684_800_000);
+    }
+
+    #[test]
+    fn pg_date_days_at_its_own_epoch_matches_the_known_unix_millis() {
+        assert_eq!(millis_from_pg_date_days(0), 946_684_800_000);
+        assert_eq!(format_iso8601_millis(millis_from_pg_date_days(0)), "2000-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn pg_date_days_round_trips_a_real_calendar_date() {
+        // 2026-08-24 -- días desde el epoch de Postgres calculados con el
+        // MISMO algoritmo de calendario (independiente de la conversión que
+        // se está probando).
+        let days_since_pg_epoch = (days_from_civil(2026, 8, 24) - PG_EPOCH_DAYS_SINCE_UNIX_EPOCH) as i32;
+        assert_eq!(format_iso8601_millis(millis_from_pg_date_days(days_since_pg_epoch)), "2026-08-24T00:00:00.000Z");
+    }
+
+    // ---- `dateFromParts` (GRAMMAR.md §3.90) ----
+
+    #[test]
+    fn date_from_parts_matches_the_equivalent_iso8601_string() {
+        let ms = date_from_parts(2026, 1, 1, 0, 0, 0).expect("1 de enero de 2026 existe");
+        assert_eq!(ms, parse_iso8601_millis("2026-01-01T00:00:00.000Z").unwrap());
+        assert_eq!(format_iso8601_millis(ms), "2026-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn date_from_parts_supports_a_full_time_of_day() {
+        let ms = date_from_parts(2026, 8, 24, 14, 30, 45).unwrap();
+        assert_eq!(format_iso8601_millis(ms), "2026-08-24T14:30:45.000Z");
+    }
+
+    #[test]
+    fn date_from_parts_rejects_a_day_that_does_not_exist() {
+        let err = date_from_parts(2026, 2, 30, 0, 0, 0).expect_err("30 de febrero no existe");
+        assert!(err.contains("2026-02-30"), "{err}");
+    }
+
+    #[test]
+    fn date_from_parts_rejects_each_out_of_range_field_naming_it() {
+        assert!(date_from_parts(2026, 0, 1, 0, 0, 0).unwrap_err().contains("month"));
+        assert!(date_from_parts(2026, 13, 1, 0, 0, 0).unwrap_err().contains("month"));
+        assert!(date_from_parts(2026, 1, 0, 0, 0, 0).unwrap_err().contains("day"));
+        assert!(date_from_parts(2026, 1, 32, 0, 0, 0).unwrap_err().contains("day"));
+        assert!(date_from_parts(2026, 1, 1, 24, 0, 0).unwrap_err().contains("hour"));
+        assert!(date_from_parts(2026, 1, 1, 0, 60, 0).unwrap_err().contains("minute"));
+        assert!(date_from_parts(2026, 1, 1, 0, 0, 60).unwrap_err().contains("second"));
+        assert!(date_from_parts(-1, 1, 1, 0, 0, 0).unwrap_err().contains("year"));
+        assert!(date_from_parts(10000, 1, 1, 0, 0, 0).unwrap_err().contains("year"));
+    }
+
+    #[test]
+    fn date_from_parts_supports_dates_before_1970() {
+        let ms = date_from_parts(1969, 12, 31, 23, 59, 59).unwrap();
+        assert!(ms < 0, "una fecha antes del epoch debe dar milisegundos negativos");
+        assert_eq!(format_iso8601_millis(ms), "1969-12-31T23:59:59.000Z");
+    }
+
+    /// El caso real que motiva esto (GRAMMAR.md §3.90): el límite de un
+    /// trimestre se puede construir y comparar contra un Timestamp real.
+    #[test]
+    fn date_from_parts_builds_a_usable_quarter_boundary() {
+        let q1_start = date_from_parts(2026, 1, 1, 0, 0, 0).unwrap();
+        let q2_start = date_from_parts(2026, 4, 1, 0, 0, 0).unwrap();
+        let inside_q1 = parse_iso8601_millis("2026-02-15T10:00:00.000Z").unwrap();
+        assert!(inside_q1 >= q1_start && inside_q1 < q2_start, "15 de febrero debe caer dentro del Q1");
     }
 }

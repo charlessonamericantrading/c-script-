@@ -39,6 +39,16 @@ pub(crate) enum Cell {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum ColumnKind {
     Int,
+    /// Un campo `Type::Timestamp` (GRAMMAR.md §3.31/§3.91) -- distinto de
+    /// `Int`/`Int64` porque del lado Postgres puede venir de UNA de dos
+    /// formas físicas MUY distintas: `BIGINT` con milisegundos (la
+    /// convención propia de c-script, lo que `linkc build` crea) o un
+    /// `date`/`timestamp`/`timestamptz` NATIVO de Postgres (una tabla ya
+    /// existente, adoptada) -- ver `postgres_timestamp_cell`. Del lado
+    /// SQLite se comporta exactamente igual que `Int` (SQLite no tiene un
+    /// tipo temporal nativo separado, así que no hay ambigüedad que
+    /// resolver ahí).
+    Timestamp,
     Float,
     Text,
     Bool,
@@ -239,7 +249,10 @@ fn with_reconnect<T>(
 
 fn sqlite_cell(row: &rusqlite::Row, i: usize, kind: ColumnKind) -> rusqlite::Result<Cell> {
     Ok(match kind {
-        ColumnKind::Int => match row.get::<_, Option<i64>>(i)? {
+        // SQLite no tiene un tipo temporal nativo separado -- una columna
+        // `Timestamp` es siempre INTEGER con milisegundos, sin la
+        // ambigüedad que sí existe del lado Postgres (ver `ColumnKind::Timestamp`).
+        ColumnKind::Int | ColumnKind::Timestamp => match row.get::<_, Option<i64>>(i)? {
             Some(n) => Cell::Int(n),
             None => Cell::Null,
         },
@@ -284,9 +297,80 @@ fn postgres_int_cell(row: &postgres::Row, i: usize) -> Result<Option<i64>, Strin
     row.try_get::<_, Option<i16>>(i).map(|v| v.map(i64::from)).map_err(|e| e.to_string())
 }
 
+/// Decodifica el binario CRUDO que Postgres manda para `timestamp`/
+/// `timestamptz` (8 bytes, entero de 64 bits big-endian, microsegundos
+/// desde su propio epoch 2000-01-01 -- IDÉNTICO para las dos variantes: la
+/// diferencia "with/without time zone" es de FORMATEO en texto, nunca de
+/// representación binaria) -- GRAMMAR.md §3.91. `postgres`/`postgres-types`
+/// no ofrece esto sin sumar la dependencia `chrono`; se implementa a mano
+/// en vez de eso, mismo espíritu que el algoritmo de calendario de Hinnant
+/// en `runtime/timestamp.rs` -- un formato binario chico y documentado por
+/// el propio protocolo de Postgres no amerita una dependencia nueva.
+struct PgTimestampMicros(i64);
+
+impl<'a> postgres::types::FromSql<'a> for PgTimestampMicros {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let bytes: [u8; 8] = raw.try_into().map_err(|_| format!("'{ty}': se esperaban 8 bytes, llegaron {}", raw.len()))?;
+        Ok(PgTimestampMicros(i64::from_be_bytes(bytes)))
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        matches!(*ty, postgres::types::Type::TIMESTAMP | postgres::types::Type::TIMESTAMPTZ)
+    }
+}
+
+/// Como `PgTimestampMicros`, para `date` nativo -- 4 bytes, entero de 32
+/// bits big-endian, DÍAS (no microsegundos) desde el mismo epoch 2000-01-01.
+struct PgDateDays(i32);
+
+impl<'a> postgres::types::FromSql<'a> for PgDateDays {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let bytes: [u8; 4] = raw.try_into().map_err(|_| format!("'{ty}': se esperaban 4 bytes, llegaron {}", raw.len()))?;
+        Ok(PgDateDays(i32::from_be_bytes(bytes)))
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        matches!(*ty, postgres::types::Type::DATE)
+    }
+}
+
+/// Una columna `Timestamp` (GRAMMAR.md §3.31/§3.91) contra Postgres puede
+/// ser físicamente UNA de dos cosas MUY distintas -- se prueban en orden,
+/// mismo criterio que `postgres_int_cell` con los tres anchos de entero:
+///
+/// 1. `BIGINT` con milisegundos-desde-1970 -- la convención propia de
+///    c-script, lo que `linkc build` crea para una tabla nueva.
+/// 2. `timestamp`/`timestamptz`/`date` NATIVO de Postgres -- una tabla YA
+///    EXISTENTE, adoptada (`--adopt-existing`/`linkc introspect`), que
+///    nunca pasó por `linkc build`.
+///
+/// Encontrado auditando un reporte de adopción real (MyFinance): antes de
+/// esta ronda, una columna `date`/`timestamp` nativa declarada como
+/// `Timestamp` fallaba al leer la primera fila real -- ninguno de los tres
+/// anchos de entero de `postgres_int_cell` matchea el OID de esos tipos
+/// (`try_get` exige que el OID de la columna matchee EXACTO al tipo Rust
+/// pedido), así que la única alternativa documentada era declarar el campo
+/// como `String` -- que a su vez fallaba igual, por el motivo opuesto (el
+/// wire binario de un `timestamp` tampoco es texto UTF-8 válido).
+fn postgres_timestamp_cell(row: &postgres::Row, i: usize) -> Result<Option<i64>, String> {
+    if let Ok(v) = row.try_get::<_, Option<i64>>(i) {
+        return Ok(v);
+    }
+    if let Ok(v) = row.try_get::<_, Option<PgTimestampMicros>>(i) {
+        return Ok(v.map(|PgTimestampMicros(micros)| super::timestamp::millis_from_pg_timestamp_micros(micros)));
+    }
+    row.try_get::<_, Option<PgDateDays>>(i)
+        .map(|v| v.map(|PgDateDays(days)| super::timestamp::millis_from_pg_date_days(days)))
+        .map_err(|e| e.to_string())
+}
+
 fn postgres_cell(row: &postgres::Row, i: usize, kind: ColumnKind) -> Result<Cell, String> {
     Ok(match kind {
         ColumnKind::Int => match postgres_int_cell(row, i)? {
+            Some(n) => Cell::Int(n),
+            None => Cell::Null,
+        },
+        ColumnKind::Timestamp => match postgres_timestamp_cell(row, i)? {
             Some(n) => Cell::Int(n),
             None => Cell::Null,
         },

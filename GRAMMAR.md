@@ -111,6 +111,8 @@
   - [3.87 `/health` verifica conectividad real a la base — RESUELTO](#387-health-verifica-conectividad-real-a-la-base--resuelto)
   - [3.88 Lint: comparación insegura de un secreto con `==` — RESUELTO](#388-lint-comparación-insegura-de-un-secreto-con----resuelto)
   - [3.89 `--trust-proxy`: `@rate_limit` detrás de un proxy real — RESUELTO](#389---trust-proxy-rate_limit-detrás-de-un-proxy-real--resuelto)
+  - [3.90 `dateFromParts(...)`: construir un `Timestamp` arbitrario — RESUELTO](#390-datefromparts-construir-un-timestamp-arbitrario--resuelto)
+  - [3.91 `Timestamp` decodifica `date`/`timestamp`/`timestamptz` nativos de Postgres — RESUELTO](#391-timestamp-decodifica-datetimestamptimestamptz-nativos-de-postgres--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1281,7 +1283,7 @@ La otra fila "no -- nunca se implementó" que quedaba en la tabla de tipos origi
 
 **Solo comparable -- sin aritmética, sin ser scrutinee de `match`, sin métodos.** `<`/`<=`/`>`/`>=`/`==`/`!=` funcionan entre dos `Timestamp` (mismo mecanismo que ordena `Int`); `+`/`-`/`*`/`/`/`%` y `-` unario se rechazan -- no existe un tipo `Duration`, así que "sumar" a un `Timestamp` no tiene un significado definido todavía, diseño futuro aparte. Excluido como scrutinee de `match`, mismo criterio que ya excluye `Float` a propósito. Sin ningún método propio (`.algo()` sobre un `Timestamp` es siempre un error del checker) -- la completion del LSP para un receptor `Timestamp` devuelve una lista vacía explícita, no el fallback genérico con métodos de otros tipos que acá no aplican.
 
-**Sin construcción desde código fuente en v0 -- límite real, documentado, no un olvido.** No hay `now()`: el lenguaje no tiene NINGÚN mecanismo de función builtin sin receptor (`Expr::Call` solo reconoce una `fn` de usuario por nombre, o un método vía `receptor.metodo(...)`) -- agregar uno sería territorio arquitectónico nuevo, no parte de "agregar un tipo". Tampoco hay auto-stamping de una columna tipo `createdAt` al hacer `insert` en `db` -- una decisión de diseño aparte, con sus propios trade-offs (¿es magia sorprendente o la conveniencia esperada?), que amerita su propia ronda si aparece la necesidad real. Un valor `Timestamp` en v0 solo puede: llegar como parámetro de un `rpc` desde el cliente, o ya estar guardado en `db`. Ninguno de los dos queda descartado para siempre, solo fuera de esta ronda.
+**Sin construcción desde código fuente en v0 -- límite real, documentado, no un olvido. [ACTUALIZADO -- ver §3.32 y §3.90].** Al momento de escribir este párrafo, no había `now()`: el lenguaje no tenía NINGÚN mecanismo de función builtin sin receptor (`Expr::Call` solo reconocía una `fn` de usuario por nombre, o un método vía `receptor.metodo(...)`) -- agregar uno era territorio arquitectónico nuevo, no parte de "agregar un tipo". Ese límite quedó resuelto en dos pasos posteriores: §3.32 agregó `now()` (el instante actual), y §3.90 agregó `dateFromParts(...)` (una fecha/hora arbitraria construida a mano, para cálculos como "el primer día del trimestre fiscal"). Tampoco hay auto-stamping de una columna tipo `createdAt` al hacer `insert` en `db` -- ver `@autoUpdate` (GRAMMAR.md, sección de columnas automáticas) para ese caso, que sí quedó resuelto por separado. Un valor `Timestamp` ya no está limitado a llegar como parámetro de un `rpc` o a estar guardado en `db`: también se puede construir en código con `now()` o `dateFromParts(...)`.
 
 ### 3.32 Función builtin `now() -> Timestamp` — RESUELTO
 
@@ -4242,6 +4244,77 @@ LINK_TRUST_PROXY=1 linkc serve app.link 8787   # equivalente
 - **Solo afecta a `@rate_limit`.** `request.header("X-Forwarded-For")` (GRAMMAR.md §3.38) sigue devolviendo el header CRUDO tal cual llegó, sin ningún procesamiento -- este flag no cambia nada de lo que un cuerpo de rpc puede leer directamente.
 
 **Verificado**: `cli_rate_limit.rs` con el binario real como subproceso (5 tests nuevos, sobre 3 que ya existían) -- sin `--trust-proxy`, `X-Forwarded-For` con valores distintos NO separa el balde (todo cuenta contra el mismo límite, probando que el header se ignora); con `--trust-proxy`, cada IP reenviada distinta tiene su propio balde, y el PRIMER hop de una cadena `cliente, proxy1, proxy2` es el que se usa; con `--trust-proxy` pero SIN el header, cae de vuelta a `remote_addr()` sin romper nada; y `LINK_TRUST_PROXY` funciona igual que el flag.
+
+---
+
+### 3.90 `dateFromParts(...)`: construir un `Timestamp` arbitrario — RESUELTO
+
+Encontrado auditando un reporte de adopción real (MyFinance, backend de cálculo de Modelos tributarios 130/303/347): §3.31 documentaba, a propósito, que un `Timestamp` v0 "solo puede llegar como parámetro de un `rpc` desde el cliente, o ya estar guardado en `db`" -- `now()` (§3.32) cerró el caso "el instante ACTUAL", pero construir una fecha ARBITRARIA (ej. "el 1 de enero de 2026", el límite de un trimestre) seguía siendo imposible desde adentro de un `rpc`. Un cálculo que depende de un rango de fechas -- el caso de Modelo 130/303, que necesita el inicio y el fin de un trimestre a partir de `año`/`trimestre` -- no tenía forma de escribirse enteramente en el backend.
+
+<!-- linkc:check -->
+```rust
+service Impuestos {
+  rpc inicioDeTrimestre(anio: Int, trimestre: Int) -> Timestamp {
+    let mes = (trimestre - 1) * 3 + 1;
+    dateFromParts(anio, mes, 1, 0, 0, 0)
+  }
+}
+
+test "el trimestre 3 de 2026 empieza el 1 de julio" {
+  let t = Impuestos.inicioDeTrimestre(2026, 3);
+  assert(t == dateFromParts(2026, 7, 1, 0, 0, 0));
+}
+```
+
+**`dateFromParts(year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int) -> Timestamp`: builtin sin receptor, mismo mecanismo exacto que `now()` (`checker.rs`/`runtime/mod.rs` reconocen el nombre de forma especial, no una `fn` de usuario).** Los 6 argumentos son obligatorios -- sin sobrecarga ni valores por defecto para "solo la fecha" (medianoche implícita se escribe pasando `0, 0, 0` a mano). Milisegundos siempre en `.000` -- sin un séptimo parámetro para eso, fuera de alcance de esta ronda. Reusa `parse_iso8601_millis` (el mismo parser/validador que ya existía para un `Timestamp` que llega por el wire) armando el string ISO-8601 internamente, en vez de reimplementar la validación de calendario -- un solo lugar decide qué fecha "existe de verdad".
+
+**Una fecha inválida es `bad_request` (400), no un panic ni un 500.** `month`/`day`/`hour`/`minute`/`second` fuera de rango (mes 13, hora 25) Y un día que no existe DENTRO de un mes válido (30 de febrero) se rechazan igual -- es información que vino de datos del propio programa (`año`/`trimestre` como parámetros de rpc, por ejemplo), así que un valor mal armado es responsabilidad de quien llama, no un bug del servidor. El mensaje nombra CUÁL campo está mal.
+
+**Límites honestos:**
+- **Siempre UTC, sin zona horaria.** Mismo criterio que el resto de `Timestamp` (§3.31) -- no hay forma de pedir "medianoche en Madrid" directamente, hay que convertir a UTC antes de llamar.
+- **Año limitado a 0-9999 (4 dígitos).** Misma restricción que ya tenía `parse_iso8601_millis` para un `Timestamp` que llega por el wire -- consistente en los dos sentidos, no un límite nuevo.
+- **Sin aritmética de fechas todavía** (sumar/restar días, "el trimestre siguiente"). `dateFromParts` construye un punto fijo; calcular relativo a otro `Timestamp` sigue sin un tipo `Duration` (mismo límite que documenta §3.31).
+
+**Verificado**: 6 tests en `runtime/timestamp.rs` (coincide con el ISO-8601 equivalente, hora completa, rechaza un día que no existe nombrando la fecha, rechaza cada campo fuera de rango nombrándolo, fechas antes de 1970, y el caso real -- construir y comparar el límite de un trimestre), 1 en `checker.rs` (6 `Int` obligatorios, tipa `Timestamp`, referenciable como valor de primera clase igual que `now`) y 3 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (el cálculo de trimestre completo end-to-end, uso como valor de primera clase, y una fecha inválida como 400 nombrando la fecha exacta).
+
+---
+
+### 3.91 `Timestamp` decodifica `date`/`timestamp`/`timestamptz` nativos de Postgres — RESUELTO
+
+La otra mitad del mismo reporte de adopción real (MyFinance): las tablas YA EXISTENTES de un sistema que se adopta casi siempre tienen sus columnas de fecha en el tipo NATIVO de Postgres (`date`/`timestamp`/`timestamptz`), no en el `BIGINT` de milisegundos que `linkc build` genera para un `Timestamp` propio (§3.31). Auditando el código real (`runtime/store.rs`) apareció que esto estaba genuinamente ROTO en los dos sentidos, no solo sin probar:
+
+- **Declarado como `String`** (lo que `linkc introspect`, §3.66, hacía automáticamente hasta esta ronda, con una advertencia): compilaba bien, pero la PRIMERA fila real fallaba al leer -- el wire binario de un `timestamp`/`date` de Postgres no es texto UTF-8, así que ningún `String` puede decodificarlo.
+- **Declarado como `Timestamp`**: TAMBIÉN fallaba -- `postgres_int_cell` (la función que decodifica un `Timestamp`/`Int`/`Int64` del lado Postgres) solo sabía leer enteros de 8/4/2 bytes (`BIGINT`/`INTEGER`/`SMALLINT`), y el OID de un `timestamp`/`date` nativo no matchea NINGUNO de los tres -- `postgres` (la crate) rechaza la lectura si el OID de la columna no coincide EXACTO con lo que el tipo Rust pedido acepta, sin importar que el ancho en bytes coincida por casualidad.
+
+<!-- linkc:fragment -->
+```rust
+// Tabla YA EXISTENTE, con columnas de fecha NATIVAS de Postgres --
+// típicamente vía `--adopt-existing` (§3.67):
+//   CREATE TABLE facturas (
+//     id BIGSERIAL PRIMARY KEY,
+//     fecha_emision date NOT NULL,
+//     created_at timestamptz NOT NULL
+//   );
+type Factura = { id: Int, fechaEmision: Timestamp, createdAt: Timestamp }
+db { facturas: Factura[] }
+
+service Facturas {
+  rpc list() -> Factura[] { db.facturas.all() }
+}
+```
+
+**`ColumnKind::Timestamp`, nuevo -- distinto de `ColumnKind::Int` (que sigue siendo solo para `Int`/`Int64`).** Del lado Postgres (`postgres_timestamp_cell`, `runtime/store.rs`), un campo `Timestamp` prueba EN ORDEN: `BIGINT` (la convención propia de c-script, primero porque es el caso más común para una tabla que `linkc build` creó), después `timestamp`/`timestamptz` nativo (microsegundos desde el epoch de Postgres, 2000-01-01 -- IDÉNTICO en las dos variantes, la diferencia "with/without time zone" es de FORMATEO en texto, nunca de representación binaria), después `date` nativo (días, no microsegundos, desde el mismo epoch). Del lado SQLite, `ColumnKind::Timestamp` se comporta exactamente igual que `Int` -- SQLite no tiene un tipo temporal nativo separado, así que no hay ninguna ambigüedad que resolver ahí.
+
+**Decodificado a MANO, sin sumar la dependencia `chrono`.** `postgres`/`postgres-types` no ofrece un `FromSql` para tipos temporales sin esa dependencia. Se implementó `FromSql` para dos structs locales (`PgTimestampMicros`/`PgDateDays`) que leen el binario CRUDO del wire de Postgres (8 bytes big-endian para timestamp/timestamptz, 4 para date, el formato que el propio protocolo de Postgres documenta) -- mismo espíritu que el algoritmo de calendario de Hinnant que ya vivía en `runtime/timestamp.rs`: un formato binario chico y bien definido no amerita una dependencia nueva. El offset entre los dos epochs (2000-01-01 de Postgres, 1970-01-01 de c-script/Unix) se calcula con el mismo `days_from_civil` que el resto del archivo, no un número mágico suelto.
+
+**`linkc introspect` (§3.66) ahora mapea `date`/`timestamp`/`timestamptz` a `Timestamp` SIN advertencia -- mapeo exacto, ya no un placeholder "revisar a mano".** Antes de esta ronda recomendaba `String` con una advertencia -- una recomendación que en los hechos estaba rota, porque ni `String` ni `Timestamp` decodificaban. `time` (sin fecha) sigue sin mapeo exacto y sigue emitiendo `String` con advertencia -- un `Timestamp` de c-script es un instante completo (fecha + hora), no le cabe una hora suelta sin fecha.
+
+**Límites honestos:**
+- **Solo LECTURA.** Esta ronda resuelve `SELECT`/decodificación -- `insert`/`applyPatch` sobre un campo `Timestamp` siguen escribiendo `BIGINT` sin importar el tipo físico real de la columna, así que ESCRIBIR contra una columna `date`/`timestamp` nativa adoptada (en vez de solo leerla) sigue sin funcionar. No era parte del caso real reportado (MyFinance solo necesita LEER fechas de facturas ya existentes, nunca crearlas desde c-script) -- queda trackeado para una ronda aparte si aparece la necesidad.
+- **Microsegundos truncados a milisegundos**, no redondeados -- mismo límite de precisión que el resto de `Timestamp` (§3.31).
+- **`uuid` nativo de Postgres queda FUERA de esta ronda a propósito.** Auditando este mismo código apareció la misma forma de problema potencial (`Type::Uuid`/`String` decodificando contra el OID de un `uuid` nativo, nunca verificado) -- `linkc introspect` lo señala en su advertencia, pero no se tocó: esta ronda se acotó al caso confirmado y reportado (fechas), no a auditar cada tipo nativo de Postgres de una sola vez.
+
+**Verificado**: 6 tests en `runtime/timestamp.rs` contra los DOS epochs de forma independiente (la constante del offset coincide con el algoritmo de calendario, un ancla pública conocida -- 2000-01-01 en milisegundos-desde-1970 -- para `timestamp` y para `date`, precisión truncada a milisegundos, un valor negativo antes del epoch de Postgres). 2 en `introspect.rs` (mapeo exacto sin advertencia para `date`/`timestamp`/`timestamptz`, `time` sigue advirtiendo). 1 en `pg_integration.rs` contra un PostgreSQL real: una tabla creada y sembrada con SQL crudo (`date`/`timestamptz`/`timestamp` nativos, nunca escritos por c-script), adoptada con `--adopt-existing` declarando los tres campos como `Timestamp`, decodifica la fila real correctamente vía un rpc real. Más un test end-to-end que extiende `introspect_generates_a_link_file_that_actually_works_against_the_real_table`: `linkc introspect` sobre una tabla con una columna `date` real genera `Timestamp` sin advertencia, y el `.link` generado (sin tocar a mano) lee la fila real con la fecha correcta.
 
 ---
 

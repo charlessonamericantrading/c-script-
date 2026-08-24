@@ -9,11 +9,14 @@
 //! suelto). El resultado es un PUNTO DE PARTIDA para revisar a mano, no un
 //! `.link` listo para producción sin mirarlo: cualquier columna que este
 //! módulo no pueda mapear con confianza (JSONB de forma desconocida, un
-//! `timestamp`/`timestamptz` NATIVO -- el `Timestamp` de c-script necesita
-//! milisegundos en `BIGINT`, GRAMMAR.md §3.31, no el tipo nativo de Postgres)
-//! se emite igual, como `String`, con un comentario `/* TODO */` al lado que
-//! dice exactamente qué hace falta revisar -- nunca se omite una columna en
-//! silencio.
+//! `uuid`, un `time` sin fecha) se emite igual, como `String`, con un
+//! comentario `/* TODO */` al lado que dice exactamente qué hace falta
+//! revisar -- nunca se omite una columna en silencio. `date`/`timestamp`/
+//! `timestamptz` NATIVOS de Postgres SÍ mapean con confianza a `Timestamp`
+//! (sin advertencia) desde GRAMMAR.md §3.91 -- antes de esa ronda mapeaban a
+//! `String` con advertencia, un mapeo que en los hechos estaba ROTO (ni
+//! `String` ni `Timestamp` decodificaban una columna así contra una fila
+//! real).
 //!
 //! Los nombres de campo son los nombres REALES de columna SQL, `snake_case`
 //! incluido -- c-script no tiene ningún mecanismo de alias campo->columna
@@ -49,9 +52,18 @@ fn map_pg_type(pg_type: &str, column_name: &str) -> (&'static str, Option<String
         "boolean" => ("Bool", None),
         "double precision" | "real" | "numeric" => ("Float", None),
         "text" | "character varying" | "character" | "citext" => ("String", None),
+        // NO se mapea a `Uuid` (GRAMMAR.md §3.70) a propósito -- ese tipo sí
+        // existe, pero decodificar un `uuid` NATIVO de Postgres contra un
+        // campo `Uuid`/`String` no está verificado (mismo tipo de mapeo
+        // "parece obvio, nunca se probó contra una fila real" que resultó
+        // roto para `date`/`timestamp`, GRAMMAR.md §3.91) -- queda como
+        // `String` con advertencia hasta auditarlo aparte.
         "uuid" => (
             "String",
-            Some(format!("'{column_name}' es uuid -- se mapea a String (el valor de texto), no hay un tipo UUID dedicado")),
+            Some(format!(
+                "'{column_name}' es uuid -- se mapea a String; el tipo 'Uuid' nativo de c-script (GRAMMAR.md §3.70) \
+                 existe, pero decodificarlo contra un uuid NATIVO de Postgres no está verificado todavía, revisar a mano"
+            )),
         ),
         "jsonb" | "json" => (
             "String",
@@ -60,12 +72,22 @@ fn map_pg_type(pg_type: &str, column_name: &str) -> (&'static str, Option<String
                  declará un 'type' propio para ese shape y reemplazá 'String' acá si corresponde"
             )),
         ),
-        "timestamp without time zone" | "timestamp with time zone" | "date" | "time without time zone" => (
+        // GRAMMAR.md §3.91: hasta antes de esa ronda, un `date`/`timestamp`
+        // NATIVO de Postgres (no el `BIGINT` propio de c-script) no
+        // decodificaba -- `Timestamp` acá era un mapeo roto, disfrazado de
+        // "revisar a mano". Ahora que decodifica de verdad (los dos
+        // backends, `runtime/store.rs::postgres_timestamp_cell`), es un
+        // mapeo EXACTO, sin advertencia -- mismo criterio que `bigint`/
+        // `boolean` arriba.
+        "timestamp without time zone" | "timestamp with time zone" | "date" => ("Timestamp", None),
+        // `time` (sin fecha) SIGUE sin mapeo -- un Timestamp de c-script es
+        // un INSTANTE completo (fecha + hora), no le cabe una hora-del-día
+        // suelta sin perder información.
+        "time without time zone" => (
             "String",
             Some(format!(
-                "'{column_name}' es {pg_type} (un tipo de fecha/hora NATIVO de Postgres) -- el 'Timestamp' de \
-                 c-script necesita milisegundos en BIGINT (GRAMMAR.md §3.31), no este tipo nativo; revisar a mano \
-                 (migrar la columna a BIGINT, o convertir en el propio rpc)"
+                "'{column_name}' es time without time zone -- 'Timestamp' de c-script es un INSTANTE completo \
+                 (fecha + hora, GRAMMAR.md §3.31), no le cabe una hora suelta sin fecha; revisar a mano"
             )),
         ),
         other => (
@@ -213,14 +235,37 @@ mod tests {
     }
 
     #[test]
-    fn map_pg_type_flags_jsonb_uuid_and_native_timestamps_with_a_warning() {
+    fn map_pg_type_flags_jsonb_and_uuid_with_a_warning() {
         assert!(map_pg_type("jsonb", "meta").1.is_some());
         assert!(map_pg_type("uuid", "external_id").1.is_some());
-        assert!(map_pg_type("timestamp with time zone", "created_at").1.is_some());
-        assert!(map_pg_type("timestamp without time zone", "created_at").1.is_some());
-        // Los tres siguen dando un tipo VÁLIDO (String) -- nunca se omite la
+        // Los dos siguen dando un tipo VÁLIDO (String) -- nunca se omite la
         // columna del .link generado, aunque necesite revisión.
         assert_eq!(map_pg_type("jsonb", "meta").0, "String");
+    }
+
+    /// GRAMMAR.md §3.91: `date`/`timestamp`/`timestamptz` NATIVOS de
+    /// Postgres decodifican de verdad contra un campo `Timestamp` desde
+    /// esta ronda -- mapeo EXACTO, sin advertencia, mismo criterio que
+    /// `bigint`/`boolean`. Antes de esta ronda mapeaban a `String` con
+    /// advertencia (un mapeo que en los hechos estaba roto: ni `String` ni
+    /// `Timestamp` decodificaban una columna así).
+    #[test]
+    fn map_pg_type_maps_native_date_and_timestamp_to_timestamp_without_a_warning() {
+        for ty in ["date", "timestamp without time zone", "timestamp with time zone"] {
+            let (mapped, warning) = map_pg_type(ty, "created_at");
+            assert_eq!(mapped, "Timestamp", "'{ty}'");
+            assert!(warning.is_none(), "'{ty}' no debería generar advertencia: {warning:?}");
+        }
+    }
+
+    /// `time` (sin fecha) es la única forma temporal que SIGUE sin mapeo
+    /// exacto -- un `Timestamp` de c-script es un instante completo, no le
+    /// cabe una hora suelta.
+    #[test]
+    fn map_pg_type_still_warns_on_a_bare_time_without_a_date() {
+        let (mapped, warning) = map_pg_type("time without time zone", "hora_apertura");
+        assert_eq!(mapped, "String");
+        assert!(warning.is_some());
     }
 
     #[test]
