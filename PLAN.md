@@ -360,6 +360,116 @@ Con las Fases 0 a 3 completadas y el núcleo v1.28.0 plenamente operativo, las s
 
 ---
 
+## 9. Hoja de Ruta Extendida (Fase 5 · Gaps de Adopción Real a Escala)
+
+**Origen** (24/08/2026): dos reportes de adopción real, compartidos por el usuario -- `c-script-wishlist.md` (164 ítems, app financiera "MyFinance" sobre Postgres ya existente) y `peticiones-c-script-linkc.md` (108 ítems, migración real de 17 microservicios dentro de "IgnisLove"). 272 ítems en total, verificados uno por uno contra el código real (GRAMMAR.md §3.1–§3.67 y `README.md`) antes de sumarlos acá -- varios ya estaban resueltos y se descartaron (ver la lista al final de esta sección). El resto se depuró (mucha superposición entre los dos reportes) y se ordenó siguiendo el pedido explícito: **primero todo lo que no bloquea nada externo, al final lo ya trackeado en §8 y lo genuinamente bloqueado**. Dentro de cada subsección, el orden es aproximadamente el de urgencia que los propios reportes señalan.
+
+### 9.1 Documentación (bajo costo, alto valor -- hacer esto primero, sin importar el tamaño del resto)
+1. **Matriz de comportamiento de auto-migrate**: documentar con ejemplos qué hace ante columna nueva (ya cubierto), columna eliminada, columna renombrada, **cambio de tipo** de una columna existente, y campo que pasa de obligatorio a opcional (o al revés) -- hoy el README solo cubre el caso aditivo.
+2. **Comportamiento ante colisión de colección**: documentar explícitamente qué pasa cuando dos `.link` distintos, servidos contra la misma base, declaran la misma colección con esquemas de columnas distintos.
+3. **`CREATE EXTENSION IF NOT EXISTS "pgcrypto"`**: verificar (contra una Postgres gestionada real si hace falta, no solo documentar de oído) si requiere superusuario en proveedores como Neon/RDS/Supabase, y documentarlo en el `schema.pg.sql` generado.
+4. **`link.lock`**: documentar qué garantiza, cuándo hay que regenerarlo, y por qué compilar un `.link` suelto fuera de su carpeta de proyecto avisa que no puede leer los ficheros que declara.
+5. **Guía oficial "SQLite vs PostgreSQL"**: cómo decidir cuál usar para un servicio nuevo.
+6. **Guía oficial de despliegue multi-servicio**: 10+ archivos `.link` en un mismo host -- el README cubre bien un servicio suelto, no una migración real de un monolito a muchos servicios en paralelo.
+7. **Guía oficial de adopción incremental**: convivir con una base de código existente que no está en c-script, sirviendo solo piezas nuevas en `linkc`.
+8. **"AGENTS.md para consumidores"**: una versión del AGENTS.md existente centrada en integrar de forma segura servicios `.link` ya generados, no en compilar el lenguaje.
+9. **Documentar el comportamiento exacto de `SIGTERM`**: verificar primero qué hace hoy `linkc serve` (¿cierra conexiones en curso? ¿flush del WAL de SQLite? ¿timeout?) -- puede que ya se comporte bien y solo falte documentarlo + un test de regresión.
+
+### 9.2 Núcleo del Lenguaje
+1. **Narrowing/desreferencia de `T?` dentro de un `rpc`**: el gap más repetido y con más fricción de los dos reportes -- hoy no hay forma de leer el interior de un opcional dentro de un cuerpo de rpc (`if let`, `?`, `match`, ni siquiera un `.isSome()`/`.isNone()` que permita al menos la rama sin leer el valor). Obligó a mover lógica de negocio real (caducidad de cupón) fuera del servidor en la adopción de IgnisLove. Necesita su propio diseño: mínimo viable es un operador `??` (default) más `.isSome()`/`.isNone()`; narrowing completo tipo `if let Some(x) = opt { ... }` es el objetivo pero es un cambio real en el flujo de tipos del checker.
+2. **Mensaje de error específico para la regla de arriba**: mientras no esté resuelto el punto 1, que el error del compilador (`se esperaba LBrace, se encontró Bang`, hoy) nombre la regla real y sugiera la alternativa documentada (devolver el opcional al cliente y compararlo ahí) -- se puede hacer independientemente y de inmediato.
+3. **Tipo `Uuid` nativo**: hoy hay que usar `String` y validar el formato a mano.
+4. **Tipo `Decimal`/`Money` de precisión exacta**: `Float` es una fuente de error de redondeo conocida y confirmada por dos adoptantes financieros distintos -- necesita su propio diseño (representación interna, mapeo en los dos backends SQL).
+5. **`@deprecated("usa X en su lugar")`**: en un campo o rpc, propagado al `.d.ts` generado como comentario JSDoc.
+6. **Docstrings inline propagados a OpenAPI**: hoy la única documentación de un rpc en el spec generado es su nombre.
+7. **Validadores declarativos por campo** (`@validate(email)`, `@validate(regex, "...")`): cubre a la vez la petición de "validación de request body más allá del tipo" del lado HTTP (§9.4).
+8. **Valores por defecto en campos de `struct`**: hoy solo existen en parámetros de función.
+
+### 9.3 Base de Datos y Consultas
+1. **`db.<c>.upsert(matchFn, insertValue, updateFn)`**: el caso "si existe actualiza, si no inserta" es boilerplate repetido hoy -- confirmado como patrón reimplementado a mano (buscar, borrar, reinsertar con el mismo id) en 4 servicios reales de IgnisLove.
+2. **`db.<c>.insertMany(items)`**: batch insert -- evita N idas y vueltas HTTP secuenciales en un backfill real.
+3. **`db.<c>.count(predicate)` sin traer filas**: hoy `findWhere(...).length()` trae la tabla entera a memoria solo para contar.
+4. **`findWhere`/`deleteWhere` empujados a SQL de verdad**: hoy se evalúan en el intérprete (confirmado en `db.rs`: a diferencia de `sumBy`/etc., no bajan a una cláusula `WHERE`) -- fusionar con el pushdown de `db.<c>.filter(predicate)` ya trackeado en §8.2.2, misma máquina de "predicado estructural a SQL".
+5. **`createdAt`/`updatedAt` automáticos**: gestionados por el runtime sin asignarlos a mano en cada `insert`.
+6. **Soft-delete nativo**: un `deletedAt` gestionado por el runtime, con `all()` filtrando automáticamente las filas borradas.
+7. **`@index` e índices únicos compuestos declarativos**: más allá de la PK.
+8. **Constraints `@check` declarativos** en el `.link`.
+9. **Detección de colisión de nombre de tabla**: que `linkc build`/`linkc serve --db postgres://...` avise (o aborte con `--strict`) si una colección mapea a una tabla que YA EXISTE en la base de destino y no fue creada por ese mismo `.link` -- encontrado en producción real (`telemetry.link` habría chocado con una tabla `events` real de un pipeline de analítica).
+10. **`--db-schema <nombre>` o `--db-prefix`**: namespacing para compartir una base Postgres entre varios `.link` sin pensar en colisiones de nombre.
+11. **`linkc migrate --dry-run`**: mostrar el DDL exacto que se ejecutaría sin aplicarlo, más comportamiento configurable ante una migración que perdería datos (¿aborta por defecto? ¿hace falta `--allow-destructive`?).
+12. **`linkc build --diff <archivo-anterior>`**: qué cambió en el contrato TypeScript generado entre dos versiones del `.link`, para revisión de PR.
+13. **`@cache("60s")` declarativo** sobre un rpc, para lecturas costosas y poco cambiantes.
+14. **Idempotency keys nativas** en rpcs de escritura: hoy hay que implementar la comprobación de "¿ya existe?" a mano antes de cada inserción en un backfill con reintentos.
+
+### 9.4 HTTP y Diseño de API
+1. **Timeout y reintentos configurables en `http.*`**: hoy no está documentado cuál es el timeout por defecto ni si se puede ajustar.
+2. **Hooks de middleware de usuario**: lógica "antes"/"después" de cualquier rpc, para logging o métricas transversales -- cambio real en el modelo de ejecución.
+3. **Webhooks salientes declarativos**: registrar una URL de terceros y que el runtime reintente/firme automáticamente -- simétrico a la verificación de webhooks entrantes que ya existe (`crypto.hmacSha256`).
+4. **Compresión gzip/brotli** de la respuesta, opcional vía flag.
+5. **CORS configurable por ruta**, no solo global (`--cors-origin`).
+6. **HSTS configurable** desde `linkc serve` para cuando el propio proceso termina TLS (hoy asume que siempre hay un proxy delante).
+
+### 9.5 Autenticación y Seguridad
+1. **`@rate_limit` con `X-Forwarded-For` de confianza configurable**: la mitad "proxies de confianza" de lo ya trackeado en §8.3.2 -- confirmado como bloqueo real (todo corre detrás de nginx en la adopción de IgnisLove).
+2. **Revocar todas las sesiones de un usuario**: hoy solo existe `destroySession()` por token individual, no un "cerrar todas las sesiones de este usuario" (confirmado, no existe tal método en `session.rs`).
+3. **Bloqueo de cuenta configurable** tras N intentos fallidos.
+4. **Log de auditoría de autorización estructurado**: quién llamó a qué rpc, con qué rol, y si se permitió o denegó.
+5. **API keys de servicio**: para llamadas servidor-a-servidor, distintas de las sesiones de usuario -- confirmado como gap real (IgnisLove usa `fetch` sin autenticación entre su app Node y cada `linkc serve`, confiando solo en que el puerto no sea alcanzable).
+6. **Escaneo de secretos en tiempo de compilación**: que `linkc build`/`lint` avise si detecta una URL de conexión o API key literal en el código.
+7. **Lint: comparación `==` sobre un campo `secret`/`token`/`password`**: recomendar `crypto.timingSafeEqual` automáticamente.
+8. **Lint: `@requires(Role.X)` que nunca llama a `auth.currentRole()`/`currentUserId()`**: indicio de autorización de fachada.
+9. **Cifrado de campo a nivel de columna** (`@encrypted` en un `String` sensible).
+10. **RBAC por recurso**: permisos más allá de todo-o-nada por rol.
+11. **ABAC**: reglas basadas en atributos del propio recurso (ej. "solo el dueño de la factura").
+
+### 9.6 Almacenamiento y Comunicaciones
+1. **`smtp` con adjuntos y cc/bcc**: `sendToMany`/`sendHtml` ya resueltos (GRAMMAR.md §3.63); adjuntos y cc/bcc siguen sin cubrir. El módulo `storage`/S3 (§8.5) y el envío asíncrono de `smtp` (§8.3.3) ya están trackeados -- este ítem es específicamente lo que falta de `smtp.send` en sí.
+
+### 9.7 CLI y Experiencia de Desarrollador
+1. **`linkc test <archivo> --filter <nombre>`**: ejecutar un solo test por nombre.
+2. **`linkc --version` por archivo generado**: para saber con qué versión exacta del compilador se generó cada `gen/` cuando conviven varias versiones en el tiempo.
+3. **`linkc doctor`**: diagnóstico de entorno (versión, PATH, permisos, conectividad a la DB configurada) antes de un despliegue.
+4. **`--host <dirección>`/`--bind 127.0.0.1`**: hoy `linkc serve` siempre escucha en `0.0.0.0` sin alternativa (confirmado, no existe tal flag) -- depende enteramente del firewall del sistema operativo como única capa de defensa. Gap de seguridad real, no solo de conveniencia.
+5. **Unix domain sockets** (`--socket /run/app.sock`) como alternativa a TCP.
+6. **Límite configurable de tamaño máximo de body** de request.
+7. **Suite de administración de datos**: `linkc db inspect`/`db shell`/`export`/`import`/`seed` -- listar tablas y conteo de filas, REPL de solo lectura, exportar/importar entre entornos o motores, poblar una base nueva desde un fichero.
+8. **RPCs de administración estándar opcionales** (`_admin.vacuum()`, `_admin.tableStats()`) detrás de `@requires(Role.Admin)`.
+9. **Modo "workspace"**: un único proceso sirviendo varios `.link` bajo un mismo puerto, o al menos `linkc serve-all <directorio> --port-base N` que levante todos los `.link` de una carpeta con puertos consecutivos -- confirmado como necesidad real (17 procesos pm2 en IgnisLove, uno por servicio).
+10. **Backoff configurable ante fallo de bind de puerto** (`--restart-backoff`): confirmado con 61 reinicios en ráfaga en un arranque en frío de 13 procesos simultáneos.
+11. **`linkc systemd <archivo> <puerto>`**: generador de unidad systemd, a la par de `linkc docker` que ya existe.
+12. **`linkc pm2-config <archivo> <puerto> -o ecosystem.json`**: generador de configuración PM2.
+
+### 9.8 Observabilidad
+1. **Logging estructurado en JSON** (`--log-format json`) + **nivel de log configurable** (`--log-level warn|info|debug`) -- hoy cada request exitosa deja una línea, ruidoso en producción con tráfico real.
+2. **Métricas Prometheus nativas en `/metrics`**: latencia por rpc, conexiones activas, tamaño de la base -- confirmado, no existe hoy ningún `/metrics`, solo un `/health` fijo.
+3. **Health check configurable**: verificar conectividad real a la base (y a servicios externos declarados), no un 200 fijo.
+4. **Métrica de clientes conectados a un `stream`**: para depurar streaming sin instrumentación externa.
+5. **Métrica de latencia de propagación NOTIFY + cola de reintento acotada**: hoy es best-effort puro y un evento de más de 8000 bytes no llega a otras instancias sin ningún aviso visible.
+
+### 9.9 Diferido -- ya trackeado en §8, prioridad menor que 9.1–9.8
+Por pedido explícito, lo que ya estaba en la hoja de ruta antes de estos dos reportes pasa a continuación de todo lo de arriba, no porque sea menos importante en términos absolutos, sino porque los dos reportes de adopción real no lo señalan como más urgente que lo nuevo: **§8.1.2** (playground multi-archivo), **§8.2.1** (agregación con truncamiento de fecha -- reforzado por peticiones#49), **§8.2.2** (`db.<c>.filter` pushdown -- ahora incluye también `findWhere`/`deleteWhere`, ver §9.3.4), **§8.2.3** (transacciones), **§8.3.1** (limpieza proactiva de sesiones), **§8.3.2** (rate limiting distribuido -- la mitad de estado compartido/Redis; la mitad de `X-Forwarded-For` se adelantó a §9.5.1 por ser más simple y más citada), **§8.3.3** (smtp asíncrono), **§8.4.1** (carga completa de `User` en sesión), **§8.5.1** (módulo `storage`/S3).
+
+### 9.10 Bloqueado -- requiere algo externo o una decisión previa
+No autónomo por diseño, no por pereza -- cada ítem nombra qué falta:
+1. **Publicación en npm** (`link-lang`): credenciales de la cuenta npm del usuario. Ya trackeado en §8.1.1.
+2. **Publicación en VS Code Marketplace / JetBrains / Zed**: cuentas de publisher del usuario en cada marketplace.
+3. **Imagen Docker oficial publicada**: credenciales de un registro (Docker Hub o similar) del usuario.
+4. **Paquetes `apt`/`brew`**: cuentas y claves de firma de cada gestor de paquetes.
+5. **GitHub Action oficial publicada** (`setup-linkc@v1`) en el Marketplace: requiere publicarla bajo la organización/cuenta de GitHub del usuario.
+6. **Integraciones con GCS, Azure Blob, Stripe, Twilio, SQS/RabbitMQ**: el código se puede escribir, pero verificarlo de punta a punta (mismo estándar que el resto de este proyecto: contra el servicio real, no un mock) necesita que el usuario provea credenciales de prueba de cada proveedor.
+7. **OAuth2/OIDC nativo (login social)**: el protocolo se puede implementar, pero verificarlo de verdad necesita un proveedor de identidad real (Google/GitHub/etc.) con una app de prueba registrada por el usuario.
+8. **Backend MySQL/MariaDB**: un backend nuevo a la par de SQLite/Postgres, toca `storage.rs`/`db.rs`/codegen de punta a punta -- necesita decisión explícita de alcance antes de empezar, no es una ronda autocontenida.
+9. **Intérprete multi-hilo**: cambio de arquitectura fundamental -- single-threaded es una decisión de diseño deliberada y documentada en todo GRAMMAR.md. Necesita decisión explícita, no solo una bandera.
+10. **Sharding, réplicas de solo lectura, base separada por tenant**: subsistemas distribuidos genuinamente grandes -- necesitan diseño aprobado antes de implementar.
+11. **Compilación AOT a binario nativo** independiente del intérprete: proyecto grande de backend de codegen, más allá del WASM actual limitado a escalares -- necesita decisión de alcance.
+12. **GraphQL como transporte alternativo**: compite arquitectónicamente con el diseño RPC-first del proyecto -- necesita decisión de si encaja con la tesis del proyecto en absoluto, no solo una implementación.
+13. **Auto-scaling hints, rolling updates, rollback automático tras health check fallido**: presuponen una plataforma de orquestación (k8s/ECS) que el proyecto no apunta hoy -- o es una decisión de alcance para que `linkc serve` la conozca, o es puramente un tema de guía de despliegue (ver §9.1).
+14. **Canal de soporte (Discord/Slack), programa de "adoptantes de referencia", benchmark comparativo publicado contra terceros**: acciones organizacionales/de comunidad, no trabajo de código -- las tiene que decidir y ejecutar el usuario, no algo que se implemente en el compilador.
+
+**Ítems de los dos reportes ya resueltos antes de esta ronda** (no reimplementar, verificado contra el código real): adoptar tabla existente sin auto-migrar (§3.67, v1.28.0), tipo de PK flexible en Postgres -- SERIAL/IDENTITY 16/32 bits (§3.59, v1.20.0), `linkc introspect` (§3.66, v1.27.0), puente de sesión JWT externo (§3.64, v1.25.0), status/headers en `http.get`/`post` salientes (§3.60, v1.21.0), `smtp` a varios destinatarios y HTML (§3.63, v1.24.0), `Int64` como campo agregable/agrupable (§3.65, v1.26.0), paginación empujada a SQL + cursor (§3.48/§3.61), `@route` con múltiples parámetros/catch-all/query string (§3.37/§3.42/§3.57/§3.62), `response.setStatus`/`@content_type`/`escapeHtml` (§3.45/§3.46/§3.35), Argon2id configurable + detección de hash legado (§3.58), `crypto.randomInt`/`timingSafeEqual` (§3.54), CORS allowlist + cabeceras de seguridad fijas (§3.41), PostgreSQL runtime + TLS + auto-reconexión + LISTEN/NOTIFY cross-instancia (§3.36/§3.40/§3.44), `--session-ttl` (§3.50), `auth.currentRole`/`createSessionWithId`/`currentUserId` (§3.51/§3.53).
+
+---
+
 ### Sobre el nombre
 
 Decidido: **c-script**, en minúsculas. La extensión de archivo (`.link`) y el nombre del binario del compilador (`linkc`) se mantienen como está — no hace falta que deletreen la marca, igual que `.rs` no dice "rust". Ver [GRAMMAR.md](GRAMMAR.md) para el resto de las convenciones de nomenclatura.
