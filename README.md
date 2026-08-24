@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.57.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-861-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.58.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 859 automated tests:
+**Works today**, covered by 861 automated tests:
 
 - `linkc build` / `serve` / `serve-all` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- PostgreSQL now warns (never blocks) when migrating a preexisting table whose columns share nothing in common with what's declared — the real incident: a service almost silently merged its schema into an unrelated table that happened to share its collection name. Deliberately a warning, not a hard failure — two different `.link` files intentionally sharing one table with disjoint columns is an existing, supported pattern this heuristic can't tell apart from an accidental collision
 - `--service-api-key <key>`/`LINK_SERVICE_API_KEY` for `linkc serve`/`serve-all`: requires the `X-Service-Api-Key` header (constant-time compared) on every request except `/health`/`/`/`/status`, checked before the body is even read — closes the gap where any process on the same machine (not just an external caller) could call a service exactly like the legitimate gateway. A layer distinct from and prior to `@requires`/JWT/sessions (which authenticate the end *user*, not the caller) — both coexist on the same request
 - `linkc serve-all <dir> --port-base N` runs every `.link` in a directory as one OS process (one thread per service, its own port and its own SQLite file each) instead of one process per service — the real case that motivated it: 13-17 separate `pm2` processes in a production adoption, one per `.link`. `--restart-backoff <duration>` (also usable with plain `linkc serve`) adds native exponential backoff on a recoverable startup failure (port already bound, Postgres down) — a bind/connect failure in one service no longer takes the rest down with it
 - `dateFromParts(year, month, day, hour, minute, second) -> Timestamp` builds an arbitrary `Timestamp` from calendar parts — `now()` only ever gave the *current* instant, so computing something like a quarter's start date entirely inside an rpc was impossible before this. An invalid date (month 13, February 30) is a 400 naming the bad field, never a panic
@@ -285,7 +286,7 @@ wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_w
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **679 automated unit, integration and CLI tests**, including tests that
+Link is verified by **861 automated unit, integration and CLI tests**, including tests that
 spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
 example published in this repository's documentation:
 

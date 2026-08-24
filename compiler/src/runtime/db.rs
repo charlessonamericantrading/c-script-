@@ -435,6 +435,70 @@ fn validate_existing_id_column(backend: &Backend, collection: &str) -> Result<()
     ))
 }
 
+/// GRAMMAR.md §3.94: antes de agregarle columnas nuevas a una tabla que YA
+/// EXISTÍA (la migración no destructiva de PostgreSQL, ver el loop de `ADD
+/// COLUMN` en `connect_postgres_with_options`), avisa por stderr si esa
+/// tabla no se PARECE en nada a lo que este programa declara -- podría ser
+/// la tabla de OTRO programa que casualmente eligió el mismo nombre de
+/// colección. Encontrado en una adopción real: `telemetry.link` estuvo a
+/// punto de chocar así contra una tabla `events` real de otro servicio --
+/// evitado a mano (renombrando la colección) porque alguien lo notó, no
+/// porque el runtime lo hubiera avisado.
+///
+/// SOLO UNA ADVERTENCIA, nunca un error que corte el arranque -- a
+/// diferencia del intento original de esta función (revertido durante esta
+/// misma ronda al auditar `pg_integration.rs`): un test YA EXISTENTE,
+/// deliberado y verificado
+/// (`two_different_link_files_declaring_disjoint_columns_of_the_same_table_can_read_each_others_rows_but_not_always_write`)
+/// prueba que DOS `.link` con columnas DISJUNTAS (cero nombres en común,
+/// aparte de "id") sobre la MISMA tabla es un patrón SOPORTADO a propósito
+/// -- schema por convención de nombre de colección, no por comparación de
+/// columnas. Bloquear ese caso habría roto una feature ya shipeada; el
+/// mismo shape de datos (tabla preexistente, cero overlap) es indistinguible
+/// entre "colisión accidental" y "columnas compartidas a propósito" -- así
+/// que la señal más honesta que se puede dar es un aviso legible por un
+/// humano, no una negativa automática.
+fn warn_if_table_looks_unrelated(backend: &Backend, collection: &str, columns: &[ColumnPlan]) {
+    // Sin ninguna columna propia declarada (un struct que solo tiene "id"),
+    // no hay ninguna señal -- positiva o negativa -- que comparar.
+    if columns.is_empty() {
+        return;
+    }
+    let sql = format!("SELECT column_name FROM information_schema.columns WHERE table_name = {}", backend.placeholder(1));
+    let Ok(rows) = backend.query(&sql, &[Cell::Text(collection.to_string())], &[ColumnKind::Text]) else {
+        // Best-effort: un fallo acá nunca debe impedir que el connect siga
+        // su curso normal -- el resto del código ya maneja errores reales
+        // de conexión en otro lado.
+        return;
+    };
+    let existing: HashSet<String> =
+        rows.into_iter().filter_map(|row| row.into_iter().next()).filter_map(|cell| if let Cell::Text(s) = cell { Some(s) } else { None }).collect();
+
+    // Vacío: la tabla NO existía antes de esta corrida -- el CREATE TABLE IF
+    // NOT EXISTS de arriba recién la creó, con exactamente estas columnas
+    // (nada que avisar, por construcción coincide).
+    if existing.is_empty() {
+        return;
+    }
+
+    let declared: Vec<&str> = columns.iter().map(|c| c.field.name.as_str()).collect();
+    if declared.iter().any(|name| existing.contains(*name)) {
+        return;
+    }
+
+    let mut existing_sorted: Vec<String> = existing.into_iter().collect();
+    existing_sorted.sort();
+    eprintln!(
+        "advertencia: la tabla '{collection}' ya existe en PostgreSQL, pero NINGUNA de las columnas que '{collection}' \
+         declara ([{}]) coincide con las que la tabla ya tiene ([{}]). Si dos .link comparten esta tabla A PROPÓSITO \
+         (columnas disjuntas, GRAMMAR.md §3.17), esta advertencia es esperada y no requiere ninguna acción. Si NO es \
+         así, es probable que '{collection}' le pertenezca a OTRO programa que casualmente eligió el mismo nombre de \
+         colección -- revisá antes de seguir, o renombrá la colección en este .link.",
+        declared.join(", "),
+        existing_sorted.join(", "),
+    );
+}
+
 /// Equivalente de `check_schema_for_adoption` (SQLite) para PostgreSQL:
 /// modo `--adopt-existing`/`LINK_ADOPT_EXISTING` (GRAMMAR.md §3.67), llamado
 /// EN VEZ de `CREATE TABLE IF NOT EXISTS` + el loop de `ADD COLUMN` que
@@ -893,6 +957,11 @@ impl Db {
                 // sea requerido: `ADD COLUMN ... NOT NULL` sobre una tabla con
                 // filas fallaría, porque no hay valor que poner en las que ya
                 // están. Es un límite real y está documentado.
+                //
+                // GRAMMAR.md §3.94: antes de agregar columnas, avisa por
+                // stderr (nunca bloquea) si esta tabla no se parece a lo que
+                // el programa declara -- ver el comentario de la función.
+                warn_if_table_looks_unrelated(&backend, name, &cols);
                 for field in &non_id {
                     backend
                         .execute_ddl(&crate::codegen::postgres_emit::alter_table_add_column_postgres(name, field, &simple_enums))

@@ -165,6 +165,7 @@ fn free_port() -> u16 {
 struct Serve {
     child: Child,
     port: u16,
+    err_path: PathBuf,
 }
 
 impl Serve {
@@ -198,7 +199,7 @@ impl Serve {
 
         // Un round-trip HTTP completo es la única señal confiable de que el
         // servidor ya está sirviendo (mismo criterio que tests/server_http.rs).
-        let mut server = Serve { child, port };
+        let mut server = Serve { child, port, err_path: err_path.clone() };
         for _ in 0..300 {
             if ureq::get(&format!("http://127.0.0.1:{port}/health")).call().is_ok() {
                 return server;
@@ -218,6 +219,13 @@ impl Serve {
             std::fs::read_to_string(&out_path).unwrap_or_default(),
             std::fs::read_to_string(&err_path).unwrap_or_default()
         );
+    }
+
+    /// El log de stderr capturado desde que arrancó (`GRAMMAR.md §3.94`
+    /// lo necesita: la advertencia de tabla-posiblemente-ajena va por acá,
+    /// nunca cambia el status HTTP de ningún rpc).
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.err_path).unwrap_or_default()
     }
 
     fn rpc(&self, method: &str, body: &str) -> serde_json::Value {
@@ -1626,6 +1634,111 @@ service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
     let server_b = Serve::start(&link_b, &url);
     let err = server_b.try_rpc("Items/list", "{}").expect_err("leer una columna INTEGER real como String tiene que fallar limpio");
     assert!(!err.contains("panicked at"), "tiene que ser un error de runtime limpio, no un panic que tumbe el proceso: {err}");
+}
+
+#[test]
+fn connecting_to_a_preexisting_table_with_zero_overlapping_columns_warns_but_still_connects() {
+    // GRAMMAR.md §3.94: el caso real que lo motivó -- `telemetry.link`
+    // estuvo a punto de chocar contra una tabla `events` real de otro
+    // servicio. Este test confirma DOS cosas a la vez: que la advertencia
+    // aparece por stderr cuando el schema no tiene NINGÚN nombre de columna
+    // en común con la tabla preexistente, y que --a propósito-- el connect
+    // sigue funcionando igual que antes (nunca bloquea): un intento anterior
+    // de esta misma feature devolvía un error duro acá, lo que rompía
+    // `two_different_link_files_declaring_disjoint_columns_of_the_same_table_can_read_each_others_rows_but_not_always_write`
+    // -- ese test prueba que columnas disjuntas entre dos `.link` sobre la
+    // MISMA tabla es un patrón SOPORTADO a propósito, no un bug.
+    const COLLECTION: &str = "items_collision_warning";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("collision-warning");
+    let link_a = temp.write(
+        "a.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, orderTotal: Float }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc create(orderTotal: Float) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, orderTotal: orderTotal }}) }} }}
+"#
+        ),
+    );
+    let server_a = Serve::start(&link_a, &url);
+    server_a.rpc("Items/create", r#"{"orderTotal":9.5}"#);
+    drop(server_a);
+
+    // "b.link" declara la MISMA colección, pero sin NINGÚN nombre de
+    // columna en común con "a.link" -- exactamente el shape de una
+    // colisión de nombre accidental entre dos programas no relacionados.
+    let link_b = temp.write(
+        "b.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, sessionId: String }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+    let server_b = Serve::start(&link_b, &url);
+    // Sigue funcionando -- la advertencia nunca bloquea el connect ni
+    // ningún rpc.
+    let listed = server_b.rpc("Items/list", "{}");
+    assert!(listed.is_array(), "{listed:?}");
+
+    let stderr = server_b.stderr();
+    assert!(stderr.to_lowercase().contains("advertencia"), "esperaba una advertencia por stderr: {stderr}");
+    assert!(stderr.contains(COLLECTION), "la advertencia debe nombrar la colección: {stderr}");
+}
+
+#[test]
+fn an_evolving_table_that_shares_at_least_one_column_does_not_warn() {
+    // Contraparte del test anterior: agregar UNA columna nueva a una tabla
+    // que el programa YA venía usando (mismo escenario que
+    // `a_new_field_is_added_to_an_existing_table_without_losing_rows`) tiene
+    // overlap real con lo que la tabla ya tenía -- no debe disparar la
+    // advertencia de "esto parece de otro programa".
+    const COLLECTION: &str = "items_no_collision_warning";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("no-collision-warning");
+    let link_v1 = temp.write(
+        "v1.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc create(name: String) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, name: name }}) }} }}
+"#
+        ),
+    );
+    let server_v1 = Serve::start(&link_v1, &url);
+    server_v1.rpc("Items/create", r#"{"name":"algo"}"#);
+    drop(server_v1);
+
+    let link_v2 = temp.write(
+        "v2.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String, note: String? }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+    let server_v2 = Serve::start(&link_v2, &url);
+    let listed = server_v2.rpc("Items/list", "{}");
+    assert!(listed.is_array(), "{listed:?}");
+    assert!(!server_v2.stderr().to_lowercase().contains("advertencia"), "'name' se comparte -- no debería avisar nada: {}", server_v2.stderr());
 }
 
 /// Mismo host/base, credenciales distintas -- para probar el DDL generado

@@ -115,6 +115,7 @@
   - [3.91 `Timestamp` decodifica `date`/`timestamp`/`timestamptz` nativos de Postgres — RESUELTO](#391-timestamp-decodifica-datetimestamptimestamptz-nativos-de-postgres--resuelto)
   - [3.92 `linkc serve-all` + `--restart-backoff`: un proceso para varios servicios — RESUELTO](#392-linkc-serve-all----restart-backoff-un-proceso-para-varios-servicios--resuelto)
   - [3.93 `--service-api-key`: autenticación servidor-a-servidor — RESUELTO](#393---service-api-key-autenticación-servidor-a-servidor--resuelto)
+  - [3.94 Aviso de colisión de nombre de tabla en PostgreSQL — RESUELTO](#394-aviso-de-colisión-de-nombre-de-tabla-en-postgresql--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4382,6 +4383,43 @@ LINK_SERVICE_API_KEY=s3cr3t linkc serve backend.link 8787   # equivalente
 - **No sustituye TLS.** El header viaja en texto plano si la conexión no está cifrada -- mismo criterio que cualquier otro secreto en un header (`Authorization`, `X-Forwarded-For`): la responsabilidad de que el TRANSPORTE sea seguro (TLS en el proxy que termina la conexión, o una red interna de confianza) es de la infraestructura que rodea a `linkc serve`, no de este flag.
 
 **Verificado**: `cli_service_api_key.rs`, 7 tests con el binario real como subproceso -- sin el flag, ninguna request lo necesita (comportamiento de siempre); sin el header, `401` antes de llegar al rpc; con la clave incorrecta, `401`; con la clave correcta, la request llega y se procesa normal; `/health`/`/`/`/status` siguen respondiendo `200` sin el header; `LINK_SERVICE_API_KEY` funciona igual que el flag; un flag mal usado da un error de CLI limpio, no un panic.
+
+---
+
+### 3.94 Aviso de colisión de nombre de tabla en PostgreSQL — RESUELTO
+
+Quinto reporte de adopción real (IgnisLove) -- y el propio caso del equipo de c-script: `telemetry.link` estuvo a punto de chocar contra una tabla `events` real, ya usada por otro servicio, evitado a mano (renombrando la colección) porque alguien lo notó, no porque el runtime lo hubiera señalado. `CREATE TABLE IF NOT EXISTS` (GRAMMAR.md §3.17) es un no-op sobre una tabla que ya existe -- no mira si sus columnas tienen algo que ver con lo que el `.link` actual declara. La migración no destructiva de PostgreSQL (`ADD COLUMN IF NOT EXISTS`) le agregaría, en silencio, TODAS las columnas del programa nuevo a esa tabla ajena.
+
+```bash
+linkc serve telemetry.link 8787 --db postgres://user:pass@host/produccion
+# Si 'events' ya existe en esa base, y ninguna columna de TelemetryEvent
+# coincide con las que la tabla ya tiene, ANTES de agregar ninguna columna
+# nueva se imprime por stderr (nunca bloquea el arranque):
+#
+#   advertencia: la tabla 'events' ya existe en PostgreSQL, pero NINGUNA de
+#   las columnas que 'events' declara ([sessionId, userAgent]) coincide con
+#   las que la tabla ya tiene ([amount, customer_id, order_id]). Si dos
+#   .link comparten esta tabla A PROPÓSITO (columnas disjuntas, GRAMMAR.md
+#   §3.17), esta advertencia es esperada y no requiere ninguna acción. Si
+#   NO es así, es probable que 'events' le pertenezca a OTRO programa que
+#   casualmente eligió el mismo nombre de colección -- revisá antes de
+#   seguir, o renombrá la colección en este .link.
+```
+
+**Heurística conservadora, solo ADVIERTE por stderr -- nunca bloquea el arranque.** Antes de agregar columnas a una tabla que ya existía (`warn_if_table_looks_unrelated`, `runtime/db.rs`), si NINGUNA columna declarada (aparte de `id`) coincide por nombre con las columnas físicas que la tabla YA tiene, se imprime la advertencia de arriba nombrando ambos conjuntos de columnas -- pero la migración sigue su curso exactamente igual que antes de esta ronda: las columnas nuevas se agregan lo mismo. Una sola columna en común ya cuenta como evidencia suficiente de relación (no dispara la advertencia). Best-effort de punta a punta: si la consulta a `information_schema.columns` fallara por cualquier motivo, se omite la advertencia en silencio en vez de arriesgar romper un connect que de otro modo funcionaría.
+
+**Por qué solo advierte, y no bloquea: dos `.link` DISTINTOS compartiendo una tabla con columnas disjuntas es un caso YA soportado y probado a propósito.** La primera versión de esta ronda devolvía un error duro -- revertida al auditar `pg_integration.rs` y encontrar que `two_different_link_files_declaring_disjoint_columns_of_the_same_table_can_read_each_others_rows_but_not_always_write` (test ya existente, verificado en CI) prueba EXACTAMENTE ese patrón: dos `.link` con cero columnas en común (aparte de `id`) sobre la misma tabla, cada uno leyendo/escribiendo solo las suyas -- y lo hace a propósito, no por accidente. Esa forma es indistinguible de una colisión accidental por nombre desde el punto de vista de "cero columnas en común" -- las dos se ven IDÉNTICAS. Convertirlo en un error habría roto ese caso legítimo para atrapar el accidental. Una advertencia visible ANTES de aceptar la primera request es la red de seguridad real: le da a quien arranca el proceso la chance de Ctrl+C y revisar, sin bloquear a quien de verdad comparte una tabla a propósito -- mismo criterio de "mejor un falso negativo ocasional que ruido sobre código legítimo" que ya llevó a reformular el lint de "autorización de fachada" (PLAN.md §9.5).
+
+**Solo PostgreSQL.** SQLite (`check_schema_matches`, GRAMMAR.md §3.17) ya falla FUERTE ante cualquier diferencia de schema que no sea agregar una columna opcional nueva -- una tabla de otro programa, con columnas casi seguro distintas, ya se detecta ahí (con un mensaje de diff completo, no específico a "cero columnas en común", pero igual de efectivo). El gap real era solo del lado PostgreSQL, donde la migración es deliberadamente tolerante (datos de producción, no se puede recrear la tabla).
+
+**`--adopt-existing` no necesita este aviso -- ya es más estricto.** Ese modo (GRAMMAR.md §3.67) ya EXIGE que cada columna declarada exista físicamente (`validate_columns_exist_for_adoption`) -- una tabla sin relación casi seguro ya falla ahí, con un error más específico ("faltan columnas"), no solo una advertencia.
+
+**Límites honestos:**
+- **Heurística, no prueba.** Cero columnas en común es evidencia fuerte pero no concluyente -- dos schemas sin relación PODRÍAN coincidir en un nombre de columna por casualidad (ej. ambos tienen `createdAt`), evitando la advertencia sin ser en verdad la misma tabla. No hay ninguna forma de saberlo con certeza sin un mecanismo de "quién creó esta tabla" (un `--db-schema`/`--db-prefix` que evite la colisión de raíz, todavía sin implementado, sería la solución real).
+- **No previene nada, solo avisa.** Si nadie lee stdout/stderr del proceso al arrancar (ej. corriendo desatendido bajo `pm2`/`systemd` sin revisar logs), la advertencia pasa desapercibida igual que antes -- mismo límite que cualquier log, no un gate que se pueda forzar a fallar (`--fail-on-schema-warning` o similar queda fuera de esta ronda).
+- **Un aviso por colección, no deduplicado entre reinicios.** Cada arranque de `linkc serve` contra la misma tabla ajena vuelve a imprimir la misma advertencia -- no hay un mecanismo de "ya avisé una vez, no lo repitas".
+
+**Verificado**: `pg_integration.rs` contra un PostgreSQL real -- `connecting_to_a_preexisting_table_with_zero_overlapping_columns_warns_but_still_connects` (dos `.link` con cero columnas en común sobre la misma tabla: el segundo conecta y sirve requests normalmente, nunca bloquea, y su stderr contiene la advertencia nombrando la colección) y `an_evolving_table_that_shares_at_least_one_column_does_not_warn` (agregar una columna nueva a una tabla que comparte al menos un nombre de columna con la física NO dispara ninguna advertencia). Los dos tests preexistentes que prueban el caso LEGÍTIMO de columnas disjuntas (`two_different_link_files_declaring_disjoint_columns_of_the_same_table_...` y su vecino de tipos en conflicto) se re-confirmaron sin cambios -- la advertencia nueva no les rompe nada.
 
 ---
 

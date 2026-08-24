@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.58.0] - 2026-08-24
+
+### 🐛 Arreglado
+- **Aviso de colisión de nombre de tabla en PostgreSQL.** Quinto reporte de adopción real (el propio caso del equipo de c-script): `telemetry.link` estuvo a punto de chocar contra una tabla `events` real de otro servicio -- evitado a mano, no porque el runtime lo hubiera señalado. `CREATE TABLE IF NOT EXISTS` es un no-op sobre una tabla que ya existe -- no miraba si sus columnas tenían algo que ver con lo declarado, así que la migración no destructiva de Postgres (`ADD COLUMN IF NOT EXISTS`) le agregaba, en silencio, TODAS las columnas del programa nuevo a una tabla ajena. Ahora, antes de migrar una tabla preexistente, si NINGUNA columna declarada (aparte de `id`) coincide por nombre con las que la tabla ya tiene, se imprime una advertencia por stderr nombrando ambos conjuntos de columnas. Deliberadamente solo advierte, nunca bloquea el arranque: dos `.link` distintos compartiendo una tabla con columnas disjuntas es un caso ya soportado y probado a propósito (GRAMMAR.md §3.17), indistinguible de una colisión accidental mirando solo "cero columnas en común" -- convertirlo en error habría roto ese caso legítimo. Solo Postgres: SQLite ya fallaba fuerte ante cualquier diferencia de schema real.
+
+861 tests (2 nuevos) en `pg_integration.rs` contra un PostgreSQL real: dos `.link` con cero columnas en común sobre la misma tabla conectan y sirven normal, con la advertencia visible en stderr; una tabla evolucionando con al menos una columna compartida NO dispara ninguna advertencia; los tests preexistentes del caso legítimo de columnas disjuntas se re-confirmaron sin cambios. Detalle completo: GRAMMAR.md §3.94.
+
 ## [1.57.0] - 2026-08-24
 
 ### ✨ Nuevo
