@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.65.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`List<Int>.sum() -> Int`.** Analizando en paralelo, por primera vez, tres adoptadores reales a la vez (IgnisLove, "CRM"/Nexus, Glowapp), este gap salió de "CRM" con un bug de producción real como evidencia: `accounting.link` (`getAccountingSummary`) necesitaba sumar montos ya filtrados en memoria y, al no existir forma de sumar sin un `while` manual, el código quedó con un placeholder que multiplica la CANTIDAD de transacciones por una tarifa plana inventada en vez de sumar los montos de verdad -- un reporte financiero con cifras fabricadas, no aproximadas. Alcance deliberadamente acotado a `List<Int>` -- `List<Int64>`/`List<Float>` quedan afuera a propósito: en runtime `Value::List` no lleva tag de tipo de elemento, así que una lista VACÍA de esos dos tipos no tendría de dónde sacar qué `Value` devolver sin construir infraestructura de recuperación de tipo estático que esta ronda no amerita para un solo método. El checker rechaza esos dos casos con un mensaje que nombra el motivo explícito, no un "método no encontrado" genérico.
+
+903 tests (6 nuevos): 4 en `checker.rs` (tipa sobre `List<Int>`, rechaza `List<Int64>`/`List<Float>` con mensaje claro, sin argumentos) y 2 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (suma real de una lista no vacía; lista vacía da `0` -- el caso que el placeholder de "cantidad × tarifa" jamás hubiera distinguido de "una transacción gratis"). Detalle completo: GRAMMAR.md §3.101.
+
+### 📝 Nota
+- **Primer análisis paralelo de tres adoptadores reales a la vez** (IgnisLove, "CRM"/Nexus -- primer análisis de este, 11 `.link` -- y Glowapp -- confirmado que NO usa c-script), solo lectura, sin modificar nada de sus repos. Además de `.sum()` (arriba), quedaron documentados en PLAN.md, priorizados para próximas rondas: `db.<c>.increment()` e `db.<c>.top()` (§9.3, ambos con bug de producción real confirmado en IgnisLove -- lost-update en contadores, y `getBestArm()` que nunca devuelve el mejor brazo), predicado pushdown más allá de `==` re-priorizado (§9.3.1, tres casos de alta frecuencia nuevos en CRM: badge de notificaciones, alertas de stock, contador de chats), `smtp` con adjuntos/cc/bcc re-priorizado (§9.6.1, CRM abandonó el módulo por completo), tareas programadas nativas re-priorizadas (§9.7.7, 10+ schedulers hand-rolled en Glowapp), `@rate_limit` con clave adicional a la IP (§9.4.6, caso de abuso real en Glowapp), `linkc serve-all --port-map-out` (§9.7.6, gateway de producción en IgnisLove hardcodea el mapeo de puertos a mano), índice único condicional (§9.3.2, junto al compuesto), lint para el antipatrón `delete()`+`insert()` (§9.3.9).
+
 ## [1.64.0] - 2026-08-24
 
 ### ✨ Nuevo

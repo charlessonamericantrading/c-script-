@@ -122,6 +122,7 @@
   - [3.98 Lint `hardcoded-secret-literal` — RESUELTO](#398-lint-hardcoded-secret-literal--resuelto)
   - [3.99 `linkc test --db <url-postgres>` — RESUELTO](#399-linkc-test---db-url-postgres--resuelto)
   - [3.100 `linkc doctor`: diagnóstico de entorno antes de un despliegue — RESUELTO](#3100-linkc-doctor-diagnóstico-de-entorno-antes-de-un-despliegue--resuelto)
+  - [3.101 `List<Int>.sum() -> Int` — RESUELTO, alcance acotado](#3101-listintsum---int--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -916,7 +917,7 @@ fn sum(xs: Int[]) -> Int {
 
 **`while` NUNCA es una expresión.** `if`/`match` sí lo son porque necesitan unificar un valor entre ramas — eso exigiría diseñar `break <valor>`, un tipo para "el loop que nunca hace `break`" (el lenguaje no tiene ningún tipo `Never`/bottom) y unificación de tipos entre N sitios de `break`. Nada de eso hace falta para agregar sin recursión: el patrón es mutar un `let mut` declarado ANTES del loop, y usar un valor de cola DESPUÉS de él — el `while` en sí corre por puro efecto, se chequea contra `Type::Void` (mismo tratamiento que un `if`/`match` en posición de sentencia).
 
-**Sin `for`, a propósito.** No existe ningún concepto de rango/iterador en el lenguaje (`.take`/`.filter`/`.map`/`.length` siguen siendo los únicos métodos de `List`, sin `.reduce()`/`.forEach()`); todo lo que `for` daría ya es expresable con `while` + indexado manual (`arr[i]`, que ya existía). Agregarlo antes de que `while` se haya usado en programas reales sería azúcar prematuro — mismo criterio que ya dejó afuera closures de 0 parámetros y roles múltiples en `@requires`.
+**Sin `for`, a propósito.** No existe ningún concepto de rango/iterador en el lenguaje (`.take`/`.filter`/`.map`/`.length`/`.join`/`.reverse`, más `.sum()` sobre `List<Int>` desde §3.101, siguen siendo los únicos métodos de `List`, sin `.reduce()`/`.forEach()` genéricos); todo lo que `for` daría ya es expresable con `while` + indexado manual (`arr[i]`, que ya existía). Agregarlo antes de que `while` se haya usado en programas reales sería azúcar prematuro — mismo criterio que ya dejó afuera closures de 0 parámetros y roles múltiples en `@requires`.
 
 **Sin `break`/`continue`, a propósito.** Implementarlos bien primero necesita resolver el hallazgo de abajo (un `break` anidado dentro de un `if`/`match` fallaría en silencio por la misma razón estructural que `return` ya falla) — deferido a una ronda futura si el uso real lo pide; la recursión sigue disponible mientras tanto para loops con salida temprana.
 
@@ -4631,6 +4632,22 @@ linkc doctor backend.link --db postgres://user:pass@host/base   # o LINK_DATABAS
 **Código de salida**: `1` si algún chequeo real dio error (archivo inválido, sin permiso de escritura, base inalcanzable); `0` si los cuatro pasaron -- pensado para un paso de CI antes de desplegar (`linkc doctor backend.link --db "$LINK_DATABASE_URL" || exit 1`), no solo para lectura humana.
 
 **Verificado**: `cli_doctor.rs` (7 tests) contra el binario real -- éxito con SQLite default, archivo faltante, error de sintaxis, URL de Postgres inalcanzable (puerto cerrado, falla rápido en vez de colgarse) sin panic, URL malformada sin panic, uso sin argumentos, y `LINK_DATABASE_URL` funcionando igual que `--db`; más 1 test en `pg_integration.rs` contra un PostgreSQL real, confirmando `[OK]` de conectividad Y que ninguna tabla se creó (`doctor` nunca toca el schema).
+
+---
+
+### 3.101 `List<Int>.sum() -> Int` — RESUELTO, alcance acotado
+
+PLAN.md §9.3, gap nuevo encontrado analizando "CRM" (Nexus, 11 `.link`, primer análisis de este adoptador esta sesión) -- con un bug de producción real como evidencia, no solo una preferencia de estilo. `List` solo tenía `.take`/`.filter`/`.map`/`.length`/`.join`/`.reverse` (§3.15), sin ninguna forma de sumar sin un `while` manual. `accounting.link`, `getAccountingSummary()`, necesitaba el total real de una lista de montos ya filtrada en memoria (`incomeTx`/`expenseTx`, resultado de `.all().filter(...)`) -- al no existir `.sum()`, el código terminó con un placeholder que multiplica la CANTIDAD de transacciones por una tarifa plana inventada (`incomeTx.length() * 1000`) en vez de sumar `t.amount` de verdad. Un reporte financiero mostrando cifras fabricadas, no aproximadas, en código que pasaba sus propios tests porque ninguno verificaba esos campos puntuales.
+
+```
+fn total(montos: Int[]) -> Int { montos.sum() }
+```
+
+**Alcance deliberadamente acotado a `List<Int>` en esta ronda -- NO `List<Int64>`/`List<Float>`.** No es una limitación sintáctica arbitraria: en runtime, `Value::List` (`runtime/mod.rs`) no lleva ningún tag de tipo de elemento -- mismo límite ya documentado en la doc de `Value::Uuid` ("una vez que la información de tipo ESTÁTICO ya no está disponible en runtime"). Con una lista NO vacía, el tag de la primera `Value::Int`/`Value::Int64`/`Value::Float` ya alcanzaría para saber qué sumar -- pero una lista VACÍA (un caso real y válido: "cero transacciones de un tipo en el período") no tiene ningún elemento del que leer ese tag, y adivinar mal ahí sería un bug de serialización SILENCIOSO: `Int64` viaja como string por el wire, `Int` como número (§3.30) -- devolver el `Value` equivocado rompería el contrato sin ningún error visible. Resolver esto en general necesitaría que el checker le pasara el tipo estático del receptor al intérprete en el sitio de la llamada, infraestructura que esta ronda no amerita para un solo método. `List<Int>` no tiene esa ambigüedad -- un único tipo posible, incluso vacía -- así que es lo único que se resuelve acá; el checker rechaza `List<Int64>`/`List<Float>` con un mensaje explícito que nombra el motivo, no un "método no encontrado" genérico.
+
+**`.reduce()` genérico, `.sum()` sobre `Int64`/`Float`**: quedan fuera de esta ronda, para cuando haya demanda real y valga la pena resolver la ambigüedad de tipo del caso vacío.
+
+**Verificado**: 4 tests en `checker.rs` (`List<Int>` tipa, `List<Int64>`/`List<Float>` se rechazan con el mensaje que nombra el motivo, `.sum()` no toma argumentos) + 2 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (suma real de una lista no vacía; una lista vacía -- el caso que el placeholder de "cantidad × tarifa" jamás hubiera distinguido de "una transacción gratis" -- da `0`).
 
 ---
 

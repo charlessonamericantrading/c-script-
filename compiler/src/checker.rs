@@ -3431,6 +3431,27 @@ impl Checker {
                 self.expect_no_args(args, "length")?;
                 Some(Type::Int)
             }
+            // GRAMMAR.md §3.101: en esta ronda solo `List<Int>` -- `List<Int64>`/
+            // `List<Float>` quedan deliberadamente afuera. No es una restricción
+            // sintáctica: en runtime `Value::List` (runtime/mod.rs) no lleva
+            // ningún tag de tipo de elemento (mismo límite ya documentado en la
+            // doc de `Value::Uuid` ahí mismo) -- una lista VACÍA no tiene de
+            // dónde sacar "esto era Int64" o "esto era Float" para elegir el
+            // `Value` correcto a devolver, y equivocarse ahí sería un bug de
+            // serialización silencioso (`Int64` viaja como string en el wire,
+            // `Int` como número -- GRAMMAR.md §3.30). `List<Int>` no tiene esa
+            // ambigüedad (un solo tipo posible para "vacío" también), así que
+            // es lo único que se resuelve acá.
+            (Type::List(inner), "sum") => {
+                self.expect_no_args(args, "sum")?;
+                if !matches!(inner.as_ref(), Type::Int) {
+                    return Err(err(format!(
+                        "'.sum()' en esta ronda solo aplica sobre `List<Int>`/`Int[]` -- es `List<{inner}>`. \
+                         `Int64`/`Float` quedan deliberadamente afuera (GRAMMAR.md §3.101)"
+                    )));
+                }
+                Some(Type::Int)
+            }
             // El caso FÁCIL de los dos métodos de orden superior (GRAMMAR.md
             // §3.10): el tipo del callback (T) -> Bool ya se conoce ENTERO
             // de entrada, así que alcanza con el mismo check_expr(Closure,
@@ -5926,6 +5947,44 @@ type T = { id: Int, s: Status }")
             fn count(xs: Int[]) -> Int { xs.length() }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_sum_on_int_list_returns_int() {
+        let src = r#"
+            fn total(xs: Int[]) -> Int { xs.sum() }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_sum_on_int64_list_is_rejected_with_a_clear_message() {
+        let src = r#"
+            fn total(xs: Int64[]) -> Int64 { xs.sum() }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        let msg = errors[0].to_string();
+        assert!(msg.contains("List<Int64>"), "{msg}");
+        assert!(msg.contains("deliberadamente afuera"), "{msg}");
+    }
+
+    #[test]
+    fn list_sum_on_float_list_is_rejected_with_a_clear_message() {
+        let src = r#"
+            fn total(xs: Float[]) -> Float { xs.sum() }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        let msg = errors[0].to_string();
+        assert!(msg.contains("List<Float>"), "{msg}");
+    }
+
+    #[test]
+    fn list_sum_takes_no_arguments() {
+        let src = r#"
+            fn total(xs: Int[]) -> Int { xs.sum(1) }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        assert!(errors[0].to_string().contains("no toma argumentos"), "{:?}", errors[0]);
     }
 
     // ---- spans en errores de TIPOS (LSP prerrequisito 3/3, Ronda B) ----

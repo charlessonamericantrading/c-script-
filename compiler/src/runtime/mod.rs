@@ -1404,6 +1404,17 @@ fn call_method(
                 Ok(Value::List(items.into_iter().take(n).collect()))
             }
             "length" => Ok(Value::Int(items.len() as i64)),
+            // GRAMMAR.md §3.101: checker.rs ya garantizó que esto es
+            // `List<Int>` -- `Int64`/`Float` quedan afuera a propósito esta
+            // ronda, ver la doc ahí para el motivo (una lista vacía no lleva
+            // ningún tag de tipo de elemento en runtime).
+            "sum" => {
+                let mut total: i64 = 0;
+                for item in &items {
+                    total += as_int(item)?;
+                }
+                Ok(Value::Int(total))
+            }
             "filter" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'filter' requiere 1 argumento"))?;
                 let mut kept = Vec::new();
@@ -4862,6 +4873,39 @@ mod tests {
         let result =
             invoke_rpc(&program, "S", "count", &json!({"xs": [1, 2, 3]}), &Db::seeded()).unwrap();
         assert_eq!(result, json!(3));
+    }
+
+    #[test]
+    fn list_sum_adds_every_element() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc total(xs: Int[]) -> Int { xs.sum() }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "total", &json!({"xs": [1200, 350, 7]}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(1557));
+    }
+
+    // GRAMMAR.md §3.101: el caso real que motivó `.sum()` -- un reporte
+    // financiero sumando montos ya filtrados en memoria (`incomeTx.length()
+    // * tarifa` en vez de la suma real, porque no había forma de sumar sin
+    // un `while` manual). Este test confirma explícitamente el caso vacío
+    // (0 transacciones de un tipo en el período), el que un placeholder de
+    // "cantidad * tarifa" jamás hubiera distinguido de "1 transacción
+    // gratis" -- `.sum()` sobre una lista vacía siempre da 0.
+    #[test]
+    fn list_sum_on_an_empty_list_is_zero() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc total(xs: Int[]) -> Int { xs.filter(|x: Int| { x > 1000000 }).sum() }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "total", &json!({"xs": [1, 2, 3]}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!(0));
     }
 
     // ---- constructo de loop: `while` (GRAMMAR.md §3.15) ----

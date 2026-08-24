@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-897-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.64.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-903-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.65.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 897 automated tests:
+**Works today**, covered by 903 automated tests:
 
 - `linkc build` / `serve` / `serve-all` / `migrate --dry-run` / `doctor` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `List<Int>.sum() -> Int`: sums every element with a real loop — `List<Int64>`/`List<Float>` are deliberately out of scope for now (an empty list of either has no element to read the right `Value` tag from at runtime, and guessing wrong there would be a silent wire-format bug, since `Int64` serializes as a string and `Int` as a number)
 - `linkc doctor <file> [--db <url|file>]`: environment diagnostics before a deployment — the `linkc` version, that the entry file resolves its imports/parses/type-checks, write permission in its directory, and read-only connectivity (`SELECT 1`, never any DDL) to the configured database. Prints a checklist and exits `1` if any real check failed, meant for a CI gate before `linkc serve`
 - `linkc test <file> --db <postgres-url>` (or `LINK_TEST_DB`, deliberately separate from `LINK_DATABASE_URL`): runs every `test "..." { ... }` block against a real PostgreSQL database instead of embedded SQLite — needed to actually reproduce a Postgres-wire-format bug, since SQLite and Postgres emit and decode SQL differently for the same `.link`. No per-test isolation the way SQLite `:memory:` gives for free — Postgres has no equivalent, so tests share state within a run instead of faking a reset (which would mean a destructive operation this project avoids on purpose); run this against a dedicated test database, never production
 - `linkc migrate <file> --db <postgres-url> --dry-run`: connects read-only and reports the exact `CREATE TABLE`/`ALTER TABLE ADD COLUMN` that `linkc serve` would run, without running any of it — reuses the same DDL-generating functions the real runtime uses, so this report can't drift from what actually happens. Also flags a potential table-name collision or an incompatible `id` type before you'd find out by actually connecting. PostgreSQL only — SQLite already fails loud with the exact diff on a real connect

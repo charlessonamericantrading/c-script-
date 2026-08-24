@@ -1440,12 +1440,22 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             method("findWhere(fn)", "Find records matching a predicate"),
             method("subscribe()", "Subscribe to live changes in a stream"),
         ]),
-        Type::List(_) => Some(vec![
-            method("length()", "Get the length of this list"),
-            method("take(limit)", "Take the first N items"),
-            method("map(fn)", "Map this list's items"),
-            method("filter(fn)", "Filter this list's items"),
-        ]),
+        // `sum()` (GRAMMAR.md §3.101) solo se ofrece para `List<Int>` -- a
+        // diferencia de length/take/map/filter (válidos para cualquier `T`),
+        // ofrecerlo siempre sugeriría un método que no tipa para `List<String>`
+        // u otro elemento no numérico.
+        Type::List(inner) => {
+            let mut methods = vec![
+                method("length()", "Get the length of this list"),
+                method("take(limit)", "Take the first N items"),
+                method("map(fn)", "Map this list's items"),
+                method("filter(fn)", "Filter this list's items"),
+            ];
+            if matches!(inner.as_ref(), Type::Int) {
+                methods.push(method("sum()", "Sum all elements of this List<Int>"));
+            }
+            Some(methods)
+        }
         Type::String => Some(vec![
             method("length()", "Get the length of this string"),
             method("contains(sub)", "Check if this string contains a substring"),
