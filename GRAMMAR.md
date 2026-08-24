@@ -99,6 +99,7 @@
   - [3.75 `db.<c>.upsert(matchFn, insertValue, updateFn)` — RESUELTO](#375-dbcupsertmatchfn-insertvalue-updatefn--resuelto)
   - [3.76 `db.<c>.insertMany(items)` — RESUELTO](#376-dbcinsertmanyitems--resuelto)
   - [3.77 `createdAt`/`updatedAt` automáticos: `= now()` + `@autoUpdate` — RESUELTO](#377-createdatupdatedat-automáticos--now--autoupdate--resuelto)
+  - [3.78 Soft-delete nativo: `@softDelete` — RESUELTO](#378-soft-delete-nativo-softdelete--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3853,6 +3854,54 @@ service Tasks {
 - **`@autoUpdate` no distingue "el patch no traía nada más" de "el patch traía otros campos" -- siempre pisa, sin excepción.** Un `applyPatch(id, {})` (patch vacío, sin campos) IGUAL toca `updatedAt` -- no hay forma de "aplicar un patch sin que cuente como una actualización".
 
 **Verificado**: 4 tests en `checker.rs` (`@autoUpdate` sobre `Timestamp` tipa limpio, se rechaza sobre otro tipo, no exige un default a la vez, una segunda `@autoUpdate` en el mismo campo es error de parser) y 2 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (un campo `Timestamp = now()` se completa solo al insertar, y `@autoUpdate` pisa el campo en un `applyPatch` real aunque el patch mandado NO lo mencione, mientras `createdAt` -- sin la anotación -- se mantiene idéntico antes y después). Verificado también a mano contra un servidor HTTP real (`curl`, con un `sleep` real entre las dos llamadas): `createdAt` idéntico en las dos respuestas, `updatedAt` con un timestamp distinto y posterior en la segunda.
+
+---
+
+### 3.78 Soft-delete nativo: `@softDelete` — RESUELTO
+
+"Borrar" una fila casi nunca significa borrarla de verdad -- la mayoría de los sistemas reales necesitan poder auditar o recuperar algo que un usuario marcó como eliminado. Hasta esta ronda, `db.<c>.delete(id)` siempre era un `DELETE` de SQL real, sin ninguna forma declarativa de pedir "marcalo como borrado en vez de borrarlo".
+
+<!-- linkc:check -->
+```rust
+type Task = {
+  id: Int,
+  title: String,
+  @softDelete deletedAt: Timestamp? = null,
+}
+type NewTask = { title: String, deletedAt: Timestamp? = null }
+
+db { tasks: Task[] }
+
+service Tasks {
+  rpc create(title: String) -> Task {
+    db.tasks.insert(NewTask { title: title })
+  }
+  rpc list() -> Task[] { db.tasks.all() }
+  rpc remove(id: Int) -> Bool { db.tasks.delete(id) }
+}
+
+test "delete() no borra la fila -- la marca, y all() la deja de traer" {
+  let t = Tasks.create("comprar leche");
+  assert(Tasks.list().length() == 1, "arranca visible");
+  assert(Tasks.remove(t.id) == true, "delete() devuelve true la primera vez");
+  assert(Tasks.list().length() == 0, "all() ya no la trae");
+  assert(Tasks.remove(t.id) == false, "una segunda vez sobre la misma fila no hace nada -- idempotente");
+}
+```
+
+**`@softDelete` solo sobre `Timestamp?` (opcional) -- nunca `Timestamp` requerido.** `null` es el estado "no borrado", cualquier otro valor es "borrado en este instante" -- por eso el campo TIENE que ser opcional, no hay otra forma de representar los dos estados. A lo sumo UN campo `@softDelete` por struct (dos sería ambiguo: `delete()` no sabría cuál de los dos fijar) -- rechazado en compilación, nombrando los dos campos. `= null` (el mismo mecanismo de default de campo, §3.74) es lo que hace que `NewTask { title: title }` no necesite mencionar `deletedAt` -- sin el default, cada `insert` tendría que pasarlo a mano.
+
+**`delete(id)` deja de ser un `DELETE` SQL -- pasa a ser un `UPDATE` que fija el campo a `now()`.** `AND "<campo>" IS NULL` en el propio `WHERE` hace la operación IDEMPOTENTE: una segunda llamada sobre una fila ya borrada no re-toca el timestamp (no publica un evento de `stream` de nuevo tampoco), devuelve `false` -- igual que `delete` sobre un `id` que nunca existió.
+
+**Toda lectura que devuelve una LISTA o un CONTEO filtra automáticamente.** `all()`, `page()`, `pageAfter()`, `count()`, `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` agregan `WHERE "<campo>" IS NULL` (o lo combinan con `AND` cuando ya había otra condición, como el cursor de `pageAfter`) -- ninguna fila soft-deleteada aparece en ninguno de estos. `findWhere`/`deleteWhere` heredan el filtro GRATIS, sin ningún caso especial propio: los dos reusan `all()` por dentro (mismo mecanismo ya documentado en §3.9/§8), así que si `all()` ya no trae la fila, el predicado de `findWhere`/`deleteWhere` nunca llega a evaluarla.
+
+**Límites honestos:**
+- **`find(id)` (y la re-consulta interna que hacen `insert`/`applyPatch` después de escribir) NO filtra -- una fila soft-deleteada sigue siendo encontrable por id directo.** Deliberado, no una omisión: `insert`/`applyPatch` re-consultan la fila que ELLOS MISMOS acaban de escribir por el mismo camino que usa `find` -- si un `applyPatch` tocara justo el campo de soft-delete (nada lo impide, es un campo escribible como cualquier otro), filtrar ahí haría que la re-consulta no encontrara la fila recién escrita, un panic en vez de un error limpio. La distinción real termina siendo "listados filtran, lookup directo por id no" -- mismo criterio que varios frameworks reales (Django, Rails) ya adoptan para el mismo problema.
+- **Sin forma de pedir "traeme TODO, incluidas las borradas" desde `all()`/`page()`/etc.** No hay un parámetro `includeDeleted` ni una variante -- quien necesite ver filas borradas hoy solo puede usar `find(id)` una por una (ver el límite de arriba).
+- **`applyPatch` puede seguir escribiendo el campo `@softDelete` como cualquier otro campo del `Patch<T>`.** No hay ninguna protección que lo vuelva de solo-lectura para `applyPatch` -- un patch que trae `{"deletedAt": "..."}` lo aplica tal cual, sin pasar por la lógica de idempotencia de `delete()`. "Restaurar" una fila (poner `deletedAt` de vuelta en `null` a mano vía `applyPatch`) funciona, pero no es una operación con nombre propio todavía.
+- **Sin `DEFAULT`/índice parcial a nivel de columna SQL.** El filtro se agrega en cada consulta desde el intérprete -- no hay un índice `WHERE deletedAt IS NULL` creado automáticamente que acelere esas consultas sobre una tabla grande.
+
+**Verificado**: 5 tests en `checker.rs` (`Timestamp?` tipa limpio, se rechaza sobre `Timestamp` requerido y sobre cualquier otro tipo, dos `@softDelete` en el mismo struct se rechaza, una segunda `@softDelete` en el mismo campo es error de parser) y 5 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (`delete` fija el campo en vez de borrar la fila, una segunda llamada es idempotente y devuelve `false`, `all()`/`count()` excluyen la fila borrada, `findWhere`/`deleteWhere` heredan el filtro sin código propio, y `page`/`pageAfter`/`sumBy` también filtran). Verificado también a mano contra un servidor HTTP real (`curl`): crear 2 filas, borrar una, `list`/`count` muestran solo 1, un segundo `delete` sobre la misma da `false`, `find` directo por id SIGUE encontrando la fila borrada con su `deletedAt` ya fijado.
 
 ---
 

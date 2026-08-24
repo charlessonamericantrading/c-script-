@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.42.0-blue.svg" alt="Versión" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.43.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 750 pruebas automáticas:
+**Funciona hoy**, cubierto por 760 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- Soft-delete nativo: `@softDelete` sobre un campo `Timestamp?` convierte `delete(id)` en un `UPDATE` idempotente (fija el campo a `now()`, `AND "<campo>" IS NULL` en el WHERE para que una segunda llamada sea un no-op que devuelve `false`, nunca un `DELETE` real). Toda lectura que devuelve lista o conteo -- `all()`, `page()`, `pageAfter()`, `count()`, los agregados `*By`, y `findWhere`/`deleteWhere` (que reusan `all()` por dentro, sin código extra) -- lo filtra automáticamente. `find(id)` deliberadamente NO filtra -- una fila soft-deleteada sigue siendo encontrable por id directo, mismo criterio que Django/Rails, necesario para que la re-consulta de `insert`/`applyPatch` no explote si un patch toca justo ese campo
 - `createdAt`/`updatedAt` automáticos: sin nombres de campo mágicos -- `createdAt: Timestamp = now()` (un default ya existente combinado con el builtin `now()` ya existente) ya cubre "asignado una sola vez al crear". `@autoUpdate` sobre un campo `Timestamp` (solo) es la única pieza nueva -- fuerza ese campo a `now()` en cada `applyPatch`/`upsert`-actualización, aunque el patch no lo mencione, mientras un campo sin la anotación nunca se toca solo
 - `db.<c>.insertMany(items) -> T[]`: cada elemento pasa por el mismo `insert` real de siempre (una sentencia SQL autocommit por fila), en el orden dado -- ahorra las N idas y vueltas HTTP secuenciales del cliente para un backfill, no el costo de N inserts contra la base. Sin transacción envolvente: si el ítem 3 de 5 falla, los dos primeros quedan insertados igual
 - `db.<c>.upsert(matchFn, insertValue, updateFn)`: actualizar-en-el-lugar-o-insertar sin reimplementar a mano buscar+borrar+reinsertar (que ni siquiera preserva el id de la fila con un autoincrement real). `matchFn` recorre toda la colección en el intérprete (mismo límite que `findWhere`/`deleteWhere` -- no empujado a SQL todavía); con match, `updateFn` recibe la fila existente completa y su resultado se aplica sobre ESE MISMO id. `updateFn` devuelve un valor `Omit<T,"id">` completo, no un `Patch<T>` parcial -- deliberado, ya que `Patch<T>` no tiene sintaxis de literal y no se podría construir adentro de un cuerpo de función

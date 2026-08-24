@@ -57,6 +57,7 @@ Works, verified by running it:
 - Configurable CORS + fixed security headers on `linkc serve`: `--cors-origin <origin>` (repeatable) or `LINK_CORS_ORIGINS` (comma-separated) switches from open `*` to an exact-match allowlist (echoed literal + `Vary: Origin`; a non-matching `Origin` gets no CORS header at all, on every response including `stream` SSE and errors). Every response also carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` — see GRAMMAR.md §3.41. No CSP (depends on page content) or HSTS (belongs at the TLS-terminating reverse proxy, not `linkc serve` itself).
 - `db.<c>.upsert(matchFn: (T) -> Bool, insertValue: Omit<T,"id">, updateFn: (T) -> Omit<T,"id">) -> T`: update-in-place-or-insert without hand-rolling find+delete+reinsert. `matchFn` scans the whole collection in the interpreter (not pushed to SQL — same limit as `findWhere`/`deleteWhere`) and keeps the first match. No match → inserts `insertValue`. Match → calls `updateFn` with the full EXISTING row and applies its result onto that SAME id (via the same mechanism `applyPatch` uses) — never deletes and reinserts, so the id doesn't change (unlike a hand-rolled find+delete+reinsert, which usually doesn't reproduce the same autoincrement id either). `updateFn` returns a COMPLETE `Omit<T,"id">` value, not a partial `Patch<T>` — see rule 16 for why.
 - `db.<c>.insertMany(items: Omit<T,"id">[]) -> T[]`: each item goes through the same real `insert` (one autocommit SQL statement per row) in order — saves the N sequential HTTP round trips from the client for a backfill, not the cost of N inserts against the database (still N separate `INSERT` statements, not one batch statement). No wrapping transaction — if item 3 of 5 fails, the first two stay inserted, no automatic rollback.
+- Native soft-delete: `@softDelete` on a `Timestamp?` field (only) turns `delete(id)` from a real `DELETE` into an idempotent `UPDATE` — sets the field to `now()`, `AND "<field>" IS NULL` in the WHERE so a second `delete` on an already-deleted row is a no-op returning `false`, never re-touching the timestamp or re-publishing a `stream` event. Every read that returns a LIST or a COUNT filters automatically: `all()`, `page()`, `pageAfter()`, `count()`, `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`, and `findWhere`/`deleteWhere` (which get it FREE, no extra code — they call `all()` internally). At most ONE `@softDelete` field per struct — two would be ambiguous, a compile error naming both. `= null` (the field-default mechanism, rule 15) is what avoids having to pass the field by hand on every `insert`. See rule 17 for the one big gotcha.
 - Automatic `createdAt`/`updatedAt`: NO magic field names anywhere. `createdAt: Timestamp = now()` already works with two features that already existed before this — the `now()` builtin and a plain field default (rule 15) — no new syntax needed for "set once at creation." `@autoUpdate` on a `Timestamp` field (and only `Timestamp` — anything else is a compile error) is the one new piece: it forces that field to `now()` on every `applyPatch` and on `upsert`'s update path, EVEN when the patch doesn't mention it at all. A field named `updatedAt` without `@autoUpdate` is never touched automatically, and `@autoUpdate` works on a field with any name, not just `updatedAt` — see GRAMMAR.md §3.77.
 - Sending email: `smtp.send(to: String, subject: String, body: String) -> Void`. Connection and sender come from the process environment (`LINK_SMTP_URL`, `LINK_SMTP_FROM`), never from rpc arguments — see GRAMMAR.md §3.43. `smtp.sendToMany(to: String[], subject: String, body: String) -> Void` sends ONE message with one `RCPT TO` per recipient; `smtp.sendHtml(to: String[], subject: String, html: String) -> Void` sends an HTML body (`Content-Type: text/html`) to one or many recipients — see GRAMMAR.md §3.63. All three: no attachments, no cc/bcc, synchronous (blocks the single-threaded server for that request).
 - Calling third-party APIs: `http.get(url: String) -> String` / `http.post(url: String, body: String) -> String` (unchanged), plus `http.getWithHeaders(url: String, headers) -> String` / `http.postWithHeaders(url: String, body: String, headers) -> String` for calls that need `Authorization` or any other header. `headers` is `{name: String, value: String}[]` — structural, not a builtin type, so any struct you declare with those two fields works. Response is only the body as `String`; a non-2xx becomes a runtime error (not a value with the status code) — see GRAMMAR.md §3.47. `http.getWithStatus(url: String, headers) -> {status: Int, headers: {name:String,value:String}[], body: String}` / `http.postWithStatus(url: String, body: String, headers) -> same` — two ADDITIONAL methods (the four above are unchanged) that return the status code and response headers as data instead of turning a non-2xx into a runtime error; the return type is structural too, no builtin name — see GRAMMAR.md §3.60.
@@ -178,6 +179,16 @@ difference between code that compiles and code that does not.
     pushed to SQL (same as `findWhere`/`deleteWhere`) and keeps only the FIRST match if more
     than one row qualifies — not atomic across multiple `linkc serve` instances against the
     same database. See GRAMMAR.md §3.75.
+17. **`@softDelete`: `find(id)` does NOT filter — a soft-deleted row is still reachable by
+    direct id lookup.** Deliberate, not an oversight: `insert`/`applyPatch` re-fetch the row
+    they just wrote through this SAME code path, and `applyPatch` can still write the
+    `@softDelete` field like any other field of `Patch<T>` — if `find`-style lookup filtered,
+    an `applyPatch` that happened to touch that field would make its own post-write re-fetch
+    come back empty, a panic instead of a clean result. So only LIST/COUNT-returning reads
+    filter (`all`/`page`/`pageAfter`/`count`/the `*By` aggregates/`findWhere`/`deleteWhere`) —
+    single-row `find(id)` never does. No `includeDeleted` escape hatch on the filtered methods
+    either — direct `find(id)` is the only way to see a soft-deleted row today. See GRAMMAR.md
+    §3.78.
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `page(limit: Int, offset: Int) -> T[]` (LIMIT/OFFSET pushed to real SQL, not `all().take(n)`
@@ -185,7 +196,8 @@ Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pr
 §3.76), `applyPatch(id, patch) -> T`, `delete(id) -> Bool`, `deleteWhere(pred) -> Int`,
 `subscribe()` (see rule 5), `upsert(matchFn, insertValue, updateFn) -> T` (see rule 16 and
 GRAMMAR.md §3.75), `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (`GROUP BY` pushed to real SQL —
-see rule 11 and GRAMMAR.md §3.52).
+see rule 11 and GRAMMAR.md §3.52). `delete`/`deleteWhere` become soft-delete-aware `UPDATE`s
+instead of real `DELETE`s when the collection's type has an `@softDelete` field (rule 17).
 
 ## CLI
 

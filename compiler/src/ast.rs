@@ -189,6 +189,14 @@ impl Field {
     pub fn auto_update(&self) -> bool {
         self.annotations.iter().any(|a| matches!(a, FieldAnnotation::AutoUpdate))
     }
+
+    /// ¿Lleva `@softDelete`? (GRAMMAR.md §3.78) -- un campo `Timestamp?` así
+    /// marcado convierte `delete` en un `UPDATE` que lo fija a `now()` en
+    /// vez de borrar la fila, y toda lectura (`all`/`find`/`page`/etc.)
+    /// filtra automáticamente las filas donde no es `null`.
+    pub fn soft_delete(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, FieldAnnotation::SoftDelete))
+    }
 }
 
 impl PartialEq for Field {
@@ -212,6 +220,9 @@ pub enum FieldAnnotation {
     /// `@autoUpdate` (sin paréntesis, ver `parse_field_annotations`) -- solo
     /// sobre un campo `Timestamp`. Ver GRAMMAR.md §3.77.
     AutoUpdate,
+    /// `@softDelete` (sin paréntesis) -- solo sobre un campo `Timestamp?`.
+    /// Ver GRAMMAR.md §3.78.
+    SoftDelete,
 }
 
 /// Las dos formas de `@validate(...)` que un campo `String`/`String?` admite

@@ -751,6 +751,7 @@ impl Checker {
                             .into_iter()
                             .chain(checker.check_field_defaults(fields, &t.type_params))
                             .chain(checker.check_field_auto_update(fields, &t.type_params))
+                            .chain(checker.check_field_soft_delete(fields, &t.type_params))
                         {
                             let mut e = e;
                             if let Some(file) = file_for(index) {
@@ -768,6 +769,7 @@ impl Checker {
                                 .into_iter()
                                 .chain(checker.check_field_defaults(fields, &en.type_params))
                                 .chain(checker.check_field_auto_update(fields, &en.type_params))
+                                .chain(checker.check_field_soft_delete(fields, &en.type_params))
                             {
                                 let mut e = e;
                                 if let Some(file) = file_for(index) {
@@ -1627,6 +1629,44 @@ impl Checker {
                 Ok(ty) => errors.push(
                     err(format!(
                         "'@autoUpdate' en el campo '{}': solo aplica sobre `Timestamp` -- es `{ty}`",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                ),
+                Err(e) => errors.push(e.with_span(f.name_span)),
+            }
+        }
+        errors
+    }
+
+    /// `@softDelete` (GRAMMAR.md §3.78) solo sobre un campo `Timestamp?`
+    /// exacto -- ni `Timestamp` requerido ni cualquier otro tipo. Tiene que
+    /// ser opcional porque "ausente/`null`" ES el estado "no borrado";
+    /// requerido no dejaría representar eso.
+    fn check_field_soft_delete(&self, fields: &[Field], type_params: &[String]) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        let marked: Vec<&Field> = fields.iter().filter(|f| f.soft_delete()).collect();
+        // Más de un `@softDelete` sería ambiguo: `delete()` no sabría cuál
+        // de los dos fijar. Se reporta UNA vez, nombrando los dos campos, en
+        // vez de un error por campo.
+        if marked.len() > 1 {
+            let names: Vec<&str> = marked.iter().map(|f| f.name.as_str()).collect();
+            errors.push(err(format!(
+                "más de un campo con '@softDelete' ({}) -- a lo sumo uno por struct, si no `delete()` no sabría cuál fijar",
+                names.join(", ")
+            )));
+        }
+        for f in marked {
+            let ty = if type_params.is_empty() {
+                self.resolve_type(&f.ty)
+            } else {
+                self.resolve_type_abstract(&f.ty, type_params)
+            };
+            match ty {
+                Ok(Type::Optional(inner)) if matches!(*inner, Type::Timestamp) => {}
+                Ok(ty) => errors.push(
+                    err(format!(
+                        "'@softDelete' en el campo '{}': solo aplica sobre `Timestamp?` -- es `{ty}`",
                         f.name
                     ))
                     .with_span(f.name_span),
@@ -6503,6 +6543,45 @@ type T = { id: Int, s: Status }")
         let src = "type Task = { id: Int, @autoUpdate @autoUpdate updatedAt: Timestamp }";
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         let err = parse(tokens).expect_err("dos @autoUpdate en el mismo campo debe rechazarse");
+        assert!(format!("{err:?}").contains("repetido"), "{err:?}");
+    }
+
+    // ---- soft-delete nativo: `@softDelete` (GRAMMAR.md §3.78) ----
+
+    #[test]
+    fn soft_delete_on_a_timestamp_optional_field_typechecks() {
+        let src = "type Task = { id: Int, @softDelete deletedAt: Timestamp? = null }";
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn soft_delete_on_a_required_timestamp_is_rejected() {
+        // `Timestamp` (sin `?`) no puede representar "no borrado" -- tiene
+        // que ser `Timestamp?`.
+        let src = "type Task = { id: Int, @softDelete deletedAt: Timestamp }";
+        let errs = check_source(src).expect_err("@softDelete sobre Timestamp requerido debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("solo aplica sobre")), "{errs:?}");
+    }
+
+    #[test]
+    fn soft_delete_on_a_non_timestamp_field_is_rejected() {
+        let src = "type Task = { id: Int, @softDelete deletedAt: String? }";
+        let errs = check_source(src).expect_err("@softDelete sobre String? debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("solo aplica sobre")), "{errs:?}");
+    }
+
+    #[test]
+    fn two_soft_delete_fields_on_the_same_struct_is_rejected() {
+        let src = "type Task = { id: Int, @softDelete a: Timestamp? = null, @softDelete b: Timestamp? = null }";
+        let errs = check_source(src).expect_err("dos @softDelete en el mismo struct debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("más de un campo con '@softDelete'")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_second_soft_delete_annotation_on_the_same_field_is_a_parse_error() {
+        let src = "type Task = { id: Int, @softDelete @softDelete deletedAt: Timestamp? = null }";
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("dos @softDelete en el mismo campo debe rechazarse");
         assert!(format!("{err:?}").contains("repetido"), "{err:?}");
     }
 }

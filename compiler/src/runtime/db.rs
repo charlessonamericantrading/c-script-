@@ -10,7 +10,7 @@
 // de la misma fuente de verdad, cero duplicación manual).
 
 use super::{as_int, json_to_typed_value, simple_enum_names, value_to_json, RuntimeError, Value};
-use crate::ast::Program;
+use crate::ast::{Item, Program, TypeExpr};
 use crate::checker::Checker;
 use crate::types::{FieldType, Type};
 use super::store::{Backend, Cell, ColumnKind};
@@ -120,6 +120,30 @@ fn native_sql_type(ty: &Type, simple_enums: &HashSet<String>) -> Option<&'static
         Type::Enum(name) if simple_enums.contains(name) => Some("TEXT"),
         _ => None,
     }
+}
+
+/// Nombre de colección -> nombre del campo `@softDelete` de su tipo de
+/// elemento, para cada colección que tenga uno (GRAMMAR.md §3.78, checker.rs
+/// ya garantizó a lo sumo uno por struct). `checker.db_collections()` da el
+/// `Type` YA RESUELTO (sin anotaciones); acá se cruza con `program.items`
+/// (que sí tiene `ast::Field` con anotaciones) por el `name: Some(...)` que
+/// el `Type::Struct` de un elemento de colección siempre conserva.
+fn soft_delete_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let TypeExpr::Struct(fields) = &t.ty else { continue };
+            if let Some(f) = fields.iter().find(|f| f.soft_delete()) {
+                result.insert(coll_name.clone(), f.name.clone());
+            }
+        }
+    }
+    result
 }
 
 fn create_table_sql(collection: &str, columns: &[ColumnPlan]) -> String {
@@ -421,6 +445,14 @@ pub struct Db {
     /// `m`/`t`/`p` en el hash guardado, así que verificar un hash viejo con
     /// otros parámetros sigue funcionando sin tocar esto.
     argon2_params: RefCell<argon2::Params>,
+    /// Nombre de colección -> nombre del campo `@softDelete`, si esa
+    /// colección tiene uno (GRAMMAR.md §3.78). Se calcula UNA vez al abrir
+    /// la conexión (acá SÍ hay `Program`/`ast::Field` con anotaciones a
+    /// mano, a diferencia de `Db::call` -- por eso se resuelve acá y se
+    /// guarda, en vez de recalcularlo en cada `select`/`delete`). Vacío
+    /// (sin entrada) es el caso normal -- la mayoría de colecciones no usa
+    /// soft-delete.
+    soft_delete_fields: HashMap<String, String>,
 }
 
 /// Un cambio anunciado por OTRA instancia de `linkc serve` contra la misma
@@ -652,6 +684,7 @@ impl Db {
             }
             columns.insert(name.clone(), cols);
         }
+        let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
 
         Db {
             backend: Backend::Sqlite(connection),
@@ -663,6 +696,7 @@ impl Db {
             response_status_override: std::cell::Cell::new(None),
             instance_id: random_instance_id(),
             argon2_params: RefCell::new(argon2::Params::default()),
+            soft_delete_fields,
         }
     }
 
@@ -760,6 +794,7 @@ impl Db {
 
         let instance_id = random_instance_id();
         let remote_rx = spawn_remote_listener(url.to_string(), instance_id.clone());
+        let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
 
         Ok((
             Db {
@@ -772,6 +807,7 @@ impl Db {
                 response_status_override: std::cell::Cell::new(None),
                 instance_id,
                 argon2_params: RefCell::new(argon2::Params::default()),
+                soft_delete_fields,
             },
             remote_rx,
         ))
@@ -1007,14 +1043,42 @@ db { users: User[] }
                 self.publish(collection, &updated);
                 Ok(updated)
             }
+            // GRAMMAR.md §3.78: si `collection` tiene un campo `@softDelete`,
+            // `delete` deja de ser un `DELETE` real -- pasa a ser un
+            // `UPDATE` que fija ese campo a `now()`. `AND "<campo>" IS
+            // NULL` en el WHERE hace la operación IDEMPOTENTE: una segunda
+            // llamada sobre una fila ya borrada no re-toca el timestamp,
+            // devuelve `false` (0 filas afectadas), igual que un `delete`
+            // normal sobre un id que ya no existe.
             "delete" => {
                 let id = as_int(args.first().ok_or_else(|| RuntimeError::new("delete requiere 1 argumento"))?)?;
+                // `select_rows(id: Some(_))` NUNCA filtra por soft-delete
+                // (ver su propio comentario) -- acá es exactamente lo que
+                // hace falta: encontrar la fila sea cual sea su estado, para
+                // saber si hay algo que borrar y qué publicar si se borra.
                 let existing = self.select_rows(collection, columns, Some(id))?.into_iter().next();
-                let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = {}", self.backend.placeholder(1));
-                let rows_affected = self
-                    .backend
-                    .execute(&sql, &[Cell::Int(id)])
-                    .map_err(|e| RuntimeError::new(format!("delete falló: {e}")))?;
+                let rows_affected = match self.soft_delete_fields.get(collection) {
+                    Some(field) => {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let sql = format!(
+                            "UPDATE \"{collection}\" SET \"{field}\" = {} WHERE \"id\" = {} AND \"{field}\" IS NULL",
+                            self.backend.placeholder(1),
+                            self.backend.placeholder(2)
+                        );
+                        self.backend
+                            .execute(&sql, &[Cell::Int(now_ms), Cell::Int(id)])
+                            .map_err(|e| RuntimeError::new(format!("delete (soft) falló: {e}")))?
+                    }
+                    None => {
+                        let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = {}", self.backend.placeholder(1));
+                        self.backend
+                            .execute(&sql, &[Cell::Int(id)])
+                            .map_err(|e| RuntimeError::new(format!("delete falló: {e}")))?
+                    }
+                };
                 if rows_affected > 0 {
                     if let Some(deleted_row) = existing {
                         self.publish(collection, &deleted_row);
@@ -1023,7 +1087,8 @@ db { users: User[] }
                 Ok(Value::Bool(rows_affected > 0))
             }
             "count" => {
-                let sql = format!("SELECT COUNT(*) FROM \"{collection}\"");
+                let where_clause = self.soft_delete_where(collection).map(|c| format!(" WHERE {c}")).unwrap_or_default();
+                let sql = format!("SELECT COUNT(*) FROM \"{collection}\"{where_clause}");
                 let rows = self
                     .backend
                     .query(&sql, &[], &[ColumnKind::Int])
@@ -1148,15 +1213,37 @@ db { users: User[] }
         }
     }
 
+    /// `"<campo>" IS NULL`, si `collection` tiene un campo `@softDelete`
+    /// (GRAMMAR.md §3.78) -- `None` para la enorme mayoría de colecciones,
+    /// que no usan soft-delete.
+    fn soft_delete_where(&self, collection: &str) -> Option<String> {
+        self.soft_delete_fields.get(collection).map(|field| format!("\"{field}\" IS NULL"))
+    }
+
     /// `all` (`id: None`, ordenado por "id" para output determinístico,
     /// mismo orden de inserción que ya daba el `Vec` de antes) o `find`/la
     /// re-consulta de `insert`/`applyPatch` (`id: Some(_)`, a lo sumo 1 fila).
+    ///
+    /// El filtro de `@softDelete` (GRAMMAR.md §3.78) SOLO se aplica cuando
+    /// `id` es `None` (o sea, en `all()`) -- deliberado, no una omisión: la
+    /// re-consulta que `insert`/`applyPatch` hacen contra el `id` que ELLOS
+    /// mismos acaban de escribir usa este mismo camino con `id: Some(_)`, y
+    /// si `applyPatch` estuviera fijando justo el campo de soft-delete (un
+    /// patch puede tocarlo como cualquier otro campo), filtrar ahí haría que
+    /// la re-consulta no encontrara la fila que acaba de escribir -- un
+    /// panic, no un error limpio. `find(id)` comparte el mismo criterio por
+    /// simplicidad (ver "Límites honestos", GRAMMAR.md §3.78): una fila
+    /// soft-deleteada sigue siendo encontrable por id directo, solo
+    /// desaparece de listados (`all`/`page`/`pageAfter`/agregaciones).
     fn select_rows(&self, collection: &str, columns: &[ColumnPlan], id: Option<i64>) -> Result<Vec<Value>, RuntimeError> {
         let mut col_list = vec!["\"id\"".to_string()];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
         let sql = match id {
             Some(_) => format!("SELECT {} FROM \"{collection}\" WHERE \"id\" = {}", col_list.join(", "), self.backend.placeholder(1)),
-            None => format!("SELECT {} FROM \"{collection}\" ORDER BY \"id\"", col_list.join(", ")),
+            None => match self.soft_delete_where(collection) {
+                Some(cond) => format!("SELECT {} FROM \"{collection}\" WHERE {cond} ORDER BY \"id\"", col_list.join(", ")),
+                None => format!("SELECT {} FROM \"{collection}\" ORDER BY \"id\"", col_list.join(", ")),
+            },
         };
         // El orden de `kinds` es el del SELECT: "id" primero, después las
         // columnas declaradas, en el mismo orden que `columns`.
@@ -1183,8 +1270,9 @@ db { users: User[] }
     fn select_rows_page(&self, collection: &str, columns: &[ColumnPlan], limit: i64, offset: i64) -> Result<Vec<Value>, RuntimeError> {
         let mut col_list = vec!["\"id\"".to_string()];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
         let sql = format!(
-            "SELECT {} FROM \"{collection}\" ORDER BY \"id\" LIMIT {} OFFSET {}",
+            "SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"id\" LIMIT {} OFFSET {}",
             col_list.join(", "),
             self.backend.placeholder(1),
             self.backend.placeholder(2)
@@ -1216,14 +1304,26 @@ db { users: User[] }
     fn select_rows_after(&self, collection: &str, columns: &[ColumnPlan], after: Option<i64>, limit: i64) -> Result<Vec<Value>, RuntimeError> {
         let mut col_list = vec!["\"id\"".to_string()];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
-        let sql = match after {
-            Some(_) => format!(
+        let soft_delete_cond = self.soft_delete_where(collection);
+        let sql = match (after, &soft_delete_cond) {
+            (Some(_), Some(sd)) => format!(
+                "SELECT {} FROM \"{collection}\" WHERE \"id\" > {} AND {sd} ORDER BY \"id\" LIMIT {}",
+                col_list.join(", "),
+                self.backend.placeholder(1),
+                self.backend.placeholder(2)
+            ),
+            (Some(_), None) => format!(
                 "SELECT {} FROM \"{collection}\" WHERE \"id\" > {} ORDER BY \"id\" LIMIT {}",
                 col_list.join(", "),
                 self.backend.placeholder(1),
                 self.backend.placeholder(2)
             ),
-            None => format!(
+            (None, Some(sd)) => format!(
+                "SELECT {} FROM \"{collection}\" WHERE {sd} ORDER BY \"id\" LIMIT {}",
+                col_list.join(", "),
+                self.backend.placeholder(1)
+            ),
+            (None, None) => format!(
                 "SELECT {} FROM \"{collection}\" ORDER BY \"id\" LIMIT {}",
                 col_list.join(", "),
                 self.backend.placeholder(1)
@@ -1310,8 +1410,10 @@ db { users: User[] }
 
         let key_ty = key_col.field.ty.clone();
         let value_ty = value_field_ty;
-        let sql =
-            format!("SELECT \"{key_field}\" AS \"key\", {value_expr} AS \"value\" FROM \"{collection}\" GROUP BY \"{key_field}\"");
+        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let sql = format!(
+            "SELECT \"{key_field}\" AS \"key\", {value_expr} AS \"value\" FROM \"{collection}\" {where_clause}GROUP BY \"{key_field}\""
+        );
         let kinds = vec![key_col.kind(), value_kind];
         let rows = self
             .backend

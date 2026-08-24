@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.43.0] - 2026-08-24
+
+### ✨ Nuevo
+- **Soft-delete nativo: `@softDelete`.** "Borrar" una fila casi nunca significa borrarla de verdad -- hasta esta ronda, `db.<c>.delete(id)` siempre era un `DELETE` de SQL real, sin ninguna forma declarativa de pedir "marcalo como borrado en vez de borrarlo". `@softDelete` sobre un campo `Timestamp?` (opcional -- `null` es "no borrado", cualquier otro valor es "borrado en este instante", así que TIENE que ser opcional) cambia el significado de `delete(id)`: deja de ser un `DELETE`, pasa a ser un `UPDATE` que fija ese campo a `now()`, con `AND "<campo>" IS NULL` en el propio `WHERE` para que sea IDEMPOTENTE (una segunda llamada sobre una fila ya borrada no re-toca el timestamp ni publica un evento de `stream` de nuevo, devuelve `false`). Toda lectura que devuelve lista o conteo filtra automáticamente: `all()`, `page()`, `pageAfter()`, `count()`, `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` agregan la condición al SQL; `findWhere`/`deleteWhere` la heredan GRATIS, sin ningún código propio, porque reusan `all()` por dentro. A lo sumo un campo `@softDelete` por struct (dos sería ambiguo, rechazado en compilación nombrando los dos). `= null` (el mecanismo de default de campo, v1.39.0) es lo que evita tener que pasar el campo a mano en cada `insert`. Límite deliberado, no una omisión: `find(id)` (y la re-consulta interna que `insert`/`applyPatch` hacen después de escribir) NO filtra -- si filtrara, un `applyPatch` que tocara justo ese campo haría que su propia re-consulta no encontrara la fila que acaba de escribir, un panic en vez de un error limpio. Mismo criterio que Django/Rails adoptan para el mismo problema: listados filtran, lookup directo por id no.
+
+760 tests (10 nuevos): 5 en `checker.rs` (`Timestamp?` tipa limpio, se rechaza sobre `Timestamp` requerido y sobre cualquier otro tipo, dos `@softDelete` en el mismo struct se rechaza, una segunda `@softDelete` en el mismo campo es error de parser) y 5 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (`delete` fija el campo en vez de borrar, idempotente, `all()`/`count()` excluyen la fila borrada, `findWhere`/`deleteWhere` heredan el filtro, `page`/`pageAfter`/`sumBy` también filtran). Verificado también a mano contra un servidor HTTP real (`curl`): crear 2 filas, borrar una, `list`/`count` muestran solo 1, un segundo `delete` da `false`, `find` directo por id sigue encontrando la fila borrada. Detalle completo: GRAMMAR.md §3.78.
+
 ## [1.42.0] - 2026-08-24
 
 ### ✨ Nuevo

@@ -444,9 +444,16 @@ impl Parser {
                     }
                     annotations.push(FieldAnnotation::AutoUpdate);
                 }
+                // Sin paréntesis, mismo criterio que `@autoUpdate` (GRAMMAR.md §3.78).
+                "softDelete" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::SoftDelete)) {
+                        return Err(self.error("'@softDelete' repetido sobre el mismo campo".to_string()));
+                    }
+                    annotations.push(FieldAnnotation::SoftDelete);
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)' o '@autoUpdate')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate' o '@softDelete')"
                     )))
                 }
             }

@@ -3927,6 +3927,136 @@ mod tests {
         assert_ne!(renamed["updatedAt"], updated_at_before, "updatedAt se pisó a pesar de no venir en el patch");
     }
 
+    // ---- soft-delete nativo: `@softDelete` (GRAMMAR.md §3.78) ----
+
+    fn soft_delete_program() -> crate::ast::Program {
+        program_from(
+            r#"
+            type Task = { id: Int, title: String, @softDelete deletedAt: Timestamp? = null }
+            type NewTask = { title: String, deletedAt: Timestamp? = null }
+            db { tasks: Task[] }
+            service S {
+                rpc create(title: String) -> Task { db.tasks.insert(NewTask { title: title }) }
+                rpc list() -> Task[] { db.tasks.all() }
+                rpc remove(id: Int) -> Bool { db.tasks.delete(id) }
+                rpc getById(id: Int) -> Task? { db.tasks.find(id) }
+                rpc total() -> Int { db.tasks.count() }
+            }
+        "#,
+        )
+    }
+
+    #[test]
+    fn deleting_a_row_with_a_soft_delete_field_sets_it_instead_of_removing_the_row() {
+        let program = soft_delete_program();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "create", &json!({"title": "a"}), &db).unwrap();
+        let id = created["id"].as_i64().unwrap();
+        assert_eq!(created["deletedAt"], json!(null));
+
+        let deleted = invoke_rpc(&program, "S", "remove", &json!({"id": id}), &db).unwrap();
+        assert_eq!(deleted, json!(true));
+
+        // La fila sigue existiendo -- `find` no filtra por soft-delete
+        // (límite deliberado, ver GRAMMAR.md §3.78) -- pero ahora tiene
+        // 'deletedAt' fijado.
+        let fetched = invoke_rpc(&program, "S", "getById", &json!({"id": id}), &db).unwrap();
+        assert!(!fetched["deletedAt"].is_null(), "{fetched}");
+    }
+
+    #[test]
+    fn deleting_twice_is_idempotent_and_returns_false_the_second_time() {
+        let program = soft_delete_program();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "create", &json!({"title": "a"}), &db).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        assert_eq!(invoke_rpc(&program, "S", "remove", &json!({"id": id}), &db).unwrap(), json!(true));
+        assert_eq!(
+            invoke_rpc(&program, "S", "remove", &json!({"id": id}), &db).unwrap(),
+            json!(false),
+            "una segunda vez sobre una fila ya borrada no debe re-tocarla"
+        );
+    }
+
+    #[test]
+    fn all_and_count_exclude_soft_deleted_rows() {
+        let program = soft_delete_program();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let a = invoke_rpc(&program, "S", "create", &json!({"title": "a"}), &db).unwrap();
+        let _b = invoke_rpc(&program, "S", "create", &json!({"title": "b"}), &db).unwrap();
+        assert_eq!(invoke_rpc(&program, "S", "total", &json!({}), &db).unwrap(), json!(2));
+
+        invoke_rpc(&program, "S", "remove", &json!({"id": a["id"]}), &db).unwrap();
+
+        let list = invoke_rpc(&program, "S", "list", &json!({}), &db).unwrap();
+        let titles: Vec<&str> = list.as_array().unwrap().iter().map(|r| r["title"].as_str().unwrap()).collect();
+        assert_eq!(titles, vec!["b"], "'all()' no debe traer la fila borrada");
+        assert_eq!(invoke_rpc(&program, "S", "total", &json!({}), &db).unwrap(), json!(1));
+    }
+
+    /// `findWhere`/`deleteWhere` reusan `all()` internamente (ver
+    /// `call_method`) -- heredan el filtro gratis, sin ningún caso especial
+    /// propio para soft-delete.
+    #[test]
+    fn find_where_and_delete_where_inherit_the_filter_via_all() {
+        let program = program_from(
+            r#"
+            type Task = { id: Int, title: String, @softDelete deletedAt: Timestamp? = null }
+            type NewTask = { title: String, deletedAt: Timestamp? = null }
+            db { tasks: Task[] }
+            service S {
+                rpc create(title: String) -> Task { db.tasks.insert(NewTask { title: title }) }
+                rpc remove(id: Int) -> Bool { db.tasks.delete(id) }
+                rpc findAll() -> Task[] { db.tasks.findWhere(|t: Task| { true }) }
+                rpc deleteAll() -> Int { db.tasks.deleteWhere(|t: Task| { true }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let a = invoke_rpc(&program, "S", "create", &json!({"title": "a"}), &db).unwrap();
+        invoke_rpc(&program, "S", "create", &json!({"title": "b"}), &db).unwrap();
+        invoke_rpc(&program, "S", "remove", &json!({"id": a["id"]}), &db).unwrap();
+
+        let found = invoke_rpc(&program, "S", "findAll", &json!({}), &db).unwrap();
+        assert_eq!(found.as_array().unwrap().len(), 1, "findWhere no debe ver la fila ya soft-deleted");
+
+        // deleteWhere(true) sobre lo que queda (solo "b") -- la ya borrada
+        // ni siquiera entra al loop, así que el conteo devuelto es 1, no 2.
+        let count = invoke_rpc(&program, "S", "deleteAll", &json!({}), &db).unwrap();
+        assert_eq!(count, json!(1));
+    }
+
+    /// `page`/`pageAfter`/`sumBy` también filtran -- mismo criterio que
+    /// `all()`/`count()`, no un caso especial de esos dos nada más.
+    #[test]
+    fn page_page_after_and_sum_by_exclude_soft_deleted_rows() {
+        let program = program_from(
+            r#"
+            type Task = { id: Int, title: String, amount: Int, @softDelete deletedAt: Timestamp? = null }
+            type NewTask = { title: String, amount: Int, deletedAt: Timestamp? = null }
+            db { tasks: Task[] }
+            service S {
+                rpc create(title: String, amount: Int) -> Task { db.tasks.insert(NewTask { title: title, amount: amount }) }
+                rpc remove(id: Int) -> Bool { db.tasks.delete(id) }
+                rpc page() -> Task[] { db.tasks.page(10, 0) }
+                rpc pageAfter() -> Task[] { db.tasks.pageAfter(null, 10) }
+                rpc total() -> Int { db.tasks.sumBy(|t: Task| { t.title }, |t: Task| { t.amount }).length() }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let a = invoke_rpc(&program, "S", "create", &json!({"title": "a", "amount": 10}), &db).unwrap();
+        invoke_rpc(&program, "S", "create", &json!({"title": "b", "amount": 20}), &db).unwrap();
+        invoke_rpc(&program, "S", "remove", &json!({"id": a["id"]}), &db).unwrap();
+
+        assert_eq!(invoke_rpc(&program, "S", "page", &json!({}), &db).unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(invoke_rpc(&program, "S", "pageAfter", &json!({}), &db).unwrap().as_array().unwrap().len(), 1);
+        // Un solo grupo restante ("b") -- si la fila borrada hubiera
+        // sobrevivido al GROUP BY, habría 2.
+        assert_eq!(invoke_rpc(&program, "S", "total", &json!({}), &db).unwrap(), json!(1));
+    }
+
     // ---- validación tipada del borde (auditoría) ----
     //
     // Todos estos casos se reprodujeron primero contra un servidor real:
