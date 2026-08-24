@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.77.0] - 2026-08-25
+
+### 📝 Documentado (ya funcionaba, sin un ejemplo que lo dijera)
+- **Flujo OAuth2 "client credentials" (servidor a servidor).** Auditoría de reducción de fricción con proveedores (Google APIs, Microsoft Graph, Salesforce, HubSpot y muchas otras APIs empresariales usan este flujo, distinto del "authorization code" con login de usuario, que sigue bloqueado -- necesita un proveedor de identidad real). CERO código nuevo del compilador: las tres piezas ya existían -- `http.postWithHeaders` para pedir el token, `json.parse(text) -> Dynamic` + acceso de campo sobre `Dynamic` (tipa devolviendo `Dynamic`, asignable donde se espera `String` sin cast) para extraer `access_token` sin declarar la forma completa de la respuesta, y `http.getWithHeaders` con `Authorization: Bearer <token>` para la llamada real.
+
+954 tests (1 nuevo): verificado de punta a punta contra DOS servidores HTTP de mentira reales (uno de token, uno de API protegida) en `tests/cli_http.rs` -- confirma que el `client_id`/`client_secret` llegan tal cual al primero, y que el token que ESE servidor devuelve llega EXACTO como header `Authorization` al segundo. Detalle completo, más la auditoría de por qué Azure Blob SAS NO se implementó esta ronda (Microsoft no publica un vector de prueba reproducible con la clave incluida, a diferencia de AWS): GRAMMAR.md §3.114, PLAN.md §9.10.
+
 ## [1.76.0] - 2026-08-25
 
 ### ✨ Nuevo

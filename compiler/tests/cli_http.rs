@@ -485,6 +485,71 @@ fn link_http_timeout_env_var_is_honored() {
     assert!(start.elapsed() < Duration::from_secs(10), "tardó {:?}", start.elapsed());
 }
 
+/// GRAMMAR.md §3.114: el flujo OAuth2 "client credentials" (servidor a
+/// servidor, sin login de usuario -- el que usan Google APIs/Microsoft
+/// Graph/Salesforce/HubSpot para autenticación de máquina a máquina) NO es
+/// un gap del lenguaje: `http.postWithHeaders` para pedir el token,
+/// `json.parse(...).campo` (`Type::Dynamic`, ya asignable a `String` sin
+/// cast explícito) para extraer `access_token` de la respuesta, y
+/// `http.getWithHeaders` con `Authorization: Bearer <token>` para la
+/// llamada real -- las tres piezas ya existían, ninguna nueva. Distinto del
+/// login-con-usuario (OAuth2 authorization code, PLAN.md §9.12, bloqueado
+/// porque verificarlo de punta a punta necesita un proveedor de identidad
+/// real con una app de prueba registrada).
+const OAUTH2_PROGRAM: &str = r#"
+type Header = { name: String, value: String }
+
+service Api {
+  rpc callProtectedApi(tokenUrl: String, clientId: String, clientSecret: String, apiUrl: String) -> String {
+    let tokenBody = "grant_type=client_credentials&client_id=" + clientId + "&client_secret=" + clientSecret;
+    let tokenResponse = http.postWithHeaders(tokenUrl, tokenBody, [
+      Header { name: "Content-Type", value: "application/x-www-form-urlencoded" },
+    ]);
+    let parsed = json.parse(tokenResponse);
+    let token = parsed.access_token;
+    http.getWithHeaders(apiUrl, [
+      Header { name: "Authorization", value: "Bearer " + token },
+    ])
+  }
+}
+"#;
+
+#[test]
+fn oauth2_client_credentials_flow_works_end_to_end_with_only_existing_builtins() {
+    // Dos servidores de mentira DISTINTOS -- uno hace de endpoint de token,
+    // el otro de API protegida -- para confirmar que el token que devuelve
+    // el primero es EXACTAMENTE el que el segundo recibe en su header
+    // `Authorization`, no solo que las dos llamadas salieron.
+    let token_server = FakeHttp::start_with_response(200, "OK", br#"{"access_token":"tok-xyz-789","expires_in":3600}"#, &[]);
+    let api_server = FakeHttp::start_with_response(200, "OK", br#"{"result":"secreto"}"#, &[]);
+    let temp = TempDir::new("oauth2-client-credentials");
+    let src = temp.write("app.link", OAUTH2_PROGRAM);
+    let server = Serve::start(&src);
+
+    let token_url = format!("http://127.0.0.1:{}/oauth/token", token_server.port);
+    let api_url = format!("http://127.0.0.1:{}/v1/protected", api_server.port);
+    let (status, body) = server.post(
+        "/Api/callProtectedApi",
+        &serde_json::json!({"tokenUrl": token_url, "clientId": "client-1", "clientSecret": "secret-1", "apiUrl": api_url}).to_string(),
+    );
+    assert_eq!(status, 200, "body: {body}");
+    assert_eq!(body, "\"{\\\"result\\\":\\\"secreto\\\"}\"");
+
+    let token_req = token_server.recv(Duration::from_secs(5)).expect("el servidor de token debió recibir la request");
+    assert_eq!(token_req.method, "POST");
+    assert_eq!(token_req.header("Content-Type"), Some("application/x-www-form-urlencoded"));
+    assert_eq!(token_req.body, "grant_type=client_credentials&client_id=client-1&client_secret=secret-1");
+
+    let api_req = api_server.recv(Duration::from_secs(5)).expect("el servidor de API debió recibir la request");
+    assert_eq!(api_req.method, "GET");
+    assert_eq!(
+        api_req.header("Authorization"),
+        Some("Bearer tok-xyz-789"),
+        "el token extraído de la respuesta del primer servidor tiene que llegar EXACTO al segundo: {:?}",
+        api_req.headers
+    );
+}
+
 #[test]
 fn an_http_timeout_flag_with_an_invalid_duration_is_a_clean_cli_error() {
     let temp = TempDir::new("badvalue");

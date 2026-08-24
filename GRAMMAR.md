@@ -135,6 +135,7 @@
   - [3.111 `response.redirect(url, permanent)`: redirects HTTP reales — RESUELTO](#3111-responseredirecturl-permanent-redirects-http-reales--resuelto)
   - [3.112 `base64.encode`/`base64.decode` — YA EXISTÍA, sin documentar ni probar hasta ahora](#3112-base64encodebase64decode--ya-existía-sin-documentar-ni-probar-hasta-ahora)
   - [3.113 `@cache_control("...")` por rpc — RESUELTO](#3113-cache_control-por-rpc--resuelto)
+  - [3.114 Flujo OAuth2 "client credentials" (servidor a servidor) — YA FUNCIONABA, sin un ejemplo que lo dijera](#3114-flujo-oauth2-client-credentials-servidor-a-servidor--ya-funcionaba-sin-un-ejemplo-que-lo-dijera)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4946,6 +4947,31 @@ rpc sitemap() -> String { sitemapXml(allUrls()) }
 **Mecanismo interno**: `Annotation::CacheControl(String)`, mismo patrón que `ContentType`/`Route`/`RateLimit`/`Deprecated` -- parser (`parse_optional_annotation`), accessor (`RpcDecl::cache_control()`), validación dedicada (`check_cache_control_annotation`, vacío/duplicado/`stream` rechazados). A diferencia de `response.redirect` (un override que el CUERPO del rpc fija en runtime, `Db::response_location_override`), esto es ESTÁTICO -- viene directo del AST, así que `server.rs::declared_cache_control` lo resuelve igual que `declared_content_type`, sin pasar por ningún mecanismo de `Cell`/`RefCell` por request.
 
 **Verificado**: 4 tests de tipos en `checker.rs` (combina con `@route`, vacío rechazado, declarado dos veces rechazado, rechazado dentro de un `stream` con el mismo mensaje que `setStatus`/`redirect`) + 2 end-to-end en `cli_content_type.rs` contra un servidor `linkc serve` REAL -- el header aparece exacto en el camino de éxito, FALTA por completo cuando el mismo rpc anotado falla (`panic` forzado, confirma que un 500 nunca hereda la política de caché del éxito), y el caso real combinado (`@route`+`@content_type`+`@cache_control` juntos sobre un sitemap servido por GET) da el header correcto además del Content-Type y el body ya cubiertos por §3.35.
+
+---
+
+### 3.114 Flujo OAuth2 "client credentials" (servidor a servidor) — YA FUNCIONABA, sin un ejemplo que lo dijera
+
+PLAN.md §9.10, mismo pedido explícito del usuario de reducir fricción con la mayor cantidad de proveedores posible. Google APIs, Microsoft Graph, Salesforce, HubSpot y muchas otras APIs empresariales usan OAuth2 "client credentials" para autenticación SERVIDOR A SERVIDOR (sin login de usuario, distinto de OAuth2 "authorization code" -- ese sigue bloqueado, PLAN.md §9.12, porque verificarlo de punta a punta necesita un proveedor de identidad real con una app de prueba registrada). Auditando qué haría falta para esto aparecieron CERO gaps: las tres piezas ya existían.
+
+```
+type Header = { name: String, value: String }
+
+rpc callProtectedApi(tokenUrl: String, clientId: String, clientSecret: String, apiUrl: String) -> String {
+  let tokenBody = "grant_type=client_credentials&client_id=" + clientId + "&client_secret=" + clientSecret;
+  let tokenResponse = http.postWithHeaders(tokenUrl, tokenBody, [
+    Header { name: "Content-Type", value: "application/x-www-form-urlencoded" },
+  ]);
+  let token = json.parse(tokenResponse).access_token;
+  http.getWithHeaders(apiUrl, [
+    Header { name: "Authorization", value: "Bearer " + token },
+  ])
+}
+```
+
+**Por qué esto compila y corre sin ningún cambio del compilador**: `http.postWithHeaders` (§3.47) ya podía pedir el token con el `Content-Type` que el endpoint de OAuth2 exige; `json.parse(text: String) -> Dynamic` ya existía, y `Dynamic.<cualquier-campo>` type-checkea DEVOLVIENDO `Dynamic` (`Expr::FieldAccess` sobre `Type::Dynamic`, `checker.rs`) -- no hace falta declarar la forma completa de la respuesta del proveedor solo para leer un campo; y un `Dynamic` es asignable donde se espera `String` sin cast explícito (mismo criterio que el resto del lenguaje trata `Dynamic` como escotilla de escape deliberada). El `+` entre `String` y `Dynamic` (`"Bearer " + token`) también tipea, por el mismo motivo. `http.getWithHeaders` hace la llamada real con el token ya en el header `Authorization`.
+
+**Verificado de punta a punta contra DOS servidores HTTP de mentira reales** (no un mock interno del intérprete) -- uno hace de endpoint de token (devuelve `{"access_token":"tok-xyz-789","expires_in":3600}`), el otro de API protegida: confirma que el `client_id`/`client_secret` llegan tal cual al primer servidor, y que el token que ESE servidor devolvió llega EXACTO como `Authorization: Bearer tok-xyz-789` al segundo -- la prueba real de que la extracción del campo `access_token` vía `Dynamic` funciona en runtime, no solo que tipa. 1 test nuevo en `tests/cli_http.rs`.
 
 ---
 
