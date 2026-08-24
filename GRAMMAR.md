@@ -116,6 +116,7 @@
   - [3.92 `linkc serve-all` + `--restart-backoff`: un proceso para varios servicios — RESUELTO](#392-linkc-serve-all----restart-backoff-un-proceso-para-varios-servicios--resuelto)
   - [3.93 `--service-api-key`: autenticación servidor-a-servidor — RESUELTO](#393---service-api-key-autenticación-servidor-a-servidor--resuelto)
   - [3.94 Aviso de colisión de nombre de tabla en PostgreSQL — RESUELTO](#394-aviso-de-colisión-de-nombre-de-tabla-en-postgresql--resuelto)
+  - [3.95 `countWhere` + `findWhere` empujados a SQL para `x.campo == valor` — RESUELTO](#395-countwhere--findwhere-empujados-a-sql-para-xcampo--valor--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4420,6 +4421,63 @@ linkc serve telemetry.link 8787 --db postgres://user:pass@host/produccion
 - **Un aviso por colección, no deduplicado entre reinicios.** Cada arranque de `linkc serve` contra la misma tabla ajena vuelve a imprimir la misma advertencia -- no hay un mecanismo de "ya avisé una vez, no lo repitas".
 
 **Verificado**: `pg_integration.rs` contra un PostgreSQL real -- `connecting_to_a_preexisting_table_with_zero_overlapping_columns_warns_but_still_connects` (dos `.link` con cero columnas en común sobre la misma tabla: el segundo conecta y sirve requests normalmente, nunca bloquea, y su stderr contiene la advertencia nombrando la colección) y `an_evolving_table_that_shares_at_least_one_column_does_not_warn` (agregar una columna nueva a una tabla que comparte al menos un nombre de columna con la física NO dispara ninguna advertencia). Los dos tests preexistentes que prueban el caso LEGÍTIMO de columnas disjuntas (`two_different_link_files_declaring_disjoint_columns_of_the_same_table_...` y su vecino de tipos en conflicto) se re-confirmaron sin cambios -- la advertencia nueva no les rompe nada.
+
+---
+
+### 3.95 `countWhere` + `findWhere` empujados a SQL para `x.campo == valor` — RESUELTO
+
+Sexto reporte de adopción real (IgnisLove), citado explícitamente como fricción encontrada usando el `@index`/`@unique` de un solo campo (§3.80) que ya existía: "agregué `@index` a `reviews.productId` y a `telemetry.sessionId`, y no aceleró nada -- cada `.filter()`/`findWhere` sigue trayendo la tabla entera a memoria". Cierto: `findWhere`/`deleteWhere` (§3.18) siempre evaluaron su predicado en el intérprete, trayendo la colección COMPLETA con `all()` primero -- a diferencia de `sumBy`/`countBy`/etc. (§3.52), que sí bajan a SQL. Contar cuántas reseñas tiene un producto no tenía forma de hacerse sin memoria O(tabla entera): la única opción era `findWhere(...).length()`.
+
+<!-- linkc:check -->
+```rust
+type Review = { id: Int, productId: Int, rating: Int }
+db { reviews: Review[] }
+
+service Reviews {
+  rpc add(productId: Int, rating: Int) -> Review {
+    db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
+  }
+  // countWhere: SELECT COUNT(*) ... WHERE real -- cero filas viajan del
+  // motor al proceso, ni siquiera las que matchean.
+  rpc countFor(productId: Int) -> Int {
+    db.reviews.countWhere(|r: Review| { r.productId == productId })
+  }
+  // findWhere gana el mismo atajo cuando el predicado tiene esta forma --
+  // antes de esta ronda, SIEMPRE traía la colección entera.
+  rpc listFor(productId: Int) -> Review[] {
+    db.reviews.findWhere(|r: Review| { r.productId == productId })
+  }
+}
+
+test "countWhere cuenta solo las del producto pedido" {
+  Reviews.add(1, 5);
+  Reviews.add(1, 3);
+  Reviews.add(2, 4);
+  assert(Reviews.countFor(1) == 2);
+  assert(Reviews.countFor(2) == 1);
+  assert(Reviews.countFor(999) == 0);
+}
+```
+
+**`db.<c>.countWhere(predicate: (T) -> Bool) -> Int`, builtin NUEVO -- mismo contrato de tipos que `findWhere`/`deleteWhere`, ejecución distinta.** Antes de esta ronda, la única forma de contar filas que matchean un predicado era `findWhere(...).length()` -- trae la colección entera a memoria solo para descartarla y quedarse con un número. `countWhere` reconoce el predicado ESTÁTICAMENTE (`ast::recognize_equality_predicate`, sin invocar el intérprete) y, si tiene EXACTAMENTE la forma `|x| x.campo == valor` (o `valor == x.campo`), lo traduce a `SELECT COUNT(*) FROM "tabla" WHERE "campo" = ?` -- un solo entero cruza del motor al proceso, nunca una fila. `findWhere` gana el mismo reconocimiento (mismo `SELECT` pero trayendo las columnas reales, no `COUNT(*)`) -- su firma/comportamiento observable no cambia, solo cuántas filas viajan del motor al proceso cuando el predicado matchea esta forma.
+
+**`valor` puede ser un literal o una variable capturada del entorno externo del closure -- nunca otro campo de `x`, ni una expresión derivada.** `productId` en el ejemplo de arriba es el parámetro del propio `rpc` -- el caso real que motiva esto (`reviews.productId == productId`, `telemetry.sessionId == sessionId`). Reconocido en dos pasos: `ast::recognize_equality_predicate` identifica la FORMA sintáctica (`x.campo == <lo que sea>`) sin evaluar nada; el caller (`runtime/mod.rs::recognize_pushable_equality`) evalúa ese "lo que sea" SOLO si es un literal (`Int`/`Float`/`String`/`Bool`) o un `Ident` que resuelve en el `Env` que el closure capturó al crearse -- cualquier otra forma (`x.otroCampo`, una llamada, una expresión aritmética) no se evalúa, y el predicado entero cae al camino interpretado de siempre.
+
+**Cualquier otra forma de predicado sigue funcionando exactamente igual que antes -- nunca un error, solo sin el atajo.** `>`/`<`/`!=`, `&&`/`||` combinando varias condiciones, comparar dos campos de `x` entre sí, un método, una comparación contra un enum (`x.status == Status.Active {}`, que NO es un literal reconocido) -- todo esto sigue evaluándose en el intérprete, trayendo la colección completa con `all()` como siempre. El reconocimiento es deliberadamente conservador: mejor un falso negativo ocasional (una consulta que PODRÍA pushearse pero no se detecta) que arriesgar un falso positivo que devuelva el resultado equivocado.
+
+**`"id"` también es pusheable, aunque nunca vive en `Db::columns` (que es "todo menos id").** `countWhere(|x| x.id == valor)`/`findWhere` sobre `"id"` toman un camino aparte, chico, dentro de la misma función compartida (`equals_condition`, `runtime/db.rs`).
+
+**Respeta `@softDelete` (§3.78) igual que el camino interpretado.** La condición SQL generada AND-ea la misma `"<campo>" IS NULL` que ya usa `count()`/`all()` -- una fila soft-deleteada no aparece en un `countWhere`/`findWhere` pusheado, ni por accidente.
+
+**Columnas serializadas como JSON quedan fuera del atajo.** Un campo `x?: T?`, un struct, un enum ADT, una lista/mapa -- cualquier columna que `ColumnPlan` marca `json` no tiene una igualdad simple de SQL contra un `Value` sin ambigüedad (¿comparás el JSON serializado byte a byte? ¿un subconjunto de campos?) -- el reconocimiento devuelve "no pusheable" para esas, cae al intérprete.
+
+**Límites honestos:**
+- **Solo `==` (o su espejo, `valor == x.campo`) -- ningún otro operador se empuja todavía.** `>`/`<`/`<=`/`>=`/`!=` siguen sin bajar a SQL -- PLAN.md §9.3.1 lo trackea como trabajo pendiente, junto con combinar varias condiciones (`&&`/`||`).
+- **Solo UN campo -- sin combinar condiciones.** `|x| x.a == 1 && x.b == 2` no se reconoce como pusheable (necesitaría combinar dos condiciones SQL con sus propios parámetros, un compilador de predicado más completo que el de esta ronda) -- cae entero al intérprete, aunque técnicamente las dos mitades por separado serían pusheables.
+- **`deleteWhere` NO gana este atajo.** Sigue trayendo la colección completa y borrando fila por fila (una sentencia `DELETE` por fila que matchea) -- el mismo trabajo de reconocimiento aplicaría, pero `deleteWhere` necesita además publicar cada fila borrada a los suscriptores (`stream`), lo que complica un `DELETE ... WHERE` de una sola sentencia; queda para una ronda aparte.
+- **No hay forma de pedir el plan de ejecución o confirmar desde el `.link` que un `countWhere`/`findWhere` particular SÍ se pusheó.** La única confirmación hoy es leer el código (`ast::recognize_equality_predicate`) o instrumentar el SQL emitido a mano.
+
+**Verificado**: 1 test en `checker.rs` (`countWhere` toma exactamente 1 argumento `fn(T) -> Bool` y devuelve `Int`, mismo contrato que `findWhere`/`deleteWhere`) y 5 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc`: `countWhere` cuenta correctamente vía el atajo de SQL; `findWhere` con un predicado pusheable devuelve las mismas filas que siempre devolvió; los dos con un predicado NO pusheable (`x.rating > 3`) siguen dando el resultado correcto por el camino interpretado; `countWhere`/`findWhere` sobre `"id"`; y los dos respetan `@softDelete` incluso pusheados. El SQL real emitido (`SELECT COUNT(*) FROM "reviews" WHERE "productId" = ?` / `SELECT ... WHERE "productId" = ? ORDER BY "id"`) se confirmó a mano contra `linkc test` con logging temporal antes de este release -- exactamente una consulta por llamada pusheada, ninguna para el caso de fallback.
 
 ---
 

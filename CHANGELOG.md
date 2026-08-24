@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.59.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`db.<c>.countWhere(predicate) -> Int` + `findWhere` empujado a SQL para `x.campo == valor`.** Sexto reporte de adopción real (IgnisLove): "agregué `@index` a `reviews.productId`/`telemetry.sessionId` y no aceleró nada -- cada `.filter()`/`findWhere` sigue trayendo la tabla entera a memoria". Cierto: `findWhere`/`deleteWhere` siempre evaluaron su predicado en el intérprete, trayendo la colección COMPLETA con `all()` primero, a diferencia de `sumBy`/`countBy`/etc. `countWhere` (builtin nuevo, mismo contrato de tipos que `findWhere`/`deleteWhere`) reconoce ESTÁTICAMENTE si el predicado tiene la forma exacta `|x| x.campo == valor` (un literal o una variable capturada del entorno externo, nunca otro campo de `x`) y, si la tiene, lo traduce a `SELECT COUNT(*) ... WHERE` real -- cero filas viajan del motor al proceso. `findWhere` gana el mismo atajo (mismo reconocimiento, trayendo las columnas reales en vez de `COUNT(*)`) sin cambiar su firma ni su comportamiento observable. Cualquier otro predicado (`>`/`<`/`!=`, `&&`/`||`, comparar dos campos entre sí, una columna JSON) sigue funcionando exactamente igual que antes por el camino interpretado -- nunca un error, solo sin el atajo. Respeta `@softDelete` incluso pusheado. `deleteWhere` NO gana este atajo todavía (sigue trayendo todo y borrando fila por fila) -- publicar cada fila borrada a los suscriptores de `stream` complica un `DELETE` de una sola sentencia, queda para una ronda aparte junto con operadores más allá de `==`.
+
+867 tests (6 nuevos): 1 en `checker.rs` y 5 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` -- `countWhere`/`findWhere` correctos vía el atajo de SQL, correctos por fallback ante un predicado no pusheable, el caso especial `"id"`, y `@softDelete` respetado incluso pusheado. Detalle completo: GRAMMAR.md §3.95.
+
 ## [1.58.0] - 2026-08-24
 
 ### 🐛 Arreglado

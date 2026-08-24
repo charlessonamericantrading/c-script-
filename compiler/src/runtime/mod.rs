@@ -783,6 +783,29 @@ fn as_bool(v: &Value) -> Result<bool, RuntimeError> {
     }
 }
 
+/// Predicado de `countWhere`/`findWhere` (GRAMMAR.md §3.95) reducido a
+/// `(campo, valor)` si -- y solo si -- tiene la forma `|x| x.campo ==
+/// valor` (`ast::recognize_equality_predicate`) Y el lado "valor" es lo
+/// bastante simple como para evaluarlo SIN invocar el intérprete completo:
+/// un literal, o un `Ident` que resuelve en el `Env` que el closure ya
+/// capturó al crearse (nunca el propio parámetro `x`, que no vive ahí).
+/// `None` en cualquier otro caso -- el caller cae al camino interpretado de
+/// siempre (`db.call("all")` + evaluar el predicado por fila), que sigue
+/// siendo correcto siempre, más lento solo en ese caso puntual.
+fn recognize_pushable_equality(f: &Value) -> Option<(String, Value)> {
+    let Value::Closure(params, body, captured_env) = f else { return None };
+    let (field, value_expr) = crate::ast::recognize_equality_predicate(params, body)?;
+    let value = match &value_expr.node {
+        Expr::Int(n) => Value::Int(*n),
+        Expr::Float(x) => Value::Float(*x),
+        Expr::Str(s) => Value::Str(s.clone()),
+        Expr::Bool(b) => Value::Bool(*b),
+        Expr::Ident(name) => captured_env.get(name)?.borrow().clone(),
+        _ => return None,
+    };
+    Some((field.to_string(), value))
+}
+
 fn numeric_op(
     l: Value,
     r: Value,
@@ -1249,6 +1272,15 @@ fn call_method(
             }
             "findWhere" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'findWhere' requiere 1 argumento"))?;
+                // GRAMMAR.md §3.95: `|x| x.campo == valor` empuja a un
+                // `SELECT ... WHERE` real -- solo las filas que matchean
+                // viajan del motor al proceso. Cualquier otra forma de
+                // predicado cae al camino de siempre, dos líneas más abajo.
+                if let Some((field, value)) = recognize_pushable_equality(&f) {
+                    if let Some(rows) = db.find_where_equals(&coll, &field, &value)? {
+                        return Ok(Value::List(rows));
+                    }
+                }
                 let all_val = db.call(&coll, "all", vec![])?;
                 let Value::List(items) = all_val else { return Ok(Value::List(vec![])); };
                 let mut kept = Vec::new();
@@ -1258,6 +1290,32 @@ fn call_method(
                     }
                 }
                 Ok(Value::List(kept))
+            }
+            // GRAMMAR.md §3.95: `db.<c>.countWhere(fn(T) -> Bool) -> Int` --
+            // mismo empuje a SQL que `findWhere` de arriba cuando el
+            // predicado tiene la forma `|x| x.campo == valor`, esta vez un
+            // `SELECT COUNT(*) ... WHERE` real (CERO filas viajan del motor
+            // al proceso, ni siquiera las que matchean). El caso real que lo
+            // motiva: `db.reviews.countWhere(|r| r.productId == productId)`
+            // -- antes de esto, la única forma de contar era
+            // `findWhere(...).length()`, que trae la colección ENTERA a
+            // memoria solo para descartarla y quedarse con un número.
+            "countWhere" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'countWhere' requiere 1 argumento"))?;
+                if let Some((field, value)) = recognize_pushable_equality(&f) {
+                    if let Some(n) = db.count_where_equals(&coll, &field, &value)? {
+                        return Ok(Value::Int(n));
+                    }
+                }
+                let all_val = db.call(&coll, "all", vec![])?;
+                let Value::List(items) = all_val else { return Ok(Value::Int(0)); };
+                let mut count = 0i64;
+                for item in items {
+                    if as_bool(&call_callable(f.clone(), vec![item], db, fns, checker, sessions, current_token, step_budget)?)? {
+                        count += 1;
+                    }
+                }
+                Ok(Value::Int(count))
             }
             "deleteWhere" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'deleteWhere' requiere 1 argumento"))?;
@@ -4876,6 +4934,162 @@ mod tests {
         let arr = remaining.as_array().unwrap();
         assert_eq!(arr.len(), 1, "deleteWhere NO debe tocar al usuario Admin");
         assert_eq!(arr[0]["name"], json!("AdminUser"));
+    }
+
+    /// GRAMMAR.md §3.95: el caso real que motiva `countWhere` -- contar
+    /// cuántas reseñas tiene un producto sin traer la tabla entera a
+    /// memoria. `|r: Review| { r.productId == productId }` es exactamente
+    /// el shape pusheable (`ast::recognize_equality_predicate`) -- este
+    /// test prueba el resultado CORRECTO, no que el pushdown haya corrido
+    /// (eso se verificó manualmente contra el SQL real emitido; acá lo que
+    /// importa es que el número sea el que tiene que ser).
+    #[test]
+    fn count_where_counts_only_matching_rows_via_the_sql_pushdown_path() {
+        let code = r#"
+        type Review = { id: Int, productId: Int, rating: Int }
+        db { reviews: Review[] }
+        service Reviews {
+          rpc add(productId: Int, rating: Int) -> Review {
+            db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
+          }
+          rpc countFor(productId: Int) -> Int {
+            db.reviews.countWhere(|r: Review| { r.productId == productId })
+          }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 5}), &db).unwrap();
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 3}), &db).unwrap();
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 4}), &db).unwrap();
+
+        assert_eq!(invoke_rpc(&program, "Reviews", "countFor", &json!({"productId": 1}), &db).unwrap(), json!(2));
+        assert_eq!(invoke_rpc(&program, "Reviews", "countFor", &json!({"productId": 2}), &db).unwrap(), json!(1));
+        assert_eq!(invoke_rpc(&program, "Reviews", "countFor", &json!({"productId": 999}), &db).unwrap(), json!(0));
+    }
+
+    /// `findWhere` con un predicado PUSHEABLE (`==` sobre un solo campo)
+    /// tiene que seguir devolviendo exactamente las mismas filas que antes
+    /// de GRAMMAR.md §3.95 -- el atajo de SQL es una optimización de
+    /// EJECUCIÓN, invisible desde el resultado.
+    #[test]
+    fn find_where_with_a_pushable_predicate_returns_the_same_rows_as_before() {
+        let code = r#"
+        type Review = { id: Int, productId: Int, rating: Int }
+        db { reviews: Review[] }
+        service Reviews {
+          rpc add(productId: Int, rating: Int) -> Review {
+            db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
+          }
+          rpc listFor(productId: Int) -> Review[] {
+            db.reviews.findWhere(|r: Review| { r.productId == productId })
+          }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 7, "rating": 5}), &db).unwrap();
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 8, "rating": 1}), &db).unwrap();
+
+        let rows = invoke_rpc(&program, "Reviews", "listFor", &json!({"productId": 7}), &db).unwrap();
+        let arr = rows.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{arr:?}");
+        assert_eq!(arr[0]["rating"], json!(5));
+    }
+
+    /// `countWhere`/`findWhere` con un predicado NO pusheable (cualquier
+    /// cosa que no sea `|x| x.campo == valor`: otro operador, dos campos,
+    /// una comparación entre campos del propio parámetro) siguen dando el
+    /// resultado correcto por el camino interpretado de siempre -- el
+    /// pushdown de GRAMMAR.md §3.95 es un atajo, nunca el único camino.
+    #[test]
+    fn count_where_and_find_where_fall_back_correctly_for_a_non_pushable_predicate() {
+        let code = r#"
+        type Review = { id: Int, productId: Int, rating: Int }
+        db { reviews: Review[] }
+        service Reviews {
+          rpc add(productId: Int, rating: Int) -> Review {
+            db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
+          }
+          rpc countHighRated() -> Int {
+            db.reviews.countWhere(|r: Review| { r.rating > 3 })
+          }
+          rpc listHighRated() -> Review[] {
+            db.reviews.findWhere(|r: Review| { r.rating > 3 })
+          }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 5}), &db).unwrap();
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 1}), &db).unwrap();
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 4}), &db).unwrap();
+
+        assert_eq!(invoke_rpc(&program, "Reviews", "countHighRated", &json!({}), &db).unwrap(), json!(2));
+        let rows = invoke_rpc(&program, "Reviews", "listHighRated", &json!({}), &db).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+    }
+
+    /// `countWhere("id" == valor)` es un caso especial (§3.95: `"id"` nunca
+    /// vive en `Db::columns`, que es "todo menos id") -- confirma que el
+    /// atajo de SQL también cubre ese campo, no solo los declarados.
+    #[test]
+    fn count_where_pushes_down_a_comparison_on_id_too() {
+        let code = r#"
+        type Item = { id: Int, name: String }
+        db { items: Item[] }
+        service Items {
+          rpc add(name: String) -> Item { db.items.insert(Item { id: 0, name: name }) }
+          rpc countById(target: Int) -> Int { db.items.countWhere(|i: Item| { i.id == target }) }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "Items", "add", &json!({"name": "algo"}), &db).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        assert_eq!(invoke_rpc(&program, "Items", "countById", &json!({"target": id}), &db).unwrap(), json!(1));
+        assert_eq!(invoke_rpc(&program, "Items", "countById", &json!({"target": id + 999}), &db).unwrap(), json!(0));
+    }
+
+    /// El atajo de SQL de `countWhere`/`findWhere` (GRAMMAR.md §3.95) sigue
+    /// respetando `@softDelete` (§3.78) igual que el camino interpretado --
+    /// `equals_condition` (`runtime/db.rs`) AND-ea la misma condición
+    /// `"<campo>" IS NULL` que ya usa `count()`/`all()`. Sin este AND, una
+    /// fila soft-deleteada aparecería en un `countWhere`/`findWhere`
+    /// pusheado aunque ya hubiera "desaparecido" de todo lo demás.
+    #[test]
+    fn count_where_and_find_where_respect_soft_delete_even_when_pushed_down() {
+        let code = r#"
+        type Item = { id: Int, sessionId: String, @softDelete deletedAt: Timestamp? = null }
+        db { items: Item[] }
+        service Items {
+          rpc add(sessionId: String) -> Item { db.items.insert(Item { id: 0, sessionId: sessionId, deletedAt: null }) }
+          rpc removeAll(sessionId: String) -> Int { db.items.deleteWhere(|i: Item| { i.sessionId == sessionId }) }
+          rpc countFor(sessionId: String) -> Int { db.items.countWhere(|i: Item| { i.sessionId == sessionId }) }
+          rpc listFor(sessionId: String) -> Item[] { db.items.findWhere(|i: Item| { i.sessionId == sessionId }) }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap());
+        let program = match program {
+            Ok(p) => p,
+            Err(e) => panic!("{e:?}"),
+        };
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(&program, "Items", "add", &json!({"sessionId": "abc"}), &db).unwrap();
+        assert_eq!(invoke_rpc(&program, "Items", "countFor", &json!({"sessionId": "abc"}), &db).unwrap(), json!(1));
+
+        invoke_rpc(&program, "Items", "removeAll", &json!({"sessionId": "abc"}), &db).unwrap();
+        assert_eq!(
+            invoke_rpc(&program, "Items", "countFor", &json!({"sessionId": "abc"}), &db).unwrap(),
+            json!(0),
+            "una fila soft-deleteada no debe contar, ni siquiera por el camino pusheado a SQL"
+        );
+        let rows = invoke_rpc(&program, "Items", "listFor", &json!({"sessionId": "abc"}), &db).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 0);
     }
 
     #[test]

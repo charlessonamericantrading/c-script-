@@ -1310,23 +1310,28 @@ db { users: User[] }
                 }
             }
 
-            // "deleteWhere"/"findWhere" NUNCA se implementan acá: evaluar un
-            // predicado por fila requiere invocar un closure de usuario
-            // (`call_callable`), que necesita `fns`/`checker`/`sessions`/
-            // `step_budget` -- ninguno de los cuales `Db::call` recibe (ver
-            // su firma arriba). La implementación real vive en
-            // `runtime::call_method`, que intercepta estos dos métodos
+            // "deleteWhere"/"findWhere"/"countWhere" NUNCA se implementan
+            // acá: evaluar un predicado por fila requiere invocar un closure
+            // de usuario (`call_callable`), que necesita `fns`/`checker`/
+            // `sessions`/`step_budget` -- ninguno de los cuales `Db::call`
+            // recibe (ver su firma arriba). La implementación real vive en
+            // `runtime::call_method`, que intercepta estos tres métodos
             // ANTES de llegar acá y sí tiene ese contexto (mismo patrón que
-            // `List::filter`/`List::map`); `call_method` es el único camino
-            // que el intérprete usa para despachar un método de
-            // `Value::DbCollection`, así que en el uso normal este brazo
-            // nunca corre. Como `Db::call` es `pub fn` y queda alcanzable
-            // directo (tests, LSP, código futuro), antes devolvía un
-            // resultado SILENCIOSAMENTE INCORRECTO ignorando el predicado
-            // (deleteWhere borraba TODAS las filas; findWhere las
-            // devolvía TODAS) -- fallar con un mensaje claro es siempre
-            // mejor que una respuesta que parece válida y no lo es.
-            "deleteWhere" | "findWhere" => Err(RuntimeError::new(format!(
+            // `List::filter`/`List::map`) -- incluido el atajo de SQL de
+            // GRAMMAR.md §3.95 (`count_where_equals`/`find_where_equals`,
+            // arriba), que tampoco vive acá porque reconocer el predicado
+            // (`recognize_pushable_equality`) necesita el `Env` capturado
+            // del closure, otra cosa que `Db::call` no tiene forma de
+            // recibir. `call_method` es el único camino que el intérprete
+            // usa para despachar un método de `Value::DbCollection`, así que
+            // en el uso normal este brazo nunca corre. Como `Db::call` es
+            // `pub fn` y queda alcanzable directo (tests, LSP, código
+            // futuro), antes devolvía un resultado SILENCIOSAMENTE
+            // INCORRECTO ignorando el predicado (deleteWhere borraba TODAS
+            // las filas; findWhere las devolvía TODAS) -- fallar con un
+            // mensaje claro es siempre mejor que una respuesta que parece
+            // válida y no lo es.
+            "deleteWhere" | "findWhere" | "countWhere" => Err(RuntimeError::new(format!(
                 "'db.{collection}.{method}' solo se puede invocar a través del intérprete (evalúa un predicado por fila, y este método no tiene acceso a closures) -- llegó directo a Db::call, sin pasar por runtime::call_method"
             ))),
             other => Err(RuntimeError::new(format!("método desconocido: 'db.{collection}.{other}'"))),
@@ -1467,6 +1472,84 @@ db { users: User[] }
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
+    }
+
+    /// Cell bindeable + condición SQL `"{field}" = ?` (con soft-delete
+    /// AND-eado si corresponde) para el ÚNICO shape de predicado que
+    /// `countWhere`/`findWhere` empujan a SQL (GRAMMAR.md §3.95):
+    /// `|x| x.campo == valor`. Compartido entre `count_where_equals` y
+    /// `find_where_equals` -- la única diferencia entre esos dos es qué
+    /// `SELECT` arman con esta misma condición.
+    ///
+    /// `None` (nunca un error) si `field` no es pusheable: no existe
+    /// declarado en esta colección (aparte de `"id"`), o es una columna
+    /// serializada como JSON (`x?: T?`/struct/enum ADT/lista/... -- sin
+    /// igualdad simple de SQL contra un `Value` sin ambigüedad). El caller
+    /// cae al camino interpretado de siempre ante `None` -- correcto en
+    /// cualquier caso, más lento solo en ese caso puntual.
+    fn equals_condition(&self, collection: &str, columns: &[ColumnPlan], field: &str, value: &Value) -> Option<(String, Cell)> {
+        let cell = if field == "id" {
+            let Value::Int(id) = value else { return None };
+            Cell::Int(*id)
+        } else {
+            let col = columns.iter().find(|c| c.field.name == field)?;
+            if col.json {
+                return None;
+            }
+            self.write_param(col, Some(value))
+        };
+        let cond = format!("\"{field}\" = {}", self.backend.placeholder(1));
+        let where_clause = match self.soft_delete_where(collection) {
+            Some(sd) => format!("{cond} AND {sd}"),
+            None => cond,
+        };
+        Some((where_clause, cell))
+    }
+
+    /// `db.<c>.countWhere(|x| x.campo == valor)` (GRAMMAR.md §3.95): un
+    /// `SELECT COUNT(*) ... WHERE` real -- CERO filas viajan del motor al
+    /// proceso, a diferencia del `countWhere` interpretado (traer TODO con
+    /// `all`, evaluar el predicado fila por fila en Rust, contar). `None`
+    /// (nunca un error) si el predicado no tiene esta forma exacta, o el
+    /// campo no es pusheable -- el caller (`runtime/mod.rs`) cae al camino
+    /// interpretado, que sigue siendo correcto siempre, solo más lento en
+    /// ese caso.
+    pub(crate) fn count_where_equals(&self, collection: &str, field: &str, value: &Value) -> Result<Option<i64>, RuntimeError> {
+        let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let Some((where_clause, cell)) = self.equals_condition(collection, columns, field, value) else {
+            return Ok(None);
+        };
+        let sql = format!("SELECT COUNT(*) FROM \"{collection}\" WHERE {where_clause}");
+        let rows = self
+            .backend
+            .query(&sql, &[cell], &[ColumnKind::Int])
+            .map_err(|e| RuntimeError::new(format!("error en countWhere de '{collection}': {e}")))?;
+        match rows.first().and_then(|r| r.first()) {
+            Some(Cell::Int(n)) => Ok(Some(*n)),
+            other => Err(RuntimeError::new(format!("countWhere de '{collection}' devolvió algo que no es un entero: {other:?}"))),
+        }
+    }
+
+    /// Como `count_where_equals`, para `db.<c>.findWhere(|x| x.campo ==
+    /// valor)` -- un `SELECT ... WHERE` real, solo las filas que matchean
+    /// viajan del motor al proceso (a diferencia del camino interpretado,
+    /// que trae TODA la colección y filtra en Rust). Mismo criterio de
+    /// `None` que `count_where_equals`.
+    pub(crate) fn find_where_equals(&self, collection: &str, field: &str, value: &Value) -> Result<Option<Vec<Value>>, RuntimeError> {
+        let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let Some((where_clause, cell)) = self.equals_condition(collection, columns, field, value) else {
+            return Ok(None);
+        };
+        let mut col_list = vec!["\"id\"".to_string()];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        let sql = format!("SELECT {} FROM \"{collection}\" WHERE {where_clause} ORDER BY \"id\"", col_list.join(", "));
+        let mut kinds = vec![ColumnKind::Int];
+        kinds.extend(columns.iter().map(ColumnPlan::kind));
+        let rows = self
+            .backend
+            .query(&sql, &[cell], &kinds)
+            .map_err(|e| RuntimeError::new(format!("error en findWhere de '{collection}': {e}")))?;
+        rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect::<Result<Vec<_>, _>>().map(Some)
     }
 
     /// `db.<c>.page(limit, offset)` (GRAMMAR.md §3.48) -- a diferencia de

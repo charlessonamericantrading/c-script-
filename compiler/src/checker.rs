@@ -3544,6 +3544,19 @@ impl Checker {
                 self.expect_no_args(args, "count")?;
                 Ok(Type::Int)
             }
+            // GRAMMAR.md §3.95: `db.<c>.countWhere(fn(T) -> Bool) -> Int`,
+            // mismo contrato de tipos que `findWhere`/`deleteWhere` (arriba)
+            // -- la diferencia es puramente de EJECUCIÓN (empuja a SQL
+            // cuando el predicado tiene la forma `|x| x.campo == valor`,
+            // GRAMMAR.md §3.95), invisible acá.
+            "countWhere" => {
+                let [pred_arg] = args else {
+                    return Err(err("'countWhere' toma exactamente 1 argumento (fn(T) -> Bool)"));
+                };
+                let pred_ty = Type::Function(vec![element_ty.clone()], Box::new(Type::Bool));
+                self.check_expr(pred_arg, &pred_ty, env)?;
+                Ok(Type::Int)
+            }
             "page" => {
                 let [limit_arg, offset_arg] = args else {
                     return Err(err("'page' toma exactamente 2 argumentos (limit: Int, offset: Int)"));
@@ -3604,7 +3617,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/findWhere/count/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/subscribe)"
             ))),
         }
     }
@@ -6292,6 +6305,50 @@ type T = { id: Int, s: Status }")
         "#;
         let msg2 = format!("{:?}", check_source(src2).unwrap_err());
         assert!(msg2.contains("'sumBy' toma exactamente 2"), "{msg2}");
+    }
+
+    /// GRAMMAR.md §3.95: `countWhere` es un `Int`, mismo contrato de tipos
+    /// que `findWhere`/`deleteWhere` (`fn(T) -> Bool`, exactamente 1
+    /// argumento) -- la diferencia entre los tres es de EJECUCIÓN
+    /// (`runtime/db.rs::count_where_equals`), invisible al checker.
+    #[test]
+    fn count_where_takes_a_predicate_and_returns_int() {
+        let src = r#"
+            type Review = { id: Int, productId: Int, rating: Int }
+            db { reviews: Review[] }
+            fn f(productId: Int) -> Int {
+                db.reviews.countWhere(|r: Review| { r.productId == productId })
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        let wrong_arity = r#"
+            type Review = { id: Int, productId: Int }
+            db { reviews: Review[] }
+            fn f() -> Int {
+                db.reviews.countWhere()
+            }
+        "#;
+        let msg = format!("{:?}", check_source(wrong_arity).unwrap_err());
+        assert!(msg.contains("'countWhere' toma exactamente 1"), "{msg}");
+
+        let wrong_return = r#"
+            type Review = { id: Int, productId: Int }
+            db { reviews: Review[] }
+            fn f(productId: Int) -> Review[] {
+                db.reviews.countWhere(|r: Review| { r.productId == productId })
+            }
+        "#;
+        assert!(check_source(wrong_return).is_err());
+
+        let wrong_predicate_type = r#"
+            type Review = { id: Int, productId: Int }
+            db { reviews: Review[] }
+            fn f() -> Int {
+                db.reviews.countWhere(|r: Review| { r.productId })
+            }
+        "#;
+        assert!(check_source(wrong_predicate_type).is_err(), "el predicado tiene que devolver Bool, no Int");
     }
 
     #[test]

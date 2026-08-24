@@ -791,3 +791,40 @@ pub fn recognize_field_selector<'a>(param_names: &[String], body: &'a Block) -> 
     let Expr::FieldAccess { base, field } = &body.tail.as_ref()?.node else { return None };
     matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
 }
+
+/// Reconoce `|item: T| item.campo == valor` (en cualquier orden -- `valor
+/// == item.campo` también) -- GRAMMAR.md §3.95, el ÚNICO shape de predicado
+/// que `countWhere`/`findWhere` empujan a SQL en vez de traer la colección
+/// entera a memoria y evaluar el predicado fila por fila. Devuelve el
+/// nombre del campo y la expresión del OTRO lado, sin evaluarla -- el
+/// caller (`runtime/mod.rs`, que sí tiene acceso al `Env` capturado del
+/// closure) decide si esa expresión es lo bastante simple como para confiar
+/// en el resultado (un literal, o un `Ident` que resuelve en ese `Env`) sin
+/// tener que reimplementar un evaluador de expresiones acá.
+///
+/// Mismo criterio conservador que `recognize_field_selector`: cualquier
+/// otra forma (`&&`/`||`, otro operador que no sea `==`, un campo derivado,
+/// una comparación entre DOS campos del propio parámetro) devuelve `None` --
+/// el caller cae al camino interpretado de siempre, correcto en cualquier
+/// caso, más lento solo en ese caso puntual. No intenta reconocer un `&&`
+/// de varias comparaciones simples (`x.a == 1 && x.b == 2`) -- ese caso
+/// necesitaría combinar dos condiciones SQL con parámetros propios, fuera
+/// de alcance de esta primera ronda (PLAN.md §9.3.2).
+pub fn recognize_equality_predicate<'a>(param_names: &[String], body: &'a Block) -> Option<(&'a str, &'a Spanned<Expr>)> {
+    let [param] = param_names else { return None };
+    if !body.stmts.is_empty() {
+        return None;
+    }
+    let Expr::Binary { op: BinaryOp::Eq, left, right } = &body.tail.as_ref()?.node else { return None };
+    let field_of = |e: &'a Spanned<Expr>| -> Option<&'a str> {
+        let Expr::FieldAccess { base, field } = &e.node else { return None };
+        matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
+    };
+    if let Some(field) = field_of(left) {
+        return Some((field, right));
+    }
+    if let Some(field) = field_of(right) {
+        return Some((field, left));
+    }
+    None
+}
