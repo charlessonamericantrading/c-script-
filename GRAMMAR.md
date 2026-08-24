@@ -4324,8 +4324,9 @@ service Facturas {
 |---|---|---|---|
 | `Int`, `Float` | `number` | número | — |
 | `Int64` | `string` | string (decimal, ej. `"9223372036854775807"`) | mismo rango `i64` que `Int`, serializado como string para no perder precisión arriba de `2^53` -- ver §3.30. `.toInt64()`/`.toInt()` para convertir; sin mezcla implícita con `Int` |
-| `Timestamp` | `string` | string ISO-8601 de forma fija, ej. `"2026-08-08T14:30:00.000Z"` | milisegundos desde epoch UTC internamente -- ver §3.31. Obtenible con `now() -> Timestamp` (§3.32). Solo comparable (`< <= > >= == !=`); sin aritmética |
+| `Timestamp` | `string` | string ISO-8601 de forma fija, ej. `"2026-08-08T14:30:00.000Z"` | milisegundos desde epoch UTC internamente -- ver §3.31. Obtenible con `now() -> Timestamp` (§3.32) o `dateFromParts(...) -> Timestamp` (§3.90). Solo comparable (`< <= > >= == !=`); sin aritmética |
 | `now()` | `now(): Timestamp` | `"2026-08-15T12:00:00.000Z"` | función builtin de fecha y hora actual en UTC (§3.32) |
+| `dateFromParts(year, month, day, hour, minute, second)` | `dateFromParts(year: number, month: number, day: number, hour: number, minute: number, second: number): Timestamp` | `"2026-07-01T00:00:00.000Z"` | función builtin que construye un `Timestamp` arbitrario a partir de sus componentes de calendario; `bad_request` (400) si la fecha no existe (§3.90) |
 | `assert`, `panic` | — | — | funciones builtin de aserción y control de tests en backend (§3.33) |
 | `test "nombre" { }` | — | — | bloques de test de comportamiento (§3.33), no cruzan a TS |
 | `String` | `string` | string | — |
