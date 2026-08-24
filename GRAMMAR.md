@@ -132,6 +132,7 @@
   - [3.108 `countWhere`/`findWhere` empujan a SQL `!=`/`<`/`<=`/`>`/`>=` — RESUELTO, alcance acotado](#3108-countwherefindwhere-empujan-a-sql--------resuelto-alcance-acotado)
   - [3.109 `countWhere`/`findWhere` empujan una conjunción `&&` de varias hojas — RESUELTO, alcance acotado](#3109-countwherefindwhere-empujan-una-conjunción--de-varias-hojas--resuelto-alcance-acotado)
   - [3.110 `crypto.awsS3PresignedUrl(...)`: URLs firmadas reales para Amazon S3 — RESUELTO, alcance acotado](#3110-cryptoawss3presignedurl-urls-firmadas-reales-para-amazon-s3--resuelto-alcance-acotado)
+  - [3.111 `response.redirect(url, permanent)`: redirects HTTP reales — RESUELTO](#3111-responseredirecturl-permanent-redirects-http-reales--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4856,6 +4857,40 @@ rpc urlDeDescarga(f: Factura) -> String {
 **Verificado sin necesitar una cuenta de AWS real -- contra el vector de prueba OFICIAL que Amazon publica** (`aws4_testsuite`, el mismo estándar que ya se usó para `crypto.hmacSha256` en §3.38, verificado ahí contra un vector de Python en vez de una cuenta de Stripe real): la derivación de clave + firma final reproduce BYTE A BYTE el resultado publicado para el caso "get-vanilla" (`accessKeyId=AKIDEXAMPLE`, fecha `2011-09-09 23:36:00 GMT`, región `us-east-1`) -- `b27ccfbfa7df52a200ff74193ca6e32d4b48b8856fab7ebf1c595d0670a7e470`. El formateo de fecha (`YYYYMMDD`/`YYYYMMDDTHHMMSSZ`) se confirmó contra ese mismo caso y contra la fecha del ejemplo oficial de "URL presignada de GET Object" de la documentación de AWS (`2013-05-24T00:00:00Z`). El URI-encoding (`aws_uri_encode`) se confirmó contra el vector oficial `get-vanilla-query-unreserved` (qué caracteres NO se codifican) más los casos de `/` codificado/preservado según haga falta (valor de query vs. componente de path). El builtin completo, de punta a punta vía un servidor real, se probó por ESTRUCTURA (host virtual-hosted-style, los cinco parámetros `X-Amz-*` en el orden que S3 espera, una firma de 64 caracteres hex) en vez de por match exacto de string -- el timestamp interno (`SystemTime::now()`) hace que un match byte a byte contra un vector fijo sea imposible sin inyección de reloj, que este runtime no tiene. 5 tests nuevos en `runtime/mod.rs` + `checker.rs` + `runtime/timestamp.rs` en total.
 
 **Nota de proceso.** El primer intento de resolver este reporte fue sugerirle al adoptador que armara la firma "a mano" con `crypto.hmacSha256` -- una recomendación que resultó ser INCORRECTA al verificarla (exactamente el motivo por el que no alcanza, explicado arriba). El error se detectó antes de comunicarlo como solución final, pero es la razón por la que esta sección existe como una función nueva del compilador en vez de quedar como "ya se puede hacer con lo que existe".
+
+---
+
+### 3.111 `response.redirect(url, permanent)`: redirects HTTP reales — RESUELTO
+
+PLAN.md §9.9 ítem 6 (sección de SEO y descubribilidad para IA, abierta el 24/08/2026 a pedido explícito del usuario): un redirect 301/302 es una pieza básica de SEO clásico -- consolidar contenido duplicado, mandar una URL vieja a la nueva sin perder el "link juice" que un buscador le asignó -- pero `response.setStatus(code)` (§3.46) por sí solo no alcanza: fijar el status a 301/302 sin un header `Location` apuntando a algún lado no es un redirect, es un código de status sin sentido para el cliente.
+
+```
+type Post = { id: Int, slug: String, oldSlug: String? }
+
+@route("/blog/:slug")
+rpc post(slug: String) -> String {
+  let found = db.posts.findWhere(|p: Post| { p.oldSlug == slug });
+  if found.length() > 0 {
+    // URL vieja: redirect PERMANENTE a la nueva -- un buscador transfiere
+    // el ranking de la URL vieja a la nueva en vez de tratarlas como
+    // contenido duplicado.
+    response.redirect("/blog/" + found[0].slug, true);
+    ""
+  } else {
+    renderPost(slug)
+  }
+}
+```
+
+**`response.redirect(url: String, permanent: Bool) -> Void`** fija el status HTTP (301 si `permanent`, 302 si no) Y el header `Location: <url>` de la respuesta -- mismo mecanismo interno que `response.setStatus` (`Db::response_status_override`, un `Cell` que vive por request, escrito por el cuerpo del rpc y consumido una sola vez por `server.rs` tras un éxito), más un campo hermano nuevo (`response_location_override`, un `RefCell<Option<String>>` -- `String` no es `Copy`, a diferencia de `Option<u16>`) para el destino. Los dos viajan siempre juntos: no existe una forma de fijar el status de un redirect sin su `Location`, ni viceversa.
+
+`url` puede ser relativa (`"/blog/nuevo-slug"`) o absoluta (`"https://otro-dominio.com/x"`) -- HTTP no distingue, y los dos casos son reales (reorganizar rutas del mismo sitio vs. migrar de dominio). Un `url` vacío es un error de runtime limpio. Un `url` con un salto de línea (`\r`/`\n`) TAMBIÉN es un error de runtime limpio, no una URL que se deja pasar tal cual al header -- `url` es un `String` arbitrario que el propio cuerpo del rpc arma (podría concatenar un parámetro de usuario), a diferencia del `Origin` de una request entrante, que ya pasó por el parser de líneas HTTP de `tiny_http` antes de llegar a c-script; dejarlo pasar sin chequear abriría la puerta a inyectar headers HTTP arbitrarios en la respuesta.
+
+**Mismo límite que `response.setStatus` dentro de un `stream` (§3.56), por el mismo motivo exacto**: el status de una conexión SSE es fijo para toda su duración, se decide una sola vez al abrir la respuesta -- un redirect ahí no podría tener ningún efecto, así que es un error de COMPILACIÓN (no un no-op silencioso que solo se nota en producción).
+
+**Alcance de esta ronda**: sin validación de la FORMA de `url` más allá de "no vacío, sin salto de línea" -- un valor que no sea una URL real (`"no es una url"`) se deja pasar tal cual, es responsabilidad de quien escribe el rpc. Sin soporte de redirects relativos resueltos contra la request actual (eso ya lo hace cualquier navegador con una URL relativa, no hace falta que c-script lo resuelva).
+
+**Verificado**: 3 tests de tipos en `checker.rs` (firma correcta, rechazado dentro de un `stream` con el mismo mensaje que `setStatus`, cantidad/tipos de argumento incorrectos) + 1 en `runtime/mod.rs` (URL vacía o con salto de línea rechazada antes de llegar a ningún header) + 1 end-to-end en `cli_content_type.rs` contra un servidor `linkc serve` REAL: `permanent: false` da 302 con el `Location` exacto pedido, `permanent: true` da 301, los dos leídos del socket crudo (headers HTTP reales, no solo un body que los mencione).
 
 ---
 

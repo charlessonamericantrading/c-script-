@@ -1986,6 +1986,28 @@ fn call_method(
                 db.set_response_status(code as u16);
                 Ok(Value::Null)
             }
+            "redirect" => {
+                let (url, permanent) = match (args.first(), args.get(1)) {
+                    (Some(Value::Str(u)), Some(Value::Bool(p))) => (u, *p),
+                    _ => return Err(err("response.redirect requiere (url: String, permanent: Bool)")),
+                };
+                if url.is_empty() {
+                    return Err(err("response.redirect: 'url' no puede ser un string vacío"));
+                }
+                // Mismo motivo que filtrar el Origin de una request (arriba,
+                // §3.41): un valor que termina en un header HTTP crudo nunca
+                // puede llevar CR/LF sin abrir la puerta a inyectar headers
+                // extra -- acá el riesgo es más directo, `url` es un String
+                // arbitrario que el propio código c-script arma (podría venir
+                // de un parámetro de rpc), no algo que ya pasó por el parser
+                // de líneas HTTP de tiny_http como el Origin entrante.
+                if url.contains('\r') || url.contains('\n') {
+                    return Err(err("response.redirect: 'url' no puede contener un salto de línea"));
+                }
+                db.set_response_status(if permanent { 301 } else { 302 });
+                db.set_response_location(url.clone());
+                Ok(Value::Null)
+            }
             other => Err(err(format!("método desconocido sobre response: '{other}'"))),
         },
         Value::Http => match method {
@@ -4015,6 +4037,31 @@ mod tests {
         }
         // El máximo permitido (7 días) SÍ funciona.
         assert!(invoke_rpc(&program, "Docs", "share", &json!({"seconds": 604_800}), &db).is_ok());
+    }
+
+    // ---- `response.redirect` (GRAMMAR.md §3.111) ----
+
+    /// El status/Location reales que `response.redirect` deja armados solo
+    /// se observan del lado de `server.rs` (headers HTTP de verdad, ver
+    /// `cli_content_type.rs`) -- `invoke_rpc` (este módulo) no tiene forma
+    /// de leerlos, solo el valor JSON de retorno. Lo que SÍ se puede probar
+    /// acá es la validación de `url`: un string vacío o con un salto de
+    /// línea (inyección de headers HTTP) tiene que fallar ANTES de guardar
+    /// nada en el override, sin importar qué HTTP server lo consuma después.
+    #[test]
+    fn redirect_rejects_an_empty_or_newline_containing_url() {
+        let program = program_from(
+            r#"
+            service Web {
+                rpc go(url: String) -> Void { response.redirect(url, false) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        for bad in ["", "/a\r\nX-Injected: yes", "/a\nSet-Cookie: evil=1"] {
+            invoke_rpc(&program, "Web", "go", &json!({"url": bad}), &db).expect_err(&format!("{bad:?} debería rechazarse"));
+        }
+        assert!(invoke_rpc(&program, "Web", "go", &json!({"url": "/ok"}), &db).is_ok());
     }
 
     // ---- `@validate(...)` (GRAMMAR.md §3.73) ----

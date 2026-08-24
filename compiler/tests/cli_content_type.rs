@@ -202,6 +202,52 @@ impl Serve {
         reader.read_exact(&mut buf).expect("body");
         (status, content_type, String::from_utf8_lossy(&buf).to_string())
     }
+
+    /// Como `post`, pero devuelve el header `Location` en vez del body --
+    /// para `response.redirect` (GRAMMAR.md §3.111), donde lo que importa
+    /// es el status (301/302) y a dónde apunta, no un body real. `POST`
+    /// (no `GET`) porque estos rpcs se llaman por su dirección normal
+    /// `/Servicio/rpc`, no un `@route` -- mismo protocolo que `post` de
+    /// arriba usa para el resto de este archivo.
+    fn post_redirect(&self, path: &str, body: &str) -> (u16, Option<String>) {
+        let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("conectar");
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            self.port,
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).expect("escribir request");
+        stream.flush().ok();
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("línea de estado");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("estado HTTP inesperado: {status_line:?}"));
+
+        let mut location = None;
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("header");
+            if n == 0 || line.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.trim().split_once(':') {
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "location" => location = Some(v.trim().to_string()),
+                    "content-length" => content_length = v.trim().parse().unwrap_or(0),
+                    _ => {}
+                }
+            }
+        }
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf).ok();
+        (status, location)
+    }
 }
 
 impl Drop for Serve {
@@ -487,4 +533,33 @@ service Web {
     assert_eq!(status, 500);
     assert_eq!(content_type, "application/json; charset=utf-8");
     assert!(body.contains("un status HTTP válido está entre 100 y 599"), "body inesperado: {body}");
+}
+
+#[test]
+fn response_redirect_sets_the_real_status_and_location_header() {
+    // GRAMMAR.md §3.111: `response.redirect(url, permanent)` -- `permanent:
+    // false` tiene que dar 302 de verdad (no solo un body que lo mencione),
+    // `permanent: true` tiene que dar 301, y los dos tienen que llevar el
+    // header `Location` REAL con la URL exacta que el rpc pidió.
+    let temp = TempDir::new("response-redirect");
+    let out = build(
+        &temp,
+        r#"
+service Web {
+  rpc temporary() -> Void { response.redirect("/nueva-ubicacion", false) }
+  rpc permanent() -> Void { response.redirect("https://example.com/nuevo", true) }
+}
+"#,
+    );
+    assert!(out.status.success(), "{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&temp.0.join("app.link"));
+
+    let (status, location) = server.post_redirect("/Web/temporary", "{}");
+    assert_eq!(status, 302);
+    assert_eq!(location.as_deref(), Some("/nueva-ubicacion"));
+
+    let (status, location) = server.post_redirect("/Web/permanent", "{}");
+    assert_eq!(status, 301);
+    assert_eq!(location.as_deref(), Some("https://example.com/nuevo"));
 }

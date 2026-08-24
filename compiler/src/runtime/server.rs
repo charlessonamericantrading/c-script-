@@ -535,7 +535,7 @@ fn handle_request(
         return;
     }
 
-    let (status, response_body, response_type) =
+    let (status, response_body, response_type, response_location) =
         handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, args_json);
     // `response_body` en una falla es `{"error": "<mensaje>"}`
     // (`error_json`, más abajo) -- se extrae el mensaje solo para el
@@ -552,7 +552,7 @@ fn handle_request(
     } else {
         String::new()
     };
-    let _ = request.respond(cors_response_with_type(status, response_body, &response_type, &cors_headers));
+    let _ = request.respond(cors_response_with_type(status, response_body, &response_type, &cors_headers, response_location.as_deref()));
     log_done(req_id, Some(&method), status, start, &extra);
     // Defensa en profundidad, no carga estructural: el `set_request_context`
     // de arriba ya garantiza que la PRÓXIMA request nunca ve el contexto de
@@ -930,34 +930,40 @@ fn handle_rpc(
     service_name: &str,
     rpc_name: &str,
     args_json: serde_json::Value,
-) -> (u16, String, String) {
+) -> (u16, String, String, Option<String>) {
     match invoke_rpc_with_sessions(program, service_name, rpc_name, &args_json, db, sessions, token) {
         Ok(result) => {
-            // `response.setStatus(code)` (GRAMMAR.md §3.46): consumido ACÁ,
+            // `response.setStatus(code)` (GRAMMAR.md §3.46) / `response.
+            // redirect(url, permanent)` (GRAMMAR.md §3.111): consumidos ACÁ,
             // una sola vez, solo en el camino de éxito -- un `Err` de abajo
             // nunca llega a este `match`, así que un override que el cuerpo
             // haya pedido antes de fallar simplemente no se usa (queda para
             // que `clear_request_context` lo limpie al final de la request).
             let status = db.take_response_status().unwrap_or(200);
+            let location = db.take_response_location();
             match declared_content_type(program, service_name, rpc_name) {
                 // El checker ya garantizó que un rpc con `@content_type` devuelve
                 // `String`, así que `as_str()` acá siempre acierta; el fallback
                 // existe para no inventar un panic si esa invariante se rompiera.
                 Some(ct) => {
                     let text = result.as_str().map(str::to_string).unwrap_or_else(|| result.to_string());
-                    (status, text, ct)
+                    (status, text, ct, location)
                 }
-                None => (status, result.to_string(), JSON_CONTENT_TYPE.to_string()),
+                None => (status, result.to_string(), JSON_CONTENT_TYPE.to_string(), location),
             }
         }
         // Un error SIEMPRE sale como JSON, aunque el rpc declare otro
         // Content-Type: el cliente generado espera `{"error": ...}` para
         // cualquier status >= 400, y una página de error en HTML rompería ese
-        // contrato justo cuando algo ya salió mal.
+        // contrato justo cuando algo ya salió mal. Un `Location` que un rpc
+        // haya pedido ANTES de fallar tampoco se usa -- mismo motivo que el
+        // status: una respuesta de error nunca lleva el resultado a medio
+        // camino que el cuerpo haya intentado armar.
         Err(e) => (
             status_for(&e),
             error_json(&e.to_string()),
             JSON_CONTENT_TYPE.to_string(),
+            None,
         ),
     }
 }
@@ -1165,7 +1171,7 @@ fn error_json(message: &str) -> String {
 const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 fn cors_response(status: u16, body: String, cors: &CorsHeaders) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    cors_response_with_type(status, body, JSON_CONTENT_TYPE, cors)
+    cors_response_with_type(status, body, JSON_CONTENT_TYPE, cors, None)
 }
 
 /// Igual que `cors_response` pero con el Content-Type que pidió el rpc
@@ -1178,17 +1184,32 @@ fn cors_response(status: u16, body: String, cors: &CorsHeaders) -> tiny_http::Re
 /// también necesita `Access-Control-Allow-Origin` para que el browser deje
 /// que el cliente generado LEA ese error en vez de reportar un fallo de red
 /// genérico sin mensaje.
+///
+/// `location`: el header `Location` de `response.redirect` (GRAMMAR.md
+/// §3.111), `None` en cualquier respuesta que no sea un redirect (incluido
+/// TODO camino de error -- ver `handle_rpc`). Mismo criterio de "no tirar
+/// el proceso" que `content_type_value`: una URL que no forme un header
+/// válido simplemente no se agrega, en vez de un `unwrap()` en el hilo
+/// principal del accept-loop -- el runtime ya rechazó CR/LF antes de
+/// guardar el override, así que en la práctica esto solo protegería contra
+/// un caso que `response.redirect` no debería dejar pasar en absoluto.
 fn cors_response_with_type(
     status: u16,
     body: String,
     content_type_value: &str,
     cors: &CorsHeaders,
+    location: Option<&str>,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type_value.as_bytes())
         .unwrap_or_else(|_| {
             tiny_http::Header::from_bytes(&b"Content-Type"[..], JSON_CONTENT_TYPE.as_bytes()).unwrap()
         });
     let mut response = tiny_http::Response::from_string(body).with_status_code(status).with_header(content_type);
+    if let Some(url) = location {
+        if let Ok(location_header) = tiny_http::Header::from_bytes(&b"Location"[..], url.as_bytes()) {
+            response = response.with_header(location_header);
+        }
+    }
 
     if let Some(origin) = &cors.allow_origin {
         // `.unwrap_or` en vez de `.unwrap()`: a diferencia de los headers de

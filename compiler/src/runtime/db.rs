@@ -634,6 +634,12 @@ pub struct Db {
     /// después de que `invoke_rpc` vuelve con éxito. `Cell`, no `RefCell`
     /// -- `Option<u16>` es `Copy`, no hace falta pedir prestado nada.
     response_status_override: std::cell::Cell<Option<u16>>,
+    /// `response.redirect(url, permanent)` (GRAMMAR.md §3.111) -- mismo
+    /// mecanismo y mismo ciclo de vida que `response_status_override`
+    /// (escrito por el cuerpo del rpc, leído UNA vez por `server.rs` tras
+    /// un éxito, limpiado en `clear_request_context`), pero `RefCell`
+    /// -- a diferencia de `Option<u16>`, `Option<String>` no es `Copy`.
+    response_location_override: RefCell<Option<String>>,
     /// Id aleatorio de ESTA instancia del proceso -- solo tiene sentido con
     /// Postgres (GRAMMAR.md §3.44): va adentro de cada `NOTIFY` para que el
     /// hilo de LISTEN de esta MISMA instancia pueda reconocer y descartar
@@ -947,6 +953,7 @@ impl Db {
             subscribers: RefCell::new(HashMap::new()),
             current_request: RefCell::new(None),
             response_status_override: std::cell::Cell::new(None),
+            response_location_override: RefCell::new(None),
             instance_id: random_instance_id(),
             argon2_params: RefCell::new(argon2::Params::default()),
             http_timeout: RefCell::new(DEFAULT_HTTP_TIMEOUT),
@@ -1076,6 +1083,7 @@ impl Db {
                 subscribers: RefCell::new(HashMap::new()),
                 current_request: RefCell::new(None),
                 response_status_override: std::cell::Cell::new(None),
+                response_location_override: RefCell::new(None),
                 instance_id,
                 argon2_params: RefCell::new(argon2::Params::default()),
                 http_timeout: RefCell::new(DEFAULT_HTTP_TIMEOUT),
@@ -1218,6 +1226,7 @@ db { users: User[] }
         // `handle_rpc` nunca llegó a consumirlo con `take_response_status`),
         // esto evita que el valor sobreviva para la PRÓXIMA request.
         self.response_status_override.set(None);
+        self.response_location_override.borrow_mut().take();
     }
 
     /// Llamado por `response.setStatus(code)` (GRAMMAR.md §3.46) -- guarda
@@ -1236,6 +1245,21 @@ db { users: User[] }
     /// forma que hoy no pasa.
     pub(crate) fn take_response_status(&self) -> Option<u16> {
         self.response_status_override.take()
+    }
+
+    /// Llamado por `response.redirect(url, permanent)` (GRAMMAR.md
+    /// §3.111) -- guarda la URL destino para que `server.rs` la agregue
+    /// como header `Location`, mismo ciclo de vida que
+    /// `set_response_status`/`take_response_status` (`redirect` además
+    /// llama a `set_response_status` con 301/302, así que las dos piezas
+    /// siempre viajan juntas).
+    pub(crate) fn set_response_location(&self, url: String) {
+        *self.response_location_override.borrow_mut() = Some(url);
+    }
+
+    /// Simétrico de `take_response_status`.
+    pub(crate) fn take_response_location(&self) -> Option<String> {
+        self.response_location_override.borrow_mut().take()
     }
 
     /// `""` -- no `None` -- fuera de una request HTTP real (ej. invocado

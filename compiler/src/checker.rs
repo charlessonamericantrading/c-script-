@@ -3412,6 +3412,19 @@ impl Checker {
                 self.check_expr(code_arg, &Type::Int, env)?;
                 Some(Type::Void)
             }
+            (Type::Response, "redirect") => {
+                let [url, permanent] = args else {
+                    return Err(err("'response.redirect' toma exactamente 2 argumentos (url: String, permanent: Bool)"));
+                };
+                if self.in_stream_body.get() {
+                    return Err(err(
+                        "'response.redirect' no tiene efecto dentro de un 'stream': mismo motivo que 'response.setStatus' (GRAMMAR.md §3.46) -- una conexión SSE ya envió su status antes de que el cuerpo corra",
+                    ));
+                }
+                self.check_expr(url, &Type::String, env)?;
+                self.check_expr(permanent, &Type::Bool, env)?;
+                Some(Type::Void)
+            }
             (Type::Base64, "decode") => {
                 let [str_arg] = args else {
                     return Err(err("'base64.decode' toma exactamente 1 argumento (base64_str: String)"));
@@ -5062,6 +5075,54 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn redirect_inside_a_stream_body_is_a_compile_error() {
+        // Mismo motivo que `set_status_inside_a_stream_body_is_a_compile_error`
+        // (GRAMMAR.md §3.111): una conexión SSE ya envió su status HTTP antes
+        // de que el cuerpo del stream corra, así que un redirect ahí no
+        // podría tener ningún efecto -- error de compilación en vez de un
+        // no-op silencioso.
+        let src = r#"
+            type Item = { id: Int }
+            db { items: Item[] }
+            service Items {
+                stream watchAll() -> Item {
+                    response.redirect("/otro-lado", false);
+                    db.items.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("redirect") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn redirect_inside_a_normal_rpc_body_works_and_returns_void() {
+        let src = r#"
+            service Web {
+                rpc goElsewhere() -> Void {
+                    response.redirect("/nueva-ubicacion", false)
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn redirect_rejects_the_wrong_number_or_types_of_arguments() {
+        for bad in [
+            r#"service W { rpc f() -> Void { response.redirect("/a") } }"#,
+            r#"service W { rpc f() -> Void { response.redirect("/a", false, true) } }"#,
+            r#"service W { rpc f() -> Void { response.redirect(1, false) } }"#,
+            r#"service W { rpc f() -> Void { response.redirect("/a", "no") } }"#,
+        ] {
+            assert!(check_source(bad).is_err(), "debería rechazarse: {bad}");
+        }
     }
 
     #[test]

@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.74.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`response.redirect(url, permanent: Bool) -> Void`.** Primer ítem resuelto de PLAN.md §9.9 (SEO y descubribilidad para IA, abierta a pedido explícito del usuario). Un redirect 301/302 real es SEO básico -- consolidar contenido duplicado, transferir el ranking de una URL vieja a la nueva -- y `response.setStatus` (§3.46) por sí solo no alcanzaba: fijar el status sin un header `Location` no es un redirect. Fija los dos a la vez (301 si `permanent`, 302 si no, más `Location: <url>`), mismo mecanismo interno que `setStatus` con un campo hermano nuevo para la URL. Rechaza `url` vacío o con salto de línea (inyección de headers HTTP) con un error de runtime limpio -- `url` es un `String` arbitrario que el propio rpc arma, no un header ya validado de una request entrante. Mismo límite que `setStatus` dentro de un `stream`: error de compilación, no no-op silencioso.
+
+943 tests (5 nuevos): 3 de tipos en `checker.rs` + 1 en `runtime/mod.rs` (validación de `url`) + 1 end-to-end en `cli_content_type.rs` contra un `linkc serve` real, confirmando el status Y el header `Location` reales leídos del socket crudo. Detalle completo: GRAMMAR.md §3.111.
+
 ## [1.73.0] - 2026-08-24
 
 ### ✨ Nuevo
