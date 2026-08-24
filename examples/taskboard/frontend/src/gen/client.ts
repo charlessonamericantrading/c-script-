@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc — no editar a mano.
+// Generado automáticamente por linkc v1.48.0 — no editar a mano.
 
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
 import { isBoardStats, isTask } from "./validators.ts";
@@ -150,3 +150,4 @@ class TasksClientImpl implements TasksClient {
 export function createTasksClient(baseUrl: string): TasksClient {
   return new TasksClientImpl(baseUrl);
 }
+

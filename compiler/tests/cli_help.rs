@@ -61,3 +61,19 @@ fn an_unknown_subcommand_points_at_help() {
     let text = String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("linkc --help"), "mensaje inesperado: {text}");
 }
+
+/// `linkc --version`/`-v`/`version` (PLAN.md §9.7, GRAMMAR.md §3.83):
+/// `env!("CARGO_PKG_VERSION")` acá (en este mismo `Cargo.toml`) tiene que
+/// ser LITERALMENTE lo que el binario real imprime -- las dos lecturas
+/// vienen del mismo archivo, así que una desincronización sería un bug de
+/// verdad, no un test frágil.
+#[test]
+fn version_flag_prints_the_exact_crate_version_and_succeeds() {
+    for flag in ["--version", "-v", "version"] {
+        let out = linkc().arg(flag).output().expect("no se pudo ejecutar linkc");
+        assert!(out.status.success(), "'{flag}' debería salir con código 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout.trim(), format!("linkc {}", env!("CARGO_PKG_VERSION")), "'{flag}': {stdout}");
+        assert!(String::from_utf8_lossy(&out.stderr).is_empty(), "'{flag}' escribió en stderr");
+    }
+}

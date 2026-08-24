@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.48.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc --version`/`-v`/`version`, y la versión estampada en cada archivo generado.** Hasta esta ronda `linkc` no tenía NINGUNA forma de reportar su propia versión, y ningún archivo que `linkc build` genera decía con qué versión del compilador se había generado -- un `gen/` desactualizado en un equipo donde conviven varias versiones del compilador no tenía cómo detectarse por sí solo. `linkc::VERSION` (`env!("CARGO_PKG_VERSION")`, tomada de `Cargo.toml` en tiempo de compilación, nunca un string hardcodeado aparte) alimenta las dos cosas a la vez, así que no pueden desincronizarse entre sí: `linkc --version` la imprime tal cual (`linkc 1.48.0`), y el header de `contract.d.ts`/`client.ts`/`hooks.ts`/`validators.ts`/`schemas.ts` queda estampado con ella (`// Generado automáticamente por linkc v1.48.0 — no editar a mano.`). `openapi.json`, que no admite comentarios `//`, lleva la misma información en `x-generated-by` -- una extensión de VENDOR estándar de OpenAPI (prefijo `x-`) -- deliberadamente NO en `info.version`, que es la versión del API que el propio `.link` documenta, un concepto distinto que no había que mezclar. Puramente informativo: nada compara la versión estampada en un `gen/` viejo contra el binario que lo está sirviendo o reconstruyendo -- sirve para que una persona lo note mirando el archivo.
+
+790 tests (4 nuevos): `cli_help.rs` (`--version`/`-v`/`version` imprimen exactamente `linkc <versión>` a stdout, código 0, nada por stderr -- comparado contra `env!("CARGO_PKG_VERSION")` leído en el propio test) y 3 en `codegen/*.rs` (los cinco emisores TS empiezan con el header versionado; `openapi.json` lleva `x-generated-by` con la versión, e `info.version` sigue siendo la del API, no la del compilador). Detalle completo: GRAMMAR.md §3.83.
+
 ## [1.47.0] - 2026-08-24
 
 ### ✨ Nuevo

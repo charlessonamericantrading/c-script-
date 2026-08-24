@@ -58,7 +58,7 @@ pub fn emit_validators(program: &Program) -> Result<String, String> {
     }
 
     let mut out = String::new();
-    out.push_str("// Generado automáticamente por linkc — no editar a mano.\n\n");
+    out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
 
     // Cada firma `x is X` que se emitió referencia el nombre de tipo X --
     // hay que importarlo de "./contract", igual que ya hace client.ts
@@ -509,6 +509,17 @@ mod tests {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
         emit_validators(&program).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// PLAN.md §9.7, GRAMMAR.md §3.83: mismo estampado de versión que
+    /// `contract.d.ts`/`client.ts`/`hooks.ts`.
+    #[test]
+    fn header_is_stamped_with_the_compiler_version() {
+        let out = emit("type Point = { x: Int, y: Int }");
+        assert!(
+            out.starts_with(&format!("// Generado automáticamente por linkc v{} — no editar a mano.", crate::VERSION)),
+            "{out}"
+        );
     }
 
     #[test]

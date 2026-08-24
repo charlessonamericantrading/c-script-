@@ -4,6 +4,17 @@
 // aparte aunque viva en el mismo paquete Cargo -- sin este `[lib]`, no
 // tendría de dónde importar `ast`/`checker`/`runtime`/etc.
 
+/// Versión exacta de ESTE binario -- `env!("CARGO_PKG_VERSION")` la toma de
+/// `Cargo.toml` en tiempo de COMPILACIÓN, así que nunca puede desincronizarse
+/// del binario real que la reporta (a diferencia de un string hardcodeado
+/// aparte, que alguien podría olvidarse de actualizar en un release).
+/// `linkc --version` (GRAMMAR.md §3.83) la imprime tal cual, y cada archivo
+/// que `linkc build` genera (`contract.d.ts`/`client.ts`/`hooks.ts`/
+/// `validators.ts`/`schemas.ts`/`openapi.json`) queda estampado con ella --
+/// para saber con qué versión exacta del compilador se generó un `gen/`
+/// dado, cuando conviven varias versiones en el tiempo (PLAN.md §9.7).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod ast;
 pub mod checker;
 pub mod codegen;

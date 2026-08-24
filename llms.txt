@@ -229,6 +229,7 @@ linkc dev backend.link src/gen 8787  # rebuild and restart on change
 linkc introspect postgres://... > main.link  # generate a starting .link from an existing PostgreSQL schema
 linkc serve backend.link 8787 --adopt-existing  # never touch DDL; assume every table already exists
 linkc serve backend.link 8787 --host 127.0.0.1  # bind loopback only, not 0.0.0.0
+linkc --version                      # linkc 1.48.0 -- same version stamped in every generated file
 ```
 
 ## Verified example

@@ -103,7 +103,7 @@ pub fn emit_zod_schemas(program: &Program) -> Result<String, String> {
     }
 
     let mut out = String::new();
-    out.push_str("// Generado automáticamente por linkc — no editar a mano.\n\n");
+    out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
     out.push_str("import { z } from \"zod\";\n\n");
 
     for item in &program.items {
@@ -146,6 +146,18 @@ mod tests {
     use super::*;
     use crate::lexer;
     use crate::parser;
+
+    /// PLAN.md §9.7, GRAMMAR.md §3.83: mismo estampado de versión que
+    /// `contract.d.ts`/`client.ts`/`hooks.ts`/`validators.ts`.
+    #[test]
+    fn header_is_stamped_with_the_compiler_version() {
+        let program = parser::parse(lexer::tokenize("type Item = { id: Int }").unwrap()).unwrap();
+        let out = emit_zod_schemas(&program).unwrap();
+        assert!(
+            out.starts_with(&format!("// Generado automáticamente por linkc v{} — no editar a mano.", crate::VERSION)),
+            "{out}"
+        );
+    }
 
     #[test]
     fn test_zod_emit_generates_valid_schemas() {

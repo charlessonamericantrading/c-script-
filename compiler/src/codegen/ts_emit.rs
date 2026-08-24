@@ -18,7 +18,7 @@ pub fn emit_contract(program: &Program) -> Result<String, String> {
     }
 
     let mut out = String::new();
-    out.push_str("// Generado automáticamente por linkc — no editar a mano.\n\n");
+    out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
     out.push_str("export type Result<T, E> = { type: \"Ok\"; value: T } | { type: \"Err\"; error: E };\n");
     // Partial<T> de TS YA implementa la semántica de Patch<T> de GRAMMAR.md §3.4:
     // un campo `x: T?` (=> `x: T | null`) se vuelve `x?: T | null` (omitir = no
@@ -119,7 +119,7 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     }
 
     let mut out = String::new();
-    out.push_str("// Generado automáticamente por linkc — no editar a mano.\n\n");
+    out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
 
     // Recolecta TODOS los `service` del programa, no el primero: un programa
     // con mas de un `service` (GRAMMAR.md no lo limita a uno, a diferencia de
@@ -382,7 +382,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     }
 
     let mut out = String::new();
-    out.push_str("// Generado automáticamente por linkc — no editar a mano.\n\n");
+    out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
     out.push_str("import { useState, useEffect, useCallback } from \"react\";\n");
     if !imported_types.is_empty() {
         out.push_str(&format!(
@@ -1024,6 +1024,24 @@ mod tests {
         assert_eq!(client.matches("export class LinkTransportError").count(), 1);
         assert_eq!(client.matches("export class LinkValidationError").count(), 1);
         assert_eq!(client.matches("export function isOk").count(), 1);
+    }
+
+    /// `linkc --version` / cada archivo generado (PLAN.md §9.7, GRAMMAR.md
+    /// §3.83): el header de `contract.d.ts`/`client.ts`/`hooks.ts` queda
+    /// estampado con `crate::VERSION` -- la MISMA constante que
+    /// `linkc --version` imprime, así que nunca pueden desincronizarse.
+    #[test]
+    fn contract_client_and_hooks_headers_are_stamped_with_the_compiler_version() {
+        let src = "type Item = { id: Int } db { items: Item[] } service S { rpc list() -> Item[] { db.items.all() } }";
+        let (contract, client) = emit_both(src);
+        let expected = format!("// Generado automáticamente por linkc v{} — no editar a mano.", crate::VERSION);
+        assert!(contract.starts_with(&expected), "{contract}");
+        assert!(client.starts_with(&expected), "{client}");
+
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        let hooks = emit_hooks(&program).unwrap_or_else(|e| panic!("{e}"));
+        assert!(hooks.starts_with(&expected), "{hooks}");
     }
 
     #[test]

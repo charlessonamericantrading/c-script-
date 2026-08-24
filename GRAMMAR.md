@@ -104,6 +104,7 @@
   - [3.80 Índices declarativos: `@index`/`@unique` — RESUELTO](#380-índices-declarativos-indexunique--resuelto)
   - [3.81 `--host <dirección>`: en qué interfaz escucha `linkc serve` — RESUELTO](#381---host-dirección-en-qué-interfaz-escucha-linkc-serve--resuelto)
   - [3.82 `linkc test --filter <nombre>` — RESUELTO](#382-linkc-test---filter-nombre--resuelto)
+  - [3.83 `linkc --version` y versión estampada en cada archivo generado — RESUELTO](#383-linkc---version-y-versión-estampada-en-cada-archivo-generado--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4048,6 +4049,35 @@ linkc test app.link --filter usuario
 **Solo aplica al test runner INTEGRADO (`test "..." { ... }`), nunca al testing de contrato (`linkc test archivo.link archivo.snap`).** Ese segundo modo compara el `contract.d.ts`/`client.ts`/`validators.ts` completos contra un snapshot -- no tiene nombres de test que filtrar, así que combinar `--filter` con un path de snapshot es un uso confuso, rechazado con un mensaje claro en vez de ignorado en silencio.
 
 **Verificado**: 1 test en `runtime/mod.rs` (`run_program_tests_filtered`: un filtro que matchea un subconjunto corre solo esos, uno que no matchea nada corre cero sin fallar, `None` corre TODOS -- idéntico a `run_program_tests` sin filtro) y 5 en `cli_test_runner.rs` con el binario real (filtra por substring, substring parcial también matchea, cero coincidencias termina limpio, `--filter` sin valor y `--filter` combinado con un path de snapshot son errores de uso claros, sin panic).
+
+---
+
+### 3.83 `linkc --version` y versión estampada en cada archivo generado — RESUELTO
+
+Hasta esta ronda, `linkc` no tenía NINGUNA forma de reportar su propia versión -- confirmado leyendo `main.rs`, ni `--version` ni `-v` ni `version` estaban despachados en ningún lado, y ningún archivo que `linkc build` genera decía con qué versión del compilador se había generado. Para un equipo donde conviven varias versiones del compilador en el tiempo (una máquina de CI recién actualizada, un desarrollador con un binario viejo en el `PATH`), un `gen/` desactualizado no tenía ninguna forma de detectarse por sí solo -- había que confiar en que quien lo generó se acordara de anotarlo en algún lado aparte.
+
+```bash
+linkc --version
+# linkc 1.48.0
+linkc -v        # equivalente
+linkc version   # equivalente
+```
+
+**`linkc::VERSION` es `env!("CARGO_PKG_VERSION")` -- tomada de `Cargo.toml` en tiempo de COMPILACIÓN, nunca un string hardcodeado aparte que alguien podría olvidarse de actualizar en un release.** La misma constante alimenta `linkc --version` Y el header de cada archivo que `linkc build` genera, así que las dos lecturas nunca pueden desincronizarse entre sí -- si difieren, es porque se está comparando la salida de DOS binarios distintos, que es justamente lo que este ítem existe para poder detectar.
+
+**Cada archivo TypeScript generado (`contract.d.ts`/`client.ts`/`hooks.ts`/`validators.ts`/`schemas.ts`) queda con la versión en su primera línea:**
+
+```typescript
+// Generado automáticamente por linkc v1.48.0 — no editar a mano.
+```
+
+**`openapi.json` -- que no admite comentarios `//` -- lleva la misma información en `x-generated-by`, una extensión de VENDOR estándar de OpenAPI (prefijo `x-`, cualquier herramienta que no la reconozca la ignora sin romper la validación del documento).** Deliberadamente NO se reusa `info.version` para esto -- ese campo es la versión del API que el propio `.link` documenta (algo que decide quien lo escribe, sin relación con qué versión del compilador lo generó), reusarlo mezclaría dos conceptos distintos bajo el mismo campo.
+
+**Límites honestos:**
+- **Es un COMENTARIO/campo informativo, no una restricción que `linkc build`/`linkc serve` verifiquen.** Nada compara la versión estampada en un `gen/` viejo contra la versión del binario que lo está sirviendo o reconstruyendo -- sirve para que una PERSONA lo note al mirar el archivo, no para que el compilador rechace un `gen/` desactualizado.
+- **`link.lock` tiene su propio `version` -- un número de FORMATO del lockfile (hoy `1`), no la versión del compilador.** Las dos cosas conviven sin relación: el lockfile versiona su propio schema, este ítem versiona el ARTEFACTO generado.
+
+**Verificado**: `cli_help.rs` (`--version`/`-v`/`version` imprimen exactamente `linkc <versión>` a stdout, código de salida 0, nada por stderr -- comparado contra `env!("CARGO_PKG_VERSION")` leído en el propio test, así que una desincronización real haría fallar el test) y 4 tests en `codegen/*.rs` (`contract.d.ts`/`client.ts`/`hooks.ts`, `validators.ts` y `schemas.ts` empiezan con el header versionado; `openapi.json` lleva `x-generated-by` con la versión, y `info.version` sigue siendo la del API, no la del compilador -- las dos NO deben coincidir).
 
 ---
 

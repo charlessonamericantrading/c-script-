@@ -276,6 +276,13 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
 
     let doc = json!({
         "openapi": "3.1.0",
+        // `x-generated-by` (PLAN.md §9.7, GRAMMAR.md §3.83): extensión de
+        // vendor ESTÁNDAR de OpenAPI (prefijo `x-`, cualquier herramienta la
+        // ignora sin romper la validación del documento) -- no
+        // `info.version`, que es la versión del API DOCUMENTADA (algo que
+        // decide quien escribe el `.link`, ver GRAMMAR.md §3.83), no la del
+        // compilador que lo generó.
+        "x-generated-by": format!("linkc v{}", crate::VERSION),
         "info": {
             "title": title,
             "version": "1.0.0",
@@ -322,6 +329,11 @@ mod tests {
         assert!(spec["paths"]["/Tasks/list"]["post"].is_object());
         assert!(spec["paths"]["/Tasks/create"]["post"]["requestBody"].is_object());
         assert!(spec["components"]["schemas"]["Task"].is_object());
+        // PLAN.md §9.7, GRAMMAR.md §3.83: `x-generated-by` -- extensión de
+        // vendor de OpenAPI, NUNCA `info.version` (esa es la versión del API
+        // documentada, no la del compilador).
+        assert_eq!(spec["x-generated-by"], format!("linkc v{}", crate::VERSION));
+        assert_ne!(spec["info"]["version"], format!("linkc v{}", crate::VERSION), "info.version es del API, no del compilador");
     }
 
     /// `@deprecated` sobre un rpc se propaga como `deprecated: true` +
