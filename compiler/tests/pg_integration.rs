@@ -1349,3 +1349,123 @@ service Items {{
     assert_eq!(good["name"], "fila-nueva-con-note");
     assert_eq!(good["note"], "tiene valor");
 }
+
+// ---- dos `.link` distintos declarando la misma colección contra la misma
+// base (PLAN.md §9.1, ítem "colisión de colección") ----
+
+#[test]
+fn two_different_link_files_declaring_disjoint_columns_of_the_same_table_can_read_each_others_rows_but_not_always_write() {
+    // A diferencia de SQLite (`check_schema_matches`, §3.17, exige
+    // coincidencia EXACTA), PostgreSQL nunca compara el schema completo --
+    // solo valida "id" y agrega SUS PROPIAS columnas declaradas. Dos `.link`
+    // con columnas DISTINTAS (sin nombres en común) sobre la misma tabla
+    // conviven para LECTURA sin ningún error -- pero un INSERT desde el
+    // segundo `.link` puede fallar si el primero dejó una columna NOT NULL
+    // que el segundo no conoce y por lo tanto nunca provee.
+    const COLLECTION: &str = "items_two_links_disjoint";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("two-links-disjoint");
+    let link_a = temp.write(
+        "a.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc create(name: String) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, name: name }}) }} rpc get(id: Int) -> Item? {{ db.{COLLECTION}.find(id) }} }}
+"#
+        ),
+    );
+    let server_a = Serve::start(&link_a, &url);
+    let created = server_a.rpc("Items/create", r#"{"name":"desde A"}"#);
+    let id = created["id"].as_i64().unwrap();
+    drop(server_a);
+
+    // "b.link" declara la MISMA colección con una columna distinta ("price",
+    // que "a.link" nunca mencionó) -- se espera que conecte sin queja y le
+    // agregue "price" (nullable) a la tabla que "a.link" ya creó.
+    let link_b = temp.write(
+        "b.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, price: Float? }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc get(id: Int) -> Item? {{ db.{COLLECTION}.find(id) }} rpc create(price: Float?) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, price: price }}) }} }}
+"#
+        ),
+    );
+    let server_b = Serve::start(&link_b, &url);
+    // "b.link" ve la fila que "a.link" insertó (mismo "id"), con "price" en null.
+    let seen_by_b = server_b.rpc("Items/get", &format!(r#"{{"id":{id}}}"#));
+    assert_eq!(seen_by_b["price"], serde_json::Value::Null, "'price' nunca se escribió -- tiene que verse null, no faltar la fila");
+
+    // Pero "b.link" NO puede insertar una fila propia: la tabla física tiene
+    // "name" NOT NULL (de "a.link"), y el INSERT de "b.link" nunca la
+    // menciona -- Postgres rechaza el INSERT, con un error limpio, nunca un
+    // panic que tumbe el proceso.
+    let insert_err =
+        server_b.try_rpc("Items/create", r#"{"price":9.99}"#).expect_err("insertar sin 'name' tiene que violar el NOT NULL físico");
+    assert!(!insert_err.contains("panicked at"), "tiene que ser un error de runtime limpio, no un panic: {insert_err}");
+    drop(server_b);
+
+    // "a.link" sigue viendo SU columna ("name") intacta -- nunca vio "price",
+    // y el servidor sigue funcionando después del error de arriba.
+    let server_a2 = Serve::start(&link_a, &url);
+    let seen_by_a = server_a2.rpc("Items/get", &format!(r#"{{"id":{id}}}"#));
+    assert_eq!(seen_by_a["name"], "desde A");
+    assert!(seen_by_a.get("price").is_none(), "'a.link' no declara 'price' -- no debe aparecer en su respuesta");
+}
+
+#[test]
+fn two_different_link_files_disagreeing_on_a_shared_columns_type_fails_cleanly_not_with_a_panic() {
+    // El caso peligroso: los dos `.link` declaran un campo con el MISMO
+    // nombre pero tipos distintos. `ADD COLUMN IF NOT EXISTS` es un no-op
+    // sobre una columna que ya existe -- el segundo `.link` "cree" que la
+    // columna es de su propio tipo, pero físicamente sigue siendo la del
+    // primero. Este test confirma que el desacuerdo se descubre en el
+    // primer INSERT/SELECT real (un error de tipo limpio del driver de
+    // Postgres, propagado como RuntimeError), nunca en un panic que tumbe
+    // el proceso.
+    const COLLECTION: &str = "items_two_links_type_conflict";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("two-links-conflict");
+    let link_a = temp.write(
+        "a.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, count: Int }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc create(count: Int) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, count: count }}) }} }}
+"#
+        ),
+    );
+    let server_a = Serve::start(&link_a, &url);
+    server_a.rpc("Items/create", r#"{"count":5}"#);
+    drop(server_a);
+
+    // "count" ya existe como INTEGER -- "b.link" lo declara String.
+    let link_b = temp.write(
+        "b.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, count: String }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+    let server_b = Serve::start(&link_b, &url);
+    let err = server_b.try_rpc("Items/list", "{}").expect_err("leer una columna INTEGER real como String tiene que fallar limpio");
+    assert!(!err.contains("panicked at"), "tiene que ser un error de runtime limpio, no un panic que tumbe el proceso: {err}");
+}

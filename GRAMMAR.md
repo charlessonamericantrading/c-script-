@@ -1603,6 +1603,16 @@ Verificado en `pg_integration.rs`: una tabla creada a mano con
 ella -- el arranque falla, el mensaje nombra `uuid` y la tabla, nunca aparece
 `panicked at`, y el servidor nunca llega a imprimir que está escuchando.
 
+**Qué pasa cuando dos `.link` distintos declaran la MISMA colección contra la misma base** (PLAN.md §9.1, pedido explícito en un reporte de adopción real -- "no nos atrevimos a probarlo en real"). No hay ninguna coordinación entre procesos `linkc serve` distintos -- cada uno valida y migra solo lo que SU PROPIO programa declara, así que el resultado depende de qué tan parecidos sean:
+
+- **Columnas sin nombres en común** (`a.link` declara `name`, `b.link` declara `price`): conviven sin error. Cada `ADD COLUMN IF NOT EXISTS` agrega la columna que falta, nullable; una lectura de `b.link` sobre una fila que `a.link` insertó ve su propia columna en `null` (nunca falta la fila); `a.link` nunca ve `price` en absoluto, porque sus `SELECT` solo nombran sus propias columnas declaradas (§3.36, tabla de arriba). El riesgo real no es de lectura, es de escritura: si `a.link` dejó alguna columna `NOT NULL` (como `name` acá), un `INSERT` de `b.link` que nunca la menciona viola esa constraint -- un error limpio de Postgres, propagado como error de runtime normal, nunca un panic.
+- **Un mismo nombre de columna con el MISMO tipo**: conviven sin error, ambos leen/escriben la misma columna física con la misma semántica -- es, en efecto, la forma de facto de "compartir" un campo entre dos `.link`.
+- **Un mismo nombre de columna con tipos DISTINTOS**: el peligroso. `ADD COLUMN IF NOT EXISTS` es un no-op sobre una columna que ya existe -- el segundo `.link` en conectar nunca se entera de que su tipo declarado no coincide con el real (a diferencia de `"id"`, que sí se valida explícitamente arriba). El desacuerdo se descubre recién en el primer `INSERT`/`SELECT` real contra esa columna, como un error de tipo del driver de Postgres -- limpio, nunca un panic que tumbe el proceso, pero tampoco detectado al conectar.
+
+No hay hoy ningún mecanismo de namespacing (`--db-schema`/`--db-prefix`) para evitar esto -- queda para una ronda propia (PLAN.md §9.3.10). **Recomendación mientras tanto**: si dos `.link` comparten una base, que declaren la misma colección con EXACTAMENTE los mismos campos y tipos (tratándola como una interfaz compartida), o que usen nombres de colección distintos.
+
+Verificado en `pg_integration.rs` contra una PostgreSQL real: dos `.link` con columnas disjuntas conviven para lectura, y el `INSERT` del segundo falla limpio (sin panic) cuando pisa una columna `NOT NULL` que no conoce; dos `.link` con el mismo nombre de campo y tipos distintos (`Int` vs `String`) fallan limpio en la primera lectura real, nunca al conectar.
+
 ---
 
 ### 3.37 `@route("/blog/:slug")`: URLs amigables para SEO — RESUELTO (alcance acotado)

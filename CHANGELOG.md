@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.30.0] - 2026-08-24
+
+### 📝 Documentación
+- **Comportamiento de dos `.link` distintos declarando la misma colección contra la misma base** (GRAMMAR.md §3.36), pedido explícito en un reporte de adopción real ("no nos atrevimos a probarlo"). Verificado contra un PostgreSQL real, no solo razonado: columnas sin nombres en común conviven para lectura sin error, aunque un `INSERT` del segundo `.link` puede violar una constraint `NOT NULL` que dejó el primero sin que el segundo la conozca; un mismo nombre de columna con el mismo tipo convive sin problema; un mismo nombre con tipos DISTINTOS no se detecta al conectar (`ADD COLUMN IF NOT EXISTS` es no-op sobre una columna que ya existe) y falla recién en la primera lectura/escritura real, siempre con un error limpio del driver, nunca un panic.
+
+647 tests (2 nuevos). Detalle completo: GRAMMAR.md §3.36.
+
 ## [1.29.0] - 2026-08-24
 
 ### 🐛 Arreglado
