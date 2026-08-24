@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.75.0] - 2026-08-25
+
+### 📝 Documentado (existía sin documentar ni probar)
+- **`base64.encode(data: String) -> String` / `base64.decode(base64Str: String) -> String`.** Auditoría disparada por el pedido explícito del usuario de reducir fricción con terceros ("dar soporte a la mayor cantidad de proveedores posibles"): investigando Twilio (HTTP Basic Auth) apareció que estas dos funciones YA EXISTÍAN en el checker y el runtime -- pero en ningún lugar de GRAMMAR.md/README/`llms.txt`, y sin un solo test. Mismo patrón exacto que el incidente de la firma S3 falsa de MyFinance (v1.73.0): una capacidad real, invisible para quien la necesita. Esto solo ya destraba cualquier proveedor con HTTP Basic Auth combinado con `http.postWithHeaders`, sin escribir código nuevo del compilador.
+
+947 tests (4 nuevos): 2 de tipos en `checker.rs` + 2 en `runtime/mod.rs` contra vectores conocidos (`"hello"` <-> `"aGVsbG8="`, confirmados con el `base64` del sistema) más los casos de error (base64 mal formado, bytes decodificados no-UTF8). Detalle completo, más una auditoría de fricción con Stripe/SendGrid/Twilio/Azure Blob/GCS/SQS/RabbitMQ (cuáles YA funcionan hoy, cuáles necesitan trabajo nuevo): GRAMMAR.md §3.112, PLAN.md §9.10.
+
 ## [1.74.0] - 2026-08-24
 
 ### ✨ Nuevo

@@ -133,6 +133,7 @@
   - [3.109 `countWhere`/`findWhere` empujan una conjunción `&&` de varias hojas — RESUELTO, alcance acotado](#3109-countwherefindwhere-empujan-una-conjunción--de-varias-hojas--resuelto-alcance-acotado)
   - [3.110 `crypto.awsS3PresignedUrl(...)`: URLs firmadas reales para Amazon S3 — RESUELTO, alcance acotado](#3110-cryptoawss3presignedurl-urls-firmadas-reales-para-amazon-s3--resuelto-alcance-acotado)
   - [3.111 `response.redirect(url, permanent)`: redirects HTTP reales — RESUELTO](#3111-responseredirecturl-permanent-redirects-http-reales--resuelto)
+  - [3.112 `base64.encode`/`base64.decode` — YA EXISTÍA, sin documentar ni probar hasta ahora](#3112-base64encodebase64decode--ya-existía-sin-documentar-ni-probar-hasta-ahora)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4891,6 +4892,36 @@ rpc post(slug: String) -> String {
 **Alcance de esta ronda**: sin validación de la FORMA de `url` más allá de "no vacío, sin salto de línea" -- un valor que no sea una URL real (`"no es una url"`) se deja pasar tal cual, es responsabilidad de quien escribe el rpc. Sin soporte de redirects relativos resueltos contra la request actual (eso ya lo hace cualquier navegador con una URL relativa, no hace falta que c-script lo resuelva).
 
 **Verificado**: 3 tests de tipos en `checker.rs` (firma correcta, rechazado dentro de un `stream` con el mismo mensaje que `setStatus`, cantidad/tipos de argumento incorrectos) + 1 en `runtime/mod.rs` (URL vacía o con salto de línea rechazada antes de llegar a ningún header) + 1 end-to-end en `cli_content_type.rs` contra un servidor `linkc serve` REAL: `permanent: false` da 302 con el `Location` exacto pedido, `permanent: true` da 301, los dos leídos del socket crudo (headers HTTP reales, no solo un body que los mencione).
+
+---
+
+### 3.112 `base64.encode`/`base64.decode` — YA EXISTÍA, sin documentar ni probar hasta ahora
+
+Auditoría del 25/08/2026, disparada por el pedido explícito del usuario de reducir la fricción de integrar terceros ("debemos dar soporte a la mayor cantidad de proveedores posibles"): investigando qué hacía falta para Twilio (autenticación HTTP Basic, `Authorization: Basic base64(accountSid:authToken)`) apareció que `base64.encode(data: String) -> String`/`base64.decode(base64Str: String) -> String` (RFC 4648 estándar con padding, crate `base64`) **ya existían en el checker y en el runtime desde antes** -- pero en NINGÚN lugar de GRAMMAR.md, README, o `llms.txt`, y sin un solo test que fijara su comportamiento. Exactamente el mismo patrón que llevó al incidente de la firma S3 falsa de MyFinance (§3.110): una capacidad real, invisible para cualquiera (persona o agente de IA) que necesitara encontrarla, así que en la práctica era como si no existiera.
+
+```
+rpc callTwilio(accountSid: String, authToken: String, body: String) -> String {
+  let credentials = base64.encode(accountSid + ":" + authToken);
+  http.postWithHeaders(
+    "https://api.twilio.com/2010-04-01/Accounts/" + accountSid + "/Messages.json",
+    body,
+    [{ name: "Authorization", value: "Basic " + credentials }]
+  )
+}
+```
+
+**`base64.decode` devuelve `String`, no bytes crudos** (mismo límite deliberado de siempre -- GRAMMAR.md §2, "sin tipo Bytes"): si la secuencia decodificada no es UTF-8 válido, es un error de runtime limpio, no una `String` con bytes corruptos. Cubre el caso real de auth (decodificar/codificar texto -- credenciales, JSON, cualquier payload de texto) pero NO sirve para manipular datos binarios arbitrarios (una clave HMAC binaria, una imagen) -- ese es precisamente el límite que hace que Azure Blob SAS (ver la nota de auditoría más abajo) necesite algo más que esto.
+
+**Verificado**: 2 tests nuevos de tipos en `checker.rs` + 2 en `runtime/mod.rs` contra un vector conocido (`"hello"` <-> `"aGVsbG8="`, y el caso real `"ACxxxx:authtoken123"` <-> `"QUN4eHh4OmF1dGh0b2tlbjEyMw=="`, los dos confirmados con el `base64` del sistema, no inventados a mano) más los dos casos de error (base64 mal formado, base64 válido que decodifica a bytes no-UTF8).
+
+**Auditoría de fricción con otros proveedores (PLAN.md, "Integraciones bloqueadas")**, mismo pedido del usuario -- clasificación honesta de qué necesita trabajo nuevo del compilador y qué no:
+
+- **Stripe, SendGrid, y cualquier API con `Authorization: Bearer <token>`**: YA funcionan hoy completas, sin ningún cambio -- `http.postWithHeaders`/`http.getWithHeaders` (§3.47/§3.60) para la llamada, `env.get` + `crypto.hmacSha256` + `request.rawBody()`/`request.header()` (§3.38, que ya cita a Stripe como caso motivador) para verificar el webhook de vuelta. El gap nunca fue el lenguaje -- fue que nada lo decía con un ejemplo copiable.
+- **Twilio, y cualquier API con HTTP Basic Auth**: YA funciona hoy completa, gracias a `base64.encode` (recién documentado en esta sección) + `http.postWithHeaders`.
+- **Azure Blob SAS (URLs firmadas)**: gap REAL, mismo tipo que AWS S3 (§3.110) -- la firma es un solo HMAC-SHA256 (no encadenado como AWS), pero la clave de la cuenta de Azure viaja en BASE64 (hay que decodificarla a bytes crudos para usarla como clave) y la firma resultante se codifica en BASE64 (no hex, a diferencia de `crypto.hmacSha256`) -- ninguna de las dos cosas es posible con los primitivos de `String` actuales. Candidato concreto para una próxima ronda, verificable contra los ejemplos oficiales que publica Microsoft, sin necesitar una cuenta de Azure real (mismo criterio que AWS).
+- **Google Cloud Storage (URLs firmadas V4)**: gap más grande -- la firma es RSA-SHA256 sobre la clave privada de una cuenta de servicio (formato PEM/PKCS8), no HMAC. Necesitaría sumar una crate de firma RSA (excepción nueva a "cero dependencias", como `regex` en su momento) y parsear una clave privada real -- una decisión de alcance propia, no una extensión chica de lo que ya existe.
+- **SQS**: usa el MISMO AWS Signature V4 que S3 (§3.110) para autenticar, pero como llamadas de API firmadas (headers), no como URLs presignadas -- `awsS3PresignedUrl` no cubre este caso tal cual, haría falta generalizar la derivación de firma a un primitivo que no esté atado a "armar una URL de S3". Candidato para cuando aparezca evidencia real de demanda.
+- **RabbitMQ**: protocolo AMQP binario y con estado -- una categoría totalmente distinta a firmar requests HTTP, necesitaría implementar el protocolo de transporte entero. Bloqueado/diferido, misma categoría que otras integraciones de protocolo completo en PLAN.md §9.12.
 
 ---
 

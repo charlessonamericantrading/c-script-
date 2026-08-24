@@ -4064,6 +4064,56 @@ mod tests {
         assert!(invoke_rpc(&program, "Web", "go", &json!({"url": "/ok"}), &db).is_ok());
     }
 
+    // ---- `base64.encode`/`base64.decode` (GRAMMAR.md §3.112) ----
+
+    /// `base64.encode`/`base64.decode` ya EXISTÍAN en el runtime antes de
+    /// esta ronda (`checker.rs`/`runtime/mod.rs`, base64 estándar RFC 4648
+    /// con padding vía la crate `base64`) pero sin un solo test que fijara
+    /// su comportamiento -- esta es la primera prueba real de que la
+    /// implementación existente hace lo que dice. Vector conocido
+    /// (`"hello"` <-> `"aGVsbG8="`), no inventado a mano, mismo criterio
+    /// que `crypto.hmacSha256` verificado contra un vector de Python.
+    #[test]
+    fn base64_encode_and_decode_round_trip_a_known_vector() {
+        let program = program_from(
+            r#"
+            service Codec {
+                rpc enc(s: String) -> String { base64.encode(s) }
+                rpc dec(s: String) -> String { base64.decode(s) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "Codec", "enc", &json!({"s": "hello"}), &db).unwrap(), json!("aGVsbG8="));
+        assert_eq!(invoke_rpc(&program, "Codec", "dec", &json!({"s": "aGVsbG8="}), &db).unwrap(), json!("hello"));
+        // Caso real que motiva documentar esto: `Authorization: Basic
+        // base64(sid:token)`, el esquema de auth de Twilio y de cualquier
+        // API con HTTP Basic Auth -- ningún caso especial, la misma
+        // función de siempre sobre un string con ":" adentro.
+        assert_eq!(
+            invoke_rpc(&program, "Codec", "enc", &json!({"s": "ACxxxx:authtoken123"}), &db).unwrap(),
+            json!("QUN4eHh4OmF1dGh0b2tlbjEyMw==")
+        );
+    }
+
+    #[test]
+    fn base64_decode_rejects_malformed_input_and_non_utf8_output() {
+        let program = program_from(
+            r#"
+            service Codec {
+                rpc dec(s: String) -> String { base64.decode(s) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        // Ni base64 válido en absoluto (padding/alfabeto mal formado)...
+        invoke_rpc(&program, "Codec", "dec", &json!({"s": "no es base64!!"}), &db).expect_err("debería rechazarse");
+        // ...ni base64 válido que decodifica a bytes que NO son UTF-8 --
+        // `base64.decode` devuelve `String`, así que esto es un error
+        // limpio, no bytes corruptos silenciosos. 0xFF 0xFE no es UTF-8 válido.
+        invoke_rpc(&program, "Codec", "dec", &json!({"s": "//4="}), &db).expect_err("bytes no-UTF8 deberían rechazarse");
+    }
+
     // ---- `@validate(...)` (GRAMMAR.md §3.73) ----
 
     #[test]

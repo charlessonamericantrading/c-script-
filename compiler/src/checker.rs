@@ -5126,6 +5126,27 @@ type T = { id: Int, s: Status }")
     }
 
     #[test]
+    fn base64_encode_and_decode_take_a_string_and_return_a_string() {
+        let src = r#"
+            service Codec {
+                rpc enc(s: String) -> String { base64.encode(s) }
+                rpc dec(s: String) -> String { base64.decode(s) }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn base64_encode_rejects_a_non_string_argument() {
+        let src = r#"
+            service Codec {
+                rpc bad() -> String { base64.encode(1) }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
     fn stream_rpc_body_returning_list_of_wrong_element_type_is_rejected() {
         let src = r#"
             type User = { id: Int, name: String }
