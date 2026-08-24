@@ -119,6 +119,7 @@
   - [3.95 `countWhere` + `findWhere` empujados a SQL para `x.campo == valor` — RESUELTO](#395-countwhere--findwhere-empujados-a-sql-para-xcampo--valor--resuelto)
   - [3.96 `@check(...)`: constraints numéricos de nivel de base — RESUELTO](#396-check-constraints-numéricos-de-nivel-de-base--resuelto)
   - [3.97 `linkc migrate --dry-run` — RESUELTO](#397-linkc-migrate---dry-run--resuelto)
+  - [3.98 Lint `hardcoded-secret-literal` — RESUELTO](#398-lint-hardcoded-secret-literal--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4550,6 +4551,34 @@ linkc migrate backend.link --db postgres://user:pass@host/produccion --dry-run
 - **No calcula cuánto tardaría la migración real ni bloquea la tabla.** Puramente informativo -- el tamaño de la tabla real, el lock que un `ALTER TABLE` real tomaría, no son parte de este reporte.
 
 **Verificado**: `pg_integration.rs`, 2 tests contra un PostgreSQL real -- una colección nueva muestra el `CREATE TABLE` exacto (incluido un `@check` inline) y confirma que la tabla NO se creó de verdad después; una tabla existente a la que le falta una columna muestra el `ALTER TABLE ADD COLUMN` exacto y confirma que la columna NO se agregó de verdad después.
+
+---
+
+### 3.98 Lint `hardcoded-secret-literal` — RESUELTO
+
+PLAN.md §9.5.3: "que `linkc lint` avise si detecta una URL de conexión o API key literal en el código". Un `const NOMBRE: String = "..."` de nivel superior es el lugar más común y menos ambiguo donde alguien pega un secreto real por comodidad, sobre todo temprano en un proyecto -- sin ningún aviso hasta esta ronda.
+
+<!-- linkc:check -->
+```rust
+const DB_HOST: String = "postgres://internal-db.local/app";
+
+service S {
+  rpc noop() -> Int { 1 }
+}
+```
+
+**`linkc lint` marca `const NOMBRE: String = "literal"` en DOS casos, cada uno con su propio mensaje.** (1) El literal tiene la forma de una URL de conexión con CREDENCIALES embebidas (`esquema://usuario:contraseña@resto` -- `postgres://`/`postgresql://`/`mysql://`/`mongodb://`/`redis://`/`amqp://`, lista fija de esquemas conocidos, no un parser de URL genérico). Una URL SIN credenciales (como la del ejemplo de arriba, un hostname interno sin contraseña) no dispara -- lo que importa es la contraseña adentro, no el esquema en sí. (2) El NOMBRE del `const` sugiere un secreto (mismo heurístico laxo que `timing-unsafe-secret-comparison`, §3.88: substring de `secret`/`token`/`password`/`apikey`/`api_key`, sin distinguir mayúsculas) Y el valor es un literal no vacío.
+
+**El mensaje recomienda `env.get("...")` -- pero NUNCA como reemplazo directo del valor del `const`.** Un `const` en c-script solo admite un LITERAL (`check_const`, checker.rs: "el valor de un 'const' tiene que ser un literal... no una computación en runtime") -- `const DB_URL: String = env.get("LINK_DATABASE_URL");` es un error de compilación aparte, no una alternativa válida. El mensaje real dice explícito: no declarar esto como `const` en absoluto, leer el valor con `env.get("...")` en el momento que se necesita, adentro del `rpc`/`fn` que lo usa.
+
+**Solo `const` de nivel superior -- deliberadamente, no un `let` dentro de un `rpc`/`fn`/`test`.** Es el lugar más fácil de reconocer sin ambigüedad como "esto es configuración escrita a mano", a diferencia de un `let` armado dentro de la lógica de un rpc (podría ser un valor de prueba, un template, cualquier cosa) o un literal usado una sola vez en una llamada.
+
+**Límites honestos:**
+- **Nombres compuestos solo con "key" (sin "apikey"/"api_key" exactos) no se detectan por nombre** -- `STRIPE_KEY`/`SENDGRID_KEY` no disparan por nombre (aunque SÍ dispararían si el valor tiene forma de URL con credenciales). Mismo motivo que `timing-unsafe-secret-comparison` nunca incluyó "key" suelto: identificadores comunes y perfectamente inocentes (`sortKey`, `primaryKey`, `cacheKey`) lo harían disparar constantemente -- mejor un falso negativo ocasional que ruido constante sobre código bien escrito (mismo criterio que llevó a reformular el lint de "autorización de fachada", PLAN.md §9.5.4).
+- **Solo detecta la FORMA de una URL de conexión con credenciales, no un catálogo de shapes de API key reales** (`sk_live_`/`sk_test_` de Stripe, `AKIA` de AWS, etc.) -- ese catálogo quedaría desactualizado el día que un proveedor cambie su prefijo; el heurístico de nombre (2) es lo que cubre ese caso hoy, no un patrón de valor dedicado.
+- **Puramente informativo, como el resto del linter** -- `linkc lint` sigue saliendo con código 0 aunque encuentre esto. Solo corre con `linkc lint`, no con `linkc build` (mismo alcance que el resto de las reglas de este linter, que nunca se ejecutan automáticamente durante un build).
+
+**Verificado**: 6 tests en `lint.rs` -- una URL con credenciales embebidas se marca nombrando el `const` y recomendando `env.get`; la misma URL SIN credenciales no se marca; un nombre tipo secreto con un literal se marca; un nombre/valor ordinario no se marca; un literal vacío nunca se marca aunque el nombre sugiera un secreto; un valor NO literal (ej. una llamada a `env.get(...)`, que el checker rechazaría por otro motivo aparte) tampoco se marca -- el lint corre sobre el AST parseado, antes/aparte del checker.
 
 ---
 

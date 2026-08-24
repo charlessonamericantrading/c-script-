@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.62.0] - 2026-08-24
+
+### ✨ Nuevo
+- **Lint `hardcoded-secret-literal`.** PLAN.md §9.5.3: "que `linkc lint` avise si detecta una URL de conexión o API key literal en el código". Un `const NOMBRE: String = "..."` de nivel superior se marca en dos casos: el literal tiene forma de URL de conexión con credenciales embebidas (`postgres://usuario:contraseña@resto`, y equivalentes de `postgresql`/`mysql`/`mongodb`/`redis`/`amqp` -- una URL sin credenciales no dispara), o el NOMBRE del `const` sugiere un secreto (mismo heurístico laxo que `timing-unsafe-secret-comparison`, v1.53.0) con un valor no vacío. El mensaje recomienda `env.get("...")` -- pero como reemplazo del `const` en sí (no declararlo, leer el valor con `env.get` en el momento que se necesita, dentro del rpc/fn), nunca como el valor de un const: un `const` en c-script solo admite literales, `env.get(...)` ahí es un error de compilación aparte (`check_const`, checker.rs). Puramente informativo, como el resto del linter -- `linkc lint` sigue saliendo con código 0.
+
+887 tests (6 nuevos) en `lint.rs`. Detalle completo: GRAMMAR.md §3.98.
+
 ## [1.61.0] - 2026-08-24
 
 ### ✨ Nuevo
