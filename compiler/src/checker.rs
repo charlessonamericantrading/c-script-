@@ -890,6 +890,7 @@ impl Checker {
             "Timestamp" => Ok(Type::Timestamp),
             "Float" => Ok(Type::Float),
             "String" => Ok(Type::String),
+            "Uuid" => Ok(Type::Uuid),
             "Bool" => Ok(Type::Bool),
             "Void" => Ok(Type::Void),
             "Result" => {
@@ -982,7 +983,7 @@ impl Checker {
                         Ok(Type::Generic(name.to_string(), resolved_args))
                     }
                 } else {
-                    let mut candidates: Vec<&str> = vec!["Int", "Int64", "Timestamp", "Float", "String", "Bool", "Void", "Result", "Patch", "Map"];
+                    let mut candidates: Vec<&str> = vec!["Int", "Int64", "Timestamp", "Float", "String", "Uuid", "Bool", "Void", "Result", "Patch", "Map"];
                     candidates.extend(self.types.keys().map(String::as_str));
                     candidates.extend(self.enums.keys().map(String::as_str));
                     if let Some(sug) = find_best_suggestion(name, candidates) {
@@ -2780,7 +2781,16 @@ impl Checker {
                 self.expect_no_args(args, "toInt")?;
                 Some(Type::Int)
             }
-            (Type::Int, "toString") | (Type::Int64, "toString") | (Type::Float, "toString") | (Type::Bool, "toString") => {
+            (Type::Int, "toString")
+            | (Type::Int64, "toString")
+            | (Type::Float, "toString")
+            | (Type::Bool, "toString")
+            // `Uuid` -> `String`: la salida "downgrade" explícita para
+            // cualquier operación de String que un Uuid no tiene por sí
+            // mismo (concatenar, `.length()`, etc.) -- mismo criterio que
+            // `.toInt64()`/`.toInt()`, nunca mezcla implícita entre los dos
+            // tipos (GRAMMAR.md §3.70).
+            | (Type::Uuid, "toString") => {
                 self.expect_no_args(args, "toString")?;
                 Some(Type::String)
             }
@@ -2953,7 +2963,7 @@ impl Checker {
             }
             (Type::Crypto, "uuid") => {
                 self.expect_no_args(args, "uuid")?;
-                Some(Type::String)
+                Some(Type::Uuid)
             }
             (Type::Crypto, "randomInt") => {
                 let [min, max] = args else {
@@ -5093,6 +5103,53 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(src).is_err());
+    }
+
+    // ---- tipo nativo `Uuid` (GRAMMAR.md §3.70) ----
+
+    #[test]
+    fn uuid_resolves_as_a_type_name_and_typechecks_in_struct_fields_and_rpc_signatures() {
+        let src = r#"
+            type Session = { id: Int, token: Uuid }
+            service S {
+                rpc echo(u: Uuid) -> Uuid { u }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn crypto_uuid_returns_type_uuid_not_string() {
+        let src = r#"
+            fn f() -> Uuid { crypto.uuid() }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn uuid_is_not_implicitly_compatible_with_string() {
+        // Sin mezcla implicita, mismo criterio que Int64 vs Int -- un Uuid
+        // no es un String hasta que se llama .toString() explicitamente.
+        let src = r#"
+            fn bad() -> String { crypto.uuid() }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn uuid_concatenation_without_to_string_is_rejected() {
+        let src = r#"
+            fn bad(u: Uuid) -> String { "id: " + u }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn uuid_to_string_produces_a_real_string() {
+        let src = r#"
+            fn f(u: Uuid) -> String { u.toString() }
+        "#;
+        assert!(check_source(src).is_ok());
     }
 
     #[test]

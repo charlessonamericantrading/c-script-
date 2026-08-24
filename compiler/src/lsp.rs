@@ -775,6 +775,7 @@ fn get_hover_for_word(word: &str, source: &str, full_program: Option<&Program>) 
         "Timestamp" => Some("Builtin Type `Timestamp`\n\nUTC instant, serialized as a fixed-shape ISO-8601 string (`YYYY-MM-DDTHH:mm:ss.sssZ`) on the wire and typed as `string` in TS. Comparable (`< <= > >= == !=`) but no arithmetic; not constructible from source in v0 (arrives as an rpc param or from `db`)."),
         "Float" => Some("Builtin Type `Float`\n\n64-bit floating point number."),
         "String" => Some("Builtin Type `String`\n\nUTF-8 string."),
+        "Uuid" => Some("Builtin Type `Uuid`\n\nCanonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form, validated at the JSON boundary. Distinct from `String` so a malformed value can't slip through where the program expects one. Typed as `string` in TS (no branding); construct one with `crypto.uuid()`."),
         "Bool" => Some("Builtin Type `Bool`\n\nBoolean type (`true` or `false`)."),
         "Void" => Some("Builtin Type `Void`\n\nEmpty return type for RPCs."),
         "Result" => Some("Builtin Type `Result<T, E>`\n\nResult of an operation (`Result.Ok` or `Result.Err`)."),

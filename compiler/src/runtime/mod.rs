@@ -54,6 +54,13 @@ pub enum Value {
     Timestamp(i64),
     Float(f64),
     Str(String),
+    /// Forma canónica ya validada -- ver la doc de `Type::Uuid` (types.rs,
+    /// GRAMMAR.md §3.70) para por qué es una variante propia en vez de
+    /// reusar `Str`: sin esto, `call_method` no podría distinguir "esto es
+    /// un Uuid, `.toString()` tiene sentido" de "esto ya es un String
+    /// plano" una vez que la información de tipo ESTÁTICO ya no está
+    /// disponible en runtime.
+    Uuid(String),
     Bool(bool),
     Null,
     Struct(Vec<(String, Value)>),
@@ -123,6 +130,7 @@ impl PartialEq for Value {
             (Timestamp(a), Timestamp(b)) => a == b,
             (Float(a), Float(b)) => a == b,
             (Str(a), Str(b)) => a == b,
+            (Uuid(a), Uuid(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Null, Null) => true,
             (Struct(a), Struct(b)) => a == b,
@@ -161,6 +169,7 @@ impl std::fmt::Debug for Value {
             Value::Timestamp(n) => f.debug_tuple("Timestamp").field(n).finish(),
             Value::Float(n) => f.debug_tuple("Float").field(n).finish(),
             Value::Str(s) => f.debug_tuple("Str").field(s).finish(),
+            Value::Uuid(s) => f.debug_tuple("Uuid").field(s).finish(),
             Value::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Value::Null => write!(f, "Null"),
             Value::Struct(fields) => f.debug_tuple("Struct").field(fields).finish(),
@@ -436,7 +445,7 @@ pub(crate) fn eval_expr(
                     .map(|(_, v)| v)
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -882,6 +891,7 @@ fn value_matches_type(v: &Value, ty: &crate::types::Type, checker: &Checker) -> 
         Type::Timestamp => matches!(v, Value::Timestamp(_)),
         Type::Float => matches!(v, Value::Float(_)),
         Type::String => matches!(v, Value::Str(_)),
+        Type::Uuid => matches!(v, Value::Uuid(_)),
         Type::Bool => matches!(v, Value::Bool(_)),
         Type::Optional(inner) => matches!(v, Value::Null) || value_matches_type(v, inner, checker),
         Type::List(inner) => match v {
@@ -1266,6 +1276,10 @@ fn call_method(
             "toString" => Ok(Value::Str(b.to_string())),
             other => Err(err(format!("método desconocido sobre Bool: '{other}'"))),
         },
+        Value::Uuid(s) => match method {
+            "toString" => Ok(Value::Str(s)),
+            other => Err(err(format!("método desconocido sobre Uuid: '{other}' -- '.toString()' lo baja a String"))),
+        },
         Value::Str(s) => match method {
             // chars().count(), no .len(): .len() cuenta bytes UTF-8, no
             // caracteres -- "é" son 2 bytes pero 1 carácter.
@@ -1492,7 +1506,7 @@ fn call_method(
                     (b[8] & 0x3f) | 0x80, b[9],
                     b[10], b[11], b[12], b[13], b[14], b[15]
                 );
-                Ok(Value::Str(s))
+                Ok(Value::Uuid(s))
             }
             "randomInt" => {
                 let (min, max) = match (args.first(), args.get(1)) {
@@ -2082,6 +2096,31 @@ pub fn invoke_rpc_with_sessions(
 /// valor con campos de más es un subtipo válido); descartarlos es lo que
 /// garantiza que el `Value` resultante tenga EXACTAMENTE la forma
 /// declarada, que es lo que corta la clase de bug (3).
+/// `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` -- 36 caracteres, hex en las 32
+/// posiciones que no son guión, guiones exactamente en 8/13/18/23 (índices
+/// 0-based). Sin crate de regex nueva (`validators.ts` sí usa una regex real
+/// de TS -- acá, sin esa dependencia, un escaneo manual de byte es más
+/// simple que sumar `regex` solo para esto). No valida el nibble de
+/// versión/variante -- mismo criterio que `validators.ts`, acepta cualquier
+/// UUID RFC 4122 real, rechaza basura con la forma general equivocada.
+fn is_canonical_uuid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, &b) in bytes.iter().enumerate() {
+        let expected_dash = matches!(i, 8 | 13 | 18 | 23);
+        if expected_dash {
+            if b != b'-' {
+                return false;
+            }
+        } else if !b.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn json_to_typed_value(
     j: &serde_json::Value,
     ty: &crate::types::Type,
@@ -2117,6 +2156,16 @@ pub(crate) fn json_to_typed_value(
             .ok_or_else(mismatch),
         Type::Float => j.as_f64().map(Value::Float).ok_or_else(mismatch),
         Type::String => j.as_str().map(|s| Value::Str(s.to_string())).ok_or_else(mismatch),
+        // Forma canónica 8-4-4-4-12 en hex (GRAMMAR.md §3.70) -- acá es
+        // donde de verdad se hace cumplir; `crypto.uuid()` ya produce algo
+        // válido por construcción, así que este es el único punto de
+        // entrada real para un Uuid que puede estar mal formado (un cliente
+        // mandando cualquier string).
+        Type::Uuid => j
+            .as_str()
+            .filter(|s| is_canonical_uuid(s))
+            .map(|s| Value::Uuid(s.to_string()))
+            .ok_or_else(mismatch),
         Type::Bool => j.as_bool().map(Value::Bool).ok_or_else(mismatch),
         Type::Optional(inner) => {
             if j.is_null() {
@@ -2309,6 +2358,7 @@ fn describe_type(ty: &crate::types::Type) -> String {
         Type::Timestamp => "Timestamp".into(),
         Type::Float => "Float".into(),
         Type::String => "String".into(),
+        Type::Uuid => "Uuid".into(),
         Type::Bool => "Bool".into(),
         Type::Null | Type::Void => "null".into(),
         Type::Optional(inner) => format!("{}?", describe_type(inner)),
@@ -2437,6 +2487,9 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         Value::Timestamp(n) => json!(timestamp::format_iso8601_millis(*n)),
         Value::Float(n) => json!(n),
         Value::Str(s) => json!(s),
+        // Mismo texto plano que un String -- ver la nota simétrica en
+        // json_to_typed_value (que sí exige el formato al DECODIFICAR).
+        Value::Uuid(s) => json!(s),
         Value::Bool(b) => json!(b),
         Value::Null => serde_json::Value::Null,
         Value::Struct(fields) => {
@@ -3247,6 +3300,70 @@ mod tests {
         );
         let db = Db::seeded();
         assert_eq!(invoke_rpc(&program, "S", "callIt", &json!({}), &db).unwrap(), json!(false));
+    }
+
+    // ---- tipo nativo `Uuid` (GRAMMAR.md §3.70) ----
+
+    #[test]
+    fn a_malformed_uuid_over_the_wire_is_rejected_as_a_bad_request() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc echo(u: Uuid) -> Uuid { u }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        for bad in [
+            json!({"u": "not-a-uuid"}),
+            json!({"u": "550e8400-e29b-41d4-a716-44665544000"}),  // 35 caracteres, falta uno
+            json!({"u": "550e8400-e29b-41d4-a716-4466554400000"}), // 37 caracteres, uno de más
+            json!({"u": "550e8400e29b41d4a716446655440000"}),      // sin guiones
+            json!({"u": "zzzzzzzz-e29b-41d4-a716-446655440000"}),  // no hex
+            json!({"u": 12345}),                                    // número, no string
+            json!({"u": null}),
+        ] {
+            let e = invoke_rpc(&program, "S", "echo", &bad, &db).expect_err(&format!("echo({bad}) debería rechazarse"));
+            assert_eq!(e.kind, ErrorKind::BadRequest, "echo({bad}): {e}");
+        }
+    }
+
+    #[test]
+    fn a_well_formed_uuid_round_trips_through_the_wire_exactly() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc echo(u: Uuid) -> Uuid { u }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        // Mayúsculas incluidas: la validación es case-insensitive.
+        for good in ["550e8400-e29b-41d4-a716-446655440000", "550E8400-E29B-41D4-A716-446655440000"] {
+            assert_eq!(invoke_rpc(&program, "S", "echo", &json!({"u": good}), &db).unwrap(), json!(good));
+        }
+    }
+
+    #[test]
+    fn crypto_uuid_generates_a_real_uuid_that_round_trips_through_db_insert_and_find() {
+        let program = program_from(
+            r#"
+            type Session = { id: Int, token: Uuid }
+            type NewSession = { token: Uuid }
+            db { sessions: Session[] }
+            service S {
+                rpc create() -> Session { db.sessions.insert(NewSession { token: crypto.uuid() }) }
+                rpc get(id: Int) -> Session? { db.sessions.find(id) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "create", &json!({}), &db).unwrap();
+        let token = created["token"].as_str().expect("token generado por crypto.uuid()");
+        assert_eq!(token.len(), 36, "formato uuid: {token}");
+        let id = created["id"].as_i64().unwrap();
+        let fetched = invoke_rpc(&program, "S", "get", &json!({"id": id}), &db).unwrap();
+        assert_eq!(fetched["token"], json!(token), "el mismo uuid vuelve identico al leerlo de la base");
     }
 
     // ---- validación tipada del borde (auditoría) ----
@@ -4295,10 +4412,13 @@ mod tests {
             assert("<script>alert(1)</script>".escapeHtml() == "&lt;script&gt;alert(1)&lt;/script&gt;");
             assert("a & b \"quoted\" 'single'".escapeHtml() == "a &amp; b &quot;quoted&quot; &#39;single&#39;");
 
-            // UUID & Crypto
+            // UUID & Crypto -- crypto.uuid() devuelve Type::Uuid, no
+            // String (GRAMMAR.md §3.70): .toString() lo baja explícitamente
+            // para poder usar métodos de String sobre él.
             let u = crypto.uuid();
-            assert(u.length() == 36);
-            assert(u.contains("-"));
+            let uStr = u.toString();
+            assert(uStr.length() == 36);
+            assert(uStr.contains("-"));
 
             // JSON
             let json_str = json.stringify("hola json");
@@ -4412,7 +4532,7 @@ mod tests {
             let u1 = crypto.uuid();
             let u2 = crypto.uuid();
             assert(u1 != u2, "dos uuid consecutivos deben diferir");
-            assert(u1.length() == 36, "formato uuid");
+            assert(u1.toString().length() == 36, "formato uuid");
         }
         "#;
         let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();

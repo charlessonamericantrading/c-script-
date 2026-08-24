@@ -213,6 +213,7 @@ fn type_key(ty: &Type) -> String {
         Type::Timestamp => "Timestamp".into(),
         Type::Float => "Float".into(),
         Type::String => "String".into(),
+        Type::Uuid => "Uuid".into(),
         Type::Bool => "Bool".into(),
         Type::Void => "Void".into(),
         Type::Null => "Null".into(),
@@ -267,6 +268,14 @@ fn render_check(ty: &Type, expr: &str, worklist: &mut Vec<Type>, seen: &mut Vec<
         ),
         Type::Float => format!("typeof {expr} === \"number\""),
         Type::String => format!("typeof {expr} === \"string\""),
+        // Forma canónica 8-4-4-4-12 en hex (GRAMMAR.md §3.70) -- sin
+        // restringir el nibble de versión/variante: acepta UUIDs de
+        // cualquier RFC 4122 (v1/v4/v7/etc.), rechaza basura con la forma
+        // general equivocada. Case-insensitive: mayúsculas son válidas
+        // aunque `crypto.uuid()` siempre las emite en minúscula.
+        Type::Uuid => format!(
+            "(typeof {expr} === \"string\" && /^[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}$/.test({expr}))"
+        ),
         Type::Bool => format!("typeof {expr} === \"boolean\""),
         // Void nunca es un payload real (solo retorno de rpc, tabla de
         // mapeo GRAMMAR.md §4) -- no hay nada que validar.

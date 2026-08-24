@@ -22,6 +22,12 @@ pub fn link_to_postgres_type(ty: &Type, simple_enums: &HashSet<String>) -> &'sta
         Type::Int | Type::Int64 | Type::Timestamp => "BIGINT",
         Type::Float => "DOUBLE PRECISION",
         Type::String => "TEXT",
+        // TEXT, no el tipo nativo UUID de Postgres -- mismo criterio de
+        // "sin rama por backend" que el resto de este mapeo: SQLite no
+        // tiene un tipo UUID nativo, así que los dos backends usan TEXT
+        // (GRAMMAR.md §3.70). La validación de forma vive en el borde JSON,
+        // no en una constraint de columna.
+        Type::Uuid => "TEXT",
         Type::Bool => "BOOLEAN",
         Type::Enum(name) if simple_enums.contains(name) => "TEXT",
         // Todo tipo compuesto (structs, arrays, mapas, genéricos, uniones) se guarda en JSONB nativo

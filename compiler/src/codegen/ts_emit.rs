@@ -738,6 +738,12 @@ pub(crate) fn render_type(ty: &Type) -> String {
         // si aparece un caso real que lo pida.
         Type::Timestamp => "string".to_string(),
         Type::String => "string".to_string(),
+        // Sin brand nominal (`string & { __uuid: true }`) -- mismo criterio
+        // minimalista que Timestamp arriba: TypeScript no necesita distinguir
+        // un Uuid de un string cualquiera para que el contrato sea útil, la
+        // validación real (GRAMMAR.md §3.70) vive en validators.ts, no en el
+        // sistema de tipos de TS.
+        Type::Uuid => "string".to_string(),
         Type::Bool => "boolean".to_string(),
         Type::Void => "void".to_string(),
         Type::Null => "null".to_string(),
@@ -863,7 +869,7 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
                 collect_type_names(m, names);
             }
         }
-        Type::Int | Type::Int64 | Type::Timestamp | Type::Float | Type::String | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
+        Type::Int | Type::Int64 | Type::Timestamp | Type::Float | Type::String | Type::Uuid | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
         Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Env | Type::Request | Type::Smtp | Type::Response => {
             unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64 nunca aparece en un TypeExpr real")
         }

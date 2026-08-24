@@ -91,6 +91,7 @@
   - [3.67 `--adopt-existing`: adoptar tablas sin auto-migrar — RESUELTO](#367---adopt-existing-adoptar-tablas-sin-auto-migrar--resuelto)
   - [3.68 NULL en una columna requerida tras una migración de PostgreSQL: error limpio, no `null` silencioso — RESUELTO](#368-null-en-una-columna-requerida-tras-una-migración-de-postgresql-error-limpio-no-null-silencioso--resuelto)
   - [3.69 Narrowing real de `T?`: `match`, `??` y `.isSome()`/`.isNone()` — RESUELTO](#369-narrowing-real-de-t-match--y-issome-isnone--resuelto)
+  - [3.70 Tipo nativo `Uuid` — RESUELTO](#370-tipo-nativo-uuid--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3489,6 +3490,53 @@ test "narrowing real sobre T? funciona en los tres casos" {
 
 ---
 
+### 3.70 Tipo nativo `Uuid` — RESUELTO
+
+Hasta esta ronda, un identificador con forma de UUID era `String` -- nada impedía que `"hola"` llegara donde el programa esperaba un identificador real, y validar el formato quedaba en manos de cada `rpc`, a mano, cada vez.
+
+<!-- linkc:check -->
+```rust
+type Session = { id: Int, token: Uuid }
+type NewSession = { token: Uuid }
+
+db { sessions: Session[] }
+
+service Sessions {
+  rpc create() -> Session {
+    db.sessions.insert(NewSession { token: crypto.uuid() })
+  }
+  rpc get(id: Int) -> Session? {
+    db.sessions.find(id)
+  }
+}
+
+test "un uuid generado se guarda y se lee de vuelta identico" {
+  let s = Sessions.create();
+  assert(s.token.toString().length() == 36);
+  match Sessions.get(s.id) {
+    v: Session => assert(v.token == s.token, "el mismo uuid vuelve identico"),
+    null => panic("se esperaba encontrar la sesion"),
+  }
+}
+```
+
+**Forma validada, no solo un alias de `String`.** `Uuid` exige la forma canónica `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36 caracteres, hex en las 32 posiciones que no son guión) -- sin restringir el nibble de versión/variante, así que cualquier UUID RFC 4122 real (v1/v4/v7/...) es válido, pero basura con la forma equivocada no. La validación pasa en los TRES lugares que un valor puede cruzar una frontera de tipo: el runtime al decodificar JSON entrante (`json_to_typed_value`, un escaneo manual de bytes, sin sumar la crate `regex` solo para esto), `validators.ts` (la misma forma como regex de JS), y `schemas.ts`/Zod (`z.string().regex(...)`) -- las tres regex son literalmente la misma, para que las tres capas nunca puedan divergir sobre qué es válido. `openapi.json` usa el idiom estándar `"format": "uuid"` en vez de un pattern propio.
+
+**Tipo aparte de `String`, sin mezcla implícita -- mismo criterio que `Int64` vs `Int`.** `crypto.uuid()` devuelve `Uuid`, no `String`; `"prefijo-" + unUuid` es un error de compilación, igual que comparar un `Uuid` con un literal `String` sin desenvolverlo primero. `.toString()` es la conversión explícita (mismo patrón ya establecido para `Int`/`Int64`/`Float`/`Bool`, §3.55) -- después de eso, cualquier método de `String` (`.length()`, `.contains()`, etc.) funciona normal.
+
+**Runtime: variante propia (`Value::Uuid`), no reusa `Value::Str`.** La razón real, no solo prolijidad: una vez que un valor cruza al runtime, la información de tipo ESTÁTICO ya no está disponible -- `call_method` no podría distinguir "esto es un `Uuid`, `.toString()` tiene sentido" de "esto ya es un `String` plano" si los dos compartieran la misma representación. Mismo criterio exacto que ya justificaba una variante propia para `Type::Timestamp`/`Value::Timestamp` (§3.31): el borde serializa igual (ambos son un string plano en el wire), pero el runtime necesita distinguirlos.
+
+**Storage: `TEXT` en los dos backends, nunca envuelto en JSON.** Mismo criterio de "sin rama por backend" que el resto del lenguaje -- SQLite no tiene un tipo `UUID` nativo, así que Postgres tampoco lo usa, aunque podría. La validación de forma ya pasó en el borde JSON antes de que un `Value::Uuid` pueda siquiera llegar a la capa de storage, así que la columna física no necesita ningún constraint propio -- verificado con `sqlite3 archivo.db ".schema"` mostrando `"token" TEXT NOT NULL`, no una columna JSON.
+
+**Límites honestos:**
+- **Sin sintaxis de literal `Uuid`.** No hay forma de escribir un UUID directamente en el código fuente (`"..." as Uuid` no existe) -- un `Value::Uuid` solo nace de `crypto.uuid()` o de un wire decode que ya validó el formato. Para un valor fijo en un `test`, hay que recibirlo como parámetro o generarlo con `crypto.uuid()`.
+- **No valida versión/variante RFC 4122.** Un UUID "nil" (`00000000-0000-0000-0000-000000000000`) o cualquier otro con nibbles de versión/variante inválidos pasa la validación -- solo se exige la forma general 8-4-4-4-12 en hex, no conformidad estricta con el RFC.
+- **Sin tipo `Uuid` dedicado en WASM.** El codegen wasm nativo sigue siendo solo escalares (`Int`/`Int64`/`Bool`/`Float`) -- una función con un parámetro o retorno `Uuid` no compila a WASM, mismo límite que ya aplica a `String`.
+
+**Verificado**: 5 tests nuevos en `checker.rs` (resuelve como nombre de tipo en campos de struct y firmas de rpc, `crypto.uuid()` tipa `Uuid` no `String`, sin mezcla implícita con `String` ni en asignación ni en `+`, `.toString()` funciona) y 3 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (7 variantes de UUID malformado rechazadas con 400 -- forma corta, forma larga, sin guiones, caracteres no-hex, un número JSON, `null` -- todas nombrando el campo; un UUID válido, incluido en mayúsculas, viaja por el wire exacto; `crypto.uuid()` genera un UUID real que sobrevive un `insert`+`find` contra SQLite real, idéntico byte a byte). Verificado a mano contra un servidor HTTP real (`curl`) y contra el archivo SQLite generado (`sqlite3 ... ".schema"`) además de los tests automatizados.
+
+---
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
@@ -3500,6 +3548,7 @@ test "narrowing real sobre T? funciona en los tres casos" {
 | `assert`, `panic` | — | — | funciones builtin de aserción y control de tests en backend (§3.33) |
 | `test "nombre" { }` | — | — | bloques de test de comportamiento (§3.33), no cruzan a TS |
 | `String` | `string` | string | — |
+| `Uuid` | `string` | string, forma canónica validada | tipo aparte de `String`, sin mezcla implícita -- `.toString()` para convertir (§3.70). Construible con `crypto.uuid()` |
 | `Bool` | `boolean` | bool | — |
 | `Void` | `void` | `null` en el cuerpo | Solo válido como retorno COMPLETO de un `rpc` -- como campo o parámetro es un error del checker (§4.1) |
 | `T[]` | `T[]` | array | — |

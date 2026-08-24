@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-671-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.34.0-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.35.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,10 +36,11 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 671 pruebas automáticas:
+**Funciona hoy**, cubierto por 679 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
 - Narrowing real de `T?` dentro de un cuerpo de rpc: `match x { v: T => v.campo, null => ... }` liga `v` al `T` real (no `T?`) dentro de esa rama -- reusa la misma maquinaria de patrones exhaustivos que ya narrowaba uniones, así que faltar el caso `null` o el caso de valor es un error de compilación, no una sorpresa en runtime. `if x != null { x.campo }` sigue sin angostar -- eso queda deliberado -- pero `match` sí. `x ?? default` cubre el caso común "dame un default" (encadena de izquierda a derecha: `a ?? b ?? c`), y `x.isSome()`/`x.isNone()` cubren "solo necesito saber si hay valor", los dos sin necesitar un `match` completo
+- Tipo nativo `Uuid`: valida la forma canónica `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` en cada borde que un valor puede cruzar -- decodificar una request entrante, `validators.ts`, y el schema Zod generado, los tres con exactamente el mismo chequeo para que nunca puedan discrepar. Tipo aparte de `String`, sin mezcla implícita (misma regla que `Int64` vs `Int`) -- `crypto.uuid()` devuelve `Uuid`, y `.toString()` es la bajada explícita a un string plano
 - `linkc introspect <url-postgres>` genera un `.link` de partida (types + `db {...}`) desde el schema de una base PostgreSQL ya existente -- para adoptar un sistema con datos reales en vez de escribir cada campo a mano. Punto de partida para revisar, no listo para producción tal cual: cualquier columna que no pueda mapear con confianza (`jsonb`, `uuid`, un `timestamp`/`timestamptz` nativo) igual sale con un tipo válido (`String`) más una advertencia en stderr, nunca se omite en silencio. Solo PostgreSQL, sin generar ningún `service`
 - SQLite embebido con persistencia real entre reinicios y auto-migraciones no destructivas
 - Push en vivo sobre Server-Sent Events (`stream` + `db.<c>.subscribe()`)
@@ -259,7 +260,7 @@ wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_w
 
 ## 🧪 Pruebas y Control de Calidad
 
-El compilador y el runtime de Link están verificados por **671 pruebas automáticas** unitarias,
+El compilador y el runtime de Link están verificados por **679 pruebas automáticas** unitarias,
 de integración y de CLI, incluidas pruebas que levantan el binario real como subproceso, manejan
 un servidor HTTP real, y compilan cada ejemplo de c-script publicado en la documentación de este repo:
 

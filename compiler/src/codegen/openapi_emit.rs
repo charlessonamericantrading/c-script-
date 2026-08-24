@@ -13,6 +13,11 @@ fn type_to_json_schema(ty: &Type) -> Value {
         Type::Int64 => json!({ "type": "integer", "format": "int64" }),
         Type::Float => json!({ "type": "number", "format": "double" }),
         Type::String => json!({ "type": "string" }),
+        // "format": "uuid" es el idiom estándar de JSON Schema/OpenAPI para
+        // esto -- ningún `pattern` propio hace falta, a diferencia de
+        // validators.ts/schemas.ts (que sí necesitan su propia regex,
+        // GRAMMAR.md §3.70).
+        Type::Uuid => json!({ "type": "string", "format": "uuid" }),
         Type::Bool => json!({ "type": "boolean" }),
         Type::Void => json!({ "type": "null" }),
         Type::Timestamp => json!({ "type": "string", "format": "date-time" }),

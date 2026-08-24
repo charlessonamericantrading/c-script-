@@ -85,7 +85,7 @@ impl ColumnPlan {
             Type::Int | Type::Int64 | Type::Timestamp => ColumnKind::Int,
             Type::Float => ColumnKind::Float,
             Type::Bool => ColumnKind::Bool,
-            Type::String | Type::Enum(_) => ColumnKind::Text,
+            Type::String | Type::Uuid | Type::Enum(_) => ColumnKind::Text,
             other => unreachable!("tipo nativo inesperado en una columna no-JSON: {other:?}"),
         }
     }
@@ -111,6 +111,11 @@ fn native_sql_type(ty: &Type, simple_enums: &HashSet<String>) -> Option<&'static
         Type::Timestamp => Some("INTEGER"),
         Type::Float => Some("REAL"),
         Type::String => Some("TEXT"),
+        // Misma columna TEXT que String -- la validación de forma
+        // (GRAMMAR.md §3.70) ya pasó en el borde JSON antes de que un
+        // Value::Uuid pueda siquiera llegar acá, así que la columna física
+        // no necesita ningún constraint propio.
+        Type::Uuid => Some("TEXT"),
         Type::Bool => Some("INTEGER"),
         Type::Enum(name) if simple_enums.contains(name) => Some("TEXT"),
         _ => None,
@@ -1397,6 +1402,7 @@ db { users: User[] }
                 (Type::Timestamp, Cell::Int(n)) => Some(Value::Timestamp(*n)),
                 (Type::Float, Cell::Float(f)) => Some(Value::Float(*f)),
                 (Type::String, Cell::Text(t)) => Some(Value::Str(t.clone())),
+                (Type::Uuid, Cell::Text(t)) => Some(Value::Uuid(t.clone())),
                 (Type::Bool, Cell::Bool(b)) => Some(Value::Bool(*b)),
                 (Type::Enum(name), Cell::Text(variant)) => Some(Value::Variant {
                     enum_name: name.clone(),
@@ -1451,6 +1457,7 @@ db { users: User[] }
             Value::Timestamp(n) => Cell::Int(*n),
             Value::Float(f) => Cell::Float(*f),
             Value::Str(s) => Cell::Text(s.clone()),
+            Value::Uuid(s) => Cell::Text(s.clone()),
             Value::Bool(b) => Cell::Bool(*b),
             Value::Variant { variant, .. } => Cell::Text(variant.clone()),
             other => panic!("valor no representable en una columna nativa de SQL: {other:?}"),

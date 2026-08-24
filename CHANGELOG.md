@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.35.0] - 2026-08-24
+
+### ✨ Nuevo
+- **Tipo nativo `Uuid`.** Hasta esta ronda un identificador con forma de UUID era `String` -- nada impedía basura, y validar el formato quedaba a mano en cada `rpc`. `Uuid` exige la forma canónica `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (sin restringir el nibble de versión/variante -- cualquier RFC 4122 real vale) en los TRES bordes donde un valor puede cruzar: el runtime al decodificar JSON (`json_to_typed_value`, un escaneo manual de bytes, sin sumar la crate `regex`), `validators.ts`, y `schemas.ts`/Zod -- las tres regex son literalmente la misma, para que nunca puedan divergir. `openapi.json` usa el idiom estándar `"format": "uuid"`. Tipo aparte de `String`, sin mezcla implícita -- mismo criterio que `Int64` vs `Int`: `crypto.uuid()` ahora devuelve `Uuid`, no `String`; `"prefijo-" + unUuid` es un error de compilación; `.toString()` es la conversión explícita (después de eso, cualquier método de `String` funciona normal). Runtime: `Value::Uuid` como variante propia (no reusa `Value::Str`), mismo criterio que ya justificaba una variante propia para `Timestamp` -- el borde serializa igual, pero el runtime necesita distinguirlos para saber si `.toString()` tiene sentido. Storage: `TEXT` en los dos backends, nunca envuelto en JSON -- verificado con `sqlite3 ... ".schema"` mostrando la columna nativa, no un fallback JSON.
+
+679 tests (8 nuevos): 5 en `checker.rs` (resuelve como tipo, `crypto.uuid()` tipa `Uuid`, sin mezcla implícita con `String` ni en asignación ni en `+`, `.toString()` funciona) y 3 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (7 variantes de UUID malformado rechazadas con 400, un UUID válido -- incluido en mayúsculas -- viaja exacto por el wire, `crypto.uuid()` genera uno real que sobrevive un `insert`+`find` contra SQLite real). Verificado también a mano contra un servidor HTTP real (`curl`, malformado→400, válido→200) y contra el schema SQLite generado. Detalle completo: GRAMMAR.md §3.70.
+
 ## [1.34.0] - 2026-08-24
 
 ### ✨ Nuevo

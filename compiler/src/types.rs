@@ -23,6 +23,18 @@ pub enum Type {
     Timestamp,
     Float,
     String,
+    /// Formato canónico `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` (36
+    /// caracteres, hex + guiones en esas posiciones) validado al cruzar el
+    /// borde JSON -- nunca en construcción interna, porque no hay sintaxis
+    /// de literal `Uuid` (GRAMMAR.md §3.70): un `Value::Uuid` solo nace de
+    /// `crypto.uuid()` (ya válido por construcción) o de un wire decode que
+    /// ya pasó la validación. Tipo aparte de `String` -- no el mismo `String`
+    /// con una anotación -- por el mismo motivo que `Int64` es aparte de
+    /// `Int`: sin esto, cualquier `String` (incluida basura) se aceptaría
+    /// donde el programa pide un identificador con esta forma específica.
+    /// Se guarda como `TEXT`/`string` en los dos backends SQL y en TS --
+    /// mismo criterio de "sin rama por backend" que el resto del lenguaje.
+    Uuid,
     Bool,
     Void,
     /// El tipo del literal `null`. Solo es subtipo de `Optional(_)` — ver
@@ -143,6 +155,7 @@ impl std::fmt::Display for Type {
             Type::Timestamp => write!(f, "Timestamp"),
             Type::Float => write!(f, "Float"),
             Type::String => write!(f, "String"),
+            Type::Uuid => write!(f, "Uuid"),
             Type::Bool => write!(f, "Bool"),
             Type::Void => write!(f, "Void"),
             Type::Null => write!(f, "null"),

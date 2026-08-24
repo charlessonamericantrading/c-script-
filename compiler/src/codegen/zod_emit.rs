@@ -11,6 +11,14 @@ fn render_zod_type(ty: &Type) -> String {
         Type::Int64 => "z.union([z.number().int(), z.string(), z.bigint()])".to_string(),
         Type::Float => "z.number()".to_string(),
         Type::String => "z.string()".to_string(),
+        // Misma regex canónica que validators.ts (GRAMMAR.md §3.70) --
+        // Zod ya trae `.uuid()`, pero valida contra RFC 4122 estricto
+        // (exige el nibble de versión) y ninguna otra capa de este
+        // proyecto lo hace -- una regex propia mantiene el mismo criterio
+        // en los tres lugares (runtime, validators.ts, schemas.ts).
+        Type::Uuid => {
+            "z.string().regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/)".to_string()
+        }
         Type::Bool => "z.boolean()".to_string(),
         Type::Void => "z.void()".to_string(),
         Type::Timestamp => "z.string().datetime()".to_string(),
