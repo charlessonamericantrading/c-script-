@@ -144,21 +144,70 @@ pub struct Field {
     pub optional: bool, // el `?` ANTES de `:` (x?: T) — distinto de Optional(T) en TypeExpr
     pub ty: TypeExpr,
     pub name_span: Span,
-    /// `@deprecated("usa X en su lugar")` antes del campo, si hay (GRAMMAR.md
-    /// §3.71). A diferencia de `RpcDecl.annotations`, un campo solo admite
-    /// ESTA anotación -- no tiene sentido `@authenticated`/`@route`/etc.
-    /// sobre un campo de struct, así que en vez de reusar `Vec<Annotation>`
-    /// (que obligaría a validar en el checker qué variantes son válidas acá)
-    /// el parser directamente solo sabe parsear `@deprecated` en esta
-    /// posición y rechaza cualquier otro nombre ahí mismo (ver
-    /// `parse_field` en parser.rs).
-    pub deprecated: Option<String>,
+    /// `@deprecated(...)`/`@validate(...)` antes del campo, si hay
+    /// (GRAMMAR.md §3.71 y §3.73). A diferencia de `RpcDecl.annotations`, un
+    /// campo solo admite ESTAS dos -- no tiene sentido `@authenticated`/
+    /// `@route`/etc. sobre un campo de struct, así que en vez de reusar
+    /// `Vec<Annotation>` (que obligaría a validar en el checker qué
+    /// variantes son válidas acá) el parser directamente solo sabe parsear
+    /// `@deprecated`/`@validate` en esta posición y rechaza cualquier otro
+    /// nombre ahí mismo (ver `parse_field` en parser.rs).
+    pub annotations: Vec<FieldAnnotation>,
+}
+
+impl Field {
+    /// El motivo declarado con `@deprecated("...")`, si hay (GRAMMAR.md §3.71).
+    pub fn deprecated(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            FieldAnnotation::Deprecated(reason) => Some(reason.as_str()),
+            _ => None,
+        })
+    }
+
+    /// El validador declarado con `@validate(...)`, si hay (GRAMMAR.md §3.73).
+    /// A lo sumo uno por campo -- el parser ya lo exige (ver `parse_field`).
+    pub fn validator(&self) -> Option<&FieldValidator> {
+        self.annotations.iter().find_map(|a| match a {
+            FieldAnnotation::Validate(v) => Some(v),
+            _ => None,
+        })
+    }
 }
 
 impl PartialEq for Field {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name && self.optional == other.optional && self.ty == other.ty
     }
+}
+
+/// Anotaciones que un campo de `struct` admite -- deliberadamente un enum
+/// APARTE de `Annotation` (el de `RpcDecl`), no un subconjunto reusado: un
+/// campo nunca necesita `@authenticated`/`@route`/`@rate_limit`/etc., así
+/// que un enum propio, más chico, evita que el checker tenga que rechazar
+/// en runtime combinaciones que el parser ya podría haber descartado por
+/// forma (ver `parse_field` en parser.rs).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldAnnotation {
+    /// `@deprecated("usa X en su lugar")` -- ver GRAMMAR.md §3.71.
+    Deprecated(String),
+    /// `@validate(email)` o `@validate(regex, "...")` -- ver GRAMMAR.md §3.73.
+    Validate(FieldValidator),
+}
+
+/// Las dos formas de `@validate(...)` que un campo `String`/`String?` admite
+/// (GRAMMAR.md §3.73). Ampliable a futuro (`@validate(minLength, N)`, etc.)
+/// sin romper esta forma -- cada variante nueva es un nombre nuevo dentro
+/// del mismo paréntesis, no una anotación nueva.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValidator {
+    /// `@validate(email)` -- forma general de dirección de email (no RFC
+    /// 5322 completo, ver GRAMMAR.md §3.73 "Límites honestos").
+    Email,
+    /// `@validate(regex, "^[A-Z]{3}$")` -- el patrón tal cual, sin parsear
+    /// (el parser solo lo guarda como string; el checker lo compila con la
+    /// crate `regex` para dar el error de sintaxis en compilación, no en el
+    /// primer request real).
+    Regex(String),
 }
 
 #[derive(Debug, Clone)]

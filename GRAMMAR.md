@@ -94,6 +94,7 @@
   - [3.70 Tipo nativo `Uuid` — RESUELTO](#370-tipo-nativo-uuid--resuelto)
   - [3.71 `@deprecated("motivo")` en un campo o un rpc — RESUELTO](#371-deprecatedmotivo-en-un-campo-o-un-rpc--resuelto)
   - [3.72 Docstrings `///` propagados a OpenAPI y al `.d.ts` — RESUELTO](#372-docstrings--propagados-a-openapi-y-al-dts--resuelto)
+  - [3.73 `@validate(email)` / `@validate(regex, "...")` sobre un campo — RESUELTO](#373-validateemail--validateregex--sobre-un-campo--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3623,6 +3624,59 @@ test "un rpc documentado con /// sigue funcionando exactamente igual" {
 - **Una línea en blanco entre el `///` y el `rpc` NO rompe la asociación.** El texto capturado se pega al PRÓXIMO token real sin importar cuántas líneas en blanco (o comentarios `//`/`/* */` intercalados) haya en el medio -- así que un docstring separado por accidente de su rpc por una línea vacía igual se atribuye, cosa que puede sorprender si la intención era documentar otra cosa más abajo.
 
 **Verificado**: 4 tests en `lexer.rs` (`///` se saltea como trivia igual que `//` pero además queda en `leading_doc` del próximo token real, varias líneas consecutivas se unen con `\n`, `////` NO cuenta como docstring, una línea `///` vacía produce `Some("")` no `None`), 3 en `parser.rs` (se atribuye al rpc directamente arriba, sigue atribuyéndose cuando hay una `@annotation` en el medio, un rpc sin docstring tiene `doc: None`), 2 en `openapi_emit.rs` (se propaga como `description`, y junto con `@deprecated` las dos se combinan en un solo texto en vez de pisarse) y 3 en `ts_emit.rs` (bloque JSDoc multilínea antes del método, docstring + `@deprecated` en un solo bloque con `@deprecated` como tag final, un rpc sin ninguna de las dos cosas no gana ningún comentario).
+
+---
+
+### 3.73 `@validate(email)` / `@validate(regex, "...")` sobre un campo — RESUELTO
+
+Hasta esta ronda, "validación de más allá del tipo" (¿este `String` tiene forma de email? ¿matchea un patrón?) era responsabilidad de cada `rpc`, a mano, con el mismo riesgo de cada adoptante reimplementando (o directamente no implementando) el mismo chequeo. Cierra a la vez el ítem de "validadores declarativos por campo" de PLAN.md §9.2 y la petición de "validación de request body más allá del tipo" del lado HTTP (§9.4): son la misma cosa vista desde dos ángulos.
+
+<!-- linkc:check -->
+```rust
+type Signup = {
+  id: Int,
+  @validate(email) email: String,
+  @validate(regex, "^[A-Z]{3}-[0-9]{4}$") invoiceCode: String,
+}
+// La anotación va en LA DECLARACIÓN que de verdad se construye adentro del
+// rpc -- acá NewSignup, no solo Signup -- ver "Límites honestos" más abajo.
+type NewSignup = {
+  @validate(email) email: String,
+  @validate(regex, "^[A-Z]{3}-[0-9]{4}$") invoiceCode: String,
+}
+
+db { signups: Signup[] }
+
+service Signups {
+  rpc create(email: String, invoiceCode: String) -> Signup {
+    db.signups.insert(NewSignup { email: email, invoiceCode: invoiceCode })
+  }
+}
+
+test "un email y un codigo validos se aceptan; uno invalido se hubiera rechazado antes de llegar aca" {
+  let s = Signups.create("persona@ejemplo.com", "ABC-1234");
+  assert(s.email == "persona@ejemplo.com", "email valido pasa el validador");
+  assert(s.invoiceCode == "ABC-1234", "regex valido pasa el validador");
+}
+```
+
+**Dos formas, ambas sobre `String`/`String?` únicamente.** `@validate(email)` exige una forma general de dirección de email (ver "Límites honestos"); `@validate(regex, "patrón")` compila el patrón con la crate `regex` y exige que el valor completo matchee. A lo sumo UNA `@validate` por campo -- el parser la rechaza si aparece dos veces, mismo criterio que `@deprecated`. Sobre cualquier tipo que no sea `String`/`String?` (`Int`, `Bool`, un struct anidado) es un error de compilación, no un validador que simplemente nunca corre.
+
+**El patrón de `regex` se compila EN `linkc build`, no en el primer request real.** Un patrón roto (`"[unclosed"`) es un error de compilación citando el mensaje real de la crate `regex` -- nunca un 500 la primera vez que alguien manda datos.
+
+**Enforcement real en CUATRO lugares, no solo documentación.** (1) El servidor (`linkc serve`) rechaza con 400 cualquier valor que no pase el validador, en DOS puntos -- `json_to_typed_value` (un `rpc` que recibe el struct COMPLETO como parámetro, ej. `rpc update(s: Signup)`) y `Expr::StructLit` en el intérprete (un `rpc` que arma el struct DENTRO del cuerpo a partir de parámetros sueltos, ej. `rpc register(email: String) { ... NewSignup { email: email } ... }` -- el caso más común, y el que motivó agregar el segundo punto: probando contra un servidor real con `curl`, un email inválido pasaba de largo con 200 porque solo el primer punto existía todavía). Los dos resuelven la lista de `ast::Field` (con sus `@validate`) contra la declaración ORIGINAL por nombre -- `field_annotations_for` en runtime/mod.rs. (2) `openapi.json` usa las keywords ESTÁNDAR de JSON Schema `"format": "email"` / `"pattern": "..."`, sin extensión propia. (3) `schemas.ts` (Zod) encadena `.email()` / `.regex(new RegExp("..."))` -- `new RegExp(json_string)` en vez de un literal `/.../`, para no tener que escapar `/` dentro del patrón del usuario. (4) `contract.d.ts` lleva un comentario JSDoc informativo (`Formato: email` / `Formato: coincide con /patrón/`) -- sin tag JSDoc estándar propio para esto, así que texto libre en vez de inventar uno.
+
+**Única excepción de esta sesión a "cero dependencias nuevas".** UUID/SHA-256/ISO-8601 son formas FIJAS y acotadas (36 caracteres en posiciones fijas, por ejemplo) -- hand-rollables sin drama. Un patrón de `@validate(regex, "...")` es texto arbitrario del usuario: soportar solo un subconjunto de sintaxis regex a mano sería un espejismo de corrección (funciona hasta que alguien usa un lookahead o una clase de caracteres que el subconjunto no cubre, y ahí falla de forma confusa). La crate `regex` es puro Rust (compila también a `wasm32-unknown-unknown`, por eso NO está detrás del feature `runtime` como `rusqlite`/`postgres`), del mismo ecosistema que ya se confía para el resto del compilador.
+
+**Límites honestos:**
+- **`@validate` está atado a LA DECLARACIÓN donde se escribe, nunca a la forma estructural del campo.** El gotcha real, encontrado probando (no leyendo el código): el patrón "New\*" que el resto de este documento usa en TODOS LADOS para `insert` (`Omit<T, "id">`, ver §2.1) es un tipo APARTE de `Signup`, no un alias -- si `@validate(email)` está solo en `Signup.email` y `NewSignup.email` no lo repite, construir `NewSignup { email: "basura" }` no valida NADA, aunque `Signup.email` sí esté anotado. No es un bug: es la misma regla que ya rige `@deprecated` (§3.71) y toda anotación de campo -- atada a la declaración, nunca "hereda" entre dos tipos structuralmente parecidos. Pero es fácil pisarlo sin darse cuenta con este patrón específico, así que el ejemplo de arriba anota LAS DOS declaraciones a propósito.
+- **`@validate(email)` no es RFC 5322 completo.** Exige exactamente un `@`, local-part no vacío sin espacios, dominio con al menos un `.` y ningún segmento vacío -- rechaza formas exóticas pero técnicamente válidas (local-part entre comillas, IP literal entre corchetes) que casi ningún email real usa.
+- **`validators.ts` (las funciones `isX(x): x is X` hand-escritas) NO enforce `@validate` todavía.** Siguen verificando forma/tipo (incluida la regex fija de `Uuid`, GRAMMAR.md §3.70) pero no un `@validate` de usuario -- ese emisor trabaja sobre `types::FieldType` (estructural, sin anotaciones), no sobre la declaración `ast::Field` original, y conectar los dos ahí es más superficie de la que este ítem pedía. `openapi.json`, `schemas.ts` y el servidor real sí enforce completo.
+- **Una fila YA guardada en `db` antes de agregar `@validate` no se re-valida al LEERLA.** El enforcement es en CONSTRUCCIÓN (`Expr::StructLit`) y en el DECODE del wire -- una fila leída de SQLite/Postgres (`db.<c>.find`/`all`/etc.) nunca pasa por ninguno de los dos puntos, así que un valor viejo que ya no cumpliría el validador sigue leyéndose sin error. Mismo criterio que el resto del lenguaje: la validación de forma es de ENTRADA, no una invariante re-chequeada en cada lectura.
+- **La sintaxis de regex es la de la crate `regex` de Rust del lado servidor, y la nativa de JS del lado `schemas.ts`.** Las dos son PCRE-como pero no idénticas -- ninguna soporta backreferences; lookaround (`(?=...)`/`(?!...)`) existe en JS pero no en `regex` de Rust. Un patrón que use lookaround compila en `schemas.ts` pero falla en `linkc build` (la crate `regex` lo rechaza) -- se entera en compilación, no en producción, pero el mensaje de error no explica esta asimetría entre motores.
+- **Sin más formas de validador** (`minLength`, `min`/`max` numérico, `oneOf`) -- solo `email`/`regex`, ampliable a futuro sin romper la forma (`@validate(nombre, ...)` ya es el patrón).
+
+**Verificado**: 8 tests en `checker.rs`/`parser.rs` (tipa limpio con `email`/`regex`, sobre `String?`, sobre un campo de variante de enum; rechaza sobre `Int`, un patrón regex inválido, dos `@validate` en el mismo campo, y una forma desconocida como `@validate(minLength, 3)`), 5 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (email malformado rechazado con 400 en 6 formas distintas y uno válido aceptado, regex rechaza lo que no matchea y acepta lo que sí, un campo opcional ausente no dispara validación pero uno presente sí, **el caso del struct construido adentro del cuerpo del rpc a partir de parámetros sueltos -- el que reveló el gap de `Expr::StructLit` --**, y el límite documentado arriba de que un shape "New\*" sin la anotación repetida no valida nada), 2 en `ts_emit.rs` (comentario JSDoc informativo, combinado con `@deprecated` en un solo bloque), 1 en `openapi_emit.rs` (`format`/`pattern` estándar) y 3 en `zod_emit.rs` (`.email()`, `.regex(new RegExp(...))`, orden correcto ANTES de `.nullable()` sobre un campo opcional). Verificado también a mano contra un servidor HTTP real (`curl`): el bug de `Expr::StructLit` (200 en vez de 400 para un email inválido armado adentro del rpc) se reprodujo primero así, antes de escribir el test que lo fija.
 
 ---
 

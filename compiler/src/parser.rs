@@ -356,7 +356,7 @@ impl Parser {
     }
 
     fn parse_field(&mut self) -> Result<Field, ParseError> {
-        let deprecated = self.parse_optional_field_deprecated()?;
+        let annotations = self.parse_field_annotations()?;
         let name_span = self.span(); // cubre solo el identificador -- ver ast.rs::Field::name_span
         let name = self.eat_field_name()?;
         let optional = if self.check(&TokenKind::Question) {
@@ -367,37 +367,72 @@ impl Parser {
         };
         self.eat(&TokenKind::Colon)?;
         let ty = self.parse_type_expr()?;
-        Ok(Field { name, optional, ty, name_span, deprecated })
+        Ok(Field { name, optional, ty, name_span, annotations })
     }
 
-    /// `@deprecated("usa X en su lugar")` antes de un campo de struct
-    /// (GRAMMAR.md §3.71) -- ver ast.rs::Field::deprecated para por qué esto
-    /// NO reusa `parse_optional_annotation` (esa devuelve `Vec<Annotation>`
-    /// y acepta cualquier anotación de rpc, ninguna de las cuales tiene
-    /// sentido sobre un campo). El motivo se valida no-vacío ACÁ, en el
-    /// parser, en vez de en el checker como `@content_type`: a diferencia de
-    /// un rpc, hoy no existe ningún paso del checker que recorra campos de
-    /// struct uno por uno, y agregar uno solo para esto sería más gramática
-    /// nueva de la que el ítem pide -- el string ya está disponible acá,
-    /// sin ninguna dependencia de resolución de tipos.
-    fn parse_optional_field_deprecated(&mut self) -> Result<Option<String>, ParseError> {
-        if !self.check(&TokenKind::At) {
-            return Ok(None);
+    /// `@deprecated("...")`/`@validate(...)` antes de un campo de struct
+    /// (GRAMMAR.md §3.71 y §3.73) -- ver ast.rs::Field::annotations para por
+    /// qué esto NO reusa `parse_optional_annotation` (esa devuelve
+    /// `Vec<Annotation>` y acepta cualquier anotación de rpc, ninguna de las
+    /// cuales tiene sentido sobre un campo). A lo sumo UNA de cada -- una
+    /// segunda `@deprecated` o `@validate` sobre el mismo campo es un error
+    /// acá mismo, mismo criterio que `@content_type`/`@route` en un rpc
+    /// (`check_annotation_combination`), salvo que acá no hace falta el
+    /// checker: es una cuenta puramente sintáctica. La FORMA del regex de
+    /// `@validate(regex, "...")` se valida en el checker (`check_field_validators`),
+    /// no acá -- necesita la crate `regex`, que el parser no depende de.
+    fn parse_field_annotations(&mut self) -> Result<Vec<FieldAnnotation>, ParseError> {
+        let mut annotations = Vec::new();
+        let mut seen_deprecated = false;
+        let mut seen_validate = false;
+        while self.check(&TokenKind::At) {
+            self.advance();
+            let name = self.eat_ident()?;
+            match name.as_str() {
+                "deprecated" => {
+                    if seen_deprecated {
+                        return Err(self.error("'@deprecated' repetido sobre el mismo campo: un campo tiene un solo motivo de baja".to_string()));
+                    }
+                    seen_deprecated = true;
+                    self.eat(&TokenKind::LParen)?;
+                    let reason = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    if reason.trim().is_empty() {
+                        return Err(self.error("`@deprecated(\"\")` sobre un campo: el motivo no puede estar vacío".to_string()));
+                    }
+                    annotations.push(FieldAnnotation::Deprecated(reason));
+                }
+                "validate" => {
+                    if seen_validate {
+                        return Err(self.error("'@validate' repetido sobre el mismo campo: un campo tiene un solo validador".to_string()));
+                    }
+                    seen_validate = true;
+                    self.eat(&TokenKind::LParen)?;
+                    let kind = self.eat_ident()?;
+                    let validator = match kind.as_str() {
+                        "email" => FieldValidator::Email,
+                        "regex" => {
+                            self.eat(&TokenKind::Comma)?;
+                            let pattern = self.eat_string()?;
+                            FieldValidator::Regex(pattern)
+                        }
+                        other => {
+                            return Err(self.error(format!(
+                                "'@validate({other}, ...)' desconocido (se esperaba '@validate(email)' o '@validate(regex, \"patrón\")')"
+                            )))
+                        }
+                    };
+                    self.eat(&TokenKind::RParen)?;
+                    annotations.push(FieldAnnotation::Validate(validator));
+                }
+                other => {
+                    return Err(self.error(format!(
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")' o '@validate(...)')"
+                    )))
+                }
+            }
         }
-        self.advance();
-        let name = self.eat_ident()?;
-        if name != "deprecated" {
-            return Err(self.error(format!(
-                "anotación desconocida '@{name}' sobre un campo (solo se admite '@deprecated(\"motivo\")')"
-            )));
-        }
-        self.eat(&TokenKind::LParen)?;
-        let reason = self.eat_string()?;
-        self.eat(&TokenKind::RParen)?;
-        if reason.trim().is_empty() {
-            return Err(self.error("`@deprecated(\"\")` sobre un campo: el motivo no puede estar vacío".to_string()));
-        }
-        Ok(Some(reason))
+        Ok(annotations)
     }
 
     fn parse_const_decl(&mut self) -> Result<ConstDecl, ParseError> {

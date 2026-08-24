@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.37.0"
+version = "1.38.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -41,6 +41,15 @@ tiny_http = { version = "0.12", optional = true }
 serde_json = "1"
 serde = { version = "1.0", features = ["derive"] }
 wasm-encoder = "0.200"
+# Única excepción a "cero dependencias nuevas" del proyecto (ver GRAMMAR.md
+# §3.73): a diferencia de UUID/SHA-256/ISO-8601 (formas FIJAS y acotadas,
+# triviales de escanear a mano -- ver `is_canonical_uuid` en runtime/mod.rs),
+# un patrón de `@validate(regex, "...")` es TEXTO ARBITRARIO DEL USUARIO --
+# soportar solo un subconjunto de regex a mano sería un espejismo de
+# corrección, no una alternativa razonable. Pura Rust (sin dependencias C),
+# compila también a wasm32-unknown-unknown -- por eso NO está detrás del
+# feature `runtime` como rusqlite/postgres/etc.
+regex = "1"
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 sha2 = "0.10"
 ureq = { version = "2.9", default-features = false, optional = true }

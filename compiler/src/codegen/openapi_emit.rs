@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use serde_json::{json, Value};
-use crate::ast::{Item, Member, Program, TypeExpr};
+use crate::ast::{FieldValidator, Item, Member, Program, TypeExpr};
 use crate::checker::Checker;
 use crate::types::Type;
 
@@ -110,10 +110,29 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
                         // "deprecated" es una keyword estándar de JSON Schema
                         // 2020-12 (la que usa OpenAPI 3.1), así que no hace
                         // falta ninguna extensión propietaria.
-                        if let Some(reason) = &f.deprecated {
+                        if let Some(reason) = f.deprecated() {
                             if let Some(obj) = schema.as_object_mut() {
                                 obj.insert("deprecated".to_string(), json!(true));
                                 obj.insert("description".to_string(), json!(reason));
+                            }
+                        }
+                        // `@validate(...)` sobre un campo (GRAMMAR.md §3.73)
+                        // -- "format"/"pattern" son también keywords
+                        // estándar de JSON Schema, no una extensión propia.
+                        // Solo se aplica al campo directo, no dentro de
+                        // `Optional` -- `type_to_json_schema` ya envuelve un
+                        // `String?` en `anyOf` (ver arriba), donde no hay un
+                        // único objeto de propiedades sobre el que escribir.
+                        if let Some(v) = f.validator() {
+                            if let Some(obj) = schema.as_object_mut() {
+                                match v {
+                                    FieldValidator::Email => {
+                                        obj.insert("format".to_string(), json!("email"));
+                                    }
+                                    FieldValidator::Regex(pattern) => {
+                                        obj.insert("pattern".to_string(), json!(pattern));
+                                    }
+                                }
                             }
                         }
                         props[f.name.as_str()] = schema;
@@ -360,5 +379,27 @@ mod tests {
         assert!(desc.contains("Lista todas las tareas."), "{desc}");
         assert!(desc.contains("Deprecated: usa listV2"), "{desc}");
         assert_eq!(spec["paths"]["/Tasks/list"]["post"]["deprecated"], true);
+    }
+
+    /// `@validate(email)`/`@validate(regex, "...")` (GRAMMAR.md §3.73) se
+    /// propagan como las keywords estándar de JSON Schema "format"/"pattern"
+    /// -- sin extensión propietaria.
+    #[test]
+    fn validate_email_and_regex_set_standard_json_schema_keywords() {
+        let code = r#"
+            type Signup = {
+                @validate(email) email: String,
+                @validate(regex, "^[A-Z]{3}$") code: String,
+            }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        let props = &spec["components"]["schemas"]["Signup"]["properties"];
+        assert_eq!(props["email"]["format"], "email");
+        assert_eq!(props["code"]["pattern"], "^[A-Z]{3}$");
+        assert!(props["email"]["pattern"].is_null());
     }
 }

@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.37.0-blue.svg" alt="Version" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.38.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 702 automated tests:
+**Works today**, covered by 721 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `@validate(email)` / `@validate(regex, "...")` on a `String`/`String?` field, enforced for real in four places — the actual server (400 on a bad value, checked both when an rpc receives the whole struct as a param and when it's built inline from loose params inside the body — a real `curl` test against a running server is what caught that second path was missing at first), `openapi.json` (`format`/`pattern`, standard JSON Schema keywords), `schemas.ts`/Zod (`.email()` / `.regex(new RegExp(...))`, correctly chained before `.nullable()` on an optional field), and an informative JSDoc comment in `contract.d.ts`. A malformed regex pattern is a compile error, never a first-request surprise. The one real gotcha: `@validate` is tied to the exact declaration it's written on — the "New*" (`Omit<T,"id">`) shape used everywhere for `insert` is a separate type, so the annotation has to be repeated there too. `validators.ts`'s hand-written `isX()` type guards don't enforce it yet — everything else does
 - `///` docstrings on an rpc/stream, propagated as `description` in the generated `openapi.json` and as a multi-line JSDoc block in `contract.d.ts` — purely additive: `///` was already valid anywhere (same trivia as `//`), so no existing program stops compiling; the parser only reads the captured text right above a `rpc`/`stream` (through an `@annotation` in between, if any). Combines with `@deprecated` on the same rpc into one field/block instead of one overwriting the other
 - `@deprecated("usa X en su lugar")` on a struct field or an rpc/stream — purely informational, no effect on runtime or on structural subtyping (a struct is still the same type whether or not a field carries it). Propagated as a JSDoc `/** @deprecated ... */` comment right above the field/method in the generated `contract.d.ts`, and as native `deprecated: true` + `description` (Operation Object / JSON Schema 2020-12 keywords, no proprietary `x-*` extension) in `openapi.json`. On a field it's the ONLY annotation accepted there — any other name (`@authenticated`, etc.) is a syntax error at that position, not silently ignored
 - Real narrowing of `T?` inside an rpc body: `match x { v: T => v.field, null => ... }` binds `v` to the real `T` (not `T?`) in that branch — reuses the same exhaustive pattern-matching machinery already used for union narrowing, so a missing `null` or a missing value arm is a compile error, not a runtime surprise. `if x != null { x.field }` still doesn't narrow — that stays deliberate — but `match` does. `x ?? default` covers the common "give me a default" case (chains left-to-right: `a ?? b ?? c`), and `x.isSome()`/`x.isNone()` cover "just need to know if there's a value," both without needing a full `match`

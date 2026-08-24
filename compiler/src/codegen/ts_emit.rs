@@ -643,6 +643,35 @@ fn push_rpc_jsdoc(out: &mut String, doc: Option<&str>, deprecated: Option<&str>)
     }
 }
 
+/// Emite (o no) el bloque JSDoc de un campo: `@deprecated` (§3.71) y/o
+/// `@validate` (§3.73), indentado 2 espacios. Mismo criterio que
+/// `push_rpc_jsdoc`: un solo bloque combinado, nunca dos comentarios
+/// separados, y nada si el campo no lleva ninguna de las dos anotaciones.
+/// `@validate` no tiene un tag JSDoc estándar -- se documenta como texto
+/// libre ("Formato: ...") en vez de inventar uno propio que ningún editor
+/// vaya a reconocer especialmente.
+fn push_field_jsdoc(out: &mut String, deprecated: Option<&str>, validator: Option<&FieldValidator>) {
+    let format_line = validator.map(|v| match v {
+        FieldValidator::Email => "Formato: email".to_string(),
+        FieldValidator::Regex(pattern) => format!("Formato: coincide con /{}/", jsdoc_escape(pattern)),
+    });
+    match (format_line, deprecated) {
+        (None, None) => {}
+        (Some(f), None) => {
+            out.push_str(&format!("  /** {f} */\n"));
+        }
+        (None, Some(reason)) => {
+            out.push_str(&format!("  /** @deprecated {} */\n", jsdoc_escape(reason)));
+        }
+        (Some(f), Some(reason)) => {
+            out.push_str("  /**\n");
+            out.push_str(&format!("   * {f}\n"));
+            out.push_str(&format!("   * @deprecated {}\n", jsdoc_escape(reason)));
+            out.push_str("   */\n");
+        }
+    }
+}
+
 /// Un motivo de `@deprecated` es texto libre de usuario -- si contuviera
 /// literalmente `*/` cerraría el comentario JSDoc antes de tiempo y
 /// corrompería el `.d.ts` generado. `*<wbr>/` con un espacio no es válido
@@ -659,9 +688,7 @@ fn emit_type_decl(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(
             out.push_str(&format!("export interface {}{} {{\n", t.name, generics));
             for f in fields {
                 let ty = resolve_field_ty(checker, &f.ty, &t.type_params)?;
-                if let Some(reason) = &f.deprecated {
-                    out.push_str(&format!("  /** @deprecated {} */\n", jsdoc_escape(reason)));
-                }
+                push_field_jsdoc(out, f.deprecated(), f.validator());
                 out.push_str(&format!(
                     "  {}{}: {};\n",
                     f.name,
@@ -1379,5 +1406,32 @@ mod tests {
         let (contract, _) = emit_both(src);
         assert!(!contract.contains("/**"), "{contract}");
         assert!(!contract.contains("/*"), "{contract}");
+    }
+
+    /// `@validate(email)`/`@validate(regex, "...")` sobre un campo (GRAMMAR.md
+    /// §3.73) se propagan como comentario informativo -- sin tag JSDoc
+    /// estándar propio, texto libre "Formato: ...".
+    #[test]
+    fn validate_email_and_regex_get_an_informative_jsdoc_comment() {
+        let src = r#"
+            type Signup = {
+                @validate(email) email: String,
+                @validate(regex, "^[A-Z]{3}$") code: String,
+            }
+        "#;
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("/** Formato: email */\n  email:"), "{contract}");
+        assert!(contract.contains("/** Formato: coincide con /^[A-Z]{3}$/ */\n  code:"), "{contract}");
+    }
+
+    /// `@validate` Y `@deprecated` juntos combinan en un solo bloque JSDoc.
+    #[test]
+    fn validate_and_deprecated_on_the_same_field_combine_into_one_block() {
+        let src = r#"type Signup = { @validate(email) @deprecated("usa emailV2") email: String }"#;
+        let (contract, _) = emit_both(src);
+        assert!(
+            contract.contains("  /**\n   * Formato: email\n   * @deprecated usa emailV2\n   */\n  email:"),
+            "{contract}"
+        );
     }
 }

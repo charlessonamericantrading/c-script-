@@ -559,6 +559,12 @@ pub(crate) fn eval_expr(
                 .iter()
                 .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, checker, sessions, current_token, step_budget)?)))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
+            // `@validate(...)` (GRAMMAR.md §3.73): acá, no solo en el
+            // decode del wire -- ver `apply_field_validators` para por qué
+            // este es el punto que de verdad cubre el caso común.
+            if let Some(ast_fields) = field_annotations_for(checker, name, variant.as_deref()) {
+                apply_field_validators(ast_fields, &Value::Struct(evaluated.clone()), name)?;
+            }
             match variant {
                 Some(v) => {
                     Ok(Value::Variant { enum_name: name.clone(), variant: v.clone(), fields: evaluated })
@@ -2215,7 +2221,23 @@ pub(crate) fn json_to_typed_value(
             }
             Ok(Value::Struct(entries))
         }
-        Type::Struct { fields, .. } => struct_from_json(j, fields, checker, path, &mismatch),
+        Type::Struct { fields, name } => {
+            let v = struct_from_json(j, fields, checker, path, &mismatch)?;
+            // `@validate(...)` (GRAMMAR.md §3.73): `Type::Struct` es
+            // ESTRUCTURAL (fields, sin anotaciones) -- `name` (solo para
+            // mensajes de error en el resto del checker, ver types.rs) es
+            // el único hilo que queda hasta la declaración `ast::Field`
+            // ORIGINAL, que sí carga `@validate`. Sin `name` (struct
+            // anónimo inline) no hay ninguna declaración a la que
+            // atribuirle un validador, así que simplemente no hay nada que
+            // aplicar -- no es un caso de error.
+            if let Some(n) = name {
+                if let Some(ast_fields) = field_annotations_for(checker, n, None) {
+                    apply_field_validators(ast_fields, &v, path)?;
+                }
+            }
+            Ok(v)
+        }
         Type::Generic(name, args) => {
             if let Ok(fields) = checker.expand_generic_struct(name, args) {
                 return struct_from_json(j, &fields, checker, path, &mismatch);
@@ -2257,6 +2279,91 @@ pub(crate) fn json_to_typed_value(
         ))),
         other => Err(bad_req(format!("'{path}': tipo no soportado en el wire: {other:?}"))),
     }
+}
+
+/// Los campos `ast::Field` (con sus `@validate`) de la declaración `name`,
+/// si hay -- struct (`type name = {...}`) cuando `variant` es `None`,
+/// campos de esa variante puntual cuando `variant` es `Some` (GRAMMAR.md
+/// §3.73). `None` cuando `name` no resuelve a nada con esa forma -- mismo
+/// motivo en los dos casos: nada a lo que atribuirle un validador.
+fn field_annotations_for<'a>(checker: &'a Checker, name: &str, variant: Option<&str>) -> Option<&'a Vec<Field>> {
+    match variant {
+        None => {
+            let decl = checker.types.get(name)?;
+            match &decl.ty {
+                TypeExpr::Struct(fields) => Some(fields),
+                _ => None,
+            }
+        }
+        Some(v) => {
+            let decl = checker.enums.get(name)?;
+            decl.variants.iter().find(|variant| variant.name == v)?.fields.as_ref()
+        }
+    }
+}
+
+/// Aplica `@validate(...)` (GRAMMAR.md §3.73) sobre los campos de `value`
+/// (ya decodificado) contra la lista de `ast::Field` de la declaración
+/// ORIGINAL -- el único lugar donde `@validate` vive, nunca en
+/// `types::FieldType` (estructural, sin anotaciones). Se llama desde DOS
+/// puntos: al decodificar el wire (`json_to_typed_value`, un `rpc` recibe
+/// el struct COMPLETO como parámetro) y al CONSTRUIR un literal en el
+/// intérprete (`Expr::StructLit`, el caso más común -- un `rpc` arma
+/// `NewX { campo: valorEscalar }` adentro del cuerpo a partir de parámetros
+/// sueltos, que nunca pasan por `json_to_typed_value` como struct). Sin el
+/// segundo punto, `@validate` solo protegería el caso menos común (un rpc
+/// que recibe el struct entero como parámetro) y dejaría pasar el más
+/// típico sin avisar -- encontrado probando el servidor real, no leyendo
+/// el código.
+fn apply_field_validators(ast_fields: &[Field], value: &Value, path: &str) -> Result<(), RuntimeError> {
+    let Value::Struct(entries) = value else { return Ok(()) };
+    for af in ast_fields {
+        let Some(validator) = af.validator() else { continue };
+        // Ausente (campo opcional que no vino) o presente pero `Null`: nada
+        // que validar -- `@validate` no vuelve requerido un campo opcional.
+        let Some((_, v)) = entries.iter().find(|(n, _)| n == &af.name) else { continue };
+        let Value::Str(s) = v else { continue };
+        match validator {
+            FieldValidator::Email => {
+                if !is_plausible_email(s) {
+                    return Err(bad_req(format!(
+                        "'{path}.{}': '{s}' no es un email válido (@validate(email))",
+                        af.name
+                    )));
+                }
+            }
+            FieldValidator::Regex(pattern) => {
+                // El patrón ya se validó en `linkc build`
+                // (checker::check_field_validators) -- si llegó hasta acá,
+                // compilar de nuevo no puede fallar.
+                let re = regex::Regex::new(pattern).expect("patrón de @validate ya validado en compilación");
+                if !re.is_match(s) {
+                    return Err(bad_req(format!(
+                        "'{path}.{}': '{s}' no matchea @validate(regex, \"{pattern}\")",
+                        af.name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Forma general de un email (GRAMMAR.md §3.73 "Límites honestos") -- NO
+/// RFC 5322 completo (eso admite formas raras -- local-part entre comillas,
+/// IP literal entre corchetes -- que casi ningún email real usa, y que
+/// complicarían mucho esta función sin beneficio real). Exige: exactamente
+/// un '@', local-part no vacío y sin espacios, dominio con al menos un '.'
+/// y ningún segmento (separado por '.') vacío.
+fn is_plausible_email(s: &str) -> bool {
+    let Some((local, domain)) = s.split_once('@') else { return false };
+    if local.is_empty() || local.contains(char::is_whitespace) {
+        return false;
+    }
+    if domain.contains('@') || domain.contains(char::is_whitespace) || !domain.contains('.') {
+        return false;
+    }
+    domain.split('.').all(|seg| !seg.is_empty())
 }
 
 fn struct_from_json(
@@ -3364,6 +3471,130 @@ mod tests {
         let id = created["id"].as_i64().unwrap();
         let fetched = invoke_rpc(&program, "S", "get", &json!({"id": id}), &db).unwrap();
         assert_eq!(fetched["token"], json!(token), "el mismo uuid vuelve identico al leerlo de la base");
+    }
+
+    // ---- `@validate(...)` (GRAMMAR.md §3.73) ----
+
+    #[test]
+    fn validate_email_rejects_a_malformed_address_and_accepts_a_real_one() {
+        let program = program_from(
+            r#"
+            type Signup = { @validate(email) email: String }
+            service S {
+                rpc register(s: Signup) -> String { s.email }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        for bad in ["not-an-email", "no-at-sign.com", "@no-local-part.com", "trailing-dot@x.", "spa ces@x.com", "two@@x.com"] {
+            let e = invoke_rpc(&program, "S", "register", &json!({"s": {"email": bad}}), &db)
+                .expect_err(&format!("'{bad}' debería rechazarse"));
+            assert_eq!(e.kind, ErrorKind::BadRequest, "'{bad}': {e}");
+        }
+        assert_eq!(
+            invoke_rpc(&program, "S", "register", &json!({"s": {"email": "a@b.com"}}), &db).unwrap(),
+            json!("a@b.com")
+        );
+    }
+
+    #[test]
+    fn validate_regex_rejects_a_non_matching_value_and_accepts_a_matching_one() {
+        let program = program_from(
+            r#"
+            type Order = { @validate(regex, "^[A-Z]{3}-[0-9]{4}$") sku: String }
+            service S {
+                rpc place(o: Order) -> String { o.sku }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        for bad in ["abc-1234", "AB-1234", "ABC-12345", "ABC1234"] {
+            let e = invoke_rpc(&program, "S", "place", &json!({"o": {"sku": bad}}), &db)
+                .expect_err(&format!("'{bad}' debería rechazarse"));
+            assert_eq!(e.kind, ErrorKind::BadRequest, "'{bad}': {e}");
+        }
+        assert_eq!(
+            invoke_rpc(&program, "S", "place", &json!({"o": {"sku": "ABC-1234"}}), &db).unwrap(),
+            json!("ABC-1234")
+        );
+    }
+
+    /// Un campo `String?` con `@validate` sigue siendo genuinamente opcional
+    /// -- ausente no dispara ninguna validación, solo un valor PRESENTE se
+    /// valida.
+    #[test]
+    fn validate_on_an_optional_field_only_runs_when_the_value_is_present() {
+        let program = program_from(
+            r#"
+            type Contact = { @validate(email) email?: String }
+            service S {
+                rpc echo(c: Contact) -> String? { c.email }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "echo", &json!({"c": {}}), &db).unwrap(), json!(null));
+        let e = invoke_rpc(&program, "S", "echo", &json!({"c": {"email": "not-an-email"}}), &db)
+            .expect_err("un valor presente sigue validándose");
+        assert_eq!(e.kind, ErrorKind::BadRequest, "{e}");
+    }
+
+    /// El caso REAL más común, no el sintético: un rpc no recibe el struct
+    /// entero como parámetro (eso es lo que cubren los tests de arriba, vía
+    /// `json_to_typed_value`) -- recibe campos SUELTOS y arma el struct
+    /// (típicamente el shape "New*" que omite `id`, mismo patrón que
+    /// `insert` usa en todo el proyecto) ADENTRO del cuerpo del rpc. Ese
+    /// literal nunca pasa por el decode del wire como struct -- solo
+    /// `Expr::StructLit` lo ve. Encontrado probando contra un servidor
+    /// real con `curl`: sin este chequeo en `Expr::StructLit`, un email
+    /// invalido pasaba de largo con 200 pese a `@validate(email)` estar
+    /// declarado -- el caso de uso que motivó todo el ítem quedaba
+    /// completamente sin protección.
+    #[test]
+    fn validate_fires_when_the_struct_is_constructed_inside_the_rpc_body_from_loose_params() {
+        let program = program_from(
+            r#"
+            type Signup = { id: Int, @validate(email) email: String }
+            type NewSignup = { @validate(email) email: String }
+            db { signups: Signup[] }
+            service S {
+                rpc register(email: String) -> Signup { db.signups.insert(NewSignup { email: email }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let e = invoke_rpc(&program, "S", "register", &json!({"email": "not-an-email"}), &db)
+            .expect_err("un email invalido construido adentro del cuerpo debe rechazarse igual");
+        assert_eq!(e.kind, ErrorKind::BadRequest, "{e}");
+        assert!(e.message.contains("NewSignup.email"), "{e}");
+        let ok = invoke_rpc(&program, "S", "register", &json!({"email": "a@b.com"}), &db).unwrap();
+        assert_eq!(ok["email"], json!("a@b.com"));
+    }
+
+    /// `@validate` solo protege la declaración donde está escrito -- si el
+    /// shape "New*" NO repite la anotación (solo el struct "completo" la
+    /// tiene), construir el "New*" no valida nada. No es un bug: es la
+    /// misma regla que ya aplica a `@deprecated` y a toda anotación de
+    /// campo (atada a la declaración, nunca "estructural" entre dos tipos
+    /// distintos aunque tengan el mismo campo) -- documentado como límite
+    /// honesto en GRAMMAR.md §3.73 precisamente porque es fácil de pisar
+    /// sin darse cuenta con el patrón "New*" que el resto del proyecto usa
+    /// en todos lados para `insert`.
+    #[test]
+    fn validate_on_the_full_type_does_not_protect_a_differently_named_create_shape_missing_the_same_annotation() {
+        let program = program_from(
+            r#"
+            type Signup = { id: Int, @validate(email) email: String }
+            type NewSignup = { email: String }
+            db { signups: Signup[] }
+            service S {
+                rpc register(email: String) -> Signup { db.signups.insert(NewSignup { email: email }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let result = invoke_rpc(&program, "S", "register", &json!({"email": "not-an-email"}), &db);
+        assert!(result.is_ok(), "documenta el límite: sin @validate en NewSignup, no hay nada que lo rechace");
     }
 
     // ---- validación tipada del borde (auditoría) ----

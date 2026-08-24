@@ -52,6 +52,7 @@ Works, verified by running it:
 - Per-client rate limiting: `@rate_limit("20/1m")` on an rpc caps it to N requests per time window, per `(client IP, service, rpc)` — 429 on exceeding. Format is `"N/Ns"`, `"N/Nm"` or `"N/Nh"`; combines with any other annotation and runs before the auth gate — see GRAMMAR.md §3.39.
 - `@deprecated("usa X en su lugar")` on a struct field OR an rpc/stream — purely informational, zero effect on runtime behavior or on structural subtyping (a struct is still the exact same type whether or not one of its fields carries this). On an rpc it combines freely with any other annotation (`@authenticated`, `@route`, etc.), same mechanism. On a field it is the ONLY annotation a field accepts today — `Field` has no generic annotation list like `RpcDecl` does, so any other name there (`@authenticated`, etc.) is a parse error, not silently ignored. Propagated as a JSDoc `/** @deprecated <reason> */` comment right above the field/method in `contract.d.ts`, and as native `deprecated: true` + `description` (Operation Object / JSON Schema 2020-12 keywords, no `x-*` extension) in `openapi.json` — see GRAMMAR.md §3.71.
 - `///` docstrings on an rpc/stream (only — not on `type`/`enum`/a struct field yet), propagated as `description` in `openapi.json` and as a multi-line JSDoc block in `contract.d.ts`. `///` is exactly 3 slashes — `//`/`////` are unaffected, still discarded like any other comment. Purely additive at the lexer level: `///` was already legal in ANY position (same trivia as `//`), so this changes nothing about what compiles — the parser only reads the captured text right above a `rpc`/`stream`, even through an `@annotation` in between. Combines with `@deprecated` on the same rpc into one field/block instead of one overwriting the other — see GRAMMAR.md §3.72.
+- `@validate(email)` / `@validate(regex, "...")` on a `String`/`String?` struct field only — `Int`/`Bool`/anything else is a compile error, not a validator that silently never runs. A malformed regex pattern is caught in `linkc build` (compiled with the `regex` crate — the ONE exception this project makes to "no new dependencies," since a user-supplied pattern is arbitrary text, unlike the fixed/bounded forms — UUID, SHA-256, ISO-8601 — that get hand-rolled elsewhere). Enforced for real in four places: the actual `linkc serve` process (400 on a bad value), `openapi.json` (`format`/`pattern`, standard JSON Schema keywords, no `x-*` extension), `schemas.ts`/Zod (`.email()` / `.regex(new RegExp("..."))`, chained BEFORE `.nullable()` on an optional field — `ZodNullable` doesn't have those methods, so order isn't cosmetic), and an informative JSDoc comment in `contract.d.ts`. NOT yet enforced by `validators.ts`'s hand-written `isX()` type guards — those work off the structural type, with no annotation attached — see GRAMMAR.md §3.73.
 - Configurable CORS + fixed security headers on `linkc serve`: `--cors-origin <origin>` (repeatable) or `LINK_CORS_ORIGINS` (comma-separated) switches from open `*` to an exact-match allowlist (echoed literal + `Vary: Origin`; a non-matching `Origin` gets no CORS header at all, on every response including `stream` SSE and errors). Every response also carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` — see GRAMMAR.md §3.41. No CSP (depends on page content) or HSTS (belongs at the TLS-terminating reverse proxy, not `linkc serve` itself).
 - Sending email: `smtp.send(to: String, subject: String, body: String) -> Void`. Connection and sender come from the process environment (`LINK_SMTP_URL`, `LINK_SMTP_FROM`), never from rpc arguments — see GRAMMAR.md §3.43. `smtp.sendToMany(to: String[], subject: String, body: String) -> Void` sends ONE message with one `RCPT TO` per recipient; `smtp.sendHtml(to: String[], subject: String, html: String) -> Void` sends an HTML body (`Content-Type: text/html`) to one or many recipients — see GRAMMAR.md §3.63. All three: no attachments, no cc/bcc, synchronous (blocks the single-threaded server for that request).
 - Calling third-party APIs: `http.get(url: String) -> String` / `http.post(url: String, body: String) -> String` (unchanged), plus `http.getWithHeaders(url: String, headers) -> String` / `http.postWithHeaders(url: String, body: String, headers) -> String` for calls that need `Authorization` or any other header. `headers` is `{name: String, value: String}[]` — structural, not a builtin type, so any struct you declare with those two fields works. Response is only the body as `String`; a non-2xx becomes a runtime error (not a value with the status code) — see GRAMMAR.md §3.47. `http.getWithStatus(url: String, headers) -> {status: Int, headers: {name:String,value:String}[], body: String}` / `http.postWithStatus(url: String, body: String, headers) -> same` — two ADDITIONAL methods (the four above are unchanged) that return the status code and response headers as data instead of turning a non-2xx into a runtime error; the return type is structural too, no builtin name — see GRAMMAR.md §3.60.
@@ -122,16 +123,34 @@ difference between code that compiles and code that does not.
     vs `Int`. Call `.toString()` first to get a plain `String` (then any `String` method works
     on it normally). A `Uuid`-typed field/param rejects anything that isn't the canonical
     `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form (8-4-4-4-12 hex) — see GRAMMAR.md §3.70.
-13. **`@deprecated("reason")` on a struct field only accepts THAT annotation, nothing else.**
-    `RpcDecl` has a general `Vec<Annotation>` (`@authenticated`/`@route`/`@rate_limit`/etc. all
-    combine freely there, `@deprecated` included), but `Field` does not — writing
-    `@authenticated legacyPhone: String` on a struct field is a parse error, not something the
-    checker rejects later. `@deprecated` is purely informational either way: it never changes
-    whether something type-checks, never affects structural subtyping (a struct with a
-    deprecated field is still the same type as the identical struct without the annotation),
-    and never changes runtime behavior — it only adds a JSDoc `@deprecated` comment to
-    `contract.d.ts` and `deprecated: true` + `description` to `openapi.json` — see GRAMMAR.md
-    §3.71.
+13. **A struct field accepts exactly TWO annotations — `@deprecated("reason")` and
+    `@validate(...)` — nothing else.** `RpcDecl` has a general `Vec<Annotation>`
+    (`@authenticated`/`@route`/`@rate_limit`/etc. all combine freely there), but `Field` does
+    not — writing `@authenticated legacyPhone: String` on a struct field is a parse error, not
+    something the checker rejects later. At most one of each per field (a second `@deprecated`
+    or `@validate` on the same field is also a parse error). `@deprecated` is purely
+    informational: never affects type-checking, structural subtyping, or runtime behavior —
+    only JSDoc + `openapi.json` metadata (GRAMMAR.md §3.71). `@validate` is NOT purely
+    informational — see rule 14.
+14. **`@validate(email)` / `@validate(regex, "...")` only goes on a `String`/`String?` field,
+    and is REAL enforcement, not just documentation.** `Int`/`Bool`/anything else is a compile
+    error. A malformed regex pattern fails `linkc build` itself (compiled with the `regex`
+    crate at compile time). At runtime, `linkc serve` actually rejects a bad value with 400 —
+    this is not cosmetic, checked both when an rpc receives the whole struct as a param AND
+    when the rpc builds it inline from loose params inside the body (the far more common
+    shape — `rpc register(email: String) -> User { db.users.insert(NewUser { email: email }) }`
+    — this is the path that needed a SEPARATE fix in `Expr::StructLit`, found by curling a real
+    running server, not by reading the code). Three gotchas: (a) `@validate` is tied to the
+    EXACT declaration it's written on, never inherited structurally — the "New*"
+    (`Omit<T,"id">`) shape used everywhere for `insert` is a separate type from the "full" one,
+    so annotate both or the create path stays unprotected; (b) the regex syntax is Rust's
+    `regex` crate server-side and native JS `RegExp` in `schemas.ts` — both are PCRE-like but
+    NOT identical (no backreferences in either; lookaround exists in JS but not in Rust's
+    `regex`), so a pattern using lookaround compiles fine into `schemas.ts` but fails
+    `linkc build`; (c) `validators.ts`'s hand-written `isX(x): x is X` type guards do NOT
+    enforce `@validate` yet (they work off the structural type with no annotation attached) —
+    `openapi.json`, `schemas.ts`, `contract.d.ts`, and the real server all do. See GRAMMAR.md
+    §3.73.
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `page(limit: Int, offset: Int) -> T[]` (LIMIT/OFFSET pushed to real SQL, not `all().take(n)`

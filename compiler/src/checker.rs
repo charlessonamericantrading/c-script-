@@ -736,6 +736,36 @@ impl Checker {
                         errors.push(e);
                     }
                 }
+                // `@validate(...)` (GRAMMAR.md §3.73): solo tiene sentido
+                // sobre `String`/`String?`, así que necesita resolver el
+                // tipo del campo -- por eso vive en `check_program_full`
+                // (con símbolos ya poblados por `build_symbols`) y no en el
+                // parser, a diferencia de la validación "motivo no vacío"
+                // de `@deprecated`, que es puramente sintáctica.
+                Item::Type(t) => {
+                    if let TypeExpr::Struct(fields) = &t.ty {
+                        for e in checker.check_field_validators(fields, &t.type_params) {
+                            let mut e = e;
+                            if let Some(file) = file_for(index) {
+                                e = e.with_file(file);
+                            }
+                            errors.push(e);
+                        }
+                    }
+                }
+                Item::Enum(en) => {
+                    for variant in &en.variants {
+                        if let Some(fields) = &variant.fields {
+                            for e in checker.check_field_validators(fields, &en.type_params) {
+                                let mut e = e;
+                                if let Some(file) = file_for(index) {
+                                    e = e.with_file(file);
+                                }
+                                errors.push(e);
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1478,6 +1508,59 @@ impl Checker {
         };
         crate::rate_limit::RateLimitSpec::parse(raw).map_err(|e| err(format!("`@rate_limit(\"{raw}\")` en '{}': {e}", r.name)))?;
         Ok(())
+    }
+
+    /// `@validate(...)` (GRAMMAR.md §3.73) sobre cada campo de `fields` --
+    /// llamado tanto para un `type X = { ... }` como para los campos de cada
+    /// variante de un `enum` (comparten `Field`, ver `ast.rs`). Dos cosas se
+    /// validan acá, no en el parser: que el campo sea `String`/`String?`
+    /// (necesita el tipo RESUELTO, no solo la forma sintáctica) y que un
+    /// patrón de `@validate(regex, "...")` compile de verdad con la crate
+    /// `regex` -- un patrón roto tiene que fallar en `linkc build`, nunca en
+    /// el primer request real que lo dispare.
+    fn check_field_validators(&self, fields: &[Field], type_params: &[String]) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        for f in fields {
+            let Some(validator) = f.validator() else { continue };
+            let ty = if type_params.is_empty() {
+                self.resolve_type(&f.ty)
+            } else {
+                self.resolve_type_abstract(&f.ty, type_params)
+            };
+            let ty = match ty {
+                Ok(ty) => ty,
+                Err(e) => {
+                    errors.push(e.with_span(f.name_span));
+                    continue;
+                }
+            };
+            let inner = match &ty {
+                Type::Optional(inner) => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(inner, Type::String) {
+                errors.push(
+                    err(format!(
+                        "'@validate' en el campo '{}': solo aplica sobre `String` o `String?` -- es `{ty}`",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+                continue;
+            }
+            if let FieldValidator::Regex(pattern) = validator {
+                if let Err(e) = regex::Regex::new(pattern) {
+                    errors.push(
+                        err(format!(
+                            "`@validate(regex, \"{pattern}\")` en el campo '{}': patrón inválido -- {e}",
+                            f.name
+                        ))
+                        .with_span(f.name_span),
+                    );
+                }
+            }
+        }
+        errors
     }
 
     /// Dos `@route` en CONFLICTO (`RoutePattern::conflicts_with`, route.rs:
@@ -6046,9 +6129,9 @@ type T = { id: Int, s: Status }")
     }
 
     /// El motivo vacío se rechaza en el PARSER para campos (ver
-    /// `parse_optional_field_deprecated` en parser.rs -- no hay un paso del
-    /// checker que recorra campos de struct), así que este test parsea
-    /// directo en vez de pasar por `check_source`.
+    /// `parse_field_annotations` en parser.rs -- la validación de forma no
+    /// depende de ningún tipo resuelto), así que este test parsea directo
+    /// en vez de pasar por `check_source`.
     #[test]
     fn deprecated_with_an_empty_reason_on_a_field_is_rejected() {
         let src = r#"type Old = { id: Int, @deprecated("") legacy: String }"#;
@@ -6063,5 +6146,66 @@ type T = { id: Int, s: Status }")
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         let err = parse(tokens).expect_err("una anotación de rpc sobre un campo debe rechazarse");
         assert!(format!("{err:?}").contains("anotación desconocida"), "{err:?}");
+    }
+
+    // ---- `@validate(...)` sobre un campo (GRAMMAR.md §3.73) ----
+
+    #[test]
+    fn validate_email_on_a_string_field_typechecks() {
+        let src = r#"type Signup = { @validate(email) email: String }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn validate_regex_on_a_string_field_typechecks() {
+        let src = r#"type Order = { @validate(regex, "^[A-Z]{3}$") sku: String }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    /// `String?` también es válido -- `@validate` no exige que el campo sea
+    /// requerido, solo que sea texto.
+    #[test]
+    fn validate_on_an_optional_string_field_typechecks() {
+        let src = r#"type Signup = { @validate(email) email?: String }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn validate_on_a_non_string_field_is_rejected() {
+        let src = r#"type Signup = { @validate(email) age: Int }"#;
+        let errs = check_source(src).expect_err("@validate sobre un Int debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("solo aplica sobre")), "{errs:?}");
+    }
+
+    #[test]
+    fn validate_regex_with_an_invalid_pattern_is_rejected() {
+        let src = r#"type Order = { @validate(regex, "[unclosed") sku: String }"#;
+        let errs = check_source(src).expect_err("un patrón regex inválido debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("patrón inválido")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_second_validate_on_the_same_field_is_a_parse_error() {
+        let src = r#"type Signup = { @validate(email) @validate(email) email: String }"#;
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("dos @validate en el mismo campo debe rechazarse");
+        assert!(format!("{err:?}").contains("repetido"), "{err:?}");
+    }
+
+    #[test]
+    fn an_unknown_validate_kind_is_a_parse_error() {
+        let src = r#"type Signup = { @validate(minLength, 3) name: String }"#;
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("una forma de @validate desconocida debe rechazarse");
+        assert!(format!("{err:?}").contains("desconocido"), "{err:?}");
+    }
+
+    /// `@validate` también funciona sobre el campo de una variante de enum
+    /// -- comparte `Field` con `type`, y `check_field_validators` se llama
+    /// para las dos formas (ver `check_program_full`).
+    #[test]
+    fn validate_on_an_enum_variant_field_typechecks() {
+        let src = r#"enum Event { SignedUp { @validate(email) email: String } }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 }

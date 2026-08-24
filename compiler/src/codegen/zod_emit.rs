@@ -1,7 +1,7 @@
 //! Generador de esquemas Zod (schemas.ts) a partir de tipos Link.
 //! Permite validación de formularios en React y runtime type safety con Zod.
 
-use crate::ast::{Item, Program, TypeExpr};
+use crate::ast::{FieldValidator, Item, Program, TypeExpr};
 use crate::checker::Checker;
 use crate::types::Type;
 
@@ -66,6 +66,36 @@ fn render_zod_type(ty: &Type) -> String {
     }
 }
 
+/// Igual que `render_zod_type`, pero aplica `@validate(...)` (GRAMMAR.md
+/// §3.73) sobre el `String` de la HOJA, antes de cualquier `.nullable()` --
+/// `.email()`/`.regex()` no existen sobre el `ZodNullable` que devuelve
+/// `.nullable()`, así que el orden de encadenado importa: tiene que
+/// aplicarse ANTES, no después, de ahí que esto no sea un simple postfijo
+/// sobre `render_zod_type(ty)`. `validator` solo se usa en la hoja `String`
+/// -- el checker (`check_field_validators`) ya garantiza que `@validate`
+/// nunca aparece sobre otra cosa, así que no hace falta propagarlo a
+/// ninguna otra rama.
+fn render_zod_type_for_field(ty: &Type, validator: Option<&FieldValidator>) -> String {
+    match ty {
+        Type::Optional(inner) => format!("{}.nullable()", render_zod_type_for_field(inner, validator)),
+        Type::String => {
+            let base = render_zod_type(ty);
+            match validator {
+                // `new RegExp(json_string)` en vez de un literal `/.../` --
+                // evita tener que escapar `/` dentro del patrón del usuario
+                // para no cerrar el literal antes de tiempo (`serde_json`
+                // ya produce un string JS válido, entre comillas dobles).
+                Some(FieldValidator::Email) => format!("{base}.email()"),
+                Some(FieldValidator::Regex(pattern)) => {
+                    format!("{base}.regex(new RegExp({}))", serde_json::to_string(pattern).expect("string simple"))
+                }
+                None => base,
+            }
+        }
+        other => render_zod_type(other),
+    }
+}
+
 pub fn emit_zod_schemas(program: &Program) -> Result<String, String> {
     let (checker, errors) = Checker::build_symbols(program);
     if let Some(e) = errors.into_iter().next() {
@@ -88,7 +118,7 @@ pub fn emit_zod_schemas(program: &Program) -> Result<String, String> {
                     out.push_str(&format!("export const {}Schema = z.object({{\n", t.name));
                     for f in fields {
                         let ty = checker.resolve_type(&f.ty).map_err(|e| e.to_string())?;
-                        let zod_ty = render_zod_type(&ty);
+                        let zod_ty = render_zod_type_for_field(&ty, f.validator());
                         let optional_suffix = if f.optional { ".optional()" } else { "" };
                         out.push_str(&format!("  {}: {}{},\n", f.name, zod_ty, optional_suffix));
                     }
@@ -130,5 +160,40 @@ mod tests {
         assert!(zod_out.contains("id: z.number().int()"), "{zod_out}");
         assert!(zod_out.contains("email: z.string().nullable()"), "{zod_out}");
         assert!(zod_out.contains("createdAt: z.string().datetime()"), "{zod_out}");
+    }
+
+    /// `@validate(email)` se propaga como `.email()` encadenado (GRAMMAR.md
+    /// §3.73).
+    #[test]
+    fn validate_email_becomes_a_chained_email_call() {
+        let code = r#"type Signup = { @validate(email) email: String }"#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let zod_out = emit_zod_schemas(&program).unwrap();
+        assert!(zod_out.contains("email: z.string().email(),"), "{zod_out}");
+    }
+
+    /// `@validate(regex, "...")` se propaga como `.regex(new RegExp(...))`
+    /// -- `new RegExp` en vez de un literal `/.../` para no tener que
+    /// escapar `/` dentro del patrón del usuario.
+    #[test]
+    fn validate_regex_becomes_a_chained_regex_call_using_new_regexp() {
+        let code = r#"type Order = { @validate(regex, "^[A-Z]{3}$") sku: String }"#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let zod_out = emit_zod_schemas(&program).unwrap();
+        assert!(zod_out.contains(r#"sku: z.string().regex(new RegExp("^[A-Z]{3}$")),"#), "{zod_out}");
+    }
+
+    /// Sobre un campo `String?`, `.email()`/`.regex()` tienen que ir ANTES
+    /// de `.nullable()` -- `ZodNullable` no tiene esos métodos, así que el
+    /// orden de encadenado no es cosmético, es lo único que compila.
+    #[test]
+    fn validate_on_an_optional_string_field_chains_email_before_nullable() {
+        let code = r#"type Signup = { @validate(email) email: String? }"#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let zod_out = emit_zod_schemas(&program).unwrap();
+        assert!(zod_out.contains("email: z.string().email().nullable(),"), "{zod_out}");
     }
 }
