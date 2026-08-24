@@ -127,7 +127,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("subcomandos conocidos:"));
     out(&format!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)"));
     out(&format!("     linkc build <archivo.link> <outdir> [--diff <anterior>]    (genera contratos TS, cliente, hooks, schemas Zod y OpenAPI; --diff compara el contract.d.ts nuevo contra uno guardado antes)"));
-    out(&format!("     linkc test <archivo.link> [--filter <nombre>]  (ejecuta pruebas de comportamiento integradas; --filter acota a las que CONTIENEN ese substring en el nombre)"));
+    out(&format!("     linkc test <archivo.link> [--filter <nombre>] [--db <url-postgres>]  (ejecuta pruebas de comportamiento integradas; --filter acota a las que CONTIENEN ese substring en el nombre; --db/LINK_TEST_DB corre contra PostgreSQL real en vez de SQLite :memory:, sin aislamiento entre tests -- solo contra una base de test dedicada, nunca producción)"));
     out(&format!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)"));
     out(&format!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)"));
     out(&format!("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)"));
@@ -680,7 +680,7 @@ fn print_build_diff(prev_path: &str, outdir: &str) {
 /// es ese "sí, es a propósito" explícito.
 fn cmd_test(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else {
-        eprintln!("uso: linkc test <archivo.link> [archivo.snap] [--update] [--filter <nombre>]");
+        eprintln!("uso: linkc test <archivo.link> [archivo.snap] [--update] [--filter <nombre>] [--db <url-postgres>]");
         return ExitCode::FAILURE;
     };
 
@@ -693,13 +693,33 @@ fn cmd_test(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // GRAMMAR.md §3.99: `--db <url-postgres>` corre los bloques `test
+    // "..." { ... }` contra una base Postgres REAL en vez de SQLite
+    // `:memory:` -- necesario para reproducir un bug del wire binario de
+    // Postgres (§3.91), invisible contra SQLite porque los dos backends
+    // emiten SQL distinto para el mismo `.link`. Sin el flag: comportamiento
+    // IDÉNTICO al de siempre.
+    let db_url = match read_flag_or_env(args, "--db", "LINK_TEST_DB") {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     // `--filter` solo tiene sentido contra los bloques `test "..." { ... }`
     // integrados -- el testing de CONTRATO (`linkc test <archivo> <snap>`)
     // no tiene nombres que filtrar, así que combinarlos es un uso confuso
-    // que se rechaza acá en vez de ignorar `--filter` en silencio.
+    // que se rechaza acá en vez de ignorar `--filter` en silencio. `--db`
+    // comparte el mismo motivo: el testing de contrato no toca ninguna base.
     if snap_path.is_some() && filter.is_some() {
         eprintln!(
             "--filter solo aplica a los bloques 'test \"...\" {{ ... }}' integrados, no al testing de contrato ('linkc test <archivo> <snap>')"
+        );
+        return ExitCode::FAILURE;
+    }
+    if snap_path.is_some() && db_url.is_some() {
+        eprintln!(
+            "--db solo aplica a los bloques 'test \"...\" {{ ... }}' integrados, no al testing de contrato ('linkc test <archivo> <snap>')"
         );
         return ExitCode::FAILURE;
     }
@@ -718,7 +738,26 @@ fn cmd_test(args: &[String]) -> ExitCode {
     // -- `--filter <nombre>` (PLAN.md §9.7, GRAMMAR.md §3.82) los acota a los
     // que CONTIENEN ese substring en el nombre, mismo criterio que
     // `cargo test <substring>`.
-    match runtime::run_program_tests_filtered(&program, filter.as_deref()) {
+    let result = match db_url {
+        None => runtime::run_program_tests_filtered(&program, filter.as_deref()),
+        Some(url) => {
+            if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+                eprintln!(
+                    "'--db' en 'linkc test' solo acepta una URL de PostgreSQL -- SQLite ':memory:' ya es el default sin el flag"
+                );
+                return ExitCode::FAILURE;
+            }
+            let adopt_existing = resolve_adopt_existing(args);
+            match runtime::db::Db::connect_postgres_for_testing(&program, &url, adopt_existing) {
+                Ok(db) => runtime::run_program_tests_against_db(&program, filter.as_deref(), &db),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    match result {
         Ok(summary) => {
             match &filter {
                 Some(f) => println!("running {} tests (filtro: '{f}')", summary.total),

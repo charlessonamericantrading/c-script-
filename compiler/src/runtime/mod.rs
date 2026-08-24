@@ -2112,6 +2112,37 @@ pub fn run_program_tests(program: &Program) -> Result<TestSummary, RuntimeError>
 /// `run_program_tests` (que delega acá con `None` en vez de duplicar el
 /// cuerpo).
 pub fn run_program_tests_filtered(program: &Program, filter: Option<&str>) -> Result<TestSummary, RuntimeError> {
+    run_tests_core(program, filter, None)
+}
+
+/// Como `run_program_tests_filtered`, pero corriendo TODOS los tests contra
+/// el MISMO `db` ya conectado -- GRAMMAR.md §3.99, `linkc test --db
+/// <url-postgres>`. El caso real que lo motiva: un bug de decodificación
+/// del wire binario de PostgreSQL (§3.91) es invisible corriendo contra
+/// SQLite `:memory:` -- los dos backends emiten SQL distinto para el mismo
+/// `.link`, así que "pasa contra SQLite" no prueba nada sobre Postgres.
+///
+/// SIN el aislamiento por test que `:memory:` da gratis (una conexión
+/// SQLite nueva, vacía, por cada test -- ver `run_program_tests_filtered`).
+/// Postgres no tiene un equivalente de "`:memory:`": reconectar a la MISMA
+/// URL para cada test daría el MISMO estado persistente, no uno fresco, así
+/// que en vez de fingir un aislamiento que no existe, esta variante
+/// comparte `db` a propósito -- lo que un test insertó sigue ahí para el
+/// siguiente. Correr esto contra una base de TEST dedicada, nunca contra
+/// producción, es responsabilidad de quien pasa la URL, no algo que esta
+/// función pueda verificar.
+pub fn run_program_tests_against_db(program: &Program, filter: Option<&str>, db: &Db) -> Result<TestSummary, RuntimeError> {
+    run_tests_core(program, filter, Some(db))
+}
+
+/// Como `run_program_tests`, pero corriendo solo los bloques `test "..."`
+/// cuyo NOMBRE contiene `filter` (substring, sensible a mayúsculas -- mismo
+/// criterio que `cargo test <substring>`, no un match exacto ni una regex)
+/// -- `linkc test <archivo> --filter <nombre>` (PLAN.md §9.7, GRAMMAR.md
+/// §3.82). `None` corre todos, comportamiento idéntico a
+/// `run_program_tests` (que delega acá con `None` en vez de duplicar el
+/// cuerpo).
+fn run_tests_core(program: &Program, filter: Option<&str>, shared_db: Option<&Db>) -> Result<TestSummary, RuntimeError> {
     let (checker, errors) = Checker::check_program_full(program, &[]);
     if let Some(first) = errors.into_iter().next() {
         return Err(RuntimeError::new(first.message));
@@ -2139,11 +2170,21 @@ pub fn run_program_tests_filtered(program: &Program, filter: Option<&str>) -> Re
     let mut failed = Vec::new();
 
     for test in &tests {
-        let db = Db::new(program, std::path::Path::new(":memory:"));
+        // `:memory:` fresca por test (comportamiento de siempre) si no hay
+        // `shared_db` -- ver el doc de `run_program_tests_against_db` para
+        // por qué el camino Postgres NO puede dar la misma garantía.
+        let fresh_db;
+        let db: &Db = match shared_db {
+            Some(db) => db,
+            None => {
+                fresh_db = Db::new(program, std::path::Path::new(":memory:"));
+                &fresh_db
+            }
+        };
         let sessions = SessionStore::new();
         let step_budget = Cell::new(1_000_000);
         let env = Env::new();
-        match eval_block(&test.body, &env, &db, &fns, &checker, &sessions, None, &step_budget) {
+        match eval_block(&test.body, &env, db, &fns, &checker, &sessions, None, &step_budget) {
             Ok(_) => passed += 1,
             Err(e) => failed.push((test.name.clone(), e.message)),
         }

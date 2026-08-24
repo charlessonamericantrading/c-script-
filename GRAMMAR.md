@@ -120,6 +120,7 @@
   - [3.96 `@check(...)`: constraints numéricos de nivel de base — RESUELTO](#396-check-constraints-numéricos-de-nivel-de-base--resuelto)
   - [3.97 `linkc migrate --dry-run` — RESUELTO](#397-linkc-migrate---dry-run--resuelto)
   - [3.98 Lint `hardcoded-secret-literal` — RESUELTO](#398-lint-hardcoded-secret-literal--resuelto)
+  - [3.99 `linkc test --db <url-postgres>` — RESUELTO](#399-linkc-test---db-url-postgres--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4579,6 +4580,32 @@ service S {
 - **Puramente informativo, como el resto del linter** -- `linkc lint` sigue saliendo con código 0 aunque encuentre esto. Solo corre con `linkc lint`, no con `linkc build` (mismo alcance que el resto de las reglas de este linter, que nunca se ejecutan automáticamente durante un build).
 
 **Verificado**: 6 tests en `lint.rs` -- una URL con credenciales embebidas se marca nombrando el `const` y recomendando `env.get`; la misma URL SIN credenciales no se marca; un nombre tipo secreto con un literal se marca; un nombre/valor ordinario no se marca; un literal vacío nunca se marca aunque el nombre sugiera un secreto; un valor NO literal (ej. una llamada a `env.get(...)`, que el checker rechazaría por otro motivo aparte) tampoco se marca -- el lint corre sobre el AST parseado, antes/aparte del checker.
+
+---
+
+### 3.99 `linkc test --db <url-postgres>` — RESUELTO
+
+Reporte de un adoptador real (MyFinance) verificando el fix de §3.91 contra su propio esquema: "`linkc test` corre contra SQLite embebido, que NO reproduce el bug original (decodificación del wire binario de Postgres)... Sin esto, el fix está 'compilado y probado con datos falsos', no 'verificado'". Cierto -- `run_program_tests_filtered` (el motor de `test "..." { ... }`) siempre creaba una SQLite `:memory:` nueva por cada test, sin ninguna forma de apuntar a Postgres. Los dos backends emiten SQL y decodifican el wire de forma DISTINTA (GRAMMAR.md §3.91) -- que un `test` pase contra SQLite no prueba nada sobre cómo se comporta contra Postgres real.
+
+```bash
+linkc test backend.link --db postgres://user:pass@host/base_de_test
+LINK_TEST_DB=postgres://user:pass@host/base_de_test linkc test backend.link   # equivalente
+```
+
+**`--db <url-postgres>`/`LINK_TEST_DB` (deliberadamente DISTINTA de `LINK_DATABASE_URL`, la que usa `linkc serve`) hace que TODOS los bloques `test "..." { ... }` corran contra esa base real, en vez de SQLite `:memory:`.** Env var separada a propósito: si `LINK_DATABASE_URL` (la de producción/desarrollo del `serve` real) estuviera puesta en el entorno, `linkc test` NUNCA debe usarla por accidente -- confundir "la URL del servidor" con "la URL de test" sería exactamente el tipo de error que deja un `test` real insertando filas en una base de producción. Sin el flag/env var: comportamiento IDÉNTICO al de siempre.
+
+**Solo PostgreSQL -- `--db` con cualquier otra forma de URL se rechaza.** SQLite ya es el default rápido y aislado sin el flag; no hay necesidad real de apuntar `--db` a un archivo SQLite distinto.
+
+**Límite honesto, deliberado: SIN el aislamiento por test que `:memory:` da gratis.** Contra SQLite, cada `test` arranca con una conexión `:memory:` NUEVA y VACÍA (`Db::new(program, ":memory:")` corre una vez por test) -- aislamiento total, sin que el `.link` tenga que hacer nada. Postgres no tiene un equivalente de "`:memory:`": reconectar a la MISMA URL para cada test daría el MISMO estado persistente, no uno fresco. En vez de fingir un aislamiento que no existe (ej. `DROP`/`TRUNCATE` automático entre tests, una operación destructiva que este proyecto evita a propósito -- ver "Límites honestos" de §3.97), `--db` comparte la conexión entre TODOS los tests de la corrida: lo que un test insertó, el siguiente lo ve. Correr esto contra una base de TEST dedicada (nunca contra producción) es responsabilidad de quien pasa la URL -- mismo criterio que el resto de las operaciones sobre `--db` en este proyecto (`linkc migrate --dry-run`, §3.97).
+
+**`--adopt-existing` funciona igual que en `linkc serve`.** Si la base de test ya tiene las tablas (ej. una copia real del esquema de producción, sembrada con datos reales), `--adopt-existing` evita que `linkc test` intente `CREATE TABLE`/`ALTER TABLE` sobre ellas.
+
+**Límites honestos:**
+- **Sin reset automático entre CORRIDAS tampoco.** Los datos que una corrida de `linkc test --db ...` dejó siguen ahí la próxima vez -- si eso importa, limpiar la base de test antes de cada corrida es trabajo de quien orquesta el test (un script que la resetea, o simplemente recrearla), no algo que `linkc test` hace por su cuenta.
+- **`--filter` sigue funcionando igual, pero el orden de ejecución entre los tests que SÍ corren importa ahora** (ver el `Límite` de arriba) -- filtrar a un subconjunto puede dar un resultado distinto al de correr todos, si alguno de los filtrados dependía de estado que otro test (ahora excluido) dejaba.
+- **No aplica al testing de CONTRATO** (`linkc test <archivo> <snapshot>`) -- ese camino nunca toca ninguna base, combinar `--db` con un `<snapshot>` se rechaza con un mensaje claro, mismo criterio que `--filter`.
+
+**Verificado**: 2 tests en `pg_integration.rs` contra un PostgreSQL real -- un `test` que inserta una fila vía `db.<c>.insert` deja esa fila de VERDAD en Postgres (confirmado con una consulta SQL directa después, no solo "el test pasó"); dos `test` en el mismo archivo, el segundo lee el conteo que el primero dejó -- confirma el límite de "sin aislamiento" documentado arriba, no lo esconde.
 
 ---
 

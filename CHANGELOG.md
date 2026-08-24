@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.63.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc test --db <url-postgres>`.** Segundo reporte de MyFinance, verificando el fix de decodificación de Postgres (v1.55.0, GRAMMAR.md §3.91) contra su propio esquema real: "`linkc test` corre contra SQLite embebido, que NO reproduce el bug original... sin esto, el fix está 'compilado y probado con datos falsas', no 'verificado'". El motor de `test "..." { ... }` siempre creaba SQLite `:memory:` nueva por cada test, sin ninguna forma de apuntar a Postgres -- los dos backends emiten SQL y decodifican el wire de forma distinta, así que pasar contra SQLite no prueba nada sobre cómo se comporta contra Postgres de verdad. `--db <url-postgres>`/`LINK_TEST_DB` (env var deliberadamente DISTINTA de `LINK_DATABASE_URL`, para que `linkc test` nunca use por accidente la URL de producción/desarrollo de `linkc serve`) corre TODOS los bloques `test` contra esa base real en vez de SQLite. Límite honesto, documentado explícitamente: sin el aislamiento por test que `:memory:` da gratis -- Postgres no tiene equivalente de "`:memory:`" (reconectar a la misma URL da el MISMO estado persistente, no uno fresco), así que en vez de fingir un reset automático (que sería una operación destructiva, evitada a propósito, mismo criterio que `linkc migrate --dry-run`), los tests comparten estado explícitamente: lo que uno inserta, el siguiente lo ve. Solo PostgreSQL; `--adopt-existing` funciona igual que en `linkc serve`.
+
+889 tests (2 nuevos) en `pg_integration.rs` contra un PostgreSQL real: un `test` que inserta una fila la deja de verdad en Postgres (confirmado con una consulta directa, no solo "el test pasó"); dos `test` en el mismo archivo, el segundo ve el conteo que el primero dejó -- confirma el límite de "sin aislamiento" documentado, no lo esconde. Detalle completo: GRAMMAR.md §3.99.
+
 ## [1.62.0] - 2026-08-24
 
 ### ✨ Nuevo

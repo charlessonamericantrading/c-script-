@@ -1879,6 +1879,90 @@ fn migrate_dry_run_shows_the_alter_table_for_a_missing_column_and_adds_nothing()
     assert!(!exists, "'linkc migrate --dry-run' NO debe agregar la columna de verdad");
 }
 
+/// GRAMMAR.md §3.99: `linkc test --db <url-postgres>` corre los bloques
+/// `test "..." { ... }` contra PostgreSQL real -- el caso real que lo
+/// motiva es un bug de decodificación del wire binario de Postgres,
+/// invisible corriendo contra SQLite `:memory:` (los dos backends emiten
+/// SQL distinto para el mismo `.link`). Este test confirma que la fila que
+/// un `test` insertó vía `db.<c>.insert` está de verdad en PostgreSQL
+/// después -- no en un SQLite en memoria que se descartó al terminar.
+#[test]
+fn test_with_db_flag_runs_the_test_block_against_real_postgres() {
+    const COLLECTION: &str = "reviews_test_against_postgres";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("test-against-postgres");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Review = {{ id: Int, rating: Int }}
+db {{ {COLLECTION}: Review[] }}
+test "insertar una reseña" {{
+  let r = db.{COLLECTION}.insert(Review {{ id: 0, rating: 5 }});
+  assert(r.rating == 5);
+}}
+"#
+        ),
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("test").arg(&link).arg("--db").arg(&url).output().expect("ejecutar linkc test");
+    assert!(out.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("1 passed"), "{stdout}");
+
+    // La fila tiene que existir de verdad en Postgres -- si esto corriera
+    // contra SQLite :memory: (el bug que --db existe para evitar), esta
+    // consulta directa a Postgres no encontraría nada.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let count: i64 = client.query_one(&format!("SELECT COUNT(*) FROM \"{COLLECTION}\""), &[]).unwrap().get(0);
+    assert_eq!(count, 1, "la fila insertada por el test tiene que existir de verdad en Postgres");
+}
+
+/// Límite honesto documentado en GRAMMAR.md §3.99: a diferencia de SQLite
+/// `:memory:` (una conexión fresca y vacía por CADA test), `--db
+/// <url-postgres>` comparte la MISMA conexión entre todos los tests de la
+/// corrida -- sin aislamiento. Este test confirma ese comportamiento
+/// explícitamente: lo que un test insertó, el SIGUIENTE test lo ve.
+#[test]
+fn test_with_db_flag_shares_state_across_tests_with_no_isolation() {
+    const COLLECTION: &str = "reviews_test_shared_state";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("test-shared-state");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Review = {{ id: Int, rating: Int }}
+db {{ {COLLECTION}: Review[] }}
+test "1 - insertar una reseña" {{
+  db.{COLLECTION}.insert(Review {{ id: 0, rating: 5 }});
+  assert(db.{COLLECTION}.count() == 1);
+}}
+test "2 - la reseña del test anterior sigue ahi" {{
+  assert(db.{COLLECTION}.count() == 1);
+}}
+"#
+        ),
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("test").arg(&link).arg("--db").arg(&url).output().expect("ejecutar linkc test");
+    assert!(out.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("2 passed"), "{stdout}");
+}
+
 /// Mismo host/base, credenciales distintas -- para probar el DDL generado
 /// con un rol restringido, sin depender de que la URL de test tenga un
 /// formato particular más allá de `postgres://user:pass@resto`.

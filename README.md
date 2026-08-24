@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-887-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.62.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-889-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.63.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 887 automated tests:
+**Works today**, covered by 889 automated tests:
 
 - `linkc build` / `serve` / `serve-all` / `migrate --dry-run` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `linkc test <file> --db <postgres-url>` (or `LINK_TEST_DB`, deliberately separate from `LINK_DATABASE_URL`): runs every `test "..." { ... }` block against a real PostgreSQL database instead of embedded SQLite — needed to actually reproduce a Postgres-wire-format bug, since SQLite and Postgres emit and decode SQL differently for the same `.link`. No per-test isolation the way SQLite `:memory:` gives for free — Postgres has no equivalent, so tests share state within a run instead of faking a reset (which would mean a destructive operation this project avoids on purpose); run this against a dedicated test database, never production
 - `linkc migrate <file> --db <postgres-url> --dry-run`: connects read-only and reports the exact `CREATE TABLE`/`ALTER TABLE ADD COLUMN` that `linkc serve` would run, without running any of it — reuses the same DDL-generating functions the real runtime uses, so this report can't drift from what actually happens. Also flags a potential table-name collision or an incompatible `id` type before you'd find out by actually connecting. PostgreSQL only — SQLite already fails loud with the exact diff on a real connect
 - `@check(min, N)` / `@check(max, N)` / `@check(range, N, M)` on an `Int`/`Int64`/`Float` field: a database-level constraint, not just application code — enforced BOTH on `insert`/`applyPatch` (400 naming the field and the exact bound) AND as a real inline `CHECK (...)` in the generated `CREATE TABLE`, on SQLite and PostgreSQL both. Confirmed by writing raw SQL that bypasses c-script entirely and watching the database itself reject it, on both backends. `--adopt-existing` never runs this DDL, but application-side validation still applies regardless
 - `db.<c>.countWhere(predicate) -> Int` counts matching rows with a real `SELECT COUNT(*) ... WHERE` when the predicate is exactly `|x| x.field == value` — zero rows cross from the engine to the process. `findWhere` gains the same shortcut (same recognition, fetching real columns instead of `COUNT(*)`) without any change to its signature or observable behavior. Any other predicate shape (`>`, `&&`, comparing two fields) still works exactly as before via the interpreted fallback — never an error, just without the shortcut. Respects `@softDelete` even when pushed down; `deleteWhere` doesn't get this shortcut yet

@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-887-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.62.0-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-889-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.63.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 887 pruebas automáticas:
+**Funciona hoy**, cubierto por 889 pruebas automáticas:
 
 - `linkc build` / `serve` / `serve-all` / `migrate --dry-run` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `linkc test <archivo> --db <url-postgres>` (o `LINK_TEST_DB`, deliberadamente separada de `LINK_DATABASE_URL`): corre cada bloque `test "..." { ... }` contra una base PostgreSQL real en vez de SQLite embebido -- necesario para reproducir de verdad un bug del wire de Postgres, ya que SQLite y Postgres emiten y decodifican SQL distinto para el mismo `.link`. Sin el aislamiento por test que SQLite `:memory:` da gratis -- Postgres no tiene equivalente, así que los tests comparten estado dentro de una corrida en vez de fingir un reset (que sería una operación destructiva que este proyecto evita a propósito); correr esto contra una base de test dedicada, nunca contra producción
 - `linkc migrate <archivo> --db <url-postgres> --dry-run`: conecta de solo lectura y reporta el `CREATE TABLE`/`ALTER TABLE ADD COLUMN` exacto que `linkc serve` ejecutaría, sin ejecutar nada -- reusa las mismas funciones de generación de DDL que usa el runtime real, así que este reporte no puede desincronizarse de lo que pasa de verdad. También avisa una posible colisión de nombre de tabla o un tipo de `id` incompatible antes de que lo descubras conectando de verdad. Solo PostgreSQL -- SQLite ya falla fuerte con el diff exacto al conectar de verdad
 - `@check(min, N)` / `@check(max, N)` / `@check(range, N, M)` sobre un campo `Int`/`Int64`/`Float`: una restricción de nivel de BASE, no solo código de aplicación -- se cumple TANTO en `insert`/`applyPatch` (400 que nombra el campo y el límite exacto) COMO en un `CHECK (...)` inline de verdad en el `CREATE TABLE` generado, en SQLite y en PostgreSQL. Confirmado escribiendo SQL crudo que evita a c-script por completo y viendo a la propia base rechazarlo, en los dos backends. `--adopt-existing` nunca ejecuta este DDL, pero la validación de aplicación sigue aplicando igual
 - `db.<c>.countWhere(predicate) -> Int` cuenta filas que matchean con un `SELECT COUNT(*) ... WHERE` real cuando el predicado es exactamente `|x| x.campo == valor` -- cero filas viajan del motor al proceso. `findWhere` gana el mismo atajo (mismo reconocimiento, trayendo columnas reales en vez de `COUNT(*)`) sin cambiar su firma ni su comportamiento observable. Cualquier otra forma de predicado (`>`, `&&`, comparar dos campos) sigue funcionando igual que antes por el camino interpretado -- nunca un error, solo sin el atajo. Respeta `@softDelete` incluso pusheado; `deleteWhere` todavía no gana este atajo

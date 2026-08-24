@@ -1070,6 +1070,18 @@ impl Db {
         ))
     }
 
+    /// GRAMMAR.md §3.99: envoltorio público de `connect_postgres_with_options`
+    /// para `linkc test --db <url-postgres>` (`main.rs`, un crate binario
+    /// APARTE que solo ve la API `pub` de esta librería -- `RemoteChange`,
+    /// el tipo del receiver de LISTEN/NOTIFY, es `pub(crate)` a propósito,
+    /// así que la firma completa de `connect_postgres_with_options` no es
+    /// nombrable desde afuera). Descarta el receiver -- un `linkc test` es
+    /// una corrida de una sola vez, sin ningún otro proceso escuchando
+    /// cambios en vivo, así que no hace falta esa plomería acá.
+    pub fn connect_postgres_for_testing(program: &Program, url: &str, adopt_existing: bool) -> Result<Self, String> {
+        Self::connect_postgres_with_options(program, url, adopt_existing).map(|(db, _remote_rx)| db)
+    }
+
     /// Fija el costo de `crypto.hashPassword` para lo que quede de vida del
     /// proceso (GRAMMAR.md §3.55) -- `server.rs` lo llama UNA sola vez, antes
     /// de aceptar la primera request, con lo que haya resuelto de
