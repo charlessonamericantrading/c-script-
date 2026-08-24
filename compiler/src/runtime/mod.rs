@@ -2547,30 +2547,47 @@ fn augment_with_auto_update_fields(coll: &str, checker: &Checker, patch: Value) 
 fn apply_field_validators(ast_fields: &[Field], value: &Value, path: &str) -> Result<(), RuntimeError> {
     let Value::Struct(entries) = value else { return Ok(()) };
     for af in ast_fields {
-        let Some(validator) = af.validator() else { continue };
-        // Ausente (campo opcional que no vino) o presente pero `Null`: nada
-        // que validar -- `@validate` no vuelve requerido un campo opcional.
-        let Some((_, v)) = entries.iter().find(|(n, _)| n == &af.name) else { continue };
-        let Value::Str(s) = v else { continue };
-        match validator {
-            FieldValidator::Email => {
-                if !is_plausible_email(s) {
-                    return Err(bad_req(format!(
-                        "'{path}.{}': '{s}' no es un email válido (@validate(email))",
-                        af.name
-                    )));
+        if let Some(validator) = af.validator() {
+            // Ausente (campo opcional que no vino) o presente pero `Null`:
+            // nada que validar -- `@validate` no vuelve requerido un campo
+            // opcional.
+            if let Some((_, v)) = entries.iter().find(|(n, _)| n == &af.name) {
+                if let Value::Str(s) = v {
+                    match validator {
+                        FieldValidator::Email => {
+                            if !is_plausible_email(s) {
+                                return Err(bad_req(format!(
+                                    "'{path}.{}': '{s}' no es un email válido (@validate(email))",
+                                    af.name
+                                )));
+                            }
+                        }
+                        FieldValidator::Regex(pattern) => {
+                            // El patrón ya se validó en `linkc build`
+                            // (checker::check_field_validators) -- si llegó
+                            // hasta acá, compilar de nuevo no puede fallar.
+                            let re = regex::Regex::new(pattern).expect("patrón de @validate ya validado en compilación");
+                            if !re.is_match(s) {
+                                return Err(bad_req(format!(
+                                    "'{path}.{}': '{s}' no matchea @validate(regex, \"{pattern}\")",
+                                    af.name
+                                )));
+                            }
+                        }
+                    }
                 }
             }
-            FieldValidator::Regex(pattern) => {
-                // El patrón ya se validó en `linkc build`
-                // (checker::check_field_validators) -- si llegó hasta acá,
-                // compilar de nuevo no puede fallar.
-                let re = regex::Regex::new(pattern).expect("patrón de @validate ya validado en compilación");
-                if !re.is_match(s) {
-                    return Err(bad_req(format!(
-                        "'{path}.{}': '{s}' no matchea @validate(regex, \"{pattern}\")",
-                        af.name
-                    )));
+        }
+        // GRAMMAR.md §3.96: `@check(min/max/range, ...)` -- mismos DOS
+        // puntos de entrada que `@validate` arriba (wire y `StructLit`
+        // construido en un rpc), mismo criterio de "ausente o Null: nada
+        // que validar, @check no vuelve requerido un campo opcional".
+        if let Some(check) = af.check() {
+            if let Some((_, v)) = entries.iter().find(|(n, _)| n == &af.name) {
+                if let Some(n) = as_check_number(v) {
+                    if let Err(msg) = check_number_bounds(n, check) {
+                        return Err(bad_req(format!("'{path}.{}': {msg} (@check)", af.name)));
+                    }
                 }
             }
         }
@@ -2593,6 +2610,32 @@ fn is_plausible_email(s: &str) -> bool {
         return false;
     }
     domain.split('.').all(|seg| !seg.is_empty())
+}
+
+/// `Value` -> `f64` para `@check(...)` (GRAMMAR.md §3.96) -- `None` para
+/// cualquier `Value` que no sea `Int`/`Int64`/`Float` (nunca alcanzable en
+/// la práctica: `check_field_checks` ya exigió en compilación que el campo
+/// sea uno de esos tres, así que esto es defensivo, no un caso normal).
+fn as_check_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int(n) => Some(*n as f64),
+        Value::Int64(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// El chequeo real de `@check(...)` (GRAMMAR.md §3.96) -- `Err(mensaje)`
+/// nombrando el límite violado, sin el path del campo (el caller lo agrega).
+fn check_number_bounds(n: f64, check: &FieldCheck) -> Result<(), String> {
+    match check {
+        FieldCheck::Min(min) if n < *min => Err(format!("{n} es menor que el mínimo permitido ({min})")),
+        FieldCheck::Max(max) if n > *max => Err(format!("{n} es mayor que el máximo permitido ({max})")),
+        FieldCheck::Range(min, max) if n < *min || n > *max => {
+            Err(format!("{n} está fuera del rango permitido [{min}, {max}]"))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn struct_from_json(
@@ -3824,6 +3867,102 @@ mod tests {
         let db = Db::new(&program, std::path::Path::new(":memory:"));
         let result = invoke_rpc(&program, "S", "register", &json!({"email": "not-an-email"}), &db);
         assert!(result.is_ok(), "documenta el límite: sin @validate en NewSignup, no hay nada que lo rechace");
+    }
+
+    // ---- `@check(...)` sobre un campo (GRAMMAR.md §3.96) ----
+
+    /// El caso real que motiva `@check` (PLAN.md §9.3, citado por el
+    /// usuario): `reviews.link` solo evitaba un rating fuera de 1-5 porque
+    /// el código de la aplicación lo forzaba, sin ninguna barrera si algún
+    /// día otro rpc insertaba sin pasar por esa validación. `@check(range,
+    /// 1, 5)` mueve esa barrera al nivel del propio `insert`/`applyPatch`.
+    #[test]
+    fn check_range_rejects_a_value_outside_the_declared_bounds() {
+        let program = program_from(
+            r#"
+            type Review = { id: Int, @check(range, 1, 5) rating: Int }
+            db { reviews: Review[] }
+            service S {
+                rpc add(rating: Int) -> Review { db.reviews.insert(Review { id: 0, rating: rating }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        let ok = invoke_rpc(&program, "S", "add", &json!({"rating": 3}), &db).unwrap();
+        assert_eq!(ok["rating"], json!(3));
+
+        let too_high = invoke_rpc(&program, "S", "add", &json!({"rating": 6}), &db).expect_err("6 está fuera de [1,5]");
+        assert_eq!(too_high.kind, ErrorKind::BadRequest, "{too_high}");
+        assert!(too_high.message.contains("Review.rating"), "{too_high}");
+
+        let too_low = invoke_rpc(&program, "S", "add", &json!({"rating": 0}), &db).expect_err("0 está fuera de [1,5]");
+        assert_eq!(too_low.kind, ErrorKind::BadRequest, "{too_low}");
+    }
+
+    #[test]
+    fn check_min_and_max_reject_only_the_side_they_declare() {
+        let program = program_from(
+            r#"
+            type Product = { id: Int, @check(min, 0) stock: Int, @check(max, 100.0) discountPercent: Float }
+            db { products: Product[] }
+            service S {
+                rpc add(stock: Int, discountPercent: Float) -> Product {
+                    db.products.insert(Product { id: 0, stock: stock, discountPercent: discountPercent })
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        assert!(invoke_rpc(&program, "S", "add", &json!({"stock": 0, "discountPercent": 100.0}), &db).is_ok());
+        let neg_stock = invoke_rpc(&program, "S", "add", &json!({"stock": -1, "discountPercent": 0.0}), &db).expect_err("-1 < min 0");
+        assert_eq!(neg_stock.kind, ErrorKind::BadRequest, "{neg_stock}");
+        let over_discount =
+            invoke_rpc(&program, "S", "add", &json!({"stock": 5, "discountPercent": 100.5}), &db).expect_err("100.5 > max 100");
+        assert_eq!(over_discount.kind, ErrorKind::BadRequest, "{over_discount}");
+    }
+
+    /// Mismo motivo que `validate_fires_when_the_struct_is_constructed_inside_the_rpc_body_from_loose_params`:
+    /// el caso REAL de un `insert` (armar un "New*"/struct completo con
+    /// parámetros sueltos ADENTRO del cuerpo del rpc, nunca decodificado
+    /// del wire como struct) tiene que disparar `@check` igual que el
+    /// struct completo recibido como parámetro.
+    #[test]
+    fn check_fires_when_the_struct_is_constructed_inside_the_rpc_body_from_loose_params() {
+        let program = program_from(
+            r#"
+            type Review = { id: Int, @check(range, 1, 5) rating: Int }
+            type NewReview = { @check(range, 1, 5) rating: Int }
+            db { reviews: Review[] }
+            service S {
+                rpc add(rating: Int) -> Review { db.reviews.insert(NewReview { rating: rating }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let e = invoke_rpc(&program, "S", "add", &json!({"rating": 99}), &db).expect_err("99 fuera de [1,5]");
+        assert_eq!(e.kind, ErrorKind::BadRequest, "{e}");
+        assert!(e.message.contains("NewReview.rating"), "{e}");
+    }
+
+    /// `@check` no vuelve requerido un campo opcional -- un valor AUSENTE
+    /// (o `Null`) no dispara ninguna violación, mismo criterio que
+    /// `@validate` ya documenta para `String?`.
+    #[test]
+    fn check_on_an_optional_field_does_not_fire_when_the_value_is_absent() {
+        let program = program_from(
+            r#"
+            type Review = { id: Int, @check(range, 1, 5) score: Int? }
+            db { reviews: Review[] }
+            service S {
+                rpc add() -> Review { db.reviews.insert(Review { id: 0, score: null }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let ok = invoke_rpc(&program, "S", "add", &json!({}), &db).unwrap();
+        assert_eq!(ok["score"], serde_json::Value::Null);
     }
 
     // ---- valores por defecto en campos de struct (GRAMMAR.md §3.74) ----

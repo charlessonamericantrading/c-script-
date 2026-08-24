@@ -10,7 +10,7 @@
 // de la misma fuente de verdad, cero duplicación manual).
 
 use super::{as_int, json_to_typed_value, simple_enum_names, value_to_json, RuntimeError, Value};
-use crate::ast::{Item, Program, TypeExpr};
+use crate::ast::{FieldCheck, Item, Program, TypeExpr};
 use crate::checker::Checker;
 use crate::types::{FieldType, Type};
 use super::store::{Backend, Cell, ColumnKind};
@@ -185,6 +185,30 @@ fn index_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<S
     result
 }
 
+/// Nombre de colección -> lista de `(campo, FieldCheck)` para cada campo con
+/// `@check` de su tipo de elemento (GRAMMAR.md §3.96) -- mismo cruce
+/// `checker.db_collections()` + `program.items` que `index_fields_by_collection`
+/// de abajo, mismo motivo: `ColumnPlan`/`Type::Struct` son estructurales,
+/// sin anotaciones -- solo el `ast::Field` original las tiene.
+pub(crate) fn check_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<(String, FieldCheck)>> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let TypeExpr::Struct(fields) = &t.ty else { continue };
+            let checks: Vec<(String, FieldCheck)> = fields.iter().filter_map(|f| f.check().map(|c| (f.name.clone(), c.clone()))).collect();
+            if !checks.is_empty() {
+                result.insert(coll_name.clone(), checks);
+            }
+        }
+    }
+    result
+}
+
 /// `CREATE [UNIQUE] INDEX IF NOT EXISTS ...` para cada campo `@index`/
 /// `@unique` de `collection` (GRAMMAR.md §3.80) -- `IF NOT EXISTS` hace la
 /// creación idempotente, así que corre en CADA arranque sin necesitar
@@ -218,24 +242,58 @@ fn is_unique_violation(msg: &str) -> bool {
     msg.contains("UNIQUE constraint failed") || msg.contains("duplicate key value violates unique constraint")
 }
 
+/// ¿Es este el texto con el que SQLite o Postgres reportan una violación de
+/// `CHECK`/`@check` (GRAMMAR.md §3.96)? Mismo criterio que
+/// `is_unique_violation` -- texto fijo de cada motor, no un tipo
+/// estructurado (`Backend::execute` ya perdió esa forma para cuando llega
+/// acá). En la práctica, `apply_field_validators` (`runtime/mod.rs`) ya
+/// atrapa esto ANTES de que la sentencia SQL siquiera se arme -- este
+/// caso es la segunda barrera (defensa en profundidad), alcanzable solo si
+/// algo escribe sin pasar por ese camino.
+fn is_check_violation(msg: &str) -> bool {
+    msg.contains("CHECK constraint failed") || msg.contains("violates check constraint")
+}
+
 /// Envuelve el error de una escritura fallida (`insert`/`applyPatch`) --
-/// `RuntimeError::bad_request` (400) si es una violación de `@unique`
-/// (ver `is_unique_violation`), `RuntimeError::new` (500) para cualquier
-/// otra falla de SQL genuina (columna inexistente, base caída, etc.).
+/// `RuntimeError::bad_request` (400) si es una violación de `@unique` (ver
+/// `is_unique_violation`) o de `@check` (ver `is_check_violation`),
+/// `RuntimeError::new` (500) para cualquier otra falla de SQL genuina
+/// (columna inexistente, base caída, etc.).
 fn write_error(action: &str, e: String) -> RuntimeError {
     if is_unique_violation(&e) {
         RuntimeError::bad_request(format!("ya existe una fila con ese valor único (@unique, GRAMMAR.md §3.80) -- {e}"))
+    } else if is_check_violation(&e) {
+        RuntimeError::bad_request(format!("un valor no cumple una restricción @check (GRAMMAR.md §3.96) -- {e}"))
     } else {
         RuntimeError::new(format!("{action} falló: {e}"))
     }
 }
 
-fn create_table_sql(collection: &str, columns: &[ColumnPlan]) -> String {
+/// `CHECK (...)` inline para UNA columna (GRAMMAR.md §3.96) -- misma
+/// sintaxis para SQLite y PostgreSQL, así que esta función la comparten
+/// `create_table_sql` (acá abajo) y `codegen::postgres_emit::create_postgres_table_sql`.
+/// Comparaciones numéricas simples, sin ningún riesgo de inyección: `field`
+/// siempre es un nombre de columna ya validado por el checker (nunca texto
+/// de usuario), y `min`/`max` son `f64` formateados por Rust, nunca
+/// interpolación de un string externo.
+pub(crate) fn check_clause_sql(field: &str, check: &FieldCheck) -> String {
+    match check {
+        FieldCheck::Min(min) => format!("CHECK (\"{field}\" >= {min})"),
+        FieldCheck::Max(max) => format!("CHECK (\"{field}\" <= {max})"),
+        FieldCheck::Range(min, max) => format!("CHECK (\"{field}\" >= {min} AND \"{field}\" <= {max})"),
+    }
+}
+
+fn create_table_sql(collection: &str, columns: &[ColumnPlan], checks: &[(String, FieldCheck)]) -> String {
     let mut defs = vec!["\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
 
     for col in columns {
         let not_null = if col.not_null() { " NOT NULL" } else { "" };
-        defs.push(format!("\"{}\" {}{}", col.field.name, col.sql_type, not_null));
+        let check_clause = match checks.iter().find(|(name, _)| name == &col.field.name) {
+            Some((_, c)) => format!(" {}", check_clause_sql(&col.field.name, c)),
+            None => String::new(),
+        };
+        defs.push(format!("\"{}\" {}{}{}", col.field.name, col.sql_type, not_null, check_clause));
     }
     // STRICT (SQLite >= 3.37, muy por debajo de la versión bundleada de
     // rusqlite 0.40): que SQLite rechace un tipo incompatible en vez de
@@ -827,6 +885,8 @@ impl Db {
         // mientras `linkc serve` sigue corriendo.
         let _ = connection.pragma_update(None, "journal_mode", "WAL");
 
+        let checks_by_collection = check_fields_by_collection(program, &checker);
+        let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let mut columns = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
@@ -835,14 +895,19 @@ impl Db {
             let cols: Vec<ColumnPlan> =
                 fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
             if adopt_existing {
-                // GRAMMAR.md §3.80: `--adopt-existing` nunca ejecuta DDL,
-                // punto -- ni `@index`/`@unique` es la excepción. Un índice
-                // declarado sobre una colección adoptada simplemente no se
-                // crea; documentado, no un olvido.
+                // GRAMMAR.md §3.80/§3.96: `--adopt-existing` nunca ejecuta
+                // DDL, punto -- ni `@index`/`@unique`/`@check` es la
+                // excepción. Un constraint declarado sobre una colección
+                // adoptada simplemente no se crea a nivel de base;
+                // documentado, no un olvido -- la validación de `@check`
+                // sigue aplicando del lado de la aplicación
+                // (`apply_field_validators`, `runtime/mod.rs`) sin importar
+                // este modo.
                 check_schema_for_adoption(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             } else {
+                let checks = checks_by_collection.get(name).unwrap_or(&empty_checks);
                 connection
-                    .execute(&create_table_sql(name, &cols), [])
+                    .execute(&create_table_sql(name, &cols, checks), [])
                     .unwrap_or_else(|e| panic!("no se pudo crear la tabla '{name}' en '{db_path_display}': {e}"));
                 check_schema_matches(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             }
@@ -912,6 +977,8 @@ impl Db {
         let client = connect_postgres_client(url)?;
         let backend = Backend::Postgres { client: std::cell::RefCell::new(client), url: url.to_string() };
 
+        let checks_by_collection = check_fields_by_collection(program, &checker);
+        let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let mut columns = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
@@ -927,8 +994,9 @@ impl Db {
                 // cuenta, el esquema que el proyecto documenta y el que la base
                 // realmente tiene podrían divergir -- que es la clase de bug que
                 // este repo ya encontró varias veces (GRAMMAR.md §3.9).
+                let checks = checks_by_collection.get(name).unwrap_or(&empty_checks);
                 backend
-                    .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(name, &non_id, &simple_enums))
+                    .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(name, &non_id, &simple_enums, checks))
                     .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
             }
 
@@ -2268,6 +2336,36 @@ mod tests {
             .query_row("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_users_email'", [], |r| r.get(0))
             .expect("el índice único debe existir de verdad en SQLite, no solo aplicarse desde el intérprete");
         assert!(sql.to_uppercase().contains("UNIQUE"), "{sql}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// GRAMMAR.md §3.96: el caso real que motiva `@check` -- una "barrera a
+    /// nivel de base", no solo del lado de la aplicación. Este test escribe
+    /// SQL crudo, sin pasar por `Db::call`/`apply_field_validators`
+    /// (`runtime/mod.rs`) en absoluto -- exactamente el escenario "otro rpc
+    /// inserta sin pasar por esa función" que el reporte citaba. Si
+    /// `@check` solo viviera del lado de la aplicación, este insert
+    /// pasaría sin problema.
+    #[test]
+    fn check_field_creates_a_real_sqlite_check_constraint_that_rejects_raw_sql_too() {
+        let path = std::env::temp_dir().join("c_script_test_check_constraint.db");
+        let _ = std::fs::remove_file(&path);
+        let program = program_from("type Review = { id: Int, @check(range, 1, 5) rating: Int } db { reviews: Review[] }");
+        let db = Db::new(&program, &path);
+        drop(db);
+
+        let raw = Connection::open(&path).unwrap();
+        let sql: String = raw
+            .query_row("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'reviews'", [], |r| r.get(0))
+            .unwrap();
+        assert!(sql.contains("CHECK"), "el CHECK debe existir de verdad en la tabla física: {sql}");
+
+        let err = raw.execute("INSERT INTO \"reviews\" (\"rating\") VALUES (99)", []).unwrap_err();
+        assert!(
+            format!("{err}").to_uppercase().contains("CHECK"),
+            "un INSERT crudo que viola @check debe rechazarse a nivel de SQLite, sin pasar por Rust: {err}"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

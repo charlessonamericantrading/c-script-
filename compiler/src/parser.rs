@@ -153,6 +153,34 @@ impl Parser {
         }
     }
 
+    /// Un número literal en una posición que NO es una expresión general
+    /// (ej. el argumento de `@check(min, N)`, GRAMMAR.md §3.96) -- `Int` o
+    /// `Float`, con un `-` opcional combinado acá mismo (mismo criterio que
+    /// `parse_pattern_atom` para un patrón `-1`: es UN literal negativo, no
+    /// "unario aplicado a algo", así que no se delega a la regla general de
+    /// unario de expresiones). Siempre `f64` -- un límite de `@check` sobre
+    /// un campo `Int`/`Int64` se compara igual de exacto como flotante.
+    fn eat_number(&mut self) -> Result<f64, ParseError> {
+        let negative = if self.check(&TokenKind::Minus) {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        let n = match self.peek().clone() {
+            TokenKind::Int(n) => {
+                self.advance();
+                n as f64
+            }
+            TokenKind::Float(n) => {
+                self.advance();
+                n
+            }
+            other => return Err(self.error(format!("se esperaba un número, se encontró {other:?}"))),
+        };
+        Ok(if negative { -n } else { n })
+    }
+
     fn error(&self, message: impl Into<String>) -> ParseError {
         ParseError {
             message: message.into(),
@@ -462,9 +490,43 @@ impl Parser {
                     }
                     annotations.push(FieldAnnotation::Index { unique: name == "unique" });
                 }
+                // `@check(min, N)`/`@check(max, N)`/`@check(range, N, M)`
+                // (GRAMMAR.md §3.96) -- mismo criterio de forma "kind +
+                // argumento(s)" que `@validate` arriba.
+                "check" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::Check(_))) {
+                        return Err(self.error("'@check' repetido sobre el mismo campo: un campo tiene a lo sumo un constraint".to_string()));
+                    }
+                    self.eat(&TokenKind::LParen)?;
+                    let kind = self.eat_ident()?;
+                    let check = match kind.as_str() {
+                        "min" => {
+                            self.eat(&TokenKind::Comma)?;
+                            FieldCheck::Min(self.eat_number()?)
+                        }
+                        "max" => {
+                            self.eat(&TokenKind::Comma)?;
+                            FieldCheck::Max(self.eat_number()?)
+                        }
+                        "range" => {
+                            self.eat(&TokenKind::Comma)?;
+                            let min = self.eat_number()?;
+                            self.eat(&TokenKind::Comma)?;
+                            let max = self.eat_number()?;
+                            FieldCheck::Range(min, max)
+                        }
+                        other => {
+                            return Err(self.error(format!(
+                                "'@check({other}, ...)' desconocido (se esperaba '@check(min, N)', '@check(max, N)' o '@check(range, N, M)')"
+                            )))
+                        }
+                    };
+                    self.eat(&TokenKind::RParen)?;
+                    annotations.push(FieldAnnotation::Check(check));
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index' o '@unique')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique' o '@check(...)')"
                     )))
                 }
             }

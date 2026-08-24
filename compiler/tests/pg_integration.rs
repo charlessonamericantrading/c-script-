@@ -1741,6 +1741,43 @@ service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
     assert!(!server_v2.stderr().to_lowercase().contains("advertencia"), "'name' se comparte -- no debería avisar nada: {}", server_v2.stderr());
 }
 
+/// GRAMMAR.md §3.96: `@check` crea una restricción `CHECK` real en
+/// PostgreSQL, no solo del lado de la aplicación -- este test escribe SQL
+/// crudo, sin pasar por `linkc serve`/`apply_field_validators` en absoluto,
+/// exactamente el escenario ("otro programa inserta sin pasar por la
+/// validación de la aplicación") que motivó el pedido.
+#[test]
+fn check_field_creates_a_real_postgres_check_constraint_that_rejects_raw_sql_too() {
+    const COLLECTION: &str = "reviews_check_constraint";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("check-constraint");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Review = {{ id: Int, @check(range, 1, 5) rating: Int }}
+db {{ {COLLECTION}: Review[] }}
+service Reviews {{ rpc add(rating: Int) -> Review {{ db.{COLLECTION}.insert(Review {{ id: 0, rating: rating }}) }} }}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    let ok = server.rpc("Reviews/add", r#"{"rating":3}"#);
+    assert_eq!(ok["rating"], 3);
+    drop(server);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let raw_insert = client.execute(&format!("INSERT INTO \"{COLLECTION}\" (rating) VALUES (99)"), &[]);
+    let err = raw_insert.expect_err("un INSERT crudo que viola @check debe rechazarse a nivel de Postgres, sin pasar por Rust");
+    assert!(format!("{err}").to_lowercase().contains("check"), "{err}");
+}
+
 /// Mismo host/base, credenciales distintas -- para probar el DDL generado
 /// con un rol restringido, sin depender de que la URL de test tenga un
 /// formato particular más allá de `postgres://user:pass@resto`.

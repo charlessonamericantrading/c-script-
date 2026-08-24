@@ -752,6 +752,7 @@ impl Checker {
                             .chain(checker.check_field_defaults(fields, &t.type_params))
                             .chain(checker.check_field_auto_update(fields, &t.type_params))
                             .chain(checker.check_field_soft_delete(fields, &t.type_params))
+                            .chain(checker.check_field_checks(fields, &t.type_params))
                         {
                             let mut e = e;
                             if let Some(file) = file_for(index) {
@@ -770,6 +771,7 @@ impl Checker {
                                 .chain(checker.check_field_defaults(fields, &en.type_params))
                                 .chain(checker.check_field_auto_update(fields, &en.type_params))
                                 .chain(checker.check_field_soft_delete(fields, &en.type_params))
+                                .chain(checker.check_field_checks(fields, &en.type_params))
                             {
                                 let mut e = e;
                                 if let Some(file) = file_for(index) {
@@ -1672,6 +1674,58 @@ impl Checker {
                     .with_span(f.name_span),
                 ),
                 Err(e) => errors.push(e.with_span(f.name_span)),
+            }
+        }
+        errors
+    }
+
+    /// `@check(...)` (GRAMMAR.md §3.96) sobre cada campo de `fields` --
+    /// mismo criterio que `check_field_validators`: necesita el tipo
+    /// RESUELTO del campo (`Int`/`Int64`/`Float`, requerido u opcional), así
+    /// que vive acá, no en el parser. `@check(range, N, M)` con `N > M`
+    /// también se rechaza acá -- un rango vacío ("nunca puede pasar") es
+    /// casi siempre un error de tipeo, no una restricción real que alguien
+    /// quiso escribir a propósito.
+    fn check_field_checks(&self, fields: &[Field], type_params: &[String]) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        for f in fields {
+            let Some(check) = f.check() else { continue };
+            let ty = if type_params.is_empty() {
+                self.resolve_type(&f.ty)
+            } else {
+                self.resolve_type_abstract(&f.ty, type_params)
+            };
+            let ty = match ty {
+                Ok(ty) => ty,
+                Err(e) => {
+                    errors.push(e.with_span(f.name_span));
+                    continue;
+                }
+            };
+            let inner = match &ty {
+                Type::Optional(inner) => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(inner, Type::Int | Type::Int64 | Type::Float) {
+                errors.push(
+                    err(format!(
+                        "'@check' en el campo '{}': solo aplica sobre `Int`/`Int64`/`Float` (u opcional de esos) -- es `{ty}`",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+                continue;
+            }
+            if let FieldCheck::Range(min, max) = check {
+                if min > max {
+                    errors.push(
+                        err(format!(
+                            "`@check(range, {min}, {max})` en el campo '{}': el mínimo es mayor que el máximo -- ningún valor podría pasar nunca",
+                            f.name
+                        ))
+                        .with_span(f.name_span),
+                    );
+                }
             }
         }
         errors
@@ -6349,6 +6403,51 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(wrong_predicate_type).is_err(), "el predicado tiene que devolver Bool, no Int");
+    }
+
+    // ---- `@check(...)` sobre un campo (GRAMMAR.md §3.96) ----
+
+    #[test]
+    fn check_min_max_and_range_all_type_check_on_numeric_fields() {
+        let src = r#"
+            type Review = {
+                id: Int,
+                @check(range, 1, 5) rating: Int,
+                @check(min, 0) helpfulVotes: Int64,
+                @check(max, 100.0) discount: Float,
+                @check(range, 0, 5) optionalScore: Int?
+            }
+            db { reviews: Review[] }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn check_rejects_a_non_numeric_field() {
+        let src = r#"type Review = { id: Int, @check(range, 1, 5) title: String }"#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("solo aplica sobre"), "{msg}");
+    }
+
+    #[test]
+    fn check_range_rejects_a_min_greater_than_max() {
+        let src = r#"type Review = { id: Int, @check(range, 5, 1) rating: Int }"#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("mayor que el máximo"), "{msg}");
+    }
+
+    #[test]
+    fn check_rejects_an_unknown_kind() {
+        let tokens = tokenize(r#"type Review = { id: Int, @check(evenNumber) rating: Int }"#).unwrap();
+        let err = parse(tokens).expect_err("'@check(evenNumber)' debe rechazarse en el parser");
+        assert!(format!("{err:?}").contains("desconocido"), "{err:?}");
+    }
+
+    #[test]
+    fn check_rejects_a_second_check_on_the_same_field() {
+        let tokens = tokenize(r#"type Review = { id: Int, @check(min, 0) @check(max, 5) rating: Int }"#).unwrap();
+        let err = parse(tokens).expect_err("dos '@check' en el mismo campo debe rechazarse");
+        assert!(format!("{err:?}").contains("repetido"), "{err:?}");
     }
 
     #[test]

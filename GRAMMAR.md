@@ -117,6 +117,7 @@
   - [3.93 `--service-api-key`: autenticación servidor-a-servidor — RESUELTO](#393---service-api-key-autenticación-servidor-a-servidor--resuelto)
   - [3.94 Aviso de colisión de nombre de tabla en PostgreSQL — RESUELTO](#394-aviso-de-colisión-de-nombre-de-tabla-en-postgresql--resuelto)
   - [3.95 `countWhere` + `findWhere` empujados a SQL para `x.campo == valor` — RESUELTO](#395-countwhere--findwhere-empujados-a-sql-para-xcampo--valor--resuelto)
+  - [3.96 `@check(...)`: constraints numéricos de nivel de base — RESUELTO](#396-check-constraints-numéricos-de-nivel-de-base--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4478,6 +4479,43 @@ test "countWhere cuenta solo las del producto pedido" {
 - **No hay forma de pedir el plan de ejecución o confirmar desde el `.link` que un `countWhere`/`findWhere` particular SÍ se pusheó.** La única confirmación hoy es leer el código (`ast::recognize_equality_predicate`) o instrumentar el SQL emitido a mano.
 
 **Verificado**: 1 test en `checker.rs` (`countWhere` toma exactamente 1 argumento `fn(T) -> Bool` y devuelve `Int`, mismo contrato que `findWhere`/`deleteWhere`) y 5 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc`: `countWhere` cuenta correctamente vía el atajo de SQL; `findWhere` con un predicado pusheable devuelve las mismas filas que siempre devolvió; los dos con un predicado NO pusheable (`x.rating > 3`) siguen dando el resultado correcto por el camino interpretado; `countWhere`/`findWhere` sobre `"id"`; y los dos respetan `@softDelete` incluso pusheados. El SQL real emitido (`SELECT COUNT(*) FROM "reviews" WHERE "productId" = ?` / `SELECT ... WHERE "productId" = ? ORDER BY "id"`) se confirmó a mano contra `linkc test` con logging temporal antes de este release -- exactamente una consulta por llamada pusheada, ninguna para el caso de fallback.
+
+---
+
+### 3.96 `@check(...)`: constraints numéricos de nivel de base — RESUELTO
+
+Séptimo reporte de adopción real (IgnisLove), citado con el ejemplo exacto que lo motiva: "`reviews.link` solo evita un `rating` fuera de 1-5 porque `clampRating()` lo fuerza en el código; no hay ninguna barrera a nivel de base si algún día otro rpc inserta sin pasar por esa función". Cierto -- hasta esta ronda, la ÚNICA forma de imponer un rango numérico era código de aplicación (a mano, en cada rpc que escribe), sin ningún respaldo si un `insert`/`applyPatch` nuevo se olvidaba de llamarlo, o si algo por fuera de c-script escribía directo a la tabla.
+
+<!-- linkc:check -->
+```rust
+type Review = { id: Int, @check(range, 1, 5) rating: Int }
+db { reviews: Review[] }
+
+service Reviews {
+  rpc add(rating: Int) -> Review {
+    db.reviews.insert(Review { id: 0, rating: rating })
+  }
+}
+
+test "un rating dentro de 1-5 se acepta" {
+  let r = Reviews.add(3);
+  assert(r.rating == 3);
+}
+```
+
+**Tres formas, mismo criterio "kind + argumento(s)" que `@validate(email)`/`@validate(regex, "...")`: `@check(min, N)`, `@check(max, N)`, `@check(range, N, M)`.** Solo sobre un campo `Int`/`Int64`/`Float` (requerido u opcional) -- rechazado en compilación sobre cualquier otro tipo, con el tipo real encontrado en el mensaje. `@check(range, N, M)` con `N > M` también se rechaza en compilación ("el mínimo es mayor que el máximo -- ningún valor podría pasar nunca") -- casi siempre un error de tipeo, no una restricción real que alguien quiso escribir a propósito. A lo sumo un `@check` por campo.
+
+**Enforcement DOBLE, no solo uno: aplicación Y base de datos, los dos puntos reales de entrada.** Del lado de la aplicación, `apply_field_validators` (`runtime/mod.rs`, el mismo mecanismo que ya usaba `@validate`) corre en los DOS puntos donde un struct se termina de construir -- decodificando el wire (`json_to_typed_value`, un rpc que recibe el struct completo como parámetro) y construyendo un literal DENTRO del cuerpo de un rpc (`Expr::StructLit`, el caso más común: un rpc arma `NewX { campo: valorSuelto }` a partir de parámetros propios) -- una violación es `bad_request` (400), nombrando el campo y el límite exacto. Del lado de la base, el `CREATE TABLE` genera un `CHECK (...)` inline de VERDAD -- en SQLite (columna física, parte del propio `CREATE TABLE IF NOT EXISTS`) y en PostgreSQL (mismo generador que usa `linkc build` para `schema.postgres.sql`, GRAMMAR.md §3.9) -- así que aunque algo escriba SQL crudo sin pasar por c-script en absoluto (exactamente el escenario citado en el reporte), la base sigue rechazando el valor. Un error de `CHECK` que sí llega hasta SQL (algo escribiendo por fuera del camino normal de la aplicación) también se traduce a 400, no a un 500 genérico -- mismo criterio que ya usaba `@unique` (GRAMMAR.md §3.80) para su propia violación.
+
+**`--adopt-existing` (GRAMMAR.md §3.67) nunca ejecuta este DDL -- mismo criterio que `@index`/`@unique`.** Una colección adoptada no gana el `CHECK` físico (ese modo no toca DDL en absoluto), pero la validación de aplicación SIGUE aplicando sin importar el modo -- un `insert`/`applyPatch` real sobre una colección adoptada con `@check` se rechaza igual del lado de la aplicación, aunque la tabla física no tenga el constraint.
+
+**Límites honestos:**
+- **Solo rangos numéricos simples -- ninguna expresión booleana arbitraria.** No hay forma de escribir `@check("endDate > startDate")` (comparar dos campos entre sí) ni un constraint sobre `String` (longitud, no-vacío, forma) -- PLAN.md §9.3 lo trackea como trabajo pendiente. La forma soportada hoy cubre exactamente el caso reportado (un rango numérico), no un compilador de expresiones a SQL.
+- **Sin `ALTER TABLE ADD CONSTRAINT` sobre una tabla EXISTENTE en PostgreSQL.** El `CHECK` solo se aplica al CREAR la tabla (`CREATE TABLE IF NOT EXISTS`) -- agregar `@check` a un campo de una colección que YA tiene datos en Postgres no retrofittea el constraint físico a la tabla existente (mismo límite que el resto de la migración no destructiva de Postgres, GRAMMAR.md §3.17): la validación de aplicación sigue protegiendo los `insert`/`applyPatch` nuevos, pero filas viejas que ya violaban el rango (si las hubiera) no se detectan ni se marcan.
+- **SQLite tampoco migra un `@check` agregado después.** `check_schema_matches` (GRAMMAR.md §3.17) no compara constraints `CHECK` (`PRAGMA table_info` no los reporta) -- agregar `@check` a un campo de una tabla SQLite YA creada sin el constraint no lo agrega retroactivamente; haría falta borrar el archivo y recrear, mismo procedimiento que cualquier otro cambio de schema que SQLite no auto-migra.
+- **Límites como `f64` sin importar si el campo es `Int`/`Int64`.** Comparar un valor entero contra un límite de punto flotante es exacto para cualquier magnitud humana realista -- no pensado para el borde exacto de `i64`/`Int64` (GRAMMAR.md §3.30).
+
+**Verificado**: 5 tests en `checker.rs` (`min`/`max`/`range` tipan sobre `Int`/`Int64`/`Float` requerido u opcional, se rechaza sobre un campo no numérico, `range` con mínimo mayor que máximo se rechaza, `@check` con un kind desconocido y un segundo `@check` sobre el mismo campo se rechazan en el parser). 1 en `codegen/postgres_emit.rs` (el DDL estático que `linkc build` genera lleva el `CHECK` inline exacto para las tres formas). 4 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (`range` rechaza por arriba y por abajo nombrando el campo; `min`/`max` rechazan solo el lado que declaran; dispara igual construyendo el struct DENTRO del cuerpo de un rpc a partir de parámetros sueltos, no solo recibiéndolo completo por el wire; un campo opcional ausente no dispara nada). 1 en `runtime/db.rs` contra SQLite real (el `CHECK` existe de verdad en la tabla física, y un `INSERT` crudo por SQL directo -- sin pasar por `Db::call` en absoluto -- se rechaza a nivel de SQLite). 1 en `pg_integration.rs` contra un PostgreSQL real, mismo criterio: un `INSERT` crudo por fuera de `linkc serve` se rechaza a nivel de Postgres.
 
 ---
 

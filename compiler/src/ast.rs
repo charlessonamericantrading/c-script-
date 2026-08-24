@@ -208,6 +208,16 @@ impl Field {
             _ => None,
         })
     }
+
+    /// El constraint declarado con `@check(...)`, si hay (GRAMMAR.md §3.96).
+    /// A lo sumo uno por campo -- el parser ya lo exige (ver
+    /// `parse_field_annotations`).
+    pub fn check(&self) -> Option<&FieldCheck> {
+        self.annotations.iter().find_map(|a| match a {
+            FieldAnnotation::Check(c) => Some(c),
+            _ => None,
+        })
+    }
 }
 
 impl PartialEq for Field {
@@ -240,6 +250,34 @@ pub enum FieldAnnotation {
     /// ronda -- necesitaría una anotación a nivel de `type`, no de campo,
     /// que hoy no existe (`TypeDecl` no tiene `annotations`).
     Index { unique: bool },
+    /// `@check(min, N)`/`@check(max, N)`/`@check(range, N, M)` -- GRAMMAR.md
+    /// §3.96, restricción numérica de nivel de BASE (no solo del lado
+    /// aplicación) sobre un campo `Int`/`Int64`/`Float` (requerido u
+    /// opcional). Solo el caso de rango numérico simple -- ver "Límites
+    /// honestos" de §3.96 para lo que un `@check` de otros motores (una
+    /// expresión booleana arbitraria, comparar dos campos entre sí) todavía
+    /// no cubre.
+    Check(FieldCheck),
+}
+
+/// Las tres formas de `@check(...)` (GRAMMAR.md §3.96) -- mismo criterio de
+/// "kind + argumento(s)" que `FieldValidator`, ampliable sin romper esta
+/// forma. Los límites se guardan como `f64` sin importar si el campo es
+/// `Int`/`Int64` o `Float` -- comparar un valor entero contra un límite de
+/// punto flotante es exacto para cualquier magnitud realista (un `Int64`
+/// gigantesco que se saliera del rango exacto de `f64` de todos modos no
+/// tendría sentido como límite humano de un `@check`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldCheck {
+    /// `@check(min, N)` -- el valor tiene que ser `>= N`, sin techo.
+    Min(f64),
+    /// `@check(max, N)` -- el valor tiene que ser `<= N`, sin piso.
+    Max(f64),
+    /// `@check(range, N, M)` -- el valor tiene que estar en `[N, M]`
+    /// (los dos límites inclusive). `N` tiene que ser `<= M` -- validado en
+    /// el checker (GRAMMAR.md §3.96), no acá: el parser no resuelve tipos,
+    /// así que no puede decidir todavía si esto es un error real.
+    Range(f64, f64),
 }
 
 /// Las dos formas de `@validate(...)` que un campo `String`/`String?` admite

@@ -2,8 +2,9 @@
 // Provee mapeo de tipos nativo para PostgreSQL (BIGINT, JSONB, DOUBLE PRECISION, TEXT),
 // generación de DDL completo, consultas preparadas y soporte de auto-migración no destructiva.
 
-use crate::ast::Program;
+use crate::ast::{FieldCheck, Program};
 use crate::checker::Checker;
+use crate::runtime::db::{check_clause_sql, check_fields_by_collection};
 use crate::types::{FieldType, Type};
 use std::collections::HashSet;
 
@@ -50,7 +51,10 @@ fn postgres_column_type(field: &FieldType, simple_enums: &HashSet<String>) -> &'
 }
 
 /// Genera la sentencia DDL `CREATE TABLE IF NOT EXISTS` para una colección en PostgreSQL.
-pub fn create_postgres_table_sql(collection: &str, fields: &[FieldType], simple_enums: &HashSet<String>) -> String {
+/// `checks` (GRAMMAR.md §3.96, `@check`): pares `(campo, FieldCheck)`, mismo
+/// formato que `runtime::db::check_fields_by_collection` produce -- sin
+/// entrada para el `.link` mayoría que no usa `@check` en absoluto.
+pub fn create_postgres_table_sql(collection: &str, fields: &[FieldType], simple_enums: &HashSet<String>, checks: &[(String, FieldCheck)]) -> String {
     let mut cols = vec!["\"id\" BIGSERIAL PRIMARY KEY".to_string()];
 
     for f in fields {
@@ -60,7 +64,11 @@ pub fn create_postgres_table_sql(collection: &str, fields: &[FieldType], simple_
         } else {
             ""
         };
-        cols.push(format!("\"{}\" {}{}", f.name, pg_type, not_null));
+        let check_clause = match checks.iter().find(|(name, _)| name == &f.name) {
+            Some((_, c)) => format!(" {}", check_clause_sql(&f.name, c)),
+            None => String::new(),
+        };
+        cols.push(format!("\"{}\" {}{}{}", f.name, pg_type, not_null, check_clause));
     }
 
     format!("CREATE TABLE IF NOT EXISTS \"{collection}\" (\n  {}\n);", cols.join(",\n  "))
@@ -91,11 +99,14 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
     // necesitó -- la respuesta correcta no era documentar el requisito, era
     // borrarla.
     let mut statements = vec!["-- Schema generado automáticamente por Link (PostgreSQL Enterprise Backend)".to_string()];
+    let checks_by_collection = check_fields_by_collection(program, &checker);
+    let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
 
     for (coll_name, elem_ty) in checker.db_collections() {
         if let Type::Struct { fields, .. } = elem_ty {
             let non_id_fields: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
-            let sql = create_postgres_table_sql(coll_name, &non_id_fields, &simple_enums);
+            let checks = checks_by_collection.get(coll_name).unwrap_or(&empty_checks);
+            let sql = create_postgres_table_sql(coll_name, &non_id_fields, &simple_enums, checks);
             statements.push(sql);
         }
     }
@@ -168,6 +179,22 @@ mod tests {
         assert!(ddl.contains("\"is_active\" BOOLEAN NOT NULL"));
         assert!(ddl.contains("\"created_at\" BIGINT NOT NULL"));
         assert!(ddl.contains("\"metadata\" JSONB NOT NULL"));
+    }
+
+    /// GRAMMAR.md §3.96: `@check` genera un `CHECK (...)` inline de verdad
+    /// en el DDL estático que `linkc build` emite -- no solo se valida del
+    /// lado de la aplicación (`apply_field_validators`, `runtime/mod.rs`).
+    #[test]
+    fn check_annotation_emits_a_real_sql_check_constraint() {
+        let code = r#"
+        type Review = { id: Int, @check(range, 1, 5) rating: Int, @check(min, 0) helpfulVotes: Int, @check(max, 100) discountPercent: Float }
+        db { reviews: Review[] }
+        "#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let ddl = generate_postgres_ddl(&program).unwrap();
+        assert!(ddl.contains("\"rating\" BIGINT NOT NULL CHECK (\"rating\" >= 1 AND \"rating\" <= 5)"), "{ddl}");
+        assert!(ddl.contains("\"helpfulVotes\" BIGINT NOT NULL CHECK (\"helpfulVotes\" >= 0)"), "{ddl}");
+        assert!(ddl.contains("\"discountPercent\" DOUBLE PRECISION NOT NULL CHECK (\"discountPercent\" <= 100)"), "{ddl}");
     }
 
     /// PLAN.md §9.1: auditando si `CREATE EXTENSION "pgcrypto"` necesita

@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.60.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`@check(min/max/range, ...)`: constraints numéricos de nivel de base.** Séptimo reporte de adopción real (IgnisLove), con el ejemplo exacto: "`reviews.link` solo evita un rating fuera de 1-5 porque `clampRating()` lo fuerza en el código; no hay ninguna barrera a nivel de base si algún día otro rpc inserta sin pasar por esa función". Tres formas -- `@check(min, N)`, `@check(max, N)`, `@check(range, N, M)`, mismo criterio "kind + argumento(s)" que `@validate(email)`/`@validate(regex, ...)` -- sobre un campo `Int`/`Int64`/`Float` (requerido u opcional). Enforcement DOBLE: del lado de la aplicación (`apply_field_validators`, mismo mecanismo y los mismos dos puntos de entrada que `@validate` -- wire y struct construido dentro de un rpc -- 400 nombrando el campo y el límite exacto) Y del lado de la BASE (`CHECK (...)` inline de verdad en el `CREATE TABLE`, en SQLite y en PostgreSQL, el mismo generador que usa `linkc build` para `schema.postgres.sql`) -- confirmado escribiendo SQL crudo, sin pasar por c-script en absoluto, y viendo el `INSERT` rechazado por el propio motor, en los DOS backends. `--adopt-existing` nunca ejecuta este DDL (mismo criterio que `@index`/`@unique`), pero la validación de aplicación sigue protegiendo `insert`/`applyPatch` sin importar el modo. Alcance deliberado de esta ronda: solo rangos numéricos simples, ninguna expresión booleana arbitraria ni constraint sobre `String`.
+
+879 tests (11 nuevos): 5 en `checker.rs`, 1 en `codegen/postgres_emit.rs` (el DDL estático lleva el `CHECK` exacto), 4 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc`, 1 en `runtime/db.rs` contra SQLite real (un `INSERT` crudo se rechaza a nivel de SQLite) y 1 en `pg_integration.rs` contra un PostgreSQL real (mismo criterio). Detalle completo: GRAMMAR.md §3.96.
+
 ## [1.59.0] - 2026-08-24
 
 ### ✨ Nuevo
