@@ -3,6 +3,14 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.32.0] - 2026-08-24
+
+### 📝 Documentación
+- **Gotcha real de `link.lock`/resolución de imports**: compilar un `.link` fuera de la carpeta que en verdad es la raíz de su proyecto hace que cualquier import bare-name o relativo falle con `no se pudo resolver '<ruta>'` -- confirmado con el mensaje real del compilador, no aproximado.
+- **Comportamiento exacto ante `SIGTERM`/matar el proceso**: `linkc serve` no instala ningún manejador de señales (confirmado, no hay crate ni código de señales) -- terminación inmediata sin drenado gracioso, pero ninguna escritura ya confirmada al cliente puede perderse: cada `insert`/`applyPatch`/`delete` es una única sentencia SQL autocommit, nunca una transacción multi-sentencia abierta a mitad de camino.
+
+Sin cambios de código en esta ronda -- ambos ítems ya se comportaban bien, solo faltaba confirmarlo y documentarlo. Detalle completo: GRAMMAR.md §2.1 y §3.17.
+
 ## [1.31.0] - 2026-08-24
 
 ### 🐛 Arreglado
