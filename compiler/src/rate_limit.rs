@@ -7,14 +7,16 @@
 //! qué es "20/1m" por casualidad en vez de por construcción (GRAMMAR.md
 //! §3.9).
 //!
-//! v0, alcance acotado a propósito: la clave del bucket es
-//! (ip_del_cliente, servicio, rpc) -- la IP sale de `Request::remote_addr()`
-//! (la conexión TCP real), NUNCA de un header como `X-Forwarded-For`, que
-//! cualquier cliente puede mandar con el valor que quiera. Detrás de un
-//! proxy/balanceador esto limita por la IP del proxy, no la del usuario
-//! final -- documentado como limitación conocida en vez de confiar en un
-//! header sin un mecanismo de "proxy de confianza" configurado (que v0 no
-//! tiene).
+//! La clave del bucket es (ip_del_cliente, servicio, rpc) -- la IP sale de
+//! `Request::remote_addr()` (la conexión TCP real) por default, NUNCA de un
+//! header como `X-Forwarded-For` que cualquier cliente puede mandar con el
+//! valor que quiera. Detrás de un proxy/balanceador eso limitaría por la IP
+//! del proxy, no la del usuario final -- `--trust-proxy`/`LINK_TRUST_PROXY`
+//! (GRAMMAR.md §3.89, `runtime/server.rs::client_ip_for_rate_limit`) es el
+//! opt-in explícito para usar `X-Forwarded-For` en su lugar, apagado por
+//! default -- prenderlo sin tener de verdad un proxy de confianza delante
+//! deja que cualquier cliente directo evada el límite mandando un header
+//! distinto en cada request.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

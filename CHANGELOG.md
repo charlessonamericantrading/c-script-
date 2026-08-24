@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.54.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`--trust-proxy`/`LINK_TRUST_PROXY`: `@rate_limit` detrás de un proxy real.** `@rate_limit` (GRAMMAR.md §3.39) siempre identificó al cliente por `remote_addr()` -- la conexión TCP real -- deliberadamente, nunca por `X-Forwarded-For`, que cualquier cliente puede mandar con el valor que quiera. Correcto contra un cliente directo, pero detrás de un proxy o balanceador de verdad (confirmado como bloqueo real en producción: la adopción de IgnisLove corre todo detrás de nginx) `remote_addr()` es siempre la IP del proxy, la misma para cada request -- el límite termina compartido por TODOS los usuarios reales a la vez, no por cada uno. `--trust-proxy`/`LINK_TRUST_PROXY` (apagado por default, mismo criterio de flag booleano que `--adopt-existing`) hace que `@rate_limit` use el PRIMER valor de `X-Forwarded-For` (`cliente, proxy1, proxy2, ...`) en su lugar -- sin el header presente, cae de vuelta a `remote_addr()` tal cual. Opt-in explícito a propósito: prenderlo sin tener de verdad un proxy de confianza delante deja que cualquier cliente directo evada el límite por completo, mandando un header distinto en cada request. v0 sin validar cuántos proxies hay en el medio ni de qué IP vienen -- confía en el header completo en cuanto el flag está prendido, sin un mecanismo más fino de "N saltos de confianza" o un rango CIDR.
+
+824 tests (5 nuevos) en `cli_rate_limit.rs` contra el binario real: sin `--trust-proxy`, `X-Forwarded-For` con valores distintos NO separa el balde (todo cuenta contra el mismo límite); con `--trust-proxy`, cada IP reenviada distinta tiene su propio balde, y el PRIMER hop de una cadena se usa correctamente; con `--trust-proxy` pero sin el header, cae de vuelta a `remote_addr()` sin romper nada; y `LINK_TRUST_PROXY` funciona igual que el flag. Detalle completo: GRAMMAR.md §3.89.
+
 ## [1.53.0] - 2026-08-24
 
 ### 🔒 Seguridad

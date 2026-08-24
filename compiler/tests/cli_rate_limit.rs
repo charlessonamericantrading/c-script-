@@ -93,15 +93,17 @@ struct Serve {
 
 impl Serve {
     fn start(link_path: &PathBuf) -> Self {
+        Self::start_with_args(link_path, &[])
+    }
+
+    fn start_with_args(link_path: &PathBuf, extra_args: &[&str]) -> Self {
         let port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_linkc"))
-            .arg("serve")
-            .arg(link_path)
-            .arg(port.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("iniciar 'linkc serve'");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_linkc"));
+        cmd.arg("serve").arg(link_path).arg(port.to_string());
+        for a in extra_args {
+            cmd.arg(a);
+        }
+        let child = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("iniciar 'linkc serve'");
         wait_for_port(port);
         Serve { child, port }
     }
@@ -109,6 +111,17 @@ impl Serve {
     /// POST /{service}/{method} con un body JSON y un token bearer opcional
     /// -- HTTP de verdad sobre un TcpStream propio por request.
     fn post(&self, path: &str, body: &serde_json::Value, token: Option<&str>) -> (u16, serde_json::Value) {
+        self.post_with_headers(path, body, token, &[])
+    }
+
+    /// Como `post`, más headers extra (`X-Forwarded-For`, GRAMMAR.md §3.89).
+    fn post_with_headers(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        token: Option<&str>,
+        extra_headers: &[(&str, &str)],
+    ) -> (u16, serde_json::Value) {
         let mut stream = TcpStream::connect(("127.0.0.1", self.port)).expect("conectar");
         let body_str = body.to_string();
         let mut request = format!(
@@ -118,6 +131,9 @@ impl Serve {
         );
         if let Some(t) = token {
             request.push_str(&format!("Authorization: Bearer {t}\r\n"));
+        }
+        for (k, v) in extra_headers {
+            request.push_str(&format!("{k}: {v}\r\n"));
         }
         request.push_str("\r\n");
         request.push_str(&body_str);
@@ -191,6 +207,112 @@ fn requests_over_the_limit_get_429_and_unrelated_rpcs_are_unaffected() {
         let (status, body) = server.post("/Sys/unlimited", &json!({}), None);
         assert_eq!(status, 200, "request {i} a un rpc sin límite no debió verse afectada: {body:?}");
     }
+}
+
+// ---- `--trust-proxy`/`LINK_TRUST_PROXY` (GRAMMAR.md §3.89) ----
+
+#[test]
+fn without_trust_proxy_a_spoofed_x_forwarded_for_is_ignored() {
+    // Sin --trust-proxy: TODAS estas requests vienen de la MISMA conexión
+    // TCP real (el test), así que comparten un solo bucket sin importar qué
+    // diga X-Forwarded-For -- si el header se estuviera respetando por
+    // default, cada IP distinta tendría su propio balde y esto no daría
+    // 429 nunca.
+    let temp = TempDir::new("no-trust-proxy");
+    let out = build(&temp, PROGRAM);
+    assert!(out.status.success());
+    let server = Serve::start(&temp.0.join("app.link"));
+
+    for (i, fake_ip) in ["1.1.1.1", "2.2.2.2", "3.3.3.3"].iter().enumerate() {
+        let (status, body) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", fake_ip)]);
+        assert_eq!(status, 200, "request {} debió pasar: {body:?}", i + 1);
+    }
+    let (status, body) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "4.4.4.4")]);
+    assert_eq!(status, 429, "una 4ta IP 'distinta' no debería salvar de compartir el mismo balde: {body:?}");
+}
+
+#[test]
+fn with_trust_proxy_each_forwarded_ip_gets_its_own_bucket() {
+    let temp = TempDir::new("trust-proxy-separate");
+    let out = build(&temp, PROGRAM);
+    assert!(out.status.success());
+    let server = Serve::start_with_args(&temp.0.join("app.link"), &["--trust-proxy"]);
+
+    // Cliente A agota su balde de 3.
+    for i in 1..=3 {
+        let (status, body) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "9.9.9.1")]);
+        assert_eq!(status, 200, "cliente A, request {i}: {body:?}");
+    }
+    let (status, body) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "9.9.9.1")]);
+    assert_eq!(status, 429, "cliente A ya agotó su balde: {body:?}");
+
+    // Cliente B, IP distinta -- balde propio, sin verse afectado por A.
+    let (status, body) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "9.9.9.2")]);
+    assert_eq!(status, 200, "cliente B no debería verse afectado por el balde de A: {body:?}");
+}
+
+#[test]
+fn with_trust_proxy_the_first_hop_in_a_forwarding_chain_is_used() {
+    // "cliente, proxy1, proxy2" -- el primero (más cercano al cliente
+    // original) es el que corresponde tomar, no el último.
+    let temp = TempDir::new("trust-proxy-chain");
+    let out = build(&temp, PROGRAM);
+    assert!(out.status.success());
+    let server = Serve::start_with_args(&temp.0.join("app.link"), &["--trust-proxy"]);
+
+    for i in 1..=3 {
+        let (status, body) =
+            server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "5.5.5.5, 10.0.0.1, 10.0.0.2")]);
+        assert_eq!(status, 200, "request {i}: {body:?}");
+    }
+    let (status, _) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "5.5.5.5, 10.0.0.9")]);
+    assert_eq!(status, 429, "mismo primer hop (5.5.5.5) que antes -- debe compartir el balde ya agotado");
+}
+
+#[test]
+fn with_trust_proxy_and_no_header_falls_back_to_remote_addr() {
+    // --trust-proxy prendido pero SIN X-Forwarded-For en la request: cae de
+    // vuelta a remote_addr(), mismo comportamiento de siempre -- no debería
+    // tratarse como "cliente desconocido" ni fallar de ninguna forma rara.
+    let temp = TempDir::new("trust-proxy-no-header");
+    let out = build(&temp, PROGRAM);
+    assert!(out.status.success());
+    let server = Serve::start_with_args(&temp.0.join("app.link"), &["--trust-proxy"]);
+
+    for i in 1..=3 {
+        let (status, body) = server.post("/Sys/ping", &json!({}), None);
+        assert_eq!(status, 200, "request {i}: {body:?}");
+    }
+    let (status, body) = server.post("/Sys/ping", &json!({}), None);
+    assert_eq!(status, 429, "{body:?}");
+}
+
+#[test]
+fn link_trust_proxy_env_var_is_honored() {
+    let temp = TempDir::new("trust-proxy-env");
+    let out = build(&temp, PROGRAM);
+    assert!(out.status.success());
+    let port = free_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("serve")
+        .arg(temp.0.join("app.link"))
+        .arg(port.to_string())
+        .env("LINK_TRUST_PROXY", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("iniciar 'linkc serve'");
+    let server = Serve { child, port };
+    wait_for_port(port);
+
+    for i in 1..=3 {
+        let (status, body) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "7.7.7.7")]);
+        assert_eq!(status, 200, "request {i}: {body:?}");
+    }
+    // Otra IP reenviada -- balde propio, prueba que el env var de verdad
+    // prendió el chequeo de X-Forwarded-For.
+    let (status, body) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "8.8.8.8")]);
+    assert_eq!(status, 200, "{body:?}");
 }
 
 #[test]

@@ -110,6 +110,7 @@
   - [3.86 `--http-timeout <duración>`: timeout de llamadas salientes `http.*` — RESUELTO](#386---http-timeout-duración-timeout-de-llamadas-salientes-http--resuelto)
   - [3.87 `/health` verifica conectividad real a la base — RESUELTO](#387-health-verifica-conectividad-real-a-la-base--resuelto)
   - [3.88 Lint: comparación insegura de un secreto con `==` — RESUELTO](#388-lint-comparación-insegura-de-un-secreto-con----resuelto)
+  - [3.89 `--trust-proxy`: `@rate_limit` detrás de un proxy real — RESUELTO](#389---trust-proxy-rate_limit-detrás-de-un-proxy-real--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4220,6 +4221,27 @@ linkc lint app.link
 - **Sin `--fix` automático para esta regla.** A diferencia de `unused-var`/`unused-mut`, reescribir `a == b` como `crypto.timingSafeEqual(a, b)` a ciegas podría cambiar el TIPO de la expresión que lo rodea (`Bool` en los dos casos, pero el resto del código puede depender de que sea el operador `==` real, ej. dentro de un patrón más grande) -- se deja para que una persona lo revise.
 
 **Verificado**: 7 tests en `lint.rs` (un `Ident`/`FieldAccess` con nombre sospechoso dispara la regla con `==` y con `!=`, comparar contra `null` NO dispara nada, dos nombres comunes tampoco, DENTRO de un `while`/`if`/closure se encuentra igual, y -- el test de regresión -- exactamente UNA vez adentro de un `while`, no duplicado) y 1 en `cli_fmt_lint.rs` contra el binario real (`linkc lint` imprime la regla y la recomendación de `timingSafeEqual`).
+
+---
+
+### 3.89 `--trust-proxy`: `@rate_limit` detrás de un proxy real — RESUELTO
+
+`@rate_limit` (GRAMMAR.md §3.39) siempre identificó al cliente por `remote_addr()` -- la conexión TCP real -- deliberadamente, NUNCA por un header como `X-Forwarded-For` que cualquier cliente puede mandar con el valor que quiera. Correcto contra un cliente directo, pero detrás de un proxy o balanceador de verdad (nginx, un load balancer -- confirmado como bloqueo real en producción: la adopción de IgnisLove corre TODO detrás de nginx) `remote_addr()` es siempre la IP del proxy, la misma para cada request -- el límite termina siendo compartido por TODOS los usuarios reales a la vez, no por cada uno.
+
+```bash
+linkc serve app.link 8787 --trust-proxy
+LINK_TRUST_PROXY=1 linkc serve app.link 8787   # equivalente
+```
+
+**`--trust-proxy`/`LINK_TRUST_PROXY`, apagado por default -- mismo criterio de flag booleano de presencia que `--adopt-existing`.** Prendido, `@rate_limit` usa el PRIMER valor de `X-Forwarded-For` (`cliente, proxy1, proxy2, ...` -- el primero es el más cercano al cliente original) en vez de `remote_addr()`. Sin el header presente (incluso con el flag prendido), cae de vuelta a `remote_addr()` tal cual -- no hay motivo para tratar eso como "cliente desconocido".
+
+**Es un opt-in explícito a propósito -- prenderlo sin tener de verdad un proxy de confianza delante deja que cualquier cliente directo evada el límite por completo**, mandando un `X-Forwarded-For` distinto en cada request. La responsabilidad de que el header LLEGUE confiable (que el proxy real lo sobreescriba, en vez de dejar pasar el que mandó el cliente original) es de la configuración de ESE proxy, no de `linkc`.
+
+**Límites honestos:**
+- **Sin validación de CUÁNTOS proxies hay en el medio, ni de qué IP vienen.** No hay un mecanismo más fino de "confío en estos N saltos" o "confío en este rango CIDR" (lo que Express llama `trust proxy: n` o una lista de IPs) -- v0 confía en el header COMPLETO en cuanto el flag está prendido. Suficiente para el caso real que motivó esto (un solo proxy de confianza justo delante), no para una cadena de proxies con distintos niveles de confianza.
+- **Solo afecta a `@rate_limit`.** `request.header("X-Forwarded-For")` (GRAMMAR.md §3.38) sigue devolviendo el header CRUDO tal cual llegó, sin ningún procesamiento -- este flag no cambia nada de lo que un cuerpo de rpc puede leer directamente.
+
+**Verificado**: `cli_rate_limit.rs` con el binario real como subproceso (5 tests nuevos, sobre 3 que ya existían) -- sin `--trust-proxy`, `X-Forwarded-For` con valores distintos NO separa el balde (todo cuenta contra el mismo límite, probando que el header se ignora); con `--trust-proxy`, cada IP reenviada distinta tiene su propio balde, y el PRIMER hop de una cadena `cliente, proxy1, proxy2` es el que se usa; con `--trust-proxy` pero SIN el header, cae de vuelta a `remote_addr()` sin romper nada; y `LINK_TRUST_PROXY` funciona igual que el flag.
 
 ---
 

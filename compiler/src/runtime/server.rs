@@ -147,6 +147,14 @@ impl CorsConfig {
 /// `ureq` no tiene timeout de lectura/escritura por default, así que sin
 /// esto una request a un servidor lento o colgado bloqueaba el intérprete
 /// (de un solo hilo) para SIEMPRE.
+///
+/// `trust_proxy` (GRAMMAR.md §3.89): si `@rate_limit` (GRAMMAR.md §3.39)
+/// puede usar `X-Forwarded-For` para identificar al cliente -- `false` por
+/// default (usa `remote_addr()`, la conexión TCP real). `true` SOLO cuando
+/// `linkc serve` corre detrás de un proxy de confianza (nginx, un load
+/// balancer) que sobreescribe ese header con el valor real -- sin esto,
+/// cualquier cliente directo podría mandar el header que quiera y evadir el
+/// límite por completo.
 pub fn serve(
     program: Program,
     host: &str,
@@ -159,6 +167,7 @@ pub fn serve(
     adopt_existing: bool,
     max_body_bytes: u64,
     http_timeout: Duration,
+    trust_proxy: bool,
 ) {
     let server = tiny_http::Server::http((host, port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en {host}:{port}: {e}"));
@@ -227,7 +236,7 @@ pub fn serve(
     match remote_changes {
         None => {
             for request in server.incoming_requests() {
-                handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, max_body_bytes, request);
+                handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, max_body_bytes, trust_proxy, request);
             }
         }
         Some(remote_rx) => {
@@ -242,9 +251,17 @@ pub fn serve(
                     db.publish_remote(&change.collection, change.event);
                 }
                 match server.recv_timeout(REMOTE_CHANGE_POLL_INTERVAL) {
-                    Ok(Some(request)) => {
-                        handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, max_body_bytes, request)
-                    }
+                    Ok(Some(request)) => handle_request(
+                        &program,
+                        &db,
+                        &sessions,
+                        &route_table,
+                        &mut rate_limiter,
+                        &cors,
+                        max_body_bytes,
+                        trust_proxy,
+                        request,
+                    ),
                     Ok(None) => {}
                     Err(e) => eprintln!("error aceptando una conexión: {e}"),
                 }
@@ -274,6 +291,7 @@ fn handle_request(
     rate_limiter: &mut RateLimiter,
     cors: &CorsConfig,
     max_body_bytes: u64,
+    trust_proxy: bool,
     mut request: tiny_http::Request,
 ) {
     // Resuelto UNA vez por request, antes de cualquier otra cosa --
@@ -385,12 +403,13 @@ fn handle_request(
     // `@rate_limit` (GRAMMAR.md §3.39): corre ANTES del gate de auth de
     // abajo, a propósito -- si corriera después, un rpc protegido dejaría
     // probar credenciales sin límite alguno (401 no cuesta nada). La IP
-    // sale de la conexión TCP real (`remote_addr`), nunca de un header
-    // que el cliente controla -- ver rate_limit.rs para el porqué.
+    // sale de la conexión TCP real (`remote_addr`) por default, o de
+    // `X-Forwarded-For` SOLO si `--trust-proxy`/`LINK_TRUST_PROXY` lo pide
+    // explícitamente (GRAMMAR.md §3.89) -- ver `client_ip_for_rate_limit`.
     if let Some(raw_spec) = required_rate_limit(&program, service_name, rpc_name) {
         let spec = RateLimitSpec::parse(raw_spec)
             .expect("check_rate_limit_annotation (checker.rs) ya validó este formato en compilación");
-        let client_ip = request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "desconocida".to_string());
+        let client_ip = client_ip_for_rate_limit(&request, trust_proxy);
         if !rate_limiter.check(&client_ip, service_name, rpc_name, spec) {
             let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
             log_done(req_id, Some(&method), 429, start, "");
@@ -632,6 +651,36 @@ fn parse_query_string(qs: &str) -> std::collections::HashMap<String, String> {
             (percent_decode_query_value(k), percent_decode_query_value(v))
         })
         .collect()
+}
+
+/// Identificador de cliente que usa `@rate_limit` (GRAMMAR.md §3.39/§3.89)
+/// para agrupar requests -- `remote_addr()` (la conexión TCP real) por
+/// default, o el PRIMER valor de `X-Forwarded-For` cuando `trust_proxy` es
+/// `true` Y el header está presente. `X-Forwarded-For` es una lista
+/// separada por comas que cada proxy en la cadena va extendiendo
+/// (`cliente, proxy1, proxy2, ...`) -- el primer valor es el más cercano al
+/// cliente original, así que es el que corresponde tomar. Alcance v0
+/// deliberado: no valida CUÁNTOS proxies hay en el medio ni de qué IP
+/// vienen -- confía en el valor completo del header en cuanto
+/// `trust_proxy` está prendido, sin un mecanismo más fino de "proxy de
+/// confianza por IP/CIDR" (ver GRAMMAR.md §3.89, "Límites honestos").
+/// `X-Forwarded-For` ausente (incluso con `trust_proxy` prendido) cae de
+/// vuelta a `remote_addr()` -- no hay motivo para tratar eso como "cliente
+/// desconocido" cuando la conexión TCP real sigue siendo una IP perfectamente
+/// válida para el propósito.
+fn client_ip_for_rate_limit(request: &tiny_http::Request, trust_proxy: bool) -> String {
+    if trust_proxy {
+        let forwarded = request.headers().iter().find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Forwarded-For"));
+        if let Some(header) = forwarded {
+            if let Some(first) = header.value.as_str().split(',').next() {
+                let first = first.trim();
+                if !first.is_empty() {
+                    return first.to_string();
+                }
+            }
+        }
+    }
+    request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "desconocida".to_string())
 }
 
 /// Resuelve (servicio, rpc, args) para esta request -- por una `@route` si el

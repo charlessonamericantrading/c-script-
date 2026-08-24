@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.53.0-blue.svg" alt="Version" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.54.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 819 automated tests:
+**Works today**, covered by 824 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `--trust-proxy`/`LINK_TRUST_PROXY` for `linkc serve`: makes `@rate_limit` identify the client by the first `X-Forwarded-For` value instead of `remote_addr()` — off by default, since `remote_addr()` is always the proxy's own IP behind a real reverse proxy/load balancer (confirmed as a real production blocker: the IgnisLove adoption runs entirely behind nginx), sharing the limit across every real user at once. Explicit opt-in on purpose — turning it on without an actual trusted proxy in front lets any direct client dodge the limit by sending a different header on each request. v0 trusts the whole header once enabled, no "N trusted hops" or CIDR-range mechanism yet
 - `linkc lint` flags `==`/`!=` on anything named like a secret (`token`, `password`, `apiKey`, ...) with `timing-unsafe-secret-comparison`, recommending `crypto.timingSafeEqual` instead — a plain `==` on a `String` short-circuits at the first differing byte, leaking how much of it a guesser got right. Comparing against `null` (a presence check) is deliberately exempt. Walks the whole body at any nesting depth (`if`/`match`/`while`/closures); purely informational, `linkc lint` still exits 0
 - `/health` (`/`, `/status`) checks real database connectivity — a `SELECT 1` on every request, no caching. Until now it always returned a fixed `200`, useless for any orchestrator (Kubernetes, a load balancer) deciding whether to restart the process: it could be alive and yet unable to serve any real rpc because the database was down, and `/health` would still report everything fine. Returns `503` with `"status":"error"` and the real failure in a new `"database"` field when the check fails; on Postgres it goes through the same connection auto-repair as any other query, so a transient drop heals itself right there
 - `--http-timeout <duration>`/`LINK_HTTP_TIMEOUT` for `linkc serve`: caps how long any outbound `http.*` call can take — 30s by default. Until now, `http.get`/`post`/`getWithHeaders`/etc. had no read/write timeout at all (`ureq` only defaults a 30s *connect* timeout); against this single-threaded interpreter, a slow or hanging remote server blocked the entire process forever — not even `/health` responded meanwhile. Same precedence and duration format (`Ns`/`Nm`/`Nh`/`Nd`) as `--session-ttl`; a timed-out call surfaces as an ordinary runtime error, never a panic or a hang
