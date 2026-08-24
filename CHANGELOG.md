@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.34.0] - 2026-08-24
+
+### ✨ Nuevo
+- **Narrowing real de `T?`: `match`, `??`, `.isSome()`/`.isNone()`.** El gap más repetido y con más fricción de dos reportes de adopción real independientes -- hasta esta ronda no había NINGUNA forma de leer el valor interior de un `T?` dentro de un `rpc` (bloqueó lógica de negocio real, un caso confirmado: validar caducidad de un cupón tuvo que moverse fuera del servidor). `match x { v: T => ..., null => ... }` narrowea de verdad -- reusa el mismo mecanismo de patrones que ya narrowaba uniones (`Pattern::Type`, `check_exhaustive_union`), con un `check_exhaustive_optional` hermano y `null` como patrón literal nuevo. Exhaustivo de verdad: falta el caso `null` o el caso de valor, error de compilación. `a ?? b` (con encadenado real: `a ?? b ?? default`, cortocircuita como `&&`/`||`) cubre el caso "dame un default" sin la ceremonia de un match completo; `.isSome()`/`.isNone()` cubren "solo necesito saber si hay valor" -- con un caso adversarial real resuelto (un struct PLANO con un campo de verdad llamado `isSome` que guarda una closure sigue llamándose como ESE campo, nunca shadoweado por el atajo del opcional). `if x != null { x.campo }` sigue sin angostar, a propósito -- eso no cambió. El mensaje de error de acceso directo a un campo sobre `T?` ahora señala las tres alternativas reales en vez de solo decir "no se puede". Completion del LSP para `T?` ofrece `isSome()`/`isNone()`, nunca los campos de `T` (que siguen necesitando `match`).
+
+671 tests (22 nuevos): 14 en `checker.rs` (exhaustividad completa en los dos sentidos, wildcard, patrón de tipo incompatible rechazado, `null` contra escrutinio no opcional rechazado, `??` sobre no-opcional rechazado, lado derecho de `??` debe ser `T` o `T?`, encadenado, `isSome`/`isNone` rechazados sobre no-opcional y sin argumentos), 7 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (narrowing de struct y primitivo, `??` con cortocircuito real verificado, encadenado de 3 opcionales, caso adversarial del campo shadowing), 1 en `lsp.rs` (completion). Detalle completo: GRAMMAR.md §3.69.
+
 ## [1.33.0] - 2026-08-24
 
 ### 📝 Documentación

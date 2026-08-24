@@ -508,6 +508,12 @@ pub enum BinaryOp {
     GtEq,
     And,
     Or,
+    /// `a ?? b` (GRAMMAR.md §3.9): si `a` (un `T?`) no es `null`, el valor
+    /// desenvuelto; si no, `b` (de tipo `T`). Azúcar sobre exactamente el
+    /// `match` de narrowing de arriba -- existe aparte porque escribir
+    /// `match x { v: Item => v, null => default }` para el caso más común
+    /// ("dame un default") es ceremonia real que no aporta nada.
+    Coalesce,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -543,11 +549,11 @@ pub enum MatchArmBody {
 pub enum Pattern {
     /// binding simple, incluye `_` (wildcard)
     Bind(String),
-    /// `1`, `"texto"`, `true`/`false` (GRAMMAR.md §3.3) -- deliberadamente
-    /// SIN Float (comparar floats por igualdad exacta es la misma trampa
-    /// que Rust terminó prohibiendo en sus propios patrones) y sin `null`
-    /// (matchear un `T?` directamente queda para cuando exista ese diseño;
-    /// hoy la forma de testear nullability es `== null` en un `if`, §3.7).
+    /// `1`, `"texto"`, `true`/`false`, `null` (GRAMMAR.md §3.3) --
+    /// deliberadamente SIN Float (comparar floats por igualdad exacta es la
+    /// misma trampa que Rust terminó prohibiendo en sus propios patrones).
+    /// `null` solo es válido contra un escrutinio `T?` -- narrowing real de
+    /// un opcional, GRAMMAR.md §3.9: `match x { v: Item => ..., null => ... }`.
     Literal(LiteralPattern),
     /// `Enum.Variante { campo: patrón, ... }` — la variante unitaria sin
     /// llaves (`Enum.Variante`) se representa con `fields: None`.
@@ -581,6 +587,7 @@ pub enum LiteralPattern {
     Int(i64),
     Str(String),
     Bool(bool),
+    Null,
 }
 
 #[derive(Debug, Clone, PartialEq)]

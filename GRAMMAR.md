@@ -90,6 +90,7 @@
   - [3.66 `linkc introspect`: generar un `.link` desde una base PostgreSQL existente — RESUELTO, alcance acotado](#366-linkc-introspect-generar-un-link-desde-una-base-postgresql-existente--resuelto-alcance-acotado)
   - [3.67 `--adopt-existing`: adoptar tablas sin auto-migrar — RESUELTO](#367---adopt-existing-adoptar-tablas-sin-auto-migrar--resuelto)
   - [3.68 NULL en una columna requerida tras una migración de PostgreSQL: error limpio, no `null` silencioso — RESUELTO](#368-null-en-una-columna-requerida-tras-una-migración-de-postgresql-error-limpio-no-null-silencioso--resuelto)
+  - [3.69 Narrowing real de `T?`: `match`, `??` y `.isSome()`/`.isNone()` — RESUELTO](#369-narrowing-real-de-t-match--y-issome-isnone--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3417,6 +3418,74 @@ Si la tabla física de `items` tiene una fila con `NULL` en `note` (típico tras
 - `--adopt-existing` (§3.67) no cambia nada acá: sigue validando solo que la columna EXISTA, nunca sus valores reales.
 
 **Verificado**: 5 tests nuevos en `runtime/mod.rs` confirman la matriz completa de auto-migrate contra SQLite real (columna eliminada, renombrada, tipo cambiado, requerido→opcional, opcional→requerido -- las 5 fallan al conectar, con el mismo mensaje ya documentado en §3.17); 1 test nuevo en `pg_integration.rs` contra un PostgreSQL real siembra una fila con `NULL` a mano (simulando datos de antes de la migración), confirma que `list()` falla con un error que nombra el campo -- nunca un panic -- y que el servidor sigue respondiendo 200 normal a la request SIGUIENTE contra una fila sin el problema.
+
+---
+
+### 3.69 Narrowing real de `T?`: `match`, `??` y `.isSome()`/`.isNone()` — RESUELTO
+
+El gap más repetido y con más fricción de dos reportes de adopción real independientes (MyFinance, IgnisLove): hasta esta ronda no había NINGUNA forma de leer el valor interior de un `T?` dentro de un `rpc` -- `if x != null { x.campo }` tipaba el `if` pero el acceso a `campo` adentro siempre fallaba, a propósito (§3.4), porque c-script no tenía narrowing vía `if`. La salida documentada era "devolvé el `T?` tal cual y desarmalo del lado de TypeScript" -- una respuesta real, pero que en la práctica bloqueó lógica de negocio genuina (un caso real: validar la caducidad de un cupón tuvo que moverse FUERA del servidor, al cliente, porque no había forma de comparar `cupon?.expiresAt` contra `now()` dentro del `rpc`).
+
+**La pieza que ya existía y hacía esto tratable en una sola ronda**: el narrowing de uniones vía `match` (§3.9) -- `Pattern::Type(nombre, Tipo)` para ligar una variable al tipo real, más el algoritmo de exhaustividad que ya usa `check_exhaustive_union`. Un `T?` no es más que "T o ausente" -- dos casos, no una lista de miembros -- así que se resuelve con el MISMO mecanismo de patrones, una función de exhaustividad hermana (`check_exhaustive_optional`, dos `bool` en vez de un `Vec<bool>` por miembro), y un patrón nuevo: `null` como literal de patrón (antes explícitamente prohibido, `LiteralPattern` no tenía esa variante).
+
+<!-- linkc:check -->
+```rust
+type Coupon = { id: Int, code: String, expiresAt: Timestamp }
+
+service Coupons {
+  // 'match' desarma el T? de verdad: 'cc' queda ligado a Coupon (no
+  // Coupon?) dentro de esa rama -- ahí sí se puede leer cc.code/cc.expiresAt.
+  rpc describe(c: Coupon?) -> String {
+    match c {
+      cc: Coupon => "activo: " + cc.code,
+      null => "sin coupon",
+    }
+  }
+
+  // '??': el caso común, "dame un default" -- azúcar sobre el mismo match,
+  // sin la ceremonia de escribirlo entero para solo eso.
+  rpc nameOrDefault(name: String?) -> String {
+    name ?? "anonimo"
+  }
+
+  // '.isSome()'/'.isNone()': cuando el cuerpo solo necesita SABER si hay
+  // valor, no leerlo -- la rama sin la ceremonia de un match completo.
+  rpc hasCoupon(c: Coupon?) -> Bool {
+    c.isSome()
+  }
+}
+
+test "narrowing real sobre T? funciona en los tres casos" {
+  let present = Coupon { id: 1, code: "AHORRO10", expiresAt: now() };
+  assert(Coupons.describe(present) == "activo: AHORRO10");
+  assert(Coupons.describe(null) == "sin coupon");
+  assert(Coupons.nameOrDefault("Ada") == "Ada");
+  assert(Coupons.nameOrDefault(null) == "anonimo");
+  assert(Coupons.hasCoupon(present));
+  assert(!Coupons.hasCoupon(null));
+}
+```
+
+**Las tres formas, y cuándo usar cada una:**
+
+| Forma | Cuándo | Lo que da |
+|---|---|---|
+| `match x { v: T => ..., null => ... }` | Necesitás leer campos/métodos de `T`, o las dos ramas hacen algo distinto de verdad | Narrowing completo -- `v` es `T`, no `T?`, dentro de esa rama |
+| `x ?? default` | Solo necesitás "el valor, o un default si no hay" | El `T` desenvuelto directo, sin match -- encadenable (`a ?? b ?? c`, asocia a izquierda) |
+| `x.isSome()` / `x.isNone()` | Solo necesitás SABER si hay valor, no leerlo | `Bool` -- la rama sigue sin poder leer el valor sin `match`/`??` |
+
+**`match` sobre `T?` es exhaustivo de verdad, igual que sobre una unión.** Falta el caso `null`, o falta el caso `v: T` (o ambos): error de compilación (`match no exhaustivo sobre {T}?: falta cubrir [...]`), nunca un caso sin cubrir que explota en runtime. Un `Pattern::Bind` sin guard (`_ => ...` o `cualquiera => ...`) cubre los dos casos a la vez, mismo criterio que el resto de los escrutinios de este lenguaje (§3.3).
+
+**`a ?? b` acepta DOS formas para `b`, no solo una.** Si `b` es el `T` desenvuelto (el caso común), el resultado de `a ?? b` es `T`, definitivo -- ya no opcional. Si `b` es TAMBIÉN `T?` (para encadenar `a ?? b ?? default`), el resultado sigue siendo `T?` hasta que algún eslabón de la cadena sea definitivo. `a ?? b ?? c` no necesita ningún caso especial para "la cadena completa" -- asocia a izquierda como cualquier otro binario, así que cada `??` sólo mira sus dos operandos inmediatos. Cortocircuita: `b` nunca se evalúa si `a` ya tiene valor, mismo criterio que `&&`/`||`.
+
+**`.isSome()`/`.isNone()` funcionan sobre CUALQUIER `T?`, incluido uno struct-shaped -- con un caso adversarial real resuelto.** Un opcional no tiene ningún envoltorio en runtime: su forma "presente" es el valor de `T` tal cual (`Value::Struct` si `T` es un struct), y su forma "ausente" es `Value::Null`. Eso significa que `x.isSome()` sobre un `x: Item?` presente evalúa `x` a un `Value::Struct` normal -- y el camino genérico de `FieldAccess` sobre un struct busca un CAMPO real llamado `isSome`, no un método, así que un struct que declara honestamente un campo `isSome: (Int) -> Bool` (closures como campos, §3.10) y lo llama con esa misma sintaxis tiene que seguir funcionando como ESE campo. Se resuelve mirando, en runtime, si el valor real tiene un campo con ese nombre ANTES de asumir que es el método del opcional -- verificado con un test que arma ese struct adversarial a propósito.
+
+**Límites honestos:**
+- **Narrowing solo vía `match`, nunca vía `if`.** `if x != null { x.campo }` sigue sin angostar -- decisión deliberada de §3.4/§3.9, no algo que esta ronda haya revisado. Quien quiera narrowing con sintaxis de `if` tiene que usar `match` con un patrón de tipo, no hay un atajo `if let` separado.
+- **`match` sobre `T?` exige EXACTAMENTE el tipo interno, no un supertipo/subtipo arbitrario** -- mismo criterio de subtipado mutuo que ya usa `check_exhaustive_union` (dos structs estructuralmente idénticos SÍ se aceptan entre sí, por diseño de subtipado estructural -- no es una laxitud nueva de esta ronda).
+- **`??` no valida en runtime que el default sea "seguro"** -- si el default es una llamada costosa (una lectura a `db`, por ejemplo), cortocircuita igual que `&&`/`||`, pero seguirá pagando ese costo cada vez que el lado izquierdo SÍ sea `null`.
+- **Nada de esto cruza a TypeScript.** `match`/`??`/`.isSome()`/`.isNone()` son construcciones de BACKEND -- el contrato generado sigue emitiendo `T | null` para un campo `T?` tal cual siempre lo hizo (§3.4); el cliente sigue angostando con las herramientas propias de TypeScript, sin ningún cambio.
+
+**Verificado**: 14 tests nuevos en `checker.rs` (exhaustividad completa -- falta `null`, falta el caso de valor, wildcard cubre los dos, un patrón de tipo incompatible se rechaza, `null` contra un escrutinio no opcional se rechaza, `??` sobre algo no opcional se rechaza, el lado derecho de `??` tiene que ser `T` o `T?`, encadenar typechecked, `.isSome()`/`.isNone()` se rechazan sobre un tipo no opcional y no aceptan argumentos) y 7 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (narrowing de struct y de primitivo en los dos sentidos, `??` con valor presente/default/cortocircuito real, encadenado de 3 opcionales, `isSome`/`isNone` sobre un struct-shaped `T?`, y el caso adversarial del campo `isSome` real que no se deja shadowear); 1 test más en `lsp.rs` confirma que el completion sobre un `T?` ofrece solo `isSome()`/`isNone()`, nunca los campos de `T`.
 
 ---
 

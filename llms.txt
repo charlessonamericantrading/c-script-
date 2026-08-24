@@ -76,9 +76,12 @@ difference between code that compiles and code that does not.
    first-attempt failures.
 2. **Closures take no return-type annotation**: `|t: Todo| { !t.completed }`, never
    `|t: Todo| -> Bool { ... }`.
-3. **A `T?` cannot be dereferenced.** `if x != null` type-checks as a boolean test but does
-   not narrow `x`, so `x.field` inside the branch is an error. Return `T?` to the frontend
-   (TypeScript narrows it fine) instead of taking it apart in c-script.
+3. **A `T?` still can't be dereferenced via `if`.** `if x != null` type-checks as a boolean
+   test but doesn't narrow `x`, so `x.field` inside the branch is still an error — that part
+   is deliberate and unchanged. Real narrowing exists through `match` instead:
+   `match x { v: T => v.field, null => ... }` binds `v` to the real `T` (GRAMMAR.md §3.69).
+   For "give me a default," `x ?? default` is shorter; `x.isSome()`/`x.isNone()` cover "just
+   need to know if there's a value" without reading it.
 4. **`db.<c>.insert` takes the type without `id`** (`Omit<T, "id">`). Passing a full struct
    with an explicit `id` is accepted, but the value is ignored — the database assigns 1, 2, 3…
 5. **`db.<c>.subscribe()` is legal in exactly one place**: as the entire body of
@@ -92,11 +95,13 @@ difference between code that compiles and code that does not.
    (SSE owns its content type), and at most once. Auth annotations stack with it:
    `@requires(Role.Admin) @content_type("text/html")` is valid and is how an admin
    page is written.
-9. **`@route`'s parameter set must match the rpc's parameter set by name, exactly**:
-   `@route("/blog/:category/:slug")` requires the rpc to take exactly `category` and
-   `slug` as parameters (in any order — binding is by name, not position), each
-   `String` or `Int`, nothing else. A route with no `:param` requires the rpc to take
-   zero parameters; there is no query-string or body fallback.
+9. **`@route`'s path params must be a SUBSET of the rpc's params, matched by name.**
+   `@route("/blog/:category/:slug")` requires the rpc to take `category` and `slug`
+   somewhere in its params (any order — binding is by name, not position), each
+   `String` or `Int`. Any rpc param NOT in the path is read from the query string
+   instead (`String`/`Int` required, `String?`/`Int?` optional, `null` if absent) — a
+   route with no `:param` at all still works with query-only params, or zero params.
+   `body` is still never read on a `@route` GET.
 10. **`@rate_limit`'s argument is `"N/window"`, not a sentence.** `"20/1m"` (20 per
     minute), never `"20 per minute"` or `"20/minute"`. Window unit is exactly one of
     `s`/`m`/`h`; the window's number is optional (`"5/m"` means `"5/1m"`) but the
@@ -177,8 +182,10 @@ service Todos {
     })
   }
 
-  // Returns Todo? and hands it to TypeScript as `Todo | null`. Do not try to
-  // read a field off it here -- there is no narrowing in c-script.
+  // Returns Todo? and hands it to TypeScript as `Todo | null` -- no need to
+  // narrow it here since this rpc just passes it through. If you DID need to
+  // read a field off it in the backend, `match`/`??`/`.isSome()` narrow a
+  // T? for real; `if x != null { x.field }` still doesn't.
   rpc getById(id: Int) -> Todo? {
     db.todos.find(id)
   }

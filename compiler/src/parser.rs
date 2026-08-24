@@ -808,7 +808,7 @@ impl Parser {
         // Misma restricción que la condición de un `if` (parse_if_expr):
         // sin esto, `while x { ... }` sería tan ambiguo con un struct-lit
         // `x { ... }` como `if x { ... }` ya lo es.
-        let cond = self.parse_or_expr(true)?;
+        let cond = self.parse_coalesce_expr(true)?;
         let body = self.parse_block()?;
         let span = merge(start, self.prev_span());
         Ok(Spanned { node: Stmt::While { cond, body }, span })
@@ -832,8 +832,23 @@ impl Parser {
         } else if self.check(&TokenKind::If) {
             self.parse_if_expr()
         } else {
-            self.parse_or_expr(no_struct_lit)
+            self.parse_coalesce_expr(no_struct_lit)
         }
+    }
+
+    /// `a ?? b` (GRAMMAR.md §3.9) -- la precedencia más floja de todas (ata
+    /// después de `||`/`&&`/comparaciones), mismo lugar que ocupa en
+    /// TypeScript/Rust (`.unwrap_or`). `a ?? b ?? c` asocia a IZQUIERDA,
+    /// como cualquier otro binario de esta cadena.
+    fn parse_coalesce_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
+        let mut left = self.parse_or_expr(no_struct_lit)?;
+        while self.check(&TokenKind::QuestionQuestion) {
+            self.advance();
+            let right = self.parse_or_expr(no_struct_lit)?;
+            let span = merge(left.span, right.span);
+            left = Spanned { node: Expr::Binary { op: BinaryOp::Coalesce, left: Box::new(left), right: Box::new(right) }, span };
+        }
+        Ok(left)
     }
 
     fn parse_if_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
@@ -841,7 +856,7 @@ impl Parser {
         self.eat(&TokenKind::If)?;
         // La condición siempre restringe struct-lits, sin importar el
         // contexto exterior: `if x { ... }` es ambiguo igual que `match`.
-        let cond = Box::new(self.parse_or_expr(true)?);
+        let cond = Box::new(self.parse_coalesce_expr(true)?);
         let then_block = self.parse_block()?;
         self.eat(&TokenKind::Else)?;
         let else_block = if self.check(&TokenKind::If) {
@@ -992,7 +1007,7 @@ impl Parser {
             // §2.3) -- un guard, igual que esa condición, siempre termina
             // justo antes de un token que decide el resto del arm (acá, `=>`),
             // así que restringir struct-lits acá no pierde generalidad real.
-            Some(self.parse_or_expr(true)?)
+            Some(self.parse_coalesce_expr(true)?)
         } else {
             None
         };
@@ -1072,6 +1087,14 @@ impl Parser {
             TokenKind::False => {
                 self.advance();
                 Ok(Pattern::Literal(LiteralPattern::Bool(false)))
+            }
+            // `null` como patrón (GRAMMAR.md §3.9): narrowing real de un
+            // `T?` -- `match x { v: Item => ..., null => ... }`. Solo válido
+            // contra un escrutinio opcional, el checker es quien lo rechaza
+            // en cualquier otro lado (check_literal_matches_type).
+            TokenKind::Null => {
+                self.advance();
+                Ok(Pattern::Literal(LiteralPattern::Null))
             }
             _ => {
                 let name = self.eat_ident()?;

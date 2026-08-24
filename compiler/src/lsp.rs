@@ -1470,6 +1470,15 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
                 .map(|f| json!({ "label": f.name, "kind": 5, "detail": format!("Field: {}", render_type(&f.ty)) }))
                 .collect(),
         ),
+        // Un `T?` no puede desreferenciarse por `.campo` -- ofrecer los
+        // campos de `inner` acá sería sugerir código que el checker rechaza
+        // ni bien se acepte (GRAMMAR.md §3.69). Los únicos dos métodos
+        // reales sobre un opcional son estos; leer el valor de verdad
+        // necesita 'match' (sin completado propio -- no es un método).
+        Type::Optional(_) => Some(vec![
+            method("isSome()", "Check if this optional has a value, without reading it"),
+            method("isNone()", "Check if this optional is null, without reading it"),
+        ]),
         _ => None,
     }
 }
@@ -1799,6 +1808,20 @@ mod tests {
         assert!(completions.iter().any(|c| c["label"] == "x"), "{completions:?}");
         assert!(completions.iter().any(|c| c["label"] == "y"), "{completions:?}");
         assert!(!completions.iter().any(|c| c["label"] == "map(fn)"), "un struct no tiene métodos de lista: {completions:?}");
+    }
+
+    #[test]
+    fn test_completion_after_dot_on_an_optional_receiver_only_offers_is_some_is_none() {
+        // GRAMMAR.md §3.69: un `T?` no puede desreferenciarse por `.campo`
+        // (ni por completion) -- solo `isSome()`/`isNone()` son válidos acá,
+        // nunca los campos de `Point` (eso necesita 'match' primero).
+        let code = "type Point = { x: Int, y: Int }\nfn f(p: Point?) -> Bool { p. }\n";
+        let line1 = code.lines().nth(1).unwrap();
+        let col = line1.find("p.").unwrap() + 2;
+        let completions = get_completions(code, 1, col, None);
+        assert!(completions.iter().any(|c| c["label"] == "isSome()"), "{completions:?}");
+        assert!(completions.iter().any(|c| c["label"] == "isNone()"), "{completions:?}");
+        assert!(!completions.iter().any(|c| c["label"] == "x"), "un T? no ofrece los campos de T: {completions:?}");
     }
 
     #[test]

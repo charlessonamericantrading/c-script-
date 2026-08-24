@@ -487,6 +487,47 @@ pub(crate) fn eval_expr(
                     }
                 }
             }
+            // `.isSome()`/`.isNone()` sobre un `T?` (GRAMMAR.md §3.9):
+            // interceptado ACÁ, antes de evaluar `callee` como field access
+            // genérico -- el checker solo aprueba estos dos nombres cuando
+            // `base` es de tipo `Optional(_)` (`try_builtin_method`), pero un
+            // opcional PRESENTE no tiene ningún envoltorio en runtime: su
+            // valor es el de `T` tal cual, que puede ser `Value::Struct`.
+            // `Expr::FieldAccess` de más abajo, evaluado genéricamente,
+            // buscaría "isSome" como un CAMPO real de ese struct (y fallaría
+            // a `Value::Null` en vez de producir un método) -- exactamente
+            // el mismo desacuerdo que motivó este atajo.
+            //
+            // Ojo con el caso adversarial: un struct PLANO (no opcional)
+            // puede legítimamente declarar un campo `isSome`/`isNone` de
+            // tipo función y llamarlo con esta MISMA sintaxis
+            // (`x.isSome()`, closures como campos, GRAMMAR.md §3.10) -- ESE
+            // caso tiene que seguir el camino normal, no el atajo de abajo.
+            // Se distinguen mirando si el valor real tiene un campo con ese
+            // nombre: si lo tiene, es el campo (posible closure), no el
+            // opcional; `base_v` ya evaluado se reusa para no evaluar `base`
+            // dos veces (importante si tiene efectos, ej. una lectura a `db`).
+            if let Expr::FieldAccess { base, field } = &callee.node {
+                if field == "isSome" || field == "isNone" {
+                    let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token, step_budget)?;
+                    let shadowed_by_real_field = matches!(
+                        &base_v,
+                        Value::Struct(fields) | Value::Variant { fields, .. } if fields.iter().any(|(n, _)| n == field)
+                    );
+                    if !shadowed_by_real_field {
+                        let is_null = matches!(base_v, Value::Null);
+                        return Ok(Value::Bool(if field == "isSome" { !is_null } else { is_null }));
+                    }
+                    let callee_v = match &base_v {
+                        Value::Struct(fields) | Value::Variant { fields, .. } => {
+                            fields.iter().find(|(n, _)| n == field).map(|(_, v)| v.clone()).unwrap_or(Value::Null)
+                        }
+                        _ => unreachable!("shadowed_by_real_field solo es true para Struct/Variant"),
+                    };
+                    let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                    return call_callable(callee_v, arg_vs, db, fns, checker, sessions, current_token, step_budget);
+                }
+            }
             let callee_v = eval_expr(callee, env, db, fns, checker, sessions, current_token, step_budget)?;
             let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
             match callee_v {
@@ -631,6 +672,17 @@ fn eval_binary(
             _ => Ok(Value::Bool(as_bool(&eval_expr(right, env, db, fns, checker, sessions, current_token, step_budget)?)?)),
         };
     }
+    // `a ?? b` (GRAMMAR.md §3.9) también cortocircuita: `b` nunca se evalúa
+    // si `a` ya tiene un valor -- mismo espíritu que `&&`/`||` arriba, útil
+    // si `b` es una llamada costosa (una lectura a `db`, por ejemplo) que no
+    // hace falta pagar cuando `a` ya resolvió el caso.
+    if op == Coalesce {
+        let l = eval_expr(left, env, db, fns, checker, sessions, current_token, step_budget)?;
+        return match l {
+            Value::Null => eval_expr(right, env, db, fns, checker, sessions, current_token, step_budget),
+            other => Ok(other),
+        };
+    }
 
     let l = eval_expr(left, env, db, fns, checker, sessions, current_token, step_budget)?;
     let r = eval_expr(right, env, db, fns, checker, sessions, current_token, step_budget)?;
@@ -651,7 +703,7 @@ fn eval_binary(
         LtEq => compare(l, r, |o| o != std::cmp::Ordering::Greater),
         Gt => compare(l, r, |o| o == std::cmp::Ordering::Greater),
         GtEq => compare(l, r, |o| o != std::cmp::Ordering::Less),
-        And | Or => unreachable!("manejado arriba con cortocircuito"),
+        And | Or | Coalesce => unreachable!("manejado arriba con cortocircuito"),
     }
 }
 
@@ -808,6 +860,7 @@ fn literal_matches(lit: &LiteralPattern, v: &Value) -> bool {
         (LiteralPattern::Int(a), Value::Int(b)) => a == b,
         (LiteralPattern::Str(a), Value::Str(b)) => a == b,
         (LiteralPattern::Bool(a), Value::Bool(b)) => a == b,
+        (LiteralPattern::Null, Value::Null) => true,
         _ => false,
     }
 }
@@ -3057,6 +3110,143 @@ mod tests {
             invoke_rpc(&program, "S", "describe", &json!({"v": {"x": "hola"}}), &db).unwrap(),
             json!("B")
         );
+    }
+
+    // ---- narrowing real de `T?` vía 'match', '??', '.isSome()'/'.isNone()' (GRAMMAR.md §3.9) ----
+
+    #[test]
+    fn match_narrowing_over_an_optional_struct_reads_the_real_field_in_both_branches() {
+        let program = program_from(
+            r#"
+            type Coupon = { id: Int, code: String }
+            service S {
+                rpc describe(c: Coupon?) -> String {
+                    match c {
+                        cc: Coupon => "activo: " + cc.code,
+                        null => "sin coupon",
+                    }
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(
+            invoke_rpc(&program, "S", "describe", &json!({"c": {"id": 1, "code": "AHORRO10"}}), &db).unwrap(),
+            json!("activo: AHORRO10")
+        );
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"c": null}), &db).unwrap(), json!("sin coupon"));
+    }
+
+    #[test]
+    fn match_narrowing_over_a_primitive_optional_works_too() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc describe(x: Int?) -> String {
+                    match x {
+                        n: Int => "valor: " + n.toString(),
+                        null => "ausente",
+                    }
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"x": 5}), &db).unwrap(), json!("valor: 5"));
+        assert_eq!(invoke_rpc(&program, "S", "describe", &json!({"x": null}), &db).unwrap(), json!("ausente"));
+    }
+
+    #[test]
+    fn coalesce_returns_the_value_when_present_and_the_default_when_null() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc nameOrDefault(name: String?) -> String {
+                    name ?? "anonimo"
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "nameOrDefault", &json!({"name": "Ada"}), &db).unwrap(), json!("Ada"));
+        assert_eq!(invoke_rpc(&program, "S", "nameOrDefault", &json!({"name": null}), &db).unwrap(), json!("anonimo"));
+    }
+
+    #[test]
+    fn coalesce_short_circuits_and_never_evaluates_the_right_side_when_left_is_present() {
+        // El lado derecho de '??' es una llamada a assert(false, ...) --
+        // si esto se evaluara igual (sin cortocircuito real), el test
+        // fallaría con ese mensaje en vez de pasar.
+        let program = program_from(
+            r#"
+            service S {
+                rpc firstOrBoom(x: String?) -> String {
+                    x ?? panic("el lado derecho de ?? no debería evaluarse")
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "firstOrBoom", &json!({"x": "presente"}), &db).unwrap(), json!("presente"));
+    }
+
+    #[test]
+    fn coalesce_chains_across_several_optionals_left_to_right() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc firstNonNull(a: String?, b: String?) -> String {
+                    a ?? b ?? "los dos ausentes"
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(
+            invoke_rpc(&program, "S", "firstNonNull", &json!({"a": null, "b": null}), &db).unwrap(),
+            json!("los dos ausentes")
+        );
+        assert_eq!(invoke_rpc(&program, "S", "firstNonNull", &json!({"a": null, "b": "b"}), &db).unwrap(), json!("b"));
+        assert_eq!(invoke_rpc(&program, "S", "firstNonNull", &json!({"a": "a", "b": "b"}), &db).unwrap(), json!("a"));
+    }
+
+    #[test]
+    fn is_some_and_is_none_reflect_presence_for_a_struct_shaped_optional() {
+        let program = program_from(
+            r#"
+            type Item = { id: Int, name: String }
+            service S {
+                rpc present(x: Item?) -> Bool { x.isSome() }
+                rpc absent(x: Item?) -> Bool { x.isNone() }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let item = json!({"id": 1, "name": "Ada"});
+        assert_eq!(invoke_rpc(&program, "S", "present", &json!({"x": item}), &db).unwrap(), json!(true));
+        assert_eq!(invoke_rpc(&program, "S", "present", &json!({"x": null}), &db).unwrap(), json!(false));
+        assert_eq!(invoke_rpc(&program, "S", "absent", &json!({"x": null}), &db).unwrap(), json!(true));
+    }
+
+    #[test]
+    fn is_some_does_not_get_shadowed_by_a_real_struct_field_of_the_same_name() {
+        // El caso adversarial que motivó el chequeo explícito en
+        // eval_expr::Expr::Call: un struct PLANO (no opcional) con un campo
+        // de verdad llamado 'isSome' (una closure) tiene que seguir
+        // llamándose como ESE campo, no como el atajo del opcional.
+        let program = program_from(
+            r#"
+            type Weird = { id: Int, isSome: (Int) -> Bool }
+            service S {
+                rpc callIt() -> Bool {
+                    let w = Weird { id: 1, isSome: |n: Int| { n > 100 } };
+                    w.isSome(0)
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "callIt", &json!({}), &db).unwrap(), json!(false));
     }
 
     // ---- validación tipada del borde (auditoría) ----

@@ -289,7 +289,14 @@ impl Lexer {
             ',' => TokenKind::Comma,
             ';' => TokenKind::Semi,
             ':' => TokenKind::Colon,
-            '?' => TokenKind::Question,
+            '?' => {
+                if self.peek() == Some('?') {
+                    self.advance();
+                    TokenKind::QuestionQuestion
+                } else {
+                    TokenKind::Question
+                }
+            }
             '@' => TokenKind::At,
             '.' => TokenKind::Dot,
             '+' => TokenKind::Plus,

@@ -100,6 +100,7 @@ pub enum TokenKind {
     Semi,     // ;
     Colon,    // :
     Question, // ?
+    QuestionQuestion, // ?? (null-coalescing, GRAMMAR.md §3.9)
     At,       // @   (anotaciones sobre rpc/stream: @authenticated, @requires(...))
     Pipe,     // |   (union de tipos: A | B)
     Lt,       // <

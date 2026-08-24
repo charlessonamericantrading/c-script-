@@ -169,9 +169,10 @@ test "inserting and fetching product" {
   let created = Products.create("Mechanical Keyboard", 99.99);
   assert(created.id > 0, "id generated");
 
-  // `get` returns Product? -- it can be compared against null, but its fields
-  // cannot be read here: there is no narrowing in c-script. Hand the value to
-  // TypeScript, which narrows `Product | null` correctly.
+  // `get` returns Product? -- `if fetched != null { fetched.name }` still
+  // doesn't narrow (deliberate). `match fetched { p: Product => ..., null =>
+  // ... }` does narrow for real (GRAMMAR.md 3.69); `fetched ?? default` and
+  // `fetched.isSome()` cover the common shortcuts.
   let fetched = Products.get(created.id);
   assert(fetched != null, "product exists");
 }

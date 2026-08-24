@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-649-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.33.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-671-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.34.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 649 automated tests:
+**Works today**, covered by 671 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- Real narrowing of `T?` inside an rpc body: `match x { v: T => v.field, null => ... }` binds `v` to the real `T` (not `T?`) in that branch — reuses the same exhaustive pattern-matching machinery already used for union narrowing, so a missing `null` or a missing value arm is a compile error, not a runtime surprise. `if x != null { x.field }` still doesn't narrow — that stays deliberate — but `match` does. `x ?? default` covers the common "give me a default" case (chains left-to-right: `a ?? b ?? c`), and `x.isSome()`/`x.isNone()` cover "just need to know if there's a value," both without needing a full `match`
 - `linkc introspect <postgres-url>` generates a starting `.link` (types + `db {...}`) from an existing PostgreSQL database's schema — for adopting a system with real data instead of writing every field by hand. A starting point to review, not production-ready as-is: any column it can't map with confidence (`jsonb`, `uuid`, a native `timestamp`/`timestamptz`) still gets a valid type (`String`) plus a warning on stderr, never silently dropped. PostgreSQL only, no `service` generated
 - Embedded SQLite with real persistence across restarts, and non-destructive auto-migrations
 - Live push over Server-Sent Events (`stream` + `db.<c>.subscribe()`)
@@ -114,7 +115,7 @@ rules is compiled by the real binary on every CI run** — which is what actuall
 hallucination: what the agent reads is what the compiler accepts, not a promise.
 
 - **[`AGENTS.md`](AGENTS.md)**: what Claude Code and Codex read first — repository map, real commands, project conventions, and the list of what is knowingly broken so an agent does not report it as a new finding.
-- **[`llms.txt`](llms.txt) & [`llms-full.txt`](llms-full.txt)**: the condensed language reference, including the syntax mistakes every LLM makes (enum variants need braces as values, closures take no return type, `T?` cannot be dereferenced).
+- **[`llms.txt`](llms.txt) & [`llms-full.txt`](llms-full.txt)**: the condensed language reference, including the syntax mistakes every LLM makes (enum variants need braces as values, closures take no return type, `T?` can't be dereferenced via `if` — `match`/`??`/`.isSome()` narrow it instead).
 - **`CLAUDE.md`, `.cursorrules`, `.cursor/rules/c-script.mdc`, `.windsurfrules`, `.github/copilot-instructions.md`**: the same rules in each tool's own format — `CLAUDE.md` is what Claude Code auto-loads on open; it's a thin pointer into `AGENTS.md`, not a duplicate.
 
 Every c-script example in those files is compiled by the real binary on every CI run
@@ -261,7 +262,7 @@ wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_w
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **649 automated unit, integration and CLI tests**, including tests that
+Link is verified by **671 automated unit, integration and CLI tests**, including tests that
 spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
 example published in this repository's documentation:
 

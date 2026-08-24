@@ -82,8 +82,11 @@ Full list in [`llms.txt`](llms.txt). The three that break almost every first att
 1. An enum variant used as a **value** needs braces — `Role.Member {}`. In an annotation
    (`@requires(Role.Admin)`) and in a `match` pattern (`Role.Admin => ...`) it has none.
 2. Closures carry no return type: `|u: User| { u.active }`, never `|u: User| -> Bool {...}`.
-3. `T?` cannot be dereferenced. `if x != null { x.name }` is an error — there is no
-   narrowing. Hand the `T?` to TypeScript, which narrows it correctly.
+3. `T?` still can't be dereferenced via `if`. `if x != null { x.name }` is an error — there's
+   no narrowing through `if`, deliberately. Use `match x { v: T => v.name, null => ... }`
+   instead — that narrows for real (GRAMMAR.md §3.69). For the common "give me a default"
+   case, `x ?? default` is shorter; `x.isSome()`/`x.isNone()` cover "just need to know if
+   there's a value."
 
 A complete, verified program:
 

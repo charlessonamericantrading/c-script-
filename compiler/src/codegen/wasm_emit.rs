@@ -269,6 +269,14 @@ fn emit_expr(expr: &ast::Expr, ctx: &mut WasmFuncCtx, func: &mut Function) -> Re
                     ast::BinaryOp::GtEq => { func.instruction(&Instruction::I64GeS); }
                     ast::BinaryOp::And => { func.instruction(&Instruction::I64And); }
                     ast::BinaryOp::Or => { func.instruction(&Instruction::I64Or); }
+                    // `??` opera sobre un tipo opcional -- el codegen wasm
+                    // nativo es solo escalares (Int/Int64/Bool/Float, nunca
+                    // Optional), así que nunca debería llegar acá; si algún
+                    // día un tipo escalar pudiera ser opcional en wasm, esto
+                    // necesitaría su propio diseño, no un caso por accidente.
+                    other => {
+                        return Err(format!("operador {other:?} no soportado en wasm"));
+                    }
                 }
             }
             Ok(true)

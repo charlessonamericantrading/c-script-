@@ -1850,9 +1850,16 @@ impl Checker {
             Type::Union(members) => {
                 self.check_exhaustive_union(members, arms)?;
             }
+            // Narrowing real de un opcional (GRAMMAR.md §3.9): `null` para
+            // el caso ausente, `nombre: T` para el caso presente -- mismo
+            // mecanismo de patrones que ya usa la unión de arriba, pero acá
+            // el escrutinio no es una lista de miembros, es "T o ausente".
+            Type::Optional(inner) => {
+                self.check_exhaustive_optional(inner, arms)?;
+            }
             other => {
                 return Err(err(format!(
-                    "'match' requiere un valor de tipo enum, Int, String, Bool o unión; se encontró {other}"
+                    "'match' requiere un valor de tipo enum, Int, String, Bool, unión u opcional (T?); se encontró {other}"
                 )))
             }
         }
@@ -2099,6 +2106,83 @@ impl Checker {
         }
     }
 
+    /// Narrowing real de `T?` (GRAMMAR.md §3.9). Dos "miembros" a cubrir, no
+    /// una lista: el caso ausente (patrón `null`) y el caso presente (patrón
+    /// `nombre: T`, que liga `nombre` al `T` DESENVUELTO -- ya no `T?`). Un
+    /// `Pattern::Bind` sin guard cubre los dos a la vez, mismo criterio que
+    /// el resto de los escrutinios de esta función.
+    fn check_exhaustive_optional(&self, inner: &Type, arms: &[MatchArm]) -> Result<(), CheckError> {
+        let mut wildcard = false;
+        let mut covers_null = false;
+        let mut covers_value = false;
+        for arm in arms {
+            if arm.guard.is_some() {
+                continue;
+            }
+            self.collect_optional_coverage(&arm.pattern, inner, &mut wildcard, &mut covers_null, &mut covers_value)?;
+        }
+
+        if wildcard || (covers_null && covers_value) {
+            Ok(())
+        } else {
+            let mut missing = Vec::new();
+            if !covers_null {
+                missing.push("null".to_string());
+            }
+            if !covers_value {
+                missing.push(inner.to_string());
+            }
+            Err(err(format!("match no exhaustivo sobre {inner}?: falta cubrir {missing:?} (GRAMMAR.md §3.9)")))
+        }
+    }
+
+    /// Análogo a `collect_union_coverage`, pero con dos `bool` en vez de un
+    /// `Vec<bool>` por miembro -- un opcional no es una lista de tipos
+    /// distinguibles, es "T o ausente", así que la cobertura es binaria.
+    fn collect_optional_coverage(
+        &self,
+        pattern: &Pattern,
+        inner: &Type,
+        wildcard: &mut bool,
+        covers_null: &mut bool,
+        covers_value: &mut bool,
+    ) -> Result<(), CheckError> {
+        match pattern {
+            Pattern::Bind(_) => {
+                *wildcard = true;
+                Ok(())
+            }
+            Pattern::Literal(LiteralPattern::Null) => {
+                *covers_null = true;
+                Ok(())
+            }
+            Pattern::Type(_, texpr) => {
+                let resolved = self.resolve_type(texpr)?;
+                if is_subtype(&resolved, inner) && is_subtype(inner, &resolved) {
+                    *covers_value = true;
+                    Ok(())
+                } else {
+                    Err(err(format!(
+                        "el patrón de tipo '{resolved}' no corresponde al tipo interno de este opcional ({inner}?)"
+                    )))
+                }
+            }
+            Pattern::Or(subs) => {
+                for s in subs {
+                    self.collect_optional_coverage(s, inner, wildcard, covers_null, covers_value)?;
+                }
+                Ok(())
+            }
+            Pattern::Literal(lit) => Err(err(format!(
+                "patrón literal {lit:?} no válido contra un escrutinio T? -- usá 'null' o 'nombre: Tipo' (GRAMMAR.md §3.9)"
+            ))),
+            Pattern::Variant { enum_name, .. } => Err(err(format!(
+                "patrón de variante de enum ('{enum_name}') no válido contra un escrutinio T? -- usá \
+                 'null' o 'nombre: Tipo' (GRAMMAR.md §3.9)"
+            ))),
+        }
+    }
+
     fn check_literal_matches_type(&self, lit: &LiteralPattern, ty: &Type) -> Result<(), CheckError> {
         let ok = matches!(
             (lit, ty),
@@ -2109,6 +2193,10 @@ impl Checker {
             (LiteralPattern::Int(_), Type::Int | Type::Int64)
                 | (LiteralPattern::Str(_), Type::String)
                 | (LiteralPattern::Bool(_), Type::Bool)
+                // `null` solo tiene sentido contra un escrutinio opcional --
+                // ver check_match/check_exhaustive_optional, que es el único
+                // lugar que llega acá con un `Type::Optional` de verdad.
+                | (LiteralPattern::Null, Type::Optional(_))
         );
         if ok {
             Ok(())
@@ -2377,9 +2465,13 @@ impl Checker {
                     // TypeScript `if (x != null)` SI angosta y acá no
                     // (GRAMMAR.md §3.4). Decir solo "no se puede" deja a quien
                     // lo lee -- humano o modelo -- probando variantes que
-                    // tampoco existen.
+                    // tampoco existen. `if x != null { x.campo }` sigue sin
+                    // angostar (a propósito, ver §3.4) -- pero desde §3.9 SÍ
+                    // hay dos formas reales de leer el valor: `match`
+                    // narrowing (`match x { v: {inner} => v.{field}, null => ... }`)
+                    // o, si el caso es "dame un default", `x ?? default`.
                     Type::Optional(inner) => Err(err(format!(
-                        "no se puede acceder al campo '{field}' sobre {inner}?: un valor nullable no se angosta con `if x != null` (no hay narrowing en c-script, GRAMMAR.md §3.4). Devolvé el {inner}? tal cual y desarmalo del lado de TypeScript, que sí angosta `{inner} | null`"
+                        "no se puede acceder al campo '{field}' sobre {inner}?: un valor nullable no se angosta con `if x != null` (GRAMMAR.md §3.4). Usá 'match' para desarmarlo de verdad -- `match x {{ v: {inner} => v.{field}, null => ... }}` (GRAMMAR.md §3.9) -- o devolvé el {inner}? tal cual y desarmalo del lado de TypeScript, que también angosta `{inner} | null`"
                     ))),
                     other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other}"))),
                 }
@@ -2584,6 +2676,46 @@ impl Checker {
                 self.check_expr(right, &Type::Bool, env)?;
                 Ok(Type::Bool)
             }
+            // `a ?? b` (GRAMMAR.md §3.9): `a` tiene que ser de verdad `T?` --
+            // si ya no es opcional no hay nada que este operador aporte, y
+            // dejarlo pasar en silencio (evaluando siempre a `a`) escondería
+            // ese error de tipeo en vez de señalarlo. `b` acepta DOS formas:
+            // el `T` desenvuelto (el caso común, "dame un default seguro" --
+            // el resultado queda definitivo, ya no opcional) o el MISMO `T?`
+            // (para encadenar `a ?? b ?? default`, donde `b` todavía puede
+            // ser null -- el resultado sigue siendo `T?` hasta que algún
+            // eslabón sea definitivo). `a ?? b ?? c` asocia a izquierda, así
+            // que esto se resuelve solo, sin ningún caso especial para la
+            // cadena completa: cada `??` mira nada más que sus dos operandos
+            // inmediatos.
+            Coalesce => {
+                let l = self.synth_expr(left, env)?;
+                match l {
+                    Type::Optional(inner) => {
+                        let r = self.synth_expr(right, env)?;
+                        if is_subtype(&r, &inner) && is_subtype(&inner, &r) {
+                            Ok(*inner)
+                        } else if let Type::Optional(r_inner) = &r {
+                            if is_subtype(r_inner, &inner) && is_subtype(&inner, r_inner) {
+                                Ok(Type::Optional(inner))
+                            } else {
+                                Err(err(format!(
+                                    "'??' requiere que el lado derecho sea {inner} o {inner}?; se encontró {r}"
+                                )))
+                            }
+                        } else {
+                            Err(err(format!("'??' requiere que el lado derecho sea {inner} o {inner}?; se encontró {r}")))
+                        }
+                    }
+                    Type::Dynamic => {
+                        self.synth_expr(right, env)?;
+                        Ok(Type::Dynamic)
+                    }
+                    other => Err(err(format!(
+                        "'??' requiere que el lado izquierdo sea un tipo opcional (T?); se encontró {other} -- si ya no es opcional, usalo directo sin '??'"
+                    ))),
+                }
+            }
         }
     }
 
@@ -2651,6 +2783,14 @@ impl Checker {
             (Type::Int, "toString") | (Type::Int64, "toString") | (Type::Float, "toString") | (Type::Bool, "toString") => {
                 self.expect_no_args(args, "toString")?;
                 Some(Type::String)
+            }
+            // `.isSome()`/`.isNone()` (GRAMMAR.md §3.9): la rama de un `T?`
+            // sin necesitar 'match' -- útil cuando el cuerpo solo necesita
+            // SABER si hay valor, no leerlo (leer el valor sigue exigiendo
+            // 'match', el único lugar que de verdad angosta a `T`).
+            (Type::Optional(_), "isSome") | (Type::Optional(_), "isNone") => {
+                self.expect_no_args(args, field)?;
+                Some(Type::Bool)
             }
             (Type::String, "length") => {
                 self.expect_no_args(args, "length")?;
@@ -4792,6 +4932,183 @@ type T = { id: Int, s: Status }")
                 }
             }
         "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    // ---- narrowing real de `T?` vía 'match' (GRAMMAR.md §3.9) ----
+
+    #[test]
+    fn match_narrows_an_optional_struct_to_read_its_field() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            fn describe(x: Item?) -> String {
+                match x {
+                    v: Item => v.name,
+                    null => "sin item",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn match_over_optional_missing_the_null_arm_is_rejected() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            fn describe(x: Item?) -> String {
+                match x {
+                    v: Item => v.name,
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("no exhaustivo")), "{err:?}");
+    }
+
+    #[test]
+    fn match_over_optional_missing_the_value_arm_is_rejected() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            fn describe(x: Item?) -> String {
+                match x {
+                    null => "sin item",
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("no exhaustivo")), "{err:?}");
+    }
+
+    #[test]
+    fn wildcard_covers_both_arms_of_an_optional_match() {
+        let src = r#"
+            fn describe(x: Int?) -> String {
+                match x {
+                    _ => "cualquier cosa",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn a_null_pattern_against_a_non_optional_scrutinee_is_rejected() {
+        let src = r#"
+            fn describe(x: Int) -> String {
+                match x {
+                    n: Int => "un entero",
+                    null => "nunca alcanzable",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn a_type_pattern_that_does_not_match_the_optionals_inner_type_is_rejected() {
+        let src = r#"
+            fn describe(x: Int?) -> String {
+                match x {
+                    s: String => "nunca puede pasar",
+                    null => "sin valor",
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    // ---- `??` null-coalescing (GRAMMAR.md §3.9) ----
+
+    #[test]
+    fn coalesce_on_an_optional_typechecks_to_the_inner_type() {
+        let src = r#"
+            fn nameOrDefault(x: String?) -> String {
+                x ?? "sin nombre"
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn coalesce_on_a_non_optional_left_side_is_rejected() {
+        let src = r#"
+            fn bad(x: String) -> String {
+                x ?? "default"
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("'??'")), "{err:?}");
+    }
+
+    #[test]
+    fn coalesce_right_side_must_match_the_inner_type() {
+        let src = r#"
+            fn bad(x: String?) -> String {
+                x ?? 5
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn coalesce_chains_left_to_right() {
+        let src = r#"
+            fn firstNonNull(a: String?, b: String?) -> String {
+                a ?? b ?? "los dos ausentes"
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    // ---- `.isSome()`/`.isNone()` (GRAMMAR.md §3.9) ----
+
+    #[test]
+    fn is_some_and_is_none_typecheck_on_an_optional() {
+        let src = r#"
+            fn hasValue(x: Int?) -> Bool {
+                x.isSome()
+            }
+            fn missingValue(x: Int?) -> Bool {
+                x.isNone()
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn is_some_on_a_non_optional_is_rejected() {
+        let src = r#"
+            fn bad(x: Int) -> Bool {
+                x.isSome()
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn is_some_rejects_arguments() {
+        let src = r#"
+            fn bad(x: Int?) -> Bool {
+                x.isSome(1)
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn matching_over_a_plain_int_still_uses_literal_patterns_not_optional_narrowing() {
+        let src = r#"
+            fn bad(x: Int) -> String {
+                match x {
+                    1 => "uno",
+                    _ => "otro",
+                }
+            }
+        "#;
+        // Match sobre Int PRIMITIVO (no opcional) -- pasa por
+        // check_exhaustive_literal, no check_exhaustive_optional. Confirma
+        // que agregar el brazo Type::Optional al dispatch de check_match no
+        // rompió el camino de Int/String/Bool que ya existía.
         assert!(check_source(src).is_ok());
     }
 

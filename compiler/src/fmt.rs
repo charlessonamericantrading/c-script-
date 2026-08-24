@@ -117,6 +117,7 @@ pub fn format_source(src: &str) -> Result<String, String> {
             TokenKind::Pipe => out.push('|'),
             TokenKind::Bang => out.push('!'),
             TokenKind::Question => out.push('?'),
+            TokenKind::QuestionQuestion => out.push_str("??"),
             TokenKind::Arrow => out.push_str("->"),
             TokenKind::FatArrow => out.push_str("=>"),
             TokenKind::Dot => out.push('.'),
@@ -218,6 +219,7 @@ fn needs_space_before(prev: &TokenKind, curr: &TokenKind) -> bool {
             | TokenKind::GtEq
             | TokenKind::AmpAmp
             | TokenKind::PipePipe
+            | TokenKind::QuestionQuestion
             | TokenKind::Pipe
             | TokenKind::Arrow
             | TokenKind::FatArrow
@@ -242,6 +244,7 @@ fn needs_space_before(prev: &TokenKind, curr: &TokenKind) -> bool {
             | TokenKind::GtEq
             | TokenKind::AmpAmp
             | TokenKind::PipePipe
+            | TokenKind::QuestionQuestion
             | TokenKind::Pipe
     ) {
         return true;
