@@ -131,11 +131,19 @@ pub enum TokenKind {
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
+    /// El texto de uno o más `///` consecutivos que preceden a este token
+    /// directamente, si hay (GRAMMAR.md §3.72) -- `None` para la enorme
+    /// mayoría de tokens. Puesto acá y no en un mapa aparte porque el
+    /// consumidor natural (`parser.rs`, al empezar a parsear una
+    /// declaración) ya tiene el token en la mano en `self.peek()`; un mapa
+    /// paralelo índice->doc hubiera necesitado que el parser supiera SU
+    /// PROPIO índice de token en todo punto, información que hoy no lleva.
+    pub leading_doc: Option<String>,
 }
 
 impl Token {
     pub fn new(kind: TokenKind, span: Span) -> Self {
-        Token { kind, span }
+        Token { kind, span, leading_doc: None }
     }
 }
 

@@ -21,6 +21,14 @@ struct Lexer {
     pos: usize,
     line: usize,
     col: usize,
+    /// Líneas `///` acumuladas desde el último token real, todavía sin
+    /// asignar a ninguno (GRAMMAR.md §3.72). Se vuelca sobre el PRÓXIMO
+    /// token real que se produzca (`run`) y se resetea ahí mismo -- así que
+    /// un `///` en cualquier posición donde el parser no lo espere (media
+    /// expresión, dentro de un `if`, etc.) simplemente queda pegado a un
+    /// token que nadie lee ese campo, exactamente inocuo como un `//`
+    /// normal hoy: CERO nuevos errores de sintaxis en programas existentes.
+    pending_doc: Option<String>,
 }
 
 impl Lexer {
@@ -30,6 +38,7 @@ impl Lexer {
             pos: 0,
             line: 1,
             col: 1,
+            pending_doc: None,
         }
     }
 
@@ -89,17 +98,47 @@ impl Lexer {
             };
 
             let end = self.pos;
-            tokens.push(Token::new(kind, Span::new(start, end, line, col)));
+            let mut token = Token::new(kind, Span::new(start, end, line, col));
+            token.leading_doc = self.pending_doc.take();
+            tokens.push(token);
         }
         Ok(tokens)
     }
 
     /// Saltea espacios en blanco, comentarios de línea (`//`) y de bloque (`/* */`).
+    /// `///` (exactamente 3 slashes, no 4+) es la excepción: además de
+    /// saltearse como trivia normal, su texto se acumula en `pending_doc`
+    /// (GRAMMAR.md §3.72) -- varias líneas `///` consecutivas (solo
+    /// separadas por espacio en blanco, ninguna otra cosa en el medio) se
+    /// unen con `\n` en un solo docstring.
     fn skip_trivia(&mut self) -> Result<(), LexError> {
         loop {
             match self.peek() {
                 Some(c) if c.is_whitespace() => {
                     self.advance();
+                }
+                Some('/') if self.peek_at(1) == Some('/') && self.peek_at(2) == Some('/') && self.peek_at(3) != Some('/') => {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    if self.peek() == Some(' ') {
+                        self.advance(); // un solo espacio de indentación tras `///` no es parte del texto
+                    }
+                    let text_start = self.pos;
+                    while let Some(c) = self.peek() {
+                        if c == '\n' {
+                            break;
+                        }
+                        self.advance();
+                    }
+                    let line_text: String = self.chars[text_start..self.pos].iter().collect();
+                    match &mut self.pending_doc {
+                        Some(acc) => {
+                            acc.push('\n');
+                            acc.push_str(&line_text);
+                        }
+                        None => self.pending_doc = Some(line_text),
+                    }
                 }
                 Some('/') if self.peek_at(1) == Some('/') => {
                     while let Some(c) = self.peek() {
@@ -454,6 +493,44 @@ mod tests {
                 TokenKind::Eof
             ]
         );
+    }
+
+    /// `///` (GRAMMAR.md §3.72) se saltea como trivia igual que `//` -- el
+    /// stream de `TokenKind` no cambia -- pero además queda capturado en
+    /// `leading_doc` del PRÓXIMO token real.
+    #[test]
+    fn a_triple_slash_comment_is_skipped_like_a_normal_comment_but_captured_as_leading_doc() {
+        let tokens = tokenize("/// crea un usuario nuevo\nrpc create() -> Int { 1 }").unwrap();
+        assert_eq!(
+            tokens.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+            kinds("rpc create() -> Int { 1 }")
+        );
+        assert_eq!(tokens[0].leading_doc.as_deref(), Some("crea un usuario nuevo"));
+        assert!(tokens[1..].iter().all(|t| t.leading_doc.is_none()));
+    }
+
+    /// Varias líneas `///` consecutivas se unen con `\n` en un solo docstring.
+    #[test]
+    fn consecutive_triple_slash_lines_join_with_newlines_into_one_docstring() {
+        let tokens = tokenize("/// linea uno\n/// linea dos\nrpc f() -> Int { 1 }").unwrap();
+        assert_eq!(tokens[0].leading_doc.as_deref(), Some("linea uno\nlinea dos"));
+    }
+
+    /// `////` (4+ slashes) NO es un docstring -- sigue siendo un separador
+    /// visual común (`//// Sección ////`), tratado como comentario normal.
+    #[test]
+    fn four_or_more_slashes_is_not_a_docstring() {
+        let tokens = tokenize("//// Sección ////\nrpc f() -> Int { 1 }").unwrap();
+        assert!(tokens[0].leading_doc.is_none());
+    }
+
+    /// Un `///` sin nada detrás (línea vacía) produce un docstring vacío,
+    /// no `None` -- distinción real: "documentado, pero en blanco" no es lo
+    /// mismo que "sin documentar".
+    #[test]
+    fn an_empty_triple_slash_line_produces_an_empty_string_not_none() {
+        let tokens = tokenize("///\nrpc f() -> Int { 1 }").unwrap();
+        assert_eq!(tokens[0].leading_doc.as_deref(), Some(""));
     }
 
     #[test]

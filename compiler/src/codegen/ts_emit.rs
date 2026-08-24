@@ -612,6 +612,37 @@ fn resolve_field_ty(checker: &Checker, ty: &TypeExpr, type_params: &[String]) ->
     }
 }
 
+/// Emite (o no) el bloque JSDoc de un rpc: docstring `///` (GRAMMAR.md
+/// §3.72) y/o `@deprecated` (§3.71), indentado 2 espacios. `None`/`None` no
+/// emite nada -- mismo comportamiento que antes de que cualquiera de los dos
+/// existiera. Con las dos cosas presentes, el docstring va primero como
+/// texto libre y `@deprecated` como su propia línea de tag JSDoc, DENTRO del
+/// mismo bloque (no dos comentarios separados) -- así es como cualquier
+/// editor que entienda JSDoc espera verlos combinados.
+fn push_rpc_jsdoc(out: &mut String, doc: Option<&str>, deprecated: Option<&str>) {
+    match (doc, deprecated) {
+        (None, None) => {}
+        (Some(d), None) => {
+            out.push_str("  /**\n");
+            for line in d.lines() {
+                out.push_str(&format!("   * {}\n", jsdoc_escape(line)));
+            }
+            out.push_str("   */\n");
+        }
+        (None, Some(reason)) => {
+            out.push_str(&format!("  /** @deprecated {} */\n", jsdoc_escape(reason)));
+        }
+        (Some(d), Some(reason)) => {
+            out.push_str("  /**\n");
+            for line in d.lines() {
+                out.push_str(&format!("   * {}\n", jsdoc_escape(line)));
+            }
+            out.push_str(&format!("   * @deprecated {}\n", jsdoc_escape(reason)));
+            out.push_str("   */\n");
+        }
+    }
+}
+
 /// Un motivo de `@deprecated` es texto libre de usuario -- si contuviera
 /// literalmente `*/` cerraría el comentario JSDoc antes de tiempo y
 /// corrompería el `.d.ts` generado. `*<wbr>/` con un espacio no es válido
@@ -721,9 +752,7 @@ fn emit_service_interface(out: &mut String, s: &ServiceDecl, checker: &Checker) 
         } else {
             format!("Promise<{}>", render_type(&ret_ty))
         };
-        if let Some(reason) = rpc.deprecated() {
-            out.push_str(&format!("  /** @deprecated {} */\n", jsdoc_escape(reason)));
-        }
+        push_rpc_jsdoc(out, rpc.doc.as_deref(), rpc.deprecated());
         out.push_str(&format!("  {}({}): {};\n", rpc.name, params.join(", "), ret_str));
     }
     // Auth v0 (GRAMMAR.md §3.14): parte de la interfaz pública, no solo de
@@ -1298,5 +1327,57 @@ mod tests {
         let (contract, _) = emit_both(src);
         assert!(!contract.contains("viejo */ ignorar"), "{contract}");
         assert!(contract.contains("viejo * / ignorar"), "{contract}");
+    }
+
+    /// Un docstring `///` sobre un rpc (GRAMMAR.md §3.72) se propaga como
+    /// bloque JSDoc multilínea justo antes de la firma del método en la
+    /// interfaz `{Service}Client`.
+    #[test]
+    fn a_docstring_on_an_rpc_becomes_a_multiline_jsdoc_block() {
+        let src = r#"
+            service Tasks {
+                /// Crea una tarea nueva.
+                /// El titulo no puede estar vacio.
+                rpc create(title: String) -> Int { 1 }
+            }
+        "#;
+        let (contract, _) = emit_both(src);
+        assert!(
+            contract.contains("  /**\n   * Crea una tarea nueva.\n   * El titulo no puede estar vacio.\n   */\n  create("),
+            "{contract}"
+        );
+    }
+
+    /// Docstring Y `@deprecated` juntos: un solo bloque JSDoc, con
+    /// `@deprecated` como su propia línea de tag al final -- no dos
+    /// comentarios separados.
+    #[test]
+    fn a_docstring_and_deprecated_combine_into_one_jsdoc_block() {
+        let src = r#"
+            service Tasks {
+                /// Lista todas las tareas.
+                @deprecated("usa listV2")
+                rpc list() -> Int { 1 }
+            }
+        "#;
+        let (contract, _) = emit_both(src);
+        assert!(
+            contract.contains("  /**\n   * Lista todas las tareas.\n   * @deprecated usa listV2\n   */\n  list("),
+            "{contract}"
+        );
+    }
+
+    /// Un rpc sin docstring ni `@deprecated` no gana ningún comentario --
+    /// comportamiento sin cambios respecto de antes de esta ronda.
+    #[test]
+    fn an_rpc_with_neither_doc_nor_deprecated_gets_no_jsdoc() {
+        let src = r#"
+            service Tasks {
+                rpc list() -> Int { 1 }
+            }
+        "#;
+        let (contract, _) = emit_both(src);
+        assert!(!contract.contains("/**"), "{contract}");
+        assert!(!contract.contains("/*"), "{contract}");
     }
 }

@@ -206,6 +206,12 @@ pub struct RpcDecl {
     pub return_type: TypeExpr,
     pub body: Block,
     pub annotations: Vec<Annotation>,
+    /// El docstring `///` que precede al rpc/stream (incluyendo cualquier
+    /// `@annotation` en el medio), si hay (GRAMMAR.md §3.72) -- se propaga
+    /// como `description` a `openapi.json`. Ignorado en `PartialEq`, mismo
+    /// criterio que `Field::deprecated` (ast.rs): es metadata puramente
+    /// informativa, no cambia qué declara el rpc.
+    pub doc: Option<String>,
     pub span: Span,
 }
 

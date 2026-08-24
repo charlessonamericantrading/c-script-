@@ -93,6 +93,7 @@
   - [3.69 Narrowing real de `T?`: `match`, `??` y `.isSome()`/`.isNone()` — RESUELTO](#369-narrowing-real-de-t-match--y-issome-isnone--resuelto)
   - [3.70 Tipo nativo `Uuid` — RESUELTO](#370-tipo-nativo-uuid--resuelto)
   - [3.71 `@deprecated("motivo")` en un campo o un rpc — RESUELTO](#371-deprecatedmotivo-en-un-campo-o-un-rpc--resuelto)
+  - [3.72 Docstrings `///` propagados a OpenAPI y al `.d.ts` — RESUELTO](#372-docstrings--propagados-a-openapi-y-al-dts--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3582,6 +3583,46 @@ test "un campo o rpc deprecado sigue funcionando igual -- es puramente informati
 - **La clase `{Service}ClientImpl` (la implementación concreta, no la interfaz `{Service}Client`) no repite el JSDoc en sus propios métodos.** `create{Service}Client(...)` devuelve el tipo `{Service}Client` (la interfaz), así que cualquier editor que tipe la variable contra ese tipo -- el caso normal -- sí ve el aviso; solo alguien que importe y tipe explícitamente contra la clase concreta se lo perdería.
 
 **Verificado**: 6 tests en `checker.rs` (tipa limpio combinado con `@requires` en un rpc, rechaza dos `@deprecated` en el mismo rpc, rechaza motivo vacío en un rpc, tipa limpio en un campo sin afectar subtipificación estructural -- un struct con un campo deprecado sigue aceptándose donde se espera el struct equivalente sin la anotación --, rechaza motivo vacío en un campo, rechaza cualquier otra anotación sobre un campo) y 4 en `codegen` (2 en `ts_emit.rs`: el JSDoc aparece exactamente antes del campo/método marcado y en ningún otro, un motivo con `*/` literal no corta el comentario antes de tiempo; 2 en `openapi_emit.rs`: `deprecated: true` + `description` en la operación y en la propiedad del schema, ausentes en las que no llevan la anotación).
+
+---
+
+### 3.72 Docstrings `///` propagados a OpenAPI y al `.d.ts` — RESUELTO
+
+Hasta esta ronda, la única documentación de un `rpc` en `openapi.json` era su propio nombre en `"summary"` -- cualquier comentario `//` o `/* */` que alguien escribiera arriba se perdía por completo al compilar: el lexer los trataba todos igual, como trivia a descartar.
+
+<!-- linkc:check -->
+```rust
+type Task = { id: Int, title: String }
+type NewTask = { title: String }
+
+db { tasks: Task[] }
+
+service Tasks {
+  /// Crea una tarea nueva.
+  /// El titulo no puede estar vacio -- lo valida el checker, no este comentario.
+  rpc create(title: String) -> Task {
+    db.tasks.insert(NewTask { title: title })
+  }
+}
+
+test "un rpc documentado con /// sigue funcionando exactamente igual" {
+  let t = Tasks.create("comprar leche");
+  assert(t.title == "comprar leche", "el docstring es puramente informativo, no cambia nada en runtime");
+}
+```
+
+**`///` (exactamente 3 slashes) es la única forma que se captura -- `//` y `/* */` se siguen descartando igual que siempre.** `////` (4 o más) tampoco cuenta como docstring, a propósito: sigue siendo el separador visual común (`//// Sección ////`) sin ganar un significado nuevo por accidente. Varias líneas `///` consecutivas (sin nada más que espacio en blanco entre ellas) se unen con `\n` en un solo texto -- así es como se escribe un docstring de más de una línea.
+
+**Cero riesgo de romper un programa existente.** Un `///` en CUALQUIER posición sigue siendo válido -- el lexer lo saltea como trivia exactamente igual que antes, esté o no justo arriba de un `rpc`/`stream`. La única diferencia es que, ADEMÁS de saltearlo, el texto queda capturado y se lo pega al siguiente token real (`Token::leading_doc`, ver lexer.rs) -- el parser solo lo lee en el único lugar donde tiene sentido (justo antes de un `rpc`/`stream`, incluso si hay una `@annotation` en el medio: `/// texto` seguido de `@requires(...)` seguido de `rpc` sigue atribuyéndose al rpc). En cualquier otra posición, el texto capturado simplemente no lo lee nadie -- ningún programa que compilaba antes deja de compilar.
+
+**Propagado a `openapi.json` como `description` del Operation Object, y a `contract.d.ts` como un bloque JSDoc multilínea.** Si el mismo rpc también lleva `@deprecated("...")` (§3.71), las dos cosas conviven en el mismo campo en vez de que una pise a la otra: en OpenAPI, el motivo se agrega al final de la descripción (`"{docstring}\n\nDeprecated: {motivo}"`); en el `.d.ts`, `@deprecated` aparece como su propia línea de tag DENTRO del mismo bloque `/** ... */` -- nunca dos comentarios separados.
+
+**Límites honestos:**
+- **Solo sobre `rpc`/`stream` -- no sobre `type`/`enum`/campo de struct.** A diferencia de `@deprecated` (que sí llega a un campo), un docstring sobre un `type` completo o sobre un campo individual no se captura ni se propaga a ningún lado todavía -- el ítem original (PLAN.md §9.2) pedía específicamente documentación de rpc, que es donde hoy `openapi.json` tiene el hueco más visible.
+- **Un `///` "huérfano" (sin ningún `rpc`/`stream` inmediatamente después, ni siquiera separado por una línea en blanco) se pierde en silencio, sin error.** El lexer no distingue "esto está pegado a una declaración real" de "esto quedó suelto al final de un archivo" -- ambos casos simplemente no producen ningún `RpcDecl.doc`. Mismo comportamiento que cualquier comentario hoy: nada avisa que "sobra".
+- **Una línea en blanco entre el `///` y el `rpc` NO rompe la asociación.** El texto capturado se pega al PRÓXIMO token real sin importar cuántas líneas en blanco (o comentarios `//`/`/* */` intercalados) haya en el medio -- así que un docstring separado por accidente de su rpc por una línea vacía igual se atribuye, cosa que puede sorprender si la intención era documentar otra cosa más abajo.
+
+**Verificado**: 4 tests en `lexer.rs` (`///` se saltea como trivia igual que `//` pero además queda en `leading_doc` del próximo token real, varias líneas consecutivas se unen con `\n`, `////` NO cuenta como docstring, una línea `///` vacía produce `Some("")` no `None`), 3 en `parser.rs` (se atribuye al rpc directamente arriba, sigue atribuyéndose cuando hay una `@annotation` en el medio, un rpc sin docstring tiene `doc: None`), 2 en `openapi_emit.rs` (se propaga como `description`, y junto con `@deprecated` las dos se combinan en un solo texto en vez de pisarse) y 3 en `ts_emit.rs` (bloque JSDoc multilínea antes del método, docstring + `@deprecated` en un solo bloque con `@deprecated` como tag final, un rpc sin ninguna de las dos cosas no gana ningún comentario).
 
 ---
 

@@ -183,11 +183,24 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
                 }
             });
 
+            // Docstring `///` (GRAMMAR.md §3.72) -> "description" del
+            // Operation Object -- antes de esta ronda, el único texto que un
+            // rpc tenía en el spec generado era su nombre.
+            if let Some(doc) = &rpc.doc {
+                operation["description"] = json!(doc);
+            }
+
             // `@deprecated` sobre un rpc (GRAMMAR.md §3.71) -- "deprecated"
-            // es una keyword nativa de Operation Object en OpenAPI 3.x.
+            // es una keyword nativa de Operation Object en OpenAPI 3.x. Si
+            // YA hay un docstring, el motivo se agrega en vez de pisarlo --
+            // las dos cosas coexisten (documentar por qué existe Y por qué
+            // ya no usarlo son preguntas distintas).
             if let Some(reason) = rpc.deprecated() {
                 operation["deprecated"] = json!(true);
-                operation["description"] = json!(reason);
+                operation["description"] = json!(match &rpc.doc {
+                    Some(doc) => format!("{doc}\n\nDeprecated: {reason}"),
+                    None => reason.to_string(),
+                });
             }
 
             if !rpc.params.is_empty() {
@@ -301,5 +314,51 @@ mod tests {
         assert_eq!(props["legacyPhone"]["deprecated"], true);
         assert_eq!(props["legacyPhone"]["description"], "usa email");
         assert!(props["email"]["deprecated"].is_null());
+    }
+
+    /// Un docstring `///` sobre un rpc (GRAMMAR.md §3.72) se propaga como
+    /// `description` del Operation Object -- antes de esta ronda, el único
+    /// texto de un rpc en el spec generado era su nombre.
+    #[test]
+    fn a_docstring_on_an_rpc_becomes_the_operation_description() {
+        let code = r#"
+            service Tasks {
+                /// Lista todas las tareas pendientes, ordenadas por id.
+                rpc list() -> Int { 1 }
+            }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        assert_eq!(
+            spec["paths"]["/Tasks/list"]["post"]["description"],
+            "Lista todas las tareas pendientes, ordenadas por id."
+        );
+        assert!(spec["paths"]["/Tasks/list"]["post"]["deprecated"].is_null());
+    }
+
+    /// Docstring Y `@deprecated` a la vez: el motivo se agrega al final de
+    /// la descripción en vez de pisarla -- las dos preguntas ("qué hace" y
+    /// "por qué ya no usarlo") coexisten en el mismo campo.
+    #[test]
+    fn a_docstring_and_deprecated_together_combine_into_one_description() {
+        let code = r#"
+            service Tasks {
+                /// Lista todas las tareas.
+                @deprecated("usa listV2")
+                rpc list() -> Int { 1 }
+            }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        let desc = spec["paths"]["/Tasks/list"]["post"]["description"].as_str().unwrap();
+        assert!(desc.contains("Lista todas las tareas."), "{desc}");
+        assert!(desc.contains("Deprecated: usa listV2"), "{desc}");
+        assert_eq!(spec["paths"]["/Tasks/list"]["post"]["deprecated"], true);
     }
 }

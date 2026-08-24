@@ -69,6 +69,15 @@ impl Parser {
         self.tokens[self.pos].span
     }
 
+    /// El docstring `///` que precede DIRECTAMENTE al token actual, si hay
+    /// (GRAMMAR.md §3.72) -- tiene que leerse ANTES de consumir ningún token
+    /// de la declaración (incluida una `@annotation` opcional, que puede
+    /// venir DESPUÉS del docstring en el `.link` fuente), porque
+    /// `leading_doc` vive en el primer token, no en uno fijo.
+    fn peek_leading_doc(&self) -> Option<String> {
+        self.tokens[self.pos].leading_doc.clone()
+    }
+
     /// Span del ÚLTIMO token consumido -- para cerrar el span de un nodo
     /// justo después de un `eat`/`advance` de cierre (`}`/`)`/`]`/etc.),
     /// sin tener que guardar ese token en una variable aparte.
@@ -421,12 +430,16 @@ impl Parser {
     fn parse_member(&mut self) -> Result<Member, ParseError> {
         // Capturado ANTES de la anotación opcional -- si `parse_rpc_like`
         // tomara su propio inicio al entrar, `@authenticated`/`@requires`
-        // quedaría sistemáticamente AFUERA del span del rpc.
+        // quedaría sistemáticamente AFUERA del span del rpc. Mismo motivo
+        // para `doc` (GRAMMAR.md §3.72): un `///` en el `.link` fuente
+        // siempre va ANTES de la `@annotation`, así que vive en el token que
+        // hoy es `start`, no en el de `rpc`/`stream`.
         let start = self.span();
+        let doc = self.peek_leading_doc();
         let annotations = self.parse_optional_annotation()?;
         match self.peek().clone() {
-            TokenKind::Rpc => Ok(Member::Rpc(self.parse_rpc_like(start, TokenKind::Rpc, annotations)?)),
-            TokenKind::Stream => Ok(Member::Stream(self.parse_rpc_like(start, TokenKind::Stream, annotations)?)),
+            TokenKind::Rpc => Ok(Member::Rpc(self.parse_rpc_like(start, TokenKind::Rpc, annotations, doc)?)),
+            TokenKind::Stream => Ok(Member::Stream(self.parse_rpc_like(start, TokenKind::Stream, annotations, doc)?)),
             other => Err(self.error(format!("se esperaba 'rpc' o 'stream', se encontró {other:?}"))),
         }
     }
@@ -513,8 +526,9 @@ impl Parser {
     /// `start` viene de `parse_member` (capturado antes de la anotación
     /// opcional, ver ahí). El span de la declaración cubre la FIRMA hasta el
     /// return type -- se calcula ANTES de parsear `body`, a propósito (el
-    /// cuerpo tiene sus propios spans precisos, ver ast.rs::RpcDecl).
-    fn parse_rpc_like(&mut self, start: Span, kw: TokenKind, annotations: Vec<Annotation>) -> Result<RpcDecl, ParseError> {
+    /// cuerpo tiene sus propios spans precisos, ver ast.rs::RpcDecl). `doc`
+    /// idem, viene de `parse_member` (GRAMMAR.md §3.72).
+    fn parse_rpc_like(&mut self, start: Span, kw: TokenKind, annotations: Vec<Annotation>, doc: Option<String>) -> Result<RpcDecl, ParseError> {
         self.eat(&kw)?;
         let name = self.eat_ident()?;
         self.eat(&TokenKind::LParen)?;
@@ -530,6 +544,7 @@ impl Parser {
             return_type,
             body,
             annotations,
+            doc,
             span,
         })
     }
@@ -2074,5 +2089,37 @@ mod tests {
         let Item::Test(t) = &prog.items[0] else { panic!("se esperaba Item::Test") };
         assert_eq!(t.name, "smoke_test");
         assert_eq!(t.body.stmts.len(), 1);
+    }
+
+    // ---- docstrings `///` (GRAMMAR.md §3.72) ----
+
+    #[test]
+    fn a_triple_slash_docstring_directly_above_an_rpc_attaches_to_it() {
+        let src = "service S {\n/// crea un usuario nuevo\nrpc create() -> Int { 1 }\n}";
+        let prog = parse_source(src);
+        let Item::Service(ServiceDecl { members, .. }) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &members[0] else { panic!() };
+        assert_eq!(r.doc.as_deref(), Some("crea un usuario nuevo"));
+    }
+
+    /// El docstring va ANTES de la `@annotation`, no entre esta y `rpc` --
+    /// tiene que seguir atribuyéndose al rpc igual (ver `parse_member`).
+    #[test]
+    fn a_docstring_before_an_annotation_still_attaches_to_the_rpc() {
+        let src = "enum Role { Admin }\nservice S {\n/// solo para administradores\n@requires(Role.Admin)\nrpc panel() -> Int { 1 }\n}";
+        let prog = parse_source(src);
+        let Item::Service(ServiceDecl { members, .. }) = &prog.items[1] else { panic!() };
+        let Member::Rpc(r) = &members[0] else { panic!() };
+        assert_eq!(r.doc.as_deref(), Some("solo para administradores"));
+        assert!(r.auth().is_some());
+    }
+
+    #[test]
+    fn an_rpc_with_no_docstring_has_doc_none() {
+        let src = "service S { rpc f() -> Int { 1 } }";
+        let prog = parse_source(src);
+        let Item::Service(ServiceDecl { members, .. }) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &members[0] else { panic!() };
+        assert!(r.doc.is_none());
     }
 }

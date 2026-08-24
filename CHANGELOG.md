@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.37.0] - 2026-08-24
+
+### ✨ Nuevo
+- **Docstrings `///` propagados a `openapi.json` y `contract.d.ts`.** Hasta esta ronda, la única documentación de un rpc en el spec generado era su propio nombre en `"summary"` -- cualquier comentario arriba se perdía al compilar, el lexer trataba `//`, `///` y `/* */` exactamente igual, como trivia a descartar. Nueva infraestructura de lexer: `///` (exactamente 3 slashes -- ni `//` ni `////`, que sigue siendo el separador visual común sin significado especial) se sigue saltando como trivia igual que siempre, pero además su texto queda capturado en `Token::leading_doc` y se pega al PRÓXIMO token real. Varias líneas `///` consecutivas se unen con `\n` en un solo docstring. El parser solo lee ese campo en el único lugar donde tiene sentido -- justo antes de un `rpc`/`stream`, incluso con una `@annotation` en el medio (`/// texto` → `@requires(...)` → `rpc` sigue atribuyéndose al rpc) -- así que es puramente aditivo: CERO riesgo de romper un programa existente, un `///` en cualquier otra posición simplemente no lo lee nadie, exactamente como antes. Se propaga como `description` del Operation Object en `openapi.json`, y como un bloque JSDoc multilínea `/** ... */` en `contract.d.ts`. Si el mismo rpc también lleva `@deprecated("...")` (v1.36.0), las dos cosas conviven en el mismo campo/bloque en vez de pisarse -- en OpenAPI el motivo se agrega al final de la descripción, en el `.d.ts` `@deprecated` aparece como su propia línea de tag dentro del mismo bloque.
+
+702 tests (12 nuevos): 4 en `lexer.rs` (se saltea como trivia igual que `//` pero queda en `leading_doc`, varias líneas se unen con `\n`, `////` no cuenta, una línea vacía da `Some("")` no `None`), 3 en `parser.rs` (se atribuye al rpc de abajo, sigue atribuyéndose con una `@annotation` en el medio, sin docstring da `None`), 2 en `openapi_emit.rs` (se propaga como `description`, se combina con `@deprecated` sin pisarse) y 3 en `ts_emit.rs` (bloque JSDoc multilínea, combinado con `@deprecated` en un solo bloque, ausente cuando no hay ninguna de las dos cosas). Más el ejemplo nuevo de GRAMMAR.md §3.72, compilado y ejecutado por `docs_examples.rs`. Detalle completo: GRAMMAR.md §3.72.
+
 ## [1.36.0] - 2026-08-24
 
 ### ✨ Nuevo
