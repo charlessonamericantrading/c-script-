@@ -114,6 +114,7 @@
   - [3.90 `dateFromParts(...)`: construir un `Timestamp` arbitrario — RESUELTO](#390-datefromparts-construir-un-timestamp-arbitrario--resuelto)
   - [3.91 `Timestamp` decodifica `date`/`timestamp`/`timestamptz` nativos de Postgres — RESUELTO](#391-timestamp-decodifica-datetimestamptimestamptz-nativos-de-postgres--resuelto)
   - [3.92 `linkc serve-all` + `--restart-backoff`: un proceso para varios servicios — RESUELTO](#392-linkc-serve-all----restart-backoff-un-proceso-para-varios-servicios--resuelto)
+  - [3.93 `--service-api-key`: autenticación servidor-a-servidor — RESUELTO](#393---service-api-key-autenticación-servidor-a-servidor--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4353,6 +4354,34 @@ linkc serve-all ./servicios --port-base 3000 --host 127.0.0.1 --restart-backoff 
 - **Sin scaffolding de Docker/systemd para `serve-all` todavía** -- `linkc docker` (§3.62) sigue generando un `Dockerfile` de UN `.link`, sin una variante consciente de un directorio con varios.
 
 **Verificado**: `cli_serve_all.rs`, 9 tests con el binario real como subproceso, hablando HTTP y bindeando puertos de verdad -- arranca 2 servicios en un solo proceso y responde en sus dos puertos con sus propios `.db` separados; rechaza `--db`/`LINK_DATABASE_URL` compartido; falla limpio sin `--port-base` o sin ningún `.link` en el directorio; un error de tipos en un archivo aborta TODO antes de arrancar cualquier hilo (el otro servicio ni siquiera llega a abrir su puerto); un bind ocupado en un servicio NO tumba al otro, que sigue respondiendo; y con `--restart-backoff`, un servicio cuyo puerto se libera a mitad de camino se recupera solo mientras el otro sigue sano todo el tiempo -- el incidente real (68 reinicios de `telemetry`), reproducido y confirmado resuelto contra el binario real, no solo razonado por lectura de código.
+
+---
+
+### 3.93 `--service-api-key`: autenticación servidor-a-servidor — RESUELTO
+
+Cuarto reporte de adopción real (IgnisLove): un gateway Node.js (`cscript-gateway.ts`) hace `fetch` sin ninguna autenticación contra cada uno de los `linkc serve` que orquesta, confiando en que el puerto no sea alcanzable desde afuera. `--host 127.0.0.1` (GRAMMAR.md §3.81) ya cierra la mitad EXTERNA de ese hueco -- pero adentro de la misma máquina, CUALQUIER otro proceso con acceso a loopback puede llamar a esos servicios exactamente igual que el gateway legítimo. `@requires`/JWT (GRAMMAR.md §3.49/§3.64) no resuelven esto: autentican a un USUARIO final, no a QUIÉN está haciendo la llamada de red -- un rpc sin ninguna anotación de auth (o llamado internamente entre dos de los propios servicios) queda abierto a cualquiera en la máquina.
+
+```bash
+linkc serve backend.link 8787 --service-api-key s3cr3t
+LINK_SERVICE_API_KEY=s3cr3t linkc serve backend.link 8787   # equivalente
+# El caller manda:
+#   X-Service-Api-Key: s3cr3t
+```
+
+**`--service-api-key <clave>`/`LINK_SERVICE_API_KEY`: un secreto compartido, verificado en el header `X-Service-Api-Key`, ANTES de leer el body y ANTES de cualquier otro chequeo (CORS aparte, que corre primero por la propia naturaleza del preflight).** Sin el flag/env var: `None`, sin este chequeo -- comportamiento IDÉNTICO al de siempre. Con él: toda request que no sea `/`/`/health`/`/status` necesita el header, con el valor EXACTO -- comparado en tiempo constante (`constant_time_eq`, la misma función que ya usaba `crypto.timingSafeEqual`, GRAMMAR.md §3.54) para no filtrar por timing cuánto del secreto adivinó quien prueba. Sin el header, o con un valor que no matchea: `401`, antes de que el body siquiera se lea -- un caller no autorizado no le cuesta memoria ni CPU de parseo al proceso.
+
+**Una capa DISTINTA y ANTERIOR a `@requires`/JWT/sesiones -- las dos conviven, no se reemplazan.** Este flag autentica la CONEXIÓN (¿es este proceso el gateway legítimo?); `@requires(Role.Admin)`/un JWT autentican al USUARIO final que está detrás de esa conexión. Una request típica bajo este esquema lleva LOS DOS: `X-Service-Api-Key` probando que viene del gateway, y `Authorization: Bearer <token-de-usuario>` (sesión o JWT externo) probando de qué usuario se trata -- exactamente el patrón de "gateway interno + microservicios" que motivó el pedido.
+
+**`/health`/`/`/`/status` quedan EXENTOS a propósito.** Un orquestador o load balancer que hace liveness probing (Kubernetes, Docker healthcheck) no tiene por qué conocer el secreto del gateway -- exigirlo ahí habría roto cualquier monitoreo de infraestructura existente sin agregar seguridad real (un liveness check no expone datos de negocio).
+
+**Funciona igual bajo `linkc serve-all` (GRAMMAR.md §3.92) -- un valor GLOBAL para todos los servicios de la corrida, no uno distinto por servicio.** Mismo límite que el resto de los flags globales de `serve-all` (`--jwt-secret`, `--cors-origin`, etc.): todos los servicios de un mismo proceso comparten el mismo entorno.
+
+**Límites honestos:**
+- **Un único secreto, no varios por caller.** No hay forma de emitir/revocar una clave DISTINTA por servicio que llama (todo caller legítimo comparte el mismo valor) -- suficiente para el caso real (un gateway central, no una malla de N servicios llamándose entre sí con identidades propias), no para "service mesh" con identidad por servicio.
+- **Sin rotación asistida.** Cambiar la clave es reiniciar el proceso con un valor nuevo -- no hay un mecanismo de "aceptar la clave vieja Y la nueva durante una ventana" para rotar sin downtime.
+- **No sustituye TLS.** El header viaja en texto plano si la conexión no está cifrada -- mismo criterio que cualquier otro secreto en un header (`Authorization`, `X-Forwarded-For`): la responsabilidad de que el TRANSPORTE sea seguro (TLS en el proxy que termina la conexión, o una red interna de confianza) es de la infraestructura que rodea a `linkc serve`, no de este flag.
+
+**Verificado**: `cli_service_api_key.rs`, 7 tests con el binario real como subproceso -- sin el flag, ninguna request lo necesita (comportamiento de siempre); sin el header, `401` antes de llegar al rpc; con la clave incorrecta, `401`; con la clave correcta, la request llega y se procesa normal; `/health`/`/`/`/status` siguen respondiendo `200` sin el header; `LINK_SERVICE_API_KEY` funciona igual que el flag; un flag mal usado da un error de CLI limpio, no un panic.
 
 ---
 

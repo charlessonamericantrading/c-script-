@@ -180,6 +180,7 @@ pub fn serve(
     max_body_bytes: u64,
     http_timeout: Duration,
     trust_proxy: bool,
+    service_api_key: Option<String>,
 ) -> Result<(), String> {
     let server = tiny_http::Server::http((host, port)).map_err(|e| format!("no se pudo iniciar el servidor en {host}:{port}: {e}"))?;
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
@@ -246,7 +247,18 @@ pub fn serve(
     match remote_changes {
         None => {
             for request in server.incoming_requests() {
-                handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, max_body_bytes, trust_proxy, request);
+                handle_request(
+                    &program,
+                    &db,
+                    &sessions,
+                    &route_table,
+                    &mut rate_limiter,
+                    &cors,
+                    max_body_bytes,
+                    trust_proxy,
+                    service_api_key.as_deref(),
+                    request,
+                );
             }
             // Inalcanzable en la práctica -- `incoming_requests()` solo
             // termina si el `Server` se apaga desde OTRO hilo (`.unblock()`),
@@ -275,6 +287,7 @@ pub fn serve(
                         &cors,
                         max_body_bytes,
                         trust_proxy,
+                        service_api_key.as_deref(),
                         request,
                     ),
                     Ok(None) => {}
@@ -307,6 +320,7 @@ fn handle_request(
     cors: &CorsConfig,
     max_body_bytes: u64,
     trust_proxy: bool,
+    service_api_key: Option<&str>,
     mut request: tiny_http::Request,
 ) {
     // Resuelto UNA vez por request, antes de cualquier otra cosa --
@@ -327,6 +341,34 @@ fn handle_request(
     let start = std::time::Instant::now();
     let path = request.url().to_string();
     println!("[req {req_id}] {} {path}", request.method());
+
+    // `--service-api-key`/`LINK_SERVICE_API_KEY` (GRAMMAR.md §3.93): un
+    // secreto compartido que autentica al LLAMADOR (típicamente un gateway
+    // servidor-a-servidor, GRAMMAR.md §3.93), una capa distinta y ANTERIOR a
+    // `@requires`/JWT (que autentican a un USUARIO final) -- corre antes de
+    // leer el body siquiera, para rechazar rápido sin gastar memoria en un
+    // caller no autorizado. `/health`/`/`/`/status` quedan EXENTOS a
+    // propósito: un orquestador/load balancer que hace liveness probing no
+    // tiene por qué conocer el secreto del gateway.
+    if let Some(expected) = service_api_key {
+        if path != "/" && path != "/health" && path != "/status" {
+            let provided = request
+                .headers()
+                .iter()
+                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Service-Api-Key"))
+                .map(|h| h.value.as_str().to_string());
+            let ok = provided.as_deref().is_some_and(|p| super::constant_time_eq(p.as_bytes(), expected.as_bytes()));
+            if !ok {
+                let _ = request.respond(cors_response(
+                    401,
+                    error_json("falta o es inválido el header X-Service-Api-Key -- este servidor requiere autenticación servidor-a-servidor"),
+                    &cors_headers,
+                ));
+                log_done(req_id, None, 401, start, "error=\"service api key\"");
+                return;
+            }
+        }
+    }
 
     // `--max-body-bytes`/`LINK_MAX_BODY_BYTES` (GRAMMAR.md §3.85): hasta
     // esta ronda esto era `request.as_reader().read_to_string(&mut body)`

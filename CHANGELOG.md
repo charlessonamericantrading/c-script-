@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.57.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`--service-api-key <clave>`/`LINK_SERVICE_API_KEY`: autenticación servidor-a-servidor.** Cuarto reporte de adopción real (IgnisLove): un gateway Node.js hace `fetch` sin ninguna autenticación contra cada `linkc serve` que orquesta, confiando en que el puerto no sea alcanzable desde afuera -- `--host 127.0.0.1` (v1.46.0) ya cerraba la mitad EXTERNA de ese hueco, pero cualquier OTRO proceso en la misma máquina con acceso a loopback podía llamarlos exactamente igual que el gateway legítimo. `@requires`/JWT no resuelven esto: autentican a un USUARIO final, no a QUIÉN hace la llamada de red. Con el flag/env var puesto, toda request que no sea `/`/`/health`/`/status` necesita el header `X-Service-Api-Key` con el valor exacto -- comparado en tiempo constante (reusa `constant_time_eq`, la misma función de `crypto.timingSafeEqual`), verificado ANTES de leer el body. Capa DISTINTA y ANTERIOR a sesiones/JWT -- las dos conviven: una request típica lleva `X-Service-Api-Key` (prueba que viene del gateway) Y `Authorization: Bearer <token>` (prueba de qué usuario). Sin el flag: comportamiento idéntico al de siempre. Funciona igual bajo `linkc serve-all` (v1.56.0), como valor global compartido.
+
+859 tests (7 nuevos) en `cli_service_api_key.rs` contra el binario real: sin el flag nadie lo necesita; sin el header, 401 antes de llegar al rpc; con la clave incorrecta, 401; con la correcta, la request se procesa normal; `/health`/`/`/`/status` siguen respondiendo 200 sin el header; `LINK_SERVICE_API_KEY` funciona igual que el flag. Detalle completo: GRAMMAR.md §3.93.
+
 ## [1.56.0] - 2026-08-24
 
 ### ✨ Nuevo

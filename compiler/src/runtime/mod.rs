@@ -1192,7 +1192,7 @@ fn os_random_bytes(n: usize) -> Result<Vec<u8>, RuntimeError> {
 /// Comparación que no corta en el primer byte distinto: dos secretos se comparan
 /// en tiempo constante para no filtrar, vía la duración, cuánto del valor
 /// esperado adivinó quien está probando.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     // La diferencia de LARGO no es secreta (el formato del hash es público); lo
     // que no debe filtrarse es en qué posición difieren dos del mismo largo.
