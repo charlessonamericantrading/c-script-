@@ -19,6 +19,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::time::Duration;
 
 /// Cuántos eventos sin consumir tolera un suscriptor de push real
 /// (GRAMMAR.md §3.16) antes de ser desconectado. Un canal ILIMITADO sería
@@ -29,6 +30,14 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 /// mismo trade-off que la mayoría de sistemas de pub-sub/broadcast reales
 /// hacen). No es un número investigado a fondo, es un default razonable.
 const LIVE_STREAM_BUFFER: usize = 1024;
+
+/// Default de `http_timeout` (GRAMMAR.md §3.86) hasta que `server.rs` lo
+/// sobreescribe según `--http-timeout`/`LINK_HTTP_TIMEOUT` -- 30s, el mismo
+/// número que `ureq` ya usa como timeout de CONEXIÓN por default (que sí
+/// tiene uno; lo que faltaba era el de lectura/escritura). No es un número
+/// investigado a fondo, es un default razonable -- mismo criterio que
+/// `LIVE_STREAM_BUFFER` arriba.
+const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cómo se representa UN campo (que no sea `id`) de una colección en SQL --
 /// derivado una sola vez por colección, al abrir la conexión, y reusado por
@@ -515,6 +524,18 @@ pub struct Db {
     /// `m`/`t`/`p` en el hash guardado, así que verificar un hash viejo con
     /// otros parámetros sigue funcionando sin tocar esto.
     argon2_params: RefCell<argon2::Params>,
+    /// Timeout de `http.get`/`post`/`getWithHeaders`/etc. (GRAMMAR.md
+    /// §3.86): mismo criterio EXACTO que `argon2_params` de arriba (vive
+    /// acá, no como parámetro enhebrado, porque `db: &Db` ya llega a
+    /// `call_method`). `ureq` (crate) NO tiene timeout de lectura/escritura
+    /// por default -- solo 30s de timeout de CONEXIÓN -- así que sin esto
+    /// una request saliente a un servidor lento o colgado bloqueaba el
+    /// intérprete (de un solo hilo, GRAMMAR.md §3.13) para SIEMPRE, sin
+    /// límite: ninguna otra request, de ningún cliente, se atendía mientras
+    /// tanto. `server.rs` lo sobreescribe UNA vez al arrancar según
+    /// `--http-timeout`/`LINK_HTTP_TIMEOUT` (o su default, ver
+    /// `main.rs::resolve_http_timeout`).
+    http_timeout: RefCell<Duration>,
     /// Nombre de colección -> nombre del campo `@softDelete`, si esa
     /// colección tiene uno (GRAMMAR.md §3.78). Se calcula UNA vez al abrir
     /// la conexión (acá SÍ hay `Program`/`ast::Field` con anotaciones a
@@ -779,6 +800,7 @@ impl Db {
             response_status_override: std::cell::Cell::new(None),
             instance_id: random_instance_id(),
             argon2_params: RefCell::new(argon2::Params::default()),
+            http_timeout: RefCell::new(DEFAULT_HTTP_TIMEOUT),
             soft_delete_fields,
         }
     }
@@ -899,6 +921,7 @@ impl Db {
                 response_status_override: std::cell::Cell::new(None),
                 instance_id,
                 argon2_params: RefCell::new(argon2::Params::default()),
+                http_timeout: RefCell::new(DEFAULT_HTTP_TIMEOUT),
                 soft_delete_fields,
             },
             remote_rx,
@@ -921,6 +944,20 @@ impl Db {
     /// insignificante comparado con el propio hasheo (~15ms, §3.34).
     pub(crate) fn argon2_params(&self) -> argon2::Params {
         self.argon2_params.borrow().clone()
+    }
+
+    /// Timeout de `http.*` para lo que quede de vida del proceso (GRAMMAR.md
+    /// §3.86) -- mismo criterio que `set_argon2_params`: `server.rs` lo
+    /// llama UNA sola vez, antes de aceptar la primera request.
+    pub(crate) fn set_http_timeout(&self, timeout: Duration) {
+        *self.http_timeout.borrow_mut() = timeout;
+    }
+
+    /// El timeout configurado -- lo lee cada llamada a `http.get`/`post`/
+    /// `getWithHeaders`/etc. en `runtime/mod.rs`. `Duration` es `Copy`, así
+    /// que esto no necesita clonar nada.
+    pub(crate) fn http_timeout(&self) -> Duration {
+        *self.http_timeout.borrow()
     }
 
     /// Fixture SOLO para tests y para el demo wasm (`bin/wasm_demo.rs`) --

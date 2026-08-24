@@ -208,15 +208,17 @@ struct Serve {
 
 impl Serve {
     fn start(link_path: &PathBuf) -> Self {
+        Self::start_with_args(link_path, &[])
+    }
+
+    fn start_with_args(link_path: &PathBuf, extra_args: &[&str]) -> Self {
         let port = free_port();
-        let child = Command::new(env!("CARGO_BIN_EXE_linkc"))
-            .arg("serve")
-            .arg(link_path)
-            .arg(port.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("iniciar 'linkc serve'");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_linkc"));
+        cmd.arg("serve").arg(link_path).arg(port.to_string());
+        for a in extra_args {
+            cmd.arg(a);
+        }
+        let child = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("iniciar 'linkc serve'");
         wait_for_port(port);
         Serve { child, port }
     }
@@ -406,4 +408,96 @@ fn http_get_with_headers_against_an_unreachable_host_fails_cleanly_not_with_a_pa
     let (status, body) = server.post("/Sys/getWithAuth", &serde_json::json!({"url": url, "token": "x"}).to_string());
     assert_eq!(status, 500, "body: {body}");
     assert!(!body.contains("panicked"), "una conexión caída es una condición operativa normal, no un panic: {body}");
+}
+
+// ---- `--http-timeout`/`LINK_HTTP_TIMEOUT` (GRAMMAR.md §3.86) ----
+//
+// Hasta esta ronda, `http.get`/`post`/etc. no tenían NINGÚN timeout de
+// lectura/escritura (`ureq` solo trae uno de conexión, 30s, por default) --
+// una request saliente a un servidor que ACEPTA la conexión pero nunca
+// responde bloqueaba el intérprete (de un solo hilo) para SIEMPRE. Se
+// prueba acá contra un servidor de mentira que hace exactamente eso.
+
+/// Acepta la conexión y se queda sin escribir NADA -- ni siquiera una línea
+/// de estado -- durante mucho más tiempo del que cualquier timeout de este
+/// test configura. El hilo se abandona a propósito al volver (`Drop` no
+/// hace falta: el proceso de test termina igual, y el listener se cierra
+/// solo con el binding).
+struct HangingServer {
+    port: u16,
+}
+
+impl HangingServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bindear puerto efímero");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(60));
+                drop(stream);
+            }
+        });
+        HangingServer { port }
+    }
+}
+
+#[test]
+fn a_hanging_upstream_times_out_instead_of_blocking_the_server_forever() {
+    let upstream = HangingServer::start();
+    let temp = TempDir::new("timeout");
+    let src = temp.write("app.link", PROGRAM);
+    // 1s -- mucho más corto que los 60s que `HangingServer` se queda sin
+    // responder, así que si el timeout de verdad se aplica esto vuelve
+    // rápido; si no se aplicara (regresión), colgaría hasta el timeout de
+    // conexión de 30s de `ureq` como mínimo -- de cualquier forma, mucho
+    // más que el presupuesto generoso que este test se da.
+    let server = Serve::start_with_args(&src, &["--http-timeout", "1s"]);
+
+    let url = format!("http://127.0.0.1:{}/", upstream.port);
+    let start = std::time::Instant::now();
+    let (status, body) = server.post("/Sys/plainGet", &serde_json::json!({"url": url}).to_string());
+    let elapsed = start.elapsed();
+
+    assert_eq!(status, 500, "un upstream que nunca responde es un error de runtime, no un 200: {body}");
+    assert!(!body.contains("panicked"), "{body}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "debería haber cortado cerca de 1s configurado, tardó {elapsed:?} -- ¿se está bloqueando en vez de cortar?"
+    );
+}
+
+#[test]
+fn link_http_timeout_env_var_is_honored() {
+    let upstream = HangingServer::start();
+    let temp = TempDir::new("timeout-env");
+    let src = temp.write("app.link", PROGRAM);
+    let port = free_port();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_linkc"));
+    cmd.arg("serve").arg(&src).arg(port.to_string()).env("LINK_HTTP_TIMEOUT", "1s");
+    let child = cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().expect("iniciar 'linkc serve'");
+    let server = Serve { child, port };
+    wait_for_port(port);
+
+    let url = format!("http://127.0.0.1:{}/", upstream.port);
+    let start = std::time::Instant::now();
+    let (status, body) = server.post("/Sys/plainGet", &serde_json::json!({"url": url}).to_string());
+    assert_eq!(status, 500, "body: {body}");
+    assert!(start.elapsed() < Duration::from_secs(10), "tardó {:?}", start.elapsed());
+}
+
+#[test]
+fn an_http_timeout_flag_with_an_invalid_duration_is_a_clean_cli_error() {
+    let temp = TempDir::new("badvalue");
+    let src = temp.write("app.link", PROGRAM);
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("serve")
+        .arg(&src)
+        .arg(free_port().to_string())
+        .arg("--http-timeout")
+        .arg("not-a-duration")
+        .output()
+        .expect("ejecutar linkc serve");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked at"), "un flag mal usado es un error de uso, no un panic: {stderr}");
 }

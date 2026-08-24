@@ -141,6 +141,12 @@ impl CorsConfig {
 /// máximo cualquier request -- ver `handle_request` para el porqué (hasta
 /// esta ronda se leía el body entero a memoria sin ningún límite, un vector
 /// real de agotamiento de memoria).
+///
+/// `http_timeout` (GRAMMAR.md §3.86): cuánto puede tardar cualquier llamada
+/// saliente (`http.get`/`post`/`getWithHeaders`/etc.) antes de abortar --
+/// `ureq` no tiene timeout de lectura/escritura por default, así que sin
+/// esto una request a un servidor lento o colgado bloqueaba el intérprete
+/// (de un solo hilo) para SIEMPRE.
 pub fn serve(
     program: Program,
     host: &str,
@@ -152,6 +158,7 @@ pub fn serve(
     jwt_config: Option<(String, String, String)>,
     adopt_existing: bool,
     max_body_bytes: u64,
+    http_timeout: Duration,
 ) {
     let server = tiny_http::Server::http((host, port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en {host}:{port}: {e}"));
@@ -189,6 +196,9 @@ pub fn serve(
     // vida del proceso -- default de la crate si no se pasó ningún flag/env
     // var (ver `resolve_argon2_params` en `main.rs`).
     db.set_argon2_params(argon2_params);
+    // GRAMMAR.md §3.86: mismo criterio que `argon2_params`, una sola vez
+    // antes de aceptar la primera request.
+    db.set_http_timeout(http_timeout);
     // Auth v0 (GRAMMAR.md §3.14): vive mientras el proceso corre, igual que
     // `db` -- sin persistencia entre reinicios. Sin expiración por default;
     // `--session-ttl`/`LINK_SESSION_TTL` (GRAMMAR.md §3.50) la agrega.

@@ -107,6 +107,7 @@
   - [3.83 `linkc --version` y versión estampada en cada archivo generado — RESUELTO](#383-linkc---version-y-versión-estampada-en-cada-archivo-generado--resuelto)
   - [3.84 `auth.destroyAllSessions(userId)`: revocar todas las sesiones de un usuario — RESUELTO](#384-authdestroyallsessionsuserid-revocar-todas-las-sesiones-de-un-usuario--resuelto)
   - [3.85 `--max-body-bytes <N>`: límite de tamaño del body de una request — RESUELTO](#385---max-body-bytes-n-límite-de-tamaño-del-body-de-una-request--resuelto)
+  - [3.86 `--http-timeout <duración>`: timeout de llamadas salientes `http.*` — RESUELTO](#386---http-timeout-duración-timeout-de-llamadas-salientes-http--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4128,6 +4129,28 @@ LINK_MAX_BODY_BYTES=1000000 linkc serve app.link 8787  # equivalente
 - **`linkc dev` no expone este flag todavía**, mismo alcance que `--host`/el resto de los flags de `serve` en modo desarrollo.
 
 **Verificado**: `cli_max_body.rs` con el binario real como subproceso (9 tests) -- un body bajo el default se acepta, un body EXACTO al límite configurado se acepta, uno de un byte más se rechaza con `413` nombrando el límite en el mensaje, un body mucho más grande (2 MiB contra un límite de 1000 bytes) también se rechaza -- probando que la lectura se corta temprano, no que se lee entero y se rechaza después --, el flag y la variable de entorno funcionan por separado y el flag le gana a la env var, `--max-body-bytes` con un valor no numérico o sin valor son errores de uso limpios sin panic, y los headers de seguridad/CORS siguen presentes en la respuesta `413`.
+
+---
+
+### 3.86 `--http-timeout <duración>`: timeout de llamadas salientes `http.*` — RESUELTO
+
+Auditando `runtime/mod.rs` apareció que `http.get`/`post`/`getWithHeaders`/`getWithStatus`/`postWithStatus`/`postWithHeaders` (GRAMMAR.md §3.47/§3.60) llamaban a `ureq::get`/`ureq::post` sin fijar NINGÚN timeout propio. `ureq` (la crate) sí trae un timeout de CONEXIÓN por default (30s) -- pero el de LECTURA/ESCRITURA, el que importa una vez que la conexión ya abrió, es "nunca" por default, documentado así por la propia crate. Para este intérprete -- de un solo hilo, GRAMMAR.md §3.13 -- eso significaba que una request saliente a un servidor lento, o que acepta la conexión y después simplemente no responde nunca, bloqueaba el proceso ENTERO para siempre: ninguna otra request, de ningún cliente, se atendía mientras tanto. Ni siquiera `/health`.
+
+```bash
+linkc serve app.link 8787 --http-timeout 10s
+LINK_HTTP_TIMEOUT=10s linkc serve app.link 8787   # equivalente
+```
+
+**`--http-timeout`/`LINK_HTTP_TIMEOUT`, mismo orden de precedencia que el resto de los flags de `serve` -- mismo formato `Ns`/`Nm`/`Nh`/`Nd` que `--session-ttl` (`parse_duration`), default 30 segundos sin ninguno de los dos.** El default es el mismo número que `ureq` ya usaba para conexión -- no un valor nuevo inventado, solo aplicado también a lectura/escritura, que es la parte que faltaba. Vive en `Db` (`http_timeout: RefCell<Duration>`), fijado UNA vez al arrancar -- mismo mecanismo exacto que `argon2_params` (GRAMMAR.md §3.58): `db: &Db` ya está disponible en cualquier punto del árbol de evaluación, así que no hace falta enhebrar un parámetro nuevo por `call_method`/`eval_expr`/etc.
+
+**Un timeout agotado se reporta como cualquier otro error de red -- 500 de runtime, nunca un panic ni un colgado.** `ureq::Error` ya distinguía un timeout de una conexión rechazada o un DNS que no resuelve; el mensaje de error que llega al cuerpo del rpc simplemente nombra la causa real que `ureq` reporta.
+
+**Límites honestos:**
+- **Un solo timeout total, no timeouts separados de conexión/lectura/escritura configurables por separado.** `ureq::Request::timeout(...)` fija el límite TOTAL de la operación -- suficiente para el problema real (que el intérprete nunca se bloquee indefinidamente), pero no permite, por ejemplo, un timeout de conexión más corto que el de lectura.
+- **Sin reintentos.** Un timeout (o cualquier otro error de red) falla esa llamada -- reintentar con backoff sigue siendo responsabilidad del código de usuario, o queda para una ronda futura (PLAN.md §9.4).
+- **Es un límite de PROCESO, no por rpc ni por URL.** Un `rpc` que necesita hablar con un servicio genuinamente lento (y otro que necesita fallar rápido) comparten el mismo timeout.
+
+**Verificado**: `cli_http.rs` con el binario real como subproceso (3 tests nuevos, sobre 7 que ya existían) -- una request a un servidor que ACEPTA la conexión pero nunca escribe nada corta cerca del `--http-timeout` configurado (medido con un `Instant` real, nunca cerca de los 60s que el servidor de mentira se queda callado), la variable de entorno funciona igual, y `--http-timeout` con una duración inválida es un error de uso limpio sin panic.
 
 ---
 

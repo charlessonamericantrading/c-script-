@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.51.0] - 2026-08-24
+
+### 🔒 Seguridad
+- **`--http-timeout <duración>`/`LINK_HTTP_TIMEOUT`: timeout de llamadas salientes `http.*`.** Auditando `runtime/mod.rs` apareció que `http.get`/`post`/`getWithHeaders`/`getWithStatus`/`postWithStatus`/`postWithHeaders` no fijaban ningún timeout de lectura/escritura propio -- `ureq` (la crate) trae 30s de timeout de CONEXIÓN por default, pero el de lectura/escritura, el que importa una vez que la conexión ya abrió, es "nunca" por default, documentado así por la propia crate. Para este intérprete de un solo hilo, eso significaba que una request saliente a un servidor lento o que acepta la conexión y nunca responde bloqueaba el proceso ENTERO para siempre -- ninguna otra request, de ningún cliente, se atendía mientras tanto, ni siquiera `/health`. `--http-timeout`/`LINK_HTTP_TIMEOUT` (mismo orden de precedencia y formato `Ns`/`Nm`/`Nh`/`Nd` que `--session-ttl`, default 30s -- el mismo número que `ureq` ya usaba para conexión) fija un timeout total por llamada, guardado en `Db` con el mismo mecanismo exacto que `argon2_params` (fijado una vez al arrancar, leído en cada llamada saliente, sin enhebrar un parámetro nuevo por todo el árbol de evaluación). Un timeout agotado se reporta como cualquier otro error de red -- 500 de runtime, nunca un panic ni un colgado.
+
+808 tests (3 nuevos) en `cli_http.rs` contra el binario real: una request a un servidor que acepta la conexión pero nunca responde corta cerca del `--http-timeout` configurado (medido con un `Instant` real), la variable de entorno funciona igual, y una duración inválida es un error de uso limpio sin panic. Detalle completo: GRAMMAR.md §3.86.
+
 ## [1.50.0] - 2026-08-24
 
 ### 🔒 Seguridad

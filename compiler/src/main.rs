@@ -133,7 +133,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--adopt-existing]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--adopt-existing]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
     out(&format!("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)"));
 }
@@ -956,7 +956,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--adopt-existing]"
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--adopt-existing]"
         );
         return ExitCode::FAILURE;
     };
@@ -1026,6 +1026,14 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
 
+    let http_timeout = match resolve_http_timeout(args) {
+        Ok(d) => d,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
@@ -1042,6 +1050,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         jwt_config,
         adopt_existing,
         max_body_bytes,
+        http_timeout,
     );
     ExitCode::SUCCESS
 }
@@ -1090,6 +1099,26 @@ fn resolve_max_body_bytes(args: &[String]) -> Result<u64, String> {
         return Ok(DEFAULT_MAX_BODY_BYTES);
     };
     raw.parse::<u64>().map_err(|_| format!("--max-body-bytes/LINK_MAX_BODY_BYTES: '{raw}' no es un entero positivo (bytes)"))
+}
+
+/// Cuánto puede tardar cualquier llamada saliente (`http.get`/`post`/
+/// `getWithHeaders`/etc., GRAMMAR.md §3.86) antes de abortar con un error de
+/// runtime, mismo orden de precedencia que el resto de los `resolve_*`:
+///
+/// 1. `--http-timeout <duración>` en la línea de comandos -- mismo formato
+///    `Ns`/`Nm`/`Nh`/`Nd` que `--session-ttl` (`parse_duration`, arriba).
+/// 2. La variable de entorno `LINK_HTTP_TIMEOUT`.
+/// 3. Ninguno de los dos: 30 segundos -- el mismo número que `ureq` (la
+///    crate) ya usa como timeout de CONEXIÓN por default; lo que faltaba
+///    era el de lectura/escritura, que por default es "nunca" (sin esto,
+///    una request saliente a un servidor colgado bloqueaba el intérprete de
+///    un solo hilo para siempre).
+fn resolve_http_timeout(args: &[String]) -> Result<std::time::Duration, String> {
+    let raw = read_flag_or_env(args, "--http-timeout", "LINK_HTTP_TIMEOUT")?;
+    let Some(raw) = raw else {
+        return Ok(std::time::Duration::from_secs(30));
+    };
+    parse_duration(&raw)
 }
 
 /// Adopción de tabla existente (`--adopt-existing`/`LINK_ADOPT_EXISTING`,

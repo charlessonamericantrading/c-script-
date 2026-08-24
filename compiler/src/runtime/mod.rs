@@ -1792,7 +1792,7 @@ fn call_method(
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("http.get requiere un argumento URL String")),
                 };
-                match ureq::get(url).call() {
+                match ureq::get(url).timeout(db.http_timeout()).call() {
                     Ok(resp) => {
                         let text = resp.into_string().unwrap_or_default();
                         Ok(Value::Str(text))
@@ -1809,7 +1809,7 @@ fn call_method(
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("http.post requiere un argumento Body String")),
                 };
-                match ureq::post(url).send_string(body) {
+                match ureq::post(url).timeout(db.http_timeout()).send_string(body) {
                     Ok(resp) => {
                         let text = resp.into_string().unwrap_or_default();
                         Ok(Value::Str(text))
@@ -1826,7 +1826,7 @@ fn call_method(
                     Some(Value::List(items)) => http_headers_from_value(items)?,
                     _ => return Err(err("http.getWithHeaders requiere una lista de headers como segundo argumento")),
                 };
-                let mut req = ureq::get(url);
+                let mut req = ureq::get(url).timeout(db.http_timeout());
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
@@ -1847,7 +1847,7 @@ fn call_method(
                     Some(Value::List(items)) => http_headers_from_value(items)?,
                     _ => return Err(err("http.getWithStatus requiere una lista de headers como segundo argumento")),
                 };
-                let mut req = ureq::get(url);
+                let mut req = ureq::get(url).timeout(db.http_timeout());
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
@@ -1876,7 +1876,7 @@ fn call_method(
                     Some(Value::List(items)) => http_headers_from_value(items)?,
                     _ => return Err(err("http.postWithStatus requiere una lista de headers como tercer argumento")),
                 };
-                let mut req = ureq::post(url);
+                let mut req = ureq::post(url).timeout(db.http_timeout());
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
@@ -1899,7 +1899,7 @@ fn call_method(
                     Some(Value::List(items)) => http_headers_from_value(items)?,
                     _ => return Err(err("http.postWithHeaders requiere una lista de headers como tercer argumento")),
                 };
-                let mut req = ureq::post(url);
+                let mut req = ureq::post(url).timeout(db.http_timeout());
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
