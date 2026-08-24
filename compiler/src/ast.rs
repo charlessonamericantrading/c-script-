@@ -131,16 +131,28 @@ pub struct Variant {
 /// un USO de tipo", que antes eran indistinguibles y hacían que un campo
 /// homónimo a un `type`/`enum` existente (`type Point = {...}; type Shape =
 /// { Point: Int }`) saltara mal al pedir goto-def sobre el nombre de campo.
-/// `PartialEq` es manual (no derive) para IGNORAR `name_span`, mismo motivo
-/// que `TypeExpr` ya no deriva `PartialEq`: dos `Field` estructuralmente
-/// iguales en offsets distintos deben seguir siendo `==` (lo usa, entre
-/// otros, `TypeExpr::Struct`'s propio `PartialEq` al comparar `Vec<Field>`).
+/// `PartialEq` es manual (no derive) para IGNORAR `name_span` y `deprecated`,
+/// mismo motivo que `TypeExpr` ya no deriva `PartialEq`: dos `Field`
+/// estructuralmente iguales en offsets distintos (o con distinto texto de
+/// `@deprecated`, que es puramente informativo) deben seguir siendo `==`
+/// (lo usa, entre otros, `TypeExpr::Struct`'s propio `PartialEq` al comparar
+/// `Vec<Field>`, y por lo tanto la subtipificación estructural -- ver
+/// GRAMMAR.md §3.71: marcar un campo deprecado no lo saca de esa comparación).
 #[derive(Debug, Clone)]
 pub struct Field {
     pub name: String,
     pub optional: bool, // el `?` ANTES de `:` (x?: T) — distinto de Optional(T) en TypeExpr
     pub ty: TypeExpr,
     pub name_span: Span,
+    /// `@deprecated("usa X en su lugar")` antes del campo, si hay (GRAMMAR.md
+    /// §3.71). A diferencia de `RpcDecl.annotations`, un campo solo admite
+    /// ESTA anotación -- no tiene sentido `@authenticated`/`@route`/etc.
+    /// sobre un campo de struct, así que en vez de reusar `Vec<Annotation>`
+    /// (que obligaría a validar en el checker qué variantes son válidas acá)
+    /// el parser directamente solo sabe parsear `@deprecated` en esta
+    /// posición y rechaza cualquier otro nombre ahí mismo (ver
+    /// `parse_field` en parser.rs).
+    pub deprecated: Option<String>,
 }
 
 impl PartialEq for Field {
@@ -250,6 +262,15 @@ impl RpcDecl {
             _ => None,
         })
     }
+
+    /// El motivo declarado con `@deprecated("...")`, si hay (GRAMMAR.md
+    /// §3.71).
+    pub fn deprecated(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::Deprecated(reason) => Some(reason.as_str()),
+            _ => None,
+        })
+    }
 }
 
 /// Anotaciones de un rpc/stream. Se permiten varias, pero no cualquier
@@ -274,6 +295,12 @@ pub enum Annotation {
     /// `@rate_limit("20/1m")` -- como mucho N requests por ventana de
     /// tiempo, por (ip del cliente, servicio, rpc). Ver GRAMMAR.md §3.39.
     RateLimit(String),
+    /// `@deprecated("usa X en su lugar")` sobre un rpc/stream -- el texto se
+    /// propaga tal cual como comentario JSDoc `@deprecated` sobre el método
+    /// correspondiente en el `.d.ts` generado (GRAMMAR.md §3.71). No cambia
+    /// nada en runtime: sigue funcionando igual, es puramente informativo
+    /// para quien consume el contrato generado.
+    Deprecated(String),
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

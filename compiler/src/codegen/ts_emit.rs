@@ -612,6 +612,15 @@ fn resolve_field_ty(checker: &Checker, ty: &TypeExpr, type_params: &[String]) ->
     }
 }
 
+/// Un motivo de `@deprecated` es texto libre de usuario -- si contuviera
+/// literalmente `*/` cerraría el comentario JSDoc antes de tiempo y
+/// corrompería el `.d.ts` generado. `*<wbr>/` con un espacio no es válido
+/// JS, así que separar los dos caracteres alcanza para neutralizarlo sin
+/// perder legibilidad.
+fn jsdoc_escape(reason: &str) -> String {
+    reason.replace("*/", "* /")
+}
+
 fn emit_type_decl(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(), String> {
     let generics = type_params_suffix(&t.type_params);
     match &t.ty {
@@ -619,6 +628,9 @@ fn emit_type_decl(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(
             out.push_str(&format!("export interface {}{} {{\n", t.name, generics));
             for f in fields {
                 let ty = resolve_field_ty(checker, &f.ty, &t.type_params)?;
+                if let Some(reason) = &f.deprecated {
+                    out.push_str(&format!("  /** @deprecated {} */\n", jsdoc_escape(reason)));
+                }
                 out.push_str(&format!(
                     "  {}{}: {};\n",
                     f.name,
@@ -709,6 +721,9 @@ fn emit_service_interface(out: &mut String, s: &ServiceDecl, checker: &Checker) 
         } else {
             format!("Promise<{}>", render_type(&ret_ty))
         };
+        if let Some(reason) = rpc.deprecated() {
+            out.push_str(&format!("  /** @deprecated {} */\n", jsdoc_escape(reason)));
+        }
         out.push_str(&format!("  {}({}): {};\n", rpc.name, params.join(", "), ret_str));
     }
     // Auth v0 (GRAMMAR.md §3.14): parte de la interfaz pública, no solo de
@@ -1240,5 +1255,48 @@ mod tests {
         assert!(hooks.contains("export function useUsersCreateMutation"), "{hooks}");
         assert!(hooks.contains("export function useUsersWatch("), "{hooks}");
         assert!(hooks.contains("for await (const item of client.watch())"), "{hooks}");
+    }
+
+    /// `@deprecated("...")` sobre un campo se propaga como comentario JSDoc
+    /// justo antes del campo en `contract.d.ts` (GRAMMAR.md §3.71) -- un
+    /// campo sin la anotación no gana ningún comentario.
+    #[test]
+    fn deprecated_field_gets_a_jsdoc_comment_in_the_contract() {
+        let src = r#"
+            type Lead = { id: Int, @deprecated("usa email en su lugar") legacyPhone: String, email: String }
+        "#;
+        let (contract, _) = emit_both(src);
+        assert!(
+            contract.contains("/** @deprecated usa email en su lugar */\n  legacyPhone:"),
+            "{contract}"
+        );
+        // `email` no está deprecado -- no debe llevar comentario adelante.
+        assert!(!contract.contains("*/\n  email:"), "{contract}");
+    }
+
+    /// `@deprecated("...")` sobre un rpc se propaga como comentario JSDoc
+    /// justo antes de la firma del método en la interfaz `{Service}Client`.
+    #[test]
+    fn deprecated_rpc_gets_a_jsdoc_comment_on_the_client_method() {
+        let src = r#"
+            service S {
+                @deprecated("usa listV2")
+                rpc list() -> Int { 1 }
+                rpc listV2() -> Int { 2 }
+            }
+        "#;
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("/** @deprecated usa listV2 */\n  list()"), "{contract}");
+        assert!(!contract.contains("*/\n  listV2("), "{contract}");
+    }
+
+    /// Un motivo con `*/` literal no puede cerrar el comentario JSDoc antes
+    /// de tiempo -- ver `jsdoc_escape`.
+    #[test]
+    fn a_deprecated_reason_containing_close_comment_is_escaped() {
+        let src = r#"type T = { id: Int, @deprecated("viejo */ ignorar esto") x: String }"#;
+        let (contract, _) = emit_both(src);
+        assert!(!contract.contains("viejo */ ignorar"), "{contract}");
+        assert!(contract.contains("viejo * / ignorar"), "{contract}");
     }
 }

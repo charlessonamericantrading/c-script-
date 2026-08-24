@@ -323,13 +323,15 @@ fn render_service(s: &ServiceDecl) -> String {
                     Some(Annotation::Authenticated) => {
                         r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string()
                     }
-                    // `auth()` nunca devuelve ContentType, Route ni RateLimit;
-                    // el brazo existe para que agregar una anotación nueva
-                    // rompa acá y no pase de largo mostrando "Público" por
-                    // descarte.
-                    Some(Annotation::ContentType(_)) | Some(Annotation::Route(_)) | Some(Annotation::RateLimit(_)) | None => {
-                        r#"<span class="badge">🌐 Público</span>"#.to_string()
-                    }
+                    // `auth()` nunca devuelve ContentType, Route, RateLimit
+                    // ni Deprecated; el brazo existe para que agregar una
+                    // anotación nueva rompa acá y no pase de largo mostrando
+                    // "Público" por descarte.
+                    Some(Annotation::ContentType(_))
+                    | Some(Annotation::Route(_))
+                    | Some(Annotation::RateLimit(_))
+                    | Some(Annotation::Deprecated(_))
+                    | None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
                 };
                 let rate_limit_badge = match r.rate_limit() {
                     Some(spec) => format!(r#"<span class="badge">⏱️ @rate_limit("{spec}")</span>"#),
@@ -343,7 +345,11 @@ fn render_service(s: &ServiceDecl) -> String {
                     Some(pattern) => format!(r#"<span class="badge">🔗 {pattern}</span>"#),
                     None => String::new(),
                 };
-                let auth_badge = format!("{auth_badge}{content_type_badge}{route_badge}{rate_limit_badge}");
+                let deprecated_badge = match r.deprecated() {
+                    Some(reason) => format!(r#"<span class="badge" style="background:#7a1f1f;">⚠️ deprecated: {reason}</span>"#),
+                    None => String::new(),
+                };
+                let auth_badge = format!("{auth_badge}{content_type_badge}{route_badge}{rate_limit_badge}{deprecated_badge}");
 
                 let mut params_str = Vec::new();
                 let mut params_table = String::new();

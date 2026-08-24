@@ -105,7 +105,18 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
                     let mut required = Vec::new();
                     for f in fields {
                         let ty = checker.resolve_type(&f.ty).map_err(|e| e.to_string())?;
-                        props[f.name.as_str()] = type_to_json_schema(&ty);
+                        let mut schema = type_to_json_schema(&ty);
+                        // `@deprecated` sobre un campo (GRAMMAR.md §3.71) --
+                        // "deprecated" es una keyword estándar de JSON Schema
+                        // 2020-12 (la que usa OpenAPI 3.1), así que no hace
+                        // falta ninguna extensión propietaria.
+                        if let Some(reason) = &f.deprecated {
+                            if let Some(obj) = schema.as_object_mut() {
+                                obj.insert("deprecated".to_string(), json!(true));
+                                obj.insert("description".to_string(), json!(reason));
+                            }
+                        }
+                        props[f.name.as_str()] = schema;
                         if !f.optional {
                             required.push(f.name.clone());
                         }
@@ -171,6 +182,13 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
                     }
                 }
             });
+
+            // `@deprecated` sobre un rpc (GRAMMAR.md §3.71) -- "deprecated"
+            // es una keyword nativa de Operation Object en OpenAPI 3.x.
+            if let Some(reason) = rpc.deprecated() {
+                operation["deprecated"] = json!(true);
+                operation["description"] = json!(reason);
+            }
 
             if !rpc.params.is_empty() {
                 operation["requestBody"] = json!({
@@ -242,5 +260,46 @@ mod tests {
         assert!(spec["paths"]["/Tasks/list"]["post"].is_object());
         assert!(spec["paths"]["/Tasks/create"]["post"]["requestBody"].is_object());
         assert!(spec["components"]["schemas"]["Task"].is_object());
+    }
+
+    /// `@deprecated` sobre un rpc se propaga como `deprecated: true` +
+    /// `description` en el Operation Object (GRAMMAR.md §3.71) -- keyword
+    /// nativa de OpenAPI, sin extensión propietaria.
+    #[test]
+    fn deprecated_rpc_sets_deprecated_true_on_the_operation() {
+        let code = r#"
+            service Tasks {
+                @deprecated("usa listV2 en su lugar")
+                rpc list() -> Int { 1 }
+                rpc listV2() -> Int { 2 }
+            }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        assert_eq!(spec["paths"]["/Tasks/list"]["post"]["deprecated"], true);
+        assert_eq!(spec["paths"]["/Tasks/list"]["post"]["description"], "usa listV2 en su lugar");
+        assert!(spec["paths"]["/Tasks/listV2"]["post"]["deprecated"].is_null());
+    }
+
+    /// `@deprecated` sobre un campo se propaga como `deprecated: true` +
+    /// `description` en el schema de esa propiedad (JSON Schema 2020-12,
+    /// la base de OpenAPI 3.1).
+    #[test]
+    fn deprecated_field_sets_deprecated_true_on_the_property_schema() {
+        let code = r#"
+            type Lead = { id: Int, @deprecated("usa email") legacyPhone: String, email: String }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        let props = &spec["components"]["schemas"]["Lead"]["properties"];
+        assert_eq!(props["legacyPhone"]["deprecated"], true);
+        assert_eq!(props["legacyPhone"]["description"], "usa email");
+        assert!(props["email"]["deprecated"].is_null());
     }
 }

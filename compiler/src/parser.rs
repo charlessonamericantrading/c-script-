@@ -347,6 +347,7 @@ impl Parser {
     }
 
     fn parse_field(&mut self) -> Result<Field, ParseError> {
+        let deprecated = self.parse_optional_field_deprecated()?;
         let name_span = self.span(); // cubre solo el identificador -- ver ast.rs::Field::name_span
         let name = self.eat_field_name()?;
         let optional = if self.check(&TokenKind::Question) {
@@ -357,7 +358,37 @@ impl Parser {
         };
         self.eat(&TokenKind::Colon)?;
         let ty = self.parse_type_expr()?;
-        Ok(Field { name, optional, ty, name_span })
+        Ok(Field { name, optional, ty, name_span, deprecated })
+    }
+
+    /// `@deprecated("usa X en su lugar")` antes de un campo de struct
+    /// (GRAMMAR.md §3.71) -- ver ast.rs::Field::deprecated para por qué esto
+    /// NO reusa `parse_optional_annotation` (esa devuelve `Vec<Annotation>`
+    /// y acepta cualquier anotación de rpc, ninguna de las cuales tiene
+    /// sentido sobre un campo). El motivo se valida no-vacío ACÁ, en el
+    /// parser, en vez de en el checker como `@content_type`: a diferencia de
+    /// un rpc, hoy no existe ningún paso del checker que recorra campos de
+    /// struct uno por uno, y agregar uno solo para esto sería más gramática
+    /// nueva de la que el ítem pide -- el string ya está disponible acá,
+    /// sin ninguna dependencia de resolución de tipos.
+    fn parse_optional_field_deprecated(&mut self) -> Result<Option<String>, ParseError> {
+        if !self.check(&TokenKind::At) {
+            return Ok(None);
+        }
+        self.advance();
+        let name = self.eat_ident()?;
+        if name != "deprecated" {
+            return Err(self.error(format!(
+                "anotación desconocida '@{name}' sobre un campo (solo se admite '@deprecated(\"motivo\")')"
+            )));
+        }
+        self.eat(&TokenKind::LParen)?;
+        let reason = self.eat_string()?;
+        self.eat(&TokenKind::RParen)?;
+        if reason.trim().is_empty() {
+            return Err(self.error("`@deprecated(\"\")` sobre un campo: el motivo no puede estar vacío".to_string()));
+        }
+        Ok(Some(reason))
     }
 
     fn parse_const_decl(&mut self) -> Result<ConstDecl, ParseError> {
@@ -462,9 +493,15 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::RateLimit(value)
                 }
+                "deprecated" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let value = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::Deprecated(value)
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")' o '@rate_limit(\"N/ventana\")')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")' o '@deprecated(\"motivo\")')"
                     )))
                 }
             };

@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.36.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`@deprecated("usa X en su lugar")` sobre un campo de struct o un rpc/stream.** Hasta esta ronda, marcar algo como "existe pero no lo uses" no tenía forma declarativa -- un comentario en el `.link` nunca llegaba al `.d.ts` generado. Sobre un `rpc`/`stream` reusa el mecanismo de anotaciones que ya existía (`@authenticated`/`@route`/`@rate_limit`/etc.), combinable libremente con cualquiera de esas -- es una dimensión ortogonal. Sobre un campo de struct es la ÚNICA anotación que un campo admite hoy: `Field` no tiene el `Vec<Annotation>` genérico de `RpcDecl`, así que el parser solo reconoce `@deprecated("...")` en esa posición y rechaza cualquier otro nombre ahí mismo con un error de sintaxis. Puramente informativo -- cero efecto en runtime ni en el checker: un rpc/campo deprecado sigue funcionando exactamente igual, y NO participa de la subtipificación estructural (dos structs idénticos salvo el `@deprecated` de un campo siguen siendo el mismo tipo). Propagado como comentario JSDoc `/** @deprecated <motivo> */` justo antes del campo/método en `contract.d.ts` (cualquier editor que entienda JSDoc lo tacha automáticamente), y como `deprecated: true` + `description` -- keywords nativas de Operation Object y JSON Schema 2020-12, sin extensión `x-*` propia -- en `openapi.json`.
+
+690 tests (11 nuevos): 6 en `checker.rs`/parser (tipa limpio combinado con `@requires` en un rpc, rechaza dos `@deprecated` en el mismo rpc, rechaza motivo vacío en rpc y en campo, tipa limpio en un campo sin afectar subtipificación estructural, rechaza cualquier otra anotación sobre un campo) y 5 en `codegen` (3 en `ts_emit.rs`: el JSDoc aparece exactamente antes de lo marcado y en ningún otro lado en campo y en rpc, un motivo con `*/` literal no corta el comentario antes de tiempo; 2 en `openapi_emit.rs`: `deprecated`+`description` en la operación y en la propiedad del schema, ausentes en las que no llevan la anotación). Más el ejemplo nuevo de GRAMMAR.md §3.71, compilado y ejecutado por `docs_examples.rs` (no suma al conteo -- ya corre como parte de ese mismo test). Detalle completo: GRAMMAR.md §3.71.
+
 ## [1.35.0] - 2026-08-24
 
 ### ✨ Nuevo

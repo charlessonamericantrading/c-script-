@@ -92,6 +92,7 @@
   - [3.68 NULL en una columna requerida tras una migración de PostgreSQL: error limpio, no `null` silencioso — RESUELTO](#368-null-en-una-columna-requerida-tras-una-migración-de-postgresql-error-limpio-no-null-silencioso--resuelto)
   - [3.69 Narrowing real de `T?`: `match`, `??` y `.isSome()`/`.isNone()` — RESUELTO](#369-narrowing-real-de-t-match--y-issome-isnone--resuelto)
   - [3.70 Tipo nativo `Uuid` — RESUELTO](#370-tipo-nativo-uuid--resuelto)
+  - [3.71 `@deprecated("motivo")` en un campo o un rpc — RESUELTO](#371-deprecatedmotivo-en-un-campo-o-un-rpc--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3534,6 +3535,53 @@ test "un uuid generado se guarda y se lee de vuelta identico" {
 - **Sin tipo `Uuid` dedicado en WASM.** El codegen wasm nativo sigue siendo solo escalares (`Int`/`Int64`/`Bool`/`Float`) -- una función con un parámetro o retorno `Uuid` no compila a WASM, mismo límite que ya aplica a `String`.
 
 **Verificado**: 5 tests nuevos en `checker.rs` (resuelve como nombre de tipo en campos de struct y firmas de rpc, `crypto.uuid()` tipa `Uuid` no `String`, sin mezcla implícita con `String` ni en asignación ni en `+`, `.toString()` funciona) y 3 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (7 variantes de UUID malformado rechazadas con 400 -- forma corta, forma larga, sin guiones, caracteres no-hex, un número JSON, `null` -- todas nombrando el campo; un UUID válido, incluido en mayúsculas, viaja por el wire exacto; `crypto.uuid()` genera un UUID real que sobrevive un `insert`+`find` contra SQLite real, idéntico byte a byte). Verificado a mano contra un servidor HTTP real (`curl`) y contra el archivo SQLite generado (`sqlite3 ... ".schema"`) además de los tests automatizados.
+
+---
+
+### 3.71 `@deprecated("motivo")` en un campo o un rpc — RESUELTO
+
+Marcar una parte del contrato como "existe pero no la uses para código nuevo" no tenía forma declarativa -- la única opción era un comentario en el `.link` que nunca llegaba al `.d.ts` generado, así que quien integraba el cliente TypeScript no se enteraba hasta que alguien le avisara a mano.
+
+<!-- linkc:check -->
+```rust
+type Contact = {
+  id: Int,
+  @deprecated("usa email en su lugar, se elimina en la próxima versión mayor")
+  legacyPhone: String?,
+  email: String,
+}
+type NewContact = { legacyPhone: String?, email: String }
+
+db { contacts: Contact[] }
+
+service Contacts {
+  @deprecated("usa createV2, que valida el formato de email")
+  rpc create(email: String) -> Contact {
+    db.contacts.insert(NewContact { legacyPhone: null, email: email })
+  }
+  rpc createV2(email: String) -> Contact {
+    db.contacts.insert(NewContact { legacyPhone: null, email: email })
+  }
+}
+
+test "un campo o rpc deprecado sigue funcionando igual -- es puramente informativo" {
+  let c = Contacts.create("a@b.com");
+  assert(c.email == "a@b.com", "el rpc deprecado sigue creando el registro normalmente");
+}
+```
+
+**Dos puntos de anclaje, cada uno con su propia gramática.** Sobre un `rpc`/`stream` reusa el mecanismo de anotaciones que ya existía (`RpcDecl.annotations`, junto a `@authenticated`/`@route`/`@rate_limit`/etc.) -- se puede combinar libremente con cualquiera de esas, es una dimensión ortogonal. Sobre un campo de `struct` es **la única anotación que un campo admite hoy**: `Field` no tiene un `Vec<Annotation>` genérico como `RpcDecl` -- el parser solo sabe reconocer `@deprecated("...")` en esa posición, y cualquier otro nombre (`@authenticated`, por ejemplo) se rechaza ahí mismo con un error de sintaxis, no silenciosamente.
+
+**Puramente informativo -- cero efecto en runtime o en el checker de tipos.** Un `rpc`/campo deprecado se sigue pudiendo llamar/leer/escribir exactamente igual; `@deprecated` no bloquea nada en compilación (a diferencia de, por ejemplo, `@content_type`, que si se usa mal es un error). Tampoco participa de la subtipificación estructural: dos `struct` idénticos salvo que uno marca un campo con `@deprecated` y el otro no siguen siendo el MISMO tipo a los ojos del checker -- la anotación es metadata de documentación, no de forma.
+
+**Propagado al `.d.ts` como JSDoc, y a `openapi.json` con la keyword nativa.** En `contract.d.ts`, el motivo aparece como `/** @deprecated <motivo> */` justo antes del campo en la `interface`, o antes de la firma del método en `{Service}Client` -- cualquier editor que entienda JSDoc (VS Code incluido) tacha automáticamente esa línea en el código de quien lo consume. En `openapi.json` se usa `"deprecated": true` (keyword estándar tanto de Operation Object como de JSON Schema 2020-12, la base de OpenAPI 3.1), más `"description"` con el motivo -- sin inventar ninguna extensión `x-*` propia.
+
+**Límites honestos:**
+- **Sin `@deprecated` sobre un `type`/`enum` completo, ni sobre un parámetro de rpc.** Solo campos de struct y rpc/stream completos -- deprecar un tipo entero o un parámetro individual no está cubierto; el workaround es deprecar cada campo del tipo, o el rpc entero si el parámetro es lo único que cambió.
+- **Sin fecha de remoción ni versión estructurada.** El motivo es texto libre (`"usa X en su lugar"`) -- no hay un campo separado tipo `removedIn: "2.0.0"` que una herramienta pudiera leer programáticamente; si hace falta esa fecha, va como parte del texto.
+- **La clase `{Service}ClientImpl` (la implementación concreta, no la interfaz `{Service}Client`) no repite el JSDoc en sus propios métodos.** `create{Service}Client(...)` devuelve el tipo `{Service}Client` (la interfaz), así que cualquier editor que tipe la variable contra ese tipo -- el caso normal -- sí ve el aviso; solo alguien que importe y tipe explícitamente contra la clase concreta se lo perdería.
+
+**Verificado**: 6 tests en `checker.rs` (tipa limpio combinado con `@requires` en un rpc, rechaza dos `@deprecated` en el mismo rpc, rechaza motivo vacío en un rpc, tipa limpio en un campo sin afectar subtipificación estructural -- un struct con un campo deprecado sigue aceptándose donde se espera el struct equivalente sin la anotación --, rechaza motivo vacío en un campo, rechaza cualquier otra anotación sobre un campo) y 4 en `codegen` (2 en `ts_emit.rs`: el JSDoc aparece exactamente antes del campo/método marcado y en ningún otro, un motivo con `*/` literal no corta el comentario antes de tiempo; 2 en `openapi_emit.rs`: `deprecated: true` + `description` en la operación y en la propiedad del schema, ausentes en las que no llevan la anotación).
 
 ---
 

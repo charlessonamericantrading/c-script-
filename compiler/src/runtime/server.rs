@@ -726,9 +726,9 @@ fn check_auth_gate(
         // cualquiera con un token de bajo privilegio un mapeo completo
         // endpoint->rol gratis (hallado en el review adversarial).
         Annotation::Requires { .. } => Err((403, "no tenés permiso para esta operación")),
-        // `required_auth` solo devuelve anotaciones de auth: si estas tres
+        // `required_auth` solo devuelve anotaciones de auth: si estas
         // llegaran a matchear, el bug está allá arriba, no acá.
-        Annotation::ContentType(_) | Annotation::Route(_) | Annotation::RateLimit(_) => Ok(()),
+        Annotation::ContentType(_) | Annotation::Route(_) | Annotation::RateLimit(_) | Annotation::Deprecated(_) => Ok(()),
     }
 }
 

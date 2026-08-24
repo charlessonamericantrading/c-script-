@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.35.0-blue.svg" alt="Versión" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.36.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 679 pruebas automáticas:
+**Funciona hoy**, cubierto por 690 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `@deprecated("usa X en su lugar")` sobre un campo de struct o un rpc/stream -- puramente informativo, sin efecto en runtime ni en la subtipificación estructural (un struct sigue siendo el mismo tipo lleve o no un campo esta anotación). Se propaga como comentario JSDoc `/** @deprecated ... */` justo antes del campo/método en el `contract.d.ts` generado, y como `deprecated: true` + `description` nativos (keywords de Operation Object / JSON Schema 2020-12, sin extensión `x-*` propia) en `openapi.json`. Sobre un campo es la ÚNICA anotación que se acepta ahí -- cualquier otro nombre (`@authenticated`, etc.) es un error de sintaxis en esa posición, no algo que se ignore en silencio
 - Narrowing real de `T?` dentro de un cuerpo de rpc: `match x { v: T => v.campo, null => ... }` liga `v` al `T` real (no `T?`) dentro de esa rama -- reusa la misma maquinaria de patrones exhaustivos que ya narrowaba uniones, así que faltar el caso `null` o el caso de valor es un error de compilación, no una sorpresa en runtime. `if x != null { x.campo }` sigue sin angostar -- eso queda deliberado -- pero `match` sí. `x ?? default` cubre el caso común "dame un default" (encadena de izquierda a derecha: `a ?? b ?? c`), y `x.isSome()`/`x.isNone()` cubren "solo necesito saber si hay valor", los dos sin necesitar un `match` completo
 - Tipo nativo `Uuid`: valida la forma canónica `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` en cada borde que un valor puede cruzar -- decodificar una request entrante, `validators.ts`, y el schema Zod generado, los tres con exactamente el mismo chequeo para que nunca puedan discrepar. Tipo aparte de `String`, sin mezcla implícita (misma regla que `Int64` vs `Int`) -- `crypto.uuid()` devuelve `Uuid`, y `.toString()` es la bajada explícita a un string plano
 - `linkc introspect <url-postgres>` genera un `.link` de partida (types + `db {...}`) desde el schema de una base PostgreSQL ya existente -- para adoptar un sistema con datos reales en vez de escribir cada campo a mano. Punto de partida para revisar, no listo para producción tal cual: cualquier columna que no pueda mapear con confianza (`jsonb`, `uuid`, un `timestamp`/`timestamptz` nativo) igual sale con un tipo válido (`String`) más una advertencia en stderr, nunca se omite en silencio. Solo PostgreSQL, sin generar ningún `service`

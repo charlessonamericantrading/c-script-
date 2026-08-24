@@ -1286,6 +1286,26 @@ impl Checker {
             )));
         }
 
+        let deprecated: Vec<&String> = r
+            .annotations
+            .iter()
+            .filter_map(|a| match a {
+                Annotation::Deprecated(reason) => Some(reason),
+                _ => None,
+            })
+            .collect();
+        if deprecated.len() > 1 {
+            return Err(err(format!(
+                "'{}' declara `@deprecated` más de una vez: un rpc tiene un solo motivo de baja",
+                r.name
+            )));
+        }
+        if let Some(reason) = deprecated.first() {
+            if reason.trim().is_empty() {
+                return Err(err(format!("`@deprecated(\"\")` en '{}': el motivo no puede estar vacío", r.name)));
+            }
+        }
+
         let content_types: Vec<&String> = r
             .annotations
             .iter()
@@ -5960,5 +5980,88 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    /// `@deprecated("...")` sobre un rpc tipa limpio y coexiste con otras
+    /// anotaciones (GRAMMAR.md §3.71) -- es una dimensión ortogonal, igual
+    /// que `@rate_limit`.
+    #[test]
+    fn deprecated_on_an_rpc_typechecks_and_combines_with_auth() {
+        let src = r#"
+            enum Role { Admin }
+            service S {
+                @requires(Role.Admin)
+                @deprecated("usa panelV2 en su lugar")
+                rpc panel() -> Int { 1 }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn deprecated_twice_on_the_same_rpc_is_rejected() {
+        let src = r#"
+            service S {
+                @deprecated("motivo uno")
+                @deprecated("motivo dos")
+                rpc old() -> Int { 1 }
+            }
+        "#;
+        let errs = check_source(src).expect_err("dos @deprecated en el mismo rpc debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("más de una vez")), "{errs:?}");
+    }
+
+    #[test]
+    fn deprecated_with_an_empty_reason_on_an_rpc_is_rejected() {
+        let src = r#"
+            service S {
+                @deprecated("")
+                rpc old() -> Int { 1 }
+            }
+        "#;
+        let errs = check_source(src).expect_err("motivo vacío debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("no puede estar vacío")), "{errs:?}");
+    }
+
+    /// `@deprecated` sobre un campo de struct (GRAMMAR.md §3.71) es
+    /// puramente informativo para el checker -- no cambia si el struct
+    /// tipa, ni la subtipificación estructural (dos structs iguales salvo
+    /// el `@deprecated` de un campo siguen siendo el mismo tipo).
+    #[test]
+    fn deprecated_on_a_struct_field_typechecks_and_does_not_affect_structural_equality() {
+        let src = r#"
+            type Old = { id: Int, @deprecated("usa email") legacyContact: String }
+            type New = { id: Int, legacyContact: String }
+            db { olds: Old[] }
+            fn takesNew(n: New) -> Int { n.id }
+            fn f() -> Int {
+                let row = db.olds.find(1);
+                match row {
+                    o: Old => takesNew(o),
+                    null => 0,
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    /// El motivo vacío se rechaza en el PARSER para campos (ver
+    /// `parse_optional_field_deprecated` en parser.rs -- no hay un paso del
+    /// checker que recorra campos de struct), así que este test parsea
+    /// directo en vez de pasar por `check_source`.
+    #[test]
+    fn deprecated_with_an_empty_reason_on_a_field_is_rejected() {
+        let src = r#"type Old = { id: Int, @deprecated("") legacy: String }"#;
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("motivo vacío en campo debe rechazarse");
+        assert!(format!("{err:?}").contains("no puede estar vacío"), "{err:?}");
+    }
+
+    #[test]
+    fn an_unknown_annotation_on_a_field_is_rejected() {
+        let src = r#"type Old = { id: Int, @authenticated legacy: String }"#;
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("una anotación de rpc sobre un campo debe rechazarse");
+        assert!(format!("{err:?}").contains("anotación desconocida"), "{err:?}");
     }
 }

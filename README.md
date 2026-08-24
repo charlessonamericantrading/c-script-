@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.35.0-blue.svg" alt="Version" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.36.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 679 automated tests:
+**Works today**, covered by 690 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `@deprecated("usa X en su lugar")` on a struct field or an rpc/stream — purely informational, no effect on runtime or on structural subtyping (a struct is still the same type whether or not a field carries it). Propagated as a JSDoc `/** @deprecated ... */` comment right above the field/method in the generated `contract.d.ts`, and as native `deprecated: true` + `description` (Operation Object / JSON Schema 2020-12 keywords, no proprietary `x-*` extension) in `openapi.json`. On a field it's the ONLY annotation accepted there — any other name (`@authenticated`, etc.) is a syntax error at that position, not silently ignored
 - Real narrowing of `T?` inside an rpc body: `match x { v: T => v.field, null => ... }` binds `v` to the real `T` (not `T?`) in that branch — reuses the same exhaustive pattern-matching machinery already used for union narrowing, so a missing `null` or a missing value arm is a compile error, not a runtime surprise. `if x != null { x.field }` still doesn't narrow — that stays deliberate — but `match` does. `x ?? default` covers the common "give me a default" case (chains left-to-right: `a ?? b ?? c`), and `x.isSome()`/`x.isNone()` cover "just need to know if there's a value," both without needing a full `match`
 - Native `Uuid` type: validates the canonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form at every boundary a value can cross — decoding an incoming request, `validators.ts`, and the generated Zod schema, all with the exact same check so the three can never disagree. A separate type from `String`, no implicit mixing (same rule as `Int64` vs `Int`) — `crypto.uuid()` returns `Uuid`, and `.toString()` is the explicit way down to a plain string
 - `linkc introspect <postgres-url>` generates a starting `.link` (types + `db {...}`) from an existing PostgreSQL database's schema — for adopting a system with real data instead of writing every field by hand. A starting point to review, not production-ready as-is: any column it can't map with confidence (`jsonb`, `uuid`, a native `timestamp`/`timestamptz`) still gets a valid type (`String`) plus a warning on stderr, never silently dropped. PostgreSQL only, no `service` generated

@@ -782,6 +782,7 @@ fn get_hover_for_word(word: &str, source: &str, full_program: Option<&Program>) 
         "Patch" => Some("Builtin Type `Patch<T>`\n\nPartial update shape for type `T`."),
         "authenticated" => Some("Annotation `@authenticated`\n\nRequires a valid authenticated session."),
         "requires" => Some("Annotation `@requires(Role)`\n\nRequires a session with the specified Role."),
+        "deprecated" => Some("Annotation `@deprecated(\"reason\")`\n\nMarks an rpc/stream or a struct field as deprecated. Propagated as a JSDoc `@deprecated` comment in the generated `.d.ts`, and as `deprecated: true` in the generated OpenAPI document. Purely informational -- does not change runtime behavior."),
         _ => None,
     };
 
