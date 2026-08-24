@@ -80,6 +80,7 @@ fn main() -> ExitCode {
         Some("test") => cmd_test(&args[2..]),
         Some("serve") => cmd_serve(&args[2..]),
         Some("serve-all") => cmd_serve_all(&args[2..]),
+        Some("migrate") => cmd_migrate(&args[2..]),
         Some("new") => cmd_new(&args[2..]),
         Some("dev") => cmd_dev(&args[2..]),
         Some("lsp") => cmd_lsp(),
@@ -133,6 +134,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
+    out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
     out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY)"));
     out(&format!("     linkc serve-all <directorio> --port-base <N> [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado)"));
@@ -284,6 +286,62 @@ fn cmd_introspect(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error al introspeccionar '{url}': {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// GRAMMAR.md §3.97: solo soporta `--dry-run` en esta ronda -- aplicar de
+/// verdad ya pasa automáticamente al conectar con `linkc serve`/
+/// `serve-all`, así que un `linkc migrate` sin `--dry-run` no tiene todavía
+/// un comportamiento propio que no sea ambiguo con eso. Rechazado
+/// explícito, con el motivo, en vez de hacer algo inesperado en silencio.
+/// Solo PostgreSQL: SQLite ya reporta el diff exacto al conectar de verdad
+/// (`check_schema_matches`, GRAMMAR.md §3.17), antes de tocar nada.
+fn cmd_migrate(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("uso: linkc migrate <archivo.link> --db <url-postgres> --dry-run");
+        return ExitCode::FAILURE;
+    };
+    if !args.iter().any(|a| a == "--dry-run") {
+        eprintln!(
+            "uso: linkc migrate <archivo.link> --db <url-postgres> --dry-run -- esta ronda solo soporta \
+             --dry-run (mostrar el DDL sin aplicarlo). Aplicar de verdad ya pasa automáticamente al conectar \
+             con 'linkc serve'/'linkc serve-all', que es intencional, no un olvido."
+        );
+        return ExitCode::FAILURE;
+    }
+    let url = match read_flag_or_env(args, "--db", "LINK_DATABASE_URL") {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            eprintln!("uso: linkc migrate <archivo.link> --db <url-postgres> --dry-run (o LINK_DATABASE_URL)");
+            return ExitCode::FAILURE;
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        eprintln!(
+            "'linkc migrate --dry-run' solo aplica a PostgreSQL -- SQLite ya reporta el diff exacto al \
+             conectar de verdad ('linkc serve'), antes de tocar nada, sin necesitar un modo aparte."
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+
+    match linkc::migrate::dry_run_postgres(&program, &url) {
+        Ok(report) => {
+            println!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }

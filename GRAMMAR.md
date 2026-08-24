@@ -118,6 +118,7 @@
   - [3.94 Aviso de colisión de nombre de tabla en PostgreSQL — RESUELTO](#394-aviso-de-colisión-de-nombre-de-tabla-en-postgresql--resuelto)
   - [3.95 `countWhere` + `findWhere` empujados a SQL para `x.campo == valor` — RESUELTO](#395-countwhere--findwhere-empujados-a-sql-para-xcampo--valor--resuelto)
   - [3.96 `@check(...)`: constraints numéricos de nivel de base — RESUELTO](#396-check-constraints-numéricos-de-nivel-de-base--resuelto)
+  - [3.97 `linkc migrate --dry-run` — RESUELTO](#397-linkc-migrate---dry-run--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4516,6 +4517,39 @@ test "un rating dentro de 1-5 se acepta" {
 - **Límites como `f64` sin importar si el campo es `Int`/`Int64`.** Comparar un valor entero contra un límite de punto flotante es exacto para cualquier magnitud humana realista -- no pensado para el borde exacto de `i64`/`Int64` (GRAMMAR.md §3.30).
 
 **Verificado**: 5 tests en `checker.rs` (`min`/`max`/`range` tipan sobre `Int`/`Int64`/`Float` requerido u opcional, se rechaza sobre un campo no numérico, `range` con mínimo mayor que máximo se rechaza, `@check` con un kind desconocido y un segundo `@check` sobre el mismo campo se rechazan en el parser). 1 en `codegen/postgres_emit.rs` (el DDL estático que `linkc build` genera lleva el `CHECK` inline exacto para las tres formas). 4 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (`range` rechaza por arriba y por abajo nombrando el campo; `min`/`max` rechazan solo el lado que declaran; dispara igual construyendo el struct DENTRO del cuerpo de un rpc a partir de parámetros sueltos, no solo recibiéndolo completo por el wire; un campo opcional ausente no dispara nada). 1 en `runtime/db.rs` contra SQLite real (el `CHECK` existe de verdad en la tabla física, y un `INSERT` crudo por SQL directo -- sin pasar por `Db::call` en absoluto -- se rechaza a nivel de SQLite). 1 en `pg_integration.rs` contra un PostgreSQL real, mismo criterio: un `INSERT` crudo por fuera de `linkc serve` se rechaza a nivel de Postgres.
+
+---
+
+### 3.97 `linkc migrate --dry-run` — RESUELTO
+
+Octavo reporte de adopción real (IgnisLove), ítem 9 de su lista priorizada: "mostrar el DDL exacto que se ejecutaría sin aplicarlo... antes de apuntar cualquier servicio a una tabla real con `--adopt-existing`, ver el DDL exacto que se ejecutaría sin aplicarlo todavía sería la verificación que le falta a ese paso". Hasta esta ronda, la única forma de saber qué DDL iba a correr `linkc serve` contra una base Postgres era conectar de verdad -- que YA lo ejecuta, al conectar (GRAMMAR.md §3.17).
+
+```bash
+linkc migrate backend.link --db postgres://user:pass@host/produccion --dry-run
+# -- 'linkc migrate --dry-run': DDL que 'linkc serve'/'linkc serve-all' ejecutaría
+# -- al conectar a esta base AHORA MISMO -- nada de esto se aplicó.
+#
+# -- 'facturas': 1 columna(s) nueva(s), agregada(s) SIEMPRE nullable (GRAMMAR.md §3.17)
+# ALTER TABLE "facturas" ADD COLUMN IF NOT EXISTS "notas" TEXT;
+#
+# -- 'clientes': sin cambios (todas las columnas declaradas ya existen)
+```
+
+**Reusa las MISMAS funciones puras de generación de DDL que ya usa el runtime real -- nunca una copia propia.** `create_postgres_table_sql`/`alter_table_add_column_postgres` (`codegen/postgres_emit.rs`) y `create_index_statements` (`runtime/db.rs`) ya eran funciones que devuelven texto SQL sin ejecutar nada -- la ejecución (`backend.execute_ddl`) siempre vivió en un paso SEPARADO. `linkc migrate --dry-run` (`src/migrate.rs`, módulo nuevo) llama a esas mismas funciones y nunca al paso que ejecuta -- si el runtime real cambiara el DDL que genera, este reporte cambia automáticamente con él, sin haber dos copias que puedan desincronizarse (GRAMMAR.md §3.9).
+
+**Conecta de verdad, pero SOLO lee -- ningún `CREATE`/`ALTER` en ningún momento.** Consulta `information_schema.columns` (la misma técnica que ya usan `validate_columns_exist_for_adoption`/§3.94) para saber qué existe de verdad, y compara contra lo que el `.link` declara: una tabla que no existe → el `CREATE TABLE` completo; una tabla existente con columnas faltantes → un `ALTER TABLE ADD COLUMN IF NOT EXISTS` por columna faltante; sin diferencias → "sin cambios". También corre el mismo chequeo de "¿esta tabla parece de otro programa?" (§3.94) y el de tipo de `"id"` (§3.36) -- si cualquiera de los dos fallaría al conectar de verdad, el reporte lo dice explícito ANTES de que alguien intente conectar en serio.
+
+**Solo PostgreSQL, a propósito.** SQLite (`check_schema_matches`) ya falla FUERTE ante cualquier diferencia de schema al conectar de verdad, con un mensaje que nombra el diff exacto ANTES de tocar nada -- un modo `--dry-run` aparte no agregaría ninguna información que ese camino no dé ya. `linkc migrate` sobre una URL que no empieza con `postgres://`/`postgresql://` se rechaza con este motivo explícito.
+
+**Solo `--dry-run` en esta ronda -- sin un modo "aplicar" separado.** `linkc migrate <archivo> --db <url>` SIN `--dry-run` se rechaza con un mensaje explícito: aplicar de verdad ya pasa automáticamente al conectar con `linkc serve`/`linkc serve-all` -- un segundo camino que también "aplica" sería ambiguo (¿cuál gana si los dos corren a la vez?) sin agregar nada que `linkc serve` no haga ya.
+
+**Límites honestos:**
+- **Sin `--allow-destructive`, porque no hace falta uno todavía.** El pedido original mencionaba "comportamiento configurable ante una migración que perdería datos" -- auditando la migración real de Postgres (GRAMMAR.md §3.17) apareció que HOY no existe ningún camino destructivo: solo crea tablas nuevas y agrega columnas SIEMPRE nullable, nunca borra ni cambia el tipo de una columna existente. No hay ninguna migración "peligrosa" que un dry-run necesite advertir hoy -- si el proyecto suma en el futuro una migración genuinamente destructiva (un `DROP COLUMN` explícito, por ejemplo), ESE sería el momento de agregar el flag, no antes.
+- **No detecta con certeza una colisión de nombre de tabla -- misma heurística, mismos límites que §3.94.** "Ninguna columna en común" es evidencia fuerte, no prueba.
+- **`--adopt-existing` no tiene su propio modo dry-run.** Ese modo nunca ejecuta DDL en absoluto (§3.67) -- no hay nada que "dry-run-ear" ahí; el reporte útil para ese caso ya es `check_schema_for_adoption`, que se ejecuta al conectar de verdad con `--adopt-existing`.
+- **No calcula cuánto tardaría la migración real ni bloquea la tabla.** Puramente informativo -- el tamaño de la tabla real, el lock que un `ALTER TABLE` real tomaría, no son parte de este reporte.
+
+**Verificado**: `pg_integration.rs`, 2 tests contra un PostgreSQL real -- una colección nueva muestra el `CREATE TABLE` exacto (incluido un `@check` inline) y confirma que la tabla NO se creó de verdad después; una tabla existente a la que le falta una columna muestra el `ALTER TABLE ADD COLUMN` exacto y confirma que la columna NO se agregó de verdad después.
 
 ---
 

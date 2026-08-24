@@ -165,7 +165,7 @@ fn soft_delete_fields_by_collection(program: &Program, checker: &Checker) -> Has
 /// cruce `checker.db_collections()` + `program.items` que
 /// `soft_delete_fields_by_collection`, mismo motivo (las anotaciones viven
 /// en `ast::Field`, no en el `Type` ya resuelto).
-fn index_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<(String, bool)>> {
+pub(crate) fn index_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<(String, bool)>> {
     let mut result = HashMap::new();
     for (coll_name, element_ty) in checker.db_collections() {
         let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
@@ -217,7 +217,7 @@ pub(crate) fn check_fields_by_collection(program: &Program, checker: &Checker) -
 /// determinístico (`idx_<tabla>_<campo>`) para que dos arranques sucesivos
 /// generen el MISMO nombre -- si generara uno al azar, cada arranque
 /// crearía un índice nuevo en vez de reconocer el que ya existe.
-fn create_index_statements(collection: &str, indexed: &[(String, bool)]) -> Vec<String> {
+pub(crate) fn create_index_statements(collection: &str, indexed: &[(String, bool)]) -> Vec<String> {
     indexed
         .iter()
         .map(|(field, unique)| {
@@ -465,7 +465,7 @@ fn check_schema_for_adoption(connection: &Connection, collection: &str, columns:
 /// devuelve un error limpio, NO un panic (el panic era específico de la
 /// variante `Row::get` sin chequear que usaba justo el fetch del id nuevo).
 /// "id" es el único caso donde ese error limpio no alcanzaba a tiempo.
-fn validate_existing_id_column(backend: &Backend, collection: &str) -> Result<(), String> {
+pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str) -> Result<(), String> {
     let sql = format!(
         "SELECT data_type FROM information_schema.columns WHERE table_name = {} AND column_name = 'id'",
         backend.placeholder(1)

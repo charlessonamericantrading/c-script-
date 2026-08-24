@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.61.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc migrate --dry-run`.** Octavo reporte de adopción real (IgnisLove): "antes de apuntar cualquier servicio a una tabla real con `--adopt-existing`, ver el DDL exacto que se ejecutaría sin aplicarlo todavía sería la verificación que le falta a ese paso". `linkc migrate <archivo.link> --db <url-postgres> --dry-run` (módulo nuevo, `src/migrate.rs`) conecta de solo LECTURA a la base y reporta el `CREATE TABLE`/`ALTER TABLE ADD COLUMN` exacto que `linkc serve`/`linkc serve-all` ejecutarían al conectar de verdad -- sin ejecutar nada. Reusa las MISMAS funciones puras de generación de DDL que ya usa el runtime real (`codegen::postgres_emit::create_postgres_table_sql`/`alter_table_add_column_postgres`, `runtime::db::create_index_statements`), nunca una copia propia que pudiera desincronizarse con el tiempo. También corre el chequeo de "¿esta tabla parece de otro programa?" (v1.58.0, GRAMMAR.md §3.94) y de tipo de `"id"` compatible ANTES de que alguien intente conectar en serio, no solo el diff de columnas. Solo PostgreSQL: SQLite ya falla fuerte con el diff exacto al conectar de verdad, antes de tocar nada. Sin `--allow-destructive` -- auditando la migración real de Postgres apareció que hoy no existe ningún camino destructivo que advertir (solo crea tablas nuevas y agrega columnas siempre nullable, nunca borra ni cambia tipos), así que el flag no tendría nada que hacer todavía. `linkc migrate` sin `--dry-run` se rechaza explícito: aplicar de verdad ya pasa automáticamente al conectar con `linkc serve`.
+
+881 tests (2 nuevos) en `pg_integration.rs` contra un PostgreSQL real: una colección nueva muestra el `CREATE TABLE` exacto (con `@check` inline) y confirma que la tabla no se creó de verdad; una tabla existente con una columna faltante muestra el `ALTER TABLE ADD COLUMN` exacto y confirma que la columna no se agregó de verdad. Detalle completo: GRAMMAR.md §3.97.
+
+### 📝 Nota
+- **`--db-schema`/`--db-prefix` (namespacing para compartir una base Postgres entre varios `.link`), deliberadamente diferido tras auditarlo.** A diferencia del resto de ítems de esta ronda, necesitaría enhebrar el prefijo/schema por decenas de sitios en `runtime/db.rs`/`codegen/postgres_emit.rs`/`introspect.rs` que hoy arman SQL con el nombre de colección tal cual -- un refactor genuinamente grande, con más riesgo de regresión que cualquier feature de esta sesión. Documentado como pendiente explícito en PLAN.md §9.3, para una ronda propia.
+
 ## [1.60.0] - 2026-08-24
 
 ### ✨ Nuevo

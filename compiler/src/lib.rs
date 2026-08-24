@@ -43,6 +43,7 @@ pub mod runtime;
 // playground.
 #[cfg(feature = "runtime")]
 pub mod introspect;
+pub mod migrate;
 pub mod scaffold;
 pub mod token;
 pub mod types;

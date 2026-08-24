@@ -1778,6 +1778,107 @@ service Reviews {{ rpc add(rating: Int) -> Review {{ db.{COLLECTION}.insert(Revi
     assert!(format!("{err}").to_lowercase().contains("check"), "{err}");
 }
 
+/// GRAMMAR.md §3.97: `linkc migrate --dry-run` sobre una colección cuya
+/// tabla física NO EXISTE todavía tiene que mostrar el `CREATE TABLE`
+/// exacto que `linkc serve` ejecutaría -- y, crucial, NO crear la tabla de
+/// verdad (el punto entero de "dry-run").
+#[test]
+fn migrate_dry_run_shows_the_create_table_for_a_brand_new_collection_and_creates_nothing() {
+    const COLLECTION: &str = "reviews_migrate_dry_run_new";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("migrate-dry-run-new");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Review = {{ id: Int, @check(range, 1, 5) rating: Int }}
+db {{ {COLLECTION}: Review[] }}
+service Reviews {{ rpc noop() -> Int {{ 1 }} }}
+"#
+        ),
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("migrate")
+        .arg(&link)
+        .arg("--db")
+        .arg(&url)
+        .arg("--dry-run")
+        .output()
+        .expect("ejecutar linkc migrate");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&format!("CREATE TABLE IF NOT EXISTS \"{COLLECTION}\"")), "{stdout}");
+    assert!(stdout.contains("CHECK (\"rating\" >= 1 AND \"rating\" <= 5)"), "{stdout}");
+    assert!(stdout.contains("tabla nueva"), "{stdout}");
+
+    // El punto entero de "dry-run": nada de esto se aplicó de verdad.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let exists = client
+        .query_one("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)", &[&COLLECTION])
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap();
+    assert!(!exists, "'linkc migrate --dry-run' NO debe crear la tabla de verdad");
+}
+
+/// Como el test anterior, pero sobre una tabla que YA EXISTE y le falta una
+/// columna -- el reporte tiene que mostrar el `ALTER TABLE ADD COLUMN`
+/// exacto, y la columna NO debe existir de verdad después.
+#[test]
+fn migrate_dry_run_shows_the_alter_table_for_a_missing_column_and_adds_nothing() {
+    const COLLECTION: &str = "reviews_migrate_dry_run_alter";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("migrate-dry-run-alter");
+    let link_v1 = temp.write(
+        "v1.link",
+        &format!("type Review = {{ id: Int, rating: Int }}\ndb {{ {COLLECTION}: Review[] }}\nservice S {{ rpc noop() -> Int {{ 1 }} }}\n"),
+    );
+    // Crea la tabla de verdad con "rating" solamente, vía un connect real.
+    let server = Serve::start(&link_v1, &url);
+    drop(server);
+
+    let link_v2 = temp.write(
+        "v2.link",
+        &format!(
+            "type Review = {{ id: Int, rating: Int, comment: String? }}\ndb {{ {COLLECTION}: Review[] }}\nservice S {{ rpc noop() -> Int {{ 1 }} }}\n"
+        ),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("migrate")
+        .arg(&link_v2)
+        .arg("--db")
+        .arg(&url)
+        .arg("--dry-run")
+        .output()
+        .expect("ejecutar linkc migrate");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&format!("ALTER TABLE \"{COLLECTION}\" ADD COLUMN IF NOT EXISTS \"comment\"")), "{stdout}");
+    assert!(!stdout.contains("tabla nueva"), "la tabla ya existía, no es nueva: {stdout}");
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let exists = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'comment')",
+            &[&COLLECTION],
+        )
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap();
+    assert!(!exists, "'linkc migrate --dry-run' NO debe agregar la columna de verdad");
+}
+
 /// Mismo host/base, credenciales distintas -- para probar el DDL generado
 /// con un rol restringido, sin depender de que la URL de test tenga un
 /// formato particular más allá de `postgres://user:pass@resto`.
