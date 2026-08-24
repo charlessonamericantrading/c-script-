@@ -108,6 +108,7 @@ fn lint_block(block: &Block, warnings: &mut Vec<LintWarning>) {
     }
 
     lint_secret_comparisons_in_block(block, warnings);
+    lint_delete_then_insert_in_block(block, warnings);
 }
 
 /// ¿El nombre SUGIERE un secreto? Substring en minúsculas, deliberadamente
@@ -187,6 +188,84 @@ fn lint_hardcoded_secret_const(c: &ConstDecl, warnings: &mut Vec<LintWarning>) {
             line: c.span.line,
             col: c.span.col,
         });
+    }
+}
+
+/// Si `expr` es `db.<coleccion>.<method>(args)`, devuelve `(coleccion,
+/// args)`. Reconoce SOLO esa forma exacta (`db` como identificador, dos
+/// `FieldAccess` anidados, después un `Call`) -- mismo criterio de "shape
+/// chico y ancho, no un intérprete de expresiones parcial" que
+/// `ast::recognize_field_selector` ya usa para `sumBy`/`maxBy`/etc.
+fn recognize_db_call<'a>(expr: &'a Expr, method: &str) -> Option<(&'a str, &'a [Spanned<Expr>])> {
+    let Expr::Call { callee, args } = expr else { return None };
+    let Expr::FieldAccess { base, field } = &callee.node else { return None };
+    if field != method {
+        return None;
+    }
+    let Expr::FieldAccess { base: db_base, field: collection } = &base.node else { return None };
+    let Expr::Ident(name) = &db_base.node else { return None };
+    if name != "db" {
+        return None;
+    }
+    Some((collection.as_str(), args.as_slice()))
+}
+
+/// Representación de texto CANÓNICA de un subconjunto chico de formas
+/// (`Ident`, `campo.anidado`, un literal `Int`) -- suficiente para comparar
+/// "¿el id que se borró es el mismo que el que se intentó preservar en el
+/// insert?" sin necesitar un comparador de expresiones genérico. Cualquier
+/// otra forma (una llamada, una expresión aritmética, ...) da `None` --
+/// el lint simplemente no dispara ahí, nunca un falso positivo por
+/// adivinar mal una equivalencia.
+fn simple_expr_key(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Ident(name) => Some(name.clone()),
+        Expr::FieldAccess { base, field } => Some(format!("{}.{field}", simple_expr_key(&base.node)?)),
+        Expr::Int(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// GRAMMAR.md §3.106: `db.<c>.delete(x.id)` seguido, más adelante en el
+/// MISMO bloque, de `db.<c>.insert(MismoTipo { id: x.id, ... })` sobre la
+/// MISMA colección y con el MISMO id -- un intento de "actualizar
+/// borrando y reinsertando" que no hace lo que parece: `insert` SIEMPRE
+/// asigna un id nuevo por autoincrement (§3.17), nunca respeta el valor
+/// que el literal declara para `id` -- así que la fila resultante queda
+/// con OTRO id, rompiendo cualquier referencia externa a la fila
+/// original. Encontrado en IgnisLove (`bandit_rewards`/`bot_defense`/
+/// `stock_cache`/etc. ya migraron a `upsert`/`applyPatch` citando
+/// exactamente este motivo; `banners.link` todavía no). Puramente
+/// informativo, como el resto del linter -- `linkc lint` sigue saliendo
+/// con código 0.
+fn lint_delete_then_insert_in_block(block: &Block, warnings: &mut Vec<LintWarning>) {
+    let exprs: Vec<(&Spanned<Expr>, usize, usize)> =
+        block.stmts.iter().filter_map(|s| if let Stmt::Expr(e) = &s.node { Some((e, s.span.line, s.span.col)) } else { None }).collect();
+
+    for (i, (expr, _, _)) in exprs.iter().enumerate() {
+        let Some((del_coll, del_args)) = recognize_db_call(&expr.node, "delete") else { continue };
+        let Some(del_id_expr) = del_args.first() else { continue };
+        let Some(del_key) = simple_expr_key(&del_id_expr.node) else { continue };
+
+        for (later, line, col) in &exprs[i + 1..] {
+            let Some((ins_coll, ins_args)) = recognize_db_call(&later.node, "insert") else { continue };
+            if ins_coll != del_coll {
+                continue;
+            }
+            let Some(Expr::StructLit { fields, .. }) = ins_args.first().map(|a| &a.node) else { continue };
+            let Some((_, id_value)) = fields.iter().find(|(name, _)| name == "id") else { continue };
+            if simple_expr_key(&id_value.node).as_deref() != Some(del_key.as_str()) {
+                continue;
+            }
+            warnings.push(LintWarning {
+                rule: "delete-then-insert-same-id",
+                message: format!(
+                    "'db.{del_coll}.delete({del_key})' seguido de 'db.{ins_coll}.insert(... id: {del_key} ...)' -- insert() SIEMPRE asigna un id NUEVO por autoincrement, nunca respeta el valor pasado en 'id', así que esto no preserva la fila original (cualquier referencia externa al id viejo queda apuntando a una fila borrada). Usá 'applyPatch'/'upsert' en su lugar"
+                ),
+                line: *line,
+                col: *col,
+            });
+        }
     }
 }
 
@@ -586,6 +665,80 @@ mod tests {
         // sobre el AST parseado, antes/aparte del checker.
         let code = r#"const DB_URL: String = env.get("LINK_DATABASE_URL");"#;
         assert!(hardcoded_secret_warnings(code).is_empty());
+    }
+
+    // ---- `delete-then-insert-same-id` (GRAMMAR.md §3.106) ----
+
+    fn delete_then_insert_warnings(code: &str) -> Vec<LintWarning> {
+        let tokens = lexer::tokenize(code).unwrap_or_else(|e| panic!("{e}"));
+        let program = parser::parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        lint_program(&program).into_iter().filter(|w| w.rule == "delete-then-insert-same-id").collect()
+    }
+
+    #[test]
+    fn delete_then_insert_with_the_same_id_on_the_same_collection_is_flagged() {
+        let code = r#"
+            type Banner = { id: Int, name: String, impressionsCount: Int }
+            db { banners: Banner[] }
+            service S {
+                rpc bump(x: Banner) -> Void {
+                    db.banners.delete(x.id);
+                    db.banners.insert(Banner { id: x.id, name: x.name, impressionsCount: x.impressionsCount + 1 });
+                }
+            }
+        "#;
+        let warnings = delete_then_insert_warnings(code);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].message.contains("banners"), "{warnings:?}");
+        assert!(warnings[0].message.contains("applyPatch"), "{warnings:?}");
+    }
+
+    #[test]
+    fn delete_then_insert_on_a_different_collection_is_not_flagged() {
+        // Archivar (borrar de una colección, insertar en OTRA) es un
+        // patrón legítimo -- no es "actualizar borrando y reinsertando".
+        let code = r#"
+            type Item = { id: Int, name: String }
+            type Archive = { id: Int, name: String }
+            db { items: Item[], archive: Archive[] }
+            service S {
+                rpc archiveIt(x: Item) -> Void {
+                    db.items.delete(x.id);
+                    db.archive.insert(Archive { id: 0, name: x.name });
+                }
+            }
+        "#;
+        assert!(delete_then_insert_warnings(code).is_empty());
+    }
+
+    #[test]
+    fn delete_then_insert_with_a_different_id_is_not_flagged() {
+        // Borrar una fila e insertar OTRA fila distinta en la misma
+        // colección es normal -- lo que dispara el lint es preservar EL
+        // MISMO id, la señal de que se está tratando de "actualizar".
+        let code = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                rpc replace(x: Item, other: Item) -> Void {
+                    db.items.delete(x.id);
+                    db.items.insert(Item { id: other.id, name: other.name });
+                }
+            }
+        "#;
+        assert!(delete_then_insert_warnings(code).is_empty());
+    }
+
+    #[test]
+    fn a_plain_insert_with_no_preceding_delete_is_not_flagged() {
+        let code = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                rpc create(name: String) -> Item { db.items.insert(Item { id: 0, name: name }) }
+            }
+        "#;
+        assert!(delete_then_insert_warnings(code).is_empty());
     }
 }
 

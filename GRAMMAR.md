@@ -127,6 +127,7 @@
   - [3.103 `Float` decodifica `numeric`/`decimal` nativo de Postgres — RESUELTO](#3103-float-decodifica-numericdecimal-nativo-de-postgres--resuelto)
   - [3.104 Escribir un `Int` contra una columna Postgres no-`BIGINT` (`SERIAL`/`SMALLINT`) — RESUELTO](#3104-escribir-un-int-contra-una-columna-postgres-no-bigint-serialsmallint--resuelto)
   - [3.105 `db.<c>.increment(id, selector, delta) -> T` — RESUELTO, alcance acotado](#3105-dbcincrementid-selector-delta---t--resuelto-alcance-acotado)
+  - [3.106 Lint `delete-then-insert-same-id` — RESUELTO](#3106-lint-delete-then-insert-same-id--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4730,6 +4731,27 @@ service Analytics {
 **Fuera de alcance a propósito, documentado en vez de escondido:** si la colección tiene un campo `@autoUpdate` (§3.77), `increment` NO lo pisa a `now()` -- a diferencia de `applyPatch`/`upsert`, que sí lo hacen. Usar `applyPatch` en su lugar si hace falta actualizar `updatedAt` a la vez que un contador.
 
 **Verificado**: 5 tests en `checker.rs` (tipa devolviendo `T` no `T?`, rechaza `Int64`, rechaza un `delta: Float`, rechaza una expresión derivada como selector, exige exactamente 3 argumentos) + 2 en `runtime/mod.rs` contra un SQLite en memoria real (incremento y decremento correctos; `id` inexistente da un error claro) + **1 en `pg_integration.rs` que es la prueba real del punto entero de esta feature**: 20 hilos, cada uno con su propia conexión HTTP, incrementando la MISMA fila 25 veces cada uno (500 incrementos concurrentes en total) contra un Postgres real -- el conteo final da EXACTO, sin perder ni uno, algo que un `upsert` con `updateFn` de lectura-previa perdería con altísima probabilidad bajo esa misma concurrencia.
+
+---
+
+### 3.106 Lint `delete-then-insert-same-id` — RESUELTO
+
+PLAN.md §9.3, gap nuevo encontrado analizando IgnisLove en profundidad: varios `.link` del repo (`bandit_rewards`, `bot_defense`, `stock_cache`, `catalog_facets`, `seo_engine`, `rfm_scorer`) tienen un comentario propio explicando por qué migraron de "borrar e reinsertar" a `upsert`/`applyPatch` -- "delete+insert con autoincrement no reproduce el id". `banners.link` todavía no había migrado. El motivo real, no solo de estilo: `insert()` SIEMPRE asigna un id nuevo por autoincrement (§3.17) -- nunca respeta el valor que un literal declara para el campo `id`, así que `db.<c>.delete(x.id); db.<c>.insert(T { id: x.id, ... })` NO preserva la fila, aunque el código parezca intentarlo escribiendo `id: x.id` explícito. Cualquier referencia externa al id viejo (otra tabla, un cliente que guardó ese id) queda apuntando a una fila que ya no existe.
+
+```
+type Banner = { id: Int, name: String, impressionsCount: Int }
+
+rpc bump(x: Banner) -> Void {
+  db.banners.delete(x.id);
+  db.banners.insert(Banner { id: x.id, name: x.name, impressionsCount: x.impressionsCount + 1 });
+}
+```
+
+**Shape detectado, mismo criterio "chico y ancho, no un intérprete de expresiones parcial" que el resto del linter:** dentro de un mismo bloque (`fn`/`rpc`/`test`, incluido el cuerpo de un `while`), un `db.<c>.delete(X)` seguido -- en cualquier punto MÁS ADELANTE del mismo bloque, no necesariamente la sentencia inmediata siguiente -- de un `db.<c>.insert(Tipo { id: X, ... })` sobre la MISMA colección, con la MISMA expresión `X` en los dos lados (comparada estructuralmente, limitado a `Ident`/`campo.anidado`/literal `Int` -- cualquier otra forma no dispara, nunca un falso positivo por adivinar una equivalencia). Borrar de una colección e insertar en OTRA (archivar) no dispara -- distinta colección. Borrar una fila e insertar una fila DISTINTA en la misma colección tampoco -- distinto id, evidencia de que no es un intento de "actualizar".
+
+**Puramente informativo**, como el resto del linter -- `linkc lint` sigue saliendo con código 0. El mensaje recomienda `applyPatch`/`upsert` en su lugar.
+
+**Verificado**: 4 tests en `lint.rs` -- el caso real exacto de `banners.link` dispara; colección distinta no dispara; id distinto no dispara; un `insert` sin ningún `delete` antes no dispara.
 
 ---
 

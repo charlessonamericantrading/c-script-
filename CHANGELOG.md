@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.69.0] - 2026-08-24
+
+### ✨ Nuevo
+- **Lint `delete-then-insert-same-id`.** Gap encontrado analizando IgnisLove en profundidad: varios `.link` del repo (`bandit_rewards`, `bot_defense`, `stock_cache`, `catalog_facets`, `seo_engine`, `rfm_scorer`) documentan en comentarios propios por qué migraron de "borrar e reinsertar" a `upsert`/`applyPatch` -- "delete+insert con autoincrement no reproduce el id" -- pero `banners.link` todavía no había migrado. El motivo real, no solo de estilo: `insert()` SIEMPRE asigna un id nuevo por autoincrement (GRAMMAR.md §3.17), nunca respeta el valor que un literal declara para `id` -- `db.<c>.delete(x.id); db.<c>.insert(T { id: x.id, ... })` NO preserva la fila aunque el código lo intente, y cualquier referencia externa al id viejo queda apuntando a una fila borrada. Shape detectado (mismo criterio "chico y ancho" del resto del linter): `delete(X)` seguido más adelante en el mismo bloque de `insert(Tipo { id: X, ... })` sobre la MISMA colección con la MISMA expresión `X` -- distinta colección (archivar) o distinto id (reemplazar por otra fila) no disparan. Puramente informativo, `linkc lint` sigue saliendo con código 0.
+
+924 tests (4 nuevos) en `lint.rs`: el caso real de `banners.link` dispara; colección distinta, id distinto, e insert sin delete previo no disparan. Detalle completo: GRAMMAR.md §3.106.
+
 ## [1.68.0] - 2026-08-24
 
 ### ✨ Nuevo
