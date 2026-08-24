@@ -169,6 +169,54 @@ fn serves_every_link_file_in_a_directory_on_sequential_ports_from_one_process() 
     assert!(dir.0.join("beta.db").exists(), "beta debe tener su propio .db");
 }
 
+/// GRAMMAR.md §3.107: `--port-map-out` escribe la asignación real
+/// (nombre de archivo sin `.link` -> puerto) a un JSON, para que un
+/// gateway externo no tenga que replicar a mano la regla de orden
+/// alfabético -- el caso real: `server/cscript-gateway.ts` de IgnisLove
+/// hardcodeaba ese mapa, con el riesgo admitido en su propio comentario de
+/// desactualizarse si se agrega/quita/renombra un `.link`.
+#[test]
+fn port_map_out_writes_the_real_assignment_before_serving() {
+    let _guard = port_guard();
+    let dir = TempDir::new("port-map-out");
+    dir.write("alpha.link", ALPHA);
+    dir.write("beta.link", BETA);
+    let port_base = free_port();
+    let map_path = dir.0.join("ports.json");
+    let server = ServeAll::start(&dir.0, port_base, &["--port-map-out", map_path.to_str().unwrap()]);
+
+    assert!(wait_for_port(port_base), "alpha no abrió a tiempo: {}", server.stderr());
+    assert!(wait_for_port(port_base + 1), "beta no abrió a tiempo: {}", server.stderr());
+
+    let contents = std::fs::read_to_string(&map_path).expect("--port-map-out debe haber escrito el archivo");
+    let parsed: serde_json::Value = serde_json::from_str(&contents).expect("tiene que ser JSON válido");
+    assert_eq!(parsed["alpha"], serde_json::json!(port_base), "{contents}");
+    assert_eq!(parsed["beta"], serde_json::json!(port_base + 1), "{contents}");
+}
+
+#[test]
+fn port_map_out_to_an_unwritable_path_fails_clean_before_starting_any_service() {
+    let _guard = port_guard();
+    let dir = TempDir::new("port-map-out-fails");
+    dir.write("alpha.link", ALPHA);
+    let port_base = free_port();
+    // Un directorio padre que no existe -- `fs::write` falla de entrada,
+    // antes de arrancar ningún hilo de servicio.
+    let bad_path = dir.0.join("no_existe").join("ports.json");
+    let server = ServeAll::start(&dir.0, port_base, &["--port-map-out", bad_path.to_str().unwrap()]);
+    // Un solo intento de conexión, no un loop de reintentos (mismo criterio
+    // que `a_type_error_in_one_link_file_aborts_the_whole_workspace_before_starting_anything`,
+    // arriba en este archivo): si el `.link` NUNCA llegó a arrancar,
+    // conectar tiene que fallar de una -- reintentar `wait_for_port` contra
+    // un puerto que jamás va a abrir solo alarga la espera sin agregar
+    // señal, y en este entorno un `connect()` a un puerto sin nada
+    // escuchando puede tardar bastante más que instantáneo.
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(TcpStream::connect(("127.0.0.1", port_base)).is_err(), "no debería haber arrancado ningún servicio si --port-map-out falló");
+    let stderr = server.stderr();
+    assert!(stderr.contains("port-map-out"), "{stderr}");
+}
+
 #[test]
 fn rejects_a_shared_db_flag_up_front() {
     let _guard = port_guard();
@@ -331,3 +379,4 @@ fn a_restart_backoff_flag_without_a_value_is_a_clean_cli_error() {
     assert!(stderr.contains("--restart-backoff"), "{stderr}");
     assert!(!stderr.contains("panicked at"), "{stderr}");
 }
+

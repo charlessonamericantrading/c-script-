@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-924-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.69.0-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-926-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.70.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 924 pruebas automáticas:
+**Funciona hoy**, cubierto por 926 pruebas automáticas:
 
 - `linkc build` / `serve` / `serve-all` / `migrate --dry-run` / `doctor` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `linkc serve-all --port-map-out <archivo.json>`: escribe `{"nombre_archivo": puerto, ...}` antes de arrancar cualquier servicio, para que un gateway externo lea la asignación real en vez de replicar la regla de orden alfabético a mano. Falla limpio (no arranca ningún servicio) si la escritura en sí falla
 - `linkc lint` marca `delete-then-insert-same-id`: `delete(x.id)` seguido de `insert(MismoTipo { id: x.id, ... })` sobre la misma colección -- `insert()` siempre asigna un id nuevo por autoincrement, nunca respeta un campo `id:` literal, así que esto nunca preserva la fila aunque el código parezca intentarlo. Recomienda `applyPatch`/`upsert` en su lugar
 - `db.<c>.increment(id, selector, delta) -> T`: un `UPDATE "campo" = "campo" + ?` atómico, sin lectura previa -- arregla un riesgo real de lost-update (dos procesos leyendo el mismo valor antes de que ninguno escriba) que `upsert` con un `updateFn` de lectura-previa sí tiene bajo concurrencia real. `delta` negativo decrementa. Acotado a `Int` por ahora
 - `db.<c>.maxRow(selector)` / `minRow(selector) -> T?`: la fila completa con el máximo/mínimo de un campo numérico, empujado a un `ORDER BY ... LIMIT 1` real -- a diferencia de `maxBy`/`minBy`, que solo agregan un valor, nunca la fila completa que lo alcanza

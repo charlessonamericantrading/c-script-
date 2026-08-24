@@ -139,7 +139,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve')"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
     out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY)"));
-    out(&format!("     linkc serve-all <directorio> --port-base <N> [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado)"));
+    out(&format!("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {{\"nombre_archivo\": puerto, ...}} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
     out(&format!("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)"));
 }
@@ -1387,7 +1387,7 @@ fn resolve_service_api_key(args: &[String]) -> Result<Option<String>, String> {
 fn cmd_serve_all(args: &[String]) -> ExitCode {
     let Some(dir) = args.first() else {
         eprintln!(
-            "uso: linkc serve-all <directorio> --port-base <N> [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>]"
+            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>]"
         );
         return ExitCode::FAILURE;
     };
@@ -1424,6 +1424,14 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             eprintln!("uso: linkc serve-all <directorio> --port-base <N> (falta --port-base)");
             return ExitCode::FAILURE;
         }
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let port_map_out = match extract_flag_value(args, "--port-map-out") {
+        Ok(v) => v,
         Err(msg) => {
             eprintln!("{msg}");
             return ExitCode::FAILURE;
@@ -1538,6 +1546,31 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
     println!("linkc serve-all: {} servicio(s) en un proceso (datos en SQLite separado por servicio)", services.len());
     for (path, port, _) in &services {
         println!("  {:<40} -> http://localhost:{port}", path.display());
+    }
+
+    // GRAMMAR.md §3.107: la asignación real (orden alfabético de los
+    // `.link` descubiertos, ver el comentario más arriba) queda escrita acá
+    // ANTES de arrancar cualquier servicio -- un gateway/proxy externo (el
+    // caso real: IgnisLove hardcodeaba a mano un mapa nombre→puerto que
+    // tenía que actualizarse cada vez que se agregaba/quitaba/renombraba un
+    // `.link`) puede leer este archivo en vez de replicar la regla de
+    // asignación por su cuenta. Clave = nombre de archivo SIN `.link` (el
+    // nombre que un router externo usaría para identificar el servicio),
+    // valor = puerto. Escribirlo es lo último antes de servir: si falla,
+    // mejor no arrancar nada a que el gateway arranque leyendo un mapeo
+    // viejo o inexistente.
+    if let Some(out_path) = &port_map_out {
+        let mut map = serde_json::Map::new();
+        for (path, port, _) in &services {
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            map.insert(name.to_string(), serde_json::json!(port));
+        }
+        let json = serde_json::to_string_pretty(&map).expect("serializar el mapeo de puertos no puede fallar");
+        if let Err(e) = fs::write(out_path, json) {
+            eprintln!("no se pudo escribir --port-map-out en '{out_path}': {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("mapeo de puertos escrito en {out_path}");
     }
 
     let handles: Vec<std::thread::JoinHandle<bool>> = services

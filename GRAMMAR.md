@@ -128,6 +128,7 @@
   - [3.104 Escribir un `Int` contra una columna Postgres no-`BIGINT` (`SERIAL`/`SMALLINT`) — RESUELTO](#3104-escribir-un-int-contra-una-columna-postgres-no-bigint-serialsmallint--resuelto)
   - [3.105 `db.<c>.increment(id, selector, delta) -> T` — RESUELTO, alcance acotado](#3105-dbcincrementid-selector-delta---t--resuelto-alcance-acotado)
   - [3.106 Lint `delete-then-insert-same-id` — RESUELTO](#3106-lint-delete-then-insert-same-id--resuelto)
+  - [3.107 `linkc serve-all --port-map-out <archivo.json>` — RESUELTO](#3107-linkc-serve-all---port-map-out-archivojson--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4752,6 +4753,24 @@ rpc bump(x: Banner) -> Void {
 **Puramente informativo**, como el resto del linter -- `linkc lint` sigue saliendo con código 0. El mensaje recomienda `applyPatch`/`upsert` en su lugar.
 
 **Verificado**: 4 tests en `lint.rs` -- el caso real exacto de `banners.link` dispara; colección distinta no dispara; id distinto no dispara; un `insert` sin ningún `delete` antes no dispara.
+
+---
+
+### 3.107 `linkc serve-all --port-map-out <archivo.json>` — RESUELTO
+
+PLAN.md §9.7, gap nuevo encontrado analizando IgnisLove en profundidad: `serve-all` (v1.56.0, §3.92) asigna puerto por orden ALFABÉTICO de los `.link` descubiertos en el directorio -- una regla determinística, pero nada externo puede LEERLA salvo replicándola a mano. `server/cscript-gateway.ts` (gateway de producción real de este adoptador, proxeando 13 servicios) hardcodea un mapa `nombre → puerto`, con un comentario propio admitiendo el riesgo: "tiene que actualizarse si algún día se añade, quita o renombra un `.link` en ese directorio".
+
+```bash
+linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json
+```
+
+**Escribe `{"nombre_archivo": puerto, ...}` a un JSON, ANTES de arrancar cualquier servicio.** La clave es el nombre del archivo sin `.link` -- lo que un router/gateway externo usaría para identificar el servicio; el valor es el puerto real asignado. Es lo ÚLTIMO que corre antes de servir: si la escritura falla (el directorio destino no existe, sin permiso), `linkc serve-all` sale con error y NO arranca ningún servicio -- mejor no levantar nada que dejar un gateway leyendo un mapeo viejo o inexistente mientras los servicios sí están corriendo.
+
+**No cambia CÓMO se asigna el puerto, solo lo hace LEGIBLE.** El orden alfabético (§3.92, con sus límites honestos ya documentados -- no es estable ante agregar/quitar/renombrar un `.link`) sigue exactamente igual; este archivo es la fuente de verdad que un proceso externo puede leer en vez de re-derivar la regla por su cuenta.
+
+**Verificado**: 2 tests en `cli_serve_all.rs` contra el binario real -- el JSON escrito antes de servir tiene la asignación real y correcta (dos `.link`, orden alfabético confirmado); un destino sin permiso de escritura (directorio padre inexistente) falla limpio y NO arranca ningún servicio, confirmado con un único intento de conexión (no un loop de reintentos -- ver la nota de proceso más abajo) más el mensaje de error en stderr.
+
+**Nota de proceso**: escribir el test de "falla limpio" reveló que `wait_for_port` (el helper de este archivo, ajustado para el caso "¿abrió a tiempo?") no es apto para probar lo contrario ("¿nunca abrió?") -- en este entorno de desarrollo, un `connect()` a un puerto sin nada escuchando puede tardar bastante más que instantáneo, así que un loop de 200 reintentos sobre ESE caso podía tardar minutos en vez de segundos. Un solo intento de conexión (mismo criterio que el test ya existente de `a_type_error_in_one_link_file_aborts_the_whole_workspace_before_starting_anything`) resuelve esto sin ambigüedad.
 
 ---
 

@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.70.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc serve-all --port-map-out <archivo.json>`.** Gap encontrado analizando IgnisLove en profundidad: `serve-all` (v1.56.0) asigna puerto por orden ALFABÉTICO de los `.link` descubiertos, pero nada externo puede leer ese mapeo salvo replicándolo a mano -- el caso real: `server/cscript-gateway.ts` (gateway de producción, 13 servicios) hardcodea un mapa nombre→puerto con un comentario propio admitiendo el riesgo de desactualizarse si se agrega/quita/renombra un `.link`. Escribe `{"nombre_archivo": puerto, ...}` a un JSON ANTES de arrancar cualquier servicio -- si la escritura falla, no arranca nada (mejor que un gateway leyendo un mapeo viejo o inexistente). No cambia la regla de asignación en sí, solo la hace legible desde afuera.
+
+926 tests (2 nuevos) en `cli_serve_all.rs` contra el binario real: el JSON escrito antes de servir tiene la asignación correcta; un destino sin permiso de escritura falla limpio y no arranca ningún servicio. Detalle completo: GRAMMAR.md §3.107.
+
 ## [1.69.0] - 2026-08-24
 
 ### ✨ Nuevo
