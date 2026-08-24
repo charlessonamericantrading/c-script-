@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.50.0] - 2026-08-24
+
+### 🔒 Seguridad
+- **`--max-body-bytes <N>`/`LINK_MAX_BODY_BYTES`: límite configurable de tamaño de body.** Hasta esta ronda `linkc serve` leía el body de CUALQUIER request entero a memoria antes de tocarlo (`request.as_reader().read_to_string(&mut body)`, sin ningún límite) -- confirmado leyendo `runtime/server.rs`. Ni auth, ni rate limiting, ni la forma del JSON tenían oportunidad de rechazar nada antes de esa lectura completa: un solo body enorme (a propósito o no) era un vector real de agotamiento de memoria del proceso entero. `--max-body-bytes`/`LINK_MAX_BODY_BYTES` (mismo orden de precedencia que el resto de los flags de `serve`, default 10 MiB) acota la lectura con `Read::take(max_body_bytes + 1)` -- el `+1` distingue "mide EXACTO el límite" (permitido) de "sigue después" (rechazado), sin leer más de un byte de más nunca -- y responde `413 Payload Too Large` ANTES de cualquier otro chequeo, sin haber leído el body completo primero. Límite de proceso, no por rpc; no se drena el resto de un body rechazado (si el cliente reusa la conexión igual, el siguiente intento da 400 y cierra -- nunca un colgado ni una fuga de memoria).
+
+805 tests (9 nuevos) en `cli_max_body.rs` contra el binario real: un body bajo el default se acepta, uno EXACTO al límite configurado se acepta, uno de un byte más se rechaza con 413 nombrando el límite, un body mucho más grande también se rechaza (probando que la lectura se corta temprano, no que se lee entero primero), flag y env var funcionan por separado con el flag ganando, valores inválidos son errores de uso limpios sin panic, y los headers de seguridad/CORS siguen en la respuesta 413. Detalle completo: GRAMMAR.md §3.85.
+
 ## [1.49.0] - 2026-08-24
 
 ### ✨ Nuevo

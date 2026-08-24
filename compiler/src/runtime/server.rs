@@ -33,7 +33,7 @@ use crate::ast::{Annotation, Item, Member};
 use crate::ast::Program;
 use crate::rate_limit::{RateLimitSpec, RateLimiter};
 use crate::route::RoutePattern;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
@@ -136,6 +136,11 @@ impl CorsConfig {
 /// sistema operativo como capa de defensa cuando el proceso no necesita
 /// aceptar conexiones desde fuera de la máquina (detrás de un proxy en el
 /// mismo host, por ejemplo).
+///
+/// `max_body_bytes` (GRAMMAR.md §3.85): cuántos bytes de BODY acepta como
+/// máximo cualquier request -- ver `handle_request` para el porqué (hasta
+/// esta ronda se leía el body entero a memoria sin ningún límite, un vector
+/// real de agotamiento de memoria).
 pub fn serve(
     program: Program,
     host: &str,
@@ -146,6 +151,7 @@ pub fn serve(
     argon2_params: argon2::Params,
     jwt_config: Option<(String, String, String)>,
     adopt_existing: bool,
+    max_body_bytes: u64,
 ) {
     let server = tiny_http::Server::http((host, port))
         .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en {host}:{port}: {e}"));
@@ -211,7 +217,7 @@ pub fn serve(
     match remote_changes {
         None => {
             for request in server.incoming_requests() {
-                handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, request);
+                handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, max_body_bytes, request);
             }
         }
         Some(remote_rx) => {
@@ -226,7 +232,9 @@ pub fn serve(
                     db.publish_remote(&change.collection, change.event);
                 }
                 match server.recv_timeout(REMOTE_CHANGE_POLL_INTERVAL) {
-                    Ok(Some(request)) => handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, request),
+                    Ok(Some(request)) => {
+                        handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, max_body_bytes, request)
+                    }
                     Ok(None) => {}
                     Err(e) => eprintln!("error aceptando una conexión: {e}"),
                 }
@@ -255,6 +263,7 @@ fn handle_request(
     route_table: &[RouteEntry],
     rate_limiter: &mut RateLimiter,
     cors: &CorsConfig,
+    max_body_bytes: u64,
     mut request: tiny_http::Request,
 ) {
     // Resuelto UNA vez por request, antes de cualquier otra cosa --
@@ -276,8 +285,34 @@ fn handle_request(
     let path = request.url().to_string();
     println!("[req {req_id}] {} {path}", request.method());
 
+    // `--max-body-bytes`/`LINK_MAX_BODY_BYTES` (GRAMMAR.md §3.85): hasta
+    // esta ronda esto era `request.as_reader().read_to_string(&mut body)`
+    // SIN NINGÚN límite -- un vector real de agotamiento de memoria, un
+    // solo body enorme (a propósito o no) se leía entero antes de que
+    // ningún otro chequeo (auth, rate limit, forma del JSON) tuviera
+    // oportunidad de rechazarlo. `.take(max_body_bytes + 1)` acota la
+    // lectura -- el `+ 1` es lo que permite distinguir "el body mide
+    // EXACTO el límite" (permitido) de "el body sigue después del límite"
+    // (rechazado), sin leer más allá de un solo byte de más en ningún
+    // caso. No se intenta drenar el resto de un body rechazado -- ver
+    // "Límites honestos" en GRAMMAR.md §3.85 sobre el único costo real de
+    // esa simplicidad (una conexión keep-alive reusada después de un 413
+    // puede confundir al servidor con el resto del body viejo, que
+    // responde 400 y cierra -- nunca un colgado ni una fuga de memoria).
     let mut body = String::new();
-    let _ = request.as_reader().read_to_string(&mut body);
+    let _ = request.as_reader().take(max_body_bytes + 1).read_to_string(&mut body);
+    if body.len() as u64 > max_body_bytes {
+        let _ = request.respond(cors_response(
+            413,
+            error_json(&format!("el body de la request supera el límite configurado ({max_body_bytes} bytes) -- ver --max-body-bytes/LINK_MAX_BODY_BYTES")),
+            &cors_headers,
+        ));
+        // Todavía no se resolvió ningún `service.rpc` (eso pasa recién al
+        // parsear el body) -- `None`, mismo criterio que cualquier rechazo
+        // que ocurre antes de llegar tan lejos.
+        log_done(req_id, None, 413, start, "");
+        return;
+    }
 
     // `request.rawBody()`/`request.header()` (GRAMMAR.md §3.38): fijado
     // ACÁ, antes de cualquier dispatch, así que para cuando un rpc

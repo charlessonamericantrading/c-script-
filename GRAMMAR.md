@@ -106,6 +106,7 @@
   - [3.82 `linkc test --filter <nombre>` — RESUELTO](#382-linkc-test---filter-nombre--resuelto)
   - [3.83 `linkc --version` y versión estampada en cada archivo generado — RESUELTO](#383-linkc---version-y-versión-estampada-en-cada-archivo-generado--resuelto)
   - [3.84 `auth.destroyAllSessions(userId)`: revocar todas las sesiones de un usuario — RESUELTO](#384-authdestroyallsessionsuserid-revocar-todas-las-sesiones-de-un-usuario--resuelto)
+  - [3.85 `--max-body-bytes <N>`: límite de tamaño del body de una request — RESUELTO](#385---max-body-bytes-n-límite-de-tamaño-del-body-de-una-request--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4105,6 +4106,28 @@ service Admin {
 **Solo alcanza sesiones creadas por ESTE `SessionStore` (`createSession`/`createSessionWithId`) -- un JWT externo (§3.64) no pasa por acá.** Un JWT válido nunca se guarda en el store en memoria (se verifica al vuelo en cada request), así que no hay nada que "borrar" del lado de `linkc` -- revocar un JWT externo sigue siendo responsabilidad del sistema que lo emitió (rotar el secreto, o su propia lista de revocación).
 
 **Verificado**: 3 tests en `session.rs` (borra todas las sesiones de un usuario y devuelve la cantidad exacta, deja intactas las de otro usuario, un usuario sin sesiones da `0` sin tocar nada, una sesión creada sin `userId` nunca matchea), 1 en `checker.rs` (toma exactamente un `Int`, tipa `Int`) y 1 en `runtime/mod.rs` contra `invoke_rpc_with_sessions` (dos sesiones del mismo usuario se revocan, una tercera de otro usuario sobrevive). Verificado también contra un servidor HTTP real (`server_http.rs`): dos tokens del mismo usuario dejan de autenticar (401, mismo código que cualquier token inexistente o vencido) después de `destroyAllSessions`, mientras el token de otro usuario sigue funcionando sin cambios.
+
+---
+
+### 3.85 `--max-body-bytes <N>`: límite de tamaño del body de una request — RESUELTO
+
+Hasta esta ronda, `linkc serve` leía el body de CUALQUIER request entero a memoria antes de tocarlo -- `request.as_reader().read_to_string(&mut body)`, sin ningún límite -- confirmado leyendo `runtime/server.rs`. Ni auth, ni rate limiting, ni la forma del JSON tenían oportunidad de rechazar nada ANTES de esa lectura completa: un solo body enorme (a propósito o no) era un vector real de agotamiento de memoria del proceso entero, sin ninguna forma declarativa de acotarlo.
+
+```bash
+linkc serve app.link 8787 --max-body-bytes 1000000   # 1 MB
+LINK_MAX_BODY_BYTES=1000000 linkc serve app.link 8787  # equivalente
+```
+
+**`--max-body-bytes`/`LINK_MAX_BODY_BYTES`, mismo orden de precedencia que el resto de los flags de `serve` -- default 10 MiB (`10 * 1024 * 1024` bytes) sin ninguno de los dos.** Un entero PLANO de bytes, sin sufijos de unidad (`"1000000"`, no `"1mb"`) -- mismo criterio que `--argon2-memory-kib`. El default es un número razonable, no exhaustivamente investigado: generoso para un body JSON real (incluido uno con algún campo `String` grande en base64), acotado para no dejar el proceso expuesto a un body sin límite.
+
+**Un body que supera el límite se rechaza con `413 Payload Too Large`, sin leerlo completo primero.** La lectura usa `Read::take(max_body_bytes + 1)` -- el `+1` es lo que distingue "el body mide EXACTO el límite" (permitido) de "sigue después del límite" (rechazado), sin necesitar leer más de un byte de más en ningún caso. El rechazo ocurre ANTES de cualquier otro chequeo (auth, rate limit, parseo del JSON) -- el punto entero es no dejar que ninguno de esos pasos compita por memoria con un body que ya se sabe demasiado grande.
+
+**Límites honestos:**
+- **No se drena el resto de un body rechazado.** Tras responder `413`, los bytes del body que todavía no se leyeron quedan sin consumir en el socket -- si el cliente intenta REUSAR la misma conexión (`keep-alive`) para otra request, el servidor intentará parsear esos bytes viejos como una línea de request nueva, fallará (`400`), y cerrará la conexión. Nunca un colgado ni una fuga de memoria -- en el peor caso, un `400` de más que el cliente no esperaba. Un cliente HTTP real que recibe un `413` normalmente no sigue mandando por la misma conexión sin haber leído la respuesta primero, así que este caso es infrecuente en la práctica.
+- **Es un límite de PROCESO, no por ruta ni por rpc.** No hay forma de darle a un rpc puntual (uno que de verdad necesita bodies grandes, ej. subir un archivo codificado en base64) un límite distinto al resto.
+- **`linkc dev` no expone este flag todavía**, mismo alcance que `--host`/el resto de los flags de `serve` en modo desarrollo.
+
+**Verificado**: `cli_max_body.rs` con el binario real como subproceso (9 tests) -- un body bajo el default se acepta, un body EXACTO al límite configurado se acepta, uno de un byte más se rechaza con `413` nombrando el límite en el mensaje, un body mucho más grande (2 MiB contra un límite de 1000 bytes) también se rechaza -- probando que la lectura se corta temprano, no que se lee entero y se rechaza después --, el flag y la variable de entorno funcionan por separado y el flag le gana a la env var, `--max-body-bytes` con un valor no numérico o sin valor son errores de uso limpios sin panic, y los headers de seguridad/CORS siguen presentes en la respuesta `413`.
 
 ---
 

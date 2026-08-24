@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.49.0-blue.svg" alt="Versión" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.50.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 796 pruebas automáticas:
+**Funciona hoy**, cubierto por 805 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `--max-body-bytes <N>`/`LINK_MAX_BODY_BYTES` para `linkc serve`: acota cuántos bytes de body puede mandar una request -- 10 MiB por default. Hasta ahora el servidor leía el body entero a memoria sin ningún límite, un vector real de agotamiento de memoria. La lectura se acota con `Read::take(max_body_bytes + 1)` y se rechaza con `413 Payload Too Large` ANTES de leerlo completo -- auth, rate limiting y el parseo del JSON nunca llegan a competir por memoria con un body ya sabido demasiado grande. Límite de proceso, no por rpc; no se drena el resto de un body rechazado (si el cliente reusa la misma conexión igual, el siguiente intento da un 400 limpio, nunca un colgado ni una fuga)
 - `linkc --version`/`-v`/`version` imprime la versión exacta del compilador (`env!("CARGO_PKG_VERSION")`, tomada de `Cargo.toml` en tiempo de compilación) -- la misma constante estampa el header de cada archivo TypeScript generado (`contract.d.ts`/`client.ts`/`hooks.ts`/`validators.ts`/`schemas.ts`) y, como JSON no admite comentarios, una extensión de vendor `x-generated-by` en `openapi.json` (nunca `info.version`, que es la versión del API documentada, un concepto aparte). Puramente informativo -- nada compara la versión estampada en un `gen/` viejo contra el binario que lo sirve o reconstruye
 - `linkc test <archivo> --filter <nombre>`: corre solo los bloques `test "..." { ... }` cuyo nombre CONTIENE ese substring (sensible a mayúsculas, mismo criterio que `cargo test <substring>`) -- un filtro que no matchea nada corre cero tests y termina con éxito igual. Solo aplica al test runner integrado, nunca al testing de contrato por snapshot (`linkc test <archivo> <snap>`), que no tiene nombres que filtrar -- combinar los dos es un error de uso claro, no un flag ignorado en silencio
 - `--host <dirección>`/`LINK_HOST` para `linkc serve`: escucha en `0.0.0.0` (todas las interfaces) por default, igual que antes -- o en una dirección puntual (`127.0.0.1`, para un proceso que solo necesita conexiones locales) para que el firewall del sistema operativo no sea la única barrera contra el resto de la red. Se pasa tal cual al bind subyacente, sin resolución ni validación propia más allá de rechazar `--host ""` vacío -- una dirección que no le pertenece a ninguna interfaz local hace fallar el arranque nombrando esa dirección exacta, nunca cae en silencio a `0.0.0.0`

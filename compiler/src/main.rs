@@ -133,7 +133,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--adopt-existing]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--adopt-existing]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
     out(&format!("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)"));
 }
@@ -956,7 +956,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--adopt-existing]"
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--adopt-existing]"
         );
         return ExitCode::FAILURE;
     };
@@ -1018,12 +1018,31 @@ fn cmd_serve(args: &[String]) -> ExitCode {
 
     let adopt_existing = resolve_adopt_existing(args);
 
+    let max_body_bytes = match resolve_max_body_bytes(args) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    runtime::server::serve(program, &host, port, source, cors, session_ttl, argon2_params, jwt_config, adopt_existing);
+    runtime::server::serve(
+        program,
+        &host,
+        port,
+        source,
+        cors,
+        session_ttl,
+        argon2_params,
+        jwt_config,
+        adopt_existing,
+        max_body_bytes,
+    );
     ExitCode::SUCCESS
 }
 
@@ -1046,6 +1065,31 @@ fn resolve_host(args: &[String]) -> Result<String, String> {
         return Err("uso: --host <dirección> (no puede ser vacío, ej. '127.0.0.1')".to_string());
     }
     Ok(host)
+}
+
+/// Default de `--max-body-bytes`/`LINK_MAX_BODY_BYTES` (GRAMMAR.md §3.85):
+/// 10 MiB -- generoso para un body JSON real (incluido uno con algún campo
+/// `String` grande en base64), acotado para no dejar el proceso entero
+/// expuesto a agotamiento de memoria por un solo body sin límite. Número
+/// razonable, no exhaustivamente investigado -- mismo criterio que
+/// `LIVE_STREAM_BUFFER` en `runtime/db.rs`.
+const DEFAULT_MAX_BODY_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Cuántos bytes de BODY acepta como máximo cualquier request a
+/// `linkc serve` (GRAMMAR.md §3.85), mismo orden de precedencia que el resto
+/// de los `resolve_*` de este archivo:
+///
+/// 1. `--max-body-bytes <N>` en la línea de comandos (bytes, un entero
+///    plano -- sin sufijos de unidad, mismo criterio que
+///    `--argon2-memory-kib`).
+/// 2. La variable de entorno `LINK_MAX_BODY_BYTES`.
+/// 3. Ninguno de los dos: `DEFAULT_MAX_BODY_BYTES`.
+fn resolve_max_body_bytes(args: &[String]) -> Result<u64, String> {
+    let raw = read_flag_or_env(args, "--max-body-bytes", "LINK_MAX_BODY_BYTES")?;
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_MAX_BODY_BYTES);
+    };
+    raw.parse::<u64>().map_err(|_| format!("--max-body-bytes/LINK_MAX_BODY_BYTES: '{raw}' no es un entero positivo (bytes)"))
 }
 
 /// Adopción de tabla existente (`--adopt-existing`/`LINK_ADOPT_EXISTING`,
