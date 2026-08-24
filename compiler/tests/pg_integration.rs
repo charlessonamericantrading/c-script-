@@ -527,6 +527,47 @@ service Arms {{
     assert_eq!(worst["name"], serde_json::json!("A"), "{worst}");
 }
 
+/// GRAMMAR.md §3.108: `countWhere`/`findWhere` empujan a SQL real, contra
+/// Postgres también (no solo SQLite, ya cubierto en `runtime/mod.rs`), los
+/// cinco operadores relacionales además de `==` -- caso real que lo motiva:
+/// `chat.link` de un adoptador real, `c.unreadCount > 0`.
+#[test]
+fn count_where_and_find_where_push_relational_operators_to_real_sql_against_postgres() {
+    const COLLECTION: &str = "chats_relational_pushdown";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("relational-pushdown");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Chat = {{ id: Int, name: String, unreadCount: Int }}
+db {{ {COLLECTION}: Chat[] }}
+service Chats {{
+  rpc add(name: String, unreadCount: Int) -> Chat {{
+    db.{COLLECTION}.insert(Chat {{ id: 0, name: name, unreadCount: unreadCount }})
+  }}
+  rpc gt() -> Int {{ db.{COLLECTION}.countWhere(|c: Chat| {{ c.unreadCount > 0 }}) }}
+  rpc gtRows() -> Chat[] {{ db.{COLLECTION}.findWhere(|c: Chat| {{ c.unreadCount > 0 }}) }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Chats/add", r#"{"name":"a","unreadCount":0}"#);
+    server.rpc("Chats/add", r#"{"name":"b","unreadCount":3}"#);
+    server.rpc("Chats/add", r#"{"name":"c","unreadCount":5}"#);
+
+    let count = server.rpc("Chats/gt", "{}");
+    assert_eq!(count, serde_json::json!(2), "{count}");
+    let rows = server.rpc("Chats/gtRows", "{}");
+    assert_eq!(rows.as_array().unwrap().len(), 2, "{rows}");
+}
+
 /// GRAMMAR.md §3.105: `db.<c>.increment` es un `UPDATE campo = campo +
 /// delta` atómico -- SIN ida y vuelta de lectura previa. La prueba real de
 /// que esto arregla el lost-update reportado (IgnisLove, varios procesos

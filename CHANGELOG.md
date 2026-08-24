@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.71.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`countWhere`/`findWhere` empujan a SQL `!=`/`<`/`<=`/`>`/`>=`, no solo `==`.** Reforzado por "CRM"/Nexus: tres casos reales de alta frecuencia (badge de notificaciones, alertas de stock, contador de chats sin leer) todavía traían la colección entera a memoria. `ast::recognize_comparison_predicate` generaliza el reconocimiento de shape (antes `recognize_equality_predicate`, solo `==`) a los cinco operadores relacionales restantes -- mismo criterio conservador de siempre, `|item: T| item.campo OP valor` en cualquier orden, con el operador "enderezado" cuando el campo aparece del lado derecho. Alcance deliberadamente acotado a UN SOLO operador por predicado -- `&&`/`||` compuesto sigue sin pushear (el ítem grande de verdad, PLAN.md §9.3.1 sigue abierto para eso): de los tres casos reales de CRM, solo `chat.link` (`c.unreadCount > 0`, un único operador) se beneficia de esta ronda.
+
+928 tests (2 nuevos): 1 en `runtime/mod.rs` contra un SQLite en memoria real cubriendo los cinco operadores nuevos (incluido el caso del campo del lado derecho) + 1 en `pg_integration.rs` contra un PostgreSQL real con el caso exacto de `chat.link`. Un test existente que usaba `rating > 3` como ejemplo de predicado NO pusheable se corrigió a un `&&` compuesto, ya que ese operador solo ahora sí pushea. Detalle completo: GRAMMAR.md §3.108.
+
 ## [1.70.0] - 2026-08-24
 
 ### ✨ Nuevo

@@ -129,6 +129,7 @@
   - [3.105 `db.<c>.increment(id, selector, delta) -> T` — RESUELTO, alcance acotado](#3105-dbcincrementid-selector-delta---t--resuelto-alcance-acotado)
   - [3.106 Lint `delete-then-insert-same-id` — RESUELTO](#3106-lint-delete-then-insert-same-id--resuelto)
   - [3.107 `linkc serve-all --port-map-out <archivo.json>` — RESUELTO](#3107-linkc-serve-all---port-map-out-archivojson--resuelto)
+  - [3.108 `countWhere`/`findWhere` empujan a SQL `!=`/`<`/`<=`/`>`/`>=` — RESUELTO, alcance acotado](#3108-countwherefindwhere-empujan-a-sql--------resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4771,6 +4772,24 @@ linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json
 **Verificado**: 2 tests en `cli_serve_all.rs` contra el binario real -- el JSON escrito antes de servir tiene la asignación real y correcta (dos `.link`, orden alfabético confirmado); un destino sin permiso de escritura (directorio padre inexistente) falla limpio y NO arranca ningún servicio, confirmado con un único intento de conexión (no un loop de reintentos -- ver la nota de proceso más abajo) más el mensaje de error en stderr.
 
 **Nota de proceso**: escribir el test de "falla limpio" reveló que `wait_for_port` (el helper de este archivo, ajustado para el caso "¿abrió a tiempo?") no es apto para probar lo contrario ("¿nunca abrió?") -- en este entorno de desarrollo, un `connect()` a un puerto sin nada escuchando puede tardar bastante más que instantáneo, así que un loop de 200 reintentos sobre ESE caso podía tardar minutos en vez de segundos. Un solo intento de conexión (mismo criterio que el test ya existente de `a_type_error_in_one_link_file_aborts_the_whole_workspace_before_starting_anything`) resuelve esto sin ambigüedad.
+
+---
+
+### 3.108 `countWhere`/`findWhere` empujan a SQL `!=`/`<`/`<=`/`>`/`>=` — RESUELTO, alcance acotado
+
+PLAN.md §9.3.1, reforzado por "CRM"/Nexus (analizado por primera vez en la ronda de IgnisLove/CRM/Glowapp): `countWhere`/`findWhere` (§3.95, v1.59.0) solo empujaban a SQL el caso `|x| x.campo == valor` -- cualquier otro operador caía al camino interpretado (traer la colección entera, filtrar en Rust). Tres casos reales de ALTA FRECUENCIA en CRM (llamados en cada carga de página, no en un backfill puntual) evidenciaron la falta: `notifications.link` (badge de notificaciones, `n.userId == uid && !n.read`), `inventory.link` (alerta de stock bajo, `p.stock <= 5 && p.stock > 0`), `chat.link` (contador de chats sin leer, `c.unreadCount > 0`).
+
+```
+type Chat = { id: Int, name: String, unreadCount: Int }
+
+rpc unreadChatCount() -> Int { db.chats.countWhere(|c: Chat| { c.unreadCount > 0 }) }
+```
+
+**`ast::recognize_comparison_predicate` generaliza el reconocimiento de shape** (antes `recognize_equality_predicate`, solo `==`) a los cinco operadores relacionales restantes: `!=`/`<`/`<=`/`>`/`>=` -- mismo criterio conservador de siempre, `|item: T| item.campo OP valor` (en cualquier orden; `valor OP item.campo` también reconocido, con el operador "enderezado" -- `<` se invierte a `>`, etc. -- para que el generador de SQL siempre reciba "campo OP valor"). `runtime/db.rs::comparison_condition` (antes `equals_condition`) genera `"<campo>" <op-sql> ?` con el operador correspondiente, compartido entre `count_where_compare`/`find_where_compare` (antes `count_where_equals`/`find_where_equals`).
+
+**Alcance deliberadamente acotado a UN SOLO operador por predicado -- `&&`/`||` compuesto sigue sin pushear.** De los tres casos reales de CRM citados arriba, solo `chat.link` (`c.unreadCount > 0`, un único operador) se beneficia directamente de esta ronda -- `notifications.link` e `inventory.link` combinan DOS condiciones con `&&`, que necesitaría un mini-compilador de predicados a SQL parametrizado de forma segura contra los dos backends, un ítem bastante más grande (PLAN.md §9.3.1, sigue abierto explícitamente para eso). Cualquier predicado con `&&`/`||`, un campo derivado, o una comparación entre DOS campos del propio parámetro sigue cayendo al camino interpretado de siempre -- correcto en cualquier caso, solo más lento en ese caso puntual, nunca silenciosamente incorrecto.
+
+**Verificado**: 1 test en `runtime/mod.rs` contra un SQLite en memoria real cubriendo los cinco operadores nuevos (incluido el caso del campo del lado derecho, confirmando que da el mismo resultado que el campo a la izquierda) + 1 en `pg_integration.rs` contra un PostgreSQL real con el caso exacto de `chat.link`. El test existente que usaba `r.rating > 3` como ejemplo de predicado NO pusheable se corrigió a un `&&` compuesto -- ese operador solo YA es pusheable desde esta ronda, así que ya no servía como ejemplo de lo que cae al camino interpretado.
 
 ---
 

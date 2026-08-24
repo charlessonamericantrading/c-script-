@@ -830,39 +830,64 @@ pub fn recognize_field_selector<'a>(param_names: &[String], body: &'a Block) -> 
     matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
 }
 
-/// Reconoce `|item: T| item.campo == valor` (en cualquier orden -- `valor
-/// == item.campo` también) -- GRAMMAR.md §3.95, el ÚNICO shape de predicado
-/// que `countWhere`/`findWhere` empujan a SQL en vez de traer la colección
+/// Reconoce `|item: T| item.campo OP valor` (en cualquier orden -- `valor
+/// OP item.campo` también) para `OP` en `==`/`!=`/`<`/`<=`/`>`/`>=` --
+/// GRAMMAR.md §3.95 (`==`, v1.59.0) ampliado a los cinco operadores
+/// restantes en GRAMMAR.md §3.108. El ÚNICO shape de predicado que
+/// `countWhere`/`findWhere` empujan a SQL en vez de traer la colección
 /// entera a memoria y evaluar el predicado fila por fila. Devuelve el
-/// nombre del campo y la expresión del OTRO lado, sin evaluarla -- el
-/// caller (`runtime/mod.rs`, que sí tiene acceso al `Env` capturado del
-/// closure) decide si esa expresión es lo bastante simple como para confiar
-/// en el resultado (un literal, o un `Ident` que resuelve en ese `Env`) sin
-/// tener que reimplementar un evaluador de expresiones acá.
+/// nombre del campo, el operador (ya "enderezado" -- ver abajo) y la
+/// expresión del lado "valor", sin evaluarla -- el caller (`runtime/mod.rs`,
+/// que sí tiene acceso al `Env` capturado del closure) decide si esa
+/// expresión es lo bastante simple como para confiar en el resultado (un
+/// literal, o un `Ident` que resuelve en ese `Env`) sin tener que
+/// reimplementar un evaluador de expresiones acá.
+///
+/// Cuando el campo aparece del lado DERECHO (`5 < item.campo`), el
+/// operador se invierte (`Lt` -> `Gt`) para que el caller SIEMPRE reciba
+/// "campo OP valor" con el campo a la izquierda, sin tener que manejar los
+/// dos órdenes por separado en el sitio de generación de SQL.
 ///
 /// Mismo criterio conservador que `recognize_field_selector`: cualquier
-/// otra forma (`&&`/`||`, otro operador que no sea `==`, un campo derivado,
-/// una comparación entre DOS campos del propio parámetro) devuelve `None` --
-/// el caller cae al camino interpretado de siempre, correcto en cualquier
-/// caso, más lento solo en ese caso puntual. No intenta reconocer un `&&`
-/// de varias comparaciones simples (`x.a == 1 && x.b == 2`) -- ese caso
-/// necesitaría combinar dos condiciones SQL con parámetros propios, fuera
-/// de alcance de esta primera ronda (PLAN.md §9.3.2).
-pub fn recognize_equality_predicate<'a>(param_names: &[String], body: &'a Block) -> Option<(&'a str, &'a Spanned<Expr>)> {
+/// otra forma (`&&`/`||`, un campo derivado, una comparación entre DOS
+/// campos del propio parámetro) devuelve `None` -- el caller cae al camino
+/// interpretado de siempre, correcto en cualquier caso, más lento solo en
+/// ese caso puntual. No intenta reconocer un `&&`/`||` de varias
+/// comparaciones simples (`x.a == 1 && x.b > 2`) -- ese caso necesitaría
+/// combinar varias condiciones SQL con sus propios parámetros, fuera de
+/// alcance de esta ronda (PLAN.md §9.3.1, sigue abierto).
+pub fn recognize_comparison_predicate<'a>(param_names: &[String], body: &'a Block) -> Option<(&'a str, BinaryOp, &'a Spanned<Expr>)> {
     let [param] = param_names else { return None };
     if !body.stmts.is_empty() {
         return None;
     }
-    let Expr::Binary { op: BinaryOp::Eq, left, right } = &body.tail.as_ref()?.node else { return None };
+    let Expr::Binary { op, left, right } = &body.tail.as_ref()?.node else { return None };
+    if !matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) {
+        return None;
+    }
     let field_of = |e: &'a Spanned<Expr>| -> Option<&'a str> {
         let Expr::FieldAccess { base, field } = &e.node else { return None };
         matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
     };
     if let Some(field) = field_of(left) {
-        return Some((field, right));
+        return Some((field, *op, right));
     }
     if let Some(field) = field_of(right) {
-        return Some((field, left));
+        return Some((field, flip_comparison_operator(*op), left));
     }
     None
+}
+
+/// `a OP b` <=> `b flip(OP) a` -- usado cuando el campo del predicado
+/// pusheable aparece del lado derecho de la comparación. `==`/`!=` son
+/// simétricos (sin cambio); los cuatro relacionales se invierten cruzado
+/// (`<` <-> `>`, `<=` <-> `>=`).
+fn flip_comparison_operator(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
 }
