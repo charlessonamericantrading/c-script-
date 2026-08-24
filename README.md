@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.40.0-blue.svg" alt="Version" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.41.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 740 automated tests:
+**Works today**, covered by 744 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `db.<c>.insertMany(items) -> T[]`: each item goes through the same real `insert` (one autocommit SQL statement per row), in order — saves the N sequential HTTP round trips from the client for a backfill, not the cost of N inserts against the database itself. No wrapping transaction: if item 3 of 5 fails, the first two stay inserted
 - `db.<c>.upsert(matchFn, insertValue, updateFn)`: update-in-place-or-insert without hand-rolling find+delete+reinsert (which doesn't even preserve the row's id across a real autoincrement). `matchFn` scans the whole collection in the interpreter (same limit as `findWhere`/`deleteWhere` — not pushed to SQL yet); on a match, `updateFn` receives the full existing row and its result is applied onto that SAME id. `updateFn` returns a full `Omit<T,"id">` value, not a partial `Patch<T>` — deliberately, since `Patch<T>` has no literal syntax and couldn't be constructed inside a function body at all
 - Default values on struct fields: `status: String = "pending"` — same syntax and mechanism as a function/rpc param default. A field with a default can be omitted from a `Struct { ... }` literal without becoming `Optional` — it stays the same declared type. Filled in by the interpreter on construction, evaluated fresh every time (`token: Uuid = crypto.uuid()` gives a different value per literal, not a cached one). Propagated as an optional field to `contract.d.ts`/`schemas.ts` (Zod), and out of `required` in `openapi.json` (plus a literal `"default"` value when it's a simple constant). No access to sibling fields in the same literal, and no support on a generic `type` yet
 - `@validate(email)` / `@validate(regex, "...")` on a `String`/`String?` field, enforced for real in four places — the actual server (400 on a bad value, checked both when an rpc receives the whole struct as a param and when it's built inline from loose params inside the body — a real `curl` test against a running server is what caught that second path was missing at first), `openapi.json` (`format`/`pattern`, standard JSON Schema keywords), `schemas.ts`/Zod (`.email()` / `.regex(new RegExp(...))`, correctly chained before `.nullable()` on an optional field), and an informative JSDoc comment in `contract.d.ts`. A malformed regex pattern is a compile error, never a first-request surprise. The one real gotcha: `@validate` is tied to the exact declaration it's written on — the "New*" (`Omit<T,"id">`) shape used everywhere for `insert` is a separate type, so the annotation has to be repeated there too. `validators.ts`'s hand-written `isX()` type guards don't enforce it yet — everything else does

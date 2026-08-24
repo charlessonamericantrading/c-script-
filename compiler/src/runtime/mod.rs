@@ -1237,6 +1237,24 @@ fn call_method(
                 }
                 Ok(Value::Int(count))
             }
+            // GRAMMAR.md §3.76: cada elemento pasa por el mismo `insert`
+            // real de siempre (una sentencia SQL autocommit por fila) -- lo
+            // que ahorra es la ida y vuelta HTTP N veces desde el cliente,
+            // no el costo de N inserts contra la base. Sin transacción
+            // envolvente (mismo criterio "autocommit por sentencia" que el
+            // resto del lenguaje, ver GRAMMAR.md §3.17/§2.1): si el item 3
+            // de 5 falla, los 2 primeros quedan insertados.
+            "insertMany" => {
+                let items = args.into_iter().next().ok_or_else(|| err("'insertMany' requiere 1 argumento"))?;
+                let Value::List(items) = items else {
+                    return Err(err("'insertMany': se esperaba una lista"));
+                };
+                let mut inserted = Vec::with_capacity(items.len());
+                for item in items {
+                    inserted.push(db.call(&coll, "insert", vec![item])?);
+                }
+                Ok(Value::List(inserted))
+            }
             // GRAMMAR.md §3.75: `matchFn` corre en el intérprete sobre
             // TODAS las filas (mismo criterio que `findWhere`/`deleteWhere`
             // arriba -- no empujado a SQL, ver PLAN.md §9.3.4), se queda con
@@ -3776,6 +3794,38 @@ mod tests {
 
         let all = invoke_rpc(&program, "S", "bump", &json!({"name": "otro"}), &db).unwrap();
         assert_ne!(all["id"], second["id"], "un name distinto SÍ inserta una fila nueva");
+    }
+
+    // ---- db.<c>.insertMany(items) (GRAMMAR.md §3.76) ----
+
+    #[test]
+    fn insert_many_inserts_every_item_and_returns_them_all_with_real_ids() {
+        let program = program_from(
+            r#"
+            type Task = { id: Int, title: String }
+            type NewTask = { title: String }
+            db { tasks: Task[] }
+            service S {
+                rpc seed() -> Task[] {
+                    db.tasks.insertMany([NewTask { title: "a" }, NewTask { title: "b" }, NewTask { title: "c" }])
+                }
+                rpc all() -> Task[] { db.tasks.all() }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let result = invoke_rpc(&program, "S", "seed", &json!({}), &db).unwrap();
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["title"], json!("a"));
+        assert_eq!(rows[2]["title"], json!("c"));
+        // Ids reales asignados por la base, uno distinto por fila.
+        let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        // Confirma que quedaron persistidas de verdad, no solo devueltas.
+        let persisted = invoke_rpc(&program, "S", "all", &json!({}), &db).unwrap();
+        assert_eq!(persisted.as_array().unwrap().len(), 3);
     }
 
     // ---- validación tipada del borde (auditoría) ----

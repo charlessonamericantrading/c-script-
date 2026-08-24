@@ -97,6 +97,7 @@
   - [3.73 `@validate(email)` / `@validate(regex, "...")` sobre un campo — RESUELTO](#373-validateemail--validateregex--sobre-un-campo--resuelto)
   - [3.74 Valores por defecto en campos de `struct` — RESUELTO](#374-valores-por-defecto-en-campos-de-struct--resuelto)
   - [3.75 `db.<c>.upsert(matchFn, insertValue, updateFn)` — RESUELTO](#375-dbcupsertmatchfn-insertvalue-updatefn--resuelto)
+  - [3.76 `db.<c>.insertMany(items)` — RESUELTO](#376-dbcinsertmanyitems--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -783,7 +784,7 @@ fn makeUser(input: NewUser) -> NewUserRecord {
 // db.users.insert(makeUser(input)) -- NewUserRecord <: Omit<User,"id"> por subtipado estructural
 ```
 
-**Métodos:** `all() -> T[]`, `find(id: Int) -> T?`, `insert(x: Omit<T,"id">) -> T`, `applyPatch(id: Int, p: Patch<T>) -> T`, `findWhere(f: (T) -> Bool) -> T[]`, `deleteWhere(f: (T) -> Bool) -> Int`, `count() -> Int`, `page(limit: Int, offset: Int) -> T[]`, `pageAfter(cursor: Int?, limit: Int) -> T[]`, `upsert(matchFn: (T) -> Bool, insertValue: Omit<T,"id">, updateFn: (T) -> Omit<T,"id">) -> T` (§3.75), `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` — resueltos contra el tipo de elemento de verdad (`Type::DbCollection`, checker.rs). Un nombre de colección o de método desconocido ya es un error del checker (`db.usres.fnid(1)`, con AMBOS typo'd, se rechaza en tiempo de chequeo), no algo que se descubre recién en runtime.
+**Métodos:** `all() -> T[]`, `find(id: Int) -> T?`, `insert(x: Omit<T,"id">) -> T`, `insertMany(items: Omit<T,"id">[]) -> T[]` (§3.76), `applyPatch(id: Int, p: Patch<T>) -> T`, `findWhere(f: (T) -> Bool) -> T[]`, `deleteWhere(f: (T) -> Bool) -> Int`, `count() -> Int`, `page(limit: Int, offset: Int) -> T[]`, `pageAfter(cursor: Int?, limit: Int) -> T[]`, `upsert(matchFn: (T) -> Bool, insertValue: Omit<T,"id">, updateFn: (T) -> Omit<T,"id">) -> T` (§3.75), `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` — resueltos contra el tipo de elemento de verdad (`Type::DbCollection`, checker.rs). Un nombre de colección o de método desconocido ya es un error del checker (`db.usres.fnid(1)`, con AMBOS typo'd, se rechaza en tiempo de chequeo), no algo que se descubre recién en runtime.
 
 **Runtime: en memoria al principio, generalizado.** `runtime/db.rs`'s `Db` pasó de estar hardcodeado a una única colección `"users"` a un `HashMap` con una entrada por colección declarada. Se eliminó el hack que le ponía un default a `deletedAt` en `insert` — bajo la regla `Omit<T,"id">`, `deletedAt` (requerido, nullable) es un campo obligado del argumento; quien inserta pasa `deletedAt: null` explícito, consistente con "sin coerción implícita en ningún lado" (§3.7). **Actualización: RESUELTO.** El storage detrás ya no es en memoria -- ver §3.17: `Db` corre sobre SQLite real, con persistencia genuina entre reinicios de `linkc serve`.
 
@@ -3767,6 +3768,45 @@ test "la primera vez inserta, la segunda actualiza la MISMA fila" {
 - **No atómico frente a una escritura concurrente entre el `matchFn` y el `applyPatch`/`insert`.** El intérprete es single-threaded (una request en vuelo a la vez, GRAMMAR.md §3.36), así que dentro de UN proceso no hay carrera real -- pero con más de una instancia de `linkc serve` contra la misma base (§3.44), dos `upsert` simultáneos sobre el mismo `matchFn` podrían insertar dos filas en vez de una.
 
 **Verificado**: 3 tests en `checker.rs` (tipa limpio con las tres firmas correctas, rechaza un `updateFn` que devuelve un tipo que no es el shape insertable, rechaza menos de 3 argumentos) y 2 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (sin match inserta con `count: 1`, con match actualiza la MISMA fila -- mismo id, `count` incrementado vía `updateFn` -- y un `matchFn` distinto sí inserta una fila nueva con id distinto). Verificado también a mano contra un servidor HTTP real (`curl`): primer `bump` inserta id=1 count=1, segundo `bump` con el mismo nombre actualiza a id=1 count=2, un nombre distinto inserta id=2.
+
+---
+
+### 3.76 `db.<c>.insertMany(items)` — RESUELTO
+
+Un backfill que necesita crear N filas hacía N llamadas a `insert` -- si venían del CLIENTE, N idas y vueltas HTTP secuenciales; si venían de un solo `rpc` con un loop adentro, N sentencias `insert` de todos modos, pero al menos una sola request. Ninguna de las dos formas tenía un método dedicado para "estas son todas nuevas, insertalas".
+
+<!-- linkc:check -->
+```rust
+type Task = { id: Int, title: String }
+type NewTask = { title: String }
+
+db { tasks: Task[] }
+
+service Tasks {
+  rpc seed() -> Task[] {
+    db.tasks.insertMany([
+      NewTask { title: "primera" },
+      NewTask { title: "segunda" },
+      NewTask { title: "tercera" },
+    ])
+  }
+}
+
+test "insertMany inserta cada item y devuelve las filas con id real asignado" {
+  let rows = Tasks.seed();
+  assert(rows.length() == 3, "las tres filas se insertaron");
+  assert(rows[0].title == "primera", "orden preservado");
+  assert(rows[0].id != rows[1].id, "cada fila tiene su propio id real, no uno compartido");
+}
+```
+
+**`db.<c>.insertMany(items: Omit<T,"id">[]) -> T[]`.** Mismo shape insertable que `insert` (`Omit<T,"id">`), pero como lista -- cada elemento se inserta con el `insert` de siempre (una sentencia SQL autocommit por fila, mismo criterio que el resto del lenguaje), en el orden dado. Lo que ahorra es la ida y vuelta HTTP N veces desde el cliente cuando N filas se crean juntas, no el costo de N inserts contra la base -- sigue siendo N sentencias SQL, no una sola sentencia batch.
+
+**Límites honestos:**
+- **Sin transacción envolvente.** Cada `insert` es autocommit por su cuenta (mismo criterio ya documentado para el resto del lenguaje, GRAMMAR.md §2.1/§3.17) -- si el ítem 3 de 5 falla (por ejemplo, un `@validate` que rechaza uno de los valores), los 2 primeros quedan insertados igual, no hay rollback automático de lo que ya se aplicó.
+- **No es una sentencia SQL batch real.** `insertMany([a, b, c])` ejecuta 3 `INSERT` separados, no un `INSERT ... VALUES (...), (...), (...)` de una sola sentencia -- el ahorro es de round-trips HTTP del cliente, no de round-trips a la base de datos.
+
+**Verificado**: 3 tests en `checker.rs` (tipa limpio con una lista del shape insertable, rechaza una lista de tipo equivocado, rechaza 0 argumentos) y 1 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (las 3 filas se insertan con ids reales y distintos, en el orden dado, y quedan persistidas de verdad -- confirmado leyéndolas de vuelta con `all()` en una llamada aparte). Verificado también a mano contra un servidor HTTP real (`curl`): tres títulos mandados en un solo `insertMany`, tres filas con id 1/2/3 en la respuesta.
 
 ---
 

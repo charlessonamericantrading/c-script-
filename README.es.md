@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.40.0-blue.svg" alt="Versión" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.41.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 740 pruebas automáticas:
+**Funciona hoy**, cubierto por 744 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `db.<c>.insertMany(items) -> T[]`: cada elemento pasa por el mismo `insert` real de siempre (una sentencia SQL autocommit por fila), en el orden dado -- ahorra las N idas y vueltas HTTP secuenciales del cliente para un backfill, no el costo de N inserts contra la base. Sin transacción envolvente: si el ítem 3 de 5 falla, los dos primeros quedan insertados igual
 - `db.<c>.upsert(matchFn, insertValue, updateFn)`: actualizar-en-el-lugar-o-insertar sin reimplementar a mano buscar+borrar+reinsertar (que ni siquiera preserva el id de la fila con un autoincrement real). `matchFn` recorre toda la colección en el intérprete (mismo límite que `findWhere`/`deleteWhere` -- no empujado a SQL todavía); con match, `updateFn` recibe la fila existente completa y su resultado se aplica sobre ESE MISMO id. `updateFn` devuelve un valor `Omit<T,"id">` completo, no un `Patch<T>` parcial -- deliberado, ya que `Patch<T>` no tiene sintaxis de literal y no se podría construir adentro de un cuerpo de función
 - Valores por defecto en campos de struct: `status: String = "pending"` -- misma sintaxis y mecanismo que un default de parámetro de función/rpc. Un campo con default se puede omitir de un literal `Struct { ... }` sin volverse `Optional` -- sigue siendo el mismo tipo declarado. Lo completa el intérprete al construir, evaluado de nuevo cada vez (`token: Uuid = crypto.uuid()` da un valor distinto por literal, no uno cacheado). Se propaga como campo opcional a `contract.d.ts`/`schemas.ts` (Zod), y fuera de `required` en `openapi.json` (más un valor `"default"` literal cuando es una constante simple). Sin acceso a otros campos del mismo literal, y sin soporte todavía en un `type` genérico
 - `@validate(email)` / `@validate(regex, "...")` sobre un campo `String`/`String?`, con enforcement real en cuatro lugares -- el servidor real (400 ante un valor inválido, chequeado tanto cuando un rpc recibe el struct entero como parámetro como cuando lo arma adentro del cuerpo a partir de parámetros sueltos -- un `curl` real contra un servidor corriendo fue lo que reveló que ese segundo camino faltaba al principio), `openapi.json` (`format`/`pattern`, keywords estándar de JSON Schema), `schemas.ts`/Zod (`.email()` / `.regex(new RegExp(...))`, encadenado correctamente ANTES de `.nullable()` en un campo opcional) y un comentario JSDoc informativo en `contract.d.ts`. Un patrón regex mal formado es un error de compilación, nunca una sorpresa en el primer request. El límite real: `@validate` está atado a la declaración exacta donde se escribe -- el shape "New*" (`Omit<T,"id">`) que se usa en todos lados para `insert` es un tipo aparte, así que hay que repetir la anotación ahí también. Las funciones `isX()` hand-escritas de `validators.ts` todavía no lo enforce -- todo lo demás sí

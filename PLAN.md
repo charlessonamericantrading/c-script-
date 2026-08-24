@@ -376,19 +376,20 @@ Con las Fases 0 a 3 completadas y el núcleo v1.28.0 plenamente operativo, las s
 **§9.2 completo** salvo `Decimal`/`Money` (necesita su propio diseño, ítem 1 arriba).
 
 ### 9.3 Base de Datos y Consultas
-1. **`db.<c>.insertMany(items)`**: batch insert -- evita N idas y vueltas HTTP secuenciales en un backfill real.
-2. **`db.<c>.count(predicate)` sin traer filas**: hoy `findWhere(...).length()` trae la tabla entera a memoria solo para contar.
-3. **`findWhere`/`deleteWhere` empujados a SQL de verdad**: hoy se evalúan en el intérprete (confirmado en `db.rs`: a diferencia de `sumBy`/etc., no bajan a una cláusula `WHERE`) -- fusionar con el pushdown de `db.<c>.filter(predicate)` ya trackeado en §8.2.2, misma máquina de "predicado estructural a SQL".
-4. **`createdAt`/`updatedAt` automáticos**: gestionados por el runtime sin asignarlos a mano en cada `insert`.
-5. **Soft-delete nativo**: un `deletedAt` gestionado por el runtime, con `all()` filtrando automáticamente las filas borradas.
-6. **`@index` e índices únicos compuestos declarativos**: más allá de la PK.
-7. **Constraints `@check` declarativos** en el `.link`.
-8. **Detección de colisión de nombre de tabla**: que `linkc build`/`linkc serve --db postgres://...` avise (o aborte con `--strict`) si una colección mapea a una tabla que YA EXISTE en la base de destino y no fue creada por ese mismo `.link` -- encontrado en producción real (`telemetry.link` habría chocado con una tabla `events` real de un pipeline de analítica).
-9. **`--db-schema <nombre>` o `--db-prefix`**: namespacing para compartir una base Postgres entre varios `.link` sin pensar en colisiones de nombre.
-10. **`linkc migrate --dry-run`**: mostrar el DDL exacto que se ejecutaría sin aplicarlo, más comportamiento configurable ante una migración que perdería datos (¿aborta por defecto? ¿hace falta `--allow-destructive`?).
-11. **`linkc build --diff <archivo-anterior>`**: qué cambió en el contrato TypeScript generado entre dos versiones del `.link`, para revisión de PR.
-12. **`@cache("60s")` declarativo** sobre un rpc, para lecturas costosas y poco cambiantes.
-13. **Idempotency keys nativas** en rpcs de escritura: hoy hay que implementar la comprobación de "¿ya existe?" a mano antes de cada inserción en un backfill con reintentos.
+1. **`db.<c>.count(predicate)` sin traer filas**: hoy `findWhere(...).length()` trae la tabla entera a memoria solo para contar.
+2. **`findWhere`/`deleteWhere` empujados a SQL de verdad**: hoy se evalúan en el intérprete (confirmado en `db.rs`: a diferencia de `sumBy`/etc., no bajan a una cláusula `WHERE`) -- fusionar con el pushdown de `db.<c>.filter(predicate)` ya trackeado en §8.2.2, misma máquina de "predicado estructural a SQL".
+3. **`createdAt`/`updatedAt` automáticos**: gestionados por el runtime sin asignarlos a mano en cada `insert`.
+4. **Soft-delete nativo**: un `deletedAt` gestionado por el runtime, con `all()` filtrando automáticamente las filas borradas.
+5. **`@index` e índices únicos compuestos declarativos**: más allá de la PK.
+6. **Constraints `@check` declarativos** en el `.link`.
+7. **Detección de colisión de nombre de tabla**: que `linkc build`/`linkc serve --db postgres://...` avise (o aborte con `--strict`) si una colección mapea a una tabla que YA EXISTE en la base de destino y no fue creada por ese mismo `.link` -- encontrado en producción real (`telemetry.link` habría chocado con una tabla `events` real de un pipeline de analítica).
+8. **`--db-schema <nombre>` o `--db-prefix`**: namespacing para compartir una base Postgres entre varios `.link` sin pensar en colisiones de nombre.
+9. **`linkc migrate --dry-run`**: mostrar el DDL exacto que se ejecutaría sin aplicarlo, más comportamiento configurable ante una migración que perdería datos (¿aborta por defecto? ¿hace falta `--allow-destructive`?).
+10. **`linkc build --diff <archivo-anterior>`**: qué cambió en el contrato TypeScript generado entre dos versiones del `.link`, para revisión de PR.
+11. **`@cache("60s")` declarativo** sobre un rpc, para lecturas costosas y poco cambiantes.
+12. **Idempotency keys nativas** en rpcs de escritura: hoy hay que implementar la comprobación de "¿ya existe?" a mano antes de cada inserción en un backfill con reintentos.
+
+**Hecho** (24/08/2026): **`db.<c>.upsert(matchFn, insertValue, updateFn)`**: ver v1.40.0, GRAMMAR.md §3.75. **`db.<c>.insertMany(items)`** (originalmente el ítem 1 de esta lista): cada elemento pasa por el mismo `insert` real de siempre (una sentencia SQL autocommit por fila) -- lo que ahorra es la ida y vuelta HTTP N veces desde el cliente, no el costo de N inserts contra la base. Sin transacción envolvente (mismo criterio "autocommit por sentencia" del resto del lenguaje): si un ítem falla a mitad de la lista, los anteriores quedan insertados. Ver v1.41.0, GRAMMAR.md §3.76.
 
 **Hecho** (24/08/2026): **`db.<c>.upsert(matchFn, insertValue, updateFn)`** (originalmente el ítem 1 de esta lista): "si existe actualizá, si no insertá" sin reimplementar a mano el patrón buscar+borrar+reinsertar -- que además tenía un bug de identidad real (un borrado+inserción normalmente NO reproduce el mismo id autoincrement). `matchFn` corre en el intérprete sobre toda la colección (no empujado a SQL, mismo límite que `findWhere`/`deleteWhere`, ítem 3 de esta lista); con match, `updateFn` se llama con la fila existente completa y el resultado se aplica sobre el MISMO id, nunca borra+reinserta. `updateFn` devuelve `Omit<T,"id">` completo, no `Patch<T>` -- decisión deliberada: `Patch<T>` no tiene sintaxis de literal en el lenguaje (GRAMMAR.md §3.4), así que una función que "devolviera un Patch<T>" sería imposible de escribir desde un cuerpo de rpc/fn. Ver v1.40.0, GRAMMAR.md §3.75.
 

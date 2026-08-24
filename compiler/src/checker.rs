@@ -3412,6 +3412,19 @@ impl Checker {
                 self.check_expr(value_arg, &insertable, env)?;
                 Ok(element_ty.clone())
             }
+            // GRAMMAR.md §3.76. Cada elemento sigue siendo `insert` real
+            // (una sentencia SQL autocommit por fila, mismo criterio que el
+            // resto del lenguaje -- ver "Límites honestos") -- lo que evita
+            // es la ida y vuelta HTTP N veces, no el costo de N inserts en
+            // la base.
+            "insertMany" => {
+                let [items_arg] = args else {
+                    return Err(err("'insertMany' toma exactamente 1 argumento (items: Omit<T,\"id\">[])"));
+                };
+                let insertable = self.omit_id_field(element_ty)?;
+                self.check_expr(items_arg, &Type::List(Box::new(insertable)), env)?;
+                Ok(Type::List(Box::new(element_ty.clone())))
+            }
             "applyPatch" => {
                 let [id_arg, patch_arg] = args else {
                     return Err(err("'applyPatch' toma exactamente 2 argumentos (id: Int, patch: Patch<T>)"));
@@ -3507,7 +3520,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/applyPatch/delete/deleteWhere/findWhere/count/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/findWhere/count/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/subscribe)"
             ))),
         }
     }
@@ -6385,5 +6398,47 @@ type T = { id: Int, s: Status }")
         "#;
         let errs = check_source(src).expect_err("upsert con menos de 3 argumentos debe rechazarse");
         assert!(errs.iter().any(|e| e.message.contains("toma exactamente 3 argumentos")), "{errs:?}");
+    }
+
+    // ---- db.<c>.insertMany(items) (GRAMMAR.md §3.76) ----
+
+    #[test]
+    fn insert_many_with_a_list_of_the_insertable_shape_typechecks() {
+        let src = r#"
+            type Task = { id: Int, title: String }
+            type NewTask = { title: String }
+            db { tasks: Task[] }
+            service S {
+                rpc seed() -> Task[] {
+                    db.tasks.insertMany([NewTask { title: "a" }, NewTask { title: "b" }])
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn insert_many_rejects_a_list_of_the_wrong_shape() {
+        let src = r#"
+            type Task = { id: Int, title: String }
+            db { tasks: Task[] }
+            service S {
+                rpc seed() -> Task[] { db.tasks.insertMany([1, 2, 3]) }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn insert_many_with_the_wrong_number_of_arguments_is_rejected() {
+        let src = r#"
+            type Task = { id: Int, title: String }
+            db { tasks: Task[] }
+            service S {
+                rpc seed() -> Task[] { db.tasks.insertMany() }
+            }
+        "#;
+        let errs = check_source(src).expect_err("insertMany sin argumentos debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("toma exactamente 1 argumento")), "{errs:?}");
     }
 }

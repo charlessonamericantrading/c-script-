@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.41.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`db.<c>.insertMany(items: Omit<T,"id">[]) -> T[]`.** Un backfill que necesita crear N filas hacía N `insert` sueltos -- desde el cliente, N idas y vueltas HTTP secuenciales; desde un solo rpc con un loop, al menos una request pero sin ningún método dedicado para "estas son todas nuevas, insertalas". Cada elemento pasa por el `insert` de siempre (una sentencia SQL autocommit por fila, mismo criterio que el resto del lenguaje) en el orden dado -- lo que ahorra es la ida y vuelta HTTP N veces desde el cliente cuando N filas se crean juntas, no el costo de N inserts contra la base (sigue siendo N sentencias `INSERT`, no una sola sentencia batch). Sin transacción envolvente: si el ítem 3 de 5 falla, los 2 primeros quedan insertados igual, no hay rollback automático.
+
+744 tests (4 nuevos): 3 en `checker.rs` (tipa limpio con una lista del shape insertable, rechaza tipo equivocado, rechaza 0 argumentos) y 1 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (las filas se insertan con ids reales y distintos en el orden dado, y quedan persistidas de verdad, confirmado leyéndolas de vuelta con `all()` en una llamada aparte). Verificado también a mano contra un servidor HTTP real (`curl`): tres títulos en un solo `insertMany`, tres filas con id 1/2/3 en la respuesta. Detalle completo: GRAMMAR.md §3.76.
+
 ## [1.40.0] - 2026-08-24
 
 ### ✨ Nuevo
