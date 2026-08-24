@@ -6601,7 +6601,7 @@ type T = { id: Int, s: Status }")
     /// GRAMMAR.md §3.95: `countWhere` es un `Int`, mismo contrato de tipos
     /// que `findWhere`/`deleteWhere` (`fn(T) -> Bool`, exactamente 1
     /// argumento) -- la diferencia entre los tres es de EJECUCIÓN
-    /// (`runtime/db.rs::count_where_compare`), invisible al checker.
+    /// (`runtime/db.rs::count_where_conjunction`), invisible al checker.
     #[test]
     fn count_where_takes_a_predicate_and_returns_int() {
         let src = r#"

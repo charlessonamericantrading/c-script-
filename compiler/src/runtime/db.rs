@@ -1415,9 +1415,9 @@ db { users: User[] }
             // `runtime::call_method`, que intercepta estos tres métodos
             // ANTES de llegar acá y sí tiene ese contexto (mismo patrón que
             // `List::filter`/`List::map`) -- incluido el atajo de SQL de
-            // GRAMMAR.md §3.95/§3.108 (`count_where_compare`/`find_where_compare`,
+            // GRAMMAR.md §3.95/§3.108 (`count_where_conjunction`/`find_where_conjunction`,
             // arriba), que tampoco vive acá porque reconocer el predicado
-            // (`recognize_pushable_comparison`) necesita el `Env` capturado
+            // (`recognize_pushable_conjunction`) necesita el `Env` capturado
             // del closure, otra cosa que `Db::call` no tiene forma de
             // recibir. `call_method` es el único camino que el intérprete
             // usa para despachar un método de `Value::DbCollection`, así que
@@ -1571,67 +1571,80 @@ db { users: User[] }
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
     }
 
-    /// Cell bindeable + condición SQL `"{field}" OP ?` (con soft-delete
-    /// AND-eado si corresponde) para el shape de predicado que
-    /// `countWhere`/`findWhere` empujan a SQL (GRAMMAR.md §3.95, `==` v1.59.0;
-    /// §3.108, los otros cinco operadores relacionales): `|x| x.campo OP
-    /// valor`. Compartido entre `count_where_compare` y `find_where_compare`
-    /// -- la única diferencia entre esos dos es qué `SELECT` arman con esta
-    /// misma condición.
+    /// Cells bindeables + condición SQL `"{f1}" OP1 ? AND "{f2}" OP2 ? AND
+    /// ...` (con soft-delete AND-eado al final si corresponde) para el
+    /// shape de predicado que `countWhere`/`findWhere` empujan a SQL
+    /// (GRAMMAR.md §3.95, `==` v1.59.0; §3.108, los otros cinco operadores
+    /// relacionales; §3.109, una conjunción `&&` de varias condiciones así
+    /// en vez de una sola): `|x| x.campo OP valor && ...`. Compartido entre
+    /// `count_where_conjunction` y `find_where_conjunction` -- la única
+    /// diferencia entre esos dos es qué `SELECT` arman con esta misma
+    /// condición. Una lista de una sola condición es el caso de siempre (un
+    /// solo operador).
     ///
-    /// `None` (nunca un error) si `field` no es pusheable: no existe
-    /// declarado en esta colección (aparte de `"id"`), o es una columna
-    /// serializada como JSON (`x?: T?`/struct/enum ADT/lista/... -- sin
-    /// comparación simple de SQL contra un `Value` sin ambigüedad). El
-    /// caller cae al camino interpretado de siempre ante `None` -- correcto
-    /// en cualquier caso, más lento solo en ese caso puntual.
-    fn comparison_condition(&self, collection: &str, columns: &[ColumnPlan], field: &str, op: BinaryOp, value: &Value) -> Option<(String, Cell)> {
-        let sql_op = match op {
-            BinaryOp::Eq => "=",
-            BinaryOp::NotEq => "!=",
-            BinaryOp::Lt => "<",
-            BinaryOp::LtEq => "<=",
-            BinaryOp::Gt => ">",
-            BinaryOp::GtEq => ">=",
-            // `ast::recognize_comparison_predicate` ya filtra a estos seis
-            // -- cualquier otro operador nunca llega hasta acá.
-            _ => return None,
-        };
-        let cell = if field == "id" {
-            let Value::Int(id) = value else { return None };
-            Cell::Int(*id)
-        } else {
-            let col = columns.iter().find(|c| c.field.name == field)?;
-            if col.json {
-                return None;
-            }
-            self.write_param(col, Some(value))
-        };
-        let cond = format!("\"{field}\" {sql_op} {}", self.backend.placeholder(1));
+    /// `None` (nunca un error) si CUALQUIER condición de la lista no es
+    /// pusheable: su campo no existe declarado en esta colección (aparte de
+    /// `"id"`), o es una columna serializada como JSON (`x?: T?`/struct/enum
+    /// ADT/lista/... -- sin comparación simple de SQL contra un `Value` sin
+    /// ambigüedad). El caller cae al camino interpretado de siempre ante
+    /// `None` -- correcto en cualquier caso, más lento solo en ese caso
+    /// puntual.
+    fn conjunction_condition(&self, collection: &str, columns: &[ColumnPlan], conditions: &[(String, BinaryOp, Value)]) -> Option<(String, Vec<Cell>)> {
+        if conditions.is_empty() {
+            return None;
+        }
+        let mut clauses = Vec::with_capacity(conditions.len());
+        let mut cells = Vec::with_capacity(conditions.len());
+        for (idx, (field, op, value)) in conditions.iter().enumerate() {
+            let sql_op = match op {
+                BinaryOp::Eq => "=",
+                BinaryOp::NotEq => "!=",
+                BinaryOp::Lt => "<",
+                BinaryOp::LtEq => "<=",
+                BinaryOp::Gt => ">",
+                BinaryOp::GtEq => ">=",
+                // `ast::recognize_conjunction_predicate` ya filtra a estos
+                // seis -- cualquier otro operador nunca llega hasta acá.
+                _ => return None,
+            };
+            let cell = if field == "id" {
+                let Value::Int(id) = value else { return None };
+                Cell::Int(*id)
+            } else {
+                let col = columns.iter().find(|c| &c.field.name == field)?;
+                if col.json {
+                    return None;
+                }
+                self.write_param(col, Some(value))
+            };
+            clauses.push(format!("\"{field}\" {sql_op} {}", self.backend.placeholder(idx + 1)));
+            cells.push(cell);
+        }
+        let cond = clauses.join(" AND ");
         let where_clause = match self.soft_delete_where(collection) {
             Some(sd) => format!("{cond} AND {sd}"),
             None => cond,
         };
-        Some((where_clause, cell))
+        Some((where_clause, cells))
     }
 
-    /// `db.<c>.countWhere(|x| x.campo OP valor)` (GRAMMAR.md §3.95/§3.108):
-    /// un `SELECT COUNT(*) ... WHERE` real -- CERO filas viajan del motor al
-    /// proceso, a diferencia del `countWhere` interpretado (traer TODO con
-    /// `all`, evaluar el predicado fila por fila en Rust, contar). `None`
-    /// (nunca un error) si el predicado no tiene esta forma exacta, o el
-    /// campo no es pusheable -- el caller (`runtime/mod.rs`) cae al camino
-    /// interpretado, que sigue siendo correcto siempre, solo más lento en
-    /// ese caso.
-    pub(crate) fn count_where_compare(&self, collection: &str, field: &str, op: BinaryOp, value: &Value) -> Result<Option<i64>, RuntimeError> {
+    /// `db.<c>.countWhere(|x| x.campo OP valor && ...)` (GRAMMAR.md
+    /// §3.95/§3.108/§3.109): un `SELECT COUNT(*) ... WHERE` real -- CERO
+    /// filas viajan del motor al proceso, a diferencia del `countWhere`
+    /// interpretado (traer TODO con `all`, evaluar el predicado fila por
+    /// fila en Rust, contar). `None` (nunca un error) si el predicado no
+    /// tiene esta forma exacta, o algún campo no es pusheable -- el caller
+    /// (`runtime/mod.rs`) cae al camino interpretado, que sigue siendo
+    /// correcto siempre, solo más lento en ese caso.
+    pub(crate) fn count_where_conjunction(&self, collection: &str, conditions: &[(String, BinaryOp, Value)]) -> Result<Option<i64>, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
-        let Some((where_clause, cell)) = self.comparison_condition(collection, columns, field, op, value) else {
+        let Some((where_clause, cells)) = self.conjunction_condition(collection, columns, conditions) else {
             return Ok(None);
         };
         let sql = format!("SELECT COUNT(*) FROM \"{collection}\" WHERE {where_clause}");
         let rows = self
             .backend
-            .query(&sql, &[cell], &[ColumnKind::Int])
+            .query(&sql, &cells, &[ColumnKind::Int])
             .map_err(|e| RuntimeError::new(format!("error en countWhere de '{collection}': {e}")))?;
         match rows.first().and_then(|r| r.first()) {
             Some(Cell::Int(n)) => Ok(Some(*n)),
@@ -1639,14 +1652,14 @@ db { users: User[] }
         }
     }
 
-    /// Como `count_where_compare`, para `db.<c>.findWhere(|x| x.campo OP
-    /// valor)` -- un `SELECT ... WHERE` real, solo las filas que matchean
-    /// viajan del motor al proceso (a diferencia del camino interpretado,
-    /// que trae TODA la colección y filtra en Rust). Mismo criterio de
-    /// `None` que `count_where_compare`.
-    pub(crate) fn find_where_compare(&self, collection: &str, field: &str, op: BinaryOp, value: &Value) -> Result<Option<Vec<Value>>, RuntimeError> {
+    /// Como `count_where_conjunction`, para `db.<c>.findWhere(|x| x.campo
+    /// OP valor && ...)` -- un `SELECT ... WHERE` real, solo las filas que
+    /// matchean viajan del motor al proceso (a diferencia del camino
+    /// interpretado, que trae TODA la colección y filtra en Rust). Mismo
+    /// criterio de `None` que `count_where_conjunction`.
+    pub(crate) fn find_where_conjunction(&self, collection: &str, conditions: &[(String, BinaryOp, Value)]) -> Result<Option<Vec<Value>>, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
-        let Some((where_clause, cell)) = self.comparison_condition(collection, columns, field, op, value) else {
+        let Some((where_clause, cells)) = self.conjunction_condition(collection, columns, conditions) else {
             return Ok(None);
         };
         let mut col_list = vec!["\"id\"".to_string()];
@@ -1656,7 +1669,7 @@ db { users: User[] }
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
             .backend
-            .query(&sql, &[cell], &kinds)
+            .query(&sql, &cells, &kinds)
             .map_err(|e| RuntimeError::new(format!("error en findWhere de '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect::<Result<Vec<_>, _>>().map(Some)
     }
@@ -1838,7 +1851,7 @@ db { users: User[] }
     /// `SELECT ... ORDER BY "<campo>" {DESC|ASC} LIMIT 1`, a diferencia de
     /// `maxBy`/`minBy` (arriba), que solo agregan un VALOR, nunca la fila
     /// que lo alcanza. Reusa `row_to_fields` (mismo decodificador que
-    /// `select_rows`/`find_where_compare`) para la fila entera, no
+    /// `select_rows`/`find_where_conjunction`) para la fila entera, no
     /// `scalar_cell_to_value` (que `select_grouped` usa para una sola
     /// celda) -- por eso no comparte código con `select_grouped` más allá
     /// del `closure_field_name` inicial. `Value::Null` sobre una colección

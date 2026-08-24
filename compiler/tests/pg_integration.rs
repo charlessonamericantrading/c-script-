@@ -568,6 +568,54 @@ service Chats {{
     assert_eq!(rows.as_array().unwrap().len(), 2, "{rows}");
 }
 
+/// GRAMMAR.md §3.109: generaliza el test anterior a una conjunción `&&` de
+/// varias hojas -- el caso real de "CRM" que lo motiva, `notifications.link`:
+/// `n.userId == uid && !n.read`. Contra un Postgres real para confirmar que
+/// el `AND` generado (dos placeholders `$1`/`$2` en Postgres, no solo uno)
+/// bindea en el orden correcto y no corrompe el protocolo binario -- el
+/// mismo tipo de bug que el fix de escritura de `Int` (§3.104) hubiera
+/// dejado pasar si solo se hubiera probado contra SQLite.
+#[test]
+fn count_where_and_find_where_push_a_conjunction_of_leaves_to_real_sql_against_postgres() {
+    const COLLECTION: &str = "notifications_conjunction_pushdown";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("conjunction-pushdown");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Notification = {{ id: Int, userId: Int, read: Bool }}
+db {{ {COLLECTION}: Notification[] }}
+service Notifications {{
+  rpc add(userId: Int, read: Bool) -> Notification {{
+    db.{COLLECTION}.insert(Notification {{ id: 0, userId: userId, read: read }})
+  }}
+  rpc unreadFor(userId: Int) -> Int {{
+    db.{COLLECTION}.countWhere(|n: Notification| {{ n.userId == userId && !n.read }})
+  }}
+  rpc unreadRowsFor(userId: Int) -> Notification[] {{
+    db.{COLLECTION}.findWhere(|n: Notification| {{ n.userId == userId && !n.read }})
+  }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Notifications/add", r#"{"userId":1,"read":false}"#);
+    server.rpc("Notifications/add", r#"{"userId":1,"read":true}"#);
+    server.rpc("Notifications/add", r#"{"userId":2,"read":false}"#);
+
+    let count = server.rpc("Notifications/unreadFor", r#"{"userId":1}"#);
+    assert_eq!(count, serde_json::json!(1), "{count}");
+    let rows = server.rpc("Notifications/unreadRowsFor", r#"{"userId":1}"#);
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+}
+
 /// GRAMMAR.md §3.105: `db.<c>.increment` es un `UPDATE campo = campo +
 /// delta` atómico -- SIN ida y vuelta de lectura previa. La prueba real de
 /// que esto arregla el lost-update reportado (IgnisLove, varios procesos

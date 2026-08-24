@@ -783,28 +783,39 @@ fn as_bool(v: &Value) -> Result<bool, RuntimeError> {
     }
 }
 
-/// Predicado de `countWhere`/`findWhere` (GRAMMAR.md §3.95/§3.108) reducido
-/// a `(campo, operador, valor)` si -- y solo si -- tiene la forma `|x|
-/// x.campo OP valor` (`ast::recognize_comparison_predicate`, OP en
-/// `==`/`!=`/`<`/`<=`/`>`/`>=`) Y el lado "valor" es lo bastante simple
-/// como para evaluarlo SIN invocar el intérprete completo: un literal, o un
-/// `Ident` que resuelve en el `Env` que el closure ya capturó al crearse
-/// (nunca el propio parámetro `x`, que no vive ahí). `None` en cualquier
-/// otro caso -- el caller cae al camino interpretado de siempre
-/// (`db.call("all")` + evaluar el predicado por fila), que sigue siendo
-/// correcto siempre, más lento solo en ese caso puntual.
-fn recognize_pushable_comparison(f: &Value) -> Option<(String, BinaryOp, Value)> {
+/// Predicado de `countWhere`/`findWhere` (GRAMMAR.md §3.95/§3.108/§3.109)
+/// reducido a una lista de `(campo, operador, valor)`, una por cada hoja de
+/// una conjunción `&&` (una conjunción de una sola hoja es el caso de un
+/// solo operador de siempre) -- si y solo si CADA hoja tiene la forma `x.campo
+/// OP valor` (`ast::recognize_conjunction_predicate`, OP en
+/// `==`/`!=`/`<`/`<=`/`>`/`>=`, o `!x.campo`/`x.campo` sueltos como
+/// booleanos) Y su lado "valor" (cuando no es un booleano sintetizado) es
+/// lo bastante simple como para evaluarlo SIN invocar el intérprete
+/// completo: un literal, o un `Ident` que resuelve en el `Env` que el
+/// closure ya capturó al crearse (nunca el propio parámetro `x`, que no
+/// vive ahí). `None` si CUALQUIER hoja falla -- el caller cae al camino
+/// interpretado de siempre (`db.call("all")` + evaluar el predicado por
+/// fila), que sigue siendo correcto siempre, más lento solo en ese caso
+/// puntual.
+fn recognize_pushable_conjunction(f: &Value) -> Option<Vec<(String, BinaryOp, Value)>> {
     let Value::Closure(params, body, captured_env) = f else { return None };
-    let (field, op, value_expr) = crate::ast::recognize_comparison_predicate(params, body)?;
-    let value = match &value_expr.node {
-        Expr::Int(n) => Value::Int(*n),
-        Expr::Float(x) => Value::Float(*x),
-        Expr::Str(s) => Value::Str(s.clone()),
-        Expr::Bool(b) => Value::Bool(*b),
-        Expr::Ident(name) => captured_env.get(name)?.borrow().clone(),
-        _ => return None,
-    };
-    Some((field.to_string(), op, value))
+    let leaves = crate::ast::recognize_conjunction_predicate(params, body)?;
+    let mut out = Vec::with_capacity(leaves.len());
+    for (field, op, operand) in leaves {
+        let value = match operand {
+            crate::ast::PredicateOperand::Bool(b) => Value::Bool(b),
+            crate::ast::PredicateOperand::Expr(value_expr) => match &value_expr.node {
+                Expr::Int(n) => Value::Int(*n),
+                Expr::Float(x) => Value::Float(*x),
+                Expr::Str(s) => Value::Str(s.clone()),
+                Expr::Bool(b) => Value::Bool(*b),
+                Expr::Ident(name) => captured_env.get(name.as_str())?.borrow().clone(),
+                _ => return None,
+            },
+        };
+        out.push((field.to_string(), op, value));
+    }
+    Some(out)
 }
 
 fn numeric_op(
@@ -1273,13 +1284,14 @@ fn call_method(
             }
             "findWhere" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'findWhere' requiere 1 argumento"))?;
-                // GRAMMAR.md §3.95/§3.108: `|x| x.campo OP valor` (OP en
-                // ==/!=/</<=/>/>=) empuja a un `SELECT ... WHERE` real --
+                // GRAMMAR.md §3.95/§3.108/§3.109: `|x| x.campo OP valor`
+                // (OP en ==/!=/</<=/>/>=), incluida una conjunción `&&` de
+                // varias hojas así, empuja a un `SELECT ... WHERE` real --
                 // solo las filas que matchean viajan del motor al proceso.
                 // Cualquier otra forma de predicado cae al camino de
                 // siempre, dos líneas más abajo.
-                if let Some((field, op, value)) = recognize_pushable_comparison(&f) {
-                    if let Some(rows) = db.find_where_compare(&coll, &field, op, &value)? {
+                if let Some(conditions) = recognize_pushable_conjunction(&f) {
+                    if let Some(rows) = db.find_where_conjunction(&coll, &conditions)? {
                         return Ok(Value::List(rows));
                     }
                 }
@@ -1304,8 +1316,8 @@ fn call_method(
             // memoria solo para descartarla y quedarse con un número.
             "countWhere" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'countWhere' requiere 1 argumento"))?;
-                if let Some((field, op, value)) = recognize_pushable_comparison(&f) {
-                    if let Some(n) = db.count_where_compare(&coll, &field, op, &value)? {
+                if let Some(conditions) = recognize_pushable_conjunction(&f) {
+                    if let Some(n) = db.count_where_conjunction(&coll, &conditions)? {
                         return Ok(Value::Int(n));
                     }
                 }
@@ -5165,7 +5177,7 @@ mod tests {
     /// GRAMMAR.md §3.95: el caso real que motiva `countWhere` -- contar
     /// cuántas reseñas tiene un producto sin traer la tabla entera a
     /// memoria. `|r: Review| { r.productId == productId }` es exactamente
-    /// el shape pusheable (`ast::recognize_comparison_predicate`) -- este
+    /// el shape pusheable (`ast::recognize_conjunction_predicate`) -- este
     /// test prueba el resultado CORRECTO, no que el pushdown haya corrido
     /// (eso se verificó manualmente contra el SQL real emitido; acá lo que
     /// importa es que el número sea el que tiene que ser).
@@ -5267,15 +5279,14 @@ mod tests {
         assert_eq!(rows.as_array().unwrap().len(), 2);
     }
 
-    /// `countWhere`/`findWhere` con un predicado NO pusheable (`&&`/`||`
-    /// compuesto, dos campos, una comparación entre campos del propio
-    /// parámetro -- GRAMMAR.md §9.3.1, sigue abierto) siguen dando el
-    /// resultado correcto por el camino interpretado de siempre -- el
-    /// pushdown de GRAMMAR.md §3.95/§3.108 es un atajo, nunca el único
-    /// camino. `r.rating > 3` SOLO (un único operador relacional) ya NO es
-    /// un buen ejemplo de "no pusheable" desde §3.108 -- ese caso ahora sí
-    /// empuja a SQL; acá se usa un `&&` compuesto a propósito, que sigue
-    /// sin pushear.
+    /// `countWhere`/`findWhere` con un predicado NO pusheable (`||`
+    /// combinando condiciones, o una comparación entre DOS campos del
+    /// propio parámetro -- GRAMMAR.md §9.3 ítem 1, siguen abiertos) siguen
+    /// dando el resultado correcto por el camino interpretado de siempre --
+    /// el pushdown de GRAMMAR.md §3.95/§3.108/§3.109 es un atajo, nunca el
+    /// único camino. Ni `r.rating > 3` solo (§3.108) ni un `&&` de varias
+    /// hojas simples (§3.109) son ya buenos ejemplos de "no pusheable" --
+    /// acá se usa un `||` a propósito, que sigue sin pushear.
     #[test]
     fn count_where_and_find_where_fall_back_correctly_for_a_non_pushable_predicate() {
         let code = r#"
@@ -5285,26 +5296,91 @@ mod tests {
           rpc add(productId: Int, rating: Int) -> Review {
             db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
           }
-          rpc countHighRated() -> Int {
-            db.reviews.countWhere(|r: Review| { r.rating > 3 && r.productId == 1 })
+          rpc countHighRatedOrProductOne() -> Int {
+            db.reviews.countWhere(|r: Review| { r.rating > 3 || r.productId == 1 })
           }
-          rpc listHighRated() -> Review[] {
-            db.reviews.findWhere(|r: Review| { r.rating > 3 && r.productId == 1 })
+          rpc listHighRatedOrProductOne() -> Review[] {
+            db.reviews.findWhere(|r: Review| { r.rating > 3 || r.productId == 1 })
           }
         }
         "#;
         let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
         let db = Db::new(&program, std::path::Path::new(":memory:"));
 
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 5}), &db).unwrap();
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 1}), &db).unwrap();
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 4}), &db).unwrap();
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 5}), &db).unwrap(); // rating>3 Y productId==1
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 1}), &db).unwrap(); // solo productId==1
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 4}), &db).unwrap(); // solo rating>3
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 2}), &db).unwrap(); // ninguna
 
-        // Solo la primera fila cumple LAS DOS condiciones a la vez
-        // (productId 2 tiene rating > 3 pero no productId == 1).
-        assert_eq!(invoke_rpc(&program, "Reviews", "countHighRated", &json!({}), &db).unwrap(), json!(1));
-        let rows = invoke_rpc(&program, "Reviews", "listHighRated", &json!({}), &db).unwrap();
+        // Las primeras 3 filas cumplen AL MENOS UNA de las dos condiciones.
+        assert_eq!(invoke_rpc(&program, "Reviews", "countHighRatedOrProductOne", &json!({}), &db).unwrap(), json!(3));
+        let rows = invoke_rpc(&program, "Reviews", "listHighRatedOrProductOne", &json!({}), &db).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 3);
+    }
+
+    /// GRAMMAR.md §3.109: `countWhere`/`findWhere` empujan a SQL una
+    /// conjunción `&&` de varias hojas simples, no solo un único operador
+    /// (generaliza §3.108). Casos reales que lo motivan, dos de "CRM":
+    /// `notifications.link` (`n.userId == uid && !n.read`) e
+    /// `inventory.link` (`p.stock <= 5 && p.stock > 0`, el MISMO campo dos
+    /// veces en la misma conjunción). De paso cubre las dos hojas
+    /// booleanas nuevas que no necesitan ningún operador explícito:
+    /// `!x.campo` (equivale a `== false`) y `x.campo` solo (`== true`).
+    #[test]
+    fn count_where_and_find_where_push_down_a_conjunction_of_several_leaves() {
+        let code = r#"
+        type Notification = { id: Int, userId: Int, read: Bool }
+        type Product = { id: Int, stock: Int }
+        db { notifications: Notification[], products: Product[] }
+        service Notifications {
+          rpc add(userId: Int, read: Bool) -> Notification {
+            db.notifications.insert(Notification { id: 0, userId: userId, read: read })
+          }
+          rpc unreadFor(userId: Int) -> Int {
+            db.notifications.countWhere(|n: Notification| { n.userId == userId && !n.read })
+          }
+          rpc unreadRowsFor(userId: Int) -> Notification[] {
+            db.notifications.findWhere(|n: Notification| { n.userId == userId && !n.read })
+          }
+          rpc readCount() -> Int { db.notifications.countWhere(|n: Notification| { n.read }) }
+        }
+        service Products {
+          rpc add(stock: Int) -> Product { db.products.insert(Product { id: 0, stock: stock }) }
+          rpc lowStockCount() -> Int {
+            db.products.countWhere(|p: Product| { p.stock <= 5 && p.stock > 0 })
+          }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Notifications", "add", &json!({"userId": 1, "read": false}), &db).unwrap();
+        invoke_rpc(&program, "Notifications", "add", &json!({"userId": 1, "read": true}), &db).unwrap();
+        invoke_rpc(&program, "Notifications", "add", &json!({"userId": 2, "read": false}), &db).unwrap();
+
+        assert_eq!(
+            invoke_rpc(&program, "Notifications", "unreadFor", &json!({"userId": 1}), &db).unwrap(),
+            json!(1),
+            "usuario 1 tiene 1 no leída de sus 2 notificaciones"
+        );
+        let rows = invoke_rpc(&program, "Notifications", "unreadRowsFor", &json!({"userId": 1}), &db).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(
+            invoke_rpc(&program, "Notifications", "readCount", &json!({}), &db).unwrap(),
+            json!(1),
+            "hoja booleana suelta (x.campo, sin operador, equivale a == true)"
+        );
+
+        invoke_rpc(&program, "Products", "add", &json!({"stock": 0}), &db).unwrap();
+        invoke_rpc(&program, "Products", "add", &json!({"stock": 3}), &db).unwrap();
+        invoke_rpc(&program, "Products", "add", &json!({"stock": 5}), &db).unwrap();
+        invoke_rpc(&program, "Products", "add", &json!({"stock": 10}), &db).unwrap();
+
+        assert_eq!(
+            invoke_rpc(&program, "Products", "lowStockCount", &json!({}), &db).unwrap(),
+            json!(2),
+            "stock <= 5 && stock > 0: solo 3 y 5 -- el MISMO campo dos veces en la conjunción"
+        );
     }
 
     /// `countWhere("id" == valor)` es un caso especial (§3.95: `"id"` nunca

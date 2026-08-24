@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.72.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`countWhere`/`findWhere` empujan una conjunción `&&` de varias hojas.** Pedido explícito del usuario tras revisar el estado de IgnisLove/MyFinance: resuelve los DOS casos reales de CRM que la ronda de un solo operador (v1.71.0) había dejado sin cubrir -- `notifications.link` (`n.userId == uid && !n.read`) e `inventory.link` (`p.stock <= 5 && p.stock > 0`, el MISMO campo dos veces). `ast::recognize_conjunction_predicate` reemplaza y generaliza `recognize_comparison_predicate`, recorriendo el árbol de `&&` recursivamente; también reconoce `!x.campo`/`x.campo` sueltos como hojas booleanas (`== false`/`== true`), sin ningún operador explícito. `runtime/db.rs::conjunction_condition` arma `"f1" op1 $1 AND "f2" op2 $2 AND ...` con un placeholder posicional por hoja. Alcance deliberado: solo `&&` -- `||` sigue sin pushear, sin evidencia real de demanda todavía.
+
+930 tests (2 nuevos): 1 en `runtime/mod.rs` contra un SQLite en memoria real cubriendo los dos casos reales de CRM más las dos hojas booleanas sueltas + 1 en `pg_integration.rs` contra un PostgreSQL real confirmando que el `AND` con dos placeholders posicionales (`$1`/`$2`) bindea en el orden correcto. Un test existente que usaba un `&&` compuesto como ejemplo de predicado NO pusheable (agregado en v1.71.0) se corrigió otra vez, ahora a un `||`. Detalle completo: GRAMMAR.md §3.109. De paso se abrió PLAN.md §9.9, una nueva sección de backlog para SEO y descubribilidad de agentes de IA (sitemap/robots.txt declarativos, metadata SEO clásica, reglas para crawlers de IA, `llms.txt` auto-generado por proyecto, ejemplos estructurados en OpenAPI, redirects, `@cache_control`) -- todavía sin implementar, candidatos para próximas rondas.
+
 ## [1.71.0] - 2026-08-24
 
 ### ✨ Nuevo

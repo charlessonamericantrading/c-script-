@@ -830,52 +830,112 @@ pub fn recognize_field_selector<'a>(param_names: &[String], body: &'a Block) -> 
     matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
 }
 
+/// El lado "valor" de una hoja de conjunción (ver `recognize_conjunction_predicate`
+/// abajo). Normalmente una expresión del código fuente sin evaluar todavía
+/// (mismo criterio que la versión de un solo operador) -- pero `!item.campo`
+/// se reconoce como una hoja completa (`item.campo == false`) sin que exista
+/// ningún literal `false` en el código fuente al que apuntar, y lo mismo
+/// para `item.campo` solo (`item.campo == true`) -- por eso esta forma
+/// también admite un booleano SINTETIZADO, no tomado del AST.
+pub enum PredicateOperand<'a> {
+    Expr(&'a Spanned<Expr>),
+    Bool(bool),
+}
+
 /// Reconoce `|item: T| item.campo OP valor` (en cualquier orden -- `valor
-/// OP item.campo` también) para `OP` en `==`/`!=`/`<`/`<=`/`>`/`>=` --
-/// GRAMMAR.md §3.95 (`==`, v1.59.0) ampliado a los cinco operadores
-/// restantes en GRAMMAR.md §3.108. El ÚNICO shape de predicado que
-/// `countWhere`/`findWhere` empujan a SQL en vez de traer la colección
-/// entera a memoria y evaluar el predicado fila por fila. Devuelve el
-/// nombre del campo, el operador (ya "enderezado" -- ver abajo) y la
-/// expresión del lado "valor", sin evaluarla -- el caller (`runtime/mod.rs`,
-/// que sí tiene acceso al `Env` capturado del closure) decide si esa
-/// expresión es lo bastante simple como para confiar en el resultado (un
-/// literal, o un `Ident` que resuelve en ese `Env`) sin tener que
-/// reimplementar un evaluador de expresiones acá.
+/// OP item.campo` también) para `OP` en `==`/`!=`/`<`/`<=`/`>`/`>=`, Y
+/// AHORA TAMBIÉN una conjunción de varias hojas así unidas con `&&`
+/// (`item.a OP1 v1 && item.b OP2 v2 && ...`), incluyendo `!item.campo`/
+/// `item.campo` sueltos como hojas booleanas -- GRAMMAR.md §3.95 (`==`,
+/// v1.59.0), §3.108 (los otros cinco operadores, un solo operador por
+/// predicado), §3.109 (conjunción de N hojas). El ÚNICO shape de predicado
+/// que `countWhere`/`findWhere` empujan a SQL en vez de traer la colección
+/// entera a memoria y evaluar el predicado fila por fila. Devuelve, por
+/// cada hoja, el nombre del campo, el operador (ya "enderezado" -- ver
+/// abajo) y el lado "valor" sin evaluar -- el caller (`runtime/mod.rs`, que
+/// sí tiene acceso al `Env` capturado del closure) decide si cada uno es lo
+/// bastante simple como para confiar en el resultado (un literal, o un
+/// `Ident` que resuelve en ese `Env`) sin tener que reimplementar un
+/// evaluador de expresiones acá.
 ///
-/// Cuando el campo aparece del lado DERECHO (`5 < item.campo`), el
-/// operador se invierte (`Lt` -> `Gt`) para que el caller SIEMPRE reciba
-/// "campo OP valor" con el campo a la izquierda, sin tener que manejar los
-/// dos órdenes por separado en el sitio de generación de SQL.
+/// Cuando el campo de una hoja de comparación aparece del lado DERECHO (`5
+/// < item.campo`), el operador se invierte (`Lt` -> `Gt`) para que el
+/// caller SIEMPRE reciba "campo OP valor" con el campo a la izquierda, sin
+/// tener que manejar los dos órdenes por separado en el sitio de
+/// generación de SQL.
 ///
-/// Mismo criterio conservador que `recognize_field_selector`: cualquier
-/// otra forma (`&&`/`||`, un campo derivado, una comparación entre DOS
-/// campos del propio parámetro) devuelve `None` -- el caller cae al camino
-/// interpretado de siempre, correcto en cualquier caso, más lento solo en
-/// ese caso puntual. No intenta reconocer un `&&`/`||` de varias
-/// comparaciones simples (`x.a == 1 && x.b > 2`) -- ese caso necesitaría
-/// combinar varias condiciones SQL con sus propios parámetros, fuera de
-/// alcance de esta ronda (PLAN.md §9.3.1, sigue abierto).
-pub fn recognize_comparison_predicate<'a>(param_names: &[String], body: &'a Block) -> Option<(&'a str, BinaryOp, &'a Spanned<Expr>)> {
+/// Mismo criterio conservador que `recognize_field_selector`: `||` en
+/// CUALQUIER posición, un campo derivado, o una comparación entre DOS
+/// campos del propio parámetro hace fallar TODO el reconocimiento (`None`)
+/// -- el caller cae al camino interpretado de siempre, correcto en
+/// cualquier caso, más lento solo en ese caso puntual. Alcance deliberado
+/// de esta ronda: solo `&&` (los casos reales de CRM que lo motivaron --
+/// `n.userId == uid && !n.read`, `p.stock <= 5 && p.stock > 0` -- son los
+/// dos conjunciones puras) -- `||` necesitaría una cláusula `OR` separada
+/// en el SQL generado, sin evidencia real de demanda todavía; queda para
+/// una ronda dedicada si aparece. `deleteWhere` tampoco gana este atajo
+/// (mismo motivo que la versión de un solo operador: publicar cada fila
+/// borrada a `stream` complica un `DELETE ... WHERE` de una sola sentencia).
+pub fn recognize_conjunction_predicate<'a>(param_names: &[String], body: &'a Block) -> Option<Vec<(&'a str, BinaryOp, PredicateOperand<'a>)>> {
     let [param] = param_names else { return None };
     if !body.stmts.is_empty() {
         return None;
     }
-    let Expr::Binary { op, left, right } = &body.tail.as_ref()?.node else { return None };
-    if !matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) {
-        return None;
+    let mut leaves = Vec::new();
+    collect_conjunction_leaves(param, body.tail.as_ref()?, &mut leaves)?;
+    Some(leaves)
+}
+
+fn strip_parens(mut e: &Spanned<Expr>) -> &Spanned<Expr> {
+    while let Expr::Paren(inner) = &e.node {
+        e = inner;
     }
-    let field_of = |e: &'a Spanned<Expr>| -> Option<&'a str> {
-        let Expr::FieldAccess { base, field } = &e.node else { return None };
-        matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
-    };
-    if let Some(field) = field_of(left) {
-        return Some((field, *op, right));
+    e
+}
+
+fn field_of_param<'a>(param: &str, e: &'a Spanned<Expr>) -> Option<&'a str> {
+    let Expr::FieldAccess { base, field } = &e.node else { return None };
+    matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
+}
+
+fn collect_conjunction_leaves<'a>(
+    param: &str,
+    expr: &'a Spanned<Expr>,
+    out: &mut Vec<(&'a str, BinaryOp, PredicateOperand<'a>)>,
+) -> Option<()> {
+    let expr = strip_parens(expr);
+    match &expr.node {
+        Expr::Binary { op: BinaryOp::And, left, right } => {
+            collect_conjunction_leaves(param, left, out)?;
+            collect_conjunction_leaves(param, right, out)?;
+            Some(())
+        }
+        Expr::Binary { op, left, right }
+            if matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) =>
+        {
+            let left = strip_parens(left);
+            let right = strip_parens(right);
+            if let Some(field) = field_of_param(param, left) {
+                out.push((field, *op, PredicateOperand::Expr(right)));
+                return Some(());
+            }
+            if let Some(field) = field_of_param(param, right) {
+                out.push((field, flip_comparison_operator(*op), PredicateOperand::Expr(left)));
+                return Some(());
+            }
+            None
+        }
+        Expr::Unary { op: UnaryOp::Not, operand } => {
+            let field = field_of_param(param, strip_parens(operand))?;
+            out.push((field, BinaryOp::Eq, PredicateOperand::Bool(false)));
+            Some(())
+        }
+        _ => {
+            let field = field_of_param(param, expr)?;
+            out.push((field, BinaryOp::Eq, PredicateOperand::Bool(true)));
+            Some(())
+        }
     }
-    if let Some(field) = field_of(right) {
-        return Some((field, flip_comparison_operator(*op), left));
-    }
-    None
 }
 
 /// `a OP b` <=> `b flip(OP) a` -- usado cuando el campo del predicado
