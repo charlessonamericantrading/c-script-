@@ -129,6 +129,27 @@ pub(crate) fn millis_from_pg_date_days(days: i32) -> i64 {
     (i64::from(days) + PG_EPOCH_DAYS_SINCE_UNIX_EPOCH) * MS_PER_DAY
 }
 
+/// Milisegundos desde epoch -> `(dateStamp, amzDate)` en las dos formas
+/// fijas que AWS Signature V4 exige (GRAMMAR.md §3.110): `dateStamp` es
+/// `YYYYMMDD` (usado en el credential scope y en la derivación de la
+/// clave de firma), `amzDate` es `YYYYMMDDTHHMMSSZ` (el header/parámetro
+/// `X-Amz-Date`) -- mismo cálculo de calendario que `format_iso8601_millis`
+/// de arriba, solo que sin separadores. `div_euclid`/`rem_euclid` por el
+/// mismo motivo de siempre (una fecha anterior a 1970 no debería pasar
+/// nunca por acá en la práctica -- esto siempre parte de `SystemTime::now()`
+/// -- pero la función es total de todas formas, sin panics posibles).
+pub(crate) fn format_aws_sigv4_datetime(total_ms: i64) -> (String, String) {
+    let days = total_ms.div_euclid(MS_PER_DAY);
+    let ms_of_day = total_ms.rem_euclid(MS_PER_DAY);
+    let (y, m, d) = civil_from_days(days);
+    let hour = ms_of_day / MS_PER_HOUR;
+    let min = (ms_of_day % MS_PER_HOUR) / MS_PER_MIN;
+    let sec = (ms_of_day % MS_PER_MIN) / MS_PER_SEC;
+    let date_stamp = format!("{y:04}{m:02}{d:02}");
+    let amz_date = format!("{date_stamp}T{hour:02}{min:02}{sec:02}Z");
+    (date_stamp, amz_date)
+}
+
 /// `dateFromParts(year, month, day, hour, minute, second) -> Timestamp`
 /// (GRAMMAR.md §3.90): construye un `Timestamp` arbitrario a partir de sus
 /// componentes de calendario -- cierra el límite que §3.31 dejaba abierto a
@@ -177,6 +198,18 @@ mod tests {
     fn epoch_round_trips() {
         assert_eq!(format_iso8601_millis(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(parse_iso8601_millis("1970-01-01T00:00:00.000Z"), Some(0));
+    }
+
+    #[test]
+    fn aws_sigv4_datetime_matches_the_official_aws_test_suite_dates() {
+        // Fecha exacta del "get-vanilla" test case del aws4_testsuite oficial
+        // de AWS (Mon, 09 Sep 2011 23:36:00 GMT) -- ver GRAMMAR.md §3.110.
+        let ms = parse_iso8601_millis("2011-09-09T23:36:00.000Z").unwrap();
+        assert_eq!(format_aws_sigv4_datetime(ms), ("20110909".to_string(), "20110909T233600Z".to_string()));
+        // Fecha del worked example de "GET Object" con URL firmada de la
+        // documentación oficial de AWS (2013-05-24T00:00:00Z).
+        let ms = parse_iso8601_millis("2013-05-24T00:00:00.000Z").unwrap();
+        assert_eq!(format_aws_sigv4_datetime(ms), ("20130524".to_string(), "20130524T000000Z".to_string()));
     }
 
     #[test]

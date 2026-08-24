@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.73.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`crypto.awsS3PresignedUrl(accessKeyId, secretAccessKey, region, bucket, objectKey, expiresSeconds) -> String`.** Reportado por MyFinance: `DocumentStorageService` tenía una firma S3 FALSA (`?signature=hmac_verified`, un string literal) porque `crypto.hmacSha256` (String -> String) no alcanza para el encadenado de HMACs con BYTES CRUDOS que AWS Signature V4 exige -- confirmado como limitación real del primitivo existente, no como falta de documentación o de discoverabilidad. Arma la URL COMPLETA lista para usar (no solo la firma), resolviendo adentro del runtime todo el protocolo (canonical request, string-to-sign, derivación de clave de firma, URI-encoding exacto) para que ningún adoptador tenga que reimplementarlo a mano. Alcance acotado: solo `GET` (compartir/descargar), solo credenciales de larga duración, estilo virtual-hosted-style.
+
+938 tests (8 nuevos): la derivación de clave + firma final reproduce BYTE A BYTE el vector de prueba OFICIAL que Amazon publica (`aws4_testsuite`, caso "get-vanilla") -- verificado sin necesitar ninguna cuenta de AWS real, mismo estándar que ya se usó para `crypto.hmacSha256`. Detalle completo: GRAMMAR.md §3.110.
+
+### 📝 Nota de proceso
+El primer intento de resolver este reporte fue recomendarle a MyFinance que armara la firma "a mano" con `crypto.hmacSha256` -- una recomendación que resultó ser INCORRECTA al verificarla (`hmacSha256` devuelve hex, no bytes crudos, y AWS Signature V4 necesita encadenar los bytes crudos de un HMAC como clave del siguiente). El error se corrigió antes de comunicarlo como solución final, pero es la razón por la que este ítem terminó siendo una función nueva del compilador en vez de quedar documentado como "ya se puede hacer con lo que existe".
+
 ## [1.72.0] - 2026-08-24
 
 ### ✨ Nuevo

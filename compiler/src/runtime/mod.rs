@@ -1224,6 +1224,49 @@ fn os_random_bytes(n: usize) -> Result<Vec<u8>, RuntimeError> {
     Ok(buf)
 }
 
+/// `UriEncode()` exacto de AWS Signature V4 (GRAMMAR.md §3.110, spec en
+/// docs.aws.amazon.com/general/latest/gr/sigv4-signed-request-examples.html):
+/// cada BYTE (no cada carácter -- un caracter UTF-8 multibyte se codifica
+/// byte por byte, que es lo correcto) se deja tal cual si es "sin reservar"
+/// (`A-Za-z0-9-._~`), si no se codifica `%XX` con hex EN MAYÚSCULA. `/` es
+/// el único caso especial: se codifica en un VALOR de query string
+/// (`encode_slash: true`, ej. dentro de `X-Amz-Credential`) pero se
+/// preserva tal cual en el componente de path de la URI (`encode_slash:
+/// false`, para el nombre del objeto -- un "folder/archivo.pdf" real no
+/// debe convertirse en un solo segmento codificado).
+fn aws_uri_encode(s: &str, encode_slash: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let c = b as char;
+        if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~') {
+            out.push(c);
+        } else if c == '/' && !encode_slash {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// HMAC-SHA256 devolviendo los 32 bytes CRUDOS del digest, no su hex --
+/// `crypto.hmacSha256` (GRAMMAR.md §3.38) siempre devuelve `String`
+/// (hex), lo que alcanza para verificar la firma de un webhook pero NO
+/// para encadenar HMACs usando el resultado de uno como clave del
+/// siguiente (AWS Signature V4 necesita exactamente eso -- ver
+/// `awsS3PresignedUrl` más abajo). Esta función es privada al runtime,
+/// nunca expuesta directo a un programa c-script -- ahí es donde
+/// mantener la distinción "bytes crudos vs. hex" importa; el lenguaje en
+/// sí sigue sin un tipo de bytes crudos, a propósito (GRAMMAR.md §2, "sin
+/// tipo Bytes -- todo lo binario entra/sale como String codificado").
+fn hmac_sha256_raw(key: &[u8], data: &[u8]) -> Result<Vec<u8>, RuntimeError> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| err(format!("clave HMAC inválida: {e}")))?;
+    mac.update(data);
+    Ok(mac.finalize().into_bytes().to_vec())
+}
+
 /// Comparación que no corta en el primer byte distinto: dos secretos se comparan
 /// en tiempo constante para no filtrar, vía la duración, cuánto del valor
 /// esperado adivinó quien está probando.
@@ -1597,6 +1640,57 @@ fn call_method(
                 mac.update(message.as_bytes());
                 let hex_str: String = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
                 Ok(Value::Str(hex_str))
+            }
+            "awsS3PresignedUrl" => {
+                let (access_key_id, secret_access_key, region, bucket, object_key, expires_seconds) =
+                    match (args.first(), args.get(1), args.get(2), args.get(3), args.get(4), args.get(5)) {
+                        (Some(Value::Str(a)), Some(Value::Str(s)), Some(Value::Str(r)), Some(Value::Str(b)), Some(Value::Str(k)), Some(Value::Int(e))) => (a, s, r, b, k, *e),
+                        _ => {
+                            return Err(err(
+                                "crypto.awsS3PresignedUrl requiere (accessKeyId: String, secretAccessKey: String, region: String, bucket: String, objectKey: String, expiresSeconds: Int)",
+                            ))
+                        }
+                    };
+                if !(1..=604_800).contains(&expires_seconds) {
+                    return Err(err(format!(
+                        "crypto.awsS3PresignedUrl: 'expiresSeconds' tiene que estar entre 1 y 604800 (7 días, el máximo que AWS acepta con credenciales de larga duración), se recibió {expires_seconds}"
+                    )));
+                }
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let (date_stamp, amz_date) = timestamp::format_aws_sigv4_datetime(now_ms);
+                let host = format!("{bucket}.s3.{region}.amazonaws.com");
+                let canonical_uri = format!("/{}", aws_uri_encode(object_key, false));
+                let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
+                let credential = format!("{access_key_id}/{credential_scope}");
+                // Orden ALFABÉTICO por nombre de parámetro -- ya lo están tal
+                // cual se arman acá, así que no hace falta un sort explícito
+                // (ver el test que confirma esto contra el vector oficial de
+                // AWS con dos valores del MISMO nombre, donde si importa).
+                let canonical_query_string = format!(
+                    "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={amz_date}&X-Amz-Expires={expires_seconds}&X-Amz-SignedHeaders=host",
+                    aws_uri_encode(&credential, true),
+                );
+                let canonical_headers = format!("host:{host}\n");
+                let canonical_request = format!("GET\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD");
+                use sha2::{Digest, Sha256};
+                let hashed_canonical_request: String =
+                    Sha256::digest(canonical_request.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+                let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashed_canonical_request}");
+                // Derivación de la clave de firma: 4 HMAC-SHA256 encadenados
+                // donde el resultado CRUDO (bytes, no su hex) de cada paso es
+                // la clave del siguiente -- GRAMMAR.md §3.110 explica por qué
+                // `crypto.hmacSha256` (String -> String) no alcanza para esto:
+                // no hay forma de volver a meter sus bytes crudos como clave.
+                let k_date = hmac_sha256_raw(format!("AWS4{secret_access_key}").as_bytes(), date_stamp.as_bytes())?;
+                let k_region = hmac_sha256_raw(&k_date, region.as_bytes())?;
+                let k_service = hmac_sha256_raw(&k_region, b"s3")?;
+                let k_signing = hmac_sha256_raw(&k_service, b"aws4_request")?;
+                let signature: String =
+                    hmac_sha256_raw(&k_signing, string_to_sign.as_bytes())?.iter().map(|b| format!("{b:02x}")).collect();
+                Ok(Value::Str(format!("https://{host}{canonical_uri}?{canonical_query_string}&X-Amz-Signature={signature}")))
             }
             "randomToken" => {
                 let length = match args.first() {
@@ -3809,6 +3903,118 @@ mod tests {
         let id = created["id"].as_i64().unwrap();
         let fetched = invoke_rpc(&program, "S", "get", &json!({"id": id}), &db).unwrap();
         assert_eq!(fetched["token"], json!(token), "el mismo uuid vuelve identico al leerlo de la base");
+    }
+
+    // ---- `crypto.awsS3PresignedUrl` (GRAMMAR.md §3.110) ----
+
+    /// El vector de prueba OFICIAL de AWS ("get-vanilla", del
+    /// `aws4_testsuite` publicado por Amazon, obtenido de un mirror en
+    /// GitHub -- accessKeyId `AKIDEXAMPLE`, secretAccessKey
+    /// `wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY`, fecha `2011-09-09
+    /// 23:36:00 GMT`, región `us-east-1`, "servicio" `host`), NO contra un
+    /// número inventado -- mismo estándar que `crypto.hmacSha256` (§3.38,
+    /// verificado contra un vector de Python). Reconstruye a mano la
+    /// derivación de clave + firma final de ESE caso exacto usando
+    /// `hmac_sha256_raw` (la pieza nueva, encadenar HMACs con los bytes
+    /// CRUDOS del paso anterior como clave del siguiente) y confirma que
+    /// el resultado es BYTE A BYTE el que AWS publica. Esta es la parte
+    /// más propensa a error de todo `awsS3PresignedUrl` -- si esto está
+    /// mal, la URL generada es indistinguible de una bien formada hasta
+    /// que S3 la rechaza con 403 en producción.
+    #[test]
+    fn hmac_sha256_raw_chain_reproduces_the_official_aws_sigv4_test_vector() {
+        let secret_access_key = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+        let date_stamp = "20110909";
+        let region = "us-east-1";
+        let service = "host";
+        let string_to_sign = "AWS4-HMAC-SHA256\n\
+             20110909T233600Z\n\
+             20110909/us-east-1/host/aws4_request\n\
+             366b91fb121d72a00f46bbe8d395f53a102b06dfb7e79636515208ed3fa606b1";
+
+        let k_date = hmac_sha256_raw(format!("AWS4{secret_access_key}").as_bytes(), date_stamp.as_bytes()).unwrap();
+        let k_region = hmac_sha256_raw(&k_date, region.as_bytes()).unwrap();
+        let k_service = hmac_sha256_raw(&k_region, service.as_bytes()).unwrap();
+        let k_signing = hmac_sha256_raw(&k_service, b"aws4_request").unwrap();
+        let signature: String = hmac_sha256_raw(&k_signing, string_to_sign.as_bytes()).unwrap().iter().map(|b| format!("{b:02x}")).collect();
+
+        assert_eq!(signature, "b27ccfbfa7df52a200ff74193ca6e32d4b48b8856fab7ebf1c595d0670a7e470", "no matchea el vector oficial de AWS (get-vanilla)");
+    }
+
+    /// `aws_uri_encode`: los caracteres "sin reservar" (`A-Za-z0-9-._~`)
+    /// pasan tal cual -- confirmado contra el string EXACTO del vector
+    /// oficial `get-vanilla-query-unreserved` del `aws4_testsuite` de AWS,
+    /// que existe justamente para fijar cuáles caracteres NO se codifican.
+    /// El resto de los casos (espacio, `/` con y sin `encode_slash`, un
+    /// caracter reservado cualquiera) verifican la regla escrita de la
+    /// documentación de AWS (%XX en hex MAYÚSCULA) donde no hay un vector
+    /// público más específico para citar.
+    #[test]
+    fn aws_uri_encode_matches_the_official_aws_unreserved_character_vector() {
+        let unreserved = "-._~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        assert_eq!(aws_uri_encode(unreserved, true), unreserved);
+        assert_eq!(aws_uri_encode(unreserved, false), unreserved);
+
+        assert_eq!(aws_uri_encode("a b", true), "a%20b");
+        assert_eq!(aws_uri_encode("a/b", true), "a%2Fb", "en un valor de query, '/' SÍ se codifica");
+        assert_eq!(aws_uri_encode("a/b", false), "a/b", "en el path del objeto, '/' se preserva");
+        assert_eq!(aws_uri_encode("AKIDEXAMPLE/20110909/us-east-1/host/aws4_request", true), "AKIDEXAMPLE%2F20110909%2Fus-east-1%2Fhost%2Faws4_request");
+    }
+
+    /// El builtin completo, de punta a punta contra un servidor real -- el
+    /// timestamp que arma internamente (`SystemTime::now()`) hace que un
+    /// match byte a byte contra un vector fijo sea imposible (no hay forma
+    /// de inyectar el reloj), así que esto verifica la ESTRUCTURA exacta
+    /// que AWS exige: host virtual-hosted-style, los cinco parámetros
+    /// `X-Amz-*` (en el orden alfabético que S3 espera), y una firma final
+    /// de 64 caracteres hexadecimales. El caso real que lo motiva:
+    /// `DocumentStorageService` de un adoptador tenía una firma FALSA
+    /// (`?signature=hmac_verified`, un literal) porque `crypto.hmacSha256`
+    /// (String -> String) no alcanza para el encadenado de bytes crudos
+    /// que SigV4 exige -- ver GRAMMAR.md §3.110.
+    #[test]
+    fn aws_s3_presigned_url_has_the_exact_shape_s3_requires() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc share() -> String {
+                    crypto.awsS3PresignedUrl("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "us-east-1", "mi-bucket", "facturas/2026/factura-42.pdf", 3600)
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let url = invoke_rpc(&program, "Docs", "share", &json!({}), &db).unwrap();
+        let url = url.as_str().unwrap();
+
+        assert!(url.starts_with("https://mi-bucket.s3.us-east-1.amazonaws.com/facturas/2026/factura-42.pdf?"), "{url}");
+        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "{url}");
+        assert!(url.contains("X-Amz-Credential=AKIDEXAMPLE%2F"), "{url}");
+        assert!(url.contains("X-Amz-Date="), "{url}");
+        assert!(url.contains("X-Amz-Expires=3600"), "{url}");
+        assert!(url.contains("X-Amz-SignedHeaders=host"), "{url}");
+        let sig = url.split("X-Amz-Signature=").nth(1).expect("la URL tiene que terminar con la firma");
+        assert_eq!(sig.len(), 64, "la firma es un SHA-256 en hex: {sig}");
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "hex en minúscula: {sig}");
+    }
+
+    #[test]
+    fn aws_s3_presigned_url_rejects_an_out_of_range_expiry() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc share(seconds: Int) -> String {
+                    crypto.awsS3PresignedUrl("AKID", "secret", "us-east-1", "b", "k", seconds)
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        for bad in [0, -1, 604_801] {
+            invoke_rpc(&program, "Docs", "share", &json!({"seconds": bad}), &db).expect_err(&format!("{bad} segundos debería rechazarse"));
+        }
+        // El máximo permitido (7 días) SÍ funciona.
+        assert!(invoke_rpc(&program, "Docs", "share", &json!({"seconds": 604_800}), &db).is_ok());
     }
 
     // ---- `@validate(...)` (GRAMMAR.md §3.73) ----

@@ -3214,6 +3214,20 @@ impl Checker {
                 self.check_expr(message, &Type::String, env)?;
                 Some(Type::String)
             }
+            (Type::Crypto, "awsS3PresignedUrl") => {
+                let [access_key_id, secret_access_key, region, bucket, object_key, expires_seconds] = args else {
+                    return Err(err(
+                        "'crypto.awsS3PresignedUrl' toma exactamente 6 argumentos (accessKeyId: String, secretAccessKey: String, region: String, bucket: String, objectKey: String, expiresSeconds: Int)",
+                    ));
+                };
+                self.check_expr(access_key_id, &Type::String, env)?;
+                self.check_expr(secret_access_key, &Type::String, env)?;
+                self.check_expr(region, &Type::String, env)?;
+                self.check_expr(bucket, &Type::String, env)?;
+                self.check_expr(object_key, &Type::String, env)?;
+                self.check_expr(expires_seconds, &Type::Int, env)?;
+                Some(Type::String)
+            }
             (Type::Crypto, "randomToken") => {
                 let [length] = args else {
                     return Err(err("'crypto.randomToken' toma exactamente 1 argumento (length: Int)"));
@@ -5572,6 +5586,34 @@ type T = { id: Int, s: Status }")
             fn f() -> Uuid { crypto.uuid() }
         "#;
         assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn aws_s3_presigned_url_takes_five_strings_and_an_int_and_returns_string() {
+        let src = r#"
+            fn f() -> String {
+                crypto.awsS3PresignedUrl("AKID", "secret", "us-east-1", "bucket", "key.pdf", 3600)
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn aws_s3_presigned_url_rejects_the_wrong_number_of_arguments() {
+        let src = r#"
+            fn f() -> String { crypto.awsS3PresignedUrl("AKID", "secret") }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn aws_s3_presigned_url_rejects_expires_seconds_as_a_string() {
+        let src = r#"
+            fn f() -> String {
+                crypto.awsS3PresignedUrl("AKID", "secret", "us-east-1", "bucket", "key.pdf", "3600")
+            }
+        "#;
+        assert!(check_source(src).is_err());
     }
 
     #[test]

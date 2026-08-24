@@ -131,6 +131,7 @@
   - [3.107 `linkc serve-all --port-map-out <archivo.json>` — RESUELTO](#3107-linkc-serve-all---port-map-out-archivojson--resuelto)
   - [3.108 `countWhere`/`findWhere` empujan a SQL `!=`/`<`/`<=`/`>`/`>=` — RESUELTO, alcance acotado](#3108-countwherefindwhere-empujan-a-sql--------resuelto-alcance-acotado)
   - [3.109 `countWhere`/`findWhere` empujan una conjunción `&&` de varias hojas — RESUELTO, alcance acotado](#3109-countwherefindwhere-empujan-una-conjunción--de-varias-hojas--resuelto-alcance-acotado)
+  - [3.110 `crypto.awsS3PresignedUrl(...)`: URLs firmadas reales para Amazon S3 — RESUELTO, alcance acotado](#3110-cryptoawss3presignedurl-urls-firmadas-reales-para-amazon-s3--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4815,6 +4816,46 @@ rpc unreadFor(userId: Int) -> Int {
 **Alcance deliberado, igual que §3.108: solo `&&`, `||` sigue sin pushear.** Los dos casos reales citados arriba son conjunciones PURAS -- ninguno de los reportes de adopción cita un `||` de alta frecuencia todavía. `||` necesitaría una cláusula `OR` separada en el SQL generado (`(a AND b) OR (c AND d)`, en general), una forma bastante más rica que agregar hojas a una lista plana -- queda explícitamente para una ronda dedicada si aparece evidencia real. Una comparación entre DOS campos del propio parámetro (`endDate > startDate`) tampoco está cubierta -- mismo motivo de siempre (sin forma de expresar "columna vs. columna" en el valor bindeado). `deleteWhere` sigue sin ganar ESTE atajo tampoco (mismo motivo de §3.95: publicar cada fila borrada a `stream` complica un `DELETE ... WHERE` de una sola sentencia).
 
 **Verificado**: 1 test nuevo en `runtime/mod.rs` contra un SQLite en memoria real cubriendo los dos casos reales de CRM (`&&` con `!campo`, y `&&` con el MISMO campo dos veces) más las dos hojas booleanas sueltas (`x.campo`/`!x.campo` sin `&&`) + 1 en `pg_integration.rs` contra un PostgreSQL real con el caso exacto de `notifications.link`, confirmando que el `AND` con dos placeholders posicionales (`$1`/`$2`) bindea en el orden correcto. El test existente que usaba un `&&` compuesto como ejemplo de predicado NO pusheable (agregado en §3.108 para reemplazar el ejemplo de un solo operador, que ese mismo cambio volvió pusheable) se corrigió otra vez, ahora a un `||` -- el mismo patrón exacto que motivó la nota de §3.108 de arriba, un recordatorio de que "el ejemplo de lo no soportado" necesita revisarse cada vez que el alcance soportado crece.
+
+---
+
+### 3.110 `crypto.awsS3PresignedUrl(...)`: URLs firmadas reales para Amazon S3 — RESUELTO, alcance acotado
+
+Gap NUEVO (24/08/2026), reportado por un adoptador real ("MyFinance"): `DocumentStorageService` necesitaba generar una URL firmada para compartir/descargar un documento desde S3, y terminó con una firma FALSA -- `?signature=hmac_verified`, un string LITERAL, no un HMAC de verdad -- porque `crypto.hmacSha256` (§3.38) no alcanzaba. El motivo no era negligencia: es una limitación real y verificable del primitivo existente. AWS Signature Version 4 deriva su clave de firma encadenando CUATRO HMAC-SHA256, donde el resultado CRUDO (los 32 bytes del digest) de cada paso es la CLAVE del siguiente:
+
+```
+kDate    = HMAC-SHA256("AWS4" + secretAccessKey, dateStamp)
+kRegion  = HMAC-SHA256(kDate,   region)
+kService = HMAC-SHA256(kRegion, "s3")
+kSigning = HMAC-SHA256(kService, "aws4_request")
+firma    = Hex(HMAC-SHA256(kSigning, stringToSign))
+```
+
+`crypto.hmacSha256(secret: String, message: String) -> String` siempre toma y devuelve `String` -- su salida es la representación HEX del digest, no los bytes. Pasar esa hex de vuelta como `secret` del siguiente paso firma con la clave EQUIVOCADA (los bytes UTF-8 del texto hexadecimal, no los 32 bytes reales que representa) y produce una firma que no es la que AWS calcula. No hay forma de rodear esto desde c-script: el lenguaje no tiene (a propósito) un tipo de bytes crudos -- así que el encadenado tiene que resolverse DENTRO del runtime, en Rust, antes de que el resultado cruce a un `Value::Str`.
+
+```
+type Factura = { id: Int, s3Key: String }
+
+rpc urlDeDescarga(f: Factura) -> String {
+  crypto.awsS3PresignedUrl(
+    env.get("AWS_ACCESS_KEY_ID"), env.get("AWS_SECRET_ACCESS_KEY"),
+    "eu-west-1", "mis-facturas", f.s3Key, 3600
+  )
+}
+```
+
+**`crypto.awsS3PresignedUrl(accessKeyId: String, secretAccessKey: String, region: String, bucket: String, objectKey: String, expiresSeconds: Int) -> String`** arma la URL COMPLETA lista para usar (`https://<bucket>.s3.<region>.amazonaws.com/<objectKey>?X-Amz-Algorithm=...&...&X-Amz-Signature=...`), no solo la firma -- a diferencia de exponer un primitivo de firma genérico (que hubiera dejado en manos del `.link` de cada adoptador la construcción del "canonical request" y el URI-encoding EXACTO que AWS exige, la misma clase de trabajo fino y propenso a error que llevó a MyFinance a dejar un placeholder en primer lugar), esta función resuelve el protocolo COMPLETO adentro del runtime. `expiresSeconds` fuera de `1..=604800` (7 días, el máximo que AWS acepta con credenciales de larga duración) es un error de runtime limpio, nunca una URL con una expiración inválida.
+
+**Alcance deliberado de esta ronda:**
+
+- **Solo `GET` (compartir/descargar), no `PUT`/subir.** El caso real reportado es "generar un link de descarga" -- una URL presignada para SUBIR necesita, además, que el cliente mande el `Content-Type`/tamaño exactos que la firma prevé, un contrato más amplio entre quien genera la URL y quien la usa que el caso de descarga no tiene. Queda para una ronda dedicada si aparece evidencia real de demanda.
+- **Solo credenciales de larga duración (access key + secret key), sin `X-Amz-Security-Token`.** Credenciales temporales de AWS STS no están cubiertas.
+- **Estilo "virtual-hosted" (`bucket.s3.region.amazonaws.com`) siempre**, nunca el estilo de path (`s3.region.amazonaws.com/bucket`). Un nombre de bucket con puntos (que rompe el certificado TLS wildcard del estilo virtual-hosted) no tiene manejo especial -- caveat conocido y documentado de AWS, no algo que esta función intente resolver.
+- **Sin llamar a AWS para nada.** Es una función PURA -- ninguna request sale del proceso. Verificar que el resultado funciona de verdad contra un bucket real (permisos, que el objeto exista, que la cuenta esté bien configurada) sigue siendo responsabilidad de quien la usa; c-script no puede confirmar eso sin credenciales reales de AWS, que esta ronda no tenía disponibles.
+
+**Verificado sin necesitar una cuenta de AWS real -- contra el vector de prueba OFICIAL que Amazon publica** (`aws4_testsuite`, el mismo estándar que ya se usó para `crypto.hmacSha256` en §3.38, verificado ahí contra un vector de Python en vez de una cuenta de Stripe real): la derivación de clave + firma final reproduce BYTE A BYTE el resultado publicado para el caso "get-vanilla" (`accessKeyId=AKIDEXAMPLE`, fecha `2011-09-09 23:36:00 GMT`, región `us-east-1`) -- `b27ccfbfa7df52a200ff74193ca6e32d4b48b8856fab7ebf1c595d0670a7e470`. El formateo de fecha (`YYYYMMDD`/`YYYYMMDDTHHMMSSZ`) se confirmó contra ese mismo caso y contra la fecha del ejemplo oficial de "URL presignada de GET Object" de la documentación de AWS (`2013-05-24T00:00:00Z`). El URI-encoding (`aws_uri_encode`) se confirmó contra el vector oficial `get-vanilla-query-unreserved` (qué caracteres NO se codifican) más los casos de `/` codificado/preservado según haga falta (valor de query vs. componente de path). El builtin completo, de punta a punta vía un servidor real, se probó por ESTRUCTURA (host virtual-hosted-style, los cinco parámetros `X-Amz-*` en el orden que S3 espera, una firma de 64 caracteres hex) en vez de por match exacto de string -- el timestamp interno (`SystemTime::now()`) hace que un match byte a byte contra un vector fijo sea imposible sin inyección de reloj, que este runtime no tiene. 5 tests nuevos en `runtime/mod.rs` + `checker.rs` + `runtime/timestamp.rs` en total.
+
+**Nota de proceso.** El primer intento de resolver este reporte fue sugerirle al adoptador que armara la firma "a mano" con `crypto.hmacSha256` -- una recomendación que resultó ser INCORRECTA al verificarla (exactamente el motivo por el que no alcanza, explicado arriba). El error se detectó antes de comunicarlo como solución final, pero es la razón por la que esta sección existe como una función nueva del compilador en vez de quedar como "ya se puede hacer con lo que existe".
 
 ---
 
