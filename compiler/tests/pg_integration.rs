@@ -238,6 +238,19 @@ impl Serve {
     /// Postgres falla -- un 5xx con `{"error": "..."}"`, no un timeout ni
     /// una conexión rechazada -- así que `Err` acá es "el status no fue
     /// 2xx", con el mensaje de error del body si lo trae.
+    /// `GET /health` (GRAMMAR.md §3.87) -- devuelve (status, body JSON) sin
+    /// panickear sobre un 503, a diferencia de `rpc`: el test de health
+    /// check necesita ver ESE status para probar el punto entero de la
+    /// feature.
+    fn health(&self) -> (u16, serde_json::Value) {
+        let (status, text) = match ureq::get(&format!("http://127.0.0.1:{}/health", self.port)).call() {
+            Ok(r) => (r.status(), r.into_string().expect("leer el body")),
+            Err(ureq::Error::Status(status, r)) => (status, r.into_string().unwrap_or_default()),
+            Err(e) => panic!("/health falló de red: {e}"),
+        };
+        (status, serde_json::from_str(&text).unwrap_or_else(|e| panic!("/health no devolvió JSON ({e}): {text}")))
+    }
+
     fn try_rpc(&self, method: &str, body: &str) -> Result<serde_json::Value, String> {
         let request = ureq::post(&format!("http://127.0.0.1:{}/{method}", self.port))
             .set("Content-Type", "application/json")
@@ -959,6 +972,74 @@ fn a_dropped_connection_self_heals_without_a_process_restart() {
     let emails: Vec<&str> = all.as_array().expect("list debe devolver un array").iter().map(|l| l["email"].as_str().unwrap()).collect();
     assert!(emails.contains(&"before@example.com"), "la fila de antes del corte debe seguir ahí: {emails:?}");
     assert!(emails.contains(&"after@example.com"), "la fila de después de reconectar debe estar: {emails:?}");
+}
+
+// GRAMMAR.md §3.87: `/health` hace un `SELECT 1` real contra la base, en vez
+// de un 200 fijo sin importar nada -- reusa exactamente la misma técnica que
+// `a_dropped_connection_self_heals_without_a_process_restart` (arriba) para
+// cortar la conexión de verdad con `pg_terminate_backend`.
+
+#[test]
+fn health_check_reports_503_while_postgres_is_down_and_recovers_on_its_own() {
+    const COLLECTION: &str = "leads_health";
+    const APP_NAME: &str = "linkc_health_test";
+    let Some(base_url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&base_url, COLLECTION);
+
+    let url = with_query_param(&base_url, &format!("application_name={APP_NAME}"));
+    let temp = TempDir::new("health");
+    let src = temp.program(COLLECTION);
+    let server = Serve::start(&src, &url);
+
+    // Sana antes de tocar nada.
+    let (status, body) = server.health();
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["database"], "ok");
+
+    // Cortar la conexión del SERVIDOR (identificada por application_name),
+    // desde una conexión administrativa aparte -- mismo mecanismo exacto
+    // que el test de reconexión.
+    let mut admin = postgres::Client::connect(&base_url, postgres::NoTls).expect("conectar como admin");
+    let terminated = admin
+        .execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE application_name = $1 AND pid <> pg_backend_pid()",
+            &[&APP_NAME],
+        )
+        .expect("ejecutar pg_terminate_backend");
+    assert!(terminated > 0, "no se encontró la conexión del servidor por application_name");
+
+    // La PRIMERA request tras el corte todavía ve la conexión rota --
+    // `with_reconnect` la reemplaza DESPUÉS de fallar, no antes -- así que
+    // /health tiene que reportar 503 al menos una vez antes de recuperarse.
+    // No se asume que sea EXACTAMENTE la primera (carrera real con cuándo
+    // el cliente interno nota el corte), mismo criterio que el test de
+    // reconexión: se prueba la propiedad, no el timing exacto.
+    let mut saw_503 = false;
+    let mut recovered = false;
+    for _ in 0..100 {
+        let (status, body) = server.health();
+        if status == 503 {
+            saw_503 = true;
+            assert_eq!(body["status"], "error", "body: {body:?}");
+            assert_ne!(body["database"], "ok", "body: {body:?}");
+        } else if saw_503 && status == 200 {
+            recovered = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(saw_503, "/health nunca reportó la caída -- ¿se está devolviendo 200 fijo de nuevo?");
+    assert!(recovered, "/health debería recuperarse solo, sin reiniciar el proceso");
+
+    let (status, body) = server.health();
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body["database"], "ok");
 }
 
 // GRAMMAR.md §3.44: LISTEN/NOTIFY entre DOS instancias de `linkc serve`

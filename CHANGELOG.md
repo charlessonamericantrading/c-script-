@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.52.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`/health` verifica conectividad real a la base.** Hasta esta ronda `/health` (`/`/`/status`, mismo handler) devolvía `200 {"status":"ok",...}` fijo sin tocar la base para nada -- inútil para cualquier orquestador (Kubernetes, un load balancer) que lo usa para decidir si reiniciar el proceso o sacarlo de rotación: el proceso podía estar vivo y sin embargo incapaz de servir ningún rpc real porque la base estaba caída, y `/health` igual reportaba todo bien. `Db::health_check()` (nuevo) ejecuta un `SELECT 1` real en CADA request a `/health`, sin caché -- `200` si respondió, `503 Service Unavailable` si no, con `"status":"error"` y el mensaje real en un nuevo campo `"database"` del body. Del lado Postgres, el chequeo pasa por el mismo `with_reconnect` que cualquier otra query real -- una caída transitoria se autorepara ahí mismo, así que `/health` no solo reporta el estado, también participa de la reconexión automática.
+
+811 tests (3 nuevos): 2 en `cli_health.rs` contra un servidor SQLite real (forma exacta del JSON en el camino feliz, listando los servicios declarados de verdad; `/`, `/health`, `/status` devuelven exactamente lo mismo) y 1 en `pg_integration.rs` (reusando la técnica de `pg_terminate_backend` del test de reconexión existente): `/health` pasa de 200/"ok" a 503/"error" mientras la conexión está cortada, y vuelve solo a 200 sin reiniciar el proceso. Detalle completo: GRAMMAR.md §3.87.
+
 ## [1.51.0] - 2026-08-24
 
 ### 🔒 Seguridad

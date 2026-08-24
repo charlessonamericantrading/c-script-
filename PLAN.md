@@ -428,10 +428,11 @@ Con las Fases 0 a 3 completadas y el núcleo v1.28.0 plenamente operativo, las s
 
 ### 9.8 Observabilidad
 1. **Logging estructurado en JSON** (`--log-format json`) + **nivel de log configurable** (`--log-level warn|info|debug`) -- hoy cada request exitosa deja una línea, ruidoso en producción con tráfico real.
-2. **Métricas Prometheus nativas en `/metrics`**: latencia por rpc, conexiones activas, tamaño de la base -- confirmado, no existe hoy ningún `/metrics`, solo un `/health` fijo.
-3. **Health check configurable**: verificar conectividad real a la base (y a servicios externos declarados), no un 200 fijo.
-4. **Métrica de clientes conectados a un `stream`**: para depurar streaming sin instrumentación externa.
-5. **Métrica de latencia de propagación NOTIFY + cola de reintento acotada**: hoy es best-effort puro y un evento de más de 8000 bytes no llega a otras instancias sin ningún aviso visible.
+2. **Métricas Prometheus nativas en `/metrics`**: latencia por rpc, conexiones activas, tamaño de la base -- confirmado, no existe hoy ningún `/metrics`.
+3. **Métrica de clientes conectados a un `stream`**: para depurar streaming sin instrumentación externa.
+4. **Métrica de latencia de propagación NOTIFY + cola de reintento acotada**: hoy es best-effort puro y un evento de más de 8000 bytes no llega a otras instancias sin ningún aviso visible.
+
+**Hecho** (24/08/2026): **Health check real** (originalmente el ítem 3 de esta lista): `/health` (`/`/`/status`, mismo handler) devolvía `200` FIJO sin tocar la base para nada -- inútil para cualquier orquestador que lo usa para decidir si reiniciar el proceso. `Db::health_check()` ejecuta un `SELECT 1` real en CADA request a `/health`, sin caché -- `200`/`"status":"ok"` si respondió, `503`/`"status":"error"` si no, con el mensaje real en `"database"`. Del lado Postgres pasa por el MISMO `with_reconnect` (§3.40) que cualquier otra query -- una caída transitoria se autorepara ahí mismo. Alcance de esta ronda: solo la base, no "servicios externos declarados" -- c-script no tiene hoy ningún concepto declarativo de dependencias externas, así que esa mitad del ítem original queda pendiente de esa pieza previa. Ver v1.52.0, GRAMMAR.md §3.87.
 
 ### 9.9 Diferido -- ya trackeado en §8, prioridad menor que 9.1–9.8
 Por pedido explícito, lo que ya estaba en la hoja de ruta antes de estos dos reportes pasa a continuación de todo lo de arriba, no porque sea menos importante en términos absolutos, sino porque los dos reportes de adopción real no lo señalan como más urgente que lo nuevo: **§8.1.2** (playground multi-archivo), **§8.2.1** (agregación con truncamiento de fecha -- reforzado por peticiones#49), **§8.2.2** (`db.<c>.filter` pushdown -- ahora incluye también `findWhere`/`deleteWhere`, ver §9.3.4), **§8.2.3** (transacciones), **§8.3.1** (limpieza proactiva de sesiones), **§8.3.2** (rate limiting distribuido -- la mitad de estado compartido/Redis; la mitad de `X-Forwarded-For` se adelantó a §9.5.1 por ser más simple y más citada), **§8.3.3** (smtp asíncrono), **§8.4.1** (carga completa de `User` en sesión), **§8.5.1** (módulo `storage`/S3).

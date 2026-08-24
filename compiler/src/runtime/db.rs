@@ -1017,6 +1017,19 @@ db { users: User[] }
         self.backend.is_postgres()
     }
 
+    /// `/health` (GRAMMAR.md §3.87): un `SELECT 1` real contra la base --
+    /// `Ok(())` si respondió, `Err(mensaje)` si no. `execute_ddl` (no
+    /// `query`) porque no hace falta decodificar ninguna fila de vuelta,
+    /// solo confirmar que la conexión responde -- y del lado Postgres ya
+    /// pasa por `with_reconnect` (GRAMMAR.md §3.40), así que una caída
+    /// transitoria se autorepara ACÁ MISMO antes de reportar error, igual
+    /// que cualquier otra query real. Sin caché: cada request a `/health`
+    /// hace su propio chequeo -- barato (un `SELECT 1`), y un health check
+    /// que devuelve un resultado viejo no sirve para nada.
+    pub fn health_check(&self) -> Result<(), String> {
+        self.backend.execute_ddl("SELECT 1")
+    }
+
     /// Ver la doc de `Db::current_request` (arriba). Llamado por
     /// `server.rs` una vez por request, justo antes de invocar el rpc.
     pub(crate) fn set_request_context(&self, ctx: RequestContext) {

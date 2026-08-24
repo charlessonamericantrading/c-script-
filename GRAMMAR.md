@@ -108,6 +108,7 @@
   - [3.84 `auth.destroyAllSessions(userId)`: revocar todas las sesiones de un usuario — RESUELTO](#384-authdestroyallsessionsuserid-revocar-todas-las-sesiones-de-un-usuario--resuelto)
   - [3.85 `--max-body-bytes <N>`: límite de tamaño del body de una request — RESUELTO](#385---max-body-bytes-n-límite-de-tamaño-del-body-de-una-request--resuelto)
   - [3.86 `--http-timeout <duración>`: timeout de llamadas salientes `http.*` — RESUELTO](#386---http-timeout-duración-timeout-de-llamadas-salientes-http--resuelto)
+  - [3.87 `/health` verifica conectividad real a la base — RESUELTO](#387-health-verifica-conectividad-real-a-la-base--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4151,6 +4152,36 @@ LINK_HTTP_TIMEOUT=10s linkc serve app.link 8787   # equivalente
 - **Es un límite de PROCESO, no por rpc ni por URL.** Un `rpc` que necesita hablar con un servicio genuinamente lento (y otro que necesita fallar rápido) comparten el mismo timeout.
 
 **Verificado**: `cli_http.rs` con el binario real como subproceso (3 tests nuevos, sobre 7 que ya existían) -- una request a un servidor que ACEPTA la conexión pero nunca escribe nada corta cerca del `--http-timeout` configurado (medido con un `Instant` real, nunca cerca de los 60s que el servidor de mentira se queda callado), la variable de entorno funciona igual, y `--http-timeout` con una duración inválida es un error de uso limpio sin panic.
+
+---
+
+### 3.87 `/health` verifica conectividad real a la base — RESUELTO
+
+Hasta esta ronda, `/health` (`/`/`/status` son el mismo handler) devolvía `200 {"status":"ok",...}` FIJO, sin tocar la base para nada -- confirmado leyendo `runtime/server.rs`. Inútil para cualquier orquestador (Kubernetes, un load balancer, `systemd` con un healthcheck) que lo usa para decidir si reiniciar el proceso o sacarlo de rotación: el proceso podía estar vivo (aceptando conexiones TCP) y sin embargo incapaz de servir NINGÚN rpc real porque la base estaba caída, y `/health` igual reportaba todo bien.
+
+<!-- linkc:check -->
+```rust
+type Item = { id: Int, name: String }
+db { items: Item[] }
+
+service Items {
+  rpc list() -> Item[] { db.items.all() }
+}
+```
+
+```bash
+curl -s localhost:8787/health
+# {"status":"ok","engine":"c-script","version":"1.52.0","services":["Items"],"database":"ok"}
+```
+
+**`db.health_check()` (nuevo en `Db`) ejecuta un `SELECT 1` real contra la base en CADA request a `/health` -- sin caché: un health check que devuelve un resultado viejo no sirve para nada.** `Ok(())` → `200`, `Err(mensaje)` → `503 Service Unavailable`, con `"status": "error"` y `"database": "<mensaje>"` en el body. Del lado Postgres, el chequeo pasa por el MISMO `with_reconnect` (GRAMMAR.md §3.40) que cualquier otra query real -- una caída transitoria se autorepara ahí mismo, así que `/health` no solo reporta el estado, también participa de la reconexión automática.
+
+**Límites honestos:**
+- **Solo la BASE, no "servicios externos declarados".** c-script no tiene hoy ningún concepto declarativo de "este programa depende de esta API externa" -- `http.*`/`smtp.*` son llamadas libres desde cualquier cuerpo de rpc, no una dependencia que el checker conozca de antemano. Extender `/health` a eso necesitaría esa pieza primero.
+- **Sin forma de saltear el chequeo.** No hay un flag para volver al `200` fijo de siempre -- se consideró innecesario: un `SELECT 1` es barato, y un health check que puede mentir por configuración no es lo que nadie quiere de default.
+- **Un solo `SELECT 1`, no una verificación de que CADA colección declarada sea alcanzable.** Una base conectada pero con una tabla específica corrupta (fuera del control de este runtime) no se detecta acá -- eso ya fallaría en la primera lectura real de esa colección, con el error normal de esa request.
+
+**Verificado**: `cli_health.rs` con el binario real como subproceso contra SQLite (2 tests) -- forma exacta del JSON (`status`/`engine`/`version`/`database`/`services`, listando los servicios declarados de verdad) en el camino feliz, y que `/`, `/health`, `/status` devuelven exactamente lo mismo. El camino de FALLA real se prueba en `pg_integration.rs` (reusando la misma técnica de `pg_terminate_backend` que el test de reconexión, GRAMMAR.md §3.40, solo contra un PostgreSQL real): `/health` pasa de `200`/`"ok"` a `503`/`"error"` mientras la conexión está cortada, y vuelve solo a `200` sin reiniciar el proceso -- sin necesitar ayuda humana, mismo criterio de auto-reparación que el resto de las queries.
 
 ---
 

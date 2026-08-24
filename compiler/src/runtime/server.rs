@@ -343,18 +343,27 @@ fn handle_request(
                 _ => None,
             })
             .collect();
+        // GRAMMAR.md §3.87: `SELECT 1` real contra la base -- hasta esta
+        // ronda `/health` devolvía 200 fijo sin importar si la base
+        // respondía o no, inútil para cualquier orquestador que lo usa para
+        // decidir si reiniciar el proceso o sacarlo de un load balancer.
+        let (status, db_status) = match db.health_check() {
+            Ok(()) => (200, serde_json::json!("ok")),
+            Err(e) => (503, serde_json::json!(e)),
+        };
         let health_json = serde_json::json!({
-            "status": "ok",
+            "status": if status == 200 { "ok" } else { "error" },
             "engine": "c-script",
             // Del Cargo.toml, no escrita a mano: la versión que reporta el
             // servidor tiene que ser la del binario que está corriendo, y
             // una constante suelta se queda vieja en el primer release.
-            "version": env!("CARGO_PKG_VERSION"),
-            "services": services
+            "version": crate::VERSION,
+            "services": services,
+            "database": db_status,
         })
         .to_string();
-        let _ = request.respond(cors_response(200, health_json, &cors_headers));
-        log_done(req_id, Some("health"), 200, start, "");
+        let _ = request.respond(cors_response(status, health_json, &cors_headers));
+        log_done(req_id, Some("health"), status, start, "");
         return;
     }
 

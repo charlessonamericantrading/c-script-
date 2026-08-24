@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.51.0-blue.svg" alt="Version" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.52.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 808 automated tests:
+**Works today**, covered by 811 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `/health` (`/`, `/status`) checks real database connectivity — a `SELECT 1` on every request, no caching. Until now it always returned a fixed `200`, useless for any orchestrator (Kubernetes, a load balancer) deciding whether to restart the process: it could be alive and yet unable to serve any real rpc because the database was down, and `/health` would still report everything fine. Returns `503` with `"status":"error"` and the real failure in a new `"database"` field when the check fails; on Postgres it goes through the same connection auto-repair as any other query, so a transient drop heals itself right there
 - `--http-timeout <duration>`/`LINK_HTTP_TIMEOUT` for `linkc serve`: caps how long any outbound `http.*` call can take — 30s by default. Until now, `http.get`/`post`/`getWithHeaders`/etc. had no read/write timeout at all (`ureq` only defaults a 30s *connect* timeout); against this single-threaded interpreter, a slow or hanging remote server blocked the entire process forever — not even `/health` responded meanwhile. Same precedence and duration format (`Ns`/`Nm`/`Nh`/`Nd`) as `--session-ttl`; a timed-out call surfaces as an ordinary runtime error, never a panic or a hang
 - `--max-body-bytes <N>`/`LINK_MAX_BODY_BYTES` for `linkc serve`: caps how many bytes of body any request can send — 10 MiB by default. Until now the server read a request's entire body into memory with no limit at all, a real memory-exhaustion vector. The read is bounded with `Read::take(max_body_bytes + 1)` and rejected with `413 Payload Too Large` *before* it's read in full — auth, rate limiting, and JSON parsing never get a chance to compete for memory with a body already known to be too large. Process-wide, not per-rpc; a rejected body's remaining bytes aren't drained (a client that reuses the same connection anyway gets a clean 400 on its next attempt, never a hang or a leak)
 - `linkc --version`/`-v`/`version` prints the exact compiler version (`env!("CARGO_PKG_VERSION")`, taken from `Cargo.toml` at compile time) — the same constant stamps the header of every generated TypeScript file (`contract.d.ts`/`client.ts`/`hooks.ts`/`validators.ts`/`schemas.ts`) and, since JSON has no comments, an `x-generated-by` vendor extension in `openapi.json` (never `info.version`, which is the documented API's own version, a separate concern). Purely informational — nothing checks a stale `gen/`'s stamped version against the binary serving or rebuilding it
