@@ -81,6 +81,7 @@ fn main() -> ExitCode {
         Some("serve") => cmd_serve(&args[2..]),
         Some("serve-all") => cmd_serve_all(&args[2..]),
         Some("migrate") => cmd_migrate(&args[2..]),
+        Some("doctor") => cmd_doctor(&args[2..]),
         Some("new") => cmd_new(&args[2..]),
         Some("dev") => cmd_dev(&args[2..]),
         Some("lsp") => cmd_lsp(),
@@ -135,6 +136,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
+    out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve')"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
     out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY)"));
     out(&format!("     linkc serve-all <directorio> --port-base <N> [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado)"));
@@ -344,6 +346,111 @@ fn cmd_migrate(args: &[String]) -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Enmascara `usuario:contraseña@` en una URL de conexión antes de
+/// imprimirla -- `linkc doctor` muestra QUÉ base está configurada
+/// (diagnóstico útil), pero nunca la credencial en sí, ni siquiera en la
+/// terminal local (un log/CI que capture stdout no debería terminar con un
+/// secreto adentro). Si la URL no tiene `://` o no tiene `@` antes del host,
+/// se devuelve tal cual -- no hay nada que enmascarar.
+fn redact_url_credentials(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else { return url.to_string() };
+    let after_scheme = &url[scheme_end + 3..];
+    let Some(at) = after_scheme.find('@') else { return url.to_string() };
+    format!("{}://***@{}", &url[..scheme_end], &after_scheme[at + 1..])
+}
+
+/// `linkc doctor <archivo.link> [--db <url|archivo>]` (GRAMMAR.md §3.100,
+/// originalmente PLAN.md §9.7.1): diagnóstico de entorno antes de un
+/// despliegue, pensado para correr en CI o a mano justo antes de `linkc
+/// serve`/`serve-all`. Interpretación deliberada de "PATH" del ítem
+/// original: `linkc` es un binario estático sin ningún otro ejecutable de
+/// sistema del que depender, así que revisar la variable de entorno `PATH`
+/// no daría ninguna señal real -- lo que SÍ importa antes de un despliegue
+/// es que el `.link` de entrada y todos sus `import` resuelvan y tipen, que
+/// es lo que este chequeo verifica en su lugar.
+///
+/// Cada chequeo es independiente entre sí (uno que falla no cancela los
+/// demás) -- el reporte completo importa más que salir rápido en el primer
+/// error, mismo criterio que `linkc migrate --dry-run` reportando por
+/// colección en vez de abortar en la primera. Código de salida: `FAILURE`
+/// si algún chequeo real dio error (archivo inválido, sin permiso de
+/// escritura, base inalcanzable); un `--db` de Postgres es el único chequeo
+/// que hace una conexión de red de verdad, y lo hace de SOLO LECTURA (`SELECT
+/// 1` vía `check_postgres_connectivity`) -- nunca crea ni altera tablas,
+/// para eso ya está `linkc migrate --dry-run`.
+fn cmd_doctor(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("uso: linkc doctor <archivo.link> [--db <url|archivo>]");
+        return ExitCode::FAILURE;
+    };
+    println!("linkc doctor -- diagnóstico de entorno para '{path}'\n");
+
+    let mut ok_count = 0usize;
+    let mut err_count = 0usize;
+
+    println!("[OK]    versión de linkc: {}", linkc::VERSION);
+    ok_count += 1;
+
+    match load_and_check(path) {
+        Ok(_) => {
+            println!("[OK]    '{path}' existe, resuelve sus imports, parsea y tipa correctamente");
+            ok_count += 1;
+        }
+        Err(_) => {
+            println!("[ERROR] '{path}' no se pudo cargar -- ver los errores impresos arriba");
+            err_count += 1;
+        }
+    }
+
+    let check_dir = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+    let probe = check_dir.join(".linkc_doctor_check");
+    match fs::write(&probe, b"linkc doctor") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            println!("[OK]    permiso de escritura en '{}'", display_path(check_dir));
+            ok_count += 1;
+        }
+        Err(e) => {
+            println!("[ERROR] sin permiso de escritura en '{}': {e}", display_path(check_dir));
+            err_count += 1;
+        }
+    }
+
+    match resolve_db_source(path, args) {
+        Ok(runtime::server::DbSource::SqliteFile(db_path)) => {
+            println!(
+                "[OK]    base de datos: SQLite embebido en '{}' (sin --db/LINK_DATABASE_URL configurada)",
+                display_path(&db_path)
+            );
+            ok_count += 1;
+        }
+        Ok(runtime::server::DbSource::Postgres(url)) => {
+            println!("[INFO]  base de datos: PostgreSQL configurada ({})", redact_url_credentials(&url));
+            match runtime::db::check_postgres_connectivity(&url) {
+                Ok(()) => {
+                    println!("[OK]    conectividad a PostgreSQL: conectó y respondió (solo lectura, no se tocó ningún schema)");
+                    ok_count += 1;
+                }
+                Err(e) => {
+                    println!("[ERROR] conectividad a PostgreSQL: {e}");
+                    err_count += 1;
+                }
+            }
+        }
+        Err(msg) => {
+            println!("[ERROR] configuración de base de datos inválida: {msg}");
+            err_count += 1;
+        }
+    }
+
+    println!("\n{ok_count} OK, {err_count} error(es)");
+    if err_count > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 

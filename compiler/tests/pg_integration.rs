@@ -1963,6 +1963,39 @@ test "2 - la reseña del test anterior sigue ahi" {{
     assert!(stdout.contains("2 passed"), "{stdout}");
 }
 
+/// GRAMMAR.md §3.100: `linkc doctor --db <url-postgres>` confirma
+/// conectividad de solo lectura contra una base REAL -- este test cubre lo
+/// que `cli_doctor.rs` no puede (esos tests solo prueban el camino de
+/// error, con un puerto cerrado; nunca se conectan a un Postgres real). Doble
+/// verificación: el chequeo reporta `[OK]`, Y la base sigue exactamente
+/// igual después (ninguna tabla nueva) -- `doctor` nunca debe ejecutar DDL.
+#[test]
+fn doctor_reports_ok_connectivity_against_a_real_postgres_and_touches_no_schema() {
+    const COLLECTION: &str = "reviews_doctor_connectivity";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("doctor-connectivity");
+    let link = temp.write("app.link", &format!("type Review = {{ id: Int, rating: Int }}\ndb {{ {COLLECTION}: Review[] }}\n"));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("doctor").arg(&link).arg("--db").arg(&url).output().expect("ejecutar linkc doctor");
+    assert!(out.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[OK]    conectividad a PostgreSQL"), "{stdout}");
+    assert!(stdout.contains("0 error(es)"), "{stdout}");
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let exists = client
+        .query_one("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)", &[&COLLECTION])
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap();
+    assert!(!exists, "'linkc doctor' NO debe crear ninguna tabla -- es solo diagnóstico de conectividad");
+}
+
 /// Mismo host/base, credenciales distintas -- para probar el DDL generado
 /// con un rol restringido, sin depender de que la URL de test tenga un
 /// formato particular más allá de `postgres://user:pass@resto`.

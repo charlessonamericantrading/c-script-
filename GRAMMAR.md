@@ -121,6 +121,7 @@
   - [3.97 `linkc migrate --dry-run` — RESUELTO](#397-linkc-migrate---dry-run--resuelto)
   - [3.98 Lint `hardcoded-secret-literal` — RESUELTO](#398-lint-hardcoded-secret-literal--resuelto)
   - [3.99 `linkc test --db <url-postgres>` — RESUELTO](#399-linkc-test---db-url-postgres--resuelto)
+  - [3.100 `linkc doctor`: diagnóstico de entorno antes de un despliegue — RESUELTO](#3100-linkc-doctor-diagnóstico-de-entorno-antes-de-un-despliegue--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4606,6 +4607,30 @@ LINK_TEST_DB=postgres://user:pass@host/base_de_test linkc test backend.link   # 
 - **No aplica al testing de CONTRATO** (`linkc test <archivo> <snapshot>`) -- ese camino nunca toca ninguna base, combinar `--db` con un `<snapshot>` se rechaza con un mensaje claro, mismo criterio que `--filter`.
 
 **Verificado**: 2 tests en `pg_integration.rs` contra un PostgreSQL real -- un `test` que inserta una fila vía `db.<c>.insert` deja esa fila de VERDAD en Postgres (confirmado con una consulta SQL directa después, no solo "el test pasó"); dos `test` en el mismo archivo, el segundo lee el conteo que el primero dejó -- confirma el límite de "sin aislamiento" documentado arriba, no lo esconde.
+
+---
+
+### 3.100 `linkc doctor`: diagnóstico de entorno antes de un despliegue — RESUELTO
+
+PLAN.md §9.7.1, en el backlog desde antes de los reportes de adopción: "diagnóstico de entorno (versión, PATH, permisos, conectividad a la DB configurada) antes de un despliegue". `linkc` no tenía ninguna forma de responder "¿este entorno está listo para `linkc serve`?" sin arrancar el servidor de verdad y ver si fallaba en producción.
+
+```bash
+linkc doctor backend.link
+linkc doctor backend.link --db postgres://user:pass@host/base   # o LINK_DATABASE_URL
+```
+
+**Cuatro chequeos, cada uno independiente de los demás -- uno que falla no cancela los siguientes, el reporte completo importa más que salir rápido en el primer error (mismo criterio que `linkc migrate --dry-run`, §3.97, reportando por colección en vez de abortar):**
+
+1. **Versión de `linkc`** (`linkc::VERSION`, la misma constante que estampa cada archivo generado -- §3.83).
+2. **El `.link` de entrada existe, resuelve todos sus `import`, parsea y tipa.** Reinterpretación deliberada del "PATH" del ítem original: `linkc` es un binario estático sin ningún otro ejecutable de sistema del que depender, así que inspeccionar la variable de entorno `PATH` no daría ninguna señal real de si un despliegue va a funcionar -- lo que sí importa es que el programa de entrada compile, que es justamente lo que este chequeo verifica en su lugar. Un error real (sintaxis, tipos, un `import` que no resuelve) se imprime con el mismo diagnóstico con snippet+caret de `linkc <archivo.link>`.
+3. **Permiso de escritura en el directorio del `.link`.** Crea y borra un archivo de prueba (`.linkc_doctor_check`) ahí mismo -- el mismo directorio donde `linkc serve` sin `--db`/`LINK_DATABASE_URL` crea el archivo SQLite por default.
+4. **Conectividad a la base configurada** (`--db`/`LINK_DATABASE_URL`, misma resolución y mismo formato que `linkc serve` -- una URL `postgres://`/`postgresql://`, o cualquier otro valor se toma como ruta de archivo SQLite):
+   - **Sin `--db`/`LINK_DATABASE_URL`**: SQLite embebido, informativo -- la ruta exacta que usaría `linkc serve` (`<archivo>.db` al lado del `.link`), sin conexión de red que probar.
+   - **Con una URL de Postgres**: conecta de VERDAD y corre un `SELECT 1` (`check_postgres_connectivity`, reusando el mismo `connect_postgres_client` que `linkc migrate --dry-run`) -- pero **solo lectura, nunca ejecuta ningún DDL**, ni siquiera el chequeo de colisión de tabla (§3.94) o de tipo de `id` (§3.36) que sí corre `linkc migrate --dry-run`: `doctor` responde "¿la base es alcanzable?", no "¿el schema calza?", que ya es la pregunta que resuelve `migrate --dry-run` por separado. La URL se muestra en el reporte para diagnóstico, pero con la credencial (`usuario:contraseña@`) siempre enmascarada -- ni en la terminal local debería terminar un secreto en texto plano, por si ese output se captura en un log o en CI.
+
+**Código de salida**: `1` si algún chequeo real dio error (archivo inválido, sin permiso de escritura, base inalcanzable); `0` si los cuatro pasaron -- pensado para un paso de CI antes de desplegar (`linkc doctor backend.link --db "$LINK_DATABASE_URL" || exit 1`), no solo para lectura humana.
+
+**Verificado**: `cli_doctor.rs` (7 tests) contra el binario real -- éxito con SQLite default, archivo faltante, error de sintaxis, URL de Postgres inalcanzable (puerto cerrado, falla rápido en vez de colgarse) sin panic, URL malformada sin panic, uso sin argumentos, y `LINK_DATABASE_URL` funcionando igual que `--db`; más 1 test en `pg_integration.rs` contra un PostgreSQL real, confirmando `[OK]` de conectividad Y que ninguna tabla se creó (`doctor` nunca toca el schema).
 
 ---
 

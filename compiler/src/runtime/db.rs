@@ -764,6 +764,21 @@ pub(crate) fn connect_postgres_client(url: &str) -> Result<postgres::Client, Str
     }
 }
 
+/// `linkc doctor` (GRAMMAR.md §3.100): confirma que la base configurada
+/// responde, sin ejecutar NINGÚN DDL -- a diferencia de `Db::new`/
+/// `connect_postgres_with_options` (que corren el chequeo/migración de
+/// schema completo al conectar), `doctor` corre ANTES de un despliegue y no
+/// debe crear ni alterar nada por su cuenta. Mismo `connect_postgres_client`
+/// que ya usa `linkc migrate --dry-run` (migrate.rs); pub (no pub(crate))
+/// porque `main.rs` -- un crate binario separado de esta librería -- lo
+/// llama directo, mismo motivo que `connect_postgres_for_testing` (§3.99,
+/// más abajo en este archivo).
+pub fn check_postgres_connectivity(url: &str) -> Result<(), String> {
+    let mut client = connect_postgres_client(url)?;
+    client.execute("SELECT 1", &[]).map_err(|e| format!("conectó pero la consulta de prueba falló: {e}"))?;
+    Ok(())
+}
+
 /// Arranca el hilo de LISTEN dedicado (GRAMMAR.md §3.44) y devuelve el
 /// extremo lector del canal por el que manda cada `RemoteChange` que
 /// reconoce como AJENO (no su propio eco -- ver `parse_remote_notification`).

@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.64.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc doctor <archivo.link> [--db <url|archivo>]`.** PLAN.md §9.7.1, en el backlog general desde antes de los reportes de adopción reciente: "diagnóstico de entorno (versión, PATH, permisos, conectividad a la DB configurada) antes de un despliegue". Elegido como siguiente ítem al cerrar la lista priorizada de IgnisLove/MyFinance por ser de bajo riesgo de regresión (lectura pura, sin tocar ningún camino de código ya modificado esta sesión). Cuatro chequeos independientes entre sí -- uno que falla no cancela los demás: (1) versión de `linkc`; (2) que el `.link` de entrada resuelva sus imports, parsee y tipe, con el mismo diagnóstico snippet+caret de `linkc <archivo.link>` si no; (3) permiso de escritura en el directorio del `.link` (crea y borra un archivo de prueba ahí); (4) conectividad de SOLO LECTURA (`SELECT 1`, reusando `connect_postgres_client` de `linkc migrate --dry-run`, nunca ningún DDL) a la base configurada vía `--db`/`LINK_DATABASE_URL` -- informativo si es SQLite embebido (default sin configurar nada). La credencial de una URL de Postgres se enmascara siempre en el reporte. "PATH" del ítem original reinterpretado a propósito: un binario estático sin ningún ejecutable de sistema del que depender no gana nada real inspeccionando esa variable de entorno -- el chequeo que sí importa antes de desplegar es que el programa de entrada compile. Código de salida `1` si algún chequeo real falló, pensado para un paso de CI.
+
+897 tests (8 nuevos): 7 en `cli_doctor.rs` contra el binario real (éxito con SQLite default, archivo faltante, error de sintaxis, URL de Postgres inalcanzable sin colgarse ni panic, URL malformada sin panic, uso sin argumentos, `LINK_DATABASE_URL` igual que `--db`) y 1 en `pg_integration.rs` contra un PostgreSQL real, confirmando `[OK]` de conectividad Y que ninguna tabla se creó. Detalle completo: GRAMMAR.md §3.100.
+
 ## [1.63.0] - 2026-08-24
 
 ### ✨ Nuevo
