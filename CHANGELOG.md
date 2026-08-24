@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.78.0] - 2026-08-25
+
+### 🐛 Arreglado
+- **Lint `unused-var`: 14 falsos positivos dentro de closures y struct-literals.** Issue #11, reportado por IgnisLove con evidencia excepcional: 3 repros mínimos aislando la causa exacta más una tabla de 14 falsos positivos reales verificados a mano en 7 de sus 17 `.link` (`bandit_rewards`, `banners`, `catalog_facets`, `irene_chat`, `reviews`, `rfm_scorer`, `seo_engine`). `expr_count_ident` (`lint.rs`) tenía seis variantes de `Expr` sin manejar (`Closure`, `StructLit`, `Match`, `Index`, `TupleLit`, `TupleIndex`), cayendo al `_ => 0` genérico -- una variable usada SOLO adentro del `body` de una closure pasada a `.filter()`/`upsert`/`findWhere`, o SOLO como valor de un campo de un struct-literal de cola, se marcaba como no usada pese a estar bien. Confirmado desde que el check existe (v1.62.0), no una regresión puntual -- importa más que ruido: si `--fix` renombrara automáticamente a `_target`/`_reward`, o alguien lo hiciera a mano confiando en el aviso, rompería código que funciona.
+
+959 tests (5 nuevos): los TRES repros del issue reproducidos literalmente + un caso de `Expr::Match` (mismo bug de fondo) + un test de no-regresión confirmando que una variable genuinamente sin usar se sigue marcando. Detalle completo: GRAMMAR.md §3.115.
+
 ## [1.77.0] - 2026-08-25
 
 ### 📝 Documentado (ya funcionaba, sin un ejemplo que lo dijera)

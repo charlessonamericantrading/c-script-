@@ -259,7 +259,7 @@ linkc serve backend.link 8787 --restart-backoff 1s  # native exponential backoff
 linkc serve-all ./services --port-base 3000  # one process serves every .link in ./services, one thread+port each
 linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json  # write {"name": port, ...} before serving
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
-linkc --version                      # linkc 1.77.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.78.0 -- same version stamped in every generated file
 ```
 
 ## Verified example

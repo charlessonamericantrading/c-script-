@@ -136,6 +136,7 @@
   - [3.112 `base64.encode`/`base64.decode` — YA EXISTÍA, sin documentar ni probar hasta ahora](#3112-base64encodebase64decode--ya-existía-sin-documentar-ni-probar-hasta-ahora)
   - [3.113 `@cache_control("...")` por rpc — RESUELTO](#3113-cache_control-por-rpc--resuelto)
   - [3.114 Flujo OAuth2 "client credentials" (servidor a servidor) — YA FUNCIONABA, sin un ejemplo que lo dijera](#3114-flujo-oauth2-client-credentials-servidor-a-servidor--ya-funcionaba-sin-un-ejemplo-que-lo-dijera)
+  - [3.115 Lint `unused-var`: 14 falsos positivos dentro de closures y struct-literals — RESUELTO](#3115-lint-unused-var-14-falsos-positivos-dentro-de-closures-y-struct-literals--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4972,6 +4973,31 @@ rpc callProtectedApi(tokenUrl: String, clientId: String, clientSecret: String, a
 **Por qué esto compila y corre sin ningún cambio del compilador**: `http.postWithHeaders` (§3.47) ya podía pedir el token con el `Content-Type` que el endpoint de OAuth2 exige; `json.parse(text: String) -> Dynamic` ya existía, y `Dynamic.<cualquier-campo>` type-checkea DEVOLVIENDO `Dynamic` (`Expr::FieldAccess` sobre `Type::Dynamic`, `checker.rs`) -- no hace falta declarar la forma completa de la respuesta del proveedor solo para leer un campo; y un `Dynamic` es asignable donde se espera `String` sin cast explícito (mismo criterio que el resto del lenguaje trata `Dynamic` como escotilla de escape deliberada). El `+` entre `String` y `Dynamic` (`"Bearer " + token`) también tipea, por el mismo motivo. `http.getWithHeaders` hace la llamada real con el token ya en el header `Authorization`.
 
 **Verificado de punta a punta contra DOS servidores HTTP de mentira reales** (no un mock interno del intérprete) -- uno hace de endpoint de token (devuelve `{"access_token":"tok-xyz-789","expires_in":3600}`), el otro de API protegida: confirma que el `client_id`/`client_secret` llegan tal cual al primer servidor, y que el token que ESE servidor devolvió llega EXACTO como `Authorization: Bearer tok-xyz-789` al segundo -- la prueba real de que la extracción del campo `access_token` vía `Dynamic` funciona en runtime, no solo que tipa. 1 test nuevo en `tests/cli_http.rs`.
+
+---
+
+### 3.115 Lint `unused-var`: 14 falsos positivos dentro de closures y struct-literals — RESUELTO
+
+**Issue #11**, reportado por IgnisLove con evidencia excepcional: 3 repros mínimos aislando la causa exacta más una tabla de 14 falsos positivos reales verificados a mano en 7 de los 17 `.link` de esa adopción (`bandit_rewards`, `banners`, `catalog_facets`, `irene_chat`, `reviews`, `rfm_scorer`, `seo_engine`). `linkc lint`'s `unused-var` marcaba como "no usada" una variable cuya ÚNICA aparición (o todas) caían dentro de (A) el `body` de una closure pasada como argumento a `.filter()`/`upsert`/`findWhere`, o (B) el valor de un campo de un struct-literal, cuando ese struct-literal era la expresión de cola del rpc (directa o como argumento de `insert(...)`/`upsert(...)`). Confirmado desde que el check existe (v1.62.0), no una regresión de una release puntual.
+
+```
+rpc queryFacetCounts(category: String) -> Int {
+  let target = category.toLower();
+  db.facets.all().filter(|f: FacetItem| {
+    target == "all" || f.category == target  // 'target' usado DOS veces acá
+  }).length()
+}
+```
+
+Antes de esta ronda, `linkc lint` marcaba `target` como `unused-var` en este código -- pese a usarse dos veces, correcto y con intención clara.
+
+**Causa raíz: `expr_count_ident` (el contador de usos que `unused-var` consulta) tenía un `match` sobre `Expr` con seis variantes SIN arm**, todas cayendo al `_ => 0` genérico -- `Closure`, `StructLit`, `Match`, `Index`, `TupleLit`, `TupleIndex`. `Expr::Call` sí recorría sus `args` (por eso una closure pasada como argumento no se perdía del todo), pero al llegar al propio nodo `Expr::Closure` dentro de esos args, el contador no sabía bajar adentro de su `body` -- el mismo motivo exacto por el que `Expr::StructLit` tampoco contaba los VALORES de sus campos. Nada de esto era un problema de diseño del checker/runtime (que sí resuelven estas formas correctamente, GRAMMAR.md §3.9-§3.10) -- el bug vivía únicamente en este contador auxiliar del linter, una segunda implementación aparte que podía (y de hecho llegó a) divergir.
+
+**Arreglado agregando los seis arms que faltaban** a `expr_count_ident` (`lint.rs`): `Index`/`TupleLit`/`TupleIndex` recorren sus sub-expresiones tal cual el resto de las formas ya manejadas; `StructLit` recorre el valor de CADA campo (`fields: Vec<(String, Spanned<Expr>)>`); `Closure` delega en `block_uses_ident` sobre su `body` (mismo mecanismo que ya usaban los dos brazos de un `if`); `Match` recorre el `scrutinee`, el `guard` de cada arm si lo tiene, y el `body` de cada arm (`MatchArmBody::Expr` o `::Block`, este último también vía `block_uses_ident`). Ningún cambio de comportamiento fuera de este contador -- `unused-var`/`unused-mut`/`--fix` siguen funcionando exactamente igual para el resto de los casos.
+
+**Por qué importaba de verdad, más allá del ruido**: el propio issue lo señala -- si `linkc lint --fix` alguna vez renombra automáticamente estas variables a `_target`/`_reward`/etc. (o si alguien lo hace a mano confiando en el aviso), el prefijo `_` es una señal semántica real ("intencionalmente sin usar", GRAMMAR.md) que ninguna de estas 14 variables merecía -- un falso positivo de este lint, seguido de un `--fix` ciego, rompe código que funciona.
+
+**Verificado**: 5 tests nuevos en `lint.rs` -- los TRES repros del issue reproducidos literalmente (closure de `.filter()`, struct-literal de cola, closures+struct-literals de `upsert`) más un caso de `Expr::Match` (mismo bug de fondo, sin `.link` real citado en el issue pero cubierto de una vez) y un test de no-regresión confirmando que una variable genuinamente sin usar se sigue marcando.
 
 ---
 

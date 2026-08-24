@@ -432,6 +432,35 @@ fn expr_count_ident(expr: &Expr, target: &str) -> usize {
         }
         Expr::FieldAccess { base, .. } => expr_count_ident(&base.node, target),
         Expr::ArrayLit(elems) => elems.iter().map(|e| expr_count_ident(&e.node, target)).sum(),
+        // GRAMMAR.md §3.115 (issue #11, reportado por IgnisLove): estos
+        // seis arms faltaban -- cualquier uso de `target` que solo
+        // apareciera DENTRO de uno de ellos era invisible para este
+        // contador, así que `unused-var` lo marcaba como no usado aunque sí
+        // lo estuviera. El caso real más común: una closure pasada a
+        // `.filter()`/`upsert`/`findWhere` (`Expr::Closure`, siempre
+        // argumento de un `Expr::Call` que SÍ recorre `args`, pero el
+        // contador nunca bajaba adentro del `body` de esa closure) y el
+        // valor de un campo de un struct-literal de cola o pasado a
+        // `insert`/`upsert` (`Expr::StructLit`, cuyos `fields` nunca se
+        // recorrían).
+        Expr::Index { base, index } => expr_count_ident(&base.node, target) + expr_count_ident(&index.node, target),
+        Expr::TupleLit(elems) => elems.iter().map(|e| expr_count_ident(&e.node, target)).sum(),
+        Expr::TupleIndex { base, .. } => expr_count_ident(&base.node, target),
+        Expr::StructLit { fields, .. } => fields.iter().map(|(_, v)| expr_count_ident(&v.node, target)).sum(),
+        Expr::Closure { body, .. } => usize::from(block_uses_ident(body, target)),
+        Expr::Match { scrutinee, arms } => {
+            let mut c = expr_count_ident(&scrutinee.node, target);
+            for arm in arms {
+                if let Some(guard) = &arm.guard {
+                    c += expr_count_ident(&guard.node, target);
+                }
+                c += match &arm.body {
+                    MatchArmBody::Expr(e) => expr_count_ident(&e.node, target),
+                    MatchArmBody::Block(b) => usize::from(block_uses_ident(b, target)),
+                };
+            }
+            c
+        }
         _ => 0,
     }
 }
@@ -496,6 +525,146 @@ mod tests {
         let fixed = fix_source(code, &warnings);
         assert!(fixed.contains("let _unused = 42;"));
         assert!(fixed.contains("let never_changed = 100;"));
+    }
+
+    // ---- 14 falsos positivos de `unused-var` (GRAMMAR.md §3.115, issue
+    // #11 reportado por IgnisLove): `expr_count_ident` no bajaba adentro
+    // del `body` de una `Expr::Closure` ni de los valores de
+    // `Expr::StructLit`, así que una variable usada SOLO ahí adentro se
+    // marcaba como no usada. Los tres tests que siguen son los tres repros
+    // exactos del issue, tal cual los reportaron -- no simplificados.
+
+    fn lint_warnings(code: &str) -> Vec<LintWarning> {
+        let tokens = lexer::tokenize(code).unwrap_or_else(|e| panic!("{e}"));
+        let program = parser::parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        lint_program(&program)
+    }
+
+    #[test]
+    fn a_variable_used_only_inside_a_filter_closure_is_not_a_false_positive() {
+        // Repro 1 del issue: `target` se usa DOS veces, pero las dos
+        // adentro del `body` de la closure que `.filter()` recibe como
+        // argumento -- antes de esta ronda, `Expr::Call` sí recorría sus
+        // `args`, pero `expr_count_ident` no sabía bajar adentro de un
+        // `Expr::Closure` una vez que llegaba a él.
+        let code = r#"
+            type FacetItem = { id: Int, productId: Int, category: String, inStock: Bool }
+            db { facets: FacetItem[] }
+            service S {
+                rpc queryFacetCounts(category: String) -> Int {
+                    let target = category.toLower();
+                    let matches = db.facets.all().filter(|f: FacetItem| {
+                        target == "all" || f.category == target
+                    });
+                    matches.length()
+                }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "unused-var" && w.message.contains("target")),
+            "'target' se usa dos veces adentro de la closure de .filter(): {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_variable_used_only_as_a_tail_struct_literal_field_value_is_not_a_false_positive() {
+        // Repro 2 del issue: las tres variables (`total`, `inStock`,
+        // `outOfStock`) se usan de la MISMA forma, como valor de un campo
+        // del mismo struct-literal de cola -- pero antes de esta ronda solo
+        // `outOfStock` se marcaba (falso positivo), porque `total`/
+        // `inStock` tenían un uso ADICIONAL fuera del struct-literal
+        // (`total - inStock`) que alcanzaba para no disparar la regla; el
+        // bug real es que NINGUNA de las tres debería depender de ese uso
+        // extra -- `expr_count_ident` nunca recorría `Expr::StructLit`.
+        let code = r#"
+            type FacetCounts = { total: Int, inStock: Int, outOfStock: Int }
+            service S {
+                rpc counts(total: Int, inStock: Int) -> FacetCounts {
+                    let outOfStock = total - inStock;
+                    FacetCounts {
+                        total: total,
+                        inStock: inStock,
+                        outOfStock: outOfStock,
+                    }
+                }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "unused-var"),
+            "las tres variables se usan como valor de un campo del struct-literal de cola: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn variables_used_only_inside_upsert_closures_and_struct_literals_are_not_false_positives() {
+        // Repro 3 del issue: `reward` se usa en el struct-literal del
+        // segundo argumento de `upsert` (`insertValue`) Y adentro del
+        // `body` de la closure del tercer argumento (`updateFn`) --
+        // ninguno de los dos contaba antes de esta ronda.
+        let code = r#"
+            type Arm = { id: Int, code: String, pulls: Int, total: Int }
+            db { arms: Arm[] }
+            service S {
+                rpc bump(code: String, reward: Int) -> Arm {
+                    db.arms.upsert(
+                        |a: Arm| { a.code == code },
+                        Arm { id: 0, code: code, pulls: 1, total: reward },
+                        |existing: Arm| {
+                            Arm { id: 0, code: code, pulls: existing.pulls + 1, total: existing.total + reward }
+                        }
+                    )
+                }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "unused-var" && (w.message.contains("reward") || w.message.contains("code"))),
+            "'reward' y 'code' se usan adentro de struct-literals y closures de upsert: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_variable_used_only_inside_a_match_arm_is_not_a_false_positive() {
+        // Mismo bug de fondo (`expr_count_ident` sin arm para
+        // `Expr::Match`), un caso que el issue no citó con un `.link` real
+        // pero que comparte la misma causa raíz -- cubierto de una vez.
+        let code = r#"
+            fn describe(x: Int?) -> String {
+                let label = "valor";
+                match x {
+                    v: Int => label + ": " + v.toString(),
+                    null => "sin " + label,
+                }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "unused-var" && w.message.contains("label")),
+            "'label' se usa en los dos arms del match: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_unused_variable_is_still_flagged_after_the_fix() {
+        // No-regresión: el fix de arriba no debe volver el linter ciego a
+        // un caso real -- una variable que NO se usa en ningún lado (ni
+        // adentro de una closure, ni de un struct-literal) sigue
+        // marcándose.
+        let code = r#"
+            service S {
+                rpc f(name: String) -> String {
+                    let reallyUnused = name.toLower();
+                    name
+                }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(
+            warnings.iter().any(|w| w.rule == "unused-var" && w.message.contains("reallyUnused")),
+            "una variable de verdad sin usar tiene que seguir marcándose: {warnings:?}"
+        );
     }
 
     // ---- `timing-unsafe-secret-comparison` (GRAMMAR.md §3.88) ----
