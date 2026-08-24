@@ -1207,6 +1207,21 @@ fn call_method(
     match receiver {
         Value::DbCollection(coll) => match method {
 
+            // GRAMMAR.md §3.77: intercepta ACÁ (no en db.rs::Db::call) por
+            // el mismo motivo que `findWhere`/`deleteWhere` -- necesita
+            // `checker` para encontrar qué campos llevan `@autoUpdate`,
+            // algo que `Db::call` no recibe. `upsert` (más abajo) llama a
+            // `db.call(&coll, "applyPatch", ...)` DIRECTO, así que pasa por
+            // `augment_with_auto_update_fields` a mano ahí también -- no a
+            // través de este brazo (una única función compartida evita que
+            // los dos caminos diverjan).
+            "applyPatch" => {
+                let mut it = args.into_iter();
+                let id = it.next().ok_or_else(|| err("'applyPatch' requiere 2 argumentos"))?;
+                let patch = it.next().ok_or_else(|| err("'applyPatch' requiere 2 argumentos"))?;
+                let patch = augment_with_auto_update_fields(&coll, checker, patch);
+                db.call(&coll, "applyPatch", vec![id, patch])
+            }
             "findWhere" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'findWhere' requiere 1 argumento"))?;
                 let all_val = db.call(&coll, "all", vec![])?;
@@ -1291,6 +1306,7 @@ fn call_method(
                         let id = *id;
                         let new_value =
                             call_callable(update_fn, vec![row], db, fns, checker, sessions, current_token, step_budget)?;
+                        let new_value = augment_with_auto_update_fields(&coll, checker, new_value);
                         db.call(&coll, "applyPatch", vec![Value::Int(id), new_value])
                     }
                     None => db.call(&coll, "insert", vec![insert_value]),
@@ -2382,6 +2398,37 @@ fn field_annotations_for<'a>(checker: &'a Checker, name: &str, variant: Option<&
             decl.variants.iter().find(|variant| variant.name == v)?.fields.as_ref()
         }
     }
+}
+
+/// Pisa a `now()` (GRAMMAR.md §3.77) cualquier campo `@autoUpdate` de la
+/// colección `coll` dentro de `patch` -- sin importar qué traía el patch
+/// para ese campo (o si no traía nada). `coll` es un nombre de COLECCIÓN de
+/// `db` (ej. "counters"), no el nombre del tipo -- primer paso es resolverlo
+/// a su tipo de elemento vía `checker.db_collections()` (mismo mapa que usa
+/// el resto del checker para esto) para poder reusar `field_annotations_for`.
+/// Si `patch` no es un `Value::Struct` (no debería pasar, `applyPatch` ya lo
+/// exige en otro lado) se devuelve tal cual, sin tocar nada.
+fn augment_with_auto_update_fields(coll: &str, checker: &Checker, patch: Value) -> Value {
+    let Value::Struct(mut fields) = patch else { return patch };
+    let Some(crate::types::Type::Struct { name: Some(type_name), .. }) = checker.db_collections().get(coll) else {
+        return Value::Struct(fields);
+    };
+    let Some(ast_fields) = field_annotations_for(checker, type_name, None) else {
+        return Value::Struct(fields);
+    };
+    let auto_update_names: Vec<&str> = ast_fields.iter().filter(|f| f.auto_update()).map(|f| f.name.as_str()).collect();
+    if auto_update_names.is_empty() {
+        return Value::Struct(fields);
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    for name in auto_update_names {
+        fields.retain(|(n, _)| n != name);
+        fields.push((name.to_string(), Value::Timestamp(now_ms)));
+    }
+    Value::Struct(fields)
 }
 
 /// Aplica `@validate(...)` (GRAMMAR.md §3.73) sobre los campos de `value`
@@ -3826,6 +3873,58 @@ mod tests {
         // Confirma que quedaron persistidas de verdad, no solo devueltas.
         let persisted = invoke_rpc(&program, "S", "all", &json!({}), &db).unwrap();
         assert_eq!(persisted.as_array().unwrap().len(), 3);
+    }
+
+    // ---- createdAt/updatedAt automáticos: `= now()` + `@autoUpdate` (GRAMMAR.md §3.77) ----
+
+    /// `createdAt: Timestamp = now()` (el default ya existente, GRAMMAR.md
+    /// §3.74) alcanza para "asignado solo, sin tocarlo a mano en cada
+    /// insert" -- sin ninguna anotación nueva.
+    #[test]
+    fn a_timestamp_field_defaulting_to_now_is_set_on_insert_without_being_given() {
+        let program = program_from(
+            r#"
+            type Task = { id: Int, title: String, createdAt: Timestamp = now() }
+            type NewTask = { title: String, createdAt: Timestamp = now() }
+            db { tasks: Task[] }
+            service S {
+                rpc create(title: String) -> Task { db.tasks.insert(NewTask { title: title }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "create", &json!({"title": "a"}), &db).unwrap();
+        assert!(created["createdAt"].is_string(), "{created}");
+    }
+
+    /// `@autoUpdate` pisa el campo a `now()` en CADA `applyPatch`, incluso
+    /// cuando el patch enviado no lo menciona -- verificado contra un
+    /// servidor real primero (curl), acá fijado como test.
+    #[test]
+    fn auto_update_bumps_the_field_on_apply_patch_even_when_the_patch_omits_it() {
+        let program = program_from(
+            r#"
+            type Task = { id: Int, title: String, createdAt: Timestamp = now(), @autoUpdate updatedAt: Timestamp = now() }
+            type NewTask = { title: String, createdAt: Timestamp = now(), @autoUpdate updatedAt: Timestamp = now() }
+            db { tasks: Task[] }
+            service S {
+                rpc create(title: String) -> Task { db.tasks.insert(NewTask { title: title }) }
+                rpc rename(id: Int, patch: Patch<Task>) -> Task { db.tasks.applyPatch(id, patch) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "create", &json!({"title": "a"}), &db).unwrap();
+        let id = created["id"].as_i64().unwrap();
+        let created_at_before = created["createdAt"].clone();
+        let updated_at_before = created["updatedAt"].clone();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // El patch solo trae 'title' -- 'updatedAt' NO aparece acá.
+        let renamed = invoke_rpc(&program, "S", "rename", &json!({"id": id, "patch": {"title": "b"}}), &db).unwrap();
+
+        assert_eq!(renamed["createdAt"], created_at_before, "createdAt nunca cambia después del insert");
+        assert_ne!(renamed["updatedAt"], updated_at_before, "updatedAt se pisó a pesar de no venir en el patch");
     }
 
     // ---- validación tipada del borde (auditoría) ----

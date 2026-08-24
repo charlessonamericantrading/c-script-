@@ -378,17 +378,20 @@ impl Parser {
         Ok(Field { name, optional, ty, name_span, annotations, default })
     }
 
-    /// `@deprecated("...")`/`@validate(...)` antes de un campo de struct
-    /// (GRAMMAR.md §3.71 y §3.73) -- ver ast.rs::Field::annotations para por
-    /// qué esto NO reusa `parse_optional_annotation` (esa devuelve
-    /// `Vec<Annotation>` y acepta cualquier anotación de rpc, ninguna de las
-    /// cuales tiene sentido sobre un campo). A lo sumo UNA de cada -- una
-    /// segunda `@deprecated` o `@validate` sobre el mismo campo es un error
-    /// acá mismo, mismo criterio que `@content_type`/`@route` en un rpc
+    /// `@deprecated("...")`/`@validate(...)`/`@autoUpdate` antes de un campo
+    /// de struct (GRAMMAR.md §3.71, §3.73 y §3.77) -- ver
+    /// ast.rs::Field::annotations para por qué esto NO reusa
+    /// `parse_optional_annotation` (esa devuelve `Vec<Annotation>` y acepta
+    /// cualquier anotación de rpc, ninguna de las cuales tiene sentido sobre
+    /// un campo). A lo sumo UNA de cada -- una segunda `@deprecated`/
+    /// `@validate`/`@autoUpdate` sobre el mismo campo es un error acá mismo,
+    /// mismo criterio que `@content_type`/`@route` en un rpc
     /// (`check_annotation_combination`), salvo que acá no hace falta el
     /// checker: es una cuenta puramente sintáctica. La FORMA del regex de
     /// `@validate(regex, "...")` se valida en el checker (`check_field_validators`),
-    /// no acá -- necesita la crate `regex`, que el parser no depende de.
+    /// no acá -- necesita la crate `regex`, que el parser no depende de. Que
+    /// `@autoUpdate` solo aplique sobre `Timestamp` TAMBIÉN se valida en el
+    /// checker, mismo motivo (necesita el tipo resuelto).
     fn parse_field_annotations(&mut self) -> Result<Vec<FieldAnnotation>, ParseError> {
         let mut annotations = Vec::new();
         let mut seen_deprecated = false;
@@ -433,9 +436,17 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     annotations.push(FieldAnnotation::Validate(validator));
                 }
+                // Sin paréntesis -- a diferencia de `@deprecated`/`@validate`,
+                // no toma ningún argumento (GRAMMAR.md §3.77).
+                "autoUpdate" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::AutoUpdate)) {
+                        return Err(self.error("'@autoUpdate' repetido sobre el mismo campo".to_string()));
+                    }
+                    annotations.push(FieldAnnotation::AutoUpdate);
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")' o '@validate(...)')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)' o '@autoUpdate')"
                     )))
                 }
             }

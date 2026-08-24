@@ -182,6 +182,13 @@ impl Field {
             _ => None,
         })
     }
+
+    /// ¿Lleva `@autoUpdate`? (GRAMMAR.md §3.77) -- un campo `Timestamp` así
+    /// marcado se pisa a `now()` en CADA `applyPatch`/`upsert`-actualización
+    /// sobre la fila, sin importar qué traiga el patch para ese campo.
+    pub fn auto_update(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, FieldAnnotation::AutoUpdate))
+    }
 }
 
 impl PartialEq for Field {
@@ -202,6 +209,9 @@ pub enum FieldAnnotation {
     Deprecated(String),
     /// `@validate(email)` o `@validate(regex, "...")` -- ver GRAMMAR.md §3.73.
     Validate(FieldValidator),
+    /// `@autoUpdate` (sin paréntesis, ver `parse_field_annotations`) -- solo
+    /// sobre un campo `Timestamp`. Ver GRAMMAR.md §3.77.
+    AutoUpdate,
 }
 
 /// Las dos formas de `@validate(...)` que un campo `String`/`String?` admite

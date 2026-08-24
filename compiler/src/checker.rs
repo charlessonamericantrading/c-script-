@@ -750,6 +750,7 @@ impl Checker {
                             .check_field_validators(fields, &t.type_params)
                             .into_iter()
                             .chain(checker.check_field_defaults(fields, &t.type_params))
+                            .chain(checker.check_field_auto_update(fields, &t.type_params))
                         {
                             let mut e = e;
                             if let Some(file) = file_for(index) {
@@ -766,6 +767,7 @@ impl Checker {
                                 .check_field_validators(fields, &en.type_params)
                                 .into_iter()
                                 .chain(checker.check_field_defaults(fields, &en.type_params))
+                                .chain(checker.check_field_auto_update(fields, &en.type_params))
                             {
                                 let mut e = e;
                                 if let Some(file) = file_for(index) {
@@ -1599,6 +1601,37 @@ impl Checker {
             };
             if let Err(e) = self.check_expr(default, &ty, &Env::new()) {
                 errors.push(e.with_span(default.span));
+            }
+        }
+        errors
+    }
+
+    /// `@autoUpdate` (GRAMMAR.md §3.77) solo sobre un campo `Timestamp`
+    /// exacto -- ni `Timestamp?` ni cualquier otro tipo. El significado
+    /// ("pisar a `now()` en cada `applyPatch`") no tiene sentido en
+    /// ningún otro tipo, y necesita el tipo RESUELTO (no solo la forma
+    /// sintáctica), por eso vive acá y no en el parser.
+    fn check_field_auto_update(&self, fields: &[Field], type_params: &[String]) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        for f in fields {
+            if !f.auto_update() {
+                continue;
+            }
+            let ty = if type_params.is_empty() {
+                self.resolve_type(&f.ty)
+            } else {
+                self.resolve_type_abstract(&f.ty, type_params)
+            };
+            match ty {
+                Ok(Type::Timestamp) => {}
+                Ok(ty) => errors.push(
+                    err(format!(
+                        "'@autoUpdate' en el campo '{}': solo aplica sobre `Timestamp` -- es `{ty}`",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                ),
+                Err(e) => errors.push(e.with_span(f.name_span)),
             }
         }
         errors
@@ -6440,5 +6473,36 @@ type T = { id: Int, s: Status }")
         "#;
         let errs = check_source(src).expect_err("insertMany sin argumentos debe rechazarse");
         assert!(errs.iter().any(|e| e.message.contains("toma exactamente 1 argumento")), "{errs:?}");
+    }
+
+    // ---- createdAt/updatedAt automáticos: `= now()` + `@autoUpdate` (GRAMMAR.md §3.77) ----
+
+    #[test]
+    fn auto_update_on_a_timestamp_field_typechecks() {
+        let src = r#"type Task = { id: Int, @autoUpdate updatedAt: Timestamp = now() }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn auto_update_on_a_non_timestamp_field_is_rejected() {
+        let src = "type Task = { id: Int, @autoUpdate title: String }";
+        let errs = check_source(src).expect_err("@autoUpdate sobre un String debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("solo aplica sobre")), "{errs:?}");
+    }
+
+    #[test]
+    fn auto_update_does_not_require_a_default() {
+        // @autoUpdate y `= now()` son ortogonales -- el primero solo importa
+        // en applyPatch, así que un campo requerido sin default también es válido.
+        let src = "type Task = { id: Int, @autoUpdate updatedAt: Timestamp }";
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn a_second_auto_update_on_the_same_field_is_a_parse_error() {
+        let src = "type Task = { id: Int, @autoUpdate @autoUpdate updatedAt: Timestamp }";
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("dos @autoUpdate en el mismo campo debe rechazarse");
+        assert!(format!("{err:?}").contains("repetido"), "{err:?}");
     }
 }

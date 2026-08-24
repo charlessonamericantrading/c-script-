@@ -98,6 +98,7 @@
   - [3.74 Valores por defecto en campos de `struct` — RESUELTO](#374-valores-por-defecto-en-campos-de-struct--resuelto)
   - [3.75 `db.<c>.upsert(matchFn, insertValue, updateFn)` — RESUELTO](#375-dbcupsertmatchfn-insertvalue-updatefn--resuelto)
   - [3.76 `db.<c>.insertMany(items)` — RESUELTO](#376-dbcinsertmanyitems--resuelto)
+  - [3.77 `createdAt`/`updatedAt` automáticos: `= now()` + `@autoUpdate` — RESUELTO](#377-createdatupdatedat-automáticos--now--autoupdate--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3807,6 +3808,51 @@ test "insertMany inserta cada item y devuelve las filas con id real asignado" {
 - **No es una sentencia SQL batch real.** `insertMany([a, b, c])` ejecuta 3 `INSERT` separados, no un `INSERT ... VALUES (...), (...), (...)` de una sola sentencia -- el ahorro es de round-trips HTTP del cliente, no de round-trips a la base de datos.
 
 **Verificado**: 3 tests en `checker.rs` (tipa limpio con una lista del shape insertable, rechaza una lista de tipo equivocado, rechaza 0 argumentos) y 1 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (las 3 filas se insertan con ids reales y distintos, en el orden dado, y quedan persistidas de verdad -- confirmado leyéndolas de vuelta con `all()` en una llamada aparte). Verificado también a mano contra un servidor HTTP real (`curl`): tres títulos mandados en un solo `insertMany`, tres filas con id 1/2/3 en la respuesta.
+
+---
+
+### 3.77 `createdAt`/`updatedAt` automáticos: `= now()` + `@autoUpdate` — RESUELTO
+
+Fijar cuándo se creó una fila y cuándo se tocó por última vez es casi universal en cualquier tabla real -- hasta esta ronda, cada `rpc` de creación/edición tenía que asignar esos dos campos a mano, con el riesgo real de que alguien se olvide de tocar `updatedAt` en un `applyPatch` nuevo. La solución NO es una anotación mágica de campo por nombre (`createdAt`/`updatedAt` no son nombres reservados en ningún lado) -- es la COMPOSICIÓN de dos primitivas ya existentes, más una anotación chica y explícita para la única parte que de verdad faltaba.
+
+<!-- linkc:check -->
+```rust
+type Task = {
+  id: Int,
+  title: String,
+  createdAt: Timestamp = now(),
+  @autoUpdate updatedAt: Timestamp = now(),
+}
+type NewTask = {
+  title: String,
+  createdAt: Timestamp = now(),
+  @autoUpdate updatedAt: Timestamp = now(),
+}
+
+db { tasks: Task[] }
+
+service Tasks {
+  rpc create(title: String) -> Task {
+    db.tasks.insert(NewTask { title: title })
+  }
+  rpc rename(id: Int, patch: Patch<Task>) -> Task {
+    db.tasks.applyPatch(id, patch)
+  }
+}
+```
+
+**`createdAt` no necesita nada nuevo -- ya funcionaba con lo que esta sesión ya había agregado.** `now() -> Timestamp` (builtin sin receptor) más un valor por defecto de campo (`= now()`, GRAMMAR.md §3.74) alcanzan solos: un `NewTask { title: title }` que omite `createdAt` ya lo completa al construirse, sin ninguna anotación de por medio. Esto es a propósito -- componer primitivas chicas ya existentes en vez de agregar una anotación redundante que hiciera lo mismo.
+
+**`@autoUpdate` es la única pieza genuinamente nueva, y solo hace falta para "tocar en CADA actualización".** Un default (`= now()`) se completa una sola vez, al CONSTRUIR el literal -- no vuelve a correr en un `applyPatch` posterior, porque `applyPatch` nunca construye un literal nuevo, solo aplica un `Patch<T>` ya decodificado. `@autoUpdate` sobre un campo `Timestamp` (nada más -- `Int`/`Bool`/etc. es un error de compilación) hace que ESE campo se pise a `now()` en CADA `applyPatch` -- y en el paso de actualización de `upsert` (§3.75), que internamente usa el mismo mecanismo -- sin importar qué traiga el patch para ese campo, incluso si el patch ni lo menciona. Interceptado en `runtime::call_method` (no en `db.rs::Db::call`, que no tiene acceso al checker) justo antes de aplicar el patch de verdad.
+
+**`createdAt` nunca se toca después del insert -- ni con `@autoUpdate`, ni sin él.** Ninguna de las dos primitivas usadas para `createdAt` (el default, la ausencia de `@autoUpdate`) hace que se reescriba en un `applyPatch` -- si el patch trae un valor para `createdAt`, ese valor se aplica tal cual (mismo comportamiento que cualquier otro campo escribible), pero nada lo fuerza a cambiar solo. Si además se quisiera que `createdAt` fuera literalmente INMUTABLE (rechazar incluso un intento explícito de cambiarlo), eso queda para un ítem aparte (constraints declarativos, PLAN.md §9.3).
+
+**Límites honestos:**
+- **Sin nombres de campo mágicos.** `@autoUpdate` funciona sobre CUALQUIER campo `Timestamp`, no solo uno llamado `updatedAt` -- y a la inversa, un campo llamado `updatedAt` sin la anotación NO se comporta especial. La automatización es siempre explícita.
+- **`createdAt`/`updatedAt` (o los nombres que sean) siguen siendo columnas SQL normales, sin `DEFAULT`/trigger propio.** Mismo límite ya documentado para los defaults de campo en general (§3.74) -- todo pasa por el intérprete, nunca por la base.
+- **`@autoUpdate` no distingue "el patch no traía nada más" de "el patch traía otros campos" -- siempre pisa, sin excepción.** Un `applyPatch(id, {})` (patch vacío, sin campos) IGUAL toca `updatedAt` -- no hay forma de "aplicar un patch sin que cuente como una actualización".
+
+**Verificado**: 4 tests en `checker.rs` (`@autoUpdate` sobre `Timestamp` tipa limpio, se rechaza sobre otro tipo, no exige un default a la vez, una segunda `@autoUpdate` en el mismo campo es error de parser) y 2 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (un campo `Timestamp = now()` se completa solo al insertar, y `@autoUpdate` pisa el campo en un `applyPatch` real aunque el patch mandado NO lo mencione, mientras `createdAt` -- sin la anotación -- se mantiene idéntico antes y después). Verificado también a mano contra un servidor HTTP real (`curl`, con un `sleep` real entre las dos llamadas): `createdAt` idéntico en las dos respuestas, `updatedAt` con un timestamp distinto y posterior en la segunda.
 
 ---
 

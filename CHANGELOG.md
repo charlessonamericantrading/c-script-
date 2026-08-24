@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.42.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`createdAt`/`updatedAt` automáticos: `= now()` + `@autoUpdate`.** Fijar cuándo se creó una fila y cuándo se tocó por última vez es casi universal en cualquier tabla real -- hasta esta ronda, cada rpc de creación/edición lo asignaba a mano, con el riesgo real de olvidarse de tocar `updatedAt` en un `applyPatch` nuevo. Sin ninguna anotación mágica por nombre de campo (`createdAt`/`updatedAt` no son nombres reservados en ningún lado): "asignado una sola vez al crear" ya se resolvía SOLO componiendo dos primitivas ya existentes -- `now() -> Timestamp` (builtin sin receptor) más un valor por defecto de campo (`= now()`, v1.39.0) -- sin agregar nada nuevo. La única pieza genuinamente nueva es `@autoUpdate`, una anotación de campo (solo sobre `Timestamp`) que pisa ese campo a `now()` en CADA `applyPatch`/`upsert`-actualización, sin importar qué traiga el patch para ese campo -- interceptado en `runtime::call_method` (no en `db.rs::Db::call`, que no tiene acceso al checker) justo antes de aplicar el patch de verdad, mismo punto que ya usan `findWhere`/`deleteWhere`. `createdAt` (sin `@autoUpdate`) nunca se toca solo después del insert.
+
+750 tests (6 nuevos): 4 en `checker.rs` (`@autoUpdate` sobre `Timestamp` tipa limpio, se rechaza sobre otro tipo, no exige un default a la vez, una segunda `@autoUpdate` en el mismo campo es error de parser) y 2 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (un campo `Timestamp = now()` se completa solo al insertar, y `@autoUpdate` pisa el campo en un `applyPatch` real aunque el patch NO lo mencione, mientras `createdAt` -- sin la anotación -- se mantiene idéntico). Verificado también a mano contra un servidor HTTP real (`curl`, con un `sleep` real entre las dos llamadas): `createdAt` idéntico en las dos respuestas, `updatedAt` con timestamp distinto y posterior en la segunda. Detalle completo: GRAMMAR.md §3.77.
+
 ## [1.41.0] - 2026-08-24
 
 ### ✨ Nuevo

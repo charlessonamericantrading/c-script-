@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.41.0-blue.svg" alt="Versión" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.42.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 744 pruebas automáticas:
+**Funciona hoy**, cubierto por 750 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `createdAt`/`updatedAt` automáticos: sin nombres de campo mágicos -- `createdAt: Timestamp = now()` (un default ya existente combinado con el builtin `now()` ya existente) ya cubre "asignado una sola vez al crear". `@autoUpdate` sobre un campo `Timestamp` (solo) es la única pieza nueva -- fuerza ese campo a `now()` en cada `applyPatch`/`upsert`-actualización, aunque el patch no lo mencione, mientras un campo sin la anotación nunca se toca solo
 - `db.<c>.insertMany(items) -> T[]`: cada elemento pasa por el mismo `insert` real de siempre (una sentencia SQL autocommit por fila), en el orden dado -- ahorra las N idas y vueltas HTTP secuenciales del cliente para un backfill, no el costo de N inserts contra la base. Sin transacción envolvente: si el ítem 3 de 5 falla, los dos primeros quedan insertados igual
 - `db.<c>.upsert(matchFn, insertValue, updateFn)`: actualizar-en-el-lugar-o-insertar sin reimplementar a mano buscar+borrar+reinsertar (que ni siquiera preserva el id de la fila con un autoincrement real). `matchFn` recorre toda la colección en el intérprete (mismo límite que `findWhere`/`deleteWhere` -- no empujado a SQL todavía); con match, `updateFn` recibe la fila existente completa y su resultado se aplica sobre ESE MISMO id. `updateFn` devuelve un valor `Omit<T,"id">` completo, no un `Patch<T>` parcial -- deliberado, ya que `Patch<T>` no tiene sintaxis de literal y no se podría construir adentro de un cuerpo de función
 - Valores por defecto en campos de struct: `status: String = "pending"` -- misma sintaxis y mecanismo que un default de parámetro de función/rpc. Un campo con default se puede omitir de un literal `Struct { ... }` sin volverse `Optional` -- sigue siendo el mismo tipo declarado. Lo completa el intérprete al construir, evaluado de nuevo cada vez (`token: Uuid = crypto.uuid()` da un valor distinto por literal, no uno cacheado). Se propaga como campo opcional a `contract.d.ts`/`schemas.ts` (Zod), y fuera de `required` en `openapi.json` (más un valor `"default"` literal cuando es una constante simple). Sin acceso a otros campos del mismo literal, y sin soporte todavía en un `type` genérico
