@@ -1285,6 +1285,7 @@ db { users: User[] }
             }
             "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.select_grouped(collection, columns, method, &args).map(Value::List),
             "maxRow" | "minRow" => self.top_row(collection, columns, method, &args),
+            "increment" => self.increment(collection, columns, args),
             "find" => {
                 let id = as_int(args.first().ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?)?;
                 Ok(self.select_rows(collection, columns, Some(id))?.into_iter().next().unwrap_or(Value::Null))
@@ -1854,6 +1855,42 @@ db { users: User[] }
             Some(cells) => self.row_to_fields(collection, &cells, columns).map(Value::Struct),
             None => Ok(Value::Null),
         }
+    }
+
+    /// `db.<c>.increment(id, selector, delta) -> T` (GRAMMAR.md §3.105): un
+    /// `UPDATE "t" SET "campo" = "campo" + ? WHERE "id" = ?` atómico -- SIN
+    /// ida y vuelta de lectura previa, a diferencia de `upsert` con un
+    /// `updateFn` que lee `existing.campo + delta` (dos procesos
+    /// incrementando la MISMA fila a la vez pueden perder un incremento
+    /// ahí -- lost-update real, encontrado en `bandit_rewards.link`/
+    /// `bot_defense.link`/`banners.link` de IgnisLove, corriendo varios
+    /// `linkc serve-all`/pm2 compartiendo un único Postgres). Mismo criterio
+    /// de "no encontrado" que `applyPatch`: reconsulta por id después del
+    /// `UPDATE` -- 0 filas afectadas y 0 filas en la reconsulta es la MISMA
+    /// señal, "no existe ninguna fila con ese id", sin necesitar un chequeo
+    /// aparte antes de escribir.
+    fn increment(&self, collection: &str, columns: &[ColumnPlan], args: Vec<Value>) -> Result<Value, RuntimeError> {
+        let mut it = args.into_iter();
+        let id = as_int(&it.next().ok_or_else(|| RuntimeError::new("increment requiere 3 argumentos (id, selector, delta)"))?)?;
+        let selector = it.next();
+        let field = closure_field_name(selector.as_ref(), "a incrementar")?;
+        let delta = as_int(&it.next().ok_or_else(|| RuntimeError::new("increment requiere 3 argumentos (id, selector, delta)"))?)?;
+        if !columns.iter().any(|c| c.field.name == field) {
+            return Err(RuntimeError::new(format!("'increment': '{field}' no es una columna real de '{collection}'")));
+        }
+        let sql = format!(
+            "UPDATE \"{collection}\" SET \"{field}\" = \"{field}\" + {} WHERE \"id\" = {}",
+            self.backend.placeholder(1),
+            self.backend.placeholder(2)
+        );
+        self.backend.execute(&sql, &[Cell::Int(delta), Cell::Int(id)]).map_err(|e| write_error("increment", e))?;
+        let updated = self
+            .select_rows(collection, columns, Some(id))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con id {id} en '{collection}'")))?;
+        self.publish(collection, &updated);
+        Ok(updated)
     }
 
     /// Reconstruye una fila entera (`"id"` + cada columna declarada) como los

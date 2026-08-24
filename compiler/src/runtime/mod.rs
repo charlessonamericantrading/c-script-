@@ -5644,6 +5644,49 @@ mod tests {
         assert_eq!(result, json!(null));
     }
 
+    // GRAMMAR.md §3.105: `db.<c>.increment(id, selector, delta) -> T` -- un
+    // `UPDATE campo = campo + delta` atómico, sin ida y vuelta de lectura
+    // previa (a diferencia de `upsert` con un `updateFn` que sí lee primero
+    // -- el patrón que puede perder un incremento entre dos procesos, el
+    // caso real de IgnisLove que motiva esto).
+
+    #[test]
+    fn increment_adds_delta_atomically_including_negative_deltas() {
+        let code = r#"
+            type Counter = { id: Int, name: String, hits: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc create(name: String) -> Counter { db.counters.insert(Counter { id: 0, name: name, hits: 10 }) }
+                rpc bump(id: Int, delta: Int) -> Counter { db.counters.increment(id, |c: Counter| { c.hits }, delta) }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "create", &json!({"name": "views"}), &db).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let bumped = invoke_rpc(&program, "S", "bump", &json!({"id": id, "delta": 5}), &db).unwrap();
+        assert_eq!(bumped["hits"], json!(15));
+
+        let decremented = invoke_rpc(&program, "S", "bump", &json!({"id": id, "delta": -3}), &db).unwrap();
+        assert_eq!(decremented["hits"], json!(12));
+    }
+
+    #[test]
+    fn increment_on_a_missing_id_is_a_clean_error() {
+        let code = r#"
+            type Counter = { id: Int, hits: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(id: Int) -> Counter { db.counters.increment(id, |c: Counter| { c.hits }, 1) }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let err = invoke_rpc(&program, "S", "bump", &json!({"id": 999}), &db).unwrap_err();
+        assert!(format!("{err:?}").contains("no hay ningún elemento con id"), "{err:?}");
+    }
+
     #[test]
     fn count_by_on_an_enum_field_returns_the_real_enum_variant_as_key() {
         // Verificación de valor exacto, no solo longitud -- confirma que

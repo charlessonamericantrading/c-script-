@@ -527,6 +527,70 @@ service Arms {{
     assert_eq!(worst["name"], serde_json::json!("A"), "{worst}");
 }
 
+/// GRAMMAR.md §3.105: `db.<c>.increment` es un `UPDATE campo = campo +
+/// delta` atómico -- SIN ida y vuelta de lectura previa. La prueba real de
+/// que esto arregla el lost-update reportado (IgnisLove, varios procesos
+/// incrementando la MISMA fila a la vez) es exactamente esta: muchos
+/// hilos, cada uno con su PROPIA conexión HTTP, incrementando el mismo
+/// contador en simultáneo contra un Postgres real -- si `increment`
+/// hiciera read-then-write (como el `upsert` con `updateFn` que este
+/// método reemplaza en los `.link` reales), esta concurrencia perdería
+/// incrementos con altísima probabilidad. Con el `UPDATE` atómico, el
+/// total final tiene que ser EXACTO, siempre.
+#[test]
+fn increment_never_loses_an_update_under_real_concurrent_writers() {
+    const COLLECTION: &str = "counters_concurrent_increment";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("concurrent-increment");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Counter = {{ id: Int, hits: Int }}
+db {{ {COLLECTION}: Counter[] }}
+service Counters {{
+  rpc create() -> Counter {{ db.{COLLECTION}.insert(Counter {{ id: 0, hits: 0 }}) }}
+  rpc bump(id: Int) -> Counter {{ db.{COLLECTION}.increment(id, |c: Counter| {{ c.hits }}, 1) }}
+  rpc get(id: Int) -> Counter? {{ db.{COLLECTION}.find(id) }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    let created = server.rpc("Counters/create", "{}");
+    let id = created["id"].as_i64().expect("insert devuelve un id");
+
+    const THREADS: usize = 20;
+    const BUMPS_PER_THREAD: usize = 25;
+    let port = server.port;
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(move || {
+                for _ in 0..BUMPS_PER_THREAD {
+                    let body = format!(r#"{{"id":{id}}}"#);
+                    ureq::post(&format!("http://127.0.0.1:{port}/Counters/bump"))
+                        .set("Content-Type", "application/json")
+                        .send_string(&body)
+                        .unwrap_or_else(|e| panic!("Counters/bump falló: {e}"));
+                }
+            });
+        }
+    });
+
+    let result = server.rpc("Counters/get", &format!(r#"{{"id":{id}}}"#));
+    assert_eq!(
+        result["hits"],
+        serde_json::json!((THREADS * BUMPS_PER_THREAD) as i64),
+        "increment tiene que ser atómico -- ni un solo +1 de {} debería perderse: {result}",
+        THREADS * BUMPS_PER_THREAD
+    );
+}
+
 const INT64_AGGREGATE_PROGRAM: &str = r#"
 type Sale = { id: Int, region: Int64, amount: Int64 }
 type RegionTotal = { key: Int64, value: Int64 }

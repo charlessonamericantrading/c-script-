@@ -3650,6 +3650,7 @@ impl Checker {
             }
             "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.check_aggregate_by(element_ty, method, args, env),
             "maxRow" | "minRow" => self.check_top_row(element_ty, method, args, env),
+            "increment" => self.check_increment(element_ty, method, args, env),
 
             // GRAMMAR.md §3.75. `updateFn` devuelve `Omit<T,"id">` (un
             // VALOR completo), no `Patch<T>` -- a propósito: `Patch<T>` no
@@ -3693,7 +3694,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/increment/subscribe)"
             ))),
         }
     }
@@ -3895,6 +3896,31 @@ impl Checker {
             )));
         }
         Ok(Type::Optional(Box::new(element_ty.clone())))
+    }
+
+    /// `db.<c>.increment(id, selector, delta) -> T` (GRAMMAR.md §3.105):
+    /// mismo shape de selector (`field_selector`) que `maxRow`/`minRow`, pero
+    /// acá el campo tiene que ser ESCRIBIBLE de verdad -- `UPDATE "campo" =
+    /// "campo" + ?` en runtime. Alcance deliberadamente acotado a `Int` en
+    /// esta ronda -- `Int64`/`Float` quedan afuera a propósito: los casos
+    /// reales que motivaron esto (contadores como `totalPulls`/
+    /// `requestCount`) son todos `Int`, y ampliar el alcance sin evidencia
+    /// real de demanda sería adivinar. Devuelve `T` (no `T?`) -- un `id` que
+    /// no existe es un error claro en runtime, mismo criterio que
+    /// `applyPatch`.
+    fn check_increment(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
+        let [id_arg, selector_arg, delta_arg] = args else {
+            return Err(err(format!("'{method}' toma exactamente 3 argumentos (id: Int, selector: |item: T| item.campo, delta: Int)")));
+        };
+        self.check_expr(id_arg, &Type::Int, env)?;
+        let (field_name, field_ty) = self.field_selector(element_ty, selector_arg, method, "a incrementar")?;
+        if !matches!(field_ty, Type::Int) {
+            return Err(err(format!(
+                "'{method}': el campo '{field_name}' es {field_ty} -- en esta ronda solo aplica sobre Int (Int64/Float quedan deliberadamente afuera, GRAMMAR.md §3.105)"
+            )));
+        }
+        self.check_expr(delta_arg, &Type::Int, env)?;
+        Ok(element_ty.clone())
     }
 
     fn expect_no_args(&self, args: &[Spanned<Expr>], method: &str) -> Result<(), CheckError> {
@@ -6450,6 +6476,71 @@ type T = { id: Int, s: Status }")
         "#;
         let msg = format!("{:?}", check_source(src).unwrap_err());
         assert!(msg.contains("toma exactamente 1 argumento"), "{msg}");
+    }
+
+    // GRAMMAR.md §3.105: `db.<c>.increment(id, selector, delta) -> T`.
+
+    #[test]
+    fn increment_returns_the_element_type_not_optional() {
+        let src = r#"
+            type Counter = { id: Int, hits: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(id: Int) -> Counter { db.counters.increment(id, |c: Counter| { c.hits }, 1) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn increment_rejects_an_int64_field() {
+        let src = r#"
+            type Counter = { id: Int, hits: Int64 }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(id: Int) -> Counter { db.counters.increment(id, |c: Counter| { c.hits }, 1) }
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("deliberadamente afuera"), "{msg}");
+    }
+
+    #[test]
+    fn increment_rejects_a_float_delta() {
+        let src = r#"
+            type Counter = { id: Int, hits: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(id: Int) -> Counter { db.counters.increment(id, |c: Counter| { c.hits }, 1.5) }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn increment_rejects_a_derived_expression_as_the_selector() {
+        let src = r#"
+            type Counter = { id: Int, hits: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(id: Int) -> Counter { db.counters.increment(id, |c: Counter| { c.hits + 1 }, 1) }
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("selector de campo"), "{msg}");
+    }
+
+    #[test]
+    fn increment_takes_exactly_three_arguments() {
+        let src = r#"
+            type Counter = { id: Int, hits: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(id: Int) -> Counter { db.counters.increment(id, |c: Counter| { c.hits }) }
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("toma exactamente 3 argumentos"), "{msg}");
     }
 
     #[test]

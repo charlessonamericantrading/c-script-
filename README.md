@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-912-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.67.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-920-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.68.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 912 automated tests:
+**Works today**, covered by 920 automated tests:
 
 - `linkc build` / `serve` / `serve-all` / `migrate --dry-run` / `doctor` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `db.<c>.increment(id, selector, delta) -> T`: an atomic `UPDATE "field" = "field" + ?`, no prior read — fixes a real lost-update risk (two processes reading the same value before either writes back) that `upsert` with a read-then-write `updateFn` has under real concurrency. `delta` negative decrements. Scoped to `Int` for now
 - `db.<c>.maxRow(selector)` / `minRow(selector) -> T?`: the full row with the max/min of a numeric field, pushed to a real `ORDER BY ... LIMIT 1` — unlike `maxBy`/`minBy`, which only aggregate a value, never the whole row that reaches it
 - `List<Int>.sum() -> Int`: sums every element with a real loop — `List<Int64>`/`List<Float>` are deliberately out of scope for now (an empty list of either has no element to read the right `Value` tag from at runtime, and guessing wrong there would be a silent wire-format bug, since `Int64` serializes as a string and `Int` as a number)
 - `linkc doctor <file> [--db <url|file>]`: environment diagnostics before a deployment — the `linkc` version, that the entry file resolves its imports/parses/type-checks, write permission in its directory, and read-only connectivity (`SELECT 1`, never any DDL) to the configured database. Prints a checklist and exits `1` if any real check failed, meant for a CI gate before `linkc serve`

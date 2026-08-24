@@ -126,6 +126,7 @@
   - [3.102 `db.<c>.maxRow(selector)`/`minRow(selector) -> T?` — RESUELTO](#3102-dbcmaxrowselectorminrowselector---t--resuelto)
   - [3.103 `Float` decodifica `numeric`/`decimal` nativo de Postgres — RESUELTO](#3103-float-decodifica-numericdecimal-nativo-de-postgres--resuelto)
   - [3.104 Escribir un `Int` contra una columna Postgres no-`BIGINT` (`SERIAL`/`SMALLINT`) — RESUELTO](#3104-escribir-un-int-contra-una-columna-postgres-no-bigint-serialsmallint--resuelto)
+  - [3.105 `db.<c>.increment(id, selector, delta) -> T` — RESUELTO, alcance acotado](#3105-dbcincrementid-selector-delta---t--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -812,7 +813,7 @@ fn makeUser(input: NewUser) -> NewUserRecord {
 // db.users.insert(makeUser(input)) -- NewUserRecord <: Omit<User,"id"> por subtipado estructural
 ```
 
-**Métodos:** `all() -> T[]`, `find(id: Int) -> T?`, `insert(x: Omit<T,"id">) -> T`, `insertMany(items: Omit<T,"id">[]) -> T[]` (§3.76), `applyPatch(id: Int, p: Patch<T>) -> T`, `findWhere(f: (T) -> Bool) -> T[]`, `deleteWhere(f: (T) -> Bool) -> Int`, `count() -> Int`, `page(limit: Int, offset: Int) -> T[]`, `pageAfter(cursor: Int?, limit: Int) -> T[]`, `upsert(matchFn: (T) -> Bool, insertValue: Omit<T,"id">, updateFn: (T) -> Omit<T,"id">) -> T` (§3.75), `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`, `maxRow`/`minRow` (§3.102) — resueltos contra el tipo de elemento de verdad (`Type::DbCollection`, checker.rs). Un nombre de colección o de método desconocido ya es un error del checker (`db.usres.fnid(1)`, con AMBOS typo'd, se rechaza en tiempo de chequeo), no algo que se descubre recién en runtime.
+**Métodos:** `all() -> T[]`, `find(id: Int) -> T?`, `insert(x: Omit<T,"id">) -> T`, `insertMany(items: Omit<T,"id">[]) -> T[]` (§3.76), `applyPatch(id: Int, p: Patch<T>) -> T`, `findWhere(f: (T) -> Bool) -> T[]`, `deleteWhere(f: (T) -> Bool) -> Int`, `count() -> Int`, `page(limit: Int, offset: Int) -> T[]`, `pageAfter(cursor: Int?, limit: Int) -> T[]`, `upsert(matchFn: (T) -> Bool, insertValue: Omit<T,"id">, updateFn: (T) -> Omit<T,"id">) -> T` (§3.75), `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`, `maxRow`/`minRow` (§3.102), `increment` (§3.105) — resueltos contra el tipo de elemento de verdad (`Type::DbCollection`, checker.rs). Un nombre de colección o de método desconocido ya es un error del checker (`db.usres.fnid(1)`, con AMBOS typo'd, se rechaza en tiempo de chequeo), no algo que se descubre recién en runtime.
 
 **Runtime: en memoria al principio, generalizado.** `runtime/db.rs`'s `Db` pasó de estar hardcodeado a una única colección `"users"` a un `HashMap` con una entrada por colección declarada. Se eliminó el hack que le ponía un default a `deletedAt` en `insert` — bajo la regla `Omit<T,"id">`, `deletedAt` (requerido, nullable) es un campo obligado del argumento; quien inserta pasa `deletedAt: null` explícito, consistente con "sin coerción implícita en ningún lado" (§3.7). **Actualización: RESUELTO.** El storage detrás ya no es en memoria -- ver §3.17: `Db` corre sobre SQLite real, con persistencia genuina entre reinicios de `linkc serve`.
 
@@ -4703,6 +4704,32 @@ Encontrado auditando por qué CI llevaba varios pushes seguidos en rojo sin que 
 - Un test de `linkc introspect` (§3.66) reusaba el `db {{ ... }}` COMPLETO del introspect de la base entera como programa a correr -- como introspect escanea TODA la base y `cargo test` no serializa los tests por default, una tabla de OTRO test corriendo en paralelo (con un `id UUID`, rechazado a propósito por §3.36) se colaba y hacía fallar la conexión. Se corrigió para extraer solo el tipo relevante del output y armar un programa acotado a mano.
 
 **Nota de proceso, la más importante de esta sección**: estos cinco bugs (uno de producto, cuatro de tests) llevaban en rojo desde v1.58.0 como mínimo -- **~10 versions consecutivas pusheadas sin que ninguna verificación real de esta sesión los hubiera detectado**, porque nunca se corrió `pg_integration.rs` contra un Postgres real localmente (el entorno de desarrollo no tenía uno disponible) y nadie chequeó el estado de CI en GitHub después de cada push. El snapshot `examples/users.link.snap` (que embebe el número de versión exacto) también llevaba desde v1.48.0 sin regenerar, rompiendo el mismo job por un motivo aparte. Ambos indican el mismo hueco de proceso: "tests verdes localmente" y "CI verde" no son lo mismo, y solo el segundo es la promesa real. Corregido yendo hacia adelante: verificar contra Postgres real cuando esté disponible, y confirmar el estado de CI (`gh run list`) después de pushear, no asumirlo.
+
+---
+
+### 3.105 `db.<c>.increment(id, selector, delta) -> T` — RESUELTO, alcance acotado
+
+PLAN.md §9.3, gap nuevo encontrado analizando IgnisLove en profundidad, **con un riesgo de producción real y confirmado como evidencia (lost-update, no un bug ya materializado sino uno estructuralmente posible en la topología real de este adoptador)**. Sin una forma atómica de incrementar un campo, tres `.link` (`bandit_rewards`, `bot_defense`, `banners`) hacían read-then-write manual -- `upsert` con un `updateFn` que lee `existing.campo + 1` -- para contadores (`totalPulls`, `requestCount`, `impressionsCount`/`clicksCount`). En la topología real de este adoptador (varios procesos `linkc serve-all`/pm2 compartiendo un único Postgres, confirmado en `server/cscript-gateway.ts`), dos procesos pueden leer el mismo valor antes de que el otro escriba y perder un incremento -- el `updateFn` de `upsert` corre en el INTÉRPRETE, no dentro de una transacción SQL, así que no hay nada que lo proteja.
+
+```
+type Counter = { id: Int, hits: Int }
+
+service Analytics {
+  rpc bump(id: Int) -> Counter { db.counters.increment(id, |c: Counter| { c.hits }, 1) }
+}
+```
+
+**Un `UPDATE "campo" = "campo" + ?` real, sin ninguna lectura previa.** A diferencia de `upsert`/`applyPatch` (que arman el nuevo valor en Rust y lo mandan como literal), acá el incremento pasa DENTRO de la sentencia SQL -- la atomicidad la da el propio motor (row-level locking de una `UPDATE`), no ningún mecanismo de c-script. `delta` negativo decrementa -- no hay un método `decrement` aparte, sería la misma sentencia con el signo dado vuelta.
+
+**Mismo shape reconocido que `maxRow`/`minRow`/`maxBy`/`minBy` (`field_selector`), pero acá el campo tiene que ser escribible de verdad.** Alcance deliberadamente acotado a `Int` en esta ronda -- `Int64`/`Float` quedan afuera a propósito: los casos reales que motivan esto son todos contadores `Int`, y no hay ninguna barrera técnica que lo impida (a diferencia de `List<Int>.sum()`, §3.101, acá no hay ambigüedad de tipo posible -- el tipo de columna siempre se conoce estáticamente vía `ColumnPlan`), pero ampliar sin evidencia real de demanda sería adivinar.
+
+**`id` que no existe es un error claro, mismo criterio que `applyPatch`.** El `UPDATE` sobre un `id` inexistente afecta 0 filas silenciosamente (comportamiento normal de SQL); la reconsulta por `id` inmediatamente después es la que detecta "no existe" y falla con un mensaje que nombra el `id` y la colección -- un solo camino para los dos casos, sin necesitar un chequeo de existencia previo.
+
+**Composición gratis con features existentes, sin código nuevo.** Un `@check(min/max/range, ...)` en el campo incrementado se sigue enforceando -- el `UPDATE` pasa por la MISMA base con el MISMO `CHECK` inline (§3.96), y `write_error` ya traduce esa violación a 400 igual que en `insert`/`applyPatch`. `id` directo (sin filtro de `@softDelete`, §3.78) -- mismo criterio que `find`/`applyPatch`, una fila soft-deleteada sigue siendo alcanzable por `id`.
+
+**Fuera de alcance a propósito, documentado en vez de escondido:** si la colección tiene un campo `@autoUpdate` (§3.77), `increment` NO lo pisa a `now()` -- a diferencia de `applyPatch`/`upsert`, que sí lo hacen. Usar `applyPatch` en su lugar si hace falta actualizar `updatedAt` a la vez que un contador.
+
+**Verificado**: 5 tests en `checker.rs` (tipa devolviendo `T` no `T?`, rechaza `Int64`, rechaza un `delta: Float`, rechaza una expresión derivada como selector, exige exactamente 3 argumentos) + 2 en `runtime/mod.rs` contra un SQLite en memoria real (incremento y decremento correctos; `id` inexistente da un error claro) + **1 en `pg_integration.rs` que es la prueba real del punto entero de esta feature**: 20 hilos, cada uno con su propia conexión HTTP, incrementando la MISMA fila 25 veces cada uno (500 incrementos concurrentes en total) contra un Postgres real -- el conteo final da EXACTO, sin perder ni uno, algo que un `upsert` con `updateFn` de lectura-previa perdería con altísima probabilidad bajo esa misma concurrencia.
 
 ---
 

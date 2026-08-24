@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.68.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`db.<c>.increment(id, selector, delta) -> T`.** Gap encontrado analizando IgnisLove en profundidad, con un riesgo de producción real como evidencia (lost-update estructuralmente posible, no ya materializado): tres `.link` (`bandit_rewards`, `bot_defense`, `banners`) hacían read-then-write manual con `upsert`/`updateFn` para contadores (`totalPulls`, `requestCount`, `impressionsCount`/`clicksCount`) -- en la topología real de este adoptador (varios procesos `linkc serve-all`/pm2 compartiendo un único Postgres), dos procesos pueden leer el mismo valor antes de que el otro escriba y perder un incremento. `increment` hace un `UPDATE "campo" = "campo" + ?` real, sin ninguna lectura previa -- la atomicidad la da el motor (row-level locking de la propia `UPDATE`), no ningún mecanismo de c-script. `delta` negativo decrementa. Alcance acotado a `Int` en esta ronda (Int64/Float deliberadamente afuera, sin evidencia real de demanda). Compone gratis con `@check` (la violación se sigue rechazando a 400) y con `@softDelete` (alcanzable por `id` directo, mismo criterio que `find`/`applyPatch`). `id` inexistente falla con un error claro, mismo criterio que `applyPatch`.
+
+920 tests (8 nuevos): 5 en `checker.rs`, 2 en `runtime/mod.rs` contra un SQLite en memoria real, y **1 en `pg_integration.rs` que es la prueba real del punto entero de esta feature**: 20 hilos, cada uno con su propia conexión HTTP, incrementando la MISMA fila 25 veces cada uno (500 incrementos concurrentes) contra un Postgres real -- el conteo final da EXACTO, sin perder ni uno. Detalle completo: GRAMMAR.md §3.105.
+
 ## [1.67.0] - 2026-08-24
 
 ### 🐛 Arreglado
