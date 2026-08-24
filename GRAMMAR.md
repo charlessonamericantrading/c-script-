@@ -95,6 +95,7 @@
   - [3.71 `@deprecated("motivo")` en un campo o un rpc — RESUELTO](#371-deprecatedmotivo-en-un-campo-o-un-rpc--resuelto)
   - [3.72 Docstrings `///` propagados a OpenAPI y al `.d.ts` — RESUELTO](#372-docstrings--propagados-a-openapi-y-al-dts--resuelto)
   - [3.73 `@validate(email)` / `@validate(regex, "...")` sobre un campo — RESUELTO](#373-validateemail--validateregex--sobre-un-campo--resuelto)
+  - [3.74 Valores por defecto en campos de `struct` — RESUELTO](#374-valores-por-defecto-en-campos-de-struct--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3677,6 +3678,51 @@ test "un email y un codigo validos se aceptan; uno invalido se hubiera rechazado
 - **Sin más formas de validador** (`minLength`, `min`/`max` numérico, `oneOf`) -- solo `email`/`regex`, ampliable a futuro sin romper la forma (`@validate(nombre, ...)` ya es el patrón).
 
 **Verificado**: 8 tests en `checker.rs`/`parser.rs` (tipa limpio con `email`/`regex`, sobre `String?`, sobre un campo de variante de enum; rechaza sobre `Int`, un patrón regex inválido, dos `@validate` en el mismo campo, y una forma desconocida como `@validate(minLength, 3)`), 5 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (email malformado rechazado con 400 en 6 formas distintas y uno válido aceptado, regex rechaza lo que no matchea y acepta lo que sí, un campo opcional ausente no dispara validación pero uno presente sí, **el caso del struct construido adentro del cuerpo del rpc a partir de parámetros sueltos -- el que reveló el gap de `Expr::StructLit` --**, y el límite documentado arriba de que un shape "New\*" sin la anotación repetida no valida nada), 2 en `ts_emit.rs` (comentario JSDoc informativo, combinado con `@deprecated` en un solo bloque), 1 en `openapi_emit.rs` (`format`/`pattern` estándar) y 3 en `zod_emit.rs` (`.email()`, `.regex(new RegExp(...))`, orden correcto ANTES de `.nullable()` sobre un campo opcional). Verificado también a mano contra un servidor HTTP real (`curl`): el bug de `Expr::StructLit` (200 en vez de 400 para un email inválido armado adentro del rpc) se reprodujo primero así, antes de escribir el test que lo fija.
+
+---
+
+### 3.74 Valores por defecto en campos de `struct` — RESUELTO
+
+Hasta esta ronda, un default solo existía en un parámetro de función/rpc (`rpc list(limit: Int = 20)`) -- un campo de `struct` no tenía forma de decir "si no viene, usá este valor", así que cada `rpc` de creación tenía que rellenarlo a mano (`status: "pending"` repetido en cada `NewX { ... }` del proyecto).
+
+<!-- linkc:check -->
+```rust
+type Task = {
+  id: Int,
+  title: String,
+  status: String = "pending",
+}
+type NewTask = { title: String, status: String = "pending" }
+
+db { tasks: Task[] }
+
+service Tasks {
+  rpc create(title: String) -> Task {
+    db.tasks.insert(NewTask { title: title })
+  }
+}
+
+test "un campo con default se completa solo cuando el literal no lo menciona" {
+  let t = Tasks.create("comprar leche");
+  assert(t.status == "pending", "el default se aplico sin que el rpc lo pasara");
+}
+```
+
+**Misma sintaxis y mismo mecanismo que `Param::default`, no una `@annotation`.** `nombre: Tipo = expr`, exactamente como un parámetro de función (§2.2) -- `Field` gana un `default: Option<Spanned<Expr>>` propio, en el mismo lugar del parser que ya sabía leer el default de un `Param`. Un campo CON default puede omitirse de un literal `Struct { ... }` igual que uno `?:` -- pero a diferencia de `?:`, el TIPO del campo no cambia a `Optional`: `status` sigue siendo `String`, nunca `String?`, adentro y afuera del literal.
+
+**El default se evalúa DE NUEVO en cada construcción, no una sola vez.** `token: Uuid = crypto.uuid()` genera un UUID distinto por cada `NewSession { }` -- verificado comparando dos construcciones consecutivas. Mismo entorno de evaluación EXACTO que ya usa `Param::default` (`Env::new()` vacío): un default no ve otros campos del mismo literal ni el entorno que lo rodea, es una expresión autocontenida.
+
+**Enforcement en dos capas, igual que `@validate`.** El CHECKER exige que el default tipe contra el tipo declarado del campo (`x: Int = "hola"` falla en `linkc build`, no en el primer request) Y que un literal que omite un campo SIN default (ni `?:`) siga rechazándose -- el cambio solo relaja la regla para campos que de verdad tienen un default. El INTÉRPRETE completa el valor en `Expr::StructLit`, el mismo punto que ya se tocó para `@validate` (§3.73) -- después de completar los defaults, cualquier `@validate` del mismo campo también corre sobre el valor final, así que un default roto (si el autor se equivoca) igual se detecta.
+
+**Propagado a los tres generados como "campo opcional" -- mismo criterio que un parámetro de rpc con default.** `contract.d.ts` y `schemas.ts` (Zod) marcan el campo `?`/`.optional()`, así que quien construye el objeto del lado TS también puede omitirlo. `openapi.json` lo saca de `required` y, cuando el default es un literal simple (no una llamada como `crypto.uuid()`, que no tiene forma JSON fija sin evaluarla), lo suma como `"default"` -- keyword estándar de JSON Schema.
+
+**Límites honestos:**
+- **Un default no puede referenciar otros campos del mismo literal.** `{ a: Int, b: Int = a + 1 }` no es soportado -- el default se evalúa en un `Env::new()` vacío, no ve `a` (mismo límite que ya tenía `Param::default` para otros parámetros del mismo rpc).
+- **Sin soporte en un `type` genérico.** `type Box<T> = { value: T, tag: String = "x" }` no aplica el default al construir `Box<Int> { value: 1 }` -- esa vía (`check_generic_struct_lit`/`expand_generic_struct`) trabaja con `types::FieldType` ya resuelto, que no conserva `default`. Alcance de esta ronda.
+- **`validators.ts` no se toca.** Las funciones `isX(x): x is X` verifican forma de un valor YA EXISTENTE (típicamente de una respuesta HTTP) -- un default es un concepto de CONSTRUCCIÓN, no de validación de algo externo, así que no hay nada que cambiar ahí (a diferencia de `@validate`, donde sí había un gap real).
+- **Sin `DEFAULT` a nivel de columna SQL.** El valor se completa en el intérprete, ANTES de que la fila llegue a SQLite/Postgres -- la columna generada sigue sin ningún `DEFAULT` propio. Un `INSERT` que bypasee el runtime de Link (una migración manual, por ejemplo) no se beneficia de este default.
+
+**Verificado**: 2 tests en `parser.rs` (`= expr` parsea después del tipo, ausente da `None`), 4 en `checker.rs` (tipa limpio, rechaza un default de tipo equivocado, omitir un campo CON default tipa pero omitir uno SIN default sigue fallando, funciona sobre un campo de variante de enum), 3 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (se completa al construir, un valor explícito lo pisa, `crypto.uuid()` como default dio dos valores DISTINTOS en dos construcciones separadas -- confirma evaluación fresca, no una sola vez), 2 en `ts_emit.rs` (campo con default sale opcional en la interfaz, uno sin default sigue requerido), 2 en `openapi_emit.rs` (`"default"` para un literal simple, ausente pero igual fuera de `required` para `crypto.uuid()`) y 1 en `zod_emit.rs` (`.optional()`). Verificado también a mano contra un servidor HTTP real (`curl`): crear sin mandar el campo devuelve el default, mandándolo explícito lo pisa.
 
 ---
 

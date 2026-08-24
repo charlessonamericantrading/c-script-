@@ -367,7 +367,15 @@ impl Parser {
         };
         self.eat(&TokenKind::Colon)?;
         let ty = self.parse_type_expr()?;
-        Ok(Field { name, optional, ty, name_span, annotations })
+        // `= expr` (GRAMMAR.md §3.74) -- mismo lugar y misma sintaxis que
+        // `Param::default` (`parse_param`), no una `@annotation`.
+        let default = if self.check(&TokenKind::Equals) {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Field { name, optional, ty, name_span, annotations, default })
     }
 
     /// `@deprecated("...")`/`@validate(...)` antes de un campo de struct
@@ -2156,5 +2164,26 @@ mod tests {
         let Item::Service(ServiceDecl { members, .. }) = &prog.items[0] else { panic!() };
         let Member::Rpc(r) = &members[0] else { panic!() };
         assert!(r.doc.is_none());
+    }
+
+    // ---- valores por defecto en campos de struct (GRAMMAR.md §3.74) ----
+
+    #[test]
+    fn a_field_default_parses_after_the_type() {
+        let src = r#"type Task = { title: String, status: String = "pending" }"#;
+        let prog = parse_source(src);
+        let Item::Type(t) = &prog.items[0] else { panic!() };
+        let TypeExpr::Struct(fields) = &t.ty else { panic!() };
+        assert!(fields[0].default.is_none());
+        assert_eq!(fields[1].default.as_ref().unwrap().node, Expr::Str("pending".into()));
+    }
+
+    #[test]
+    fn a_field_without_a_default_has_none() {
+        let src = "type Task = { title: String }";
+        let prog = parse_source(src);
+        let Item::Type(t) = &prog.items[0] else { panic!() };
+        let TypeExpr::Struct(fields) = &t.ty else { panic!() };
+        assert!(fields[0].default.is_none());
     }
 }

@@ -555,15 +555,38 @@ pub(crate) fn eval_expr(
             }
         }
         Expr::StructLit { name, variant, fields } => {
-            let evaluated = fields
+            let mut evaluated = fields
                 .iter()
                 .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, checker, sessions, current_token, step_budget)?)))
                 .collect::<Result<Vec<_>, RuntimeError>>()?;
+            let ast_fields = field_annotations_for(checker, name, variant.as_deref());
+            // `= expr` (GRAMMAR.md §3.74): un campo con default que el
+            // literal fuente NO mencionó se completa acá -- el checker ya
+            // garantizó que el default tipa contra el campo
+            // (`check_field_defaults`), así que evaluarlo no puede producir
+            // algo que rompa el `Value::Struct`/`Value::Variant` resultante.
+            // `Env::new()` vacío, MISMO criterio que ya usa el default de un
+            // parámetro de función/rpc más abajo (ver el otro `Env::new()`
+            // en este archivo) -- un default no ve otros campos del mismo
+            // literal ni el entorno que lo rodea.
+            if let Some(fs) = ast_fields {
+                for f in fs {
+                    if evaluated.iter().any(|(n, _)| n == &f.name) {
+                        continue;
+                    }
+                    if let Some(default) = &f.default {
+                        let v = eval_expr(default, &Env::new(), db, fns, checker, sessions, current_token, step_budget)?;
+                        evaluated.push((f.name.clone(), v));
+                    }
+                }
+            }
             // `@validate(...)` (GRAMMAR.md §3.73): acá, no solo en el
             // decode del wire -- ver `apply_field_validators` para por qué
-            // este es el punto que de verdad cubre el caso común.
-            if let Some(ast_fields) = field_annotations_for(checker, name, variant.as_deref()) {
-                apply_field_validators(ast_fields, &Value::Struct(evaluated.clone()), name)?;
+            // este es el punto que de verdad cubre el caso común. Después
+            // de completar los defaults, así un default también se valida
+            // (nada obliga a que el default del autor sea válido).
+            if let Some(fs) = ast_fields {
+                apply_field_validators(fs, &Value::Struct(evaluated.clone()), name)?;
             }
             match variant {
                 Some(v) => {
@@ -3595,6 +3618,66 @@ mod tests {
         let db = Db::new(&program, std::path::Path::new(":memory:"));
         let result = invoke_rpc(&program, "S", "register", &json!({"email": "not-an-email"}), &db);
         assert!(result.is_ok(), "documenta el límite: sin @validate en NewSignup, no hay nada que lo rechace");
+    }
+
+    // ---- valores por defecto en campos de struct (GRAMMAR.md §3.74) ----
+
+    #[test]
+    fn a_struct_literal_omitting_a_defaulted_field_fills_it_in_at_construction() {
+        let program = program_from(
+            r#"
+            type Task = { id: Int, title: String, status: String = "pending" }
+            type NewTask = { title: String, status: String = "pending" }
+            db { tasks: Task[] }
+            service S {
+                rpc create(title: String) -> Task { db.tasks.insert(NewTask { title: title }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "create", &json!({"title": "comprar leche"}), &db).unwrap();
+        assert_eq!(created["status"], json!("pending"));
+        assert_eq!(created["title"], json!("comprar leche"));
+    }
+
+    #[test]
+    fn an_explicit_value_overrides_the_field_default() {
+        let program = program_from(
+            r#"
+            type Task = { id: Int, title: String, status: String = "pending" }
+            type NewTask = { title: String, status: String = "pending" }
+            db { tasks: Task[] }
+            service S {
+                rpc create(title: String, status: String) -> Task {
+                    db.tasks.insert(NewTask { title: title, status: status })
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "create", &json!({"title": "urgente", "status": "active"}), &db).unwrap();
+        assert_eq!(created["status"], json!("active"));
+    }
+
+    /// El default se EVALÚA de nuevo en cada construcción, no una sola vez
+    /// -- probado con `crypto.uuid()` (no-constante): dos literales
+    /// separados, sin dar el campo, tienen que salir con valores DISTINTOS.
+    #[test]
+    fn a_non_constant_default_is_evaluated_fresh_on_each_construction() {
+        let program = program_from(
+            r#"
+            type Session = { id: Int, token: Uuid = crypto.uuid() }
+            type NewSession = { token: Uuid = crypto.uuid() }
+            db { sessions: Session[] }
+            service S {
+                rpc create() -> Session { db.sessions.insert(NewSession { }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let a = invoke_rpc(&program, "S", "create", &json!({}), &db).unwrap();
+        let b = invoke_rpc(&program, "S", "create", &json!({}), &db).unwrap();
+        assert_ne!(a["token"], b["token"], "cada construcción evalúa su propio default");
     }
 
     // ---- validación tipada del borde (auditoría) ----

@@ -736,15 +736,21 @@ impl Checker {
                         errors.push(e);
                     }
                 }
-                // `@validate(...)` (GRAMMAR.md §3.73): solo tiene sentido
-                // sobre `String`/`String?`, así que necesita resolver el
-                // tipo del campo -- por eso vive en `check_program_full`
-                // (con símbolos ya poblados por `build_symbols`) y no en el
-                // parser, a diferencia de la validación "motivo no vacío"
-                // de `@deprecated`, que es puramente sintáctica.
+                // `@validate(...)` (GRAMMAR.md §3.73) y `= default`
+                // (§3.74): los dos necesitan resolver el tipo del campo
+                // (el primero para exigir `String`/`String?`, el segundo
+                // para tipar la expresión contra ese tipo), así que viven
+                // en `check_program_full` (con símbolos ya poblados por
+                // `build_symbols`) y no en el parser, a diferencia de la
+                // validación "motivo no vacío" de `@deprecated`, que es
+                // puramente sintáctica.
                 Item::Type(t) => {
                     if let TypeExpr::Struct(fields) = &t.ty {
-                        for e in checker.check_field_validators(fields, &t.type_params) {
+                        for e in checker
+                            .check_field_validators(fields, &t.type_params)
+                            .into_iter()
+                            .chain(checker.check_field_defaults(fields, &t.type_params))
+                        {
                             let mut e = e;
                             if let Some(file) = file_for(index) {
                                 e = e.with_file(file);
@@ -756,7 +762,11 @@ impl Checker {
                 Item::Enum(en) => {
                     for variant in &en.variants {
                         if let Some(fields) = &variant.fields {
-                            for e in checker.check_field_validators(fields, &en.type_params) {
+                            for e in checker
+                                .check_field_validators(fields, &en.type_params)
+                                .into_iter()
+                                .chain(checker.check_field_defaults(fields, &en.type_params))
+                            {
                                 let mut e = e;
                                 if let Some(file) = file_for(index) {
                                     e = e.with_file(file);
@@ -1558,6 +1568,37 @@ impl Checker {
                         .with_span(f.name_span),
                     );
                 }
+            }
+        }
+        errors
+    }
+
+    /// `= expr` sobre cada campo de `fields` (GRAMMAR.md §3.74) -- que el
+    /// default TIPE contra el tipo declarado del campo, en `linkc build`,
+    /// no recién cuando se evalúa por primera vez (`x: Int = "hola"` tiene
+    /// que fallar acá). `Env::new()` vacío, mismo criterio EXACTO que ya usa
+    /// `check_rpc` para `Param::default`: un default no ve otros campos del
+    /// mismo literal ni el entorno que lo rodea, es una expresión
+    /// autocontenida (ver `runtime/mod.rs::eval_expr`, mismo `Env::new()`
+    /// en la evaluación real).
+    fn check_field_defaults(&self, fields: &[Field], type_params: &[String]) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        for f in fields {
+            let Some(default) = &f.default else { continue };
+            let ty = if type_params.is_empty() {
+                self.resolve_type(&f.ty)
+            } else {
+                self.resolve_type_abstract(&f.ty, type_params)
+            };
+            let ty = match ty {
+                Ok(ty) => ty,
+                Err(e) => {
+                    errors.push(e.with_span(f.name_span));
+                    continue;
+                }
+            };
+            if let Err(e) = self.check_expr(default, &ty, &Env::new()) {
+                errors.push(e.with_span(default.span));
             }
         }
         errors
@@ -3674,7 +3715,18 @@ impl Checker {
             .map(|f| {
                 Ok(FieldType {
                     name: f.name.clone(),
-                    optional: f.optional,
+                    // Un campo CON default (GRAMMAR.md §3.74) puede
+                    // omitirse de un literal igual que uno `?:` -- se marca
+                    // `optional` acá, PURAMENTE para esta comprobación de
+                    // completitud (`check_fields_against_resolved` solo usa
+                    // este flag para decidir "¿falta este campo?"), sin que
+                    // el tipo real del campo cambie a `Optional` en ningún
+                    // otro lado. Genéricos NO pasan por acá (usan
+                    // `check_fields_against_resolved` directo con
+                    // `FieldType` ya resuelto por `expand_generic_struct`,
+                    // que no conserva `default`) -- alcance de esta ronda,
+                    // ver GRAMMAR.md §3.74 "Límites honestos".
+                    optional: f.optional || f.default.is_some(),
                     ty: self.resolve_type(&f.ty)?,
                 })
             })
@@ -6206,6 +6258,46 @@ type T = { id: Int, s: Status }")
     #[test]
     fn validate_on_an_enum_variant_field_typechecks() {
         let src = r#"enum Event { SignedUp { @validate(email) email: String } }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    // ---- valores por defecto en campos de struct (GRAMMAR.md §3.74) ----
+
+    #[test]
+    fn a_field_default_that_matches_the_field_type_typechecks() {
+        let src = r#"type Task = { title: String, status: String = "pending" }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn a_field_default_of_the_wrong_type_is_rejected() {
+        let src = "type Task = { title: String, retries: Int = \"tres\" }";
+        let errs = check_source(src).expect_err("un default de tipo equivocado debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("se esperaba")), "{errs:?}");
+    }
+
+    /// Un campo CON default puede omitirse del literal igual que uno `?:`
+    /// -- sin romper la exigencia de que uno SIN default (y sin `?`) sigue
+    /// siendo requerido.
+    #[test]
+    fn omitting_a_field_with_a_default_typechecks_but_omitting_one_without_it_does_not() {
+        let src = r#"
+            type Task = { title: String, status: String = "pending" }
+            fn f() -> Task { Task { title: "comprar leche" } }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        let src2 = r#"
+            type Task = { title: String, status: String }
+            fn f() -> Task { Task { status: "pending" } }
+        "#;
+        let errs = check_source(src2).expect_err("sin default, omitir 'title' debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("falta el campo requerido")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_default_on_an_enum_variant_field_typechecks() {
+        let src = r#"enum Event { Created { status: String = "new" } }"#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 }

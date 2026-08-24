@@ -131,10 +131,11 @@ pub struct Variant {
 /// un USO de tipo", que antes eran indistinguibles y hacían que un campo
 /// homónimo a un `type`/`enum` existente (`type Point = {...}; type Shape =
 /// { Point: Int }`) saltara mal al pedir goto-def sobre el nombre de campo.
-/// `PartialEq` es manual (no derive) para IGNORAR `name_span` y `deprecated`,
-/// mismo motivo que `TypeExpr` ya no deriva `PartialEq`: dos `Field`
-/// estructuralmente iguales en offsets distintos (o con distinto texto de
-/// `@deprecated`, que es puramente informativo) deben seguir siendo `==`
+/// `PartialEq` es manual (no derive) para IGNORAR `name_span`, `annotations`
+/// y `default`, mismo motivo que `TypeExpr` ya no deriva `PartialEq`: dos
+/// `Field` estructuralmente iguales en offsets distintos (o con distinto
+/// texto de `@deprecated`, o un default distinto pero del mismo tipo, todo
+/// puramente informativo/de conveniencia) deben seguir siendo `==`
 /// (lo usa, entre otros, `TypeExpr::Struct`'s propio `PartialEq` al comparar
 /// `Vec<Field>`, y por lo tanto la subtipificación estructural -- ver
 /// GRAMMAR.md §3.71: marcar un campo deprecado no lo saca de esa comparación).
@@ -153,6 +154,15 @@ pub struct Field {
     /// `@deprecated`/`@validate` en esta posición y rechaza cualquier otro
     /// nombre ahí mismo (ver `parse_field` en parser.rs).
     pub annotations: Vec<FieldAnnotation>,
+    /// `= expr` después del tipo, si hay (GRAMMAR.md §3.74) -- mismo lugar
+    /// y mismo mecanismo que `Param::default` (parámetros de función/rpc,
+    /// §2.2), no una anotación (`@algo(...)`) como `@deprecated`/`@validate`:
+    /// es sintaxis del propio campo, `nombre: Tipo = valor`, exactamente
+    /// igual que un parámetro. Un campo CON default puede omitirse de un
+    /// literal `Struct { ... }` igual que uno `?:` -- ver
+    /// `Checker::check_fields_against` -- aunque a diferencia de `x?: T` el
+    /// tipo del campo NO cambia a `Optional`, sigue siendo el declarado.
+    pub default: Option<Spanned<Expr>>,
 }
 
 impl Field {

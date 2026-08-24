@@ -119,7 +119,15 @@ pub fn emit_zod_schemas(program: &Program) -> Result<String, String> {
                     for f in fields {
                         let ty = checker.resolve_type(&f.ty).map_err(|e| e.to_string())?;
                         let zod_ty = render_zod_type_for_field(&ty, f.validator());
-                        let optional_suffix = if f.optional { ".optional()" } else { "" };
+                        // Un campo con `= default` (GRAMMAR.md §3.74) puede
+                        // omitirse igual que uno `?:` -- `.optional()` nada
+                        // más, no `.default(...)`: el default es una
+                        // expresión c-script arbitraria (puede ser
+                        // `crypto.uuid()`), no algo traducible a JS sin
+                        // evaluarla, así que quien construye el objeto en TS
+                        // simplemente no manda la clave y el SERVIDOR es
+                        // quien la completa (ver runtime/mod.rs::Expr::StructLit).
+                        let optional_suffix = if f.optional || f.default.is_some() { ".optional()" } else { "" };
                         out.push_str(&format!("  {}: {}{},\n", f.name, zod_ty, optional_suffix));
                     }
                     out.push_str("});\n");
@@ -195,5 +203,17 @@ mod tests {
         let program = parser::parse(tokens).unwrap();
         let zod_out = emit_zod_schemas(&program).unwrap();
         assert!(zod_out.contains("email: z.string().email().nullable(),"), "{zod_out}");
+    }
+
+    /// Un campo con `= default` (GRAMMAR.md §3.74) se emite `.optional()`
+    /// -- puede omitirse igual que uno `?:`.
+    #[test]
+    fn a_field_with_a_default_is_marked_optional() {
+        let code = r#"type Task = { title: String, status: String = "pending" }"#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let zod_out = emit_zod_schemas(&program).unwrap();
+        assert!(zod_out.contains("title: z.string(),"), "{zod_out}");
+        assert!(zod_out.contains("status: z.string().optional(),"), "{zod_out}");
     }
 }

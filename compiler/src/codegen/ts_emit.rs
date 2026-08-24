@@ -692,7 +692,12 @@ fn emit_type_decl(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(
                 out.push_str(&format!(
                     "  {}{}: {};\n",
                     f.name,
-                    if f.optional { "?" } else { "" },
+                    // Un campo con `= default` (GRAMMAR.md §3.74) puede
+                    // omitirse de un literal armado del lado TS igual que
+                    // uno `?:` -- mismo criterio que ya usa
+                    // `emit_service_interface` para un parámetro de rpc con
+                    // default (`p.default.is_some()` -> `?` en la firma).
+                    if f.optional || f.default.is_some() { "?" } else { "" },
                     render_type(&ty)
                 ));
             }
@@ -744,7 +749,7 @@ fn emit_enum_decl(out: &mut String, e: &EnumDecl, checker: &Checker) -> Result<(
                 parts.push(format!(
                     "{}{}: {}",
                     f.name,
-                    if f.optional { "?" } else { "" },
+                    if f.optional || f.default.is_some() { "?" } else { "" },
                     render_type(&ty)
                 ));
             }
@@ -1433,5 +1438,27 @@ mod tests {
             contract.contains("  /**\n   * Formato: email\n   * @deprecated usa emailV2\n   */\n  email:"),
             "{contract}"
         );
+    }
+
+    /// Un campo con `= default` (GRAMMAR.md §3.74) se emite opcional (`?`)
+    /// en la interfaz -- puede omitirse igual que uno `?:` -- mismo criterio
+    /// que ya usa un parámetro de rpc con default en su firma TS.
+    #[test]
+    fn a_field_with_a_default_is_emitted_as_optional_in_the_interface() {
+        let src = r#"type Task = { title: String, status: String = "pending" }"#;
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("title: string;"), "{contract}");
+        assert!(contract.contains("status?: string;"), "{contract}");
+    }
+
+    /// Sin default (ni `?:`), el campo sigue siendo requerido en la
+    /// interfaz -- este test evita que el cambio de arriba se vuelva "todo
+    /// campo es opcional" por accidente.
+    #[test]
+    fn a_field_without_a_default_stays_required_in_the_interface() {
+        let src = "type Task = { status: String }";
+        let (contract, _) = emit_both(src);
+        assert!(contract.contains("status: string;"), "{contract}");
+        assert!(!contract.contains("status?:"), "{contract}");
     }
 }

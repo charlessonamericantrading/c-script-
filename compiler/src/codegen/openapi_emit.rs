@@ -3,9 +3,24 @@
 
 use std::collections::BTreeMap;
 use serde_json::{json, Value};
-use crate::ast::{FieldValidator, Item, Member, Program, TypeExpr};
+use crate::ast::{Expr, FieldValidator, Item, Member, Program, TypeExpr};
 use crate::checker::Checker;
 use crate::types::Type;
+
+/// El valor JSON de un `= default` (GRAMMAR.md §3.74), si es un literal
+/// escalar simple -- `None` para cualquier otra expresión (una llamada como
+/// `crypto.uuid()`, una referencia a `const`, un `struct`/array) que no
+/// tiene una forma JSON fija conocida en compilación sin evaluarla.
+fn scalar_literal_json(e: &Expr) -> Option<Value> {
+    match e {
+        Expr::Int(n) => Some(json!(n)),
+        Expr::Float(n) => Some(json!(n)),
+        Expr::Str(s) => Some(json!(s)),
+        Expr::Bool(b) => Some(json!(b)),
+        Expr::Null => Some(Value::Null),
+        _ => None,
+    }
+}
 
 fn type_to_json_schema(ty: &Type) -> Value {
     match ty {
@@ -135,8 +150,23 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
                                 }
                             }
                         }
+                        // `= default` (GRAMMAR.md §3.74) -- un campo con
+                        // default puede omitirse de un request body igual
+                        // que uno `?:`, así que sale de `required`. Cuando
+                        // el default es un literal simple (no una llamada
+                        // como `crypto.uuid()`, que no tiene forma JSON
+                        // fija) se suma además como `"default"` -- keyword
+                        // estándar de JSON Schema, valor puramente
+                        // informativo para quien lea el spec.
+                        if let Some(default) = &f.default {
+                            if let Some(obj) = schema.as_object_mut() {
+                                if let Some(v) = scalar_literal_json(&default.node) {
+                                    obj.insert("default".to_string(), v);
+                                }
+                            }
+                        }
                         props[f.name.as_str()] = schema;
-                        if !f.optional {
+                        if !f.optional && f.default.is_none() {
                             required.push(f.name.clone());
                         }
                     }
@@ -401,5 +431,41 @@ mod tests {
         assert_eq!(props["email"]["format"], "email");
         assert_eq!(props["code"]["pattern"], "^[A-Z]{3}$");
         assert!(props["email"]["pattern"].is_null());
+    }
+
+    /// Un campo con `= default` (GRAMMAR.md §3.74) sale de `required`, y un
+    /// default de literal simple se propaga como `"default"` -- keyword
+    /// estándar de JSON Schema.
+    #[test]
+    fn a_field_with_a_literal_default_is_excluded_from_required_and_gets_the_default_keyword() {
+        let code = r#"type Task = { title: String, status: String = "pending" }"#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        let schema = &spec["components"]["schemas"]["Task"];
+        let required: Vec<&str> = schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(required.contains(&"title"), "{required:?}");
+        assert!(!required.contains(&"status"), "{required:?}");
+        assert_eq!(schema["properties"]["status"]["default"], "pending");
+    }
+
+    /// Un default NO literal (una llamada como `crypto.uuid()`) sigue
+    /// sacando el campo de `required`, pero no tiene una forma JSON fija
+    /// que propagar como `"default"` -- se omite la keyword, no un valor
+    /// inventado.
+    #[test]
+    fn a_field_with_a_non_literal_default_is_excluded_from_required_without_a_default_keyword() {
+        let code = r#"type Session = { id: Int, token: Uuid = crypto.uuid() }"#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        let schema = &spec["components"]["schemas"]["Session"];
+        let required: Vec<&str> = schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(!required.contains(&"token"), "{required:?}");
+        assert!(schema["properties"]["token"]["default"].is_null());
     }
 }
