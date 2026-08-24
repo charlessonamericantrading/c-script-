@@ -105,6 +105,33 @@ fn linkc_lint_detects_unused_variables_and_empty_tests() {
     assert!(stdout.contains("empty-test"), "{stdout}");
 }
 
+/// `timing-unsafe-secret-comparison` (GRAMMAR.md §3.88): un `==`/`!=` sobre
+/// algo nombrado como un secreto (token/password/API key) recomienda
+/// `crypto.timingSafeEqual` en vez del operador de siempre.
+#[test]
+fn linkc_lint_flags_a_secret_compared_with_double_equals() {
+    let temp = TempDir::new("lint-secret-eq");
+    let src = r#"
+        fn check(token: String, expected: String) -> Bool {
+            token == expected
+        }
+    "#;
+    let file = temp.write("app.link", src);
+
+    let res = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("lint")
+        .arg(&file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(res.status.success());
+    let stdout = String::from_utf8_lossy(&res.stdout);
+    assert!(stdout.contains("timing-unsafe-secret-comparison"), "{stdout}");
+    assert!(stdout.contains("timingSafeEqual"), "{stdout}");
+}
+
 #[test]
 fn linkc_lint_fix_applies_autofixes_in_place() {
     let temp = TempDir::new("lint-fix-test");

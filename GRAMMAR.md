@@ -109,6 +109,7 @@
   - [3.85 `--max-body-bytes <N>`: límite de tamaño del body de una request — RESUELTO](#385---max-body-bytes-n-límite-de-tamaño-del-body-de-una-request--resuelto)
   - [3.86 `--http-timeout <duración>`: timeout de llamadas salientes `http.*` — RESUELTO](#386---http-timeout-duración-timeout-de-llamadas-salientes-http--resuelto)
   - [3.87 `/health` verifica conectividad real a la base — RESUELTO](#387-health-verifica-conectividad-real-a-la-base--resuelto)
+  - [3.88 Lint: comparación insegura de un secreto con `==` — RESUELTO](#388-lint-comparación-insegura-de-un-secreto-con----resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4182,6 +4183,43 @@ curl -s localhost:8787/health
 - **Un solo `SELECT 1`, no una verificación de que CADA colección declarada sea alcanzable.** Una base conectada pero con una tabla específica corrupta (fuera del control de este runtime) no se detecta acá -- eso ya fallaría en la primera lectura real de esa colección, con el error normal de esa request.
 
 **Verificado**: `cli_health.rs` con el binario real como subproceso contra SQLite (2 tests) -- forma exacta del JSON (`status`/`engine`/`version`/`database`/`services`, listando los servicios declarados de verdad) en el camino feliz, y que `/`, `/health`, `/status` devuelven exactamente lo mismo. El camino de FALLA real se prueba en `pg_integration.rs` (reusando la misma técnica de `pg_terminate_backend` que el test de reconexión, GRAMMAR.md §3.40, solo contra un PostgreSQL real): `/health` pasa de `200`/`"ok"` a `503`/`"error"` mientras la conexión está cortada, y vuelve solo a `200` sin reiniciar el proceso -- sin necesitar ayuda humana, mismo criterio de auto-reparación que el resto de las queries.
+
+---
+
+### 3.88 Lint: comparación insegura de un secreto con `==` — RESUELTO
+
+`crypto.timingSafeEqual` (GRAMMAR.md §3.54) existe justamente porque un `==` de `String` corta en el primer byte distinto -- comparar un token, contraseña o API key con el operador de siempre filtra, por cuánto tarda la comparación, cuánto de el acertó quien prueba. La función existe desde esa ronda, pero nada avisaba si el código de alguien seguía usando `==` sobre algo que PARECE un secreto -- había que saber que el problema existe y acordarse de buscarlo.
+
+<!-- linkc:check -->
+```rust
+type LoginRequest = { token: String }
+
+fn checkToken(req: LoginRequest, expected: String) -> Bool {
+  req.token == expected
+}
+```
+
+```bash
+linkc lint app.link
+# app.link:4:3: [timing-unsafe-secret-comparison] 'token' se compara con
+# '==' -- si es un secreto (token/password/API key), usá
+# crypto.timingSafeEqual(a, b) en vez de '==' para no filtrar cuánto
+# acertó por el tiempo que tarda la comparación
+```
+
+**Nombre del operando, no tipo -- el lint corre sobre el AST crudo, antes (y sin necesitar) el checker.** `==`/`!=` donde CUALQUIERA de los dos lados es un `Ident` o el campo final de un `FieldAccess` cuyo nombre contiene (sin importar mayúsculas) `secret`, `token`, `password`, `apikey` o `api_key` -- deliberadamente laxo: mejor un falso positivo ocasional sobre un identificador con un nombre raro (`tokenCount`, por ejemplo) que dejar pasar el caso real que esta regla existe para atrapar.
+
+**Comparar contra `null` queda afuera a propósito.** `token != null` es un chequeo de PRESENCIA ("¿hay sesión?"), no de VALOR -- no hay ningún byte de un secreto involucrado, así que no hay ningún canal lateral que cerrar ahí. Sin este descarte, cualquier `if token != null { ... }` (un patrón común y correcto) generaría ruido constante.
+
+**Recorre TODO el cuerpo, no solo el nivel superior** -- adentro de un `if`/`match`/`while`/closure, en cualquier nivel de anidamiento. Encontrado auditando la implementación: la primera versión reusaba la recursión que `lint_block` ya hacía sobre el body de un `while` (para `unused-var`/`unused-mut`) y volvía a recorrer ESE MISMO bloque desde la nueva regla, duplicando cada warning que cayera adentro de un `while` -- corregido antes de este release, con un test de regresión dedicado que cuenta exactamente 1 warning, no 2.
+
+**Puramente informativo, como el resto del linter -- `linkc lint` sigue saliendo con código 0 aunque encuentre esto.** No bloquea `linkc build`; es una recomendación, no una regla de compilación.
+
+**Límites honestos:**
+- **Nombre, no flujo de datos.** No rastrea si un valor que EMPEZÓ en un campo `token` terminó en una variable con otro nombre antes de compararse -- `let t = req.token; t == expected` no dispara la regla, porque `t` no tiene un nombre sospechoso. Un analizador de flujo de datos real es un proyecto aparte.
+- **Sin `--fix` automático para esta regla.** A diferencia de `unused-var`/`unused-mut`, reescribir `a == b` como `crypto.timingSafeEqual(a, b)` a ciegas podría cambiar el TIPO de la expresión que lo rodea (`Bool` en los dos casos, pero el resto del código puede depender de que sea el operador `==` real, ej. dentro de un patrón más grande) -- se deja para que una persona lo revise.
+
+**Verificado**: 7 tests en `lint.rs` (un `Ident`/`FieldAccess` con nombre sospechoso dispara la regla con `==` y con `!=`, comparar contra `null` NO dispara nada, dos nombres comunes tampoco, DENTRO de un `while`/`if`/closure se encuentra igual, y -- el test de regresión -- exactamente UNA vez adentro de un `while`, no duplicado) y 1 en `cli_fmt_lint.rs` contra el binario real (`linkc lint` imprime la regla y la recomendación de `timingSafeEqual`).
 
 ---
 

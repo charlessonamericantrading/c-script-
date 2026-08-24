@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.53.0] - 2026-08-24
+
+### 🔒 Seguridad
+- **Lint: `timing-unsafe-secret-comparison`.** `crypto.timingSafeEqual` (v1.26.0, GRAMMAR.md §3.54) existe justamente porque un `==` de `String` corta en el primer byte distinto -- comparar un token, contraseña o API key con el operador de siempre filtra, por cuánto tarda la comparación, cuánto acertó quien prueba. La función existe desde esa ronda, pero nada avisaba si el código de alguien seguía usando `==` sobre algo que PARECE un secreto. El linter (`linkc lint`) ahora marca cualquier `==`/`!=` donde uno de los dos lados es un `Ident` o el campo final de un `FieldAccess` cuyo nombre contiene (sin distinguir mayúsculas) `secret`, `token`, `password`, `apikey` o `api_key` -- deliberadamente laxo, mejor un falso positivo ocasional que dejar pasar el caso real. Comparar contra `null` (chequeo de presencia, `token != null`) queda afuera a propósito -- no hay ningún byte de secreto involucrado ahí. Recorre TODO el cuerpo del rpc/fn/test, en cualquier nivel de anidamiento (`if`/`match`/`while`/closure) -- encontrado auditando la propia implementación: la primera versión duplicaba cada warning que cayera adentro de un `while`, corregido antes de este release. Puramente informativo, como el resto del linter: `linkc lint` sigue saliendo con código 0.
+
+819 tests (8 nuevos): 7 en `lint.rs` (dispara con `==` y con `!=`, `null` y nombres comunes no disparan nada, encuentra el caso dentro de `if`/`while`/closure, y el test de regresión que confirma exactamente UNA vez adentro de un `while`, no duplicado) y 1 en `cli_fmt_lint.rs` contra el binario real. Detalle completo: GRAMMAR.md §3.88.
+
 ## [1.52.0] - 2026-08-24
 
 ### ✨ Nuevo
