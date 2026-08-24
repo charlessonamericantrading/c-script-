@@ -123,6 +123,7 @@
   - [3.99 `linkc test --db <url-postgres>` — RESUELTO](#399-linkc-test---db-url-postgres--resuelto)
   - [3.100 `linkc doctor`: diagnóstico de entorno antes de un despliegue — RESUELTO](#3100-linkc-doctor-diagnóstico-de-entorno-antes-de-un-despliegue--resuelto)
   - [3.101 `List<Int>.sum() -> Int` — RESUELTO, alcance acotado](#3101-listintsum---int--resuelto-alcance-acotado)
+  - [3.102 `db.<c>.maxRow(selector)`/`minRow(selector) -> T?` — RESUELTO](#3102-dbcmaxrowselectorminrowselector---t--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -809,7 +810,7 @@ fn makeUser(input: NewUser) -> NewUserRecord {
 // db.users.insert(makeUser(input)) -- NewUserRecord <: Omit<User,"id"> por subtipado estructural
 ```
 
-**Métodos:** `all() -> T[]`, `find(id: Int) -> T?`, `insert(x: Omit<T,"id">) -> T`, `insertMany(items: Omit<T,"id">[]) -> T[]` (§3.76), `applyPatch(id: Int, p: Patch<T>) -> T`, `findWhere(f: (T) -> Bool) -> T[]`, `deleteWhere(f: (T) -> Bool) -> Int`, `count() -> Int`, `page(limit: Int, offset: Int) -> T[]`, `pageAfter(cursor: Int?, limit: Int) -> T[]`, `upsert(matchFn: (T) -> Bool, insertValue: Omit<T,"id">, updateFn: (T) -> Omit<T,"id">) -> T` (§3.75), `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` — resueltos contra el tipo de elemento de verdad (`Type::DbCollection`, checker.rs). Un nombre de colección o de método desconocido ya es un error del checker (`db.usres.fnid(1)`, con AMBOS typo'd, se rechaza en tiempo de chequeo), no algo que se descubre recién en runtime.
+**Métodos:** `all() -> T[]`, `find(id: Int) -> T?`, `insert(x: Omit<T,"id">) -> T`, `insertMany(items: Omit<T,"id">[]) -> T[]` (§3.76), `applyPatch(id: Int, p: Patch<T>) -> T`, `findWhere(f: (T) -> Bool) -> T[]`, `deleteWhere(f: (T) -> Bool) -> Int`, `count() -> Int`, `page(limit: Int, offset: Int) -> T[]`, `pageAfter(cursor: Int?, limit: Int) -> T[]`, `upsert(matchFn: (T) -> Bool, insertValue: Omit<T,"id">, updateFn: (T) -> Omit<T,"id">) -> T` (§3.75), `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`, `maxRow`/`minRow` (§3.102) — resueltos contra el tipo de elemento de verdad (`Type::DbCollection`, checker.rs). Un nombre de colección o de método desconocido ya es un error del checker (`db.usres.fnid(1)`, con AMBOS typo'd, se rechaza en tiempo de chequeo), no algo que se descubre recién en runtime.
 
 **Runtime: en memoria al principio, generalizado.** `runtime/db.rs`'s `Db` pasó de estar hardcodeado a una única colección `"users"` a un `HashMap` con una entrada por colección declarada. Se eliminó el hack que le ponía un default a `deletedAt` en `insert` — bajo la regla `Omit<T,"id">`, `deletedAt` (requerido, nullable) es un campo obligado del argumento; quien inserta pasa `deletedAt: null` explícito, consistente con "sin coerción implícita en ningún lado" (§3.7). **Actualización: RESUELTO.** El storage detrás ya no es en memoria -- ver §3.17: `Db` corre sobre SQLite real, con persistencia genuina entre reinicios de `linkc serve`.
 
@@ -4648,6 +4649,28 @@ fn total(montos: Int[]) -> Int { montos.sum() }
 **`.reduce()` genérico, `.sum()` sobre `Int64`/`Float`**: quedan fuera de esta ronda, para cuando haya demanda real y valga la pena resolver la ambigüedad de tipo del caso vacío.
 
 **Verificado**: 4 tests en `checker.rs` (`List<Int>` tipa, `List<Int64>`/`List<Float>` se rechazan con el mensaje que nombra el motivo, `.sum()` no toma argumentos) + 2 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (suma real de una lista no vacía; una lista vacía -- el caso que el placeholder de "cantidad × tarifa" jamás hubiera distinguido de "una transacción gratis" -- da `0`).
+
+---
+
+### 3.102 `db.<c>.maxRow(selector)`/`minRow(selector) -> T?` — RESUELTO
+
+PLAN.md §9.3, gap nuevo encontrado analizando IgnisLove en profundidad -- con un bug de producción real y confirmado como evidencia, no una preferencia de estilo. `bandit_rewards.link`, `getBestArm()`, hacía `db.arms.all()` y devolvía `allArms[0]` -- el orden de `all()` es por `"id"` (§3.48), NUNCA por el campo de recompensa, así que ese rpc JAMÁS devolvía el brazo con mejor `avgRewardTenths`, pese a su nombre: un algoritmo de optimización (bandit de recompensas) silenciosamente roto, sin ningún error que lo delatara. `maxBy`/`minBy` (§3.52) ya existían, pero solo agregan un VALOR agrupado (siempre `{key, value}[]`, incluso sin ningún campo de agrupación real) -- nunca la fila COMPLETA que alcanza ese máximo/mínimo.
+
+```
+type Arm = { id: Int, name: String, avgRewardTenths: Int }
+
+service Bandit {
+  rpc getBestArm() -> Arm? { db.arms.maxRow(|a: Arm| { a.avgRewardTenths }) }
+}
+```
+
+**Dos métodos nuevos, no uno con un parámetro de dirección.** Se descartó `db.<c>.top(selector, dir: "asc"|"desc")` -- mismo criterio que §3.52 ya usa para `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (cinco métodos con nombre explícito por combinación, nunca un query builder ni un modo-por-string): un nombre por forma es más fácil de tipar en el checker (el resultado no depende de un valor en runtime) y más fácil de leer en el sitio de la llamada.
+
+**Mismo shape reconocido, mismas restricciones de tipo que el campo de valor de `maxBy`/`minBy`.** El selector tiene que ser exactamente `|item: T| item.campo` (`ast::recognize_field_selector`, reusado tal cual -- ningún código nuevo de reconocimiento de shape); el campo tiene que ser `Int`/`Int64`/`Float`, nunca opcional. `SELECT "id", <columnas> FROM "<coleccion>" [WHERE <soft-delete>] ORDER BY "<campo>" {DESC|ASC} LIMIT 1` -- CERO filas de más viajan del motor al proceso, y `@softDelete` (§3.78) se respeta exactamente igual que en `all`/`page`/`sumBy`/etc.
+
+**`Value::Null` sobre una colección vacía (o completamente soft-deleteada), nunca un error.** Coherente con `find(id)` (que ya devuelve `T?`) y con el resto de los métodos que pueden legítimamente "no encontrar nada".
+
+**Verificado**: 5 tests en `checker.rs` (tipa devolviendo `T?`, rechaza un campo no numérico, rechaza una expresión derivada como selector, exige exactamente 1 argumento) + 2 en `runtime/mod.rs` contra un SQLite en memoria real (`maxRow`/`minRow` encuentran la fila correcta -- no la de menor `id` -- reproduciendo el bug exacto de `getBestArm()`; una colección vacía da `null`) + 1 en `pg_integration.rs` contra un PostgreSQL real, confirmando el mismo `ORDER BY ... LIMIT 1` en los dos backends.
 
 ---
 

@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-903-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.65.0-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-911-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.66.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 903 pruebas automáticas:
+**Funciona hoy**, cubierto por 911 pruebas automáticas:
 
 - `linkc build` / `serve` / `serve-all` / `migrate --dry-run` / `doctor` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `db.<c>.maxRow(selector)` / `minRow(selector) -> T?`: la fila completa con el máximo/mínimo de un campo numérico, empujado a un `ORDER BY ... LIMIT 1` real -- a diferencia de `maxBy`/`minBy`, que solo agregan un valor, nunca la fila completa que lo alcanza
 - `List<Int>.sum() -> Int`: suma todos los elementos con un loop real -- `List<Int64>`/`List<Float>` quedan deliberadamente afuera por ahora (una lista vacía de esos dos tipos no tiene de qué elemento leer el tag correcto de `Value` en runtime, y adivinar mal ahí sería un bug silencioso de formato en el wire, ya que `Int64` viaja como string y `Int` como número)
 - `linkc doctor <archivo> [--db <url|archivo>]`: diagnóstico de entorno antes de un despliegue -- la versión de `linkc`, que el archivo de entrada resuelva sus imports/parsee/tipe, permiso de escritura en su directorio, y conectividad de solo lectura (`SELECT 1`, nunca DDL) a la base configurada. Imprime un checklist y sale con código `1` si algún chequeo real falló, pensado como paso de CI antes de `linkc serve`
 - `linkc test <archivo> --db <url-postgres>` (o `LINK_TEST_DB`, deliberadamente separada de `LINK_DATABASE_URL`): corre cada bloque `test "..." { ... }` contra una base PostgreSQL real en vez de SQLite embebido -- necesario para reproducir de verdad un bug del wire de Postgres, ya que SQLite y Postgres emiten y decodifican SQL distinto para el mismo `.link`. Sin el aislamiento por test que SQLite `:memory:` da gratis -- Postgres no tiene equivalente, así que los tests comparten estado dentro de una corrida en vez de fingir un reset (que sería una operación destructiva que este proyecto evita a propósito); correr esto contra una base de test dedicada, nunca contra producción

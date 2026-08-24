@@ -485,6 +485,48 @@ fn aggregate_by_pushes_group_by_to_real_sql_against_postgres() {
     assert_eq!(count_by_key.get("Enterprise"), Some(&2), "{count_by_key:?}");
 }
 
+/// GRAMMAR.md §3.102: `maxRow`/`minRow` -- caso real que los motiva
+/// (IgnisLove, `bandit_rewards.link`, `getBestArm()`): `db.arms.all()[0]`
+/// devuelve la fila de menor `id`, nunca la de mejor recompensa. Este test
+/// confirma el `ORDER BY ... LIMIT 1` real contra Postgres, no solo SQLite
+/// (ya cubierto en `runtime/mod.rs`).
+#[test]
+fn max_row_and_min_row_push_order_by_limit_1_to_real_sql_against_postgres() {
+    const COLLECTION: &str = "arms_top_row";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("top-row");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Arm = {{ id: Int, name: String, avgRewardTenths: Int }}
+db {{ {COLLECTION}: Arm[] }}
+service Arms {{
+  rpc create(name: String, avgRewardTenths: Int) -> Arm {{
+    db.{COLLECTION}.insert(Arm {{ id: 0, name: name, avgRewardTenths: avgRewardTenths }})
+  }}
+  rpc getBestArm() -> Arm? {{ db.{COLLECTION}.maxRow(|a: Arm| {{ a.avgRewardTenths }}) }}
+  rpc getWorstArm() -> Arm? {{ db.{COLLECTION}.minRow(|a: Arm| {{ a.avgRewardTenths }}) }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Arms/create", r#"{"name":"A","avgRewardTenths":10}"#);
+    server.rpc("Arms/create", r#"{"name":"B","avgRewardTenths":95}"#);
+    server.rpc("Arms/create", r#"{"name":"C","avgRewardTenths":40}"#);
+
+    let best = server.rpc("Arms/getBestArm", "{}");
+    assert_eq!(best["name"], serde_json::json!("B"), "{best}");
+    let worst = server.rpc("Arms/getWorstArm", "{}");
+    assert_eq!(worst["name"], serde_json::json!("A"), "{worst}");
+}
+
 const INT64_AGGREGATE_PROGRAM: &str = r#"
 type Sale = { id: Int, region: Int64, amount: Int64 }
 type RegionTotal = { key: Int64, value: Int64 }

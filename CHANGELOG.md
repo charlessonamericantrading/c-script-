@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.66.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`db.<c>.maxRow(selector)` / `db.<c>.minRow(selector) -> T?`.** Gap nuevo encontrado analizando IgnisLove en profundidad, con un bug de producción real como evidencia: `bandit_rewards.link` (`getBestArm()`) hacía `db.arms.all()` y devolvía `allArms[0]` -- el orden de `all()` es por `"id"`, NUNCA por el campo de recompensa, así que ese rpc jamás devolvía el brazo con mejor `avgRewardTenths` pese a su nombre, un algoritmo de optimización silenciosamente roto. `maxBy`/`minBy` (§3.52) ya existían pero solo agregan un VALOR agrupado, nunca la fila completa que lo alcanza. Dos métodos nuevos (no uno con un parámetro `dir: "asc"|"desc"`, mismo criterio de "nombre por forma" que ya usa §3.52) empujan a `SELECT ... ORDER BY "<campo>" {DESC|ASC} LIMIT 1` real -- mismo shape reconocido y mismas restricciones de tipo (`Int`/`Int64`/`Float`, nunca opcional) que el campo de valor de `maxBy`/`minBy`, mismo respeto de `@softDelete`. `Value::Null` sobre una colección vacía, nunca un error.
+
+911 tests (8 nuevos): 5 en `checker.rs`, 2 en `runtime/mod.rs` contra un SQLite en memoria real (reproduce el bug exacto de `getBestArm()`) y 1 en `pg_integration.rs` contra un PostgreSQL real. Detalle completo: GRAMMAR.md §3.102.
+
 ## [1.65.0] - 2026-08-24
 
 ### ✨ Nuevo

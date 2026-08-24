@@ -5587,6 +5587,63 @@ mod tests {
         assert_eq!(summary.passed, 1, "{:?}", summary.failed);
     }
 
+    // GRAMMAR.md §3.102: `maxRow`/`minRow` -- caso real que los motiva
+    // (IgnisLove, `bandit_rewards.link`, `getBestArm()`): `db.arms.all()[0]`
+    // devuelve la fila de menor `id`, NUNCA la de mejor recompensa, pese al
+    // nombre del rpc -- un bug de producción real, no hipotético. Este test
+    // confirma que `maxRow`/`minRow` sí encuentran la fila correcta, contra
+    // el SQLite en memoria real de `test` (no un mock).
+    #[test]
+    fn max_row_and_min_row_find_the_row_with_the_best_and_worst_reward_not_the_lowest_id() {
+        let code = r#"
+        type Arm = { id: Int, name: String, avgRewardTenths: Int }
+        db { arms: Arm[] }
+
+        service Arms {
+            rpc create(name: String, avgRewardTenths: Int) -> Arm {
+                db.arms.insert(Arm { id: 0, name: name, avgRewardTenths: avgRewardTenths })
+            }
+        }
+
+        test "maxRow/minRow encuentran la fila correcta, no la de menor id" {
+            Arms.create("A", 10);
+            Arms.create("B", 95);
+            Arms.create("C", 40);
+
+            let best = db.arms.maxRow(|a: Arm| { a.avgRewardTenths });
+            match best {
+                a: Arm => assert(a.name == "B", "el brazo insertado SEGUNDO tiene la mejor recompensa, no el de id mas bajo"),
+                null => panic("maxRow no deberia dar null sobre una coleccion no vacia"),
+            }
+
+            let worst = db.arms.minRow(|a: Arm| { a.avgRewardTenths });
+            match worst {
+                a: Arm => assert(a.name == "A"),
+                null => panic("minRow no deberia dar null sobre una coleccion no vacia"),
+            }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests");
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.passed, 1, "{:?}", summary.failed);
+    }
+
+    #[test]
+    fn max_row_on_an_empty_collection_is_null() {
+        let code = r#"
+            type Arm = { id: Int, avgRewardTenths: Int }
+            db { arms: Arm[] }
+            service S {
+                rpc getBestArm() -> Arm? { db.arms.maxRow(|a: Arm| { a.avgRewardTenths }) }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let result = invoke_rpc(&program, "S", "getBestArm", &json!({}), &db).unwrap();
+        assert_eq!(result, json!(null));
+    }
+
     #[test]
     fn count_by_on_an_enum_field_returns_the_real_enum_variant_as_key() {
         // Verificación de valor exacto, no solo longitud -- confirma que

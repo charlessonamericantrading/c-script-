@@ -3649,6 +3649,7 @@ impl Checker {
                 Ok(Type::List(Box::new(element_ty.clone())))
             }
             "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.check_aggregate_by(element_ty, method, args, env),
+            "maxRow" | "minRow" => self.check_top_row(element_ty, method, args, env),
 
             // GRAMMAR.md §3.75. `updateFn` devuelve `Omit<T,"id">` (un
             // VALOR completo), no `Patch<T>` -- a propósito: `Patch<T>` no
@@ -3692,7 +3693,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/subscribe)"
             ))),
         }
     }
@@ -3874,6 +3875,26 @@ impl Checker {
                 FieldType { name: "value".to_string(), optional: false, ty: result_ty },
             ],
         })))
+    }
+
+    /// `db.<c>.maxRow(selector)` / `db.<c>.minRow(selector)` (GRAMMAR.md
+    /// §3.102): la fila COMPLETA con el valor máximo/mínimo de un campo --
+    /// a diferencia de `maxBy`/`minBy` (arriba), que solo agregan un VALOR
+    /// (sin `GROUP BY`, siempre 0 o 1 grupo total). Mismo shape reconocido
+    /// (`field_selector`, un acceso de campo simple) y mismas restricciones
+    /// de tipo que el campo de VALOR de `sumBy`/`maxBy`/`minBy` -- solo
+    /// `Int`/`Int64`/`Float`, nunca opcional.
+    fn check_top_row(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>], _env: &Env) -> Result<Type, CheckError> {
+        let [selector_arg] = args else {
+            return Err(err(format!("'{method}' toma exactamente 1 argumento (selector: |item: T| item.campo)")));
+        };
+        let (field_name, field_ty) = self.field_selector(element_ty, selector_arg, method, "de orden")?;
+        if !matches!(field_ty, Type::Int | Type::Int64 | Type::Float) {
+            return Err(err(format!(
+                "'{method}': el campo de orden '{field_name}' es {field_ty} -- tiene que ser Int, Int64 o Float (mismo criterio que el campo de valor de sumBy/maxBy/minBy, GRAMMAR.md §3.52)"
+            )));
+        }
+        Ok(Type::Optional(Box::new(element_ty.clone())))
     }
 
     fn expect_no_args(&self, args: &[Spanned<Expr>], method: &str) -> Result<(), CheckError> {
@@ -6363,6 +6384,72 @@ type T = { id: Int, s: Status }")
         "#;
         let msg = format!("{:?}", check_source(src).unwrap_err());
         assert!(msg.contains("tiene que ser Int, Int64 o Float"), "{msg}");
+    }
+
+    // GRAMMAR.md §3.102: `maxRow`/`minRow` -- la fila COMPLETA, a
+    // diferencia de `maxBy`/`minBy` (arriba), que solo agregan un valor.
+
+    #[test]
+    fn max_row_returns_an_optional_of_the_element_type() {
+        let src = r#"
+            type Arm = { id: Int, name: String, avgRewardTenths: Int }
+            db { arms: Arm[] }
+            service S {
+                rpc best() -> Arm? { db.arms.maxRow(|a: Arm| { a.avgRewardTenths }) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn min_row_returns_an_optional_of_the_element_type() {
+        let src = r#"
+            type Arm = { id: Int, name: String, avgRewardTenths: Int }
+            db { arms: Arm[] }
+            service S {
+                rpc worst() -> Arm? { db.arms.minRow(|a: Arm| { a.avgRewardTenths }) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn max_row_rejects_a_non_numeric_selector_field() {
+        let src = r#"
+            type Arm = { id: Int, name: String }
+            db { arms: Arm[] }
+            service S {
+                rpc best() -> Arm? { db.arms.maxRow(|a: Arm| { a.name }) }
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("tiene que ser Int, Int64 o Float"), "{msg}");
+    }
+
+    #[test]
+    fn max_row_rejects_a_derived_expression_as_the_selector() {
+        let src = r#"
+            type Arm = { id: Int, score: Int }
+            db { arms: Arm[] }
+            service S {
+                rpc best() -> Arm? { db.arms.maxRow(|a: Arm| { a.score + 1 }) }
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("selector de campo"), "{msg}");
+    }
+
+    #[test]
+    fn max_row_takes_exactly_one_argument() {
+        let src = r#"
+            type Arm = { id: Int, score: Int }
+            db { arms: Arm[] }
+            service S {
+                rpc best() -> Arm? { db.arms.maxRow(|a: Arm| { a.score }, |a: Arm| { a.score }) }
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("toma exactamente 1 argumento"), "{msg}");
     }
 
     #[test]

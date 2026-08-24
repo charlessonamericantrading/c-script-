@@ -1284,6 +1284,7 @@ db { users: User[] }
                 self.select_rows_after(collection, columns, after, limit).map(Value::List)
             }
             "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.select_grouped(collection, columns, method, &args).map(Value::List),
+            "maxRow" | "minRow" => self.top_row(collection, columns, method, &args),
             "find" => {
                 let id = as_int(args.first().ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?)?;
                 Ok(self.select_rows(collection, columns, Some(id))?.into_iter().next().unwrap_or(Value::Null))
@@ -1817,6 +1818,42 @@ db { users: User[] }
                 ])
             })
             .collect())
+    }
+
+    /// `db.<c>.maxRow(selector)` / `db.<c>.minRow(selector)` (GRAMMAR.md
+    /// §3.102): la fila COMPLETA con el valor máximo/mínimo de un campo --
+    /// `SELECT ... ORDER BY "<campo>" {DESC|ASC} LIMIT 1`, a diferencia de
+    /// `maxBy`/`minBy` (arriba), que solo agregan un VALOR, nunca la fila
+    /// que lo alcanza. Reusa `row_to_fields` (mismo decodificador que
+    /// `select_rows`/`find_where_equals`) para la fila entera, no
+    /// `scalar_cell_to_value` (que `select_grouped` usa para una sola
+    /// celda) -- por eso no comparte código con `select_grouped` más allá
+    /// del `closure_field_name` inicial. `Value::Null` sobre una colección
+    /// vacía (o completamente soft-deleteada), nunca un error.
+    fn top_row(&self, collection: &str, columns: &[ColumnPlan], method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
+        let field = closure_field_name(args.first(), "de orden")?;
+        if !columns.iter().any(|c| c.field.name == field) {
+            return Err(RuntimeError::new(format!("'{method}': '{field}' no es una columna real de '{collection}'")));
+        }
+        let mut col_list = vec!["\"id\"".to_string()];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let order = match method {
+            "maxRow" => "DESC",
+            "minRow" => "ASC",
+            other => panic!("top_row llamado con un método que Db::call no debería enrutar acá: '{other}'"),
+        };
+        let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{field}\" {order} LIMIT 1", col_list.join(", "));
+        let mut kinds = vec![ColumnKind::Int];
+        kinds.extend(columns.iter().map(ColumnPlan::kind));
+        let rows = self
+            .backend
+            .query(&sql, &[], &kinds)
+            .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+        match rows.into_iter().next() {
+            Some(cells) => self.row_to_fields(collection, &cells, columns).map(Value::Struct),
+            None => Ok(Value::Null),
+        }
     }
 
     /// Reconstruye una fila entera (`"id"` + cada columna declarada) como los
