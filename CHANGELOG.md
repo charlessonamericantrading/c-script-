@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.31.0] - 2026-08-24
+
+### 🐛 Arreglado
+- **`schema.postgres.sql` ya no pide `CREATE EXTENSION "pgcrypto"`.** Un reporte de adopción real preguntaba si esa línea (presente desde v1.0) necesitaba superusuario en un proveedor gestionado (Neon/RDS/Supabase) -- auditando para qué se usaba la respuesta fue "para nada": ninguna función de pgcrypto aparece en ningún SQL que el proyecto genera o ejecuta, `crypto.*` es Argon2id/HMAC/CSPRNG en Rust. Era peso muerto heredado que podía bloquear sin motivo a un rol sin permiso de crear extensiones. Se sacó por completo en vez de documentar un requisito que no existía.
+
+649 tests (2 nuevos): uno confirma que el DDL generado nunca menciona pgcrypto/`CREATE EXTENSION`; el otro aplica el `schema.postgres.sql` completo con un rol Postgres real `NOSUPERUSER NOCREATEDB NOCREATEROLE` y confirma que aplica limpio. Detalle completo: GRAMMAR.md §3.36.
+
 ## [1.30.0] - 2026-08-24
 
 ### 📝 Documentación

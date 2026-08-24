@@ -74,10 +74,17 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
         .map(|(k, _)| k.clone())
         .collect();
 
-    let mut statements = vec![
-        "-- Schema generado automáticamente por Link (PostgreSQL Enterprise Backend)".to_string(),
-        "CREATE EXTENSION IF NOT EXISTS \"pgcrypto\";".to_string(),
-    ];
+    // Sin `CREATE EXTENSION "pgcrypto"` (PLAN.md §9.1): auditando si esa
+    // línea necesita superusuario en Postgres gestionado (Neon/RDS/Supabase,
+    // pedido explícito en un reporte de adopción real) apareció que NADA en
+    // este codegen ni en el runtime usa ninguna función de pgcrypto --
+    // `crypto.hashPassword`/`hmacSha256`/etc. (GRAMMAR.md §3.34/§3.38/§3.55)
+    // son Argon2id/HMAC implementados en Rust (`argon2`/`hmac`), nunca SQL.
+    // La línea era peso muerto heredado que podía bloquear a alguien sin
+    // permiso de `CREATE EXTENSION` por una extensión que el proyecto nunca
+    // necesitó -- la respuesta correcta no era documentar el requisito, era
+    // borrarla.
+    let mut statements = vec!["-- Schema generado automáticamente por Link (PostgreSQL Enterprise Backend)".to_string()];
 
     for (coll_name, elem_ty) in checker.db_collections() {
         if let Type::Struct { fields, .. } = elem_ty {
@@ -128,6 +135,21 @@ mod tests {
         assert!(ddl.contains("\"is_active\" BOOLEAN NOT NULL"));
         assert!(ddl.contains("\"created_at\" BIGINT NOT NULL"));
         assert!(ddl.contains("\"metadata\" JSONB NOT NULL"));
+    }
+
+    /// PLAN.md §9.1: auditando si `CREATE EXTENSION "pgcrypto"` necesita
+    /// superusuario en Postgres gestionado apareció que nada en este codegen
+    /// ni en el runtime usa NINGUNA función de pgcrypto -- `crypto.*`
+    /// (GRAMMAR.md §3.34/§3.38/§3.55) es Argon2id/HMAC en Rust, nunca SQL.
+    /// La línea era peso muerto que podía bloquear a alguien sin permiso de
+    /// `CREATE EXTENSION` por una extensión que el proyecto nunca necesitó.
+    #[test]
+    fn generated_ddl_never_requires_the_pgcrypto_extension() {
+        let code = "type User = { id: Int, name: String } db { users: User[] }";
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let ddl = generate_postgres_ddl(&program).unwrap();
+        assert!(!ddl.to_lowercase().contains("pgcrypto"), "el DDL generado no debería mencionar pgcrypto en absoluto: {ddl}");
+        assert!(!ddl.to_lowercase().contains("create extension"), "no debería pedir ninguna extensión: {ddl}");
     }
 
     /// Regresion: `String?` no hacia match con `Type::String` y caia en el

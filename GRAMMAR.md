@@ -1613,6 +1613,8 @@ No hay hoy ningún mecanismo de namespacing (`--db-schema`/`--db-prefix`) para e
 
 Verificado en `pg_integration.rs` contra una PostgreSQL real: dos `.link` con columnas disjuntas conviven para lectura, y el `INSERT` del segundo falla limpio (sin panic) cuando pisa una columna `NOT NULL` que no conoce; dos `.link` con el mismo nombre de campo y tipos distintos (`Int` vs `String`) fallan limpio en la primera lectura real, nunca al conectar.
 
+**`schema.postgres.sql` NUNCA pide `CREATE EXTENSION`, ninguna.** Hasta esta ronda, `generate_postgres_ddl` (`codegen/postgres_emit.rs`) emitía `CREATE EXTENSION IF NOT EXISTS "pgcrypto";` al principio de cada `schema.postgres.sql` generado -- una pregunta real de un reporte de adopción ("¿requiere superusuario en Neon/RDS/Supabase?") llevó a auditar para qué se usaba, y la respuesta fue: para nada. Ninguna función de pgcrypto (`crypt()`, `gen_random_uuid()`, `digest()`, etc.) aparece en ningún SQL que este proyecto genera o ejecuta -- `crypto.hashPassword`/`hmacSha256`/`randomToken`/etc. (§3.34/§3.38/§3.54/§3.55) son Argon2id/HMAC/CSPRNG implementados en Rust, nunca en SQL. La línea era peso muerto heredado que podía bloquear sin motivo a alguien conectado con un rol sin permiso de `CREATE EXTENSION` -- se sacó por completo, en vez de solo documentar el requisito que en realidad no existía. Verificado de la forma más directa posible: un rol Postgres real creado con `NOSUPERUSER NOCREATEDB NOCREATEROLE` y solo `GRANT CREATE, USAGE ON SCHEMA public` aplica el `schema.postgres.sql` completo sin ningún error.
+
 ---
 
 ### 3.37 `@route("/blog/:slug")`: URLs amigables para SEO — RESUELTO (alcance acotado)

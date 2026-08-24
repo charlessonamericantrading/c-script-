@@ -1469,3 +1469,63 @@ service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
     let err = server_b.try_rpc("Items/list", "{}").expect_err("leer una columna INTEGER real como String tiene que fallar limpio");
     assert!(!err.contains("panicked at"), "tiene que ser un error de runtime limpio, no un panic que tumbe el proceso: {err}");
 }
+
+/// Mismo host/base, credenciales distintas -- para probar el DDL generado
+/// con un rol restringido, sin depender de que la URL de test tenga un
+/// formato particular más allá de `postgres://user:pass@resto`.
+fn with_credentials(url: &str, user: &str, password: &str) -> String {
+    let after_scheme = url.strip_prefix("postgres://").or_else(|| url.strip_prefix("postgresql://")).expect("URL postgres:// esperada");
+    let host_and_rest = after_scheme.split_once('@').map(|(_, rest)| rest).unwrap_or(after_scheme);
+    format!("postgres://{user}:{password}@{host_and_rest}")
+}
+
+#[test]
+fn generated_ddl_applies_cleanly_as_a_role_without_superuser_or_createrole() {
+    // PLAN.md §9.1: el reporte de adopción preguntaba si `CREATE EXTENSION
+    // "pgcrypto"` (que ya se sacó del DDL generado, ver postgres_emit.rs)
+    // necesitaba superusuario en un proveedor gestionado (Neon/RDS/Supabase),
+    // donde la app casi nunca corre como superusuario. Este test no asume la
+    // respuesta -- crea un rol restringido de verdad (NOSUPERUSER,
+    // NOCREATEROLE, NOCREATEDB, sin ningún privilegio más allá de crear
+    // tablas en el schema `public`) y aplica el `schema.postgres.sql`
+    // generado CONECTADO COMO ESE ROL, confirmando que aplica limpio.
+    const COLLECTION: &str = "items_restricted_role";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como el rol de test (admin en CI)");
+    let role = "linkc_test_restricted_role";
+    let password = "linkc-test-only";
+    admin.batch_execute(&format!("DROP ROLE IF EXISTS {role};")).ok();
+    let Ok(_) = admin.batch_execute(&format!(
+        "CREATE ROLE {role} WITH LOGIN PASSWORD '{password}' NOSUPERUSER NOCREATEDB NOCREATEROLE; \
+         GRANT CREATE, USAGE ON SCHEMA public TO {role};"
+    )) else {
+        eprintln!("saltado: el rol de LINK_TEST_PG_URL no tiene permiso de crear roles -- no se puede simular esta restricción acá");
+        return;
+    };
+
+    let temp = TempDir::new("restricted-role");
+    let src = temp.write(
+        "app.link",
+        &format!("type Item = {{ id: Int, name: String }}\ndb {{ {COLLECTION}: Item[] }}"),
+    );
+    let out_dir = temp.0.join("gen");
+    let build = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("build").arg(&src).arg(&out_dir).output().expect("ejecutar linkc build");
+    assert!(build.status.success(), "{}", String::from_utf8_lossy(&build.stderr));
+    let emitted = std::fs::read_to_string(out_dir.join("schema.postgres.sql")).expect("schema.postgres.sql");
+    assert!(!emitted.to_lowercase().contains("extension"), "el DDL emitido no debería pedir ninguna extensión: {emitted}");
+
+    let restricted_url = with_credentials(&url, role, password);
+    let mut restricted = postgres::Client::connect(&restricted_url, postgres::NoTls)
+        .expect("conectar con el rol restringido -- si esto falla, el problema es la conexión, no el DDL");
+    restricted
+        .batch_execute(&emitted)
+        .expect("un rol SIN superusuario/createrole tiene que poder aplicar el schema completo generado, sin CREATE EXTENSION de por medio");
+
+    admin.batch_execute(&format!("DROP TABLE IF EXISTS \"{COLLECTION}\"; DROP ROLE IF EXISTS {role};")).ok();
+}
