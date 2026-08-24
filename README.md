@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.55.0-blue.svg" alt="Version" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.56.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 843 automated tests:
+**Works today**, covered by 852 automated tests:
 
-- `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `linkc build` / `serve` / `serve-all` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `linkc serve-all <dir> --port-base N` runs every `.link` in a directory as one OS process (one thread per service, its own port and its own SQLite file each) instead of one process per service — the real case that motivated it: 13-17 separate `pm2` processes in a production adoption, one per `.link`. `--restart-backoff <duration>` (also usable with plain `linkc serve`) adds native exponential backoff on a recoverable startup failure (port already bound, Postgres down) — a bind/connect failure in one service no longer takes the rest down with it
 - `dateFromParts(year, month, day, hour, minute, second) -> Timestamp` builds an arbitrary `Timestamp` from calendar parts — `now()` only ever gave the *current* instant, so computing something like a quarter's start date entirely inside an rpc was impossible before this. An invalid date (month 13, February 30) is a 400 naming the bad field, never a panic
 - A `Timestamp` field now decodes native PostgreSQL `date`/`timestamp`/`timestamptz` columns, not just the `BIGINT`-milliseconds convention `linkc build` generates — the common case when adopting an existing table, where date columns are almost always the Postgres-native type. Decoded by hand against Postgres's raw binary wire format (no new `chrono` dependency); `linkc introspect` now recommends `Timestamp` with no warning for these columns instead of a `String` mapping that, in practice, didn't work either. Read-only for now — writing to a native column through c-script still doesn't
 - `--trust-proxy`/`LINK_TRUST_PROXY` for `linkc serve`: makes `@rate_limit` identify the client by the first `X-Forwarded-For` value instead of `remote_addr()` — off by default, since `remote_addr()` is always the proxy's own IP behind a real reverse proxy/load balancer (confirmed as a real production blocker: the IgnisLove adoption runs entirely behind nginx), sharing the limit across every real user at once. Explicit opt-in on purpose — turning it on without an actual trusted proxy in front lets any direct client dodge the limit by sending a different header on each request. v0 trusts the whole header once enabled, no "N trusted hops" or CIDR-range mechanism yet

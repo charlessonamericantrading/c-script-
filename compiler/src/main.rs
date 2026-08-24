@@ -79,6 +79,7 @@ fn main() -> ExitCode {
         Some("build") => cmd_build(&args[2..]),
         Some("test") => cmd_test(&args[2..]),
         Some("serve") => cmd_serve(&args[2..]),
+        Some("serve-all") => cmd_serve_all(&args[2..]),
         Some("new") => cmd_new(&args[2..]),
         Some("dev") => cmd_dev(&args[2..]),
         Some("lsp") => cmd_lsp(),
@@ -133,7 +134,8 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s')"));
+    out(&format!("     linkc serve-all <directorio> --port-base <N> [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
     out(&format!("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)"));
 }
@@ -956,7 +958,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing]"
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]"
         );
         return ExitCode::FAILURE;
     };
@@ -1036,26 +1038,331 @@ fn cmd_serve(args: &[String]) -> ExitCode {
 
     let trust_proxy = resolve_trust_proxy(args);
 
+    let restart_backoff = match resolve_restart_backoff(args) {
+        Ok(b) => b,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    runtime::server::serve(
-        program,
-        &host,
-        port,
-        source,
-        cors,
-        session_ttl,
-        argon2_params,
-        jwt_config,
-        adopt_existing,
-        max_body_bytes,
-        http_timeout,
-        trust_proxy,
-    );
-    ExitCode::SUCCESS
+    let attempt = || {
+        runtime::server::serve(
+            &program,
+            &host,
+            port,
+            source.clone(),
+            cors.clone(),
+            session_ttl,
+            argon2_params.clone(),
+            jwt_config.clone(),
+            adopt_existing,
+            max_body_bytes,
+            http_timeout,
+            trust_proxy,
+        )
+    };
+    match run_serve_with_backoff(attempt, restart_backoff, path) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("{msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Techo del backoff exponencial (GRAMMAR.md §3.92) -- ningún reintento
+/// espera más que esto, sin importar cuántos fallos consecutivos lleve.
+const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Cuánto tiempo corriendo SIN fallar hace falta para considerar que un
+/// servicio ya está sano de nuevo y resetear el backoff a la base -- así
+/// una racha vieja de fallos (ej. un arranque en frío con varios puertos
+/// disputados) no sigue penalizando a un servicio que ya lleva rato andando
+/// bien. Mismo espíritu que el "restart window" de systemd/pm2, un número
+/// razonable, no exhaustivamente investigado -- mismo criterio que
+/// `DEFAULT_MAX_BODY_BYTES` arriba.
+const MIN_UPTIME_TO_RESET_BACKOFF: Duration = Duration::from_secs(60);
+
+/// Reintenta `attempt` (normalmente un cierre que compila+arranca UN
+/// servicio, ver `cmd_serve`/`cmd_serve_all`) ante un fallo RECUPERABLE de
+/// `runtime::server::serve` (bind de puerto ocupado, Postgres caído al
+/// arrancar) -- GRAMMAR.md §3.92. El incidente real que lo motiva: un
+/// arranque en frío con varios procesos (pm2, en el caso reportado)
+/// compitiendo por bindear sus puertos casi al mismo tiempo, donde alguno
+/// pierde la carrera la primera vez -- hoy mitigado desde AFUERA del
+/// lenguaje (`--restart-delay` fijo de pm2); esto lo hace nativo, con
+/// backoff exponencial en vez de una espera fija siempre igual.
+///
+/// `backoff_base` es `None` sin `--restart-backoff`/`LINK_RESTART_BACKOFF`:
+/// UN solo intento, comportamiento IDÉNTICO al de siempre -- el fallo se
+/// devuelve tal cual, sin reintento nativo (delega en quien orqueste el
+/// proceso, como ya hacía). Con `Some(base)`: cada fallo duplica la espera
+/// (con techo `MAX_RESTART_BACKOFF`), reseteada a `base` después de
+/// `MIN_UPTIME_TO_RESET_BACKOFF` de funcionamiento estable. `label` va en
+/// cada línea de log -- imprescindible en `serve-all`, donde varios
+/// servicios comparten un mismo stdout/stderr de proceso.
+fn run_serve_with_backoff(attempt: impl Fn() -> Result<(), String>, backoff_base: Option<Duration>, label: &str) -> Result<(), String> {
+    let Some(base) = backoff_base else {
+        return attempt();
+    };
+    let mut delay = base;
+    loop {
+        let started = std::time::Instant::now();
+        let err = match attempt() {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        if started.elapsed() >= MIN_UPTIME_TO_RESET_BACKOFF {
+            delay = base;
+        }
+        eprintln!("[{label}] {err}");
+        eprintln!("[{label}] reintentando en {delay:?}...");
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(MAX_RESTART_BACKOFF);
+    }
+}
+
+/// `--restart-backoff <duración>`/`LINK_RESTART_BACKOFF` (GRAMMAR.md
+/// §3.92): duración BASE del backoff exponencial de `run_serve_with_backoff`
+/// ante un fallo recuperable de `serve` (bind de puerto ocupado, Postgres
+/// caído al arrancar). Mismo formato que `--session-ttl`/`--http-timeout`
+/// (`parse_duration`, granularidad de 1 segundo -- sin milisegundos, ver
+/// GRAMMAR.md §3.92 "Límites honestos"). Sin el flag/env var: `None`, un
+/// solo intento -- comportamiento IDÉNTICO al de siempre.
+fn resolve_restart_backoff(args: &[String]) -> Result<Option<Duration>, String> {
+    let raw = read_flag_or_env(args, "--restart-backoff", "LINK_RESTART_BACKOFF")?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    parse_duration(&raw).map(Some)
+}
+
+/// GRAMMAR.md §3.92: UN proceso sirviendo TODOS los `.link` de un
+/// directorio, cada uno en su propio hilo del sistema operativo y su propio
+/// puerto (`--port-base N`, N+0/N+1/N+2/... en orden alfabético de nombre
+/// de archivo -- determinístico, pero cambia si se agrega/renombra un
+/// archivo, ver "Límites honestos"). El caso real que lo motiva: 13-17
+/// procesos `pm2` separados (uno por `.link`), cada uno con su propio
+/// puerto y su propio archivo SQLite -- 13-17 líneas de deploy script para
+/// lo que podría ser una sola. `serve-all` colapsa el conteo de PROCESOS a
+/// uno, sin tocar el aislamiento de datos: cada servicio sigue con su
+/// propio archivo SQLite (`<archivo>.db` al lado del `.link`, el mismo
+/// default que `linkc serve` sin `--db`) -- por eso `--db`/
+/// `LINK_DATABASE_URL` compartido NO está soportado acá, ver más abajo.
+///
+/// Todos los `.link` se compilan ANTES de arrancar ningún hilo -- un
+/// workspace a medio arrancar (12 de 13 servicios sanos, uno ni siquiera
+/// compiló) es peor que no arrancar nada; un error de tipos en cualquiera
+/// de los archivos aborta TODO el comando, con el mismo reporte de error de
+/// siempre.
+fn cmd_serve_all(args: &[String]) -> ExitCode {
+    let Some(dir) = args.first() else {
+        eprintln!(
+            "uso: linkc serve-all <directorio> --port-base <N> [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]"
+        );
+        return ExitCode::FAILURE;
+    };
+
+    // `--db`/`LINK_DATABASE_URL` compartido entre servicios de distinto
+    // schema es exactamente el escenario de colisión de nombre de tabla que
+    // motivó §3.93 (detección de colisión) -- sin esa red de seguridad
+    // todavía, rechazarlo acá de entrada es más honesto que aceptarlo y
+    // arriesgar una tabla de un servicio pisando la de otro en silencio.
+    if args.iter().any(|a| a == "--db") || std::env::var("LINK_DATABASE_URL").ok().filter(|v| !v.trim().is_empty()).is_some() {
+        eprintln!(
+            "linkc serve-all no soporta --db/LINK_DATABASE_URL compartido entre servicios -- cada .link usa su propio \
+             archivo SQLite ('<archivo>.db' al lado del .link, igual que 'linkc serve' sin --db). Apuntar varios \
+             servicios a la MISMA base todavía no está soportado (--db-schema/--db-prefix, sin implementar)."
+        );
+        return ExitCode::FAILURE;
+    }
+
+    let dir_path = Path::new(dir);
+    if !dir_path.is_dir() {
+        eprintln!("'{dir}' no es un directorio");
+        return ExitCode::FAILURE;
+    }
+
+    let port_base: u16 = match extract_flag_value(args, "--port-base") {
+        Ok(Some(v)) => match v.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("--port-base: '{v}' no es un puerto válido (0-65535)");
+                return ExitCode::FAILURE;
+            }
+        },
+        Ok(None) => {
+            eprintln!("uso: linkc serve-all <directorio> --port-base <N> (falta --port-base)");
+            return ExitCode::FAILURE;
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut link_files: Vec<PathBuf> = match fs::read_dir(dir_path) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("link"))
+            .collect(),
+        Err(e) => {
+            eprintln!("no se pudo leer '{dir}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Orden alfabético: determinístico entre corridas (mismo directorio,
+    // mismos archivos -> misma asignación de puerto), pero NO estable ante
+    // agregar/quitar/renombrar un archivo -- ver "Límites honestos" en
+    // GRAMMAR.md §3.92. Se imprime la asignación exacta más abajo para que
+    // quede documentado en cada arranque, no solo en la documentación.
+    link_files.sort();
+    if link_files.is_empty() {
+        eprintln!("'{dir}' no tiene ningún archivo .link");
+        return ExitCode::FAILURE;
+    }
+
+    let host = match resolve_host(args) {
+        Ok(h) => h,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cors = match resolve_cors_origins(args) {
+        Ok(origins) => match origins {
+            Some(list) => runtime::server::CorsConfig::Allowlist(list),
+            None => runtime::server::CorsConfig::Any,
+        },
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let session_ttl = match resolve_session_ttl(args) {
+        Ok(ttl) => ttl,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let argon2_params = match resolve_argon2_params(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let jwt_config = match resolve_jwt_config(args) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let adopt_existing = resolve_adopt_existing(args);
+    let max_body_bytes = match resolve_max_body_bytes(args) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let http_timeout = match resolve_http_timeout(args) {
+        Ok(d) => d,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let trust_proxy = resolve_trust_proxy(args);
+    let restart_backoff = match resolve_restart_backoff(args) {
+        Ok(b) => b,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut services: Vec<(PathBuf, u16, Program)> = Vec::with_capacity(link_files.len());
+    for (i, path) in link_files.iter().enumerate() {
+        let Some(port) = port_base.checked_add(i as u16) else {
+            eprintln!("--port-base {port_base}: no alcanzan los puertos para {} archivos .link (se pasaría de 65535)", link_files.len());
+            return ExitCode::FAILURE;
+        };
+        let path_str = path.to_string_lossy().to_string();
+        let program = match load_and_check(&path_str) {
+            Ok(p) => p,
+            Err(code) => return code,
+        };
+        services.push((path.clone(), port, program));
+    }
+
+    println!("linkc serve-all: {} servicio(s) en un proceso (datos en SQLite separado por servicio)", services.len());
+    for (path, port, _) in &services {
+        println!("  {:<40} -> http://localhost:{port}", path.display());
+    }
+
+    let handles: Vec<std::thread::JoinHandle<bool>> = services
+        .into_iter()
+        .map(|(path, port, program)| {
+            let host = host.clone();
+            let cors = cors.clone();
+            let jwt_config = jwt_config.clone();
+            let argon2_params = argon2_params.clone();
+            let label = path.to_string_lossy().to_string();
+            std::thread::spawn(move || {
+                let source = runtime::server::DbSource::SqliteFile(path.with_extension("db"));
+                let attempt = || {
+                    runtime::server::serve(
+                        &program,
+                        &host,
+                        port,
+                        source.clone(),
+                        cors.clone(),
+                        session_ttl,
+                        argon2_params.clone(),
+                        jwt_config.clone(),
+                        adopt_existing,
+                        max_body_bytes,
+                        http_timeout,
+                        trust_proxy,
+                    )
+                };
+                match run_serve_with_backoff(attempt, restart_backoff, &label) {
+                    Ok(()) => true,
+                    Err(msg) => {
+                        eprintln!("[{label}] servicio caído, no se reintenta más (los demás servicios siguen corriendo): {msg}");
+                        false
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Join secuencial: cualquier hilo sano bloquea acá para siempre (el
+    // caso normal), así que el proceso sigue vivo mientras QUEDE al menos
+    // uno andando -- el código de salida solo importa en el caso raro (o de
+    // test) en que TODOS terminan.
+    let mut all_ok = true;
+    for h in handles {
+        match h.join() {
+            Ok(ok) => all_ok &= ok,
+            Err(_) => all_ok = false,
+        }
+    }
+    if all_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 /// En qué dirección escucha el servidor (GRAMMAR.md §3.81), mismo orden de

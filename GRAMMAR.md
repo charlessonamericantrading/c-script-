@@ -113,6 +113,7 @@
   - [3.89 `--trust-proxy`: `@rate_limit` detrás de un proxy real — RESUELTO](#389---trust-proxy-rate_limit-detrás-de-un-proxy-real--resuelto)
   - [3.90 `dateFromParts(...)`: construir un `Timestamp` arbitrario — RESUELTO](#390-datefromparts-construir-un-timestamp-arbitrario--resuelto)
   - [3.91 `Timestamp` decodifica `date`/`timestamp`/`timestamptz` nativos de Postgres — RESUELTO](#391-timestamp-decodifica-datetimestamptimestamptz-nativos-de-postgres--resuelto)
+  - [3.92 `linkc serve-all` + `--restart-backoff`: un proceso para varios servicios — RESUELTO](#392-linkc-serve-all----restart-backoff-un-proceso-para-varios-servicios--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4315,6 +4316,43 @@ service Facturas {
 - **`uuid` nativo de Postgres queda FUERA de esta ronda a propósito.** Auditando este mismo código apareció la misma forma de problema potencial (`Type::Uuid`/`String` decodificando contra el OID de un `uuid` nativo, nunca verificado) -- `linkc introspect` lo señala en su advertencia, pero no se tocó: esta ronda se acotó al caso confirmado y reportado (fechas), no a auditar cada tipo nativo de Postgres de una sola vez.
 
 **Verificado**: 6 tests en `runtime/timestamp.rs` contra los DOS epochs de forma independiente (la constante del offset coincide con el algoritmo de calendario, un ancla pública conocida -- 2000-01-01 en milisegundos-desde-1970 -- para `timestamp` y para `date`, precisión truncada a milisegundos, un valor negativo antes del epoch de Postgres). 2 en `introspect.rs` (mapeo exacto sin advertencia para `date`/`timestamp`/`timestamptz`, `time` sigue advirtiendo). 1 en `pg_integration.rs` contra un PostgreSQL real: una tabla creada y sembrada con SQL crudo (`date`/`timestamptz`/`timestamp` nativos, nunca escritos por c-script), adoptada con `--adopt-existing` declarando los tres campos como `Timestamp`, decodifica la fila real correctamente vía un rpc real. Más un test end-to-end que extiende `introspect_generates_a_link_file_that_actually_works_against_the_real_table`: `linkc introspect` sobre una tabla con una columna `date` real genera `Timestamp` sin advertencia, y el `.link` generado (sin tocar a mano) lee la fila real con la fecha correcta.
+
+---
+
+### 3.92 `linkc serve-all` + `--restart-backoff`: un proceso para varios servicios — RESUELTO
+
+Reporte de adopción real (IgnisLove): 13-17 `.link` desplegados como 13-17 procesos `pm2` SEPARADOS, uno por servicio -- cada uno con su propio puerto, su propio archivo SQLite, y su propia línea en el script de deploy. Un incidente confirmado en producción: un arranque en frío donde varios de esos procesos compiten por bindear sus puertos casi al mismo tiempo, alguno pierde la carrera, `pm2` lo reinicia con un `--restart-delay` fijo (una capa por completo AFUERA del lenguaje) -- 68 reinicios de un solo servicio (`telemetry`) antes de estabilizarse.
+
+```bash
+# Antes: 13 procesos pm2 separados, uno por .link, cada uno con su
+# propio --restart-delay como mitigación externa.
+
+# Ahora: un proceso sirve TODOS los .link de un directorio.
+linkc serve-all ./servicios --port-base 3000 --host 127.0.0.1 --restart-backoff 1s
+#   servicios/facturacion.link -> http://localhost:3000
+#   servicios/inventario.link  -> http://localhost:3001
+#   servicios/telemetry.link   -> http://localhost:3002
+#   ...
+```
+
+**`linkc serve-all <directorio> --port-base N`: descubre cada `.link` DIRECTO dentro de `<directorio>` (no recursivo), los compila TODOS antes de arrancar nada, y arranca uno por hilo del sistema operativo -- un único proceso, un único PID, una única línea de deploy.** El puerto de cada servicio es `N` más su posición en orden ALFABÉTICO de nombre de archivo (determinístico entre corridas del MISMO directorio con los MISMOS archivos, impreso explícitamente al arrancar -- ver "Límites honestos"). Cada hilo es independiente de los demás: `Value`/`Db`/`Program` (GRAMMAR.md §3.10, closures con `Rc<RefCell<_>>`) nunca cruzan un borde de hilo, así que no hace falta ni `Arc` ni ningún tipo de sincronización entre servicios -- cada uno vive enteramente en el suyo, exactamente como si fuera su propio proceso, solo que sin la sobrecarga de UN PROCESO DEL SISTEMA OPERATIVO por servicio.
+
+**Aislamiento de datos preservado -- solo el conteo de PROCESOS colapsa.** Cada servicio sigue leyendo/escribiendo su propio `<archivo>.db` (el mismo default que `linkc serve` sin `--db`) -- por eso `serve-all` RECHAZA `--db`/`LINK_DATABASE_URL` compartido de entrada, con un mensaje explícito: apuntar varios `.link` de distinto schema a la MISMA base es exactamente el escenario de colisión de nombre de tabla que este proyecto todavía no tiene forma de detectar (`--db-schema`/`--db-prefix`, sin implementar) -- rechazarlo de una es más honesto que aceptarlo y arriesgar que la tabla de un servicio pise la de otro en silencio.
+
+**Compilación atómica: TODOS los `.link` se tipan antes de arrancar CUALQUIER hilo.** Un workspace a medio levantar (12 de 13 servicios sanos, uno ni siquiera compiló) es peor que no levantar ninguno -- un error de tipos en cualquier archivo aborta el comando entero, con el mismo reporte de error (snippet + caret) que `linkc build`/`linkc serve` de siempre.
+
+**Un servicio caído (bind ocupado, Postgres abajo al arrancar) YA NO SE LLEVA A LOS DEMÁS POR DELANTE.** Antes de esta ronda, `runtime::server::serve` resolvía los dos fallos así: un bind fallido con `panic!`, una conexión a Postgres fallida con `std::process::exit(1)` -- cualquiera de los dos, dentro de UN proceso por servicio, solo mataba a ESE servicio (lo que `pm2` reiniciaba). Pero un `process::exit` tumba el PROCESO ENTERO, no el hilo -- si `serve-all` no lo hubiera cambiado, un Postgres caído en UN servicio se habría llevado puesto TODO el workspace. Ahora `serve` devuelve `Result<(), String>` -- `linkc serve` (un solo servicio) preserva el comportamiento de siempre (el fallo termina el proceso, código 1, delegando el reintento a quien orqueste, como antes), y `serve-all` nunca termina el proceso por un solo servicio: lo loguea con su nombre de archivo como prefijo (varios servicios comparten un mismo stdout/stderr) y sigue con los demás.
+
+**`--restart-backoff <duración>`/`LINK_RESTART_BACKOFF`: backoff exponencial NATIVO ante ese mismo fallo, reemplazando la mitigación externa (`pm2 --restart-delay`, una espera FIJA siempre igual).** Sin el flag: un solo intento, igual que siempre (delega en quien orqueste el proceso). Con el flag, `<duración>` es la espera BASE -- se DUPLICA en cada fallo consecutivo hasta un techo de 30s, reseteada a la base después de 60s de funcionamiento estable (para que una racha vieja de fallos, ej. un arranque en frío con varios puertos disputados, no siga penalizando a un servicio que ya está sano). Funciona igual en `linkc serve` (un solo servicio bajo `pm2`/`systemd`, sin migrar a `serve-all`) y en `linkc serve-all` (cada hilo reintenta el suyo, de forma independiente).
+
+**Límites honestos:**
+- **Asignación de puerto por orden alfabético, no fijada por config.** Agregar, quitar o renombrar un `.link` en el directorio corre el riesgo de reasignar los puertos de TODOS los servicios que vienen después alfabéticamente -- por eso `serve-all` imprime la asignación exacta (`archivo -> puerto`) en cada arranque, para que quien opere el gateway/proxy la vea en cada deploy. Sin un mecanismo de "puerto fijo por archivo" todavía.
+- **Todos los servicios comparten el mismo proceso del sistema operativo -- y por lo tanto el mismo entorno.** `--jwt-secret`/`LINK_JWT_SECRET` y el resto de los flags/env vars son GLOBALES a la corrida entera: no hay forma de darle a un servicio un secreto JWT distinto del resto bajo `serve-all` (si hace falta, ese servicio sigue necesitando su propio `linkc serve`). Mismo criterio para `--host`/`--cors-origin`/`--session-ttl`/etc.
+- **`--restart-backoff` cubre fallos que `serve` devuelve como `Result` (bind ocupado, conexión inicial a Postgres) -- no un panic durante el manejo de una request.** Un panic real (un bug, no una condición operativa esperada) sigue matando solo AL HILO de ese servicio (Rust no aborta el proceso entero por un panic en un hilo que no es el principal), pero `serve-all` no lo reintenta automáticamente en v0 -- ese servicio queda caído hasta un restart manual del proceso completo. Retomar un panic con `catch_unwind` para reintentarlo también queda fuera de esta ronda a propósito: confundir "falla esperada" con "hay un bug" en el mismo mecanismo de reintento no es un buen default.
+- **`parse_duration` (compartido con `--session-ttl`/`--http-timeout`) no tiene milisegundos** -- la unidad más chica es `1s`. Suficiente para un backoff razonable (1s/2s/4s/8s/16s/30s), no para uno sub-segundo.
+- **Sin scaffolding de Docker/systemd para `serve-all` todavía** -- `linkc docker` (§3.62) sigue generando un `Dockerfile` de UN `.link`, sin una variante consciente de un directorio con varios.
+
+**Verificado**: `cli_serve_all.rs`, 9 tests con el binario real como subproceso, hablando HTTP y bindeando puertos de verdad -- arranca 2 servicios en un solo proceso y responde en sus dos puertos con sus propios `.db` separados; rechaza `--db`/`LINK_DATABASE_URL` compartido; falla limpio sin `--port-base` o sin ningún `.link` en el directorio; un error de tipos en un archivo aborta TODO antes de arrancar cualquier hilo (el otro servicio ni siquiera llega a abrir su puerto); un bind ocupado en un servicio NO tumba al otro, que sigue respondiendo; y con `--restart-backoff`, un servicio cuyo puerto se libera a mitad de camino se recupera solo mientras el otro sigue sano todo el tiempo -- el incidente real (68 reinicios de `telemetry`), reproducido y confirmado resuelto contra el binario real, no solo razonado por lectura de código.
 
 ---
 

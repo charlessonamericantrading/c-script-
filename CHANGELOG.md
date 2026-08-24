@@ -3,6 +3,14 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.56.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc serve-all <directorio> --port-base N`: un proceso para varios servicios.** Reporte de adopción real (IgnisLove): 13-17 `.link` desplegados como 13-17 procesos `pm2` separados, cada uno con su propio puerto, su propio SQLite y su propia línea de deploy -- confirmado con un incidente puntual, 68 reinicios de un servicio (`telemetry`) en un arranque en frío donde varios procesos competían por bindear sus puertos casi al mismo tiempo. `serve-all` descubre cada `.link` de un directorio, los compila TODOS antes de arrancar cualquiera (un workspace a medio levantar es peor que ninguno), y levanta uno por hilo del sistema operativo dentro de un ÚNICO proceso -- puerto `N`+posición alfabética, impresa explícitamente en cada arranque. Aislamiento de datos preservado: cada servicio conserva su propio archivo SQLite, por eso `--db`/`LINK_DATABASE_URL` compartido se rechaza de entrada (mismo motivo que la falta de detección de colisión de nombre de tabla, todavía sin resolver).
+- **`--restart-backoff <duración>`/`LINK_RESTART_BACKOFF`: backoff exponencial nativo ante un fallo de bind/conexión.** Funciona en `linkc serve` y en `linkc serve-all` -- reemplaza la mitigación externa (`pm2 --restart-delay`, una espera fija) con una que dobla en cada fallo consecutivo (techo 30s, reseteada a la base tras 60s de funcionamiento estable). Auditando `runtime::server::serve` para esto apareció que un fallo de conexión a Postgres usaba `std::process::exit(1)` -- inofensivo bajo un proceso por servicio (como hoy), pero bajo `serve-all` se habría llevado puesto TODO el workspace por un solo servicio caído; `serve` ahora devuelve `Result<(), String>` en vez de terminar el proceso (`linkc serve` preserva el comportamiento externo de siempre, código 1 en el primer fallo sin el flag).
+
+852 tests (9 nuevos) en `cli_serve_all.rs` contra el binario real, bindeando puertos y hablando HTTP de verdad: arranca 2 servicios en un solo proceso con sus propios `.db` separados; rechaza `--db`/`LINK_DATABASE_URL` compartido; falla limpio sin `--port-base` o sin ningún `.link`; un error de tipos en un archivo aborta TODO antes de arrancar cualquier hilo; un bind ocupado en un servicio no tumba al otro; y con `--restart-backoff`, un servicio se recupera solo cuando su puerto se libera mientras el otro sigue sano -- el incidente real reproducido y confirmado resuelto. Detalle completo: GRAMMAR.md §3.92.
+
 ## [1.55.0] - 2026-08-24
 
 ### 🐛 Arreglado

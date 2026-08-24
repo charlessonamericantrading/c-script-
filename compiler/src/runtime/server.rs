@@ -68,6 +68,7 @@ fn log_done(req_id: u64, method: Option<&str>, status: u16, start: std::time::In
 /// De dónde salen los datos que sirve este servidor (GRAMMAR.md §3.36).
 /// El resto del programa no cambia según cuál sea: el mismo `.link`, los
 /// mismos rpc, el mismo contrato TypeScript generado.
+#[derive(Clone)]
 pub enum DbSource {
     /// Un archivo SQLite al lado del fuente -- el default de siempre.
     SqliteFile(PathBuf),
@@ -155,8 +156,19 @@ impl CorsConfig {
 /// balancer) que sobreescribe ese header con el valor real -- sin esto,
 /// cualquier cliente directo podría mandar el header que quiera y evadir el
 /// límite por completo.
+/// GRAMMAR.md §3.92: devuelve `Err` en vez de panic!/`process::exit` en los
+/// dos fallos RECUPERABLES conocidos (puerto ya ocupado, Postgres caído al
+/// arrancar) -- antes de esta ronda, cualquiera de los dos tumbaba el
+/// PROCESO entero, que para `linkc serve` (un solo servicio) no importaba,
+/// pero para `linkc serve-all` (§3.92, varios servicios en un mismo
+/// proceso) se llevaría por delante a servicios sanos junto con el que
+/// falló. El caller (`main.rs::run_serve_with_backoff`) decide qué hacer con
+/// el `Err`: `linkc serve` sin `--restart-backoff` sigue terminando el
+/// proceso con código 1 (comportamiento idéntico al de siempre, solo que
+/// ahora vía un mensaje limpio en vez de un panic con backtrace), y
+/// `serve-all` nunca termina el proceso por un solo servicio caído.
 pub fn serve(
-    program: Program,
+    program: &Program,
     host: &str,
     port: u16,
     source: DbSource,
@@ -168,9 +180,8 @@ pub fn serve(
     max_body_bytes: u64,
     http_timeout: Duration,
     trust_proxy: bool,
-) {
-    let server = tiny_http::Server::http((host, port))
-        .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en {host}:{port}: {e}"));
+) -> Result<(), String> {
+    let server = tiny_http::Server::http((host, port)).map_err(|e| format!("no se pudo iniciar el servidor en {host}:{port}: {e}"))?;
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
     // (persistida en `db_path`, GRAMMAR.md §3.17) por cada una que el
     // programa DECLARA. `Db::seeded()` es un fixture de tests/demo que
@@ -187,17 +198,16 @@ pub fn serve(
     // que ahí es `None` y el loop se queda con el `incoming_requests()`
     // bloqueante de siempre, sin overhead de polling.
     let (db, remote_changes) = match source {
-        DbSource::SqliteFile(db_path) => (Db::new_with_options(&program, &db_path, adopt_existing), None),
+        DbSource::SqliteFile(db_path) => (Db::new_with_options(program, &db_path, adopt_existing), None),
         // A diferencia de abrir un archivo local, conectarse a una base remota
         // falla por motivos operativos normales (está caída, la clave cambió,
-        // la base no existe todavía). Eso merece un mensaje que se entienda y
-        // un exit code, no el panic que usa el camino de SQLite.
-        DbSource::Postgres(url) => match Db::connect_postgres_with_options(&program, &url, adopt_existing) {
+        // la base no existe todavía). Eso merece un mensaje que se entienda,
+        // devuelto como `Err` -- no un exit del proceso entero, ver el
+        // comentario de `serve` arriba.
+        DbSource::Postgres(url) => match Db::connect_postgres_with_options(program, &url, adopt_existing) {
             Ok((db, rx)) => (db, Some(rx)),
             Err(e) => {
-                eprintln!("error: {e}");
-                eprintln!("       revisá la URL de conexión (LINK_DATABASE_URL o --db) y que la base esté levantada");
-                std::process::exit(1);
+                return Err(format!("error: {e}\n       revisá la URL de conexión (LINK_DATABASE_URL o --db) y que la base esté levantada"));
             }
         },
     };
@@ -238,6 +248,11 @@ pub fn serve(
             for request in server.incoming_requests() {
                 handle_request(&program, &db, &sessions, &route_table, &mut rate_limiter, &cors, max_body_bytes, trust_proxy, request);
             }
+            // Inalcanzable en la práctica -- `incoming_requests()` solo
+            // termina si el `Server` se apaga desde OTRO hilo (`.unblock()`),
+            // algo que `serve` nunca hace hoy. Existe para que el tipo de
+            // retorno sea honesto (`Result`, no un `loop {}` que tipa `!`).
+            Ok(())
         }
         Some(remote_rx) => {
             // Además de aceptar requests, hay que drenar los cambios que
