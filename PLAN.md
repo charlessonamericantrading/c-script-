@@ -416,15 +416,16 @@ Con las Fases 0 a 3 completadas y el núcleo v1.28.0 plenamente operativo, las s
 1. **`linkc test <archivo> --filter <nombre>`**: ejecutar un solo test por nombre.
 2. **`linkc --version` por archivo generado**: para saber con qué versión exacta del compilador se generó cada `gen/` cuando conviven varias versiones en el tiempo.
 3. **`linkc doctor`**: diagnóstico de entorno (versión, PATH, permisos, conectividad a la DB configurada) antes de un despliegue.
-4. **`--host <dirección>`/`--bind 127.0.0.1`**: hoy `linkc serve` siempre escucha en `0.0.0.0` sin alternativa (confirmado, no existe tal flag) -- depende enteramente del firewall del sistema operativo como única capa de defensa. Gap de seguridad real, no solo de conveniencia.
-5. **Unix domain sockets** (`--socket /run/app.sock`) como alternativa a TCP.
-6. **Límite configurable de tamaño máximo de body** de request.
-7. **Suite de administración de datos**: `linkc db inspect`/`db shell`/`export`/`import`/`seed` -- listar tablas y conteo de filas, REPL de solo lectura, exportar/importar entre entornos o motores, poblar una base nueva desde un fichero.
-8. **RPCs de administración estándar opcionales** (`_admin.vacuum()`, `_admin.tableStats()`) detrás de `@requires(Role.Admin)`.
-9. **Modo "workspace"**: un único proceso sirviendo varios `.link` bajo un mismo puerto, o al menos `linkc serve-all <directorio> --port-base N` que levante todos los `.link` de una carpeta con puertos consecutivos -- confirmado como necesidad real (17 procesos pm2 en IgnisLove, uno por servicio).
-10. **Backoff configurable ante fallo de bind de puerto** (`--restart-backoff`): confirmado con 61 reinicios en ráfaga en un arranque en frío de 13 procesos simultáneos.
-11. **`linkc systemd <archivo> <puerto>`**: generador de unidad systemd, a la par de `linkc docker` que ya existe.
-12. **`linkc pm2-config <archivo> <puerto> -o ecosystem.json`**: generador de configuración PM2.
+4. **Unix domain sockets** (`--socket /run/app.sock`) como alternativa a TCP.
+5. **Límite configurable de tamaño máximo de body** de request.
+6. **Suite de administración de datos**: `linkc db inspect`/`db shell`/`export`/`import`/`seed` -- listar tablas y conteo de filas, REPL de solo lectura, exportar/importar entre entornos o motores, poblar una base nueva desde un fichero.
+7. **RPCs de administración estándar opcionales** (`_admin.vacuum()`, `_admin.tableStats()`) detrás de `@requires(Role.Admin)`.
+8. **Modo "workspace"**: un único proceso sirviendo varios `.link` bajo un mismo puerto, o al menos `linkc serve-all <directorio> --port-base N` que levante todos los `.link` de una carpeta con puertos consecutivos -- confirmado como necesidad real (17 procesos pm2 en IgnisLove, uno por servicio).
+9. **Backoff configurable ante fallo de bind de puerto** (`--restart-backoff`): confirmado con 61 reinicios en ráfaga en un arranque en frío de 13 procesos simultáneos.
+10. **`linkc systemd <archivo> <puerto>`**: generador de unidad systemd, a la par de `linkc docker` que ya existe.
+11. **`linkc pm2-config <archivo> <puerto> -o ecosystem.json`**: generador de configuración PM2.
+
+**Hecho** (24/08/2026): **`--host <dirección>`/`LINK_HOST`** (originalmente el ítem 4 de esta lista): `linkc serve` escuchaba SIEMPRE en `0.0.0.0` (todas las interfaces), sin ninguna alternativa -- gap de seguridad real, no solo de conveniencia, para un proceso que solo necesita aceptar conexiones locales. Mismo orden de precedencia que el resto de los flags de `serve` (`--host` primero, después `LINK_HOST`, después el default `"0.0.0.0"` de siempre). El valor se pasa tal cual a `tiny_http::Server::http`, sin resolución propia -- una dirección que no le pertenece a ninguna interfaz local hace fallar el bind al arrancar, nombrando la dirección exacta, nunca cae en silencio a `0.0.0.0`. Ver v1.46.0, GRAMMAR.md §3.81.
 
 ### 9.8 Observabilidad
 1. **Logging estructurado en JSON** (`--log-format json`) + **nivel de log configurable** (`--log-level warn|info|debug`) -- hoy cada request exitosa deja una línea, ruidoso en producción con tráfico real.

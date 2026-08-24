@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.46.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`--host <dirección>`/`LINK_HOST` para `linkc serve`.** Hasta esta ronda el servidor siempre escuchaba en `0.0.0.0` (todas las interfaces de red de la máquina), sin ninguna alternativa -- confirmado leyendo `runtime/server.rs`, no existía ningún flag ni variable de entorno para acotarlo. Para un proceso que solo necesita aceptar conexiones locales (detrás de un proxy en el mismo host, o en una máquina de desarrollo con otras cosas corriendo), eso dejaba el firewall del sistema operativo como la ÚNICA capa de defensa -- un gap de seguridad real, no solo de conveniencia. Mismo orden de precedencia que el resto de los flags de `serve`: `--host` en la línea de comandos, si no la variable `LINK_HOST`, si no `"0.0.0.0"` de siempre (sigue siendo el valor correcto para el `ENTRYPOINT` que `linkc docker` genera, donde el proceso ya corre en su propio namespace de red de contenedor). El valor se pasa tal cual a `tiny_http::Server::http`, sin resolución ni validación propia más allá de rechazar `--host ""` vacío -- una dirección que no le pertenece a ninguna interfaz local hace fallar el bind al arrancar, con un mensaje que nombra la dirección exacta, nunca cae en silencio a `0.0.0.0`.
+
+780 tests (7 nuevos) en `cli_host.rs` contra el binario real como subproceso: el default sigue aceptando una conexión por loopback, `--host 127.0.0.1`/`LINK_HOST=127.0.0.1` sirven igual por loopback, una dirección que no le pertenece a ninguna interfaz local (`192.0.2.1`, TEST-NET-1 de RFC 5737, para no depender de una segunda interfaz real en la máquina de test) hace fallar el arranque nombrando esa dirección -- probando que el valor de verdad se usa para bindear, no se ignora en silencio --, el flag le gana a la variable de entorno, y tanto `--host` sin valor como `--host ""` son errores de uso limpios sin panic. Detalle completo: GRAMMAR.md §3.81.
+
 ## [1.45.0] - 2026-08-24
 
 ### ✨ Nuevo

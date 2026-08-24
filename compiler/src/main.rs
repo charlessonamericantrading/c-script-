@@ -125,7 +125,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--adopt-existing]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--adopt-existing]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
 }
 
@@ -924,13 +924,21 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--cors-origin <origen>] [--session-ttl <duración>] [--adopt-existing]"
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--adopt-existing]"
         );
         return ExitCode::FAILURE;
     };
     let Ok(port) = port_str.parse::<u16>() else {
         eprintln!("puerto inválido: '{port_str}'");
         return ExitCode::FAILURE;
+    };
+
+    let host = match resolve_host(args) {
+        Ok(h) => h,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
     };
 
     let source = match resolve_db_source(path, args) {
@@ -983,8 +991,29 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
 
-    runtime::server::serve(program, port, source, cors, session_ttl, argon2_params, jwt_config, adopt_existing);
+    runtime::server::serve(program, &host, port, source, cors, session_ttl, argon2_params, jwt_config, adopt_existing);
     ExitCode::SUCCESS
+}
+
+/// En qué dirección escucha el servidor (GRAMMAR.md §3.81), mismo orden de
+/// precedencia que el resto de los `resolve_*` de este archivo:
+///
+/// 1. `--host <dirección>` en la línea de comandos.
+/// 2. La variable de entorno `LINK_HOST`.
+/// 3. Ninguno de los dos: `"0.0.0.0"`, el comportamiento de siempre --
+///    escucha en todas las interfaces, sin romper a nadie que no pida esto
+///    explícitamente.
+///
+/// Solo valida que no venga vacío (`--host ""`) -- cualquier otra forma
+/// inválida (una IP mal armada, un hostname que no resuelve) la rechaza
+/// `tiny_http::Server::http` al bindear, con un mensaje que ya incluye el
+/// valor exacto que se le pasó (ver `runtime::server::serve`).
+fn resolve_host(args: &[String]) -> Result<String, String> {
+    let host = read_flag_or_env(args, "--host", "LINK_HOST")?.unwrap_or_else(|| "0.0.0.0".to_string());
+    if host.trim().is_empty() {
+        return Err("uso: --host <dirección> (no puede ser vacío, ej. '127.0.0.1')".to_string());
+    }
+    Ok(host)
 }
 
 /// Adopción de tabla existente (`--adopt-existing`/`LINK_ADOPT_EXISTING`,

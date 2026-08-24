@@ -102,6 +102,7 @@
   - [3.78 Soft-delete nativo: `@softDelete` — RESUELTO](#378-soft-delete-nativo-softdelete--resuelto)
   - [3.79 `linkc build --diff <archivo-anterior>` — RESUELTO](#379-linkc-build---diff-archivo-anterior--resuelto)
   - [3.80 Índices declarativos: `@index`/`@unique` — RESUELTO](#380-índices-declarativos-indexunique--resuelto)
+  - [3.81 `--host <dirección>`: en qué interfaz escucha `linkc serve` — RESUELTO](#381---host-dirección-en-qué-interfaz-escucha-linkc-serve--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3975,6 +3976,31 @@ test "un email nuevo se acepta -- el indice unico no molesta al camino feliz" {
 - **Índice sobre una columna JSON-serializada (struct/lista/map/genérico) es válido pero de utilidad dudosa.** El campo se guarda igual como TEXT con el JSON serializado (`ColumnPlan::for_field`) -- SQLite/Postgres indexan esa columna sin problema (y `serde_json` sin la feature `preserve_order` serializa las claves de un objeto siempre en el mismo orden, así que `@unique` sobre un `Map<K,V>` es correcto), pero comparar/ordenar por el texto de un JSON casi nunca es lo que alguien quiere de un índice.
 
 **Verificado**: 4 tests en `checker.rs`/`parser.rs` (`@index`/`@unique` tipan limpio sobre cualquier tipo de campo, una segunda `@index` o `@unique` en el mismo campo es error de parser, combinar las dos en el mismo campo también), 4 en `runtime/db.rs` contra SQLite real (`@unique` crea un índice `UNIQUE` de verdad -- verificado leyendo `sqlite_master` -- y rechaza un segundo `insert`/`applyPatch` con el mismo valor devolviendo 400; `@index` sin `unique` no bloquea valores repetidos; `--adopt-existing` no crea el índice aunque el campo esté anotado) y 1 en `postgres_emit.rs` (el DDL estático de `linkc build` emite `CREATE UNIQUE INDEX`/`CREATE INDEX` con el mismo nombre determinístico que usa el runtime).
+
+---
+
+### 3.81 `--host <dirección>`: en qué interfaz escucha `linkc serve` — RESUELTO
+
+Hasta esta ronda, `linkc serve` siempre escuchaba en `0.0.0.0` (todas las interfaces de red de la máquina) sin ninguna alternativa -- confirmado leyendo `runtime/server.rs`, no había ningún flag ni variable de entorno para acotarlo. Para un proceso que solo necesita aceptar conexiones locales (detrás de un proxy en el mismo host, por ejemplo, o en una máquina de desarrollo con otras cosas corriendo), eso deja el firewall del sistema operativo como la ÚNICA capa de defensa contra que otra máquina en la misma red le hable directamente -- un gap de seguridad real, no solo de conveniencia.
+
+```bash
+# Solo local -- ninguna otra máquina en la red puede conectarse directo.
+linkc serve app.link 8787 --host 127.0.0.1
+
+# Equivalente vía variable de entorno (para un contenedor/orquestador que
+# no siempre controla el comando exacto).
+LINK_HOST=127.0.0.1 linkc serve app.link 8787
+```
+
+**`--host`/`LINK_HOST`, mismo orden de precedencia que el resto de los flags de `serve` (flag primero, después la env var, después el default).** Sin ninguno de los dos: `"0.0.0.0"`, el comportamiento de siempre -- no rompe a nadie que no pida esto explícitamente, y sigue siendo el valor correcto para el `ENTRYPOINT` que `linkc docker` genera, donde el proceso corre en su propio namespace de red de contenedor y `0.0.0.0` ahí adentro es exactamente lo que hace falta para que el mapeo de puertos del host funcione.
+
+**El valor se pasa tal cual a `tiny_http::Server::http((host, puerto))` -- sin resolución ni validación propia.** Cualquier forma que esa llamada acepte (una IP, `"localhost"`, un hostname que resuelva) funciona; una dirección que no le pertenece a ninguna interfaz de la máquina hace que el bind falle al arrancar, con un mensaje que nombra la dirección y el puerto exactos -- nunca cae en silencio a `0.0.0.0`. La única validación propia de `linkc` es rechazar `--host ""` (vacío) antes de intentar el bind, con un mensaje de uso claro en vez de un error de bind confuso.
+
+**Límites honestos:**
+- **Todo o nada por proceso, igual que el puerto.** No hay forma de escuchar en más de una interfaz puntual a la vez (ej. loopback + una IP interna, pero no `0.0.0.0`) -- son las opciones que `tiny_http`/el sistema operativo ya exponen: una dirección concreta, o todas.
+- **`linkc dev` no expone este flag todavía.** Reinvoca `linkc serve <archivo> <puerto>` como proceso hijo sin pasar ningún flag adicional (tampoco `--db`/`--cors-origin`/etc. hoy) -- mismo alcance que el resto de esos flags en modo desarrollo.
+
+**Verificado**: `cli_host.rs` con el binario real como subproceso (7 tests) -- el default sigue aceptando una conexión por loopback, `--host 127.0.0.1` y `LINK_HOST=127.0.0.1` sirven igual por loopback, una dirección que no le pertenece a ninguna interfaz local (`192.0.2.1`, TEST-NET-1 de RFC 5737, para no depender de que la máquina de test tenga una segunda interfaz real) hace fallar el arranque nombrando esa dirección en el mensaje -- probando así que el valor de verdad se usa para bindear y no se ignora en silencio --, el flag le gana a la variable de entorno, y tanto `--host` sin valor como `--host ""` son errores de uso limpios, sin panic.
 
 ---
 

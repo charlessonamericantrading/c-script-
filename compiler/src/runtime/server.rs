@@ -130,8 +130,15 @@ impl CorsConfig {
     }
 }
 
+/// `host` (GRAMMAR.md §3.81): `"0.0.0.0"` por default -- mismo comportamiento
+/// que antes de esta ronda -- o `"127.0.0.1"`/una IP puntual vía
+/// `--host`/`LINK_HOST`, para no depender ÚNICAMENTE del firewall del
+/// sistema operativo como capa de defensa cuando el proceso no necesita
+/// aceptar conexiones desde fuera de la máquina (detrás de un proxy en el
+/// mismo host, por ejemplo).
 pub fn serve(
     program: Program,
+    host: &str,
     port: u16,
     source: DbSource,
     cors: CorsConfig,
@@ -140,8 +147,8 @@ pub fn serve(
     jwt_config: Option<(String, String, String)>,
     adopt_existing: bool,
 ) {
-    let server = tiny_http::Server::http(("0.0.0.0", port))
-        .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en el puerto {port}: {e}"));
+    let server = tiny_http::Server::http((host, port))
+        .unwrap_or_else(|e| panic!("no se pudo iniciar el servidor en {host}:{port}: {e}"));
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
     // (persistida en `db_path`, GRAMMAR.md §3.17) por cada una que el
     // programa DECLARA. `Db::seeded()` es un fixture de tests/demo que
