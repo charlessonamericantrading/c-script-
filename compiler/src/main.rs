@@ -117,7 +117,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("subcomandos conocidos:"));
     out(&format!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)"));
     out(&format!("     linkc build <archivo.link> <outdir> [--diff <anterior>]    (genera contratos TS, cliente, hooks, schemas Zod y OpenAPI; --diff compara el contract.d.ts nuevo contra uno guardado antes)"));
-    out(&format!("     linkc test <archivo.link>              (ejecuta pruebas de comportamiento integradas)"));
+    out(&format!("     linkc test <archivo.link> [--filter <nombre>]  (ejecuta pruebas de comportamiento integradas; --filter acota a las que CONTIENEN ese substring en el nombre)"));
     out(&format!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)"));
     out(&format!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)"));
     out(&format!("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)"));
@@ -611,12 +611,29 @@ fn print_build_diff(prev_path: &str, outdir: &str) {
 /// es ese "sí, es a propósito" explícito.
 fn cmd_test(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else {
-        eprintln!("uso: linkc test <archivo.link> [archivo.snap] [--update]");
+        eprintln!("uso: linkc test <archivo.link> [archivo.snap] [--update] [--filter <nombre>]");
         return ExitCode::FAILURE;
     };
 
     let snap_path = args.get(1).filter(|a| !a.starts_with("--"));
     let update = args.iter().any(|a| a == "--update");
+    let filter = match extract_flag_value(args, "--filter") {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // `--filter` solo tiene sentido contra los bloques `test "..." { ... }`
+    // integrados -- el testing de CONTRATO (`linkc test <archivo> <snap>`)
+    // no tiene nombres que filtrar, así que combinarlos es un uso confuso
+    // que se rechaza acá en vez de ignorar `--filter` en silencio.
+    if snap_path.is_some() && filter.is_some() {
+        eprintln!(
+            "--filter solo aplica a los bloques 'test \"...\" {{ ... }}' integrados, no al testing de contrato ('linkc test <archivo> <snap>')"
+        );
+        return ExitCode::FAILURE;
+    }
 
     let program = match load_and_check(path) {
         Ok(p) => p,
@@ -629,9 +646,15 @@ fn cmd_test(args: &[String]) -> ExitCode {
     }
 
     // Si solo se pasó el archivo .link, ejecutamos los bloques test integrados
-    match runtime::run_program_tests(&program) {
+    // -- `--filter <nombre>` (PLAN.md §9.7, GRAMMAR.md §3.82) los acota a los
+    // que CONTIENEN ese substring en el nombre, mismo criterio que
+    // `cargo test <substring>`.
+    match runtime::run_program_tests_filtered(&program, filter.as_deref()) {
         Ok(summary) => {
-            println!("running {} tests", summary.total);
+            match &filter {
+                Some(f) => println!("running {} tests (filtro: '{f}')", summary.total),
+                None => println!("running {} tests", summary.total),
+            }
             for (name, err) in &summary.failed {
                 println!("test \"{name}\" ... FAILED: {err}");
             }
@@ -1077,6 +1100,21 @@ fn resolve_argon2_params(args: &[String]) -> Result<argon2::Params, String> {
     let iterations = read("--argon2-iterations", "LINK_ARGON2_ITERATIONS")?.unwrap_or(argon2::Params::DEFAULT_T_COST);
     argon2::Params::new(memory_kib, iterations, argon2::Params::DEFAULT_P_COST, None)
         .map_err(|e| format!("parámetros de Argon2id inválidos (memoria={memory_kib}KiB, iteraciones={iterations}): {e}"))
+}
+
+/// `--<flag> <valor>` en CUALQUIER posición de `args` (no solo el principio
+/// -- a diferencia del parseo posicional de `cmd_build`/`--diff`, acá no
+/// hace falta separar "lo que queda" porque el resto de `cmd_test` ya sabe
+/// ignorar cualquier token que empiece con `--`), sin variable de entorno
+/// asociada -- a diferencia de `read_flag_or_env`, que SIEMPRE la exige.
+fn extract_flag_value(args: &[String], flag: &str) -> Result<Option<String>, String> {
+    match args.iter().position(|a| a == flag) {
+        Some(i) => match args.get(i + 1) {
+            Some(v) => Ok(Some(v.clone())),
+            None => Err(format!("uso: {flag} <valor> (falta el valor)")),
+        },
+        None => Ok(None),
+    }
 }
 
 /// `--<flag> <valor>` si está, si no la variable de entorno `env`, si no

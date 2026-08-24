@@ -2013,6 +2013,17 @@ pub struct TestSummary {
 /// (PLAN.md §5, Eje 2). Cada test corre con su propio entorno y base de datos
 /// SQLite en memoria (`:memory:`) aislada, asegurando independencia total.
 pub fn run_program_tests(program: &Program) -> Result<TestSummary, RuntimeError> {
+    run_program_tests_filtered(program, None)
+}
+
+/// Como `run_program_tests`, pero corriendo solo los bloques `test "..."`
+/// cuyo NOMBRE contiene `filter` (substring, sensible a mayúsculas -- mismo
+/// criterio que `cargo test <substring>`, no un match exacto ni una regex)
+/// -- `linkc test <archivo> --filter <nombre>` (PLAN.md §9.7, GRAMMAR.md
+/// §3.82). `None` corre todos, comportamiento idéntico a
+/// `run_program_tests` (que delega acá con `None` en vez de duplicar el
+/// cuerpo).
+pub fn run_program_tests_filtered(program: &Program, filter: Option<&str>) -> Result<TestSummary, RuntimeError> {
     let (checker, errors) = Checker::check_program_full(program, &[]);
     if let Some(first) = errors.into_iter().next() {
         return Err(RuntimeError::new(first.message));
@@ -2033,6 +2044,7 @@ pub fn run_program_tests(program: &Program) -> Result<TestSummary, RuntimeError>
             Item::Test(t) => Some(t),
             _ => None,
         })
+        .filter(|t| filter.is_none_or(|f| t.name.contains(f)))
         .collect();
 
     let mut passed = 0;
@@ -4918,6 +4930,30 @@ mod tests {
         assert_eq!(summary.total, 2);
         assert_eq!(summary.passed, 2);
         assert!(summary.failed.is_empty());
+    }
+
+    /// `--filter <nombre>` (PLAN.md §9.7, GRAMMAR.md §3.82): substring sobre
+    /// el NOMBRE del test, sensible a mayúsculas, mismo criterio que `cargo
+    /// test <substring>`.
+    #[test]
+    fn run_program_tests_filtered_only_runs_tests_whose_name_contains_the_substring() {
+        let code = r#"
+        test "crear usuario exitoso" { assert(true); }
+        test "actualizar usuario exitoso" { assert(true); }
+        test "borrar item" { assert(true); }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+
+        let filtered = run_program_tests_filtered(&program, Some("usuario")).expect("deberia correr");
+        assert_eq!(filtered.total, 2, "{filtered:?}");
+        assert_eq!(filtered.passed, 2);
+
+        let none_matched = run_program_tests_filtered(&program, Some("no-existe")).expect("deberia correr");
+        assert_eq!(none_matched.total, 0, "un filtro que no matchea nada corre cero tests, no es un error");
+
+        let unfiltered = run_program_tests_filtered(&program, None).expect("deberia correr");
+        assert_eq!(unfiltered.total, 3, "None corre TODOS -- mismo comportamiento que run_program_tests");
+        assert_eq!(unfiltered, run_program_tests(&program).unwrap());
     }
 
     #[test]

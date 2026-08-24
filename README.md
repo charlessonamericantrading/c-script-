@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.46.0-blue.svg" alt="Version" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.47.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Whenever you rename a field in your backend or database, your frontend shouldn't
 This section is the ground truth. If any other section of this README disagrees with it,
 this section wins. Verified on 2026-08-24 by running the compiler, not by reading it.
 
-**Works today**, covered by 780 automated tests:
+**Works today**, covered by 786 automated tests:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `linkc test <file> --filter <name>`: runs only the `test "..." { ... }` blocks whose name CONTAINS that substring (case-sensitive, same rule as `cargo test <substring>`) — a filter matching nothing runs zero tests and still succeeds. Only applies to the integrated test runner, never to contract snapshot testing (`linkc test <file> <snap>`), which has no test names to filter — combining the two is a clean usage error, not a silently-ignored flag
 - `--host <address>`/`LINK_HOST` for `linkc serve`: binds to `0.0.0.0` (all interfaces) by default, same as before — or to one specific address (`127.0.0.1`, for a process that only needs local connections) so the OS firewall isn't the only thing standing between it and the rest of the network. Passed straight to the underlying bind call, no extra resolution or validation beyond rejecting an empty `--host ""` — an address that doesn't belong to any local interface fails to start, naming the exact address, never silently falling back to `0.0.0.0`
 - Declarative single-field indexes: `@index`/`@unique` on a struct field — neither requires a particular field type. The index is created for real on startup in both backends (`CREATE [UNIQUE] INDEX IF NOT EXISTS`, idempotent, deterministic name), and `linkc build` emits the same statement in the static Postgres DDL. A `@unique` violation on `insert`/`applyPatch` (and on `upsert`'s update path) is translated to a 400, not a generic 500 — matched against the exact message SQLite/Postgres return for that specific violation. `--adopt-existing` never runs this DDL either, same rule as the rest of the schema. Composite (multi-field) indexes/constraints aren't supported yet — only single-field
 - `linkc build --diff <file>`: compares the freshly generated `contract.d.ts` against a saved copy (typically `git show <rev>:path > file` before the build) — for reviewing exactly what changed in the public contract on a PR. Reuses the same LCS diff `linkc test` already had for showing why a snapshot changed. Purely informational, never fails the build — an unreadable comparison file just prints a warning to stderr

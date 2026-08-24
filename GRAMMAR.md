@@ -103,6 +103,7 @@
   - [3.79 `linkc build --diff <archivo-anterior>` — RESUELTO](#379-linkc-build---diff-archivo-anterior--resuelto)
   - [3.80 Índices declarativos: `@index`/`@unique` — RESUELTO](#380-índices-declarativos-indexunique--resuelto)
   - [3.81 `--host <dirección>`: en qué interfaz escucha `linkc serve` — RESUELTO](#381---host-dirección-en-qué-interfaz-escucha-linkc-serve--resuelto)
+  - [3.82 `linkc test --filter <nombre>` — RESUELTO](#382-linkc-test---filter-nombre--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4001,6 +4002,52 @@ LINK_HOST=127.0.0.1 linkc serve app.link 8787
 - **`linkc dev` no expone este flag todavía.** Reinvoca `linkc serve <archivo> <puerto>` como proceso hijo sin pasar ningún flag adicional (tampoco `--db`/`--cors-origin`/etc. hoy) -- mismo alcance que el resto de esos flags en modo desarrollo.
 
 **Verificado**: `cli_host.rs` con el binario real como subproceso (7 tests) -- el default sigue aceptando una conexión por loopback, `--host 127.0.0.1` y `LINK_HOST=127.0.0.1` sirven igual por loopback, una dirección que no le pertenece a ninguna interfaz local (`192.0.2.1`, TEST-NET-1 de RFC 5737, para no depender de que la máquina de test tenga una segunda interfaz real) hace fallar el arranque nombrando esa dirección en el mensaje -- probando así que el valor de verdad se usa para bindear y no se ignora en silencio --, el flag le gana a la variable de entorno, y tanto `--host` sin valor como `--host ""` son errores de uso limpios, sin panic.
+
+---
+
+### 3.82 `linkc test --filter <nombre>` — RESUELTO
+
+Hasta esta ronda, `linkc test archivo.link` siempre corría TODOS los bloques `test "..." { ... }` del programa -- confirmado leyendo `cmd_test`, no había ningún flag para acotar la corrida a uno solo. Para un archivo con decenas de tests, iterar sobre UNO que está fallando (o que se está escribiendo recién) significaba esperar a que todos los demás corrieran también en cada vuelta.
+
+<!-- linkc:check -->
+```rust
+type User = { id: Int, name: String }
+db { users: User[] }
+
+service Users {
+  rpc create(name: String) -> User {
+    db.users.insert(User { id: 0, name: name })
+  }
+}
+
+test "crear usuario exitoso" {
+  let u = Users.create("Ada");
+  assert(u.name == "Ada");
+}
+
+test "actualizar usuario exitoso" {
+  assert(true);
+}
+
+test "borrar item" {
+  assert(true);
+}
+```
+
+```bash
+linkc test app.link --filter usuario
+# running 2 tests (filtro: 'usuario')
+# test result: ok. 2 passed; 0 failed
+#
+# "borrar item" ni siquiera se menciona -- no matchea el filtro, así que
+# no corre.
+```
+
+**`--filter <nombre>`: substring sobre el NOMBRE del test, sensible a mayúsculas -- mismo criterio que `cargo test <substring>`, no un nombre exacto ni una regex.** Cualquier test cuyo nombre CONTENGA ese texto corre; el resto ni se ejecuta ni se menciona en la salida. Un filtro que no matchea ningún nombre corre cero tests -- termina con éxito (`test result: ok. 0 tests run`), no es un error: mismo criterio que un filtro de `cargo test` que no matchea nada.
+
+**Solo aplica al test runner INTEGRADO (`test "..." { ... }`), nunca al testing de contrato (`linkc test archivo.link archivo.snap`).** Ese segundo modo compara el `contract.d.ts`/`client.ts`/`validators.ts` completos contra un snapshot -- no tiene nombres de test que filtrar, así que combinar `--filter` con un path de snapshot es un uso confuso, rechazado con un mensaje claro en vez de ignorado en silencio.
+
+**Verificado**: 1 test en `runtime/mod.rs` (`run_program_tests_filtered`: un filtro que matchea un subconjunto corre solo esos, uno que no matchea nada corre cero sin fallar, `None` corre TODOS -- idéntico a `run_program_tests` sin filtro) y 5 en `cli_test_runner.rs` con el binario real (filtra por substring, substring parcial también matchea, cero coincidencias termina limpio, `--filter` sin valor y `--filter` combinado con un path de snapshot son errores de uso claros, sin panic).
 
 ---
 

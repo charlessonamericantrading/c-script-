@@ -223,6 +223,7 @@ linkc new my-app --template nextjs   # or: vite, minimal
 linkc build backend.link src/gen     # TypeScript contract, client, validators, OpenAPI
 linkc build backend.link src/gen --diff old-contract.d.ts  # show what changed vs. a saved contract.d.ts (PR review)
 linkc test backend.link              # run the test blocks
+linkc test backend.link --filter usuario  # only test blocks whose name contains 'usuario'
 linkc serve backend.link 8787        # HTTP + SQLite + SSE
 linkc dev backend.link src/gen 8787  # rebuild and restart on change
 linkc introspect postgres://... > main.link  # generate a starting .link from an existing PostgreSQL schema

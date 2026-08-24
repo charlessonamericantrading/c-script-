@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.47.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc test <archivo> --filter <nombre>`.** Hasta esta ronda, `linkc test archivo.link` siempre corría TODOS los bloques `test "..." { ... }` del programa -- para un archivo con decenas de tests, iterar sobre uno solo (que está fallando, o que se está escribiendo recién) significaba esperar a que todos los demás corrieran también en cada vuelta. `--filter <nombre>` acota la corrida a los tests cuyo NOMBRE CONTIENE ese substring, sensible a mayúsculas -- mismo criterio que `cargo test <substring>`, no un nombre exacto ni una regex. Un filtro que no matchea ningún nombre corre cero tests y termina con éxito, no es un error. Solo aplica al test runner integrado, nunca al testing de contrato (`linkc test archivo.link archivo.snap`, que compara `contract.d.ts`/`client.ts`/`validators.ts` contra un snapshot y no tiene nombres que filtrar) -- combinar los dos es un error de uso claro en vez de un `--filter` ignorado en silencio.
+
+786 tests (6 nuevos): 1 en `runtime/mod.rs` (`run_program_tests_filtered`: un filtro que matchea un subconjunto corre solo esos, uno que no matchea nada corre cero sin fallar, `None` corre TODOS -- idéntico a sin filtro) y 5 en `cli_test_runner.rs` con el binario real (filtra por substring, substring parcial también matchea, cero coincidencias termina limpio, `--filter` sin valor y combinado con un path de snapshot son errores de uso claros sin panic). Detalle completo: GRAMMAR.md §3.82.
+
 ## [1.46.0] - 2026-08-24
 
 ### ✨ Nuevo
