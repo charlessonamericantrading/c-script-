@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.33.0] - 2026-08-24
+
+### 📝 Documentación
+- **4 guías nuevas en `docs/`**, cierran PLAN.md §9.1 por completo:
+  - [`docs/sqlite-vs-postgres.md`](docs/sqlite-vs-postgres.md): cómo decidir qué backend usar para un servicio nuevo.
+  - [`docs/multi-service-deployment.md`](docs/multi-service-deployment.md): desplegar 10+ `.link` en un mismo host -- un puerto por servicio, proxy adelante, cuidado con colisiones de nombre de tabla si comparten base.
+  - [`docs/incremental-adoption.md`](docs/incremental-adoption.md): migrar un backend existente (Express/Fastify/NestJS/lo que sea) servicio por servicio, con `linkc introspect` + `--adopt-existing` + el puente JWT como las tres piezas que lo hacen seguro.
+  - [`docs/consuming-services.md`](docs/consuming-services.md): la versión de AGENTS.md para quien integra un servicio `.link` ya generado desde otra app, no para quien lo desarrolla -- forma exacta de los errores, del `/health`, y qué NO asumir (reintentos, timeouts, batching), todo verificado contra un servidor real, no de memoria.
+
+Sin cambios de código -- 649 tests sin cambios. Detalle completo: PLAN.md §9.1.
+
 ## [1.32.0] - 2026-08-24
 
 ### 📝 Documentación

@@ -35,6 +35,7 @@ is `linkc`. They are one project.
 | `GRAMMAR.md` | The specification, and the honest limits of every feature. Has a table of contents |
 | `llms.txt` | Condensed language reference plus the mistakes LLMs make. Read it before writing `.link` code |
 | `CLAUDE.md` | What Claude Code auto-loads on open. A thin pointer into this file — keep it short, don't duplicate |
+| `docs/consuming-services.md` | This file is for developing the compiler. If you're instead integrating an already-generated `.link` service from another app, that guide is the one to read, not this one |
 
 ## Build, test, run
 
