@@ -100,6 +100,7 @@
   - [3.76 `db.<c>.insertMany(items)` — RESUELTO](#376-dbcinsertmanyitems--resuelto)
   - [3.77 `createdAt`/`updatedAt` automáticos: `= now()` + `@autoUpdate` — RESUELTO](#377-createdatupdatedat-automáticos--now--autoupdate--resuelto)
   - [3.78 Soft-delete nativo: `@softDelete` — RESUELTO](#378-soft-delete-nativo-softdelete--resuelto)
+  - [3.79 `linkc build --diff <archivo-anterior>` — RESUELTO](#379-linkc-build---diff-archivo-anterior--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -3902,6 +3903,31 @@ test "delete() no borra la fila -- la marca, y all() la deja de traer" {
 - **Sin `DEFAULT`/índice parcial a nivel de columna SQL.** El filtro se agrega en cada consulta desde el intérprete -- no hay un índice `WHERE deletedAt IS NULL` creado automáticamente que acelere esas consultas sobre una tabla grande.
 
 **Verificado**: 5 tests en `checker.rs` (`Timestamp?` tipa limpio, se rechaza sobre `Timestamp` requerido y sobre cualquier otro tipo, dos `@softDelete` en el mismo struct se rechaza, una segunda `@softDelete` en el mismo campo es error de parser) y 5 en `runtime/mod.rs` contra un servidor real vía `invoke_rpc` (`delete` fija el campo en vez de borrar la fila, una segunda llamada es idempotente y devuelve `false`, `all()`/`count()` excluyen la fila borrada, `findWhere`/`deleteWhere` heredan el filtro sin código propio, y `page`/`pageAfter`/`sumBy` también filtran). Verificado también a mano contra un servidor HTTP real (`curl`): crear 2 filas, borrar una, `list`/`count` muestran solo 1, un segundo `delete` sobre la misma da `false`, `find` directo por id SIGUE encontrando la fila borrada con su `deletedAt` ya fijado.
+
+---
+
+### 3.79 `linkc build --diff <archivo-anterior>` — RESUELTO
+
+Revisar un PR que toca un `.link` significa, en la práctica, revisar qué cambió en el CONTRATO público que consume el frontend -- no el `.link` mismo (eso ya lo muestra `git diff` normal), sino el `contract.d.ts` que `linkc build` termina generando. Hasta esta ronda no había forma de pedirle eso al compilador directamente; había que generar los dos contratos a mano y diffearlos con una herramienta aparte.
+
+```bash
+# guardar el contrato de la rama base ANTES de aplicar los cambios del PR
+git show origin/main:gen/contract.d.ts > /tmp/contract-base.d.ts
+
+# build normal de la rama del PR, comparando contra esa base
+linkc build app.link gen --diff /tmp/contract-base.d.ts
+```
+
+`--diff <archivo>` compara el `contract.d.ts` RECIÉN generado (el de la corrida actual de `linkc build`) contra el contenido de `<archivo>`, línea por línea, e imprime el resultado en la salida estándar -- reusa el mismo diff LCS (programación dinámica, O(n·m), sin ninguna dependencia nueva) que `linkc test` ya usaba para mostrar por qué un snapshot dejó de coincidir (GRAMMAR.md §5). Sin cambios: `el contrato no cambió respecto a '<archivo>'`. Con cambios: una línea por cambio, `- ...` para lo que desapareció, `+ ...` para lo que apareció, en el mismo orden relativo que ya tenían (no reordenado alfabéticamente ni agrupado por tipo).
+
+**Puramente informativo -- nunca hace fallar el build.** A diferencia de `linkc test` (que si el snapshot no coincide devuelve código de salida distinto de cero, porque ahí "cambió sin querer" es justo lo que se busca atrapar), acá el build ya tuvo éxito antes de llegar a la comparación -- `--diff` solo agrega texto a la salida para que una persona lo lea, nunca cambia si el comando termina bien o mal. Un `<archivo>` que no se puede leer (no existe, sin permisos) imprime una advertencia por stderr y el build sigue siendo exitoso igual -- el archivo de comparación es responsabilidad de quien arma el pipeline de CI/revisión, no algo que el compilador pueda validar de antemano.
+
+**Límites honestos:**
+- **`<archivo>` es un `contract.d.ts` guardado aparte, no un ref de git ni un commit.** No hay integración con git -- guardar la versión "anterior" (`git show <rev>:<path> > archivo`, como en el ejemplo de arriba) es responsabilidad de quien arma el pipeline.
+- **Solo compara `contract.d.ts`.** `client.ts`/`validators.ts`/`hooks.ts`/`schemas.ts`/`openapi.json` no entran en el diff -- son derivados del mismo contrato, así que casi todo cambio real ya se ve reflejado ahí, pero un cambio que SOLO tocara, por ejemplo, la forma exacta de un validador sin cambiar ningún tipo público no aparecería.
+- **Diff de texto plano, no un diff semántico de tipos.** No distingue "se agregó un campo opcional" (cambio compatible hacia atrás) de "se cambió el tipo de un campo existente" (cambio que rompe) -- ambos aparecen igual, como líneas `-`/`+`; es una persona la que decide qué tan grave es cada cambio, mirando el diff.
+
+**Verificado**: `cli_build_diff.rs` con el binario real como subproceso (agregar un campo muestra exactamente la línea `+` que corresponde, sin ningún cambio real muestra "no cambió", un archivo de comparación inexistente no hace fallar el build -- solo avisa por stderr, y `linkc build` sin `--diff` sigue funcionando exactamente igual que antes de esta ronda).
 
 ---
 

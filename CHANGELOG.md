@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.44.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`linkc build --diff <archivo-anterior>`.** Revisar un PR que toca un `.link` significa, en la práctica, revisar qué cambió en el CONTRATO público generado (`contract.d.ts`), no el `.link` mismo (eso ya lo muestra `git diff` normal) -- hasta esta ronda no había forma de pedirle eso al compilador, había que generar los dos contratos a mano y diffearlos con una herramienta aparte. `--diff <archivo>` compara el `contract.d.ts` recién generado contra el contenido de `<archivo>` (típicamente guardado con `git show <rev>:ruta > archivo` antes del build), línea por línea, reusando el mismo diff LCS (programación dinámica, sin dependencia nueva) que `linkc test` ya usaba para mostrar por qué un snapshot dejó de coincidir. Puramente informativo -- a diferencia de `linkc test`, nunca hace fallar el build: un archivo de comparación ilegible imprime una advertencia por stderr y el build sigue siendo exitoso igual. Solo compara `contract.d.ts` (no `client.ts`/`validators.ts`/`hooks.ts`/`schemas.ts`/`openapi.json`), y es un diff de texto plano, no semántico -- no distingue un campo nuevo (compatible) de un tipo cambiado (que rompe), eso lo decide quien lee el diff.
+
+764 tests (4 nuevos) en `cli_build_diff.rs` contra el binario real como subproceso: agregar un campo muestra exactamente la línea `+` que corresponde, sin cambios reales muestra "no cambió", un archivo de comparación inexistente no hace fallar el build (solo avisa por stderr), y `linkc build` sin `--diff` sigue funcionando exactamente igual que antes. Detalle completo: GRAMMAR.md §3.79. Con esto, **PLAN.md §9.3 (Base de Datos y Consultas) tiene 9 ítems abiertos**: `count(predicate)` y el pushdown de `findWhere`/`deleteWhere` a SQL (bloqueados entre sí, ítem grande para una ronda dedicada), `@index`/`@check` declarativos, detección de colisión de tabla, `--db-schema`, `migrate --dry-run`, `@cache`, e idempotency keys.
+
 ## [1.43.0] - 2026-08-24
 
 ### ✨ Nuevo

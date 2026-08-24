@@ -7,7 +7,7 @@
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
     <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-679-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.43.0-blue.svg" alt="Versión" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.44.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -36,9 +36,10 @@ Cada vez que renombras un campo en el backend o en la base de datos, tu frontend
 Esta sección es la verdad de fondo. Si cualquier otra parte de este README la contradice,
 gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 
-**Funciona hoy**, cubierto por 760 pruebas automáticas:
+**Funciona hoy**, cubierto por 764 pruebas automáticas:
 
 - `linkc build` / `serve` / `test` / `dev` / `lint` / `doc` / `docker` / `lsp` / `new`
+- `linkc build --diff <archivo>`: compara el `contract.d.ts` recién generado contra una copia guardada aparte (típicamente `git show <rev>:ruta > archivo` antes del build) -- para revisar exactamente qué cambió en el contrato público de un PR. Reusa el mismo diff LCS que `linkc test` ya tenía para mostrar por qué un snapshot cambió. Puramente informativo, nunca hace fallar el build -- un archivo de comparación ilegible solo imprime una advertencia por stderr
 - Soft-delete nativo: `@softDelete` sobre un campo `Timestamp?` convierte `delete(id)` en un `UPDATE` idempotente (fija el campo a `now()`, `AND "<campo>" IS NULL` en el WHERE para que una segunda llamada sea un no-op que devuelve `false`, nunca un `DELETE` real). Toda lectura que devuelve lista o conteo -- `all()`, `page()`, `pageAfter()`, `count()`, los agregados `*By`, y `findWhere`/`deleteWhere` (que reusan `all()` por dentro, sin código extra) -- lo filtra automáticamente. `find(id)` deliberadamente NO filtra -- una fila soft-deleteada sigue siendo encontrable por id directo, mismo criterio que Django/Rails, necesario para que la re-consulta de `insert`/`applyPatch` no explote si un patch toca justo ese campo
 - `createdAt`/`updatedAt` automáticos: sin nombres de campo mágicos -- `createdAt: Timestamp = now()` (un default ya existente combinado con el builtin `now()` ya existente) ya cubre "asignado una sola vez al crear". `@autoUpdate` sobre un campo `Timestamp` (solo) es la única pieza nueva -- fuerza ese campo a `now()` en cada `applyPatch`/`upsert`-actualización, aunque el patch no lo mencione, mientras un campo sin la anotación nunca se toca solo
 - `db.<c>.insertMany(items) -> T[]`: cada elemento pasa por el mismo `insert` real de siempre (una sentencia SQL autocommit por fila), en el orden dado -- ahorra las N idas y vueltas HTTP secuenciales del cliente para un backfill, no el costo de N inserts contra la base. Sin transacción envolvente: si el ítem 3 de 5 falla, los dos primeros quedan insertados igual

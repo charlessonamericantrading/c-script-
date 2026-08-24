@@ -116,7 +116,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("uso: linkc <subcomando> [opciones]"));
     out(&format!("subcomandos conocidos:"));
     out(&format!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)"));
-    out(&format!("     linkc build <archivo.link> <outdir>    (genera contratos TS, cliente, hooks, schemas Zod y OpenAPI)"));
+    out(&format!("     linkc build <archivo.link> <outdir> [--diff <anterior>]    (genera contratos TS, cliente, hooks, schemas Zod y OpenAPI; --diff compara el contract.d.ts nuevo contra uno guardado antes)"));
     out(&format!("     linkc test <archivo.link>              (ejecuta pruebas de comportamiento integradas)"));
     out(&format!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)"));
     out(&format!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)"));
@@ -521,16 +521,79 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
 
 
 
+/// `--diff <contract.d.ts anterior>` (GRAMMAR.md §3.79) se extrae ACÁ, no
+/// adentro de `build_once` -- toma un VALOR (no un flag suelto como
+/// `--update` de `linkc test`), así que hay que consumir los dos tokens
+/// juntos antes de tratar el resto como posicional (`path`/`outdir`), mismo
+/// criterio de filtrado que `cmd_test` ya usa para `snap_path`/`--update`.
 fn cmd_build(args: &[String]) -> ExitCode {
-    let (Some(path), Some(outdir)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc build <archivo.link> <outdir>");
+    let mut positional = Vec::new();
+    let mut diff_against: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--diff" {
+            let Some(value) = args.get(i + 1) else {
+                eprintln!("uso: linkc build <archivo.link> <outdir> [--diff <contract.d.ts anterior>]");
+                return ExitCode::FAILURE;
+            };
+            diff_against = Some(value);
+            i += 2;
+        } else {
+            positional.push(args[i].as_str());
+            i += 1;
+        }
+    }
+    let (Some(path), Some(outdir)) = (positional.first(), positional.get(1)) else {
+        eprintln!("uso: linkc build <archivo.link> <outdir> [--diff <contract.d.ts anterior>]");
         return ExitCode::FAILURE;
     };
-    if build_once(path, outdir).ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
+    let result = build_once(path, outdir);
+    if !result.ok {
+        return ExitCode::FAILURE;
     }
+    if let Some(prev_path) = diff_against {
+        print_build_diff(prev_path, outdir);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `linkc build --diff <archivo-anterior>` (PLAN.md §9.3, GRAMMAR.md §3.79):
+/// compara el `contract.d.ts` RECIÉN generado contra una copia anterior
+/// guardada aparte (ej. `git show HEAD~5:gen/contract.d.ts > /tmp/viejo.d.ts`),
+/// para revisión de PR -- "¿qué cambió en el contrato público entre estas
+/// dos versiones del `.link`?". Reusa `diff_lines`, el mismo LCS que ya usa
+/// `linkc test` -- no reimplementa nada, solo lo llama desde otro lugar.
+/// Puramente informativo: a diferencia de `linkc test` (que SÍ falla si el
+/// snapshot no matchea, porque ahí un cambio sin querer es justo lo que se
+/// busca atrapar), acá no hay "correcto"/"incorrecto" -- el build ya tuvo
+/// éxito antes de llegar acá, esto solo muestra qué cambió para que una
+/// persona lo revise.
+fn print_build_diff(prev_path: &str, outdir: &str) {
+    let current_path = format!("{outdir}/contract.d.ts");
+    let current = match fs::read_to_string(&current_path) {
+        Ok(s) => s.replace("\r\n", "\n"),
+        Err(e) => {
+            eprintln!("--diff: no se pudo leer '{current_path}' (recién generado): {e}");
+            return;
+        }
+    };
+    // Mismo `.replace("\r\n", "\n")` que `run_snapshot_test` ya aplica, y
+    // mismo motivo: el archivo de comparación pudo pasar por un checkout de
+    // git con `core.autocrlf=true`, y la corrección de este comando no
+    // debería depender de esa configuración ajena.
+    let previous = match fs::read_to_string(prev_path) {
+        Ok(s) => s.replace("\r\n", "\n"),
+        Err(e) => {
+            eprintln!("--diff: no se pudo leer '{prev_path}': {e}");
+            return;
+        }
+    };
+    if previous == current {
+        println!("--diff: el contrato no cambió respecto a '{prev_path}'");
+        return;
+    }
+    println!("--diff: el contrato cambió respecto a '{prev_path}':");
+    println!("{}", diff_lines(&previous, &current));
 }
 
 /// `linkc test` -- PLAN.md §5 ("tests de contrato, que el .d.ts generado no
