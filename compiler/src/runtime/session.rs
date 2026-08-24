@@ -188,6 +188,26 @@ impl SessionStore {
         self.sessions.borrow_mut().remove(token);
     }
 
+    /// Destruye TODAS las sesiones abiertas con ese `user_id` (GRAMMAR.md
+    /// §3.84) -- a diferencia de `destroy` (que opera sobre `current_token`,
+    /// la sesión que ya autenticó la request actual), esta SÍ toma un
+    /// identificador como argumento: `user_id` no es un secreto adivinable
+    /// como un token de sesión, es una clave de aplicación (mismo criterio
+    /// que ya vale para `createSessionWithId`, que también recibe un
+    /// `user_id` explícito). Quién puede LLAMAR a esto es responsabilidad
+    /// de quien escribe el `.link` -- típicamente gateado con
+    /// `@requires(Role.Admin)` en el rpc que lo envuelve, este método no
+    /// impone ninguna política propia. Devuelve cuántas sesiones se
+    /// borraron -- 0 si el usuario no tenía ninguna sesión abierta (nunca un
+    /// error). Cada sesión JWT externa (GRAMMAR.md §3.64), si las hay, no
+    /// pasa por acá -- este store nunca las guardó, no hay nada que borrar.
+    pub fn destroy_all_for_user(&self, user_id: i64) -> usize {
+        let mut sessions = self.sessions.borrow_mut();
+        let before = sessions.len();
+        sessions.retain(|_, entry| entry.user_id != Some(user_id));
+        before - sessions.len()
+    }
+
     /// `None` tanto para un token que nunca existió como para uno que ya
     /// expiró -- desde afuera de este módulo las dos cosas son
     /// indistinguibles a propósito (el mismo 401 "se requiere
@@ -290,6 +310,40 @@ mod tests {
     fn destroying_an_unknown_token_does_not_panic() {
         let store = SessionStore::new();
         store.destroy("no-existe"); // no debería paniquear
+    }
+
+    // ---- revocar TODAS las sesiones de un usuario (GRAMMAR.md §3.84) ----
+
+    #[test]
+    fn destroy_all_for_user_removes_every_session_of_that_user_and_returns_the_count() {
+        let store = SessionStore::new();
+        let a1 = store.create_with_user_id("Role".to_string(), "Admin".to_string(), Some(1));
+        let a2 = store.create_with_user_id("Role".to_string(), "Admin".to_string(), Some(1));
+        let b1 = store.create_with_user_id("Role".to_string(), "Member".to_string(), Some(2));
+
+        let removed = store.destroy_all_for_user(1);
+        assert_eq!(removed, 2, "user 1 tenía exactamente 2 sesiones abiertas");
+        assert_eq!(store.role_for(&a1), None, "sesión de user 1 debe estar borrada");
+        assert_eq!(store.role_for(&a2), None, "la SEGUNDA sesión de user 1 también");
+        assert_eq!(store.role_for(&b1), Some(("Role".to_string(), "Member".to_string())), "user 2 no debe verse afectado");
+    }
+
+    #[test]
+    fn destroy_all_for_user_with_no_sessions_returns_zero_without_touching_anything() {
+        let store = SessionStore::new();
+        let other = store.create_with_user_id("Role".to_string(), "Admin".to_string(), Some(1));
+        assert_eq!(store.destroy_all_for_user(999), 0, "user 999 nunca tuvo sesiones");
+        assert!(store.role_for(&other).is_some(), "no debería haber tocado la sesión de otro usuario");
+    }
+
+    #[test]
+    fn a_session_created_without_a_user_id_is_never_matched_by_destroy_all_for_user() {
+        // `create` (sin id) guarda `user_id: None` -- ninguna llamada con un
+        // `user_id` real (`Some(_)`) debería poder alcanzarla.
+        let store = SessionStore::new();
+        let anonymous = store.create("Role".to_string(), "Admin".to_string());
+        assert_eq!(store.destroy_all_for_user(0), 0);
+        assert!(store.role_for(&anonymous).is_some());
     }
 
     #[test]

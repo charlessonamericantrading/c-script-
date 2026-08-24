@@ -1946,6 +1946,11 @@ fn call_method(
                 }
                 Ok(Value::Null)
             }
+            "destroyAllSessions" => {
+                let user_id_val = args.into_iter().next().ok_or_else(|| err("destroyAllSessions requiere 1 argumento (userId)"))?;
+                let user_id = as_int(&user_id_val)?;
+                Ok(Value::Int(sessions.destroy_all_for_user(user_id) as i64))
+            }
             // `null` para "sin sesión" y "token inválido/vencido" por
             // igual, a propósito -- mismo criterio de indistinguibilidad
             // que ya rige el 401 de `check_auth_gate` (GRAMMAR.md §3.50):
@@ -4464,6 +4469,34 @@ mod tests {
         let result =
             invoke_rpc_with_sessions(&program, "S", "logout", &json!({}), &Db::seeded(), &sessions, None);
         assert!(result.is_ok());
+    }
+
+    /// `auth.destroyAllSessions(userId)` (GRAMMAR.md §3.84) contra un rpc
+    /// real -- a diferencia de `destroySession`, revoca TODAS las sesiones
+    /// de OTRO usuario a la vez, típicamente gateado con
+    /// `@requires(Role.Admin)` por quien escribe el `.link` (no es este
+    /// método el que impone esa política).
+    #[test]
+    fn destroy_all_sessions_revokes_every_session_of_that_user_and_leaves_others_alone() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc revoke(userId: Int) -> Int { auth.destroyAllSessions(userId) }
+            }
+        "#,
+        );
+        let sessions = SessionStore::new();
+        let victim_a = sessions.create_with_user_id("Role".to_string(), "Member".to_string(), Some(7));
+        let victim_b = sessions.create_with_user_id("Role".to_string(), "Member".to_string(), Some(7));
+        let survivor = sessions.create_with_user_id("Role".to_string(), "Member".to_string(), Some(8));
+
+        let result =
+            invoke_rpc_with_sessions(&program, "S", "revoke", &json!({"userId": 7}), &Db::seeded(), &sessions, None)
+                .unwrap();
+        assert_eq!(result, json!(2), "user 7 tenía exactamente 2 sesiones abiertas");
+        assert_eq!(sessions.role_for(&victim_a), None);
+        assert_eq!(sessions.role_for(&victim_b), None);
+        assert!(sessions.role_for(&survivor).is_some(), "la sesión de otro usuario no debe verse afectada");
     }
 
     #[test]

@@ -105,6 +105,7 @@
   - [3.81 `--host <dirección>`: en qué interfaz escucha `linkc serve` — RESUELTO](#381---host-dirección-en-qué-interfaz-escucha-linkc-serve--resuelto)
   - [3.82 `linkc test --filter <nombre>` — RESUELTO](#382-linkc-test---filter-nombre--resuelto)
   - [3.83 `linkc --version` y versión estampada en cada archivo generado — RESUELTO](#383-linkc---version-y-versión-estampada-en-cada-archivo-generado--resuelto)
+  - [3.84 `auth.destroyAllSessions(userId)`: revocar todas las sesiones de un usuario — RESUELTO](#384-authdestroyallsessionsuserid-revocar-todas-las-sesiones-de-un-usuario--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4078,6 +4079,32 @@ linkc version   # equivalente
 - **`link.lock` tiene su propio `version` -- un número de FORMATO del lockfile (hoy `1`), no la versión del compilador.** Las dos cosas conviven sin relación: el lockfile versiona su propio schema, este ítem versiona el ARTEFACTO generado.
 
 **Verificado**: `cli_help.rs` (`--version`/`-v`/`version` imprimen exactamente `linkc <versión>` a stdout, código de salida 0, nada por stderr -- comparado contra `env!("CARGO_PKG_VERSION")` leído en el propio test, así que una desincronización real haría fallar el test) y 4 tests en `codegen/*.rs` (`contract.d.ts`/`client.ts`/`hooks.ts`, `validators.ts` y `schemas.ts` empiezan con el header versionado; `openapi.json` lleva `x-generated-by` con la versión, y `info.version` sigue siendo la del API, no la del compilador -- las dos NO deben coincidir).
+
+---
+
+### 3.84 `auth.destroyAllSessions(userId)`: revocar todas las sesiones de un usuario — RESUELTO
+
+Hasta esta ronda, la única forma de cerrar una sesión era `auth.destroySession()` -- que opera sobre la sesión que ya autenticó la request ACTUAL, deliberadamente sin tomar ningún token como argumento (§3.14: si tomara un token, cualquiera podría destruir la sesión de otro con solo adivinar/conocer ese string). Eso deja sin resolver el caso real de "un usuario cambió su contraseña, o un admin lo está baneando -- hay que cerrar TODAS sus sesiones abiertas, en todos los dispositivos, ahora mismo", que no tiene forma de expresarse con un método que solo conoce "la sesión actual".
+
+<!-- linkc:fragment -->
+```rust
+enum Role { Admin, Member }
+
+service Admin {
+  @requires(Role.Admin)
+  rpc banUser(userId: Int) -> Int {
+    auth.destroyAllSessions(userId)
+  }
+}
+```
+
+**`auth.destroyAllSessions(userId: Int) -> Int`: a diferencia de `destroySession`, SÍ toma un identificador explícito.** Mismo criterio que `createSessionWithId` (§3.53): un `userId` es una clave de aplicación, no un secreto adivinable como un token de sesión -- no hay el mismo riesgo que motivó a `destroySession` a no tomar ningún argumento. Devuelve la CANTIDAD de sesiones borradas (`0` si el usuario no tenía ninguna sesión abierta, nunca un error).
+
+**Quién puede LLAMAR a esto es responsabilidad de quien escribe el `.link`, el método en sí no impone ninguna política.** Como cualquier otro builtin de `auth` (`createSession`/`createSessionWithId`), está disponible desde CUALQUIER cuerpo de rpc -- gatearlo con `@requires(Role.Admin)` (como en el ejemplo de arriba) es una decisión del autor del programa, no algo que el runtime fuerce por sí solo.
+
+**Solo alcanza sesiones creadas por ESTE `SessionStore` (`createSession`/`createSessionWithId`) -- un JWT externo (§3.64) no pasa por acá.** Un JWT válido nunca se guarda en el store en memoria (se verifica al vuelo en cada request), así que no hay nada que "borrar" del lado de `linkc` -- revocar un JWT externo sigue siendo responsabilidad del sistema que lo emitió (rotar el secreto, o su propia lista de revocación).
+
+**Verificado**: 3 tests en `session.rs` (borra todas las sesiones de un usuario y devuelve la cantidad exacta, deja intactas las de otro usuario, un usuario sin sesiones da `0` sin tocar nada, una sesión creada sin `userId` nunca matchea), 1 en `checker.rs` (toma exactamente un `Int`, tipa `Int`) y 1 en `runtime/mod.rs` contra `invoke_rpc_with_sessions` (dos sesiones del mismo usuario se revocan, una tercera de otro usuario sobrevive). Verificado también contra un servidor HTTP real (`server_http.rs`): dos tokens del mismo usuario dejan de autenticar (401, mismo código que cualquier token inexistente o vencido) después de `destroyAllSessions`, mientras el token de otro usuario sigue funcionando sin cambios.
 
 ---
 

@@ -3644,6 +3644,22 @@ impl Checker {
                 self.expect_no_args(args, "destroySession")?;
                 Ok(Type::Void)
             }
+            // GRAMMAR.md §3.84 -- a diferencia de `destroySession` (cero
+            // argumentos, opera sobre la sesión ya autenticada), ÉSTE sí
+            // toma un `userId: Int` explícito: mismo criterio que
+            // `createSessionWithId`, un `user_id` es una clave de
+            // aplicación, no un secreto adivinable.
+            "destroyAllSessions" => {
+                let [user_id_arg] = args else {
+                    return Err(err("'destroyAllSessions' toma exactamente 1 argumento (userId: Int)"));
+                };
+                match self.synth_expr(user_id_arg, env)? {
+                    Type::Int => Ok(Type::Int),
+                    other => Err(err(format!(
+                        "'destroyAllSessions' espera un Int como argumento (userId), se encontró {other}"
+                    ))),
+                }
+            }
             "currentRole" => {
                 self.expect_no_args(args, "currentRole")?;
                 Ok(Type::Optional(Box::new(Type::String)))
@@ -3653,7 +3669,7 @@ impl Checker {
                 Ok(Type::Optional(Box::new(Type::Int)))
             }
             other => Err(err(format!(
-                "'{other}' no es un método conocido de 'auth' (createSession/createSessionWithId/destroySession/currentRole/currentUserId)"
+                "'{other}' no es un método conocido de 'auth' (createSession/createSessionWithId/destroySession/destroyAllSessions/currentRole/currentUserId)"
             ))),
         }
     }
@@ -5728,6 +5744,38 @@ type T = { id: Int, s: Status }")
         assert!(res_id.is_err());
         let msg_id = format!("{:?}", res_id.unwrap_err());
         assert!(msg_id.contains("Int"), "debería mencionar 'Int': {msg_id}");
+    }
+
+    /// `auth.destroyAllSessions(userId: Int) -> Int` (GRAMMAR.md §3.84).
+    #[test]
+    fn destroy_all_sessions_requires_exactly_one_int_argument_and_types_as_int() {
+        let src = r#"
+            service S {
+                rpc revoke(userId: Int) -> Int { auth.destroyAllSessions(userId) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        let no_args = r#"
+            service S {
+                rpc revoke() -> Int { auth.destroyAllSessions() }
+            }
+        "#;
+        let res_no_args = check_source(no_args);
+        assert!(res_no_args.is_err());
+        assert!(
+            format!("{:?}", res_no_args.unwrap_err()).contains("destroyAllSessions"),
+            "debería mencionar 'destroyAllSessions'"
+        );
+
+        let bad_type = r#"
+            service S {
+                rpc revoke() -> Int { auth.destroyAllSessions("42") }
+            }
+        "#;
+        let res_bad_type = check_source(bad_type);
+        assert!(res_bad_type.is_err());
+        assert!(format!("{:?}", res_bad_type.unwrap_err()).contains("Int"), "debería mencionar 'Int'");
     }
 
     #[test]

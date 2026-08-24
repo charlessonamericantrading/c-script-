@@ -398,16 +398,17 @@ Con las Fases 0 a 3 completadas y el núcleo v1.28.0 plenamente operativo, las s
 
 ### 9.5 Autenticación y Seguridad
 1. **`@rate_limit` con `X-Forwarded-For` de confianza configurable**: la mitad "proxies de confianza" de lo ya trackeado en §8.3.2 -- confirmado como bloqueo real (todo corre detrás de nginx en la adopción de IgnisLove).
-2. **Revocar todas las sesiones de un usuario**: hoy solo existe `destroySession()` por token individual, no un "cerrar todas las sesiones de este usuario" (confirmado, no existe tal método en `session.rs`).
-3. **Bloqueo de cuenta configurable** tras N intentos fallidos.
-4. **Log de auditoría de autorización estructurado**: quién llamó a qué rpc, con qué rol, y si se permitió o denegó.
-5. **API keys de servicio**: para llamadas servidor-a-servidor, distintas de las sesiones de usuario -- confirmado como gap real (IgnisLove usa `fetch` sin autenticación entre su app Node y cada `linkc serve`, confiando solo en que el puerto no sea alcanzable).
-6. **Escaneo de secretos en tiempo de compilación**: que `linkc build`/`lint` avise si detecta una URL de conexión o API key literal en el código.
-7. **Lint: comparación `==` sobre un campo `secret`/`token`/`password`**: recomendar `crypto.timingSafeEqual` automáticamente.
-8. **Lint: `@requires(Role.X)` que nunca llama a `auth.currentRole()`/`currentUserId()`**: indicio de autorización de fachada.
-9. **Cifrado de campo a nivel de columna** (`@encrypted` en un `String` sensible).
-10. **RBAC por recurso**: permisos más allá de todo-o-nada por rol.
-11. **ABAC**: reglas basadas en atributos del propio recurso (ej. "solo el dueño de la factura").
+2. **Bloqueo de cuenta configurable** tras N intentos fallidos.
+3. **Log de auditoría de autorización estructurado**: quién llamó a qué rpc, con qué rol, y si se permitió o denegó.
+4. **API keys de servicio**: para llamadas servidor-a-servidor, distintas de las sesiones de usuario -- confirmado como gap real (IgnisLove usa `fetch` sin autenticación entre su app Node y cada `linkc serve`, confiando solo en que el puerto no sea alcanzable).
+5. **Escaneo de secretos en tiempo de compilación**: que `linkc build`/`lint` avise si detecta una URL de conexión o API key literal en el código.
+6. **Lint: comparación `==` sobre un campo `secret`/`token`/`password`**: recomendar `crypto.timingSafeEqual` automáticamente.
+7. **Lint: `@requires(Role.X)` que nunca llama a `auth.currentRole()`/`currentUserId()`**: indicio de autorización de fachada.
+8. **Cifrado de campo a nivel de columna** (`@encrypted` en un `String` sensible).
+9. **RBAC por recurso**: permisos más allá de todo-o-nada por rol.
+10. **ABAC**: reglas basadas en atributos del propio recurso (ej. "solo el dueño de la factura").
+
+**Hecho** (24/08/2026): **Revocar todas las sesiones de un usuario** (originalmente el ítem 2 de esta lista): hasta esta ronda solo existía `destroySession()`, que opera sobre la sesión que ya autenticó la request ACTUAL (deliberadamente sin tomar un token como argumento, para que nadie pueda revocar la sesión de otro adivinando su token) -- no había forma de cerrar TODAS las sesiones de un usuario dado a la vez (útil tras un cambio de contraseña, o para un admin que banea a alguien). `auth.destroyAllSessions(userId: Int) -> Int` es el nuevo builtin -- a diferencia de `destroySession`, SÍ toma un identificador (mismo criterio que `createSessionWithId`: un `user_id` es una clave de aplicación, no un secreto adivinable como un token). Devuelve cuántas sesiones se borraron. Quién puede LLAMARLO es responsabilidad de quien escribe el `.link` (típicamente `@requires(Role.Admin)`) -- el método en sí no impone ninguna política. Ver v1.49.0, GRAMMAR.md §3.84.
 
 ### 9.6 Almacenamiento y Comunicaciones
 1. **`smtp` con adjuntos y cc/bcc**: `sendToMany`/`sendHtml` ya resueltos (GRAMMAR.md §3.63); adjuntos y cc/bcc siguen sin cubrir. El módulo `storage`/S3 (§8.5) y el envío asíncrono de `smtp` (§8.3.3) ya están trackeados -- este ítem es específicamente lo que falta de `smtp.send` en sí.

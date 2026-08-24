@@ -475,6 +475,67 @@ fn current_user_id_returns_stored_user_id_over_a_real_subprocess() {
     server.shutdown();
 }
 
+// GRAMMAR.md §3.84: revocar TODAS las sesiones de un usuario a la vez
+// (`auth.destroyAllSessions(userId)`), no solo la sesión que ya autenticó la
+// request actual (eso es `destroySession`, sin argumentos). Gateado con
+// `@requires(Role.Admin)` acá -- ese gate lo decide quien escribe el
+// `.link`, `destroyAllSessions` en sí mismo no impone ninguna política.
+const REVOKE_ALL_SESSIONS_PROGRAM: &str = r#"
+enum Role { Admin, Member }
+
+service Auth {
+  rpc login(role: Role, userId: Int) -> String {
+    auth.createSessionWithId(role, userId)
+  }
+
+  @requires(Role.Admin)
+  rpc revokeUser(userId: Int) -> Int {
+    auth.destroyAllSessions(userId)
+  }
+}
+
+service Users {
+  @authenticated
+  rpc whoAmI() -> Int? {
+    auth.currentUserId()
+  }
+}
+"#;
+
+#[test]
+fn destroy_all_sessions_revokes_two_tokens_of_the_same_user_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("revoke-all-sessions", REVOKE_ALL_SESSIONS_PROGRAM);
+
+    let admin_token = server.post("/Auth/login", &json!({"role": "Admin", "userId": 1}), None).1.as_str().unwrap().to_string();
+    let victim_a = server.post("/Auth/login", &json!({"role": "Member", "userId": 7}), None).1.as_str().unwrap().to_string();
+    let victim_b = server.post("/Auth/login", &json!({"role": "Member", "userId": 7}), None).1.as_str().unwrap().to_string();
+    let survivor = server.post("/Auth/login", &json!({"role": "Member", "userId": 8}), None).1.as_str().unwrap().to_string();
+
+    // Las tres sesiones funcionan antes de revocar nada.
+    for tok in [&victim_a, &victim_b, &survivor] {
+        let (status, _) = server.post("/Users/whoAmI", &json!({}), Some(tok));
+        assert_eq!(status, 200, "token {tok} debería estar autenticado todavía");
+    }
+
+    let (status, count) = server.post("/Auth/revokeUser", &json!({"userId": 7}), Some(&admin_token));
+    assert_eq!(status, 200);
+    assert_eq!(count, json!(2), "user 7 tenía exactamente 2 sesiones abiertas");
+
+    // Las DOS sesiones de user 7 dejan de autenticar -- mismo 401 que
+    // cualquier token inexistente/vencido (GRAMMAR.md §3.50).
+    for tok in [&victim_a, &victim_b] {
+        let (status, _) = server.post("/Users/whoAmI", &json!({}), Some(tok));
+        assert_eq!(status, 401, "token {tok} debería haber quedado revocado");
+    }
+
+    // La sesión de OTRO usuario no se toca.
+    let (status, uid) = server.post("/Users/whoAmI", &json!({}), Some(&survivor));
+    assert_eq!(status, 200);
+    assert_eq!(uid, json!(8));
+
+    server.shutdown();
+}
+
 // GRAMMAR.md §3.64: auth externo -- confiar en un JWT HS256 ya emitido por un
 // backend existente, sin pasar por `auth.createSession(WithId)`. `--jwt-secret`
 // (extra_args de `ServeProcess`) es lo único que hace falta para habilitarlo.

@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.49.0] - 2026-08-24
+
+### ✨ Nuevo
+- **`auth.destroyAllSessions(userId: Int) -> Int`: revocar todas las sesiones de un usuario.** Hasta esta ronda la única forma de cerrar una sesión era `auth.destroySession()`, que opera sobre la sesión que ya autenticó la request actual, deliberadamente sin tomar ningún token como argumento -- si tomara un token, cualquiera podría destruir la sesión de otro con solo adivinarlo. Eso dejaba sin resolver el caso real de "cambió su contraseña, o un admin lo está baneando -- hay que cerrar TODAS sus sesiones, en todos los dispositivos, ahora mismo". `destroyAllSessions`, a diferencia de `destroySession`, SÍ toma un identificador explícito -- mismo criterio que `createSessionWithId`: un `userId` es una clave de aplicación, no un secreto adivinable como un token. Devuelve la cantidad de sesiones borradas (`0` si no había ninguna). Disponible desde cualquier cuerpo de rpc, como el resto de los builtins de `auth` -- gatearlo con `@requires(Role.Admin)` es una decisión de quien escribe el `.link`, no algo que el runtime imponga por sí solo. Solo alcanza sesiones propias (`createSession`/`createSessionWithId`); un JWT externo no pasa por el store en memoria, así que no hay nada que revocar de ese lado.
+
+796 tests (6 nuevos): 3 en `session.rs` (borra todas las sesiones de un usuario y devuelve la cantidad exacta, deja intactas las de otro usuario, un usuario sin sesiones da 0), 1 en `checker.rs` (toma exactamente un Int, tipa Int), 1 en `runtime/mod.rs` (dos sesiones del mismo usuario se revocan, una tercera de otro usuario sobrevive) y 1 contra un servidor HTTP real (dos tokens del mismo usuario pasan a dar 401 tras revocar, el de otro usuario sigue funcionando). Detalle completo: GRAMMAR.md §3.84.
+
 ## [1.48.0] - 2026-08-24
 
 ### ✨ Nuevo
