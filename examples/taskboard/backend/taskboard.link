@@ -36,6 +36,11 @@ service Tasks {
     db.tasks.all()
   }
 
+  @infinite(cursor, limit)
+  rpc listPaged(cursor: Int?, limit: Int) -> Task[] {
+    db.tasks.pageAfter(cursor, limit)
+  }
+
   rpc getById(id: Int) -> Task? {
     db.tasks.find(id)
   }

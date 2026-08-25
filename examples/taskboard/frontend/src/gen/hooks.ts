@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.96.0 — no editar a mano.
+// Generado automáticamente por linkc v1.97.0 — no editar a mano.
 
 import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "react";
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
@@ -24,6 +24,16 @@ export interface SubscriptionState<T> {
   isConnected: boolean;
   error: Error | null;
   reconnect: () => void;
+}
+
+export interface InfiniteQueryState<T> {
+  data: T[];
+  loading: boolean;
+  isFetchingNextPage: boolean;
+  hasNextPage: boolean;
+  error: Error | null;
+  fetchNextPage: () => Promise<void>;
+  refetch: () => Promise<void>;
 }
 
 type QueryCacheState<T> = { data: T | null; isFetching: boolean; error: Error | null };
@@ -133,6 +143,99 @@ export function useTasksListMutation(client: TasksClient): MutationState<Task[]>
   const mutate = useCallback(async (): Promise<Task[] | null> => {
     try {
       return await mutateAsync();
+    } catch {
+      return null;
+    }
+  }, [mutateAsync]);
+
+  const reset = useCallback(() => {
+    requestIdRef.current++;
+    setData(null);
+    setLoading(false);
+    setError(null);
+  }, []);
+
+  return { mutate, mutateAsync, data, loading, error, reset };
+}
+
+export function useTasksListPagedInfinite(client: TasksClient, limit: number, options?: { enabled?: boolean }): InfiniteQueryState<Task> {
+  const enabled = options?.enabled ?? true;
+  const [pages, setPages] = useState<Task[][]>([]);
+  const [nextCursor, setNextCursor] = useState<number | null>(null);
+  const [hasNextPage, setHasNextPage] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [isFetchingNextPage, setIsFetchingNextPage] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
+  const startedRef = useRef(false);
+
+  const loadPage = useCallback(async (cursorArg: number | null, replace: boolean): Promise<void> => {
+    const requestId = ++requestIdRef.current;
+    if (replace) setLoading(true); else setIsFetchingNextPage(true);
+    setError(null);
+    try {
+      const res = await client.listPaged(cursorArg, limit);
+      if (requestIdRef.current !== requestId) return;
+      setPages((prev) => (replace ? [res] : [...prev, res]));
+      setHasNextPage(res.length === limit);
+      setNextCursor(res.length > 0 ? res[res.length - 1].id : cursorArg);
+    } catch (err) {
+      if (requestIdRef.current === requestId) setError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      if (requestIdRef.current === requestId) { if (replace) setLoading(false); else setIsFetchingNextPage(false); }
+    }
+  }, [client, limit]);
+
+  useEffect(() => {
+    if (enabled && !startedRef.current) {
+      startedRef.current = true;
+      loadPage(null, true);
+    }
+  }, [enabled, loadPage]);
+
+  const fetchNextPage = useCallback(async (): Promise<void> => {
+    if (!hasNextPage || isFetchingNextPage || loading) return;
+    await loadPage(nextCursor, false);
+  }, [hasNextPage, isFetchingNextPage, loading, nextCursor, loadPage]);
+
+  const refetch = useCallback(async (): Promise<void> => {
+    startedRef.current = true;
+    setHasNextPage(true);
+    await loadPage(null, true);
+  }, [loadPage]);
+
+  return { data: pages.flat(), loading, isFetchingNextPage, hasNextPage, error, fetchNextPage, refetch };
+}
+
+export function useTasksListPagedMutation(client: TasksClient): MutationState<Task[]> & {
+  mutate: (cursor: number | null, limit: number) => Promise<Task[] | null>;
+  mutateAsync: (cursor: number | null, limit: number) => Promise<Task[]>;
+} {
+  const [data, setData] = useState<Task[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
+
+  const mutateAsync = useCallback(async (cursor: number | null, limit: number): Promise<Task[]> => {
+    const requestId = ++requestIdRef.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await client.listPaged(cursor, limit);
+      if (requestIdRef.current === requestId) setData(res);
+      return res;
+    } catch (err) {
+      const e = err instanceof Error ? err : new Error(String(err));
+      if (requestIdRef.current === requestId) setError(e);
+      throw e;
+    } finally {
+      if (requestIdRef.current === requestId) setLoading(false);
+    }
+  }, [client]);
+
+  const mutate = useCallback(async (cursor: number | null, limit: number): Promise<Task[] | null> => {
+    try {
+      return await mutateAsync(cursor, limit);
     } catch {
       return null;
     }

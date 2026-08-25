@@ -707,9 +707,17 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::Invalidates(names)
                 }
+                "infinite" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let cursor_param = self.eat_ident()?;
+                    self.eat(&TokenKind::Comma)?;
+                    let limit_param = self.eat_ident()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::Infinite { cursor_param, limit_param }
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)' o '@invalidates(rpc1, rpc2, ...)')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)' o '@infinite(cursor, limit)')"
                     )))
                 }
             };
@@ -2024,6 +2032,27 @@ mod tests {
         let tokens = tokenize("service S { @invalidates() rpc f() -> Int { 1 } }").unwrap();
         let err = parse(tokens).unwrap_err();
         assert!(err.iter().any(|e| e.message.contains("vacío")), "mensaje inesperado: {err:?}");
+    }
+
+    /// `@infinite(cursor, limit)` (GRAMMAR.md §3.134) -- dos identificadores
+    /// sueltos, siempre en ese orden.
+    #[test]
+    fn infinite_annotation_parses_the_two_bare_param_names() {
+        let prog = parse_source(
+            "service S { @infinite(cursor, limit) rpc list(cursor: Int?, limit: Int) -> Int[] { [] } }",
+        );
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(
+            r.annotations,
+            vec![Annotation::Infinite { cursor_param: "cursor".to_string(), limit_param: "limit".to_string() }]
+        );
+    }
+
+    #[test]
+    fn infinite_annotation_requires_exactly_two_names() {
+        let tokens = tokenize("service S { @infinite(cursor) rpc f(cursor: Int?) -> Int[] { [] } }").unwrap();
+        assert!(parse(tokens).is_err());
     }
 
     #[test]

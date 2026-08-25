@@ -155,6 +155,7 @@
   - [3.131 `isOk`/`isErr` y el schema Zod de `Result<T,E>` chequeaban un campo que no existe — RESUELTO (bug real)](#3131-isokiserr-y-el-schema-zod-de-resultte-chequeaban-un-campo-que-no-existe--resuelto-bug-real)
   - [3.132 Schema Zod de un enum ADT: `z.enum([...])` no alcanzaba — RESUELTO (bug real)](#3132-schema-zod-de-un-enum-adt-zenum-no-alcanzaba--resuelto-bug-real)
   - [3.133 `openapi.json`: mismos tres bugs que `isOk`/`isErr` y el schema Zod, esta vez en la especificación pública de la API — RESUELTO (bug real)](#3133-openapijson-mismos-tres-bugs-que-isokiserr-y-el-schema-zod-esta-vez-en-la-especificación-pública-de-la-api--resuelto-bug-real)
+  - [3.134 `@infinite(cursor, limit)`: scroll infinito real — RESUELTO](#3134-infinitecursor-limit-scroll-infinito-real--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5568,6 +5569,46 @@ Continuación directa del mismo audit de §3.131/§3.132: `openapi_emit.rs` (`ty
 **(3) Mismo bug de generics que §3.132, en el branch `Item::Type` de este archivo**: un `type`/`enum` GENÉRICO con un campo que referencia su propio parámetro de tipo rompía `linkc build` ENTERO -- confirmado a mano contra el binario real, DESPUÉS de arreglar el mismo bug en `schemas.ts`: `Box<T>` seguía rompiendo, esta vez en `openapi.json` específicamente (`type_to_json_schema` ya tenía un catch-all -- `{"type":"object"}` -- para cualquier tipo sin JSON Schema razonable, así que el problema era la RESOLUCIÓN del tipo, nunca su renderizado). Mismo fix, mismo patrón: `resolve_type_abstract` en vez de `resolve_type` a secas cuando `type_params` no está vacío -- tanto en `Item::Type` como en el `Item::Enum` ADT nuevo del punto (2).
 
 **Verificado**: 4 tests nuevos en `codegen::openapi_emit` (el `Result<T,E>` de un rpc real usa `oneOf`/`const`, nunca el `{ok, ...}` viejo; un ADT usa `oneOf`/`const` por variante; un enum sin datos sigue igual; un `type`/`enum` genérico -- `Box<T>` y un ADT genérico juntos -- no rompe el build) + los 11 tests existentes de este archivo (deprecated, `@example`, defaults) siguen pasando sin cambios -- ninguno tocaba `Result<T,E>` ni un ADT. Verificado también a mano contra el binario real: `linkc build examples/users.link` regenerado, `openapi.json` inspeccionado byte a byte -- el `Result<Task, ValidationError>` de `create` y el `ValidationError` de `components/schemas` usan la forma nueva (`oneOf`/`const`) en el archivo real, no solo en un test aislado.
+
+---
+
+### 3.134 `@infinite(cursor, limit)`: scroll infinito real — RESUELTO
+
+Vuelta a mejoras de TypeScript/React (no bugs) tras cerrar el audit de §3.131-§3.133: de los tres tipos de hook generado, `use{Servicio}{Rpc}Query` tiene `refetch()`, pero ninguno sabía manejar PAGINACIÓN -- un componente con scroll infinito tenía que gestionar el cursor a mano, llamando a `client.<rpc>(cursor, limit)` directo y concatenando páginas él mismo. `db.<c>.pageAfter(cursor: Int?, limit: Int)` (§3.61) ya es el único mecanismo de paginación por cursor del lenguaje -- este ítem le da un hook dedicado.
+
+```
+service Tasks {
+  @infinite(cursor, limit)
+  rpc listPaged(cursor: Int?, limit: Int) -> Task[] {
+    db.tasks.pageAfter(cursor, limit)
+  }
+}
+```
+
+```tsx
+function PagedHistory() {
+  const { data, loading, isFetchingNextPage, hasNextPage, fetchNextPage } = useTasksListPagedInfinite(client, 5);
+  if (loading) return <p>Cargando...</p>;
+  return (
+    <>
+      <ul>{data.map((t) => <li key={t.id}>{t.title}</li>)}</ul>
+      {hasNextPage && <button onClick={() => fetchNextPage()} disabled={isFetchingNextPage}>Cargar más</button>}
+    </>
+  );
+}
+```
+
+**`@infinite(cursor, limit)` nombra los DOS parámetros de ESTE rpc** que juegan el rol de cursor y tamaño de página -- identificadores sueltos, como `@invalidates`, no `Enum.Variante`. El checker exige las MISMAS firmas que `pageAfter` ya tiene (`cursor: Int?`, `limit: Int`) y que el retorno sea `T[]` con `T` teniendo un campo `id: Int` -- no un mecanismo genérico para "cualquier forma de paginación imaginable", sino el hook dedicado para el ÚNICO patrón de cursor que el lenguaje ya soporta. Reemplaza el hook de Query normal para ese rpc (nunca coexisten -- un fetch de una sola página sin nunca avanzar el cursor no es útil); el hook de Mutation se sigue emitiendo igual, sin cambios.
+
+**Cómo se calcula "hay página siguiente"**: sin un campo de conteo total en la respuesta (el rpc devuelve `T[]` liso, no un wrapper `{items, total}`), el heurístico es "si la última página trajo MENOS items que `limit`, no hay más" -- mismo criterio que usan otros sistemas de paginación por cursor sin conteo (ej. Relay). **Cómo se calcula el cursor siguiente**: el `id` del ÚLTIMO elemento de la página -- mismo criterio que `pageAfter` usa puertas adentro (un cursor de continuación basado en `id`, estable ante inserciones concurrentes, a diferencia de `page(limit, offset)`).
+
+**`cursor` desaparece de la firma pública del hook** -- lo maneja internamente, arrancando siempre en `null`; `limit` sigue siendo un parámetro real que el caller elige (tamaño de página). `data` viene YA APLANADA (`pages.flat()`, todas las páginas juntas) -- casi ningún componente real quiere iterar página por página. Mismas guardas que el resto de los hooks: `requestIdRef` contra una respuesta fuera de orden, `startedRef` para no re-disparar la primera página si `enabled` alterna false→true→false→true (perdería las páginas ya cargadas).
+
+**Alcance v0 deliberado, documentado**: sin cache compartido entre instancias (a diferencia de Query, §3.124) -- dos componentes con el mismo `useXInfinite` mantienen historiales independientes; el caso real de scroll infinito es casi siempre un único componente dueño de la lista. `refetch()` reinicia desde la página 1, descartando las páginas ya cargadas.
+
+**Demostración real**: `examples/taskboard/backend/taskboard.link` agrega `listPaged(cursor, limit)` sobre `db.tasks.pageAfter`; `examples/taskboard/frontend/src/App.tsx` consume `useTasksListPagedInfinite` en una sección nueva ("Historial paginado") con un botón "Cargar más" real.
+
+**Verificado**: 2 tests de parser (`@infinite(cursor, limit)` parsea los dos nombres; menos de dos es error de parseo), 8 de checker (firma `pageAfter`-shaped acepta; cursor no-`Int?` rechazado; limit no-`Int` rechazado; retorno sin `id: Int` rechazado; nombre de parámetro inexistente rechazado; mismo parámetro como cursor y limit rechazado; rechazado sobre un `stream`; declarado dos veces rechazado), 1 de `codegen::ts_emit` (la firma pública excluye `cursor`, incluye `limit`; NO coexiste con un hook de Query para el mismo rpc; el hook de Mutation se sigue emitiendo). Verificado también a mano contra un `linkc serve` real (`examples/taskboard`, 7 tareas creadas, `limit=3`): el mismo algoritmo que el hook generado implementa (sin React, bundle de `client.ts` vía esbuild) trajo exactamente 3 páginas (3+3+1=7), sin duplicados entre páginas, en orden ascendente, `hasNextPage` apagándose en el momento correcto. Verificado end-to-end contra React real: `examples/taskboard/frontend` regenerado, con `App.tsx` usando el hook de verdad, y tipando limpio con `tsc --noEmit` en modo estricto.
 
 ---
 

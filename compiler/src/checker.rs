@@ -1757,6 +1757,78 @@ impl Checker {
         Ok(())
     }
 
+    /// `@infinite(cursor, limit)` (GRAMMAR.md §3.134) -- mismas firmas que
+    /// `db.<c>.pageAfter(cursor: Int?, limit: Int)` (§3.61, el único
+    /// mecanismo de paginación por cursor que el lenguaje ya tiene): el
+    /// parámetro `cursor` nombrado tiene que ser `Int?`, el `limit`
+    /// nombrado tiene que ser `Int`, y el retorno tiene que ser `T[]` con
+    /// `T` teniendo un campo `id: Int` -- el próximo cursor que el hook
+    /// generado calcula es el `id` del último elemento de la página
+    /// (`ts_emit.rs`), mismo criterio que `pageAfter` usa puertas adentro.
+    fn check_infinite_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        let count = r.annotations.iter().filter(|a| matches!(a, Annotation::Infinite { .. })).count();
+        if count > 1 {
+            return Err(err(format!("'{}' declara `@infinite` más de una vez", r.name)));
+        }
+        let Some((cursor_param, limit_param)) = r.infinite() else {
+            return Ok(());
+        };
+        if is_stream {
+            return Err(err(format!(
+                "`@infinite` en el stream '{}': un stream ya empuja eventos en vivo, no necesita paginación (GRAMMAR.md §3.134)",
+                r.name
+            )));
+        }
+        if cursor_param == limit_param {
+            return Err(err(format!(
+                "`@infinite({cursor_param}, {limit_param})` en '{}': el cursor y el límite tienen que ser dos parámetros distintos",
+                r.name
+            )));
+        }
+        let find_param = |name: &str| r.params.iter().find(|p| p.name == name);
+        let Some(cursor) = find_param(cursor_param) else {
+            return Err(err(format!(
+                "`@infinite({cursor_param}, ...)` en '{}': '{cursor_param}' no es un parámetro de este rpc",
+                r.name
+            )));
+        };
+        let cursor_ty = self.resolve_type(&cursor.ty)?;
+        if cursor_ty != Type::Optional(Box::new(Type::Int)) {
+            return Err(err(format!(
+                "`@infinite({cursor_param}, ...)` en '{}': '{cursor_param}' tiene que ser `Int?` (mismo tipo que `cursor` en `db.<c>.pageAfter`) -- es `{cursor_ty}`",
+                r.name
+            )));
+        }
+        let Some(limit) = find_param(limit_param) else {
+            return Err(err(format!(
+                "`@infinite(..., {limit_param})` en '{}': '{limit_param}' no es un parámetro de este rpc",
+                r.name
+            )));
+        };
+        let limit_ty = self.resolve_type(&limit.ty)?;
+        if limit_ty != Type::Int {
+            return Err(err(format!(
+                "`@infinite(..., {limit_param})` en '{}': '{limit_param}' tiene que ser `Int` (mismo tipo que `limit` en `db.<c>.pageAfter`) -- es `{limit_ty}`",
+                r.name
+            )));
+        }
+        let ret_ty = self.resolve_type(&r.return_type)?;
+        let Type::List(elem_ty) = &ret_ty else {
+            return Err(err(format!(
+                "`@infinite` en '{}': el retorno tiene que ser una lista (`T[]`, una página de elementos) -- es `{ret_ty}`",
+                r.name
+            )));
+        };
+        let has_id_int = matches!(elem_ty.as_ref(), Type::Struct { fields, .. } if fields.iter().any(|f| f.name == "id" && f.ty == Type::Int));
+        if !has_id_int {
+            return Err(err(format!(
+                "`@infinite` en '{}': el elemento de la lista de retorno tiene que tener un campo `id: Int` -- el hook generado usa el `id` del último elemento como el próximo cursor",
+                r.name
+            )));
+        }
+        Ok(())
+    }
+
     /// `@validate(...)` (GRAMMAR.md §3.73) sobre cada campo de `fields` --
     /// llamado tanto para un `type X = { ... }` como para los campos de cada
     /// variante de un `enum` (comparten `Field`, ver `ast.rs`). Dos cosas se
@@ -2013,6 +2085,7 @@ impl Checker {
         self.check_cache_control_annotation(r, is_stream)?;
         self.check_example_annotation(r, is_stream)?;
         self.check_invalidates_annotation(r, is_stream, service)?;
+        self.check_infinite_annotation(r, is_stream)?;
         let Some(Annotation::Requires { enum_name, variant_names }) = r.auth() else {
             return Ok(());
         };
@@ -5679,6 +5752,120 @@ type T = { id: Int, s: Status }")
                 @invalidates(list)
                 @invalidates(list)
                 rpc create() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("más de una vez")), "mensaje inesperado: {err:?}");
+    }
+
+    /// `@infinite(cursor, limit)` (GRAMMAR.md §3.134) -- mismas firmas que
+    /// `db.<c>.pageAfter(cursor: Int?, limit: Int)`, retorno `T[]` con `T`
+    /// teniendo un campo `id: Int`.
+    #[test]
+    fn infinite_accepts_pageafter_shaped_signature() {
+        let src = r#"
+            type Task = { id: Int, title: String }
+            db { tasks: Task[] }
+            service Tasks {
+                @infinite(cursor, limit)
+                rpc list(cursor: Int?, limit: Int) -> Task[] { db.tasks.pageAfter(cursor, limit) }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn infinite_rejects_a_cursor_param_that_is_not_int_optional() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                @infinite(cursor, limit)
+                rpc list(cursor: String?, limit: Int) -> Task[] { [] }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("tiene que ser `Int?`")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn infinite_rejects_a_limit_param_that_is_not_int() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                @infinite(cursor, limit)
+                rpc list(cursor: Int?, limit: String) -> Task[] { [] }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("tiene que ser `Int`")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn infinite_rejects_a_return_type_without_an_id_int_field() {
+        let src = r#"
+            type Note = { text: String }
+            service Notes {
+                @infinite(cursor, limit)
+                rpc list(cursor: Int?, limit: Int) -> Note[] { [] }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("id: Int")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn infinite_rejects_a_non_existent_param_name() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                @infinite(noExiste, limit)
+                rpc list(cursor: Int?, limit: Int) -> Task[] { [] }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("no es un parámetro")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn infinite_rejects_the_same_param_as_cursor_and_limit() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                @infinite(cursor, cursor)
+                rpc list(cursor: Int?) -> Task[] { [] }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("dos parámetros distintos")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn infinite_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @infinite(cursor, limit)
+                stream list(cursor: Int?, limit: Int) -> Task {
+                    db.tasks.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("infinite") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn infinite_rejects_being_declared_twice() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                @infinite(cursor, limit)
+                @infinite(cursor, limit)
+                rpc list(cursor: Int?, limit: Int) -> Task[] { [] }
             }
         "#;
         let err = check_source(src).unwrap_err();

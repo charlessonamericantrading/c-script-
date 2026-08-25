@@ -308,6 +308,60 @@
         ]
       }
     },
+    "/Tasks/listPaged": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "cursor": {
+                    "anyOf": [
+                      {
+                        "format": "int32",
+                        "type": "integer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "limit": {
+                    "format": "int32",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "cursor",
+                  "limit"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/Task"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Respuesta exitosa"
+          }
+        },
+        "summary": "Tasks::listPaged",
+        "tags": [
+          "Tasks"
+        ]
+      }
+    },
     "/Tasks/remove": {
       "post": {
         "requestBody": {
@@ -431,5 +485,5 @@
       }
     }
   },
-  "x-generated-by": "linkc v1.96.0"
+  "x-generated-by": "linkc v1.97.0"
 }

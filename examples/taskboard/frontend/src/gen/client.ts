@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.96.0 — no editar a mano.
+// Generado automáticamente por linkc v1.97.0 — no editar a mano.
 
 import type { BoardStats, ColumnId, NewTask, Patch, Result, Task, TasksClient } from "./contract";
 import { isBoardStats, isTask } from "./validators.ts";
@@ -50,6 +50,19 @@ class TasksClientImpl implements TasksClient {
     if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
     if (!((Array.isArray(json) && json.every((item: unknown) => isTask(item))))) throw new LinkValidationError("list", json);
+    return json as Task[];
+  }
+
+  async listPaged(cursor: number | null, limit: number, options?: { signal?: AbortSignal }): Promise<Task[]> {
+    const res = await fetch(`${this.baseUrl}/Tasks/listPaged`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
+      body: JSON.stringify({ cursor, limit }),
+      signal: options?.signal,
+    });
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
+    const json: unknown = await res.json();
+    if (!((Array.isArray(json) && json.every((item: unknown) => isTask(item))))) throw new LinkValidationError("listPaged", json);
     return json as Task[];
   }
 

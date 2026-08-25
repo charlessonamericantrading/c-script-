@@ -1,7 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import { createTasksClient } from './gen/client.ts';
 import type { Task, Priority, ColumnId, NewTask } from './gen/contract.d.ts';
-import { useTasksListQuery, useTasksCreateMutation, useTasksWatchTasks } from './gen/hooks.ts';
+import { useTasksListQuery, useTasksCreateMutation, useTasksWatchTasks, useTasksListPagedInfinite } from './gen/hooks.ts';
 
 const client = createTasksClient('http://localhost:8787');
 
@@ -180,6 +180,43 @@ export function App() {
             ))}
           </div>
         </div>
+      )}
+
+      <PagedHistory />
+    </div>
+  );
+}
+
+/**
+ * `@infinite(cursor, limit)` (GRAMMAR.md §3.134) -- demostración real de
+ * `useTasksListPagedInfinite`: mismo tablero, paginado de a 5 en 5 por
+ * cursor de continuación (`db.tasks.pageAfter`, estable ante inserciones
+ * concurrentes -- a diferencia de `page(limit, offset)`), sin que este
+ * componente tenga que manejar el cursor a mano.
+ */
+function PagedHistory() {
+  const { data, loading, isFetchingNextPage, hasNextPage, fetchNextPage } = useTasksListPagedInfinite(client, 5);
+
+  return (
+    <div className="create-form" style={{ marginTop: '16px' }}>
+      <h3 style={{ marginTop: 0 }}>📜 Historial paginado (scroll infinito)</h3>
+      {loading ? (
+        <p style={{ color: '#94a3b8' }}>Cargando...</p>
+      ) : (
+        <>
+          <ul style={{ listStyle: 'none', padding: 0 }}>
+            {data.map((t) => (
+              <li key={t.id} style={{ padding: '4px 0', color: '#cbd5e1' }}>
+                #{t.id} {t.title}
+              </li>
+            ))}
+          </ul>
+          {hasNextPage && (
+            <button onClick={() => fetchNextPage()} disabled={isFetchingNextPage}>
+              {isFetchingNextPage ? 'Cargando...' : 'Cargar más'}
+            </button>
+          )}
+        </>
       )}
     </div>
   );

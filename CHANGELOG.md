@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.97.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`@infinite(cursor, limit)`: scroll infinito real.** Vuelta a mejoras de TypeScript/React (no bugs) tras cerrar el audit de Result/ADT/generics de v1.94.0-v1.96.0: de los tres tipos de hook generado, ninguno sabía manejar paginación -- un componente con scroll infinito tenía que gestionar el cursor a mano, llamando al rpc directo y concatenando páginas él mismo. `db.<c>.pageAfter(cursor: Int?, limit: Int)` (GRAMMAR.md §3.61) ya es el único mecanismo de paginación por cursor del lenguaje -- este ítem le da un hook dedicado, `use{Servicio}{Rpc}Infinite`, en vez de inventar un mecanismo genérico para cualquier forma de paginación imaginable.
+
+Nueva anotación que nombra los DOS parámetros de un rpc con rol de cursor/límite -- el checker exige las MISMAS firmas que `pageAfter` ya tiene y que el retorno sea `T[]` con `T` teniendo un campo `id: Int`. Reemplaza el hook de Query normal para ese rpc (nunca coexisten). `data` viene ya aplanada (`pages.flat()`); `hasNextPage` se calcula por heurístico de largo de página (sin conteo total en la respuesta -- "si la última página trajo menos que `limit`, no hay más", mismo criterio que Relay); el próximo cursor es el `id` del último elemento, mismo criterio que `pageAfter` usa puertas adentro. `cursor` desaparece de la firma pública del hook (lo maneja internamente); `limit` sigue siendo un parámetro real que el caller elige. Mismas guardas que el resto de los hooks (`requestIdRef` contra respuesta fuera de orden, `startedRef` para no perder páginas ya cargadas si `enabled` alterna). Alcance v0 deliberado: sin cache compartido entre instancias (a diferencia de Query).
+
+Demostrado en `examples/taskboard`: `listPaged(cursor, limit)` sobre `db.tasks.pageAfter` + una sección "Historial paginado" real en `App.tsx` con un botón "Cargar más".
+
+1053 tests (11 nuevos): 2 de parser, 8 de checker (firma válida acepta; cursor no-`Int?`, limit no-`Int`, retorno sin `id: Int`, parámetro inexistente, mismo parámetro como cursor/limit, sobre un `stream`, declarado dos veces -- todos rechazados con su mensaje propio), 1 de `codegen::ts_emit` (firma pública correcta, no coexiste con Query, Mutation sigue igual). Verificado también a mano contra un `linkc serve` real (`examples/taskboard`, 7 tareas, `limit=3`): el mismo algoritmo que el hook implementa trajo exactamente 3 páginas (3+3+1=7), sin duplicados, en orden ascendente, `hasNextPage` apagándose en el momento correcto. Verificado end-to-end contra React real: `examples/taskboard/frontend` regenerado, `App.tsx` usando el hook de verdad, tipando limpio con `tsc --noEmit` en modo estricto. Detalle completo: GRAMMAR.md §3.134, PLAN.md §9.13.
+
 ## [1.96.0] - 2026-08-25
 
 ### 🐛 Arreglado

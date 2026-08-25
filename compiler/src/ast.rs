@@ -445,6 +445,15 @@ impl RpcDecl {
         })
     }
 
+    /// `(cursor_param, limit_param)` de `@infinite(cursor, limit)`, si hay
+    /// (GRAMMAR.md §3.134).
+    pub fn infinite(&self) -> Option<(&str, &str)> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::Infinite { cursor_param, limit_param } => Some((cursor_param.as_str(), limit_param.as_str())),
+            _ => None,
+        })
+    }
+
     /// Mismo heurístico "nombre por forma" en UN solo lugar -- lo usan
     /// `codegen::ts_emit::emit_hooks` (para decidir si un rpc genera un
     /// hook `use...Query`) Y `checker::check_invalidates_annotation` (para
@@ -520,6 +529,19 @@ pub enum Annotation {
     /// (`RpcDecl::looks_like_a_query`) -- nombrar algo que no tiene cache
     /// de Query no invalidaría nada.
     Invalidates(Vec<String>),
+    /// `@infinite(cursor, limit)` (GRAMMAR.md §3.134) -- nombra los DOS
+    /// parámetros de ESTE rpc que juegan el rol de cursor de continuación y
+    /// tamaño de página, para generar un hook de scroll infinito
+    /// (`use{Servicio}{Rpc}Infinite`) en vez del hook de Query normal. Los
+    /// dos son identificadores sueltos (como `@invalidates`, no
+    /// `Enum.Variante`). El checker exige que `cursor` sea un parámetro
+    /// real de tipo `Int?` y `limit` uno de tipo `Int` -- mismas firmas que
+    /// `db.<c>.pageAfter(cursor: Int?, limit: Int)` (§3.61), el único
+    /// mecanismo de paginación por cursor que el lenguaje ya tiene -- y que
+    /// el retorno sea `T[]` con `T` teniendo un campo `id: Int` (el cursor
+    /// siguiente es el `id` del último elemento de la página, mismo
+    /// criterio que `pageAfter` usa puertas adentro).
+    Infinite { cursor_param: String, limit_param: String },
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

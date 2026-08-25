@@ -485,6 +485,24 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     out.push_str("  reconnect: () => void;\n");
     out.push_str("}\n\n");
 
+    // `@infinite(cursor, limit)` (GRAMMAR.md §3.134): scroll infinito real,
+    // por rpc anotado -- `data` ya viene APLANADA (todas las páginas juntas,
+    // `pages.flat()`), no como `T[][]`, porque casi ningún componente
+    // real quiere iterar página por página. `loading` es SOLO la primera
+    // carga (sin datos todavía, mismo criterio de nombre que Query,
+    // §3.127); `isFetchingNextPage` es la carga de una página SIGUIENTE.
+    // Sin cache compartido entre instancias (a diferencia de Query,
+    // §3.124) -- alcance v0 deliberado, ver más abajo.
+    out.push_str("export interface InfiniteQueryState<T> {\n");
+    out.push_str("  data: T[];\n");
+    out.push_str("  loading: boolean;\n");
+    out.push_str("  isFetchingNextPage: boolean;\n");
+    out.push_str("  hasNextPage: boolean;\n");
+    out.push_str("  error: Error | null;\n");
+    out.push_str("  fetchNextPage: () => Promise<void>;\n");
+    out.push_str("  refetch: () => Promise<void>;\n");
+    out.push_str("}\n\n");
+
     // Cache compartido entre TODAS las instancias de un mismo hook de Query
     // (GRAMMAR.md §3.124) -- dos componentes llamando a
     // `use{Servicio}{Rpc}Query` con los MISMOS parámetros comparten una
@@ -635,7 +653,126 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 out.push_str("  return { data, latest, isConnected, error, reconnect };\n");
                 out.push_str("}\n\n");
             } else {
-                if rpc.looks_like_a_query() {
+                if let Some((cursor_param, limit_param)) = rpc.infinite() {
+                    // El checker (`check_infinite_annotation`) ya garantizó
+                    // que el retorno es `T[]` -- desenvolver acá es seguro,
+                    // nunca el catch-all `render_type(&ret_ty)` completo
+                    // (que daría `T[]`, no `T`, para el tipo de un ELEMENTO).
+                    let elem_ty = match &ret_ty {
+                        Type::List(inner) => inner.as_ref(),
+                        _ => &ret_ty,
+                    };
+                    let elem_str = render_type(elem_ty);
+                    // `cursor` se saca de la firma pública del hook -- lo
+                    // maneja el hook internamente, empezando siempre en
+                    // `null` (primera página); el resto de los parámetros
+                    // (incluido `limit`, que el caller sigue eligiendo)
+                    // quedan igual que en un hook de Query normal.
+                    let hook_params_typed: Vec<String> = rpc
+                        .params
+                        .iter()
+                        .zip(&param_tys)
+                        .filter(|(p, _)| p.name != cursor_param)
+                        .map(|(p, ty)| {
+                            format!(
+                                "{}{}: {}",
+                                p.name,
+                                if p.default.is_some() { "?" } else { "" },
+                                render_type(ty)
+                            )
+                        })
+                        .collect();
+                    let params_sig = if hook_params_typed.is_empty() {
+                        format!("client: {}Client, options?: {{ enabled?: boolean }}", service.name)
+                    } else {
+                        format!(
+                            "client: {}Client, {}, options?: {{ enabled?: boolean }}",
+                            service.name,
+                            hook_params_typed.join(", ")
+                        )
+                    };
+                    let hook_param_names: Vec<&str> =
+                        rpc.params.iter().filter(|p| p.name != cursor_param).map(|p| p.name.as_str()).collect();
+                    let deps = if hook_param_names.is_empty() {
+                        "client".to_string()
+                    } else {
+                        format!("client, {}", hook_param_names.join(", "))
+                    };
+                    // El `id` del ÚLTIMO elemento de la página es el
+                    // próximo cursor -- mismo criterio que `pageAfter` usa
+                    // puertas adentro (GRAMMAR.md §3.61/§3.134); el checker
+                    // ya garantizó que `elem_str` tiene un campo `id: Int`.
+                    let call_args: Vec<String> = rpc
+                        .params
+                        .iter()
+                        .map(|p| if p.name == cursor_param { "cursorArg".to_string() } else { p.name.clone() })
+                        .collect();
+
+                    out.push_str(&format!(
+                        "export function use{service}{cap_rpc}Infinite({params_sig}): InfiniteQueryState<{elem_str}> {{\n",
+                        service = service.name
+                    ));
+                    out.push_str("  const enabled = options?.enabled ?? true;\n");
+                    out.push_str(&format!("  const [pages, setPages] = useState<{elem_str}[][]>([]);\n"));
+                    out.push_str("  const [nextCursor, setNextCursor] = useState<number | null>(null);\n");
+                    out.push_str("  const [hasNextPage, setHasNextPage] = useState(true);\n");
+                    out.push_str("  const [loading, setLoading] = useState(false);\n");
+                    out.push_str("  const [isFetchingNextPage, setIsFetchingNextPage] = useState(false);\n");
+                    out.push_str("  const [error, setError] = useState<Error | null>(null);\n");
+                    // Misma guarda de "solo la respuesta más reciente gana"
+                    // que el resto de los hooks -- una llamada a
+                    // `fetchNextPage()` disparada dos veces casi junta (o
+                    // un `refetch()` a mitad de un `fetchNextPage()` en
+                    // vuelo) no debe dejar una página vieja pisando una más
+                    // nueva.
+                    out.push_str("  const requestIdRef = useRef(0);\n");
+                    // Distingue "todavía no se pidió nada" de "ya se pidió
+                    // la primera página" -- sin esto, alternar `enabled`
+                    // false->true->false->true re-dispararía la primera
+                    // página cada vez, perdiendo las páginas ya cargadas.
+                    out.push_str("  const startedRef = useRef(false);\n\n");
+                    out.push_str("  const loadPage = useCallback(async (cursorArg: number | null, replace: boolean): Promise<void> => {\n");
+                    out.push_str("    const requestId = ++requestIdRef.current;\n");
+                    out.push_str("    if (replace) setLoading(true); else setIsFetchingNextPage(true);\n");
+                    out.push_str("    setError(null);\n");
+                    out.push_str("    try {\n");
+                    out.push_str(&format!("      const res = await client.{}({});\n", rpc.name, call_args.join(", ")));
+                    out.push_str("      if (requestIdRef.current !== requestId) return;\n");
+                    out.push_str("      setPages((prev) => (replace ? [res] : [...prev, res]));\n");
+                    out.push_str(&format!("      setHasNextPage(res.length === {limit_param});\n"));
+                    out.push_str("      setNextCursor(res.length > 0 ? res[res.length - 1].id : cursorArg);\n");
+                    out.push_str("    } catch (err) {\n");
+                    out.push_str("      if (requestIdRef.current === requestId) setError(err instanceof Error ? err : new Error(String(err)));\n");
+                    out.push_str("    } finally {\n");
+                    out.push_str(
+                        "      if (requestIdRef.current === requestId) { if (replace) setLoading(false); else setIsFetchingNextPage(false); }\n",
+                    );
+                    out.push_str("    }\n");
+                    out.push_str(&format!("  }}, [{deps}]);\n\n"));
+                    out.push_str("  useEffect(() => {\n");
+                    out.push_str("    if (enabled && !startedRef.current) {\n");
+                    out.push_str("      startedRef.current = true;\n");
+                    out.push_str("      loadPage(null, true);\n");
+                    out.push_str("    }\n");
+                    out.push_str("  }, [enabled, loadPage]);\n\n");
+                    out.push_str("  const fetchNextPage = useCallback(async (): Promise<void> => {\n");
+                    // No dispara una request nueva si ya no hay más
+                    // páginas, o si ya hay una carga en curso (inicial o de
+                    // otra página) -- mismo criterio de "no fetch
+                    // superpuesto" que el resto de los hooks.
+                    out.push_str("    if (!hasNextPage || isFetchingNextPage || loading) return;\n");
+                    out.push_str("    await loadPage(nextCursor, false);\n");
+                    out.push_str("  }, [hasNextPage, isFetchingNextPage, loading, nextCursor, loadPage]);\n\n");
+                    out.push_str("  const refetch = useCallback(async (): Promise<void> => {\n");
+                    out.push_str("    startedRef.current = true;\n");
+                    out.push_str("    setHasNextPage(true);\n");
+                    out.push_str("    await loadPage(null, true);\n");
+                    out.push_str("  }, [loadPage]);\n\n");
+                    out.push_str(
+                        "  return { data: pages.flat(), loading, isFetchingNextPage, hasNextPage, error, fetchNextPage, refetch };\n",
+                    );
+                    out.push_str("}\n\n");
+                } else if rpc.looks_like_a_query() {
                     let params_sig = if params_typed.is_empty() {
                         format!("client: {}Client, options?: {{ enabled?: boolean }}", service.name)
                     } else {
@@ -1749,6 +1886,54 @@ service Ticks {
         assert!(stream_block.contains("}, [client, reconnectAttempt]);"), "{hooks}");
         assert!(stream_block.contains("const reconnect = useCallback(() => {\n    setReconnectAttempt((a) => a + 1);\n  }, []);"), "{hooks}");
         assert!(stream_block.contains("return { data, latest, isConnected, error, reconnect };"), "{hooks}");
+    }
+
+    /// `@infinite(cursor, limit)` (GRAMMAR.md §3.134): scroll infinito real
+    /// sobre `db.<c>.pageAfter`, con el mismo criterio de "id del último
+    /// elemento como próximo cursor" que ese método ya usa puertas adentro.
+    #[test]
+    fn infinite_hook_manages_cursor_pagination_and_flattens_pages() {
+        let src = r#"
+            type Task = { id: Int, title: String }
+            db { tasks: Task[] }
+            service Tasks {
+                @infinite(cursor, limit)
+                rpc list(cursor: Int?, limit: Int) -> Task[] { db.tasks.pageAfter(cursor, limit) }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(
+            hooks.contains(
+                "export interface InfiniteQueryState<T> {\n  data: T[];\n  loading: boolean;\n  isFetchingNextPage: boolean;\n  hasNextPage: boolean;\n  error: Error | null;\n  fetchNextPage: () => Promise<void>;\n  refetch: () => Promise<void>;\n}"
+            ),
+            "{hooks}"
+        );
+        // `cursor` NO aparece en la firma pública -- el hook lo maneja
+        // internamente; `limit` sigue siendo un parámetro real del caller.
+        assert!(
+            hooks.contains(
+                "export function useTasksListInfinite(client: TasksClient, limit: number, options?: { enabled?: boolean }): InfiniteQueryState<Task> {"
+            ),
+            "{hooks}"
+        );
+        // NO se emite también un hook de Query normal para este rpc --
+        // @infinite lo reemplaza, no coexisten.
+        assert!(!hooks.contains("useTasksListQuery"), "{hooks}");
+        let block = hooks.split("export function useTasksListInfinite(").nth(1).expect("bloque del hook");
+        assert!(block.contains("const [pages, setPages] = useState<Task[][]>([]);"), "{hooks}");
+        assert!(block.contains("const res = await client.list(cursorArg, limit);"), "{hooks}");
+        assert!(block.contains("setHasNextPage(res.length === limit);"), "{hooks}");
+        assert!(block.contains("setNextCursor(res.length > 0 ? res[res.length - 1].id : cursorArg);"), "{hooks}");
+        assert!(
+            block.contains(
+                "return { data: pages.flat(), loading, isFetchingNextPage, hasNextPage, error, fetchNextPage, refetch };"
+            ),
+            "{hooks}"
+        );
+        // El hook de Mutation se sigue emitiendo igual (sin cambios de
+        // alcance ahí) -- @infinite solo reemplaza el hook de Query.
+        assert!(hooks.contains("export function useTasksListMutation"), "{hooks}");
     }
 
     /// El hook de Query (`use{Servicio}{Rpc}Query`) comparte cache entre

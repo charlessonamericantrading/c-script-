@@ -5,6 +5,7 @@
 ## Tasks
 
 - [rpc list() -> Task[]](/Tasks/list)
+- [rpc listPaged(cursor: Int?, limit: Int) -> Task[]](/Tasks/listPaged)
 - [rpc getById(id: Int) -> Task?](/Tasks/getById)
 - [rpc create(input: NewTask) -> Task](/Tasks/create)
 - [rpc update(id: Int, patch: Patch<Task>) -> Task](/Tasks/update)

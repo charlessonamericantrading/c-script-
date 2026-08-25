@@ -44,6 +44,7 @@ Works, verified by running it:
 - Bug fixed: `isOk`/`isErr` (exported by `client.ts` for narrowing a `Result<T,E>`) checked a fake `{ ok: true|false, ... }` shape that no real `Result` ever had — the real wire shape is `{ type: "Ok"|"Err", ... }`, same as `contract.d.ts`'s `Result<T, E>` and the real runtime validator in `validators.ts` (which never had this bug). Calling `isOk`/`isErr` against a genuine `Result` didn't even type-check before this fix. Scoped correctly: only these two auxiliary exports were affected, never the actual response validation. See GRAMMAR.md §3.131.
 - Bug fixed: `schemas.ts`'s Zod schema for an ADT enum (variants carrying data, e.g. `ValidationError { InvalidEmail { field: String }, ... }`) generated `z.enum([...])` — a bare string union that accepts the tag name as a plain string and rejects the real object shape (`{ type: "InvalidEmail", field: "..." }`), exactly backwards. Fixed to `z.discriminatedUnion("type", [...])` for any enum with at least one variant carrying fields; a plain string enum (no variant has fields) still emits `z.enum([...])`, unchanged. See GRAMMAR.md §3.132.
 - Bug fixed: `openapi.json` had the same shape bugs, in the public API spec — `Result<T,E>` was described as `{ ok: boolean, ... }` and an ADT enum as `{"type":"string","enum":[...]}`. Both fixed to `oneOf`+`const` (the JSON Schema 2020-12 equivalent of Zod's `discriminatedUnion`), matching the real wire shape everywhere else. A generic `type`/`enum` (e.g. `Box<T>`) no longer crashes `linkc build` either — same underlying fix as the Zod schema generator. See GRAMMAR.md §3.133.
+- `@infinite(cursor, limit)` on an rpc shaped like `db.<c>.pageAfter` (`cursor: Int?`, `limit: Int`, returns `T[]` where `T` has `id: Int`) generates `use{Service}{Rpc}Infinite` instead of a normal Query hook — real cursor-based infinite scroll, no manual cursor juggling in the component. `data` comes pre-flattened; `hasNextPage` is inferred from page length vs `limit` (no total-count field needed); the next cursor is the last item's `id`, same convention `pageAfter` already uses internally. `cursor` drops out of the hook's public signature (managed internally, always starts at `null`); `limit` stays a real caller-chosen parameter. No cross-instance cache sharing yet (v0 scope, unlike the regular Query hook). See GRAMMAR.md §3.134.
 - `linkc serve` — real HTTP server, embedded SQLite that persists across restarts, SSE streams.
 - `linkc test` — runs `test "..."` blocks against an isolated in-memory database.
 - `linkc dev`, `linkc lint`, `linkc doc`, `linkc docker`, `linkc systemd`, `linkc pm2-config`, `linkc lsp`, `linkc new`, `linkc --help`.
@@ -275,7 +276,7 @@ linkc serve backend.link 8787 --restart-backoff 1s  # native exponential backoff
 linkc serve-all ./services --port-base 3000  # one process serves every .link in ./services, one thread+port each
 linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json  # write {"name": port, ...} before serving
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
-linkc --version                      # linkc 1.96.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.97.0 -- same version stamped in every generated file
 ```
 
 ## Verified example

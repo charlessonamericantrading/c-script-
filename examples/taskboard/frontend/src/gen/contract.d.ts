@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.96.0 — no editar a mano.
+// Generado automáticamente por linkc v1.97.0 — no editar a mano.
 
 export type Result<T, E> = { type: "Ok"; value: T } | { type: "Err"; error: E };
 export type Patch<T> = Partial<T>;
@@ -36,6 +36,7 @@ export interface BoardStats {
 
 export interface TasksClient {
   list(options?: { signal?: AbortSignal }): Promise<Task[]>;
+  listPaged(cursor: number | null, limit: number, options?: { signal?: AbortSignal }): Promise<Task[]>;
   getById(id: number, options?: { signal?: AbortSignal }): Promise<Task | null>;
   create(input: NewTask, options?: { signal?: AbortSignal }): Promise<Task>;
   update(id: number, patch: Patch<Task>, options?: { signal?: AbortSignal }): Promise<Task>;

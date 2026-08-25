@@ -1004,7 +1004,8 @@ fn check_auth_gate(
         | Annotation::Deprecated(_)
         | Annotation::CacheControl(_)
         | Annotation::Example { .. }
-        | Annotation::Invalidates(_) => Ok(()),
+        | Annotation::Invalidates(_)
+        | Annotation::Infinite { .. } => Ok(()),
     }
 }
 
