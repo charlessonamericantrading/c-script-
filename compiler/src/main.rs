@@ -129,7 +129,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("uso: linkc <subcomando> [opciones]"));
     out(&format!("subcomandos conocidos:"));
     out(&format!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)"));
-    out(&format!("     linkc build <archivo.link> <outdir> [--diff <anterior>]    (genera contratos TS, cliente, hooks, schemas Zod, OpenAPI y llms.txt; --diff compara el contract.d.ts nuevo contra uno guardado antes)"));
+    out(&format!("     linkc build <archivo.link> <outdir> [--diff <anterior>]    (genera contratos TS, cliente, hooks, schemas Zod, OpenAPI, llms.txt y llms-full.txt; --diff compara el contract.d.ts nuevo contra uno guardado antes)"));
     out(&format!("     linkc test <archivo.link> [--filter <nombre>] [--db <url-postgres>]  (ejecuta pruebas de comportamiento integradas; --filter acota a las que CONTIENEN ese substring en el nombre; --db/LINK_TEST_DB corre contra PostgreSQL real en vez de SQLite :memory:, sin aislamiento entre tests -- solo contra una base de test dedicada, nunca producción)"));
     out(&format!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)"));
     out(&format!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)"));
@@ -694,6 +694,13 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
             return BuildResult { ok: false, touched };
         }
     };
+    let llms_txt_full = match codegen::llms_txt_emit::emit_llms_txt_full(&program, display_path(Path::new(path)).as_str()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error al emitir llms-full.txt: {e}");
+            return BuildResult { ok: false, touched };
+        }
+    };
 
     if let Err(e) = fs::create_dir_all(outdir) {
         eprintln!("no se pudo crear {outdir}: {e}");
@@ -706,6 +713,7 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
     let schemas_path = format!("{outdir}/schemas.ts");
     let openapi_path = format!("{outdir}/openapi.json");
     let llms_txt_path = format!("{outdir}/llms.txt");
+    let llms_txt_full_path = format!("{outdir}/llms-full.txt");
     if let Err(e) = fs::write(&contract_path, contract) {
         eprintln!("no se pudo escribir {contract_path}: {e}");
         return BuildResult { ok: false, touched };
@@ -734,6 +742,10 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
         eprintln!("no se pudo escribir {llms_txt_path}: {e}");
         return BuildResult { ok: false, touched };
     }
+    if let Err(e) = fs::write(&llms_txt_full_path, llms_txt_full) {
+        eprintln!("no se pudo escribir {llms_txt_full_path}: {e}");
+        return BuildResult { ok: false, touched };
+    }
 
     let wasm_path = format!("{outdir}/main.wasm");
     match codegen::wasm_emit::emit_wasm(&program) {
@@ -741,10 +753,10 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
             if let Err(e) = fs::write(&wasm_path, wasm_bytes) {
                 eprintln!("advertencia: no se pudo escribir {wasm_path}: {e}");
             }
-            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path}, {schemas_path}, {openapi_path}, {llms_txt_path} y {wasm_path}");
+            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path}, {schemas_path}, {openapi_path}, {llms_txt_path}, {llms_txt_full_path} y {wasm_path}");
         }
         Err(e) => {
-            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path}, {schemas_path}, {openapi_path}, {llms_txt_path}");
+            println!("OK: generado {contract_path}, {client_path}, {validators_path}, {hooks_path}, {schemas_path}, {openapi_path}, {llms_txt_path}, {llms_txt_full_path}");
             eprintln!(
                 "advertencia: no se generó {wasm_path} -- el codegen wasm nativo (solo funciones/escalares) no soporta este programa: {e}"
             );

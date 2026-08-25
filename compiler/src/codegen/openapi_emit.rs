@@ -32,7 +32,7 @@ fn scalar_literal_json(e: &Expr) -> Option<Value> {
 /// ignora `name`/`variant` (solo importan para el checker, que ya validó el
 /// tipo) y emite un objeto plano con sus campos -- mismo criterio que
 /// `type_to_json_schema` usa para un struct anónimo.
-fn literal_expr_to_json(e: &Expr) -> Value {
+pub(crate) fn literal_expr_to_json(e: &Expr) -> Value {
     match e {
         Expr::Int(n) => json!(n),
         Expr::Float(n) => json!(n),

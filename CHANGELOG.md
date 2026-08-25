@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.99.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`llms-full.txt`: la mitad expandida de la convención llmstxt.org.** A pedido explícito del usuario: cerrar todo lo relacionado con "SEO, meta datos, AEO, GEO, AIO, LLMO" antes de volver al backlog general de PLAN.md. Auditoría de PLAN.md §9.9 (SEO y descubribilidad para IA): los nueve ítems originales siguen resueltos, y AEO/GEO/AIO/LLMO son en sustancia la misma dimensión "descubribilidad para agentes de IA" con nombres de marketing más nuevos -- ninguno pidió una pieza técnica que no estuviera ya cubierta. La única brecha real: `llms.txt` (v1.82.0, GRAMMAR.md §3.118) implementa solo la mitad "índice" del spec de [llmstxt.org](https://llmstxt.org/) -- el spec define un `llms-full.txt` hermano con el contenido COMPLETO en vez de un resumen de una línea, para que un agente no tenga que invocar el rpc solo para ver el detalle.
+
+  `codegen::llms_txt_emit::emit_llms_txt_full` recorre los mismos servicios/rpcs que `emit_llms_txt`, pero con un `### firma` (heading) por entrada, el docstring `///` COMPLETO (sin el recorte de "solo la primera línea" que el índice aplica a propósito), y el `@example(request: ..., response: ...)` (§3.119) del rpc, si lo declaró, como bloques ` ```json ` -- reusa `literal_expr_to_json` de `openapi_emit.rs` (ahora `pub(crate)`) en vez de duplicar la conversión. `linkc build` escribe `llms-full.txt` junto a `llms.txt` siempre, sin flag nuevo -- un adopter que ya consume `llms.txt` no ve ningún cambio.
+
+1061 tests (5 nuevos) en `codegen::llms_txt_emit`: un `### firma` por rpc con el docstring entero, sin `@example` no hay ningún bloque JSON, `@example` con `request`+`response` se propaga como dos bloques separados byte a byte, un rpc sin docstring sigue apareciendo. Verificado a mano contra el binario real: `linkc build examples/users.link <tmp>` y `examples/taskboard` regenerados, `llms-full.txt` inspeccionado byte a byte junto a los demás archivos. Detalle completo: GRAMMAR.md §3.139, PLAN.md §9.9.
+
 ## [1.98.0] - 2026-08-25
 
 ### ✨ Nuevo
