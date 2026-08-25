@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.80.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`metaTags`/`openGraphTags`/`canonicalLink`/`jsonLd`: metadata SEO clásica como helpers de `String`.** Segundo ítem resuelto de PLAN.md §9.9. `metaTags(tags: {name: String, content: String}[]) -> String` y `openGraphTags(tags: {property: String, content: String}[]) -> String` arman líneas `<meta>` bien formadas (atributo `name` para meta tags clásicos, `property` para Open Graph); `canonicalLink(url: String) -> String` arma un `<link rel="canonical" href="...">`; `jsonLd(data: Dynamic) -> String` arma un bloque `<script type="application/ld+json">` serializando `data` con el mismo mecanismo que `json.stringify`. Las cuatro son builtins sin receptor, mismo patrón de 5 puntos de enganche que `sitemapXml`/`robotsTxt` (v1.79.0): tipo estructural anónimo en `checker.rs` para las dos que reciben listas, dispatch en los 3 puntos de `runtime/mod.rs`. **Mitigación de XSS en `jsonLd`**: cada `<` del JSON serializado se reemplaza por su escape Unicode (técnica recomendada por OWASP) -- sin esto, un valor de usuario dentro de `data` que contuviera literalmente `</script><script>...` cerraría el bloque JSON-LD antes de tiempo y ejecutaría el resto como HTML/JS real.
+
+978 tests (10 nuevos): 5 de tipos en `checker.rs` (acepta la forma correcta, rechaza `property` donde `metaTags` espera `name`, `canonicalLink`/`jsonLd` aceptan cualquier valor asignable) + 5 en `runtime/mod.rs` (contenido con comillas/`&` reales escapado, lista vacía sin nada inventado, `openGraphTags` con `property`, `canonicalLink` escapando `&` en la query string, `jsonLd` confirmando que el JSON serializado no contiene ningún `<` literal). Verificado también a mano contra un `linkc serve` real vía `curl`, incluida la mitigación de XSS. Detalle completo: GRAMMAR.md §3.117, PLAN.md §9.9.
+
 ## [1.79.0] - 2026-08-25
 
 ### ✨ Nuevo

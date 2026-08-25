@@ -106,6 +106,36 @@ fn robots_rule_type() -> Type {
     }
 }
 
+/// El tipo que `metaTags(tags)` (GRAMMAR.md §3.117) espera para cada
+/// entrada -- mismo criterio estructural sin nombre que `sitemap_url_type`.
+/// Meta tags clásicos (`description`, `robots`, `viewport`, ...) usan el
+/// atributo `name`; Open Graph usa `property` en cambio, de ahí que sea un
+/// `type` estructural distinto (`open_graph_tag_type` abajo) y no el mismo
+/// reusado con un campo opcional.
+fn meta_tag_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "name".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "content".to_string(), optional: false, ty: Type::String },
+        ],
+    }
+}
+
+/// El tipo que `openGraphTags(tags)` (GRAMMAR.md §3.117) espera para cada
+/// entrada -- mismo campo `content` que `meta_tag_type`, pero `property` en
+/// vez de `name`, porque así es como Open Graph (`og:title`, `og:image`,
+/// ...) distingue sus meta tags de los clásicos en el HTML real.
+fn open_graph_tag_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "property".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "content".to_string(), optional: false, ty: Type::String },
+        ],
+    }
+}
+
 impl CheckError {
     /// El PRIMER stamp gana: a medida que un error burbujea desde adentro
     /// hacia afuera (ej. de una sub-expresión hasta la sentencia que la
@@ -2757,6 +2787,23 @@ impl Checker {
                         Box::new(Type::String),
                     ));
                 }
+                // GRAMMAR.md §3.117: mismo criterio que sitemapXml/robotsTxt
+                // -- "helper que devuelve String" para el resto de PLAN.md
+                // §9.9 (metadata SEO clásica). `jsonLd` acepta `Dynamic`
+                // porque un dato JSON-LD real (schema.org) no tiene una
+                // forma fija que el checker pueda exigir de antemano.
+                if name == "metaTags" {
+                    return Ok(Type::Function(vec![Type::List(Box::new(meta_tag_type()))], Box::new(Type::String)));
+                }
+                if name == "openGraphTags" {
+                    return Ok(Type::Function(vec![Type::List(Box::new(open_graph_tag_type()))], Box::new(Type::String)));
+                }
+                if name == "canonicalLink" {
+                    return Ok(Type::Function(vec![Type::String], Box::new(Type::String)));
+                }
+                if name == "jsonLd" {
+                    return Ok(Type::Function(vec![Type::Dynamic], Box::new(Type::String)));
+                }
                 if name == "assert" {
                     return Ok(Type::Function(vec![Type::Bool], Box::new(Type::Void)));
                 }
@@ -2775,7 +2822,8 @@ impl Checker {
                 if let Some((params, ret)) = self.fns.get(name) {
                     return Ok(Type::Function(params.clone(), Box::new(ret.clone())));
                 }
-                let mut candidates: Vec<&str> = vec!["db", "auth", "now", "dateFromParts", "assert", "panic", "sitemapXml", "robotsTxt"];
+                let mut candidates: Vec<&str> =
+                    vec!["db", "auth", "now", "dateFromParts", "assert", "panic", "sitemapXml", "robotsTxt", "metaTags", "openGraphTags", "canonicalLink", "jsonLd"];
                 candidates.extend(env.keys().map(String::as_str));
                 candidates.extend(self.consts.keys().map(String::as_str));
                 candidates.extend(self.fns.keys().map(String::as_str));
@@ -4770,6 +4818,50 @@ type T = { id: Int, s: Status }")
             fn f() -> String { robotsTxt([Rule { userAgent: "*" }]) }
         "#;
         assert!(check_source(src).is_err());
+    }
+
+    /// `metaTags`/`openGraphTags`/`canonicalLink`/`jsonLd` (GRAMMAR.md
+    /// §3.117), mismo criterio estructural que `sitemapXml`/`robotsTxt` --
+    /// cualquier `type` con la forma correcta sirve.
+    #[test]
+    fn meta_tags_accepts_any_struct_shaped_like_name_and_content() {
+        let src = r#"
+            type Meta = { name: String, content: String }
+            fn f() -> String { metaTags([Meta { name: "description", content: "hola" }]) }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn meta_tags_rejects_a_struct_using_property_instead_of_name() {
+        let src = r#"
+            type Meta = { property: String, content: String }
+            fn f() -> String { metaTags([Meta { property: "og:title", content: "hola" }]) }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn open_graph_tags_accepts_any_struct_shaped_like_property_and_content() {
+        let src = r#"
+            type Og = { property: String, content: String }
+            fn f() -> String { openGraphTags([Og { property: "og:title", content: "hola" }]) }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn canonical_link_takes_one_string_and_returns_string() {
+        assert!(check_source(r#"fn f() -> String { canonicalLink("https://x.com/") }"#).is_ok());
+        assert!(check_source(r#"fn f() -> String { canonicalLink(1) }"#).is_err());
+    }
+
+    #[test]
+    fn json_ld_accepts_any_value_via_dynamic() {
+        // `Dynamic` es la escotilla de escape deliberada del lenguaje -- un
+        // `String`, un `Int`, o el resultado de `json.parse` tipan igual acá.
+        assert!(check_source(r#"fn f() -> String { jsonLd("hola") }"#).is_ok());
+        assert!(check_source(r#"fn f() -> String { jsonLd(json.parse("{}")) }"#).is_ok());
     }
 
     #[test]

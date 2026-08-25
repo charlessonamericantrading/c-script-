@@ -138,6 +138,7 @@
   - [3.114 Flujo OAuth2 "client credentials" (servidor a servidor) — YA FUNCIONABA, sin un ejemplo que lo dijera](#3114-flujo-oauth2-client-credentials-servidor-a-servidor--ya-funcionaba-sin-un-ejemplo-que-lo-dijera)
   - [3.115 Lint `unused-var`: 14 falsos positivos dentro de closures y struct-literals — RESUELTO](#3115-lint-unused-var-14-falsos-positivos-dentro-de-closures-y-struct-literals--resuelto)
   - [3.116 `sitemapXml`/`robotsTxt`: builtins declarativos para SEO — RESUELTO](#3116-sitemapxmlrobotstxt-builtins-declarativos-para-seo--resuelto)
+  - [3.117 `metaTags`/`openGraphTags`/`canonicalLink`/`jsonLd`: metadata SEO clásica como helpers de `String` — RESUELTO](#3117-metatagsopengraphtagscanonicallinkjsonld-metadata-seo-clásica-como-helpers-de-string--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5035,6 +5036,44 @@ rpc robots() -> String {
 **Alcance deliberado: preset de crawlers de IA NO incluido como código.** El ítem 3 original de PLAN.md §9.9 pedía un preset con los user-agents de IA conocidos (`GPTBot`, `ClaudeBot`, `PerplexityBot`, `Google-Extended`, etc.) ya armados adentro del compilador -- se descartó ese diseño a propósito: una lista de bots hardcodeada en el binario se desactualiza cada vez que aparece un crawler nuevo, y arreglarla requeriría una release del compilador en vez de solo cambiar el `.link` del adoptador. `robotsTxt` ya resuelve el caso completo -- un adoptador que quiera bloquear/permitir crawlers de IA específicos simplemente pasa esos `userAgent` como cualquier otra regla, sin que el lenguaje necesite saber sus nombres.
 
 **Verificado**: 4 tests de tipos en `checker.rs` (acepta cualquier `type` con la forma correcta, rechaza uno sin `loc`/`userAgent`, cantidad de argumentos) + 5 en `runtime/mod.rs` -- sitemap con y sin `lastmod` en la MISMA lista (confirma que la ausencia en una entrada no "hereda" el `lastmod` de la anterior), escape de caracteres especiales en `loc`, lista vacía (`<urlset></urlset>` válido, sin ninguna entrada), robots.txt con dos bloques + reglas + sitemap final byte a byte, y un bloque sin `disallow`/`allow`/sitemap (ninguno inventado). Probado a mano además contra un servidor `linkc serve` real vía `curl`, confirmando XML/texto válidos de punta a punta.
+
+---
+
+### 3.117 `metaTags`/`openGraphTags`/`canonicalLink`/`jsonLd`: metadata SEO clásica como helpers de `String` — RESUELTO
+
+Segundo ítem resuelto de PLAN.md §9.9 (SEO y descubribilidad para IA). Antes de esta ronda, meta tags/Open Graph/canonical URL/JSON-LD se escribían a mano concatenando `String` -- fácil de olvidar escapar un valor de usuario dentro de un atributo HTML, o de romper un bloque `<script type="application/ld+json">` si ese valor contenía literalmente `</script>`.
+
+```
+type Meta = { name: String, content: String }
+type Og = { property: String, content: String }
+
+@route("/producto/:id")
+@content_type("text/html")
+rpc productPage(id: Uuid) -> String {
+  let p = db.products.get(id)
+  let head = metaTags([
+    Meta { name: "description", content: p.description },
+    Meta { name: "robots", content: "index, follow" },
+  ]) + "\n" + openGraphTags([
+    Og { property: "og:title", content: p.name },
+    Og { property: "og:image", content: p.imageUrl },
+  ]) + "\n" + canonicalLink("https://mi-sitio.com/producto/" + id.toString())
+    + "\n" + jsonLd(json.parse("{\"@context\": \"https://schema.org\", \"@type\": \"Product\"}"))
+  "<html><head>" + head + "</head></html>"
+}
+```
+
+**`metaTags(tags: {name: String, content: String}[]) -> String`** arma una línea `<meta name="..." content="...">` por entrada, separadas por `\n` -- meta tags clásicos (`description`, `robots`, `viewport`, ...) usan el atributo `name`. **`openGraphTags(tags: {property: String, content: String}[]) -> String`** es el mismo mecanismo con el atributo `property` en vez de `name`, porque así es como Open Graph (`og:title`, `og:image`, `og:description`, ...) distingue sus meta tags del resto del `<head>`. Las dos escapan `name`/`property` y `content` con `escape_html` (§3.45) -- `content` suele venir de datos de usuario (título/descripción de un producto real).
+
+**`canonicalLink(url: String) -> String`** arma un `<link rel="canonical" href="...">` -- consolidar contenido duplicado (la misma página accesible por más de una URL) es SEO básico, mismo espíritu que `response.redirect` (§3.111) pero como elemento de `<head>` en vez de un redirect real. `url` se escapa igual que `content` arriba.
+
+**`jsonLd(data: Dynamic) -> String`** arma un bloque `<script type="application/ld+json">...</script>` con `data` serializado a JSON -- mismo serializador interno que `json.stringify` (`value_to_json` + `serde_json::to_string`; §3.114 ya usa el lado `parse` de este mismo par para leer JSON de un proveedor externo). Acepta `Dynamic`, no un `type` estructural fijo, porque un dato JSON-LD real (schema.org tiene decenas de tipos -- `Product`, `Article`, `Recipe`, ...) no tiene una forma que el checker pueda exigir de antemano; el caso de uso normal es `jsonLd(json.parse("..."))` con el JSON-LD armado como texto, o construyendo el `Dynamic` a mano.
+
+**Mitigación de XSS en `jsonLd`**: después de serializar, cada `<` del JSON se reemplaza por su escape Unicode de 4 dígitos hex para el carácter U+003C -- técnica recomendada por OWASP para embeber JSON dentro de un `<script>`. Si `data` viene de contenido de usuario (ej. el nombre de un producto) y ese valor contiene literalmente `</script><script>alert(1)</script>`, sin esta mitigación el navegador cerraría el bloque JSON-LD antes de tiempo y ejecutaría el resto como HTML/JS real -- un JSON válido nunca depende de un `<` literal fuera de un string (no es un delimitador de la gramática JSON), así que el reemplazo no rompe el parseo del lado del navegador.
+
+**Las cuatro son builtins SIN receptor** (como `sitemapXml`/`robotsTxt`/`dateFromParts`/`now`, no `crypto.X`/`json.X`) -- cableadas en los mismos cinco puntos que ese precedente: tipo en `checker.rs` (`Expr::Ident` + lista de sugerencias "quisiste decir"), y en `runtime/mod.rs`, valor `FnRef` (`Expr::Ident`), despacho directo (`Expr::Call`) y despacho indirecto vía `call_callable`. `metaTags`/`openGraphTags` son estructurales sin nombre (mismo criterio que `sitemap_url_type`/`http_header_type`) -- cualquier `type` que el programa declare con los campos exactos sirve.
+
+**Verificado**: 5 tests de tipos en `checker.rs` (acepta la forma correcta, rechaza `property` donde `metaTags` espera `name`, `canonicalLink`/`jsonLd` aceptan cualquier valor asignable a `String`/`Dynamic`) + 5 en `runtime/mod.rs` -- `metaTags` con dos entradas y contenido con comillas/`&` reales, lista vacía (`""`, nada inventado), `openGraphTags` con `property` en vez de `name`, `canonicalLink` escapando `&` en la query string, y `jsonLd` confirmando que el JSON serializado en el medio del bloque `<script>` no contiene ningún `<` literal (así que ningún `</script>` puede aparecer ahí adentro). Probado a mano además contra un servidor `linkc serve` real vía `curl`, confirmando las cuatro salidas byte a byte, incluida la mitigación de XSS de `jsonLd`.
 
 ---
 

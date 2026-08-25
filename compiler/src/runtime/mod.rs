@@ -434,6 +434,18 @@ pub(crate) fn eval_expr(
             if name == "robotsTxt" {
                 return Ok(Value::FnRef("robotsTxt".to_string()));
             }
+            if name == "metaTags" {
+                return Ok(Value::FnRef("metaTags".to_string()));
+            }
+            if name == "openGraphTags" {
+                return Ok(Value::FnRef("openGraphTags".to_string()));
+            }
+            if name == "canonicalLink" {
+                return Ok(Value::FnRef("canonicalLink".to_string()));
+            }
+            if name == "jsonLd" {
+                return Ok(Value::FnRef("jsonLd".to_string()));
+            }
             if name == "assert" {
                 return Ok(Value::FnRef("assert".to_string()));
             }
@@ -491,6 +503,22 @@ pub(crate) fn eval_expr(
                     if name == "robotsTxt" {
                         let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
                         return call_robots_txt(arg_vs);
+                    }
+                    if name == "metaTags" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_meta_tags(arg_vs);
+                    }
+                    if name == "openGraphTags" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_open_graph_tags(arg_vs);
+                    }
+                    if name == "canonicalLink" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_canonical_link(arg_vs);
+                    }
+                    if name == "jsonLd" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_json_ld(arg_vs);
                     }
                     if name == "assert" {
                         let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
@@ -1107,6 +1135,18 @@ fn call_callable(
             if name == "robotsTxt" && !fns.contains_key("robotsTxt") {
                 return call_robots_txt(arg_vs);
             }
+            if name == "metaTags" && !fns.contains_key("metaTags") {
+                return call_meta_tags(arg_vs);
+            }
+            if name == "openGraphTags" && !fns.contains_key("openGraphTags") {
+                return call_open_graph_tags(arg_vs);
+            }
+            if name == "canonicalLink" && !fns.contains_key("canonicalLink") {
+                return call_canonical_link(arg_vs);
+            }
+            if name == "jsonLd" && !fns.contains_key("jsonLd") {
+                return call_json_ld(arg_vs);
+            }
             if name == "assert" && !fns.contains_key("assert") {
                 let cond = match arg_vs.first() {
                     Some(Value::Bool(b)) => *b,
@@ -1399,6 +1439,95 @@ fn call_robots_txt(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
         out.push_str(&url);
     }
     Ok(Value::Str(out))
+}
+
+/// `metaTags(tags: {name: String, content: String}[]) -> String`
+/// (GRAMMAR.md §3.117): una línea `<meta name="..." content="...">` por
+/// entrada, separadas por `\n`, lista para pegar dentro de `<head>`. Meta
+/// tags clásicos (`description`, `robots`, `viewport`, ...) usan el
+/// atributo `name` -- Open Graph usa `property` en cambio, ver
+/// `call_open_graph_tags`. `escape_html` sobre AMBOS atributos: `content`
+/// suele venir de datos de usuario (título/descripción de un producto), y
+/// también cubre comillas dobles dentro del valor.
+fn call_meta_tags(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
+    let [tags]: [Value; 1] =
+        arg_vs.try_into().map_err(|_| err("'metaTags' requiere 1 argumento (tags: {name, content}[])"))?;
+    let Value::List(items) = tags else {
+        return Err(err("'metaTags' requiere una lista de {name, content}"));
+    };
+    let mut lines = Vec::with_capacity(items.len());
+    for item in items {
+        let Value::Struct(fields) = item else {
+            return Err(err("'metaTags': cada entrada tiene que ser un struct con 'name' y 'content'"));
+        };
+        let Some((_, Value::Str(name))) = fields.iter().find(|(n, _)| n == "name") else {
+            return Err(err("'metaTags': falta el campo 'name' o no es String"));
+        };
+        let Some((_, Value::Str(content))) = fields.iter().find(|(n, _)| n == "content") else {
+            return Err(err("'metaTags': falta el campo 'content' o no es String"));
+        };
+        lines.push(format!("<meta name=\"{}\" content=\"{}\">", escape_html(name), escape_html(content)));
+    }
+    Ok(Value::Str(lines.join("\n")))
+}
+
+/// `openGraphTags(tags: {property: String, content: String}[]) -> String`
+/// (GRAMMAR.md §3.117): mismo mecanismo que `call_meta_tags`, pero con el
+/// atributo `property` en vez de `name` -- así distingue Open Graph
+/// (`og:title`, `og:image`, ...) del resto del HTML real.
+fn call_open_graph_tags(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
+    let [tags]: [Value; 1] =
+        arg_vs.try_into().map_err(|_| err("'openGraphTags' requiere 1 argumento (tags: {property, content}[])"))?;
+    let Value::List(items) = tags else {
+        return Err(err("'openGraphTags' requiere una lista de {property, content}"));
+    };
+    let mut lines = Vec::with_capacity(items.len());
+    for item in items {
+        let Value::Struct(fields) = item else {
+            return Err(err("'openGraphTags': cada entrada tiene que ser un struct con 'property' y 'content'"));
+        };
+        let Some((_, Value::Str(property))) = fields.iter().find(|(n, _)| n == "property") else {
+            return Err(err("'openGraphTags': falta el campo 'property' o no es String"));
+        };
+        let Some((_, Value::Str(content))) = fields.iter().find(|(n, _)| n == "content") else {
+            return Err(err("'openGraphTags': falta el campo 'content' o no es String"));
+        };
+        lines.push(format!("<meta property=\"{}\" content=\"{}\">", escape_html(property), escape_html(content)));
+    }
+    Ok(Value::Str(lines.join("\n")))
+}
+
+/// `canonicalLink(url: String) -> String` (GRAMMAR.md §3.117): un
+/// `<link rel="canonical" href="...">` bien formado -- consolidar
+/// contenido duplicado (misma página accesible por más de una URL) es SEO
+/// básico, mismo espíritu que `response.redirect` (§3.111) pero como
+/// elemento de `<head>` en vez de un redirect real.
+fn call_canonical_link(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
+    let [url]: [Value; 1] = arg_vs.try_into().map_err(|_| err("'canonicalLink' requiere 1 argumento (url: String)"))?;
+    let Value::Str(url) = url else {
+        return Err(err("'canonicalLink' requiere un argumento String"));
+    };
+    Ok(Value::Str(format!("<link rel=\"canonical\" href=\"{}\">", escape_html(&url))))
+}
+
+/// `jsonLd(data: Dynamic) -> String` (GRAMMAR.md §3.117): un bloque
+/// `<script type="application/ld+json">...</script>` con `data`
+/// serializado a JSON -- mismo serializador que `json.stringify`
+/// (`value_to_json` + `serde_json::to_string`), acepta `Dynamic` porque un
+/// dato JSON-LD real (schema.org) no tiene una forma fija que el checker
+/// pueda exigir de antemano. Cada `<` del JSON serializado se reemplaza por
+/// su escape unicode de 4 dígitos hex (u+003C) DESPUÉS de serializar -- mitigación estándar
+/// (recomendada por OWASP) contra que un valor de usuario dentro del JSON
+/// contenga literalmente `</script>` y cierre la etiqueta antes de tiempo;
+/// un JSON válido nunca depende de un `<` literal fuera de un string (no es
+/// un delimitador de la gramática JSON), así que el reemplazo no rompe el
+/// parseo del lado del navegador.
+fn call_json_ld(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
+    let [data]: [Value; 1] = arg_vs.try_into().map_err(|_| err("'jsonLd' requiere 1 argumento (data: Dynamic)"))?;
+    let json_v = value_to_json(&data, &std::collections::HashSet::new());
+    let s = serde_json::to_string(&json_v).map_err(|e| err(format!("'jsonLd': error al serializar a JSON: {e}")))?;
+    let safe = s.replace('<', "\\u003c");
+    Ok(Value::Str(format!("<script type=\"application/ld+json\">{safe}</script>")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4326,6 +4455,105 @@ mod tests {
         // Ni Disallow/Allow (ninguno de los dos se pasó) ni "Sitemap:" (se
         // pasó null) -- un bloque de user-agent solo, nada inventado.
         assert_eq!(txt.as_str().unwrap(), "User-agent: *");
+    }
+
+    // ---- `metaTags`/`openGraphTags`/`canonicalLink`/`jsonLd` (GRAMMAR.md §3.117) ----
+
+    #[test]
+    fn meta_tags_builds_one_line_per_entry_and_escapes_content() {
+        let program = program_from(
+            r#"
+            type Meta = { name: String, content: String }
+            service Site {
+                rpc head() -> String {
+                    metaTags([
+                        Meta { name: "description", content: "Tienda de \"regalos\" & más" },
+                        Meta { name: "robots", content: "index, follow" },
+                    ])
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let html = invoke_rpc(&program, "Site", "head", &json!({}), &db).unwrap();
+        assert_eq!(
+            html.as_str().unwrap(),
+            "<meta name=\"description\" content=\"Tienda de &quot;regalos&quot; &amp; más\">\n<meta name=\"robots\" content=\"index, follow\">"
+        );
+    }
+
+    #[test]
+    fn meta_tags_on_an_empty_list_is_an_empty_string() {
+        let program = program_from(
+            r#"
+            type Meta = { name: String, content: String }
+            service Site {
+                rpc head() -> String { metaTags([]) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let html = invoke_rpc(&program, "Site", "head", &json!({}), &db).unwrap();
+        assert_eq!(html.as_str().unwrap(), "");
+    }
+
+    #[test]
+    fn open_graph_tags_uses_property_instead_of_name() {
+        let program = program_from(
+            r#"
+            type Og = { property: String, content: String }
+            service Site {
+                rpc head() -> String {
+                    openGraphTags([
+                        Og { property: "og:title", content: "Mi producto" },
+                        Og { property: "og:image", content: "https://x.com/foto.jpg" },
+                    ])
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let html = invoke_rpc(&program, "Site", "head", &json!({}), &db).unwrap();
+        assert_eq!(
+            html.as_str().unwrap(),
+            "<meta property=\"og:title\" content=\"Mi producto\">\n<meta property=\"og:image\" content=\"https://x.com/foto.jpg\">"
+        );
+    }
+
+    #[test]
+    fn canonical_link_escapes_the_url() {
+        let program = program_from(
+            r#"
+            service Site {
+                rpc head() -> String { canonicalLink("https://x.com/a?b=1&c=2") }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let html = invoke_rpc(&program, "Site", "head", &json!({}), &db).unwrap();
+        assert_eq!(html.as_str().unwrap(), "<link rel=\"canonical\" href=\"https://x.com/a?b=1&amp;c=2\">");
+    }
+
+    #[test]
+    fn json_ld_serializes_dynamic_data_and_escapes_a_script_close_tag() {
+        let program = program_from(
+            r#"
+            service Site {
+                rpc head() -> String { jsonLd(json.parse("{\"name\": \"</script><script>alert(1)</script>\"}")) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let html = invoke_rpc(&program, "Site", "head", &json!({}), &db).unwrap();
+        let out = html.as_str().unwrap();
+        assert!(out.starts_with("<script type=\"application/ld+json\">"));
+        assert!(out.ends_with("</script>"));
+        // El JSON serializado en el MEDIO nunca contiene un '<' literal --
+        // cada uno salió como <, así que ningún </script> puede
+        // aparecer ahí adentro y cortar el bloque antes de tiempo.
+        let inner = out.strip_prefix("<script type=\"application/ld+json\">").unwrap().strip_suffix("</script>").unwrap();
+        assert!(!inner.contains('<'));
+        assert!(inner.contains("\\u003c"));
     }
 
     // ---- `@validate(...)` (GRAMMAR.md §3.73) ----
