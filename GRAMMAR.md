@@ -153,6 +153,7 @@
   - [3.129 `client.ts`: cancelar una request con `AbortSignal` — RESUELTO](#3129-clientts-cancelar-una-request-con-abortsignal--resuelto)
   - [3.130 Hook de `stream`: `reconnect()` manual — RESUELTO](#3130-hook-de-stream-reconnect-manual--resuelto)
   - [3.131 `isOk`/`isErr` y el schema Zod de `Result<T,E>` chequeaban un campo que no existe — RESUELTO (bug real)](#3131-isokiserr-y-el-schema-zod-de-resultte-chequeaban-un-campo-que-no-existe--resuelto-bug-real)
+  - [3.132 Schema Zod de un enum ADT: `z.enum([...])` no alcanzaba — RESUELTO (bug real)](#3132-schema-zod-de-un-enum-adt-zenum-no-alcanzaba--resuelto-bug-real)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5519,6 +5520,28 @@ if (isOk(result)) {
 **El `import type { ... } from "./contract"` de `client.ts` ahora incluye `Result` SIEMPRE**, sin importar si algún rpc de este programa en particular lo usa -- antes, `isOk`/`isErr` (emitidas incondicionalmente) podían terminar referenciando un nombre nunca importado en un programa sin ningún `Result<T,E>` en sus firmas, produciendo un `Cannot find name 'Result'` real si alguien intentaba tipar contra la nueva firma.
 
 **Verificado**: 3 tests nuevos (2 en `codegen::ts_emit`, 1 en `codegen::zod_emit`) + a mano con `tsc` real, dos veces -- ANTES del fix (confirmando el error de tipo real que describía el gap) y DESPUÉS (confirmando que compila y narrowea correcto) -- contra un `client.create(...)` genuino de `examples/users.link`. El fix de Zod se verificó además con Zod REAL en runtime (no solo que compile): el schema arreglado acepta un payload `{ type: "Ok"/"Err", ... }` genuino y RECHAZA explícitamente la forma vieja (`{ ok: true, ... }`), confirmando que el cambio de discriminador realmente cambió el comportamiento, no solo el texto generado.
+
+---
+
+### 3.132 Schema Zod de un enum ADT: `z.enum([...])` no alcanzaba — RESUELTO (bug real)
+
+Octava ronda seguida, misma familia de bug que §3.131, encontrada auditando `zod_emit.rs` de punta a punta después de arreglar `Result<T,E>`: `Item::Enum` en `emit_zod_schemas` generaba `z.enum([...])` -- una unión de strings LITERALES -- para CUALQUIER enum, sin importar si sus variantes llevaban datos. `examples/users.link` declara exactamente ese caso (`enum ValidationError { InvalidEmail { field: String }, TooShort { field: String, min: Int } }`, el error de dominio real del `create` de ese ejemplo) -- un ADT, cuyo wire real (`emit_enum_decl`, ts_emit.rs) es un objeto con tag `type` más los campos de la variante, NUNCA un string pelado. `z.enum(["InvalidEmail", "TooShort"])` acepta el string `"InvalidEmail"` y rechaza `{ type: "InvalidEmail", field: "..." }` -- exactamente al revés de lo que cualquier payload real necesita.
+
+```ts
+// Antes: aceptaba el string pelado, rechazaba el objeto real.
+ValidationErrorSchema.safeParse("InvalidEmail").success;               // true (¡mal!)
+ValidationErrorSchema.safeParse({ type: "InvalidEmail", field: "x" }).success; // false (¡mal!)
+
+// Ahora: exactamente al revés, lo correcto.
+ValidationErrorSchema.safeParse("InvalidEmail").success;               // false
+ValidationErrorSchema.safeParse({ type: "InvalidEmail", field: "x" }).success; // true
+```
+
+**Mismo criterio `all_unit` que `emit_enum_decl` (ts_emit.rs) ya usa** para decidir entre las dos formas -- `e.variants.iter().all(|v| v.fields.is_none())`. Un enum sin datos en ninguna variante (`Status { Active, Inactive }`) sigue exactamente igual, `z.enum([...])`, sin cambios -- ese caso nunca tuvo el bug. Un ADT (alguna variante con datos) ahora genera `z.discriminatedUnion("type", [z.object({ type: z.literal("Variante"), ...campos }), ...])`, un `z.object` por variante -- una variante SIN datos mezclada dentro de un ADT (ej. `Shape { Circle { radius: Float }, Point }`) lleva solo el discriminador, sin campos extra, igual que `emit_enum_decl` ya hace para ese mismo caso. Los campos de cada variante reusan `render_zod_type_for_field` (con `.optional()`/validadores encadenados) -- el mismo camino que ya usan los campos de un `type` struct, no una copia aparte.
+
+**Regresión real, atrapada por `docs_examples.rs` (el suite que compila cada bloque marcado de la documentación con el binario real) antes de llegar a producción**: un ADT GENÉRICO (`enum Result<T, E> { Ok { value: T }, Err { error: E } }`, el ejemplo educativo de GRAMMAR.md/docs -- distinto del `Result<T,E>` builtin del lenguaje) tiene campos de variante que referencian su propio parámetro de tipo (`T`). El primer intento de este fix resolvía cada campo con `checker.resolve_type` a secas, que rechaza `T` ("tipo desconocido: 'T'") -- rompiendo `linkc build` ENTERO para cualquier programa con un ADT genérico, algo que el código viejo (que nunca miraba campos de variante) nunca hacía. Arreglado con `checker.resolve_type_abstract(&f.ty, &e.type_params)` -- mismo criterio que `resolve_field_ty` en ts_emit.rs ya usa -- que deja `T` como `Type::TypeParam` en vez de fallar; `render_zod_type` ya tenía un catch-all (`z.unknown()`) para cualquier tipo sin forma Zod razonable, así que el resultado es `z.object({ type: z.literal("Ok"), value: z.unknown() })` -- no del todo preciso (Zod no tiene generics reales como TS, un parámetro de tipo sin instanciar no tiene ningún schema posible mejor que ese), pero NUNCA rompe el build.
+
+**Verificado**: 3 tests nuevos en `codegen::zod_emit` (un ADT de dos variantes con datos genera el `discriminatedUnion` esperado, un enum sin datos sigue generando `z.enum` sin cambios; una variante SIN datos mezclada en un ADT lleva solo el discriminador; un ADT GENÉRICO no rompe el build, cae a `z.unknown()` en el campo con el parámetro de tipo) + el test existente de schemas simples (`test_zod_emit_generates_valid_schemas`) sigue pasando sin cambios + `docs_examples.rs` (todos los bloques marcados de la documentación, incluido el ADT genérico que originalmente rompía esto) vuelve a pasar. Verificado también con Zod REAL en runtime, mismo criterio que §3.131: el schema arreglado acepta `{ type: "InvalidEmail", field: "email" }` (y la segunda variante, `{ type: "TooShort", field: "password", min: 8 }`) y RECHAZA explícitamente el string pelado `"InvalidEmail"` que la forma vieja aceptaba.
 
 ---
 

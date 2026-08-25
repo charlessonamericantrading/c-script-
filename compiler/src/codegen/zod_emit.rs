@@ -117,8 +117,63 @@ pub fn emit_zod_schemas(program: &Program) -> Result<String, String> {
     for item in &program.items {
         match item {
             Item::Enum(e) => {
-                let variants: Vec<String> = e.variants.iter().map(|v| format!("\"{}\"", v.name)).collect();
-                out.push_str(&format!("export const {}Schema = z.enum([{}]);\n", e.name, variants.join(", ")));
+                // Bug real, misma familia que el de `Result<T,E>` arriba
+                // (GRAMMAR.md §3.131/§3.132): esto SIEMPRE emitía
+                // `z.enum([...])` -- una unión de strings LITERALES -- sin
+                // importar si el enum era un ADT con datos por variante
+                // (`ValidationError { InvalidEmail { field: String }, ...
+                // }`, tal cual en `examples/users.link`). El wire real de
+                // un ADT (`emit_enum_decl`, ts_emit.rs) es un objeto con tag
+                // `type` más los campos de la variante, NUNCA un string
+                // pelado -- `z.enum(["InvalidEmail", "TooShort"])` rechaza
+                // CUALQUIER `ValidationError` real (`{ type: "InvalidEmail",
+                // field: "..." }` no es el string `"InvalidEmail"`). Mismo
+                // criterio `all_unit` que `emit_enum_decl` ya usa para
+                // decidir entre las dos formas.
+                let all_unit = e.variants.iter().all(|v| v.fields.is_none());
+                if all_unit {
+                    let variants: Vec<String> = e.variants.iter().map(|v| format!("\"{}\"", v.name)).collect();
+                    out.push_str(&format!("export const {}Schema = z.enum([{}]);\n", e.name, variants.join(", ")));
+                } else {
+                    out.push_str(&format!("export const {}Schema = z.discriminatedUnion(\"type\", [\n", e.name));
+                    let mut variant_schemas = Vec::new();
+                    for v in &e.variants {
+                        let mut parts = vec![format!("type: z.literal(\"{}\")", v.name)];
+                        if let Some(fields) = &v.fields {
+                            for f in fields {
+                                // Un ADT genérico (`enum Result<T, E> { Ok {
+                                // value: T }, ... }`, GRAMMAR.md §2.2 --
+                                // distinto del `Result<T,E>` builtin del
+                                // lenguaje) tiene campos de variante que
+                                // referencian su propio parámetro de tipo
+                                // (`T`) -- `resolve_type` a secas lo rechaza
+                                // ("tipo desconocido: 'T'"), regresión real
+                                // encontrada por `docs_examples.rs` al
+                                // agregar este camino. `resolve_type_abstract`
+                                // (mismo criterio que `resolve_field_ty` en
+                                // ts_emit.rs) deja `T` como `Type::TypeParam`
+                                // en vez de fallar -- `render_zod_type` ya
+                                // tiene un catch-all (`z.unknown()`) para
+                                // cualquier tipo sin forma Zod razonable, así
+                                // que no hace falta un caso especial acá:
+                                // Zod no tiene generics reales como TS, un
+                                // parámetro de tipo sin instanciar no tiene
+                                // schema propio posible.
+                                let ty = if e.type_params.is_empty() {
+                                    checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
+                                } else {
+                                    checker.resolve_type_abstract(&f.ty, &e.type_params).map_err(|e| e.to_string())?
+                                };
+                                let zod_ty = render_zod_type_for_field(&ty, f.validator());
+                                let optional_suffix = if f.optional || f.default.is_some() { ".optional()" } else { "" };
+                                parts.push(format!("{}: {}{}", f.name, zod_ty, optional_suffix));
+                            }
+                        }
+                        variant_schemas.push(format!("  z.object({{ {} }})", parts.join(", ")));
+                    }
+                    out.push_str(&variant_schemas.join(",\n"));
+                    out.push_str("\n]);\n");
+                }
                 out.push_str(&format!("export type {} = z.infer<typeof {}Schema>;\n\n", e.name, e.name));
             }
             Item::Type(t) => {
@@ -215,6 +270,82 @@ mod tests {
         );
         assert!(!zod_out.contains("\"ok\""), "{zod_out}");
         assert!(!zod_out.contains("z.literal(true)"), "{zod_out}");
+    }
+
+    /// Bug real, misma familia que el de `Result<T,E>` (GRAMMAR.md §3.132):
+    /// un enum ADT (variantes con datos, `ValidationError { InvalidEmail {
+    /// field: String }, TooShort { field: String, min: Int } }` -- literal
+    /// de `examples/users.link`) generaba `z.enum(["InvalidEmail",
+    /// "TooShort"])`, una unión de strings LITERALES -- rechaza CUALQUIER
+    /// payload real (`{ type: "InvalidEmail", field: "..." }` no es el
+    /// string `"InvalidEmail"`). Ahora genera `z.discriminatedUnion("type",
+    /// ...)`, mismo criterio `all_unit` que `emit_enum_decl` (ts_emit.rs) ya
+    /// usa para decidir entre las dos formas -- un enum SIN datos (`Status`,
+    /// arriba) sigue exactamente igual, `z.enum([...])`.
+    #[test]
+    fn adt_enum_schema_discriminates_by_type_not_a_bare_string_union() {
+        let code = r#"
+            enum ValidationError {
+                InvalidEmail { field: String },
+                TooShort { field: String, min: Int },
+            }
+        "#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let zod_out = emit_zod_schemas(&program).unwrap();
+        assert!(zod_out.contains("export const ValidationErrorSchema = z.discriminatedUnion(\"type\", ["), "{zod_out}");
+        assert!(
+            zod_out.contains("z.object({ type: z.literal(\"InvalidEmail\"), field: z.string() })"),
+            "{zod_out}"
+        );
+        assert!(
+            zod_out.contains("z.object({ type: z.literal(\"TooShort\"), field: z.string(), min: z.number().int() })"),
+            "{zod_out}"
+        );
+        assert!(!zod_out.contains("z.enum([\"InvalidEmail\""), "{zod_out}");
+    }
+
+    /// Un enum ADT con una variante SIN datos mezclada con variantes CON
+    /// datos -- la variante sin datos solo lleva el discriminador `type`,
+    /// sin campos extra, igual que `emit_enum_decl` (ts_emit.rs) ya hace.
+    #[test]
+    fn adt_enum_with_a_unit_variant_mixed_in_only_carries_the_discriminant() {
+        let code = r#"
+            enum Shape {
+                Circle { radius: Float },
+                Point,
+            }
+        "#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let zod_out = emit_zod_schemas(&program).unwrap();
+        assert!(zod_out.contains("z.object({ type: z.literal(\"Circle\"), radius: z.number() })"), "{zod_out}");
+        assert!(zod_out.contains("z.object({ type: z.literal(\"Point\") })"), "{zod_out}");
+    }
+
+    /// Regresión real, encontrada por `docs_examples.rs` al agregar el
+    /// branch de ADT arriba: un ADT GENÉRICO (`enum Result<T, E> { Ok {
+    /// value: T }, ... }`, el ejemplo educativo de GRAMMAR.md/docs -- no el
+    /// `Result<T,E>` builtin del lenguaje) con un campo de variante que
+    /// referencia su propio parámetro de tipo (`T`) hacía fallar `linkc
+    /// build` ENTERO ("error de tipos: tipo desconocido: 'T'") -- antes de
+    /// esta ronda, el código viejo nunca miraba los campos de una variante,
+    /// así que nunca pisaba este error (aunque el schema que producía --
+    /// `z.enum(["Ok","Err"])` -- ya era igual de incorrecto). Zod no tiene
+    /// generics reales como TS -- un parámetro de tipo sin instanciar no
+    /// tiene ningún schema Zod razonable posible, así que cae al
+    /// `z.unknown()` catch-all de `render_zod_type`, sin que el build
+    /// entero se rompa.
+    #[test]
+    fn a_generic_adt_enum_does_not_crash_the_whole_build() {
+        let code = r#"
+            enum MyResult<T, E> {
+                Ok { value: T },
+                Err { error: E },
+            }
+        "#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let zod_out = emit_zod_schemas(&program).expect("no debería fallar sobre un ADT genérico");
+        assert!(zod_out.contains("z.object({ type: z.literal(\"Ok\"), value: z.unknown() })"), "{zod_out}");
+        assert!(zod_out.contains("z.object({ type: z.literal(\"Err\"), error: z.unknown() })"), "{zod_out}");
     }
 
     /// `@validate(email)` se propaga como `.email()` encadenado (GRAMMAR.md

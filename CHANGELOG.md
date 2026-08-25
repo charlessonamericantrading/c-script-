@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.95.0] - 2026-08-25
+
+### 🐛 Arreglado
+- **El schema Zod de un enum ADT usaba `z.enum([...])`, aceptando el string equivocado y rechazando el objeto real.** Octava ronda seguida, misma familia de bug que v1.94.0: `Item::Enum` en `zod_emit.rs` generaba `z.enum([...])` (unión de strings) para CUALQUIER enum, sin importar si sus variantes llevaban datos. `examples/users.link` declara exactamente ese caso (`ValidationError { InvalidEmail { field: String }, TooShort { field: String, min: Int } }`, el error de dominio real del `create` de ese ejemplo) -- el wire real de un ADT es un objeto con tag `type` más los campos de la variante, nunca un string pelado. El schema viejo aceptaba `"InvalidEmail"` (el string) y rechazaba `{ type: "InvalidEmail", field: "..." }` (el objeto real) -- exactamente al revés de lo que cualquier payload real necesita.
+
+Mismo criterio `all_unit` que `emit_enum_decl` (ts_emit.rs) ya usa para decidir entre las dos formas: sin datos en ninguna variante, sigue `z.enum([...])` sin cambios (nunca tuvo el bug); con datos, ahora `z.discriminatedUnion("type", [z.object({ type: z.literal("Variante"), ...campos }), ...])`, reusando `render_zod_type_for_field` (con `.optional()`/validadores) para los campos -- el mismo camino que ya usan los campos de un `type` struct.
+
+**Regresión real atrapada de paso por `docs_examples.rs`** (el suite que compila cada bloque marcado de la documentación con el binario real, antes de llegar a producción): un ADT GENÉRICO (`enum Result<T, E> { Ok { value: T }, ... }`, el ejemplo educativo de GRAMMAR.md/docs) rompía `linkc build` ENTERO -- el primer intento de este fix resolvía cada campo de variante con `resolve_type` a secas, que rechaza un parámetro de tipo sin instanciar (`T`) con "tipo desconocido". Arreglado con `resolve_type_abstract` (mismo criterio que `resolve_field_ty` en ts_emit.rs ya usa), que deja `T` como `Type::TypeParam` en vez de fallar -- cae al `z.unknown()` catch-all que `render_zod_type` ya tenía, sin romper el build.
+
+1037 tests (3 nuevos) en `codegen::zod_emit`: un ADT de dos variantes con datos genera el `discriminatedUnion` esperado, un enum sin datos sigue generando `z.enum` sin cambios, una variante SIN datos mezclada dentro de un ADT lleva solo el discriminador, y un ADT genérico no rompe el build. Verificado también con Zod REAL en runtime, mismo criterio que v1.94.0: el schema arreglado acepta `{ type: "InvalidEmail", field: "email" }` (y la segunda variante) y RECHAZA explícitamente el string pelado `"InvalidEmail"` que la forma vieja aceptaba. Detalle completo: GRAMMAR.md §3.132, PLAN.md §9.13.
+
 ## [1.94.0] - 2026-08-25
 
 ### 🐛 Arreglado
