@@ -156,6 +156,15 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     if services.is_empty() {
         return Ok(out); // sin ningun service declarado, no hay cliente que generar
     }
+    // `isOk`/`isErr` (GRAMMAR.md §3.131) están tipados contra `Result<T, E>`
+    // y se emiten SIEMPRE, sin importar si algún rpc de este programa en
+    // particular usa `Result<T,E>` -- a diferencia del resto de
+    // `imported_names` (poblado solo por los tipos que un rpc REALMENTE
+    // referencia), acá hay que garantizar el import sin condición, o un
+    // programa sin ningún `Result` en sus firmas generaría un client.ts
+    // que referencia un nombre nunca importado ("Cannot find name
+    // 'Result'").
+    imported_names.insert("Result".to_string());
     // Los `const` se emiten en ESTE archivo (ver `emit_const_decl`), así que
     // su tipo declarado también hay que importarlo -- `const DEF: Role = ...`
     // no compila si `Role` no está en scope acá.
@@ -213,11 +222,19 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     out.push_str("  }\n");
     out.push_str("}\n\n");
 
-    out.push_str("export function isOk<T, E>(result: { ok: true; value: T } | { ok: false; error: E }): result is { ok: true; value: T } {\n");
-    out.push_str("  return result.ok === true;\n");
+    // Bug real encontrado auditando este archivo (GRAMMAR.md §3.131):
+    // `isOk`/`isErr` tipaban y chequeaban contra `{ ok: true|false, ... }`,
+    // una forma que NINGÚN `Result<T,E>` real tiene -- el wire (y el propio
+    // alias `Result<T, E>` dos líneas arriba) usa `{ type: "Ok"|"Err", ...
+    // }` (GRAMMAR.md §2.2). Pasarle un `Result<T,E>` real a `isOk`/`isErr`
+    // ni siquiera tipaba (`Argument of type 'Result<User, E>' is not
+    // assignable to parameter of type '{ ok: true; ... } | { ok: false;
+    // ... }'`) -- las dos funciones eran inutilizables tal cual estaban.
+    out.push_str("export function isOk<T, E>(result: Result<T, E>): result is { type: \"Ok\"; value: T } {\n");
+    out.push_str("  return result.type === \"Ok\";\n");
     out.push_str("}\n\n");
-    out.push_str("export function isErr<T, E>(result: { ok: true; value: T } | { ok: false; error: E }): result is { ok: false; error: E } {\n");
-    out.push_str("  return result.ok === false;\n");
+    out.push_str("export function isErr<T, E>(result: Result<T, E>): result is { type: \"Err\"; error: E } {\n");
+    out.push_str("  return result.type === \"Err\";\n");
     out.push_str("}\n\n");
 
     // Los `const` viven acá, no en contract.d.ts -- ver `emit_const_decl`:
@@ -1369,6 +1386,56 @@ mod tests {
         assert!(client.contains("if (!res.ok) throw new LinkTransportError"));
         assert!(client.contains("class UsersClientImpl implements UsersClient"));
         assert!(client.contains("export function createUsersClient(baseUrl: string): UsersClient"));
+    }
+
+    /// Bug real encontrado auditando `client.ts` (GRAMMAR.md §3.131):
+    /// `isOk`/`isErr` tipaban y chequeaban contra `{ ok: true|false, ... }`,
+    /// una forma que NINGÚN `Result<T,E>` real tiene -- el wire (y
+    /// `Result<T, E>` en contract.d.ts, dos líneas más arriba en este mismo
+    /// archivo) usa `{ type: "Ok"|"Err", ... }`. Pasarle un `Result<T,E>`
+    /// real a `isOk`/`isErr` ni siquiera tipaba -- verificado a mano con
+    /// `tsc` real contra un `client.create(...)` genuino antes y después
+    /// del fix.
+    #[test]
+    fn is_ok_and_is_err_check_the_real_result_discriminant_not_a_fake_one() {
+        let (_, client) = emit_both(&users_demo_src());
+        assert!(
+            client.contains(
+                "export function isOk<T, E>(result: Result<T, E>): result is { type: \"Ok\"; value: T } {\n  return result.type === \"Ok\";\n}"
+            ),
+            "{client}"
+        );
+        assert!(
+            client.contains(
+                "export function isErr<T, E>(result: Result<T, E>): result is { type: \"Err\"; error: E } {\n  return result.type === \"Err\";\n}"
+            ),
+            "{client}"
+        );
+        // `Result` tiene que estar importado de "./contract" para que la
+        // firma de arriba compile, sin importar si ALGÚN rpc de este
+        // programa en particular usa Result<T,E> -- isOk/isErr se emiten
+        // siempre.
+        let import_line = client.lines().find(|l| l.starts_with("import type")).expect("import line");
+        assert!(import_line.contains("Result"), "{import_line}");
+    }
+
+    /// Mismo chequeo que la de arriba, pero para un programa que NO declara
+    /// ningún `Result<T,E>` en absoluto -- `isOk`/`isErr` igual se emiten
+    /// (son utilidades genéricas, no condicionadas a uso real) y `Result`
+    /// tiene que importarse igual, o el `client.ts` generado referenciaría
+    /// un nombre nunca importado.
+    #[test]
+    fn result_is_always_importable_even_when_no_rpc_uses_it() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                rpc list() -> Task[] { [] }
+            }
+        "#;
+        let (_, client) = emit_both(src);
+        let import_line = client.lines().find(|l| l.starts_with("import type")).expect("import line");
+        assert!(import_line.contains("Result"), "{import_line}");
+        assert!(client.contains("export function isOk<T, E>(result: Result<T, E>)"), "{client}");
     }
 
     /// `options?: { signal?: AbortSignal }` (GRAMMAR.md §3.129): gap real --

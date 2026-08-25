@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.94.0] - 2026-08-25
+
+### 🐛 Arreglado
+- **`isOk`/`isErr` y el schema Zod de `Result<T,E>` chequeaban un campo que no existe.** Séptima ronda seguida sobre TypeScript/React, esta vez un bug real: `isOk`/`isErr` (las funciones exportadas por `client.ts` para narrowing de un `Result<T,E>`) estaban tipadas y implementadas contra `{ ok: true; value: T } | { ok: false; error: E }`. Ningún `Result<T,E>` real tiene un campo `ok` -- el wire, `contract.d.ts` (`{ type: "Ok"; value: T } | { type: "Err"; error: E }`) y `validators.ts` usan `type: "Ok"|"Err"` desde siempre. Pasarle un `Result<T,E>` real (literalmente `await client.create(...)`) a `isOk`/`isErr` ni siquiera TIPABA -- `tsc` real rechazaba la llamada. Mismo bug en `zod_emit.rs`: el schema de `Result<T,E>` discriminaba por `"ok"`, rechazando cualquier `Result` real con Zod.
+
+**Alcance real, no sobre-vendido**: `validators.ts` -- la validación REAL de cada respuesta, la pieza de seguridad del contrato -- ya usaba `.type` correctamente desde siempre y nunca tuvo el bug; el impacto está acotado a dos exports auxiliares (`isOk`/`isErr`, y el schema Zod de `Result<T,E>` cuando aparece como campo de un tipo nombrado -- `emit_zod_schemas` no genera un schema por rpc, así que este camino no se ejercita para el uso más común de `Result` como retorno directo). `client.ts` ahora importa `Result` SIEMPRE desde `./contract`, sin importar si algún rpc del programa lo usa -- antes, `isOk`/`isErr` (emitidas incondicionalmente) podían terminar referenciando un nombre nunca importado.
+
+1034 tests (3 nuevos): 2 en `codegen::ts_emit` (la firma real tipa contra `Result<T, E>` y narrowea con `.type`; `Result` se importa siempre, incluso sin ningún rpc que lo use) + 1 en `codegen::zod_emit` (el schema discrimina por `"type"`, no `"ok"`). Verificado a mano con `tsc` real, dos veces -- antes del fix (confirmando el error de tipo exacto) y después (confirmando que compila y narrowea) -- contra un `client.create(...)` genuino. El fix de Zod se verificó además con Zod REAL en runtime: el schema arreglado acepta un payload `{ type: "Ok"/"Err", ... }` genuino y RECHAZA explícitamente la forma vieja (`{ ok: true, ... }`). Detalle completo: GRAMMAR.md §3.131, PLAN.md §9.13.
+
 ## [1.93.0] - 2026-08-25
 
 ### ✨ Nuevo

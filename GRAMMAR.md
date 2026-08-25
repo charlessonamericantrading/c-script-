@@ -152,6 +152,7 @@
   - [3.128 Hooks de React generados: `mutate` vs `mutateAsync` — RESUELTO](#3128-hooks-de-react-generados-mutate-vs-mutateasync--resuelto)
   - [3.129 `client.ts`: cancelar una request con `AbortSignal` — RESUELTO](#3129-clientts-cancelar-una-request-con-abortsignal--resuelto)
   - [3.130 Hook de `stream`: `reconnect()` manual — RESUELTO](#3130-hook-de-stream-reconnect-manual--resuelto)
+  - [3.131 `isOk`/`isErr` y el schema Zod de `Result<T,E>` chequeaban un campo que no existe — RESUELTO (bug real)](#3131-isokiserr-y-el-schema-zod-de-resultte-chequeaban-un-campo-que-no-existe--resuelto-bug-real)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5488,6 +5489,36 @@ function LiveIndicator({ client }: { client: TasksClient }) {
 **Demostración real**: `examples/taskboard/frontend/src/App.tsx` -- el indicador "Stream en Vivo" ahora muestra un botón "Reconectar" cuando `!isConnected`, llamando a `reconnect()` del hook real.
 
 **Verificado**: 1 test nuevo en `codegen::ts_emit` (`SubscriptionState<T>` expone `reconnect: () => void`; `reconnectAttempt` es dependencia real del efecto; `reconnect` incrementa el contador; el `return` del hook expone la función) + el test existente de generación de hooks (`emit_hooks_generates_queries_mutations_and_subscriptions`) sigue pasando sin cambios -- la forma pública del resto de los hooks no se tocó. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado, con `App.tsx` usando `reconnect()` de verdad, y tipando limpio con `tsc --noEmit` en modo estricto.
+
+---
+
+### 3.131 `isOk`/`isErr` y el schema Zod de `Result<T,E>` chequeaban un campo que no existe — RESUELTO (bug real)
+
+Séptima ronda seguida sobre TypeScript/React, esta vez un bug de verdad, no una mejora: auditando `client.ts` para el ítem anterior apareció que `isOk`/`isErr` -- las dos funciones exportadas para narrowing de un `Result<T,E>` (`if (isOk(result)) { result.value } else { result.error }`) -- estaban tipadas y implementadas contra `{ ok: true; value: T } | { ok: false; error: E }`. **Ningún `Result<T,E>` real tiene un campo `ok`** -- el wire, `contract.d.ts` (`Result<T, E> = { type: "Ok"; value: T } | { type: "Err"; error: E }`, dos líneas arriba en el mismo archivo generado) y `validators.ts` (que sí valida correctamente contra `.type`, nunca tuvo el bug) usan `type: "Ok"|"Err"` desde siempre (GRAMMAR.md §2.2). Pasarle un `Result<T,E>` real -- literalmente el resultado de `await client.create(...)` -- a `isOk`/`isErr` ni siquiera TIPABA: `tsc` real rechaza la llamada (`Argument of type 'Result<User, E>' is not assignable to parameter of type '{ ok: true; ... } | { ok: false; ... }'`). Las dos funciones eran, tal cual estaban, inutilizables.
+
+```ts
+// Antes: ni compilaba contra un Result real.
+const result = await client.create(input);
+if (isOk(result)) { ... } // tsc: Argument of type 'Result<User, E>' is not assignable...
+```
+
+```ts
+// Ahora: tipa y narrowea de verdad.
+const result = await client.create(input);
+if (isOk(result)) {
+  result.value; // User, no unknown
+} else if (isErr(result)) {
+  result.error; // ValidationError
+}
+```
+
+**El mismo bug, en la misma familia de código, en `zod_emit.rs`**: el schema Zod para `Result<T,E>` (emitido cuando algún `type`/`enum` con nombre tiene un CAMPO de tipo `Result<T,E>` -- `emit_zod_schemas` no genera un schema por rpc, solo por declaración nombrada, así que este camino no se ejercita para el uso más común de `Result` como retorno de rpc) usaba `z.discriminatedUnion("ok", [z.object({ ok: z.literal(true), ... }), z.object({ ok: z.literal(false), ... })])` -- la clave `"ok"` no existe en ningún payload real, así que ese schema rechaza CUALQUIER `Result` real, sin excepción. Arreglado al mismo `"type"`/`z.literal("Ok"|"Err")` que el resto del proyecto ya usa.
+
+**Corrección de alcance, para no sobre-vender el hallazgo**: `validators.ts` -- el validador que `client.ts` REALMENTE usa en cada respuesta antes de devolverla, la pieza de seguridad real del contrato -- ya usaba `.type` correctamente desde siempre; nunca tuvo este bug. El impacto real está acotado a dos exports auxiliares/opcionales (`isOk`/`isErr` en `client.ts`, y el schema Zod de `Result<T,E>` cuando aparece como campo de un tipo nombrado) -- ninguno de los dos participa en la validación real de una respuesta.
+
+**El `import type { ... } from "./contract"` de `client.ts` ahora incluye `Result` SIEMPRE**, sin importar si algún rpc de este programa en particular lo usa -- antes, `isOk`/`isErr` (emitidas incondicionalmente) podían terminar referenciando un nombre nunca importado en un programa sin ningún `Result<T,E>` en sus firmas, produciendo un `Cannot find name 'Result'` real si alguien intentaba tipar contra la nueva firma.
+
+**Verificado**: 3 tests nuevos (2 en `codegen::ts_emit`, 1 en `codegen::zod_emit`) + a mano con `tsc` real, dos veces -- ANTES del fix (confirmando el error de tipo real que describía el gap) y DESPUÉS (confirmando que compila y narrowea correcto) -- contra un `client.create(...)` genuino de `examples/users.link`. El fix de Zod se verificó además con Zod REAL en runtime (no solo que compile): el schema arreglado acepta un payload `{ type: "Ok"/"Err", ... }` genuino y RECHAZA explícitamente la forma vieja (`{ ok: true, ... }`), confirmando que el cambio de discriminador realmente cambió el comportamiento, no solo el texto generado.
 
 ---
 

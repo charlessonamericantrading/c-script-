@@ -1,6 +1,6 @@
-// Generado automáticamente por linkc v1.93.0 — no editar a mano.
+// Generado automáticamente por linkc v1.94.0 — no editar a mano.
 
-import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
+import type { BoardStats, ColumnId, NewTask, Patch, Result, Task, TasksClient } from "./contract";
 import { isBoardStats, isTask } from "./validators.ts";
 
 export class LinkTransportError extends Error {
@@ -21,12 +21,12 @@ export class LinkValidationError extends Error {
   }
 }
 
-export function isOk<T, E>(result: { ok: true; value: T } | { ok: false; error: E }): result is { ok: true; value: T } {
-  return result.ok === true;
+export function isOk<T, E>(result: Result<T, E>): result is { type: "Ok"; value: T } {
+  return result.type === "Ok";
 }
 
-export function isErr<T, E>(result: { ok: true; value: T } | { ok: false; error: E }): result is { ok: false; error: E } {
-  return result.ok === false;
+export function isErr<T, E>(result: Result<T, E>): result is { type: "Err"; error: E } {
+  return result.type === "Err";
 }
 
 class TasksClientImpl implements TasksClient {

@@ -40,9 +40,17 @@ fn render_zod_type(ty: &Type) -> String {
             format!("z.object({{\n{}\n}})", parts.join(",\n"))
         }
         Type::Enum(name) => format!("{}Schema", name),
+        // El wire real (y `Result<T, E>` en contract.d.ts, ts_emit.rs) usa
+        // `{ type: "Ok" | "Err", ... }` -- NUNCA `{ ok: true | false, ... }`
+        // (GRAMMAR.md §2.2, "Result<T,E> viaja siempre como {type:'Ok'|
+        // 'Err', ...} en un 200"). Bug real encontrado auditando este
+        // archivo: el discriminador y las claves acá usaban `ok`, un campo
+        // que ningún payload real tiene -- `z.discriminatedUnion` con la
+        // clave equivocada rechaza CUALQUIER `Result` real, sin excepción.
+        // Ver GRAMMAR.md §3.131.
         Type::ResultOf(ok_ty, err_ty) => {
             format!(
-                "z.discriminatedUnion(\"ok\", [\n  z.object({{ ok: z.literal(true), value: {} }}),\n  z.object({{ ok: z.literal(false), error: {} }})\n])",
+                "z.discriminatedUnion(\"type\", [\n  z.object({{ type: z.literal(\"Ok\"), value: {} }}),\n  z.object({{ type: z.literal(\"Err\"), error: {} }})\n])",
                 render_zod_type(ok_ty),
                 render_zod_type(err_ty)
             )
@@ -180,6 +188,33 @@ mod tests {
         assert!(zod_out.contains("id: z.number().int()"), "{zod_out}");
         assert!(zod_out.contains("email: z.string().nullable()"), "{zod_out}");
         assert!(zod_out.contains("createdAt: z.string().datetime()"), "{zod_out}");
+    }
+
+    /// Bug real encontrado auditando este archivo (GRAMMAR.md §3.131): el
+    /// schema de `Result<T,E>` discriminaba por `"ok"` con `z.literal(true/
+    /// false)`, una forma que NINGÚN payload real tiene -- el wire (y
+    /// `Result<T, E>` en contract.d.ts) usa `{ type: "Ok"|"Err", ... }`.
+    /// `z.discriminatedUnion` con la clave equivocada rechaza CUALQUIER
+    /// `Result` real -- verificado a mano con Zod real: la forma vieja
+    /// (`{ ok: true, ... }`) queda rechazada por el schema arreglado, y un
+    /// payload real (`{ type: "Ok"|"Err", ... }`) sí valida.
+    #[test]
+    fn result_schema_discriminates_by_the_real_type_field_not_a_fake_ok_field() {
+        let code = r#"
+            enum ValidationError { InvalidEmail }
+            type Task = { id: Int }
+            type LastAttempt = { outcome: Result<Task, ValidationError> }
+        "#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let zod_out = emit_zod_schemas(&program).unwrap();
+        assert!(zod_out.contains("z.discriminatedUnion(\"type\", ["), "{zod_out}");
+        assert!(zod_out.contains("z.object({ type: z.literal(\"Ok\"), value: TaskSchema })"), "{zod_out}");
+        assert!(
+            zod_out.contains("z.object({ type: z.literal(\"Err\"), error: ValidationErrorSchema })"),
+            "{zod_out}"
+        );
+        assert!(!zod_out.contains("\"ok\""), "{zod_out}");
+        assert!(!zod_out.contains("z.literal(true)"), "{zod_out}");
     }
 
     /// `@validate(email)` se propaga como `.email()` encadenado (GRAMMAR.md
