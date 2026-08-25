@@ -3,6 +3,23 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.101.0] - 2026-08-25
+
+### ✨ Nuevo
+- **Versión bundle: nueve ítems del backlog general (PLAN.md §9.3/§9.4/§9.5/§9.7/§9.8), cerrados juntos.** A pedido explícito del usuario ("seguí con los items y no pares hasta completar mínimo 10" -- nueve quedaron genuinamente listos con la misma vara de verificación de siempre; el detalle de por qué no se forzó un décimo va en el reporte de esta versión, no en este changelog):
+
+  1. **`@cache("60s")`: cache de resultado del lado del servidor** (§3.144, PLAN.md §9.3 ítem 5). Sobre un `rpc` (rechazado sobre un `stream`), cachea in-memory el resultado de la primera ejecución EXITOSA por `(service, rpc, argumentos)` -- un reintento dentro del TTL repite la respuesta sin correr el cuerpo de nuevo. Ortogonal a `@cache_control` (cliente) y `@idempotent` (escrituras).
+  2. **`deleteWhere` empuja la selección a SQL** (§3.145, PLAN.md §9.3 ítem 1, última parte). Un predicado pusheable ahora usa `find_where_conjunction` (la misma función que `findWhere`/`countWhere`) para encontrar las filas a borrar en vez de traer la colección entera a memoria -- el borrado en sí sigue fila por fila para no perder el aviso a `stream`.
+  3. **`@check(minLength/maxLength, N)`: constraints de longitud sobre `String`** (§3.146, PLAN.md §9.3 ítem 3, mitad `String`). Mismo `FieldCheck`, mismos dos puntos de enforcement (aplicación + `CHECK` real en los dos backends) que la mitad numérica ya resuelta en v1.60.0. Cuenta caracteres Unicode, no bytes.
+  4. **`@cors("...")`: override de CORS por ruta** (§3.147, PLAN.md §9.4 ítem 4). Reemplaza entero al CORS global para un `rpc`/`stream` puntual -- aplica tanto al preflight `OPTIONS` como a la respuesta real.
+  5. **Log de auditoría de autorización estructurado** (§3.148, PLAN.md §9.5 ítem 2). `auth_role`/`auth_user_id`/`auth_allowed` como campos de PRIMER NIVEL en la línea de log de cada request que pasó por `@authenticated`/`@requires`.
+  6. **`GET /metrics` en formato Prometheus** (§3.149, PLAN.md §9.8 ítems 1 y 2). `linkc_http_requests_total`/`linkc_http_request_duration_seconds_sum` por método, `linkc_stream_subscribers` por colección, `linkc_db_size_bytes` -- no exento de `--service-api-key`.
+  7. **Latencia de propagación NOTIFY + cola de reintento acotada** (§3.150, PLAN.md §9.8 ítem 3, cierra la sección). Latencia real vía `sent_at_ms` en el payload, expuesta en `/metrics`; una falla TRANSITORIA de `NOTIFY` ahora se reintenta desde una cola FIFO acotada (`MAX_PENDING_NOTIFY_RETRIES = 50`) en vez de perderse para siempre.
+  8. **`db.vacuum()`/`db.tableStats()`: RPCs de administración** (§3.151, PLAN.md §9.7 ítem 3). Dos builtins sobre `db` directo que quien escribe el `.link` expone en su propio service detrás de `@requires(Role.Admin)`, sin servicio `_admin` auto-inyectado.
+  9. **Bloqueo de cuenta configurable** (§3.152, PLAN.md §9.5 ítem 1). `auth.recordFailedLogin`/`auth.failedLoginCount(identifier, windowSeconds)`/`auth.resetFailedLogins` sobre `SessionStore` -- umbral, ventana e `identifier` los elige el propio `.link`, sin mecanismo automático ni flag de servidor nuevo.
+
+1152 tests (60 nuevos) repartidos entre `cache.rs` (5, nuevo módulo), `metrics.rs` (3, nuevo módulo), `checker.rs`/`parser.rs` (anotaciones y checks nuevos), `runtime/db.rs`/`runtime/mod.rs` (deleteWhere pusheado, minLength/maxLength, db.vacuum/tableStats con su test de regresión, NOTIFY con sent_at_ms), `session.rs` (bloqueo de cuenta), y seis archivos de integración contra un `linkc serve`/Postgres REALES: `server_http.rs` (cache), `cli_cors.rs` (override incluido el preflight), `cli_auth_audit_log.rs` (nuevo, stdout real), `cli_metrics.rs` (nuevo, incluido dos conexiones `stream` reales), `cli_auth_lockout.rs` (nuevo, login real con `Result<String, LoginError>`), `pg_integration.rs` (minLength con CHECK real, tamaño de base real, latencia NOTIFY real entre dos instancias, VACUUM real sin bloque de transacción). Detalle completo: GRAMMAR.md §3.144-§3.152, PLAN.md §9.3/§9.4/§9.5/§9.7/§9.8.
+
 ## [1.100.0] - 2026-08-25
 
 ### ✨ Nuevo

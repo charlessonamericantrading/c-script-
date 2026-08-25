@@ -515,9 +515,22 @@ impl Parser {
                             let max = self.eat_number()?;
                             FieldCheck::Range(min, max)
                         }
+                        // `@check(minLength, N)`/`@check(maxLength, N)`
+                        // (GRAMMAR.md §3.146) -- misma forma "kind + N" que
+                        // `min`/`max`, pero para `String`/`String?` en vez de
+                        // numérico; el checker es quien distingue cuál tipo
+                        // de campo exige cada uno.
+                        "minLength" => {
+                            self.eat(&TokenKind::Comma)?;
+                            FieldCheck::MinLength(self.eat_number()?)
+                        }
+                        "maxLength" => {
+                            self.eat(&TokenKind::Comma)?;
+                            FieldCheck::MaxLength(self.eat_number()?)
+                        }
                         other => {
                             return Err(self.error(format!(
-                                "'@check({other}, ...)' desconocido (se esperaba '@check(min, N)', '@check(max, N)' o '@check(range, N, M)')"
+                                "'@check({other}, ...)' desconocido (se esperaba '@check(min, N)', '@check(max, N)', '@check(range, N, M)', '@check(minLength, N)' o '@check(maxLength, N)')"
                             )))
                         }
                     };
@@ -736,9 +749,21 @@ impl Parser {
                 // Sin argumentos, igual que "authenticated" (GRAMMAR.md
                 // §3.140) -- ninguna clave que parsear.
                 "idempotent" => Annotation::Idempotent,
+                "cache" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let ttl = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::Cache(ttl)
+                }
+                "cors" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let value = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::Cors(value)
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)' o '@idempotent')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)', '@idempotent', '@cache(\"60s\")' o '@cors(\"https://origen.com\")')"
                     )))
                 }
             };
@@ -2113,6 +2138,20 @@ mod tests {
     #[test]
     fn idempotent_annotation_rejects_parentheses() {
         let tokens = tokenize("service S { @idempotent() rpc f() -> Int { 1 } }").unwrap();
+        assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn cache_annotation_parses_the_ttl_string() {
+        let prog = parse_source(r#"service S { @cache("60s") rpc f() -> Int { 1 } }"#);
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(r.annotations, vec![Annotation::Cache("60s".to_string())]);
+    }
+
+    #[test]
+    fn cache_annotation_requires_a_string_argument() {
+        let tokens = tokenize("service S { @cache() rpc f() -> Int { 1 } }").unwrap();
         assert!(parse(tokens).is_err());
     }
 

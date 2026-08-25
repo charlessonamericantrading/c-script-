@@ -1358,6 +1358,45 @@ fn a_write_on_one_instance_pushes_to_a_stream_connected_to_another() {
     assert_eq!(event["id"], created["id"], "evento recibido: {event:?}");
 }
 
+/// GRAMMAR.md §3.150: la instancia que RECIBE un cambio remoto (A, en el
+/// test de arriba) es la que mide y reporta la latencia -- este test es la
+/// contraparte que confirma que `GET /metrics` de esa instancia muestra un
+/// evento real después de una propagación cross-instancia real.
+#[test]
+fn metrics_reports_notify_propagation_latency_after_a_real_cross_instance_write() {
+    const COLLECTION: &str = "items_metrics_notify_latency";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("metrics-notify-latency");
+    let src = temp.write("app.link", &PUSH_PROGRAM.replace("COLLECTION", COLLECTION));
+
+    let instance_a = Serve::start(&src, &url);
+    let instance_b = Serve::start(&src, &url);
+
+    let mut watcher = StreamClient::connect(instance_a.port, "/Items/watchAll");
+    instance_b.rpc("Items/create", r#"{"name":"desde-B"}"#);
+    watcher.next_event().expect("la instancia A debió recibir el push de la instancia B");
+
+    // Un margen chico: el drenado del canal remoto (que registra la
+    // métrica) corre en el loop principal de A, no sincrónico con la
+    // entrega al `stream` -- los dos pasan por el MISMO tick, pero sin una
+    // señal explícita de "ya se registró la métrica" que esperar.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let text = ureq::get(&format!("http://127.0.0.1:{}/metrics", instance_a.port))
+        .call()
+        .unwrap_or_else(|e| panic!("GET /metrics falló: {e}"))
+        .into_string()
+        .expect("leer el body");
+    assert!(text.contains("linkc_notify_latency_seconds_count 1"), "body: {text}");
+    assert!(text.contains("linkc_notify_latency_seconds_sum "), "body: {text}");
+}
+
 // GRAMMAR.md §3.66: `linkc introspect <db-url>` genera un .link de partida
 // desde una base PostgreSQL YA EXISTENTE -- estos tests crean una tabla A
 // MANO (simulando un sistema adoptado, no generado por linkc) y confirman
@@ -2067,6 +2106,123 @@ service Reviews {{ rpc add(rating: Int) -> Review {{ db.{COLLECTION}.insert(Revi
     // «check» «..._check»").
     let detail = err.as_db_error().map(|db| db.message().to_lowercase()).unwrap_or_default();
     assert!(detail.contains("check"), "detalle real del error: {detail:?} (err: {err})");
+}
+
+/// GRAMMAR.md §3.146: `@check(minLength, ...)` sobre `String` genera el
+/// MISMO tipo de `CHECK` real en Postgres que `@check(range, ...)` sobre un
+/// campo numérico -- este test es la contraparte de
+/// `check_field_creates_a_real_postgres_check_constraint_that_rejects_raw_sql_too`
+/// para la mitad nueva (texto, no número).
+#[test]
+fn check_min_length_creates_a_real_postgres_check_constraint_that_rejects_raw_sql_too() {
+    const COLLECTION: &str = "posts_check_min_length_constraint";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("check-min-length-constraint");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Post = {{ id: Int, @check(minLength, 1) title: String }}
+db {{ {COLLECTION}: Post[] }}
+service Posts {{ rpc add(title: String) -> Post {{ db.{COLLECTION}.insert(Post {{ id: 0, title: title }}) }} }}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    let ok = server.rpc("Posts/add", r#"{"title":"algo"}"#);
+    assert_eq!(ok["title"], "algo");
+    drop(server);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let raw_insert = client.execute(&format!("INSERT INTO \"{COLLECTION}\" (title) VALUES ('')"), &[]);
+    let err = raw_insert.expect_err("un INSERT crudo con título vacío debe rechazarse a nivel de Postgres, sin pasar por Rust");
+    let detail = err.as_db_error().map(|db| db.message().to_lowercase()).unwrap_or_default();
+    assert!(detail.contains("check"), "detalle real del error: {detail:?} (err: {err})");
+}
+
+/// GRAMMAR.md §3.149: `GET /metrics` sobre Postgres usa `pg_database_size`
+/// (una función SQL distinta a la de SQLite, `PRAGMA page_count/page_size`)
+/// -- este test es la contraparte real de
+/// `metrics_reports_the_real_database_size_in_bytes` (`cli_metrics.rs`,
+/// SQLite) para el otro backend.
+#[test]
+fn metrics_reports_a_real_database_size_on_postgres() {
+    const COLLECTION: &str = "tasks_metrics_db_size";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("metrics-db-size");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Task = {{ id: Int, title: String }}
+db {{ {COLLECTION}: Task[] }}
+service Tasks {{ rpc add(title: String) -> Task {{ db.{COLLECTION}.insert(Task {{ id: 0, title: title }}) }} }}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Tasks/add", r#"{"title":"algo"}"#);
+
+    let text = ureq::get(&format!("http://127.0.0.1:{}/metrics", server.port))
+        .call()
+        .unwrap_or_else(|e| panic!("GET /metrics falló: {e}"))
+        .into_string()
+        .expect("leer el body");
+    let line = text.lines().find(|l| l.starts_with("linkc_db_size_bytes ")).unwrap_or_else(|| panic!("body: {text}"));
+    let size: i64 = line.trim_start_matches("linkc_db_size_bytes ").trim().parse().expect("tamaño numérico");
+    assert!(size > 0, "pg_database_size de una base real no puede ser 0: {size}");
+}
+
+/// GRAMMAR.md §3.151: `db.vacuum()` corre un `VACUUM` real contra Postgres
+/// -- el riesgo real que este test cierra es que Postgres RECHAZA `VACUUM`
+/// dentro de un bloque de transacción ("VACUUM cannot run inside a
+/// transaction block"), así que hacía falta confirmar contra el motor de
+/// verdad que el camino de ejecución (`batch_execute`, protocolo simple)
+/// no envuelve el comando en una transacción implícita.
+#[test]
+fn db_vacuum_runs_for_real_against_postgres_without_a_transaction_block_error() {
+    const COLLECTION: &str = "items_vacuum";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("db-vacuum");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String }}
+db {{ {COLLECTION}: Item[] }}
+service Admin {{
+  rpc add(name: String) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, name: name }}) }}
+  rpc doVacuum() -> Void {{ db.vacuum() }}
+  rpc stats() -> Map<String, Int> {{ db.tableStats() }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Admin/add", r#"{"name":"x"}"#);
+    let vacuum_result = server.rpc("Admin/doVacuum", "{}");
+    assert_eq!(vacuum_result, serde_json::Value::Null, "body: {vacuum_result:?}");
+
+    let stats = server.rpc("Admin/stats", "{}");
+    assert_eq!(stats[COLLECTION], 1, "body: {stats:?}");
 }
 
 /// GRAMMAR.md §3.97: `linkc migrate --dry-run` sobre una colección cuya

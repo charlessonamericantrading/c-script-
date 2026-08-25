@@ -337,6 +337,8 @@ fn render_service(s: &ServiceDecl) -> String {
                     | Some(Annotation::Invalidates(_))
                     | Some(Annotation::Infinite { .. })
                     | Some(Annotation::Idempotent)
+                    | Some(Annotation::Cache(_))
+                    | Some(Annotation::Cors(_))
                     | None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
                 };
                 let rate_limit_badge = match r.rate_limit() {

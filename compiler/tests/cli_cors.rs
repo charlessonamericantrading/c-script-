@@ -24,6 +24,16 @@ service Sys {
     "pong"
   }
 
+  @cors("*")
+  rpc pingOpen() -> String {
+    "pong"
+  }
+
+  @cors("https://partner.example.com")
+  rpc pingPartner() -> String {
+    "pong"
+  }
+
   stream watchAll() -> Item {
     db.items.all()
   }
@@ -280,6 +290,65 @@ fn a_stream_response_carries_the_same_cors_policy_as_a_normal_rpc() {
     let (status, headers, _) = server.request("POST", "/Sys/watchAll", &[("Origin", "https://evil.example.com")], "{}");
     assert_eq!(status, 200);
     assert!(Serve::header(&headers, "access-control-allow-origin").is_none(), "headers: {headers:?}");
+}
+
+// ---- `@cors("...")` override por ruta (GRAMMAR.md §3.147) ----
+
+#[test]
+fn a_route_with_cors_star_ignores_the_global_allowlist_and_is_open_to_any_origin() {
+    let temp = TempDir::new("cors-override-star");
+    let src = temp.write("app.link", PROGRAM);
+    // Global: allowlist restrictivo que NO incluye evil.example.com.
+    let server = Serve::start(&src, &["--cors-origin", "https://app.example.com"], &[]);
+
+    // El rpc SIN override sigue respetando el allowlist global.
+    let (_, headers, _) = server.request("POST", "/Sys/ping", &[("Origin", "https://evil.example.com")], "{}");
+    assert!(Serve::header(&headers, "access-control-allow-origin").is_none(), "headers: {headers:?}");
+
+    // El rpc CON @cors("*") ignora el allowlist global -- abierto a
+    // cualquier origen, mismo criterio que CorsConfig::Any.
+    let (status, headers, body) = server.request("POST", "/Sys/pingOpen", &[("Origin", "https://evil.example.com")], "{}");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"pong\"");
+    assert_eq!(Serve::header(&headers, "access-control-allow-origin"), Some("*"), "headers: {headers:?}");
+    assert_security_headers(&headers);
+}
+
+#[test]
+fn a_route_with_a_cors_allowlist_override_ignores_the_global_config() {
+    let temp = TempDir::new("cors-override-allowlist");
+    let src = temp.write("app.link", PROGRAM);
+    // Global: abierto a cualquier origen (default, sin --cors-origin).
+    let server = Serve::start(&src, &[], &[]);
+
+    // El rpc SIN override sigue abierto (comportamiento global de siempre).
+    let (_, headers, _) = server.request("POST", "/Sys/ping", &[("Origin", "https://evil.example.com")], "{}");
+    assert_eq!(Serve::header(&headers, "access-control-allow-origin"), Some("*"), "headers: {headers:?}");
+
+    // `pingPartner` tiene @cors("https://partner.example.com") -- ignora el
+    // global abierto, se comporta como un allowlist propio de un origen.
+    let (status, headers, _) = server.request("POST", "/Sys/pingPartner", &[("Origin", "https://partner.example.com")], "{}");
+    assert_eq!(status, 200);
+    assert_eq!(Serve::header(&headers, "access-control-allow-origin"), Some("https://partner.example.com"), "headers: {headers:?}");
+    assert_eq!(Serve::header(&headers, "vary"), Some("Origin"), "headers: {headers:?}");
+
+    let (status, headers, body) = server.request("POST", "/Sys/pingPartner", &[("Origin", "https://otro.example.com")], "{}");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"pong\"", "CORS lo hace cumplir el navegador, no el server rechazando la request");
+    assert!(Serve::header(&headers, "access-control-allow-origin").is_none(), "headers: {headers:?}");
+}
+
+#[test]
+fn the_cors_override_also_applies_to_the_options_preflight() {
+    // Crítico: si el preflight no anuncia el override, el navegador nunca
+    // manda la request real -- el override tiene que aplicar a los DOS.
+    let temp = TempDir::new("cors-override-preflight");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--cors-origin", "https://app.example.com"], &[]);
+
+    let (status, headers, _) = server.request("OPTIONS", "/Sys/pingPartner", &[("Origin", "https://partner.example.com")], "");
+    assert_eq!(status, 204);
+    assert_eq!(Serve::header(&headers, "access-control-allow-origin"), Some("https://partner.example.com"), "headers: {headers:?}");
 }
 
 #[test]

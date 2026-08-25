@@ -586,6 +586,36 @@ pub(crate) fn eval_expr(
                     return call_callable(callee_v, arg_vs, db, fns, checker, sessions, current_token, step_budget);
                 }
             }
+            // `db.vacuum()`/`db.tableStats()` (GRAMMAR.md §3.151): mismo
+            // motivo que el atajo de `isSome`/`isNone` arriba -- interceptar
+            // ACÁ, antes de la evaluación genérica de `callee` como
+            // FieldAccess, evita que `db.vacuum` (evaluado como base de una
+            // llamada MÁS LARGA, ej. `db.vacuum.insert(x)` sobre una
+            // colección de verdad llamada "vacuum") se malinterprete como
+            // el builtin -- este atajo solo dispara cuando `db.vacuum`/
+            // `db.tableStats` es DIRECTAMENTE lo que se está llamando, la
+            // MISMA distinción que el checker ya hace en `try_builtin_method`
+            // (que solo mira `callee` de un `Call`, nunca un `FieldAccess`
+            // intermedio).
+            if let Expr::FieldAccess { base, field } = &callee.node {
+                if (field == "vacuum" || field == "tableStats") && matches!(&base.node, Expr::Ident(n) if n == "db") && !env.contains_key("db")
+                {
+                    let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                    if !arg_vs.is_empty() {
+                        return Err(err(format!("'db.{field}' no toma argumentos")));
+                    }
+                    return match field.as_str() {
+                        "vacuum" => {
+                            db.run_vacuum().map_err(|e| err(format!("db.vacuum falló: {e}")))?;
+                            Ok(Value::Null)
+                        }
+                        _ => {
+                            let stats = db.table_stats().map_err(|e| err(format!("db.tableStats falló: {e}")))?;
+                            Ok(Value::Struct(stats.into_iter().map(|(name, count)| (name, Value::Int(count))).collect()))
+                        }
+                    };
+                }
+            }
             let callee_v = eval_expr(callee, env, db, fns, checker, sessions, current_token, step_budget)?;
             let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
             match callee_v {
@@ -839,6 +869,17 @@ fn as_bool(v: &Value) -> Result<bool, RuntimeError> {
 /// interpretado de siempre (`db.call("all")` + evaluar el predicado por
 /// fila), que sigue siendo correcto siempre, más lento solo en ese caso
 /// puntual.
+/// `db.call(&coll, "all", ...)` ya devuelve `Value::List`, siempre -- este
+/// helper solo evita repetir el `match` de desempaquetado en cada uno de los
+/// caminos de fallback de `findWhere`/`countWhere`/`deleteWhere` que caen al
+/// camino interpretado de siempre.
+fn all_items(db: &Db, coll: &str) -> Result<Vec<Value>, RuntimeError> {
+    match db.call(coll, "all", vec![])? {
+        Value::List(items) => Ok(items),
+        _ => Ok(vec![]),
+    }
+}
+
 fn recognize_pushable_conjunction(f: &Value) -> Option<Vec<(String, BinaryOp, Value)>> {
     let Value::Closure(params, body, captured_env) = f else { return None };
     let leaves = crate::ast::recognize_conjunction_predicate(params, body)?;
@@ -1741,13 +1782,39 @@ fn call_method(
                 }
                 Ok(Value::Int(count))
             }
+            // GRAMMAR.md §3.145: mismo empuje a SQL que `findWhere`/
+            // `countWhere` (§3.95/§3.108/§3.109) para la SELECCIÓN -- cuando
+            // el predicado tiene la forma pusheable, `find_where_conjunction`
+            // hace un `SELECT ... WHERE` real (respetando `@softDelete`
+            // automáticamente, igual que `conjunction_condition` ya hace
+            // para `countWhere`/`findWhere`) en vez de traer la colección
+            // ENTERA a memoria solo para descartar la mayoría en el
+            // intérprete. El BORRADO en sí sigue siendo fila por fila vía
+            // `db.call(&coll, "delete", ...)` -- a propósito, no un `DELETE
+            // ... WHERE` de una sola sentencia: cada `delete()` publica la
+            // fila borrada a cualquier `stream` suscripto a esta colección
+            // (GRAMMAR.md §3.16), y una sentencia bulk no tiene forma de dar
+            // ese aviso por fila. Cuando la selección viene YA filtrada por
+            // SQL, el predicado no se vuelve a evaluar en el intérprete
+            // (`already_filtered`) -- confiar en el mismo WHERE que
+            // `findWhere`/`countWhere` ya confían.
             "deleteWhere" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'deleteWhere' requiere 1 argumento"))?;
-                let all_val = db.call(&coll, "all", vec![])?;
-                let Value::List(items) = all_val else { return Ok(Value::Int(0)); };
+                let (items, already_filtered) = match recognize_pushable_conjunction(&f) {
+                    Some(conditions) => match db.find_where_conjunction(&coll, &conditions)? {
+                        Some(rows) => (rows, true),
+                        None => (all_items(db, &coll)?, false),
+                    },
+                    None => (all_items(db, &coll)?, false),
+                };
                 let mut count = 0i64;
                 for item in items {
-                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)? {
+                    let matches = if already_filtered {
+                        true
+                    } else {
+                        as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)?
+                    };
+                    if matches {
                         if let Value::Struct(fields) = &item {
                             if let Some((_, Value::Int(id))) = fields.iter().find(|(n, _)| n == "id") {
                                 if let Ok(Value::Bool(true)) = db.call(&coll, "delete", vec![Value::Int(*id)]) {
@@ -2567,6 +2634,35 @@ fn call_method(
                 let user_id = current_token.and_then(|tok| sessions.user_id_for(tok));
                 Ok(user_id.map(Value::Int).unwrap_or(Value::Null))
             }
+            // GRAMMAR.md §3.152: bloqueo de cuenta configurable -- tres
+            // primitivas sobre `SessionStore` (mismo store que ya guarda
+            // sesiones, un solo lugar en memoria de un solo proceso).
+            "recordFailedLogin" => {
+                let identifier = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("auth.recordFailedLogin requiere un argumento String (identifier)")),
+                };
+                sessions.record_failed_login(identifier);
+                Ok(Value::Null)
+            }
+            "failedLoginCount" => {
+                let (Some(Value::Str(identifier)), Some(window_seconds)) = (args.first(), args.get(1)) else {
+                    return Err(err("auth.failedLoginCount requiere (identifier: String, windowSeconds: Int)"));
+                };
+                let window_seconds = as_int(window_seconds)?;
+                if window_seconds < 0 {
+                    return Err(err("auth.failedLoginCount: 'windowSeconds' no puede ser negativo"));
+                }
+                Ok(Value::Int(sessions.failed_login_count(identifier, std::time::Duration::from_secs(window_seconds as u64))))
+            }
+            "resetFailedLogins" => {
+                let identifier = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("auth.resetFailedLogins requiere un argumento String (identifier)")),
+                };
+                sessions.reset_failed_logins(identifier);
+                Ok(Value::Null)
+            }
             other => Err(err(format!("método desconocido sobre auth: '{other}'"))),
         },
         Value::Service(s_name) => {
@@ -3147,6 +3243,14 @@ fn apply_field_validators(ast_fields: &[Field], value: &Value, path: &str) -> Re
                         return Err(bad_req(format!("'{path}.{}': {msg} (@check)", af.name)));
                     }
                 }
+                // GRAMMAR.md §3.146: `@check(minLength/maxLength, ...)`
+                // sobre `String` -- mismo criterio que la rama numérica de
+                // arriba, sobre `Value::Str` en vez de `as_check_number`.
+                if let Value::Str(s) = v {
+                    if let Err(msg) = check_string_length(s, check) {
+                        return Err(bad_req(format!("'{path}.{}': {msg} (@check)", af.name)));
+                    }
+                }
             }
         }
     }
@@ -3191,6 +3295,24 @@ fn check_number_bounds(n: f64, check: &FieldCheck) -> Result<(), String> {
         FieldCheck::Max(max) if n > *max => Err(format!("{n} es mayor que el máximo permitido ({max})")),
         FieldCheck::Range(min, max) if n < *min || n > *max => {
             Err(format!("{n} está fuera del rango permitido [{min}, {max}]"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// El chequeo real de `@check(minLength/maxLength, ...)` (GRAMMAR.md
+/// §3.146) -- `Err(mensaje)` nombrando el límite violado, mismo criterio
+/// que `check_number_bounds`. Cuenta caracteres Unicode (`chars().count()`),
+/// no bytes -- una longitud pensada para un humano leyendo el valor, no el
+/// tamaño de su codificación UTF-8.
+fn check_string_length(s: &str, check: &FieldCheck) -> Result<(), String> {
+    let len = s.chars().count();
+    match check {
+        FieldCheck::MinLength(min) if (len as f64) < *min => {
+            Err(format!("tiene {len} caracteres, menos que el mínimo permitido ({min})"))
+        }
+        FieldCheck::MaxLength(max) if (len as f64) > *max => {
+            Err(format!("tiene {len} caracteres, más que el máximo permitido ({max})"))
         }
         _ => Ok(()),
     }
@@ -3386,6 +3508,36 @@ pub fn required_rate_limit<'a>(program: &'a Program, service_name: &str, rpc_nam
 /// uso desde `server.rs` antes de invocar nada). El checker ya garantizó
 /// que nunca aparece sobre un `stream`, así que `server.rs` solo necesita
 /// consultarlo en el camino de un `rpc` normal.
+/// El TTL crudo de `@cache("60s")` de `{service_name}.{rpc_name}`, si hay
+/// (GRAMMAR.md §3.144) -- hermana de `required_idempotent`/
+/// `required_rate_limit`, mismo patrón. `server.rs` lo pasa a
+/// `cache::parse_ttl`, que el checker ya validó que nunca falla para un
+/// programa que compiló.
+pub fn required_cache<'a>(program: &'a Program, service_name: &str, rpc_name: &str) -> Option<&'a str> {
+    program.items.iter().find_map(|i| match i {
+        Item::Service(s) if s.name == service_name => s.members.iter().find_map(|m| match m {
+            Member::Rpc(r) if r.name == rpc_name => r.cache(),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// El valor crudo de `@cors("...")` de `{service_name}.{rpc_name}`, si hay
+/// (GRAMMAR.md §3.147) -- hermana de `required_cache`/`required_rate_limit`,
+/// mismo patrón. Busca en `Member::Rpc` Y `Member::Stream` (a diferencia de
+/// `required_cache`, que solo aplica a `rpc`) -- un stream SSE también manda
+/// headers de CORS reales.
+pub fn required_cors<'a>(program: &'a Program, service_name: &str, rpc_name: &str) -> Option<&'a str> {
+    program.items.iter().find_map(|i| match i {
+        Item::Service(s) if s.name == service_name => s.members.iter().find_map(|m| match m {
+            Member::Rpc(r) | Member::Stream(r) if r.name == rpc_name => r.cors(),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
 pub fn required_idempotent(program: &Program, service_name: &str, rpc_name: &str) -> bool {
     program.items.iter().any(|i| match i {
         Item::Service(s) if s.name == service_name => {
@@ -4892,6 +5044,99 @@ mod tests {
         assert_eq!(over_discount.kind, ErrorKind::BadRequest, "{over_discount}");
     }
 
+    /// GRAMMAR.md §3.151: `db.vacuum()`/`db.tableStats()` corren de verdad
+    /// contra SQLite (`:memory:`) -- `vacuum` no debe fallar, y `tableStats`
+    /// tiene que reflejar filas insertadas REALES, no un valor inventado.
+    #[test]
+    fn db_vacuum_and_table_stats_run_for_real_against_sqlite() {
+        let program = program_from(
+            r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service Admin {
+                rpc add(name: String) -> Item { db.items.insert(Item { id: 0, name: name }) }
+                rpc doVacuum() -> Void { db.vacuum() }
+                rpc stats() -> Map<String, Int> { db.tableStats() }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Admin", "add", &json!({"name": "a"}), &db).unwrap();
+        invoke_rpc(&program, "Admin", "add", &json!({"name": "b"}), &db).unwrap();
+
+        assert_eq!(invoke_rpc(&program, "Admin", "doVacuum", &json!({}), &db).unwrap(), json!(null));
+        assert_eq!(invoke_rpc(&program, "Admin", "stats", &json!({}), &db).unwrap(), json!({"items": 2}));
+    }
+
+    /// El bug real que este test fija (encontrado en la verificación manual
+    /// de esta ronda, antes de shippear): una colección REAL llamada
+    /// "vacuum" tiene que seguir andando normal -- `db.vacuum.all()` (con
+    /// MÁS field access después, a diferencia de `db.vacuum()` a secas) NO
+    /// puede confundirse con el builtin de arriba, o esta colección legítima
+    /// se vuelve inalcanzable en runtime aunque tipe bien.
+    #[test]
+    fn a_real_collection_named_vacuum_still_works_at_runtime() {
+        let program = program_from(
+            r#"
+            type Item = { id: Int, name: String }
+            db { vacuum: Item[] }
+            service Admin {
+                rpc add(name: String) -> Item { db.vacuum.insert(Item { id: 0, name: name }) }
+                rpc all() -> Item[] { db.vacuum.all() }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(&program, "Admin", "add", &json!({"name": "x"}), &db).unwrap();
+        let rows = invoke_rpc(&program, "Admin", "all", &json!({}), &db).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1, "{rows:?}");
+    }
+
+    /// GRAMMAR.md §3.146: `@check(minLength/maxLength, ...)` sobre
+    /// `String` -- mismo mecanismo de aplicación que `@check(min/max,
+    /// ...)` numérico de arriba, contando CARACTERES Unicode (no bytes).
+    #[test]
+    fn check_min_length_rejects_an_empty_string() {
+        let program = program_from(
+            r#"
+            type Post = { id: Int, @check(minLength, 1) title: String }
+            db { posts: Post[] }
+            service S {
+                rpc add(title: String) -> Post { db.posts.insert(Post { id: 0, title: title }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        assert!(invoke_rpc(&program, "S", "add", &json!({"title": "ok"}), &db).is_ok());
+        let empty = invoke_rpc(&program, "S", "add", &json!({"title": ""}), &db).expect_err("'' tiene 0 caracteres, menos que el mínimo 1");
+        assert_eq!(empty.kind, ErrorKind::BadRequest, "{empty}");
+        assert!(empty.message.contains("Post.title"), "{empty}");
+    }
+
+    #[test]
+    fn check_max_length_rejects_a_string_over_the_limit_counting_unicode_characters_not_bytes() {
+        let program = program_from(
+            r#"
+            type Post = { id: Int, @check(maxLength, 3) title: String }
+            db { posts: Post[] }
+            service S {
+                rpc add(title: String) -> Post { db.posts.insert(Post { id: 0, title: title }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        // "café" son 4 caracteres Unicode pero 5 bytes UTF-8 ('é' ocupa 2) --
+        // si esto contara bytes, "ók" (3 bytes, 2 caracteres) fallaría y
+        // "café" recortado a 3 bytes cortaría la 'é' a la mitad. Contando
+        // caracteres, "ók" (2) pasa el límite de 3 y "café" (4) no.
+        assert!(invoke_rpc(&program, "S", "add", &json!({"title": "ók"}), &db).is_ok());
+        let too_long = invoke_rpc(&program, "S", "add", &json!({"title": "café"}), &db).expect_err("4 caracteres > máximo 3");
+        assert_eq!(too_long.kind, ErrorKind::BadRequest, "{too_long}");
+    }
+
     /// Mismo motivo que `validate_fires_when_the_struct_is_constructed_inside_the_rpc_body_from_loose_params`:
     /// el caso REAL de un `insert` (armar un "New*"/struct completo con
     /// parámetros sueltos ADENTRO del cuerpo del rpc, nunca decodificado
@@ -6138,6 +6383,78 @@ mod tests {
         let arr = rows.as_array().unwrap();
         assert_eq!(arr.len(), 1, "{arr:?}");
         assert_eq!(arr[0]["rating"], json!(5));
+    }
+
+    /// GRAMMAR.md §3.145: `deleteWhere` con un predicado PUSHEABLE selecciona
+    /// las filas a borrar vía `find_where_conjunction` (SQL real) en vez de
+    /// traer la colección entera -- el RESULTADO tiene que ser idéntico al
+    /// camino interpretado de siempre: solo las filas que matchean se
+    /// borran, el resto sobrevive.
+    #[test]
+    fn delete_where_with_a_pushable_predicate_deletes_only_matching_rows() {
+        let code = r#"
+        type Review = { id: Int, productId: Int, rating: Int }
+        db { reviews: Review[] }
+        service Reviews {
+          rpc add(productId: Int, rating: Int) -> Review {
+            db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
+          }
+          rpc removeFor(productId: Int) -> Int {
+            db.reviews.deleteWhere(|r: Review| { r.productId == productId })
+          }
+          rpc all() -> Review[] { db.reviews.all() }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 5}), &db).unwrap();
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 3}), &db).unwrap();
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 4}), &db).unwrap();
+
+        let deleted = invoke_rpc(&program, "Reviews", "removeFor", &json!({"productId": 1}), &db).unwrap();
+        assert_eq!(deleted, json!(2), "deben borrarse las dos filas de productId=1");
+
+        let remaining = invoke_rpc(&program, "Reviews", "all", &json!({}), &db).unwrap();
+        let arr = remaining.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{arr:?}");
+        assert_eq!(arr[0]["productId"], json!(2), "la fila de productId=2 tiene que sobrevivir");
+    }
+
+    /// Un predicado NO pusheable (`&&` no aplica, o combina dos campos entre
+    /// sí) tiene que caer al camino interpretado de siempre -- mismo
+    /// resultado, solo más lento.
+    #[test]
+    fn delete_where_falls_back_correctly_for_a_non_pushable_predicate() {
+        let code = r#"
+        type Review = { id: Int, productId: Int, rating: Int }
+        db { reviews: Review[] }
+        service Reviews {
+          rpc add(productId: Int, rating: Int) -> Review {
+            db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
+          }
+          rpc removeLowRated() -> Int {
+            // Compara dos campos del propio parámetro entre sí -- no tiene
+            // la forma pusheable (`ast::recognize_conjunction_predicate`
+            // exige que el lado derecho NUNCA referencie al parámetro), así
+            // que cae al camino interpretado a propósito.
+            db.reviews.deleteWhere(|r: Review| { r.rating < r.productId })
+          }
+          rpc all() -> Review[] { db.reviews.all() }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 0}), &db).unwrap(); // 0 < 1: se borra
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 5, "rating": 10}), &db).unwrap(); // 10 < 5: sobrevive
+
+        let deleted = invoke_rpc(&program, "Reviews", "removeLowRated", &json!({}), &db).unwrap();
+        assert_eq!(deleted, json!(1));
+        let remaining = invoke_rpc(&program, "Reviews", "all", &json!({}), &db).unwrap();
+        let arr = remaining.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{arr:?}");
+        assert_eq!(arr[0]["productId"], json!(5));
     }
 
     /// GRAMMAR.md §3.108: `countWhere`/`findWhere` empujan a SQL los cinco

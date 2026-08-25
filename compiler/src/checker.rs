@@ -1901,6 +1901,49 @@ impl Checker {
         Ok(())
     }
 
+    /// `@cache("60s")` (GRAMMAR.md §3.144, PLAN.md §9.3) -- mismo criterio
+    /// que `check_cache_control_annotation`: rechaza más de una vez y sobre
+    /// un `stream` (una conexión SSE no tiene un único resultado que
+    /// cachear). El formato de la duración lo valida `cache::parse_ttl`,
+    /// misma función que el runtime usa para calcular la expiración real.
+    fn check_cache_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        let values: Vec<&String> =
+            r.annotations.iter().filter_map(|a| match a { Annotation::Cache(v) => Some(v), _ => None }).collect();
+        if values.len() > 1 {
+            return Err(err(format!("'{}' declara `@cache` más de una vez: un rpc tiene un solo TTL de cache", r.name)));
+        }
+        let Some(raw) = values.first() else {
+            return Ok(());
+        };
+        if is_stream {
+            return Err(err(format!(
+                "`@cache` en el stream '{}': una conexión SSE no tiene un único resultado que cachear (GRAMMAR.md §3.144) -- llamalo desde un 'rpc' normal",
+                r.name
+            )));
+        }
+        crate::cache::parse_ttl(raw).map_err(|e| err(format!("`@cache(\"{raw}\")` en '{}': {e}", r.name)))?;
+        Ok(())
+    }
+
+    /// `@cors("...")` (GRAMMAR.md §3.147) -- dimensión ORTOGONAL, se combina
+    /// con cualquier otra anotación (mismo criterio que `@cache_control`).
+    /// Válido sobre un `stream` también (a diferencia de `@cache_control`/
+    /// `@idempotent`) -- un stream SSE sigue mandando headers de CORS reales
+    /// (`sse_preamble`), así que un override por ruta tiene el mismo sentido
+    /// ahí que en un `rpc` normal.
+    fn check_cors_annotation(&self, r: &RpcDecl) -> Result<(), CheckError> {
+        let values: Vec<&String> = r.annotations.iter().filter_map(|a| match a { Annotation::Cors(v) => Some(v), _ => None }).collect();
+        if values.len() > 1 {
+            return Err(err(format!("'{}' declara `@cors` más de una vez: un rpc tiene un solo override de CORS", r.name)));
+        }
+        if let Some(value) = values.first() {
+            if value.trim().is_empty() {
+                return Err(err(format!("`@cors(\"\")` en '{}': el valor no puede estar vacío", r.name)));
+            }
+        }
+        Ok(())
+    }
+
     /// `@validate(...)` (GRAMMAR.md §3.73) sobre cada campo de `fields` --
     /// llamado tanto para un `type X = { ... }` como para los campos de cada
     /// variante de un `enum` (comparten `Field`, ver `ast.rs`). Dos cosas se
@@ -2081,18 +2124,30 @@ impl Checker {
                 Type::Optional(inner) => inner.as_ref(),
                 other => other,
             };
-            if !matches!(inner, Type::Int | Type::Int64 | Type::Float) {
+            let is_length_check = matches!(check, FieldCheck::MinLength(_) | FieldCheck::MaxLength(_));
+            if is_length_check {
+                if !matches!(inner, Type::String) {
+                    errors.push(
+                        err(format!(
+                            "'@check(minLength/maxLength, ...)' en el campo '{}': solo aplica sobre `String` (u opcional de eso) -- es `{ty}`",
+                            f.name
+                        ))
+                        .with_span(f.name_span),
+                    );
+                    continue;
+                }
+            } else if !matches!(inner, Type::Int | Type::Int64 | Type::Float) {
                 errors.push(
                     err(format!(
-                        "'@check' en el campo '{}': solo aplica sobre `Int`/`Int64`/`Float` (u opcional de esos) -- es `{ty}`",
+                        "'@check(min/max/range, ...)' en el campo '{}': solo aplica sobre `Int`/`Int64`/`Float` (u opcional de esos) -- es `{ty}`",
                         f.name
                     ))
                     .with_span(f.name_span),
                 );
                 continue;
             }
-            if let FieldCheck::Range(min, max) = check {
-                if min > max {
+            match check {
+                FieldCheck::Range(min, max) if min > max => {
                     errors.push(
                         err(format!(
                             "`@check(range, {min}, {max})` en el campo '{}': el mínimo es mayor que el máximo -- ningún valor podría pasar nunca",
@@ -2101,6 +2156,21 @@ impl Checker {
                         .with_span(f.name_span),
                     );
                 }
+                // GRAMMAR.md §3.146: una longitud es una CANTIDAD de
+                // caracteres -- negativa o fraccionaria no tiene significado
+                // (a diferencia de `min`/`max`/`range`, que sí aceptan
+                // cualquier `f64` real porque el campo que limitan puede ser
+                // `Float`).
+                FieldCheck::MinLength(n) | FieldCheck::MaxLength(n) if *n < 0.0 || n.fract() != 0.0 => {
+                    errors.push(
+                        err(format!(
+                            "'@check(minLength/maxLength, {n})' en el campo '{}': una longitud tiene que ser un entero no negativo",
+                            f.name
+                        ))
+                        .with_span(f.name_span),
+                    );
+                }
+                _ => {}
             }
         }
         errors
@@ -2159,6 +2229,8 @@ impl Checker {
         self.check_invalidates_annotation(r, is_stream, service)?;
         self.check_infinite_annotation(r, is_stream)?;
         self.check_idempotent_annotation(r, is_stream)?;
+        self.check_cache_annotation(r, is_stream)?;
+        self.check_cors_annotation(r)?;
         let Some(Annotation::Requires { enum_name, variant_names }) = r.auth() else {
             return Ok(());
         };
@@ -3455,6 +3527,19 @@ impl Checker {
             return self.check_auth_method(field, args, env).map(Some);
         }
         let ty = match (&base_ty, field.as_str()) {
+            // `db.vacuum()`/`db.tableStats()` (GRAMMAR.md §3.151) -- a
+            // diferencia de `db.<coleccion>.<metodo>(...)` (interceptado
+            // arriba vía `Type::DbCollection`), estos son builtins sobre
+            // `db` DIRECTO, sin colección de por medio -- mismo criterio de
+            // "sin gramática nueva" que el resto de esta lista.
+            (Type::Db, "vacuum") => {
+                self.expect_no_args(args, "vacuum")?;
+                Some(Type::Void)
+            }
+            (Type::Db, "tableStats") => {
+                self.expect_no_args(args, "tableStats")?;
+                Some(Type::MapOf(Box::new(Type::String), Box::new(Type::Int)))
+            }
             (Type::Int, "toFloat") => {
                 self.expect_no_args(args, "toFloat")?;
                 Some(Type::Float)
@@ -4218,8 +4303,37 @@ impl Checker {
                 self.expect_no_args(args, "currentUserId")?;
                 Ok(Type::Optional(Box::new(Type::Int)))
             }
+            // GRAMMAR.md §3.152: bloqueo de cuenta configurable -- tres
+            // primitivas chicas en vez de un mecanismo mágico, mismo
+            // criterio que el resto del lenguaje (§9.1 del PLAN): quien
+            // escribe el `.link` decide el umbral/ventana en su PROPIO
+            // código de login, sin ninguna anotación ni flag de servidor
+            // nueva. `identifier` es responsabilidad de quien llama (email,
+            // user id como String, IP -- lo que tenga sentido para SU login).
+            "recordFailedLogin" => {
+                let [identifier] = args else {
+                    return Err(err("'recordFailedLogin' toma exactamente 1 argumento (identifier: String)"));
+                };
+                self.check_expr(identifier, &Type::String, env)?;
+                Ok(Type::Void)
+            }
+            "failedLoginCount" => {
+                let [identifier, window_seconds] = args else {
+                    return Err(err("'failedLoginCount' toma exactamente 2 argumentos (identifier: String, windowSeconds: Int)"));
+                };
+                self.check_expr(identifier, &Type::String, env)?;
+                self.check_expr(window_seconds, &Type::Int, env)?;
+                Ok(Type::Int)
+            }
+            "resetFailedLogins" => {
+                let [identifier] = args else {
+                    return Err(err("'resetFailedLogins' toma exactamente 1 argumento (identifier: String)"));
+                };
+                self.check_expr(identifier, &Type::String, env)?;
+                Ok(Type::Void)
+            }
             other => Err(err(format!(
-                "'{other}' no es un método conocido de 'auth' (createSession/createSessionWithId/destroySession/destroyAllSessions/currentRole/currentUserId)"
+                "'{other}' no es un método conocido de 'auth' (createSession/createSessionWithId/destroySession/destroyAllSessions/currentRole/currentUserId/recordFailedLogin/failedLoginCount/resetFailedLogins)"
             ))),
         }
     }
@@ -6065,6 +6179,153 @@ type T = { id: Int, s: Status }")
     }
 
     #[test]
+    fn cache_annotation_type_checks_on_a_plain_rpc() {
+        let src = r#"
+            service Stats {
+                @cache("60s")
+                rpc summary() -> Int { 1 }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn cache_annotation_rejects_a_malformed_ttl() {
+        let src = r#"
+            service Stats {
+                @cache("60")
+                rpc summary() -> Int { 1 }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn cache_annotation_rejects_being_declared_twice() {
+        let src = r#"
+            service Stats {
+                @cache("60s")
+                @cache("5m")
+                rpc summary() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("más de una vez")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn cache_annotation_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @cache("60s")
+                stream list() -> Task {
+                    db.tasks.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("cache") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn auth_lockout_builtins_type_check() {
+        let src = r#"
+            service Sys {
+                rpc onFail(email: String) -> Void { auth.recordFailedLogin(email) }
+                rpc count(email: String) -> Int { auth.failedLoginCount(email, 900) }
+                rpc onSuccess(email: String) -> Void { auth.resetFailedLogins(email) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn auth_failed_login_count_requires_string_and_int() {
+        let src = r#"service Sys { rpc f(email: Int) -> Int { auth.failedLoginCount(email, 900) } }"#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn db_vacuum_and_table_stats_type_check() {
+        let src = r#"
+            type Item = { id: Int }
+            db { items: Item[] }
+            service Admin {
+                rpc doVacuum() -> Void { db.vacuum() }
+                rpc stats() -> Map<String, Int> { db.tableStats() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn db_vacuum_rejects_arguments() {
+        let src = r#"
+            db { items: { id: Int }[] }
+            service Admin { rpc f() -> Void { db.vacuum(1) } }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn a_real_collection_named_vacuum_is_unaffected() {
+        // `db.vacuum()` (llamado DIRECTO, cero argumentos) es el builtin --
+        // pero una colección de VERDAD llamada "vacuum" sigue funcionando
+        // normal con cualquier otro método real sobre ella (GRAMMAR.md
+        // §3.151).
+        let src = r#"
+            type Item = { id: Int }
+            db { vacuum: Item[] }
+            service Admin { rpc f() -> Item[] { db.vacuum.all() } }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn cors_annotation_type_checks_and_combines_with_other_annotations() {
+        let src = r#"
+            service Sys {
+                @authenticated
+                @cors("https://a.com, https://b.com")
+                rpc f() -> Int { 1 }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn cors_annotation_is_allowed_on_a_stream() {
+        let src = r#"
+            type Item = { id: Int }
+            db { items: Item[] }
+            service Sys {
+                @cors("*")
+                stream watch() -> Item { db.items.all() }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn cors_annotation_rejects_an_empty_value() {
+        let src = r#"service Sys { @cors("") rpc f() -> Int { 1 } }"#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("no puede estar vacío"), "{msg}");
+    }
+
+    #[test]
+    fn cors_annotation_rejects_being_declared_twice() {
+        let src = r#"service Sys { @cors("*") @cors("https://a.com") rpc f() -> Int { 1 } }"#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("más de una vez")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
     fn base64_encode_and_decode_take_a_string_and_return_a_string() {
         let src = r#"
             service Codec {
@@ -7792,6 +8053,35 @@ type T = { id: Int, s: Status }")
         let src = r#"type Review = { id: Int, @check(range, 5, 1) rating: Int }"#;
         let msg = format!("{:?}", check_source(src).unwrap_err());
         assert!(msg.contains("mayor que el máximo"), "{msg}");
+    }
+
+    #[test]
+    fn check_min_length_and_max_length_type_check_on_string_fields() {
+        let src = r#"
+            type Review = {
+                id: Int,
+                @check(minLength, 1) title: String,
+                @check(maxLength, 280) comment: String,
+                @check(minLength, 3) optionalTag: String?
+            }
+            db { reviews: Review[] }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn check_min_length_rejects_a_non_string_field() {
+        let src = r#"type Review = { id: Int, @check(minLength, 1) rating: Int }"#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("solo aplica sobre `String`"), "{msg}");
+    }
+
+    #[test]
+    fn check_min_length_rejects_a_negative_or_fractional_length() {
+        let msg = format!("{:?}", check_source(r#"type Review = { id: Int, @check(minLength, -1) title: String }"#).unwrap_err());
+        assert!(msg.contains("entero no negativo"), "{msg}");
+        let msg = format!("{:?}", check_source(r#"type Review = { id: Int, @check(maxLength, 1.5) title: String }"#).unwrap_err());
+        assert!(msg.contains("entero no negativo"), "{msg}");
     }
 
     #[test]

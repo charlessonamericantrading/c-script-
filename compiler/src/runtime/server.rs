@@ -26,14 +26,17 @@
 // el límite de `Send` de arriba: lo único que cruza al hilo escritor es
 // JSON puro, nunca `Db`/`Value`.
 
-use super::db::Db;
+use super::db::{now_ms, Db};
 use super::session::SessionStore;
 use super::{
-    invoke_rpc_with_sessions, is_stream_member, live_subscribe_collection, required_auth, required_idempotent, required_rate_limit,
+    invoke_rpc_with_sessions, is_stream_member, live_subscribe_collection, required_auth, required_cache, required_cors,
+    required_idempotent, required_rate_limit,
 };
 use crate::ast::{Annotation, Item, Member};
 use crate::ast::Program;
+use crate::cache::CacheStore;
 use crate::idempotency::{hash_request_body, IdempotencyStore, Lookup};
+use crate::metrics::MetricsStore;
 use crate::rate_limit::{RateLimitSpec, RateLimiter};
 use crate::route::RoutePattern;
 use std::io::{Read, Write};
@@ -123,6 +126,28 @@ fn status_level(status: u16) -> LogLevel {
 /// que separarlo en campos propios sin inventar un schema que esta ronda
 /// no amerita, límite documentado en GRAMMAR.md §3.122, no escondido.
 fn log_done(log: LogConfig, req_id: u64, method: Option<&str>, status: u16, start: std::time::Instant, extra: &str) {
+    log_done_with_audit(log, req_id, method, status, start, extra, None)
+}
+
+/// Como `log_done`, más el rastro de auditoría de autorización (GRAMMAR.md
+/// §3.148: "quién llamó a qué rpc, con qué rol, y si se permitió o
+/// denegó") -- `audit` es `Some` SOLO para un rpc que de verdad declaró
+/// `@authenticated`/`@requires` (`check_auth_gate::AuthGateResult`, más
+/// arriba); un rpc público sigue usando `log_done` a secas, sin este campo.
+/// En modo JSON, los tres campos van como claves de PRIMER NIVEL (no
+/// enterrados en `extra`, a diferencia del resto de las anotaciones de esta
+/// línea) -- son el dato que este ítem pide poder indexar/filtrar de
+/// verdad ("mostrame todo lo que el rol X tuvo denegado"), no una nota
+/// informativa más.
+fn log_done_with_audit(
+    log: LogConfig,
+    req_id: u64,
+    method: Option<&str>,
+    status: u16,
+    start: std::time::Instant,
+    extra: &str,
+    audit: Option<&AuthAudit>,
+) {
     if status_level(status) < log.level {
         return;
     }
@@ -130,20 +155,34 @@ fn log_done(log: LogConfig, req_id: u64, method: Option<&str>, status: u16, star
     let method_field = method.unwrap_or("-");
     match log.format {
         LogFormat::Text => {
-            if extra.is_empty() {
-                println!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms}");
-            } else {
-                println!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms} {extra}");
+            let mut line = format!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms}");
+            if let Some(a) = audit {
+                line.push_str(&format!(
+                    " auth_role={:?} auth_user_id={} auth_allowed={}",
+                    a.role.as_deref().unwrap_or("-"),
+                    a.user_id.map(|id| id.to_string()).unwrap_or_else(|| "-".to_string()),
+                    a.allowed
+                ));
             }
+            if !extra.is_empty() {
+                line.push(' ');
+                line.push_str(extra);
+            }
+            println!("{line}");
         }
         LogFormat::Json => {
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "req_id": req_id,
                 "method": method,
                 "status": status,
                 "duration_ms": elapsed_ms,
                 "extra": if extra.is_empty() { None } else { Some(extra) },
             });
+            if let Some(a) = audit {
+                json["auth_role"] = a.role.clone().map(serde_json::Value::String).unwrap_or(serde_json::Value::Null);
+                json["auth_user_id"] = a.user_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
+                json["auth_allowed"] = serde_json::Value::Bool(a.allowed);
+            }
             println!("{json}");
         }
     }
@@ -203,6 +242,18 @@ struct CorsHeaders {
     /// reciben, sin agregar un parámetro más a los 16 call-sites de
     /// `cors_response`/`cors_response_with_type`.
     hsts: Option<String>,
+}
+
+/// `@cors("...")` (GRAMMAR.md §3.147) a un `CorsConfig` -- mismo formato
+/// separado-por-comas que `LINK_CORS_ORIGINS` (`main.rs::resolve_cors_origins`),
+/// más `"*"` como caso especial para `CorsConfig::Any`. El checker ya
+/// garantizó que el valor no está vacío, así que el `Allowlist` resultante
+/// siempre tiene al menos un origen.
+fn parse_cors_override(raw: &str) -> CorsConfig {
+    if raw.trim() == "*" {
+        return CorsConfig::Any;
+    }
+    CorsConfig::Allowlist(raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
 }
 
 impl CorsConfig {
@@ -350,6 +401,12 @@ pub fn serve(
     // de arriba -- un solo store para todo el proceso, mutado en el hilo
     // principal.
     let mut idempotency_store = IdempotencyStore::new();
+    // `@cache` (GRAMMAR.md §3.144): mismo criterio que `idempotency_store`
+    // de arriba.
+    let mut cache_store = CacheStore::new();
+    // `GET /metrics` (GRAMMAR.md §3.149): mismo criterio que los tres de
+    // arriba.
+    let mut metrics_store = MetricsStore::new();
     println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     match remote_changes {
@@ -362,6 +419,8 @@ pub fn serve(
                     &route_table,
                     &mut rate_limiter,
                     &mut idempotency_store,
+                    &mut cache_store,
+                    &mut metrics_store,
                     &cors,
                     hsts.as_deref(),
                     max_body_bytes,
@@ -386,8 +445,22 @@ pub fn serve(
             // "despierte" al loop.
             loop {
                 while let Ok(change) = remote_rx.try_recv() {
+                    // GRAMMAR.md §3.150: latencia real de propagación --
+                    // `sent_at_ms` viajó en el propio payload del NOTIFY
+                    // (armado por la instancia que escribió), nunca un
+                    // valor local inventado. `max(0, ...)` por si los
+                    // relojes de las dos instancias están levemente
+                    // desalineados -- una latencia negativa no tiene
+                    // sentido y solo ensuciaría el promedio.
+                    let latency_ms = (now_ms() - change.sent_at_ms).max(0);
+                    metrics_store.record_notify_latency(std::time::Duration::from_millis(latency_ms as u64));
                     db.publish_remote(&change.collection, change.event);
                 }
+                // GRAMMAR.md §3.150: reintenta cualquier NOTIFY que haya
+                // fallado por una conexión caída transitoria -- mismo tick
+                // que ya drena `remote_rx` arriba, sin ningún hilo/timer
+                // nuevo.
+                db.flush_pending_notify_retries();
                 match server.recv_timeout(REMOTE_CHANGE_POLL_INTERVAL) {
                     Ok(Some(request)) => handle_request(
                         &program,
@@ -396,6 +469,8 @@ pub fn serve(
                         &route_table,
                         &mut rate_limiter,
                         &mut idempotency_store,
+                        &mut cache_store,
+                        &mut metrics_store,
                         &cors,
                         hsts.as_deref(),
                         max_body_bytes,
@@ -433,6 +508,8 @@ fn handle_request(
     route_table: &[RouteEntry],
     rate_limiter: &mut RateLimiter,
     idempotency_store: &mut IdempotencyStore,
+    cache_store: &mut CacheStore,
+    metrics_store: &mut MetricsStore,
     cors: &CorsConfig,
     hsts: Option<&str>,
     max_body_bytes: u64,
@@ -448,6 +525,19 @@ fn handle_request(
         .iter()
         .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Origin"))
         .map(|h| h.value.as_str().to_string());
+    let path = request.url().to_string();
+    // `@cors("...")` (GRAMMAR.md §3.147): resuelve (service, rpc) del PATH
+    // solo, SIN el body -- `resolve_route` con un body vacío es seguro para
+    // esto: la rama `@route` nunca toca `body`, y la rama `/Service/rpc`
+    // solo lo usa para armar los ARGUMENTOS, no para decidir cuál rpc es
+    // (lo único que hace falta acá). Necesario ANTES del preflight OPTIONS
+    // de abajo -- un override por ruta tiene que aplicar tanto al preflight
+    // como a la respuesta real, o el browser nunca deja pasar la request
+    // real para un origen que el override permite pero el CORS global no.
+    let cors_override =
+        resolve_route(&path, "", route_table).ok().and_then(|(service_name, rpc_name, _)| required_cors(&program, service_name, rpc_name));
+    let effective_cors_config = cors_override.map(parse_cors_override);
+    let cors: &CorsConfig = effective_cors_config.as_ref().unwrap_or(cors);
     let mut cors_headers = cors.headers_for(request_origin.as_deref());
     // `--hsts`/`LINK_HSTS` (GRAMMAR.md §3.143): constante para todo el
     // proceso -- se copia acá una vez por request, en la MISMA bolsa que
@@ -462,7 +552,6 @@ fn handle_request(
 
     let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let start = std::time::Instant::now();
-    let path = request.url().to_string();
     // Nivel `Info` fijo -- mismo criterio que un 2xx/3xx en `log_done`, así
     // que a `--log-level info` (el default) esta línea sigue imprimiéndose
     // SIEMPRE, byte a byte igual que antes de esta ronda; solo se suprime
@@ -576,6 +665,19 @@ fn handle_request(
         return;
     }
 
+    // `GET /metrics` (GRAMMAR.md §3.149): formato de exposición de
+    // Prometheus. A diferencia de `/health`, NO está exento de
+    // `--service-api-key` (arriba) -- los volúmenes/latencias por rpc son
+    // más sensibles que un simple "¿está vivo?", así que si el operador
+    // configuró esa capa, Prometheus también tiene que mandarla (soportado
+    // nativamente por `scrape_configs.authorization` en `prometheus.yml`).
+    if path == "/metrics" {
+        let metrics_text = metrics_store.render_prometheus_text(&db.subscriber_counts(), db.size_bytes());
+        let _ = request.respond(cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None));
+        log_done(log, req_id, Some("metrics"), 200, start, "");
+        return;
+    }
+
     let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, &route_table) {
         Ok(resolved) => resolved,
         Err(None) => {
@@ -628,11 +730,13 @@ fn handle_request(
     // parámetros a través de un 400 detallado antes de que el caller
     // pruebe estar autorizado (GRAMMAR.md §3.14).
     let token = extract_bearer_token(&request);
-    if let Err((status, msg)) = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name) {
+    let auth_gate = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name);
+    if let Err((status, msg)) = auth_gate.outcome {
         let _ = request.respond(cors_response(status, error_json(msg), &cors_headers));
-        log_done(log, req_id, Some(&method), status, start, &format!("error={msg:?}"));
+        log_done_with_audit(log, req_id, Some(&method), status, start, &format!("error={msg:?}"), auth_gate.audit.as_ref());
         return;
     }
+    let auth_audit = auth_gate.audit;
 
     if is_stream_member(&program, service_name, rpc_name) {
         // Push real v0 (GRAMMAR.md §3.16): si el cuerpo matchea el
@@ -652,7 +756,7 @@ fn handle_request(
                     let status = status_for(&e);
                     let msg = e.to_string();
                     let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
-                    log_done(log, req_id, Some(&method), status, start, &format!("error={msg:?}"));
+                    log_done_with_audit(log, req_id, Some(&method), status, start, &format!("error={msg:?}"), auth_audit.as_ref());
                 }
             }
             return;
@@ -675,7 +779,7 @@ fn handle_request(
                 let status = status_for(&e);
                 let msg = e.to_string();
                 let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
-                log_done(log, req_id, Some(&method), status, start, &format!("error={msg:?}"));
+                log_done_with_audit(log, req_id, Some(&method), status, start, &format!("error={msg:?}"), auth_audit.as_ref());
                 return;
             }
         };
@@ -695,7 +799,7 @@ fn handle_request(
         match idempotency_store.lookup(service_name, rpc_name, key, &request_hash) {
             Lookup::Hit { status, body: cached_body, content_type } => {
                 let _ = request.respond(cors_response_with_type(status, cached_body, &content_type, &cors_headers, None, None));
-                log_done(log, req_id, Some(&method), status, start, "idempotent=\"replayed\"");
+                log_done_with_audit(log, req_id, Some(&method), status, start, "idempotent=\"replayed\"", auth_audit.as_ref());
                 db.clear_request_context();
                 return;
             }
@@ -704,11 +808,29 @@ fn handle_request(
                     "'Idempotency-Key: {key}' ya se usó en '{method}' con un body distinto -- generá una clave nueva para una operación distinta"
                 );
                 let _ = request.respond(cors_response(409, error_json(&msg), &cors_headers));
-                log_done(log, req_id, Some(&method), 409, start, &format!("error={msg:?}"));
+                log_done_with_audit(log, req_id, Some(&method), 409, start, &format!("error={msg:?}"), auth_audit.as_ref());
                 db.clear_request_context();
                 return;
             }
             Lookup::Miss => {}
+        }
+    }
+
+    // `@cache("60s")` (GRAMMAR.md §3.144): cache del lado del SERVIDOR,
+    // keyeado por (service, rpc, argumentos) -- dimensión ORTOGONAL a
+    // `@idempotent` de arriba (esa es opt-in por request vía un header del
+    // CLIENTE, esta es automática y transparente, sin ningún header). La
+    // clave usa el JSON de `args_json` tal cual llegó (sin canonicalizar
+    // orden de claves) -- mismo criterio ya aceptado del lado del cache de
+    // Query en `hooks.ts` (`JSON.stringify(params)`, GRAMMAR.md §3.124).
+    let cache_ttl = required_cache(&program, service_name, rpc_name);
+    let cache_key = cache_ttl.map(|_| args_json.to_string());
+    if let (Some(_), Some(key)) = (cache_ttl, &cache_key) {
+        if let Some((status, body, content_type)) = cache_store.get(service_name, rpc_name, key) {
+            let _ = request.respond(cors_response_with_type(status, body, &content_type, &cors_headers, None, None));
+            log_done_with_audit(log, req_id, Some(&method), status, start, "cache=\"hit\"", auth_audit.as_ref());
+            db.clear_request_context();
+            return;
         }
     }
 
@@ -724,6 +846,15 @@ fn handle_request(
         if (200..300).contains(&status) {
             let request_hash = hash_request_body(&body);
             idempotency_store.store(service_name, rpc_name, key, &request_hash, status, response_body.clone(), response_type.clone());
+        }
+    }
+    // `@cache`: mismo criterio de "solo se graba un éxito" que `@idempotent`
+    // -- un error no queda cacheado, así que el próximo caller vuelve a
+    // intentar el cuerpo real en vez de recibir una falla vieja repetida.
+    if let (Some(raw_ttl), Some(key)) = (cache_ttl, &cache_key) {
+        if (200..300).contains(&status) {
+            let ttl = crate::cache::parse_ttl(raw_ttl).expect("check_cache_annotation (checker.rs) ya validó este formato en compilación");
+            cache_store.put(service_name, rpc_name, key, status, response_body.clone(), response_type.clone(), ttl);
         }
     }
     // `response_body` en una falla es `{"error": "<mensaje>"}`
@@ -749,7 +880,13 @@ fn handle_request(
         response_location.as_deref(),
         response_cache_control.as_deref(),
     ));
-    log_done(log, req_id, Some(&method), status, start, &extra);
+    // GRAMMAR.md §3.149: alcance v0 -- solo el camino de dispatch NORMAL de
+    // un rpc suma acá. Un hit de `@idempotent`/`@cache` (arriba, ambos
+    // devuelven ANTES de llegar hasta acá) y un `stream` (spawneado en su
+    // propio hilo, nunca pasa por esta línea) no se cuentan -- ver la nota
+    // completa en GRAMMAR.md §3.149 para el porqué de cada uno.
+    metrics_store.record(&method, start.elapsed());
+    log_done_with_audit(log, req_id, Some(&method), status, start, &extra, auth_audit.as_ref());
     // Defensa en profundidad, no carga estructural: el `set_request_context`
     // de arriba ya garantiza que la PRÓXIMA request nunca ve el contexto de
     // esta. Limpiarlo acá además evita que sobreviva en memoria más de lo
@@ -1079,25 +1216,54 @@ fn extract_idempotency_key(request: &tiny_http::Request) -> Option<String> {
 /// resueltos para que `auth.createSession`/`destroySession` funcionen
 /// dentro de un cuerpo. Nunca construye ningún `Value` del intérprete: solo
 /// compara strings contra lo que `SessionStore` ya guarda.
+/// Resultado de `check_auth_gate` -- separa la decisión (`outcome`, lo que
+/// de verdad cambia la respuesta) del rastro de auditoría (GRAMMAR.md
+/// §3.148: "quién llamó a qué rpc, con qué rol, y si se permitió o
+/// denegó"). `audit` es `Some` SOLO cuando el rpc de verdad declaró
+/// `@authenticated`/`@requires` -- un rpc público no genera ruido de
+/// auditoría, no hay ninguna decisión de autorización que registrar ahí.
+struct AuthGateResult {
+    outcome: Result<(), (u16, &'static str)>,
+    audit: Option<AuthAudit>,
+}
+
+struct AuthAudit {
+    /// El rol resuelto de la sesión, si había un token válido -- `None` si
+    /// la request vino sin token o con uno que no resolvió a ninguna sesión
+    /// real (los dos casos que `sessions.role_for` no puede distinguir del
+    /// lado de quién llama, mismo criterio que el 401 que ya devuelve).
+    role: Option<String>,
+    user_id: Option<i64>,
+    allowed: bool,
+}
+
+/// ¿Puede ESTA request llamar a `{service_name}.{rpc_name}`? La ÚNICA
+/// decisión de autorización de todo el servidor -- vive acá, no en el
+/// intérprete (`runtime/mod.rs`), que solo recibe `sessions`/`token` ya
+/// resueltos para que `auth.createSession`/`destroySession` funcionen
+/// dentro de un cuerpo. Nunca construye ningún `Value` del intérprete: solo
+/// compara strings contra lo que `SessionStore` ya guarda.
 fn check_auth_gate(
     program: &Program,
     sessions: &SessionStore,
     token: Option<&str>,
     service_name: &str,
     rpc_name: &str,
-) -> Result<(), (u16, &'static str)> {
+) -> AuthGateResult {
     // `None` cubre "sin anotación" Y "rpc desconocido" -- ese segundo caso
     // lo detecta con el error real `invoke_rpc_with_sessions` más abajo.
     let Some(annotation) = required_auth(program, service_name, rpc_name) else {
-        return Ok(());
+        return AuthGateResult { outcome: Ok(()), audit: None };
     };
-    let Some(tok) = token else {
-        return Err((401, "se requiere autenticación"));
+    let role_info = token.and_then(|tok| sessions.role_for(tok).map(|(enum_, variant)| (tok, enum_, variant)));
+    let user_id = token.and_then(|tok| sessions.user_id_for(tok));
+    let audit_role = role_info.as_ref().map(|(_, _, variant)| variant.clone());
+    let mk_audit = |allowed: bool| Some(AuthAudit { role: audit_role.clone(), user_id, allowed });
+
+    let Some((_, role_enum, role_variant)) = role_info else {
+        return AuthGateResult { outcome: Err((401, "se requiere autenticación")), audit: mk_audit(false) };
     };
-    let Some((role_enum, role_variant)) = sessions.role_for(tok) else {
-        return Err((401, "se requiere autenticación"));
-    };
-    match annotation {
+    let outcome = match annotation {
         Annotation::Authenticated => Ok(()),
         // `role_enum == ""` es el sentinel de `SessionStore::role_for`
         // (GRAMMAR.md §3.64) para "esta sesión viene de un JWT externo, sin
@@ -1127,8 +1293,11 @@ fn check_auth_gate(
         | Annotation::Example { .. }
         | Annotation::Invalidates(_)
         | Annotation::Infinite { .. }
-        | Annotation::Idempotent => Ok(()),
-    }
+        | Annotation::Idempotent
+        | Annotation::Cache(_)
+        | Annotation::Cors(_) => Ok(()),
+    };
+    AuthGateResult { audit: mk_audit(outcome.is_ok()), outcome }
 }
 
 /// El Content-Type que declaró el rpc con `@content_type("...")`, si lo hizo

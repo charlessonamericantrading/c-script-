@@ -759,3 +759,53 @@ fn idempotent_rejects_the_same_key_reused_with_a_different_body_over_a_real_subp
     server.shutdown();
 }
 
+/// `@cache("60s")` (GRAMMAR.md §3.144): `summary` inserta una fila real cada
+/// vez que CORRE de verdad -- `rowCount` (sin `@cache`) es lo que prueba que
+/// un segundo POST dentro del TTL nunca ejecutó el cuerpo de nuevo, no solo
+/// que devolvió un número parecido.
+const CACHE_PROGRAM: &str = r#"
+    type Stat = { id: Int, n: Int }
+    db { stats: Stat[] }
+    service Stats {
+        @cache("60s")
+        rpc summary() -> Int {
+            db.stats.insert(Stat { id: 0, n: 1 });
+            db.stats.all().length()
+        }
+        rpc rowCount() -> Int { db.stats.all().length() }
+    }
+"#;
+
+#[test]
+fn cache_replays_the_stored_result_within_the_ttl_without_rerunning_the_body_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("cache-replay", CACHE_PROGRAM);
+
+    let (status1, body1) = server.post("/Stats/summary", &json!({}), None);
+    assert_eq!(status1, 200, "body: {body1:?}");
+    assert_eq!(body1, json!(1));
+
+    let (status2, body2) = server.post("/Stats/summary", &json!({}), None);
+    assert_eq!(status2, 200, "body: {body2:?}");
+    assert_eq!(body2, json!(1), "un hit de cache repite EXACTAMENTE el resultado grabado");
+
+    let (_, row_count) = server.post("/Stats/rowCount", &json!({}), None);
+    assert_eq!(row_count, json!(1), "el segundo POST no debió haber insertado una segunda fila");
+
+    server.shutdown();
+}
+
+#[test]
+fn a_rpc_without_cache_runs_its_body_every_time_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("cache-none", CACHE_PROGRAM);
+
+    server.post("/Stats/rowCount", &json!({}), None);
+    // `rowCount` no tiene `@cache` -- llamarlo dos veces no inserta nada (no
+    // muta), pero confirma que un rpc sin la anotación nunca pasa por el
+    // camino de cache (status 200 estable, sin efectos raros).
+    let (status, body) = server.post("/Stats/rowCount", &json!({}), None);
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body, json!(0));
+
+    server.shutdown();
+}
+

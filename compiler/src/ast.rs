@@ -278,6 +278,16 @@ pub enum FieldCheck {
     /// el checker (GRAMMAR.md §3.96), no acá: el parser no resuelve tipos,
     /// así que no puede decidir todavía si esto es un error real.
     Range(f64, f64),
+    /// `@check(minLength, N)` (GRAMMAR.md §3.146) -- sobre `String`/
+    /// `String?`, no numérico: la CANTIDAD de caracteres tiene que ser
+    /// `>= N`. `@check(minLength, 1)` es la forma de expresar "no vacío".
+    /// `f64` por el mismo motivo que `Min`/`Max`/`Range` -- el checker
+    /// valida que sea un entero no negativo, acá el parser solo guarda el
+    /// número tal cual se escribió.
+    MinLength(f64),
+    /// `@check(maxLength, N)` -- la cantidad de caracteres tiene que ser
+    /// `<= N`.
+    MaxLength(f64),
 }
 
 /// Las dos formas de `@validate(...)` que un campo `String`/`String?` admite
@@ -466,6 +476,26 @@ impl RpcDecl {
         self.annotations.iter().any(|a| matches!(a, Annotation::Idempotent))
     }
 
+    /// La duración cruda de `@cache("60s")`, si hay (GRAMMAR.md §3.144) --
+    /// texto sin parsear, mismo criterio que `rate_limit()`/`cache_control()`:
+    /// el checker valida el formato, acá es solo el string tal como se
+    /// escribió.
+    pub fn cache(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::Cache(ttl) => Some(ttl.as_str()),
+            _ => None,
+        })
+    }
+
+    /// El valor crudo de `@cors("...")`, si hay (GRAMMAR.md §3.147) --
+    /// texto sin parsear, mismo criterio que `rate_limit()`/`cache()`.
+    pub fn cors(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::Cors(v) => Some(v.as_str()),
+            _ => None,
+        })
+    }
+
     /// Mismo heurístico "nombre por forma" en UN solo lugar -- lo usan
     /// `codegen::ts_emit::emit_hooks` (para decidir si un rpc genera un
     /// hook `use...Query`) Y `checker::check_invalidates_annotation` (para
@@ -567,6 +597,24 @@ pub enum Annotation {
     /// caller que no manda el header no ve ningún cambio de comportamiento
     /// -- la deduplicación es opt-in por REQUEST, no forzada por el rpc.
     Idempotent,
+    /// `@cache("60s")` (GRAMMAR.md §3.144) -- cachea el resultado de una
+    /// ejecución EXITOSA en el servidor, keyeado por (service, rpc,
+    /// argumentos), por la duración dada (`Ns`/`Nm`/`Nh`/`Nd`, mismo formato
+    /// que `--session-ttl`). Para lecturas costosas y poco cambiantes --
+    /// dimensión ORTOGONAL a `@cache_control` (que solo le dice al CLIENTE
+    /// cuánto puede cachear; esto cachea del lado del SERVIDOR, ahorrando la
+    /// ejecución real del cuerpo). Alcance v0: sin invalidación cruzada con
+    /// `@invalidates` (esa es una cache de CLIENTE separada) -- una entrada
+    /// expira sola por tiempo, nunca antes.
+    Cache(String),
+    /// `@cors("https://a.com, https://b.com")` o `@cors("*")` (GRAMMAR.md
+    /// §3.147) -- override de CORS por rpc/stream, mismo formato
+    /// separado-por-comas que `LINK_CORS_ORIGINS` (main.rs). Reemplaza
+    /// ENTERO al `--cors-origin`/`LINK_CORS_ORIGINS` global para ESTE
+    /// endpoint puntual (nunca lo combina) -- el caso real: la API entera
+    /// detrás de un allowlist, salvo un endpoint público (un widget, un
+    /// sitemap) que necesita otro origen o `*`.
+    Cors(String),
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

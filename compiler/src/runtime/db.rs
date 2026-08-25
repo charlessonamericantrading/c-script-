@@ -281,6 +281,12 @@ pub(crate) fn check_clause_sql(field: &str, check: &FieldCheck) -> String {
         FieldCheck::Min(min) => format!("CHECK (\"{field}\" >= {min})"),
         FieldCheck::Max(max) => format!("CHECK (\"{field}\" <= {max})"),
         FieldCheck::Range(min, max) => format!("CHECK (\"{field}\" >= {min} AND \"{field}\" <= {max})"),
+        // GRAMMAR.md §3.146: `length(...)` cuenta CARACTERES (no bytes) en
+        // los dos motores para una columna de texto -- mismo criterio que
+        // `check_string_length` (runtime/mod.rs) del lado de la aplicación,
+        // ninguno de los dos cuenta bytes UTF-8.
+        FieldCheck::MinLength(min) => format!("CHECK (length(\"{field}\") >= {min})"),
+        FieldCheck::MaxLength(max) => format!("CHECK (length(\"{field}\") <= {max})"),
     }
 }
 
@@ -616,6 +622,17 @@ pub struct Db {
     /// (`Db::call`/`Db::subscribe`), nunca desde ningún hilo escritor (que
     /// solo recibe el `Receiver`, ya extraído, nunca vuelve a tocar `Db`).
     subscribers: RefCell<HashMap<String, Vec<SyncSender<serde_json::Value>>>>,
+    /// Cola ACOTADA de `NOTIFY` que fallaron por un motivo TRANSITORIO
+    /// (conexión caída -- nunca el caso "payload de más de 8000 bytes",
+    /// que jamás se arregla solo reintentando, GRAMMAR.md §3.150). Un
+    /// cambio local ya se publicó `deliver_local` de todos modos -- esto
+    /// SOLO afecta si OTRAS instancias se enteran. `runtime/server.rs`
+    /// reintenta drenar esta cola en cada vuelta del loop que ya escucha
+    /// cambios remotos (Postgres únicamente, mismo tick de 200ms que
+    /// `REMOTE_CHANGE_POLL_INTERVAL`). Acotada (`MAX_PENDING_NOTIFY_RETRIES`)
+    /// -- descarta la más VIEJA al llenarse, nunca crece sin límite si la
+    /// base queda caída por mucho tiempo.
+    pending_notify_retries: RefCell<std::collections::VecDeque<(String, serde_json::Value)>>,
     /// Contexto de LA request HTTP que está invocando un rpc ahora mismo --
     /// body crudo + headers, para `request.rawBody()`/`request.header()`
     /// (GRAMMAR.md §3.38). `server.rs` lo fija justo antes de invocar el rpc
@@ -687,6 +704,12 @@ pub struct Db {
 pub(crate) struct RemoteChange {
     pub collection: String,
     pub event: serde_json::Value,
+    /// Epoch ms de cuando la instancia ORIGEN mandó el `NOTIFY` (GRAMMAR.md
+    /// §3.150) -- `runtime/server.rs` resta esto de "ahora" al drenar el
+    /// canal para medir la latencia de propagación real, sin necesitar
+    /// relojes sincronizados entre instancias más allá de lo que ya asume
+    /// cualquier métrica de este tipo (NTP de sistema operativo normal).
+    pub sent_at_ms: i64,
 }
 
 /// Un solo canal de Postgres para TODOS los cambios de TODAS las
@@ -707,6 +730,13 @@ const REMOTE_CHANGE_BUFFER: usize = 1024;
 /// instancias (límite honesto, GRAMMAR.md §3.44): partirlo o comprimirlo
 /// abriría su propia complejidad para un caso de borde.
 const MAX_NOTIFY_PAYLOAD_BYTES: usize = 7900;
+
+/// Cuántos `NOTIFY` fallidos por conexión caída tolera la cola de reintento
+/// (GRAMMAR.md §3.150) antes de descartar el más VIEJO -- un número chico
+/// a propósito: esta cola existe para cubrir una caída CORTA (segundos,
+/// hasta que `with_reconnect` repare la conexión sola), no como un
+/// almacenamiento durable de cambios pendientes.
+const MAX_PENDING_NOTIFY_RETRIES: usize = 50;
 
 /// Un id de instancia nuevo, del CSPRNG del sistema -- mismo origen de
 /// entropía que `crypto.uuid()`/`crypto.randomToken` (GRAMMAR.md §3.34), acá
@@ -859,7 +889,16 @@ fn parse_remote_notification(payload: &str, my_instance_id: &str) -> Option<Remo
     }
     let collection = v.get("collection")?.as_str()?.to_string();
     let event = v.get("event")?.clone();
-    Some(RemoteChange { collection, event })
+    // `unwrap_or(now)` en vez de `?`: un payload de una instancia VIEJA (de
+    // antes de GRAMMAR.md §3.150, sin este campo) sigue propagándose --
+    // solo pierde la métrica de latencia para ESE evento puntual, nunca el
+    // evento en sí.
+    let sent_at_ms = v.get("sent_at_ms").and_then(|v| v.as_i64()).unwrap_or_else(now_ms);
+    Some(RemoteChange { collection, event, sent_at_ms })
+}
+
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 impl Db {
@@ -951,6 +990,7 @@ impl Db {
             simple_enums,
             columns,
             subscribers: RefCell::new(HashMap::new()),
+            pending_notify_retries: RefCell::new(std::collections::VecDeque::new()),
             current_request: RefCell::new(None),
             response_status_override: std::cell::Cell::new(None),
             response_location_override: RefCell::new(None),
@@ -1081,6 +1121,7 @@ impl Db {
                 simple_enums,
                 columns,
                 subscribers: RefCell::new(HashMap::new()),
+                pending_notify_retries: RefCell::new(std::collections::VecDeque::new()),
                 current_request: RefCell::new(None),
                 response_status_override: std::cell::Cell::new(None),
                 response_location_override: RefCell::new(None),
@@ -1205,6 +1246,71 @@ db { users: User[] }
     /// que devuelve un resultado viejo no sirve para nada.
     pub fn health_check(&self) -> Result<(), String> {
         self.backend.execute_ddl("SELECT 1")
+    }
+
+    /// `GET /metrics` (GRAMMAR.md §3.149): tamaño de la base en bytes, o
+    /// `None` si la query falla (nunca hace fallar `/metrics` entero por
+    /// esto -- ver `runtime/server.rs`). SQLite no tiene una función SQL
+    /// directa para "tamaño del archivo", pero `page_count * page_size` (dos
+    /// `PRAGMA`, consultables como cualquier `SELECT`) es exacto -- es
+    /// literalmente cómo SQLite calcula el tamaño del archivo por dentro.
+    /// Postgres sí tiene una función dedicada, `pg_database_size`.
+    pub fn size_bytes(&self) -> Option<i64> {
+        match &self.backend {
+            Backend::Sqlite(_) => {
+                let page_count = self.backend.query("PRAGMA page_count", &[], &[ColumnKind::Int]).ok()?;
+                let page_size = self.backend.query("PRAGMA page_size", &[], &[ColumnKind::Int]).ok()?;
+                let Some(Cell::Int(pc)) = page_count.first().and_then(|r| r.first()) else { return None };
+                let Some(Cell::Int(ps)) = page_size.first().and_then(|r| r.first()) else { return None };
+                Some(pc * ps)
+            }
+            Backend::Postgres { .. } => {
+                let rows = self.backend.query("SELECT pg_database_size(current_database())", &[], &[ColumnKind::Int]).ok()?;
+                match rows.first().and_then(|r| r.first()) {
+                    Some(Cell::Int(n)) => Some(*n),
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    /// `db.vacuum() -> Void` (GRAMMAR.md §3.151) -- `VACUUM` real contra el
+    /// motor, mismo comando en los dos backends. Sin ninguna gramática
+    /// nueva del lado de c-script: un builtin sin argumentos sobre `db`
+    /// (`Value::Db`), pensado para exponerse detrás de `@requires(Role.Admin)`
+    /// en el propio `.link` de quien lo necesite -- la gramática de
+    /// autorización YA existe, este ítem no inventa una nueva.
+    pub fn run_vacuum(&self) -> Result<(), String> {
+        self.backend.execute_ddl("VACUUM")
+    }
+
+    /// `db.tableStats() -> Map<String, Int>` (GRAMMAR.md §3.151) -- cuántas
+    /// filas tiene CADA colección declarada, contando FILAS FÍSICAS (sin
+    /// filtrar `@softDelete`) -- a propósito distinto de `count()`, que sí
+    /// filtra: el caso de uso es diagnóstico de tamaño real de la tabla,
+    /// donde una fila soft-deleteada sigue ocupando espacio real.
+    pub fn table_stats(&self) -> Result<Vec<(String, i64)>, String> {
+        let mut out = Vec::with_capacity(self.columns.len());
+        for collection in self.columns.keys() {
+            let rows = self.backend.query(&format!("SELECT COUNT(*) FROM \"{collection}\""), &[], &[ColumnKind::Int])?;
+            let Some(Cell::Int(n)) = rows.first().and_then(|r| r.first()) else {
+                return Err(format!("tableStats: no se pudo leer el conteo de '{collection}'"));
+            };
+            out.push((collection.clone(), *n));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// `GET /metrics` (GRAMMAR.md §3.149): cuántos clientes están
+    /// suscriptos a cada colección AHORA MISMO, para el gauge
+    /// `linkc_stream_subscribers`. Mismo límite ya documentado de
+    /// `deliver_local` -- un suscriptor desconectado se poda RECIÉN en la
+    /// próxima publicación a esa colección, así que este conteo puede
+    /// sobre-reportar temporalmente hasta esa próxima escritura; no hay
+    /// forma de saber que un cliente se fue sin intentar escribirle.
+    pub fn subscriber_counts(&self) -> Vec<(String, usize)> {
+        self.subscribers.borrow().iter().map(|(collection, txs)| (collection.clone(), txs.len())).collect()
     }
 
     /// Ver la doc de `Db::current_request` (arriba). Llamado por
@@ -1531,10 +1637,34 @@ db { users: User[] }
     }
 
     fn notify_remote(&self, collection: &str, json: &serde_json::Value) {
+        if self.try_notify_remote(collection, json) {
+            return;
+        }
+        // Falla TRANSITORIA (conexión caída) -- se encola para reintentar
+        // en el próximo tick del loop de `server.rs` (GRAMMAR.md §3.150),
+        // acotado para no crecer sin límite si la base queda caída mucho
+        // tiempo. El payload de más de 8000 bytes NUNCA llega hasta acá --
+        // `try_notify_remote` lo descarta con su propio aviso, sin encolar
+        // nada (reintentarlo no lo arreglaría).
+        let mut queue = self.pending_notify_retries.borrow_mut();
+        if queue.len() >= MAX_PENDING_NOTIFY_RETRIES {
+            queue.pop_front();
+        }
+        queue.push_back((collection.to_string(), json.clone()));
+    }
+
+    /// El envío real de un `NOTIFY` -- `true` si salió bien (o si el
+    /// payload supera el límite y se descartó a propósito, `false` SOLO
+    /// ante una falla transitoria que vale la pena reintentar). Separado de
+    /// `notify_remote` para que tanto el envío original como
+    /// `flush_pending_notify_retries` (más abajo) compartan la MISMA
+    /// lógica de encolar en vez de tener dos copias que puedan divergir.
+    fn try_notify_remote(&self, collection: &str, json: &serde_json::Value) -> bool {
         let payload = serde_json::json!({
             "instance": self.instance_id,
             "collection": collection,
             "event": json,
+            "sent_at_ms": now_ms(),
         })
         .to_string();
         if payload.len() > MAX_NOTIFY_PAYLOAD_BYTES {
@@ -1543,10 +1673,28 @@ db { users: User[] }
                  ({MAX_NOTIFY_PAYLOAD_BYTES}) -- no se propaga a otras instancias (GRAMMAR.md §3.44)",
                 payload.len()
             );
-            return;
+            return true;
         }
-        if let Err(e) = self.backend.notify(REMOTE_CHANGE_CHANNEL, &payload) {
-            eprintln!("aviso: no se pudo notificar el cambio en '{collection}' a otras instancias: {e}");
+        match self.backend.notify(REMOTE_CHANGE_CHANNEL, &payload) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("aviso: no se pudo notificar el cambio en '{collection}' a otras instancias: {e}");
+                false
+            }
+        }
+    }
+
+    /// Reintenta cada `NOTIFY` pendiente en la cola acotada (GRAMMAR.md
+    /// §3.150) -- llamado por `runtime/server.rs` en cada vuelta del loop
+    /// que ya escucha cambios remotos, así que no hace falta ningún hilo ni
+    /// timer nuevo. Los que salen bien se sacan de la cola; los que vuelven
+    /// a fallar quedan para el próximo tick, en el mismo orden (FIFO).
+    pub(crate) fn flush_pending_notify_retries(&self) {
+        let pending: Vec<(String, serde_json::Value)> = self.pending_notify_retries.borrow_mut().drain(..).collect();
+        for (collection, json) in pending {
+            if !self.try_notify_remote(&collection, &json) {
+                self.pending_notify_retries.borrow_mut().push_back((collection, json));
+            }
         }
     }
 
@@ -2164,6 +2312,38 @@ mod tests {
         assert!(parse_remote_notification("no es json", "cualquiera").is_none());
         assert!(parse_remote_notification("{}", "cualquiera").is_none());
         assert!(parse_remote_notification(r#"{"instance":"x"}"#, "cualquiera").is_none(), "falta collection/event");
+    }
+
+    /// GRAMMAR.md §3.150: `sent_at_ms` viaja en el payload real (armado por
+    /// `try_notify_remote`) y se decodifica tal cual -- la métrica de
+    /// latencia de `server.rs` depende de que este valor sea EXACTO, no
+    /// recalculado del lado receptor.
+    #[test]
+    fn parse_remote_notification_decodes_sent_at_ms() {
+        let payload = serde_json::json!({
+            "instance": "otra-instancia",
+            "collection": "items",
+            "event": {"id": 1},
+            "sent_at_ms": 1_700_000_000_000i64,
+        })
+        .to_string();
+        let change = parse_remote_notification(&payload, "mi-instancia").expect("debió parsear");
+        assert_eq!(change.sent_at_ms, 1_700_000_000_000);
+    }
+
+    /// Compatibilidad hacia atrás: un payload de una instancia vieja (antes
+    /// de GRAMMAR.md §3.150, sin este campo) sigue propagando el evento --
+    /// solo pierde la métrica de latencia para ESE evento puntual.
+    #[test]
+    fn parse_remote_notification_tolerates_a_payload_without_sent_at_ms() {
+        let payload = serde_json::json!({
+            "instance": "otra-instancia",
+            "collection": "items",
+            "event": {"id": 1},
+        })
+        .to_string();
+        let change = parse_remote_notification(&payload, "mi-instancia").expect("debió parsear igual, sin el campo nuevo");
+        assert_eq!(change.event, serde_json::json!({"id": 1}));
     }
 
     #[test]

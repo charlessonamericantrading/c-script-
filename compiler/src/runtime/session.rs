@@ -133,6 +133,12 @@ struct SessionEntry {
 /// `std::sync::Mutex` para un re-lock del mismo hilo.
 pub struct SessionStore {
     sessions: RefCell<HashMap<String, SessionEntry>>,
+    /// Bloqueo de cuenta (GRAMMAR.md §3.152) -- timestamps de intentos
+    /// fallidos por `identifier` (email, user id como String, lo que decida
+    /// quien llama), más viejo primero para que podar por ventana sea
+    /// barato (cortar del frente). `RefCell`, mismo criterio que
+    /// `sessions`.
+    failed_logins: RefCell<HashMap<String, std::collections::VecDeque<Instant>>>,
     /// Configurado UNA vez al construir el store (`--session-ttl`/
     /// `LINK_SESSION_TTL`, GRAMMAR.md §3.50) -- nunca cambia sesión a
     /// sesión, así que vivir en el store entero (no en cada `create`) es
@@ -148,7 +154,7 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn new() -> Self {
-        SessionStore { sessions: RefCell::new(HashMap::new()), ttl: None, jwt: None }
+        SessionStore { sessions: RefCell::new(HashMap::new()), failed_logins: RefCell::new(HashMap::new()), ttl: None, jwt: None }
     }
 
     /// Como `new()`, pero cada sesión que este store cree expira `ttl`
@@ -156,7 +162,44 @@ impl SessionStore {
     /// `runtime::server::serve`, cuando `--session-ttl`/`LINK_SESSION_TTL`
     /// están configurados.
     pub fn with_ttl(ttl: Duration) -> Self {
-        SessionStore { sessions: RefCell::new(HashMap::new()), ttl: Some(ttl), jwt: None }
+        SessionStore { sessions: RefCell::new(HashMap::new()), failed_logins: RefCell::new(HashMap::new()), ttl: Some(ttl), jwt: None }
+    }
+
+    /// `auth.recordFailedLogin(identifier)` (GRAMMAR.md §3.152) -- agrega
+    /// un timestamp AHORA a la lista de `identifier`. No poda acá (lo hace
+    /// `failed_login_count`, con la ventana real que el caller recién en
+    /// ESE momento decide) -- una entrada vieja sin consultar nunca más
+    /// simplemente queda sin usarse hasta que algo la pode; un lockout real
+    /// consulta seguido, así que esto no crece sin límite en la práctica.
+    pub fn record_failed_login(&self, identifier: &str) {
+        self.failed_logins.borrow_mut().entry(identifier.to_string()).or_default().push_back(Instant::now());
+    }
+
+    /// `auth.failedLoginCount(identifier, windowSeconds)` -- cuántos
+    /// intentos fallidos quedan DENTRO de los últimos `window` (podando los
+    /// que ya vencieron, del frente de la cola -- más viejo primero por
+    /// construcción, así que cortar en el primer que todavía entra es
+    /// correcto sin recorrer toda la lista).
+    pub fn failed_login_count(&self, identifier: &str, window: Duration) -> i64 {
+        let now = Instant::now();
+        let mut map = self.failed_logins.borrow_mut();
+        let Some(times) = map.get_mut(identifier) else { return 0 };
+        while let Some(&front) = times.front() {
+            if now.saturating_duration_since(front) > window {
+                times.pop_front();
+            } else {
+                break;
+            }
+        }
+        times.len() as i64
+    }
+
+    /// `auth.resetFailedLogins(identifier)` -- llamado tras un login
+    /// EXITOSO (GRAMMAR.md §3.152): un intento bueno borra el historial de
+    /// fallos previos, no los deja acumulándose contra un usuario legítimo
+    /// que solo se equivocó de contraseña un par de veces.
+    pub fn reset_failed_logins(&self, identifier: &str) {
+        self.failed_logins.borrow_mut().remove(identifier);
     }
 
     /// Habilita verificar JWTs externos ADEMÁS de las sesiones propias de
@@ -284,6 +327,43 @@ impl Default for SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_login_count_is_zero_for_an_identifier_never_recorded() {
+        let store = SessionStore::new();
+        assert_eq!(store.failed_login_count("nadie@x.com", Duration::from_secs(900)), 0);
+    }
+
+    #[test]
+    fn record_failed_login_accumulates_within_the_window() {
+        let store = SessionStore::new();
+        store.record_failed_login("a@x.com");
+        store.record_failed_login("a@x.com");
+        store.record_failed_login("a@x.com");
+        assert_eq!(store.failed_login_count("a@x.com", Duration::from_secs(900)), 3);
+        // Otro identifier, contador propio.
+        assert_eq!(store.failed_login_count("b@x.com", Duration::from_secs(900)), 0);
+    }
+
+    #[test]
+    fn failed_login_count_excludes_attempts_outside_the_window() {
+        let store = SessionStore::new();
+        store.record_failed_login("a@x.com");
+        // Ventana de 0 segundos: el intento que se acaba de grabar ya está
+        // "afuera" (el chequeo es `> window`, así que cualquier duración
+        // positiva transcurrida excede una ventana de 0).
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(store.failed_login_count("a@x.com", Duration::from_secs(0)), 0);
+    }
+
+    #[test]
+    fn reset_failed_logins_clears_the_count() {
+        let store = SessionStore::new();
+        store.record_failed_login("a@x.com");
+        store.record_failed_login("a@x.com");
+        store.reset_failed_logins("a@x.com");
+        assert_eq!(store.failed_login_count("a@x.com", Duration::from_secs(900)), 0);
+    }
 
     #[test]
     fn create_then_role_for_round_trips() {
