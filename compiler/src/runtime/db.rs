@@ -546,7 +546,25 @@ fn warn_if_table_looks_unrelated(backend: &Backend, collection: &str, columns: &
     }
 
     let declared: Vec<&str> = columns.iter().map(|c| c.field.name.as_str()).collect();
-    if declared.iter().any(|name| existing.contains(*name)) {
+
+    // GRAMMAR.md §3.94: nombres de convención de auditoría (`createdAt`/
+    // `updatedAt`/`deletedAt` -- la misma terna que `@autoUpdate`/
+    // `@softDelete` promueven como estándar en todo el lenguaje, GRAMMAR.md
+    // §3.68/§3.63) son tan comunes entre programas SIN ninguna relación
+    // real entre sí que, solos, no son evidencia de nada: dos servicios de
+    // dos equipos distintos casi seguro los nombran igual por seguir la
+    // convención del lenguaje, no porque compartan la tabla a propósito --
+    // el landmine real que esta lista cierra es una colisión accidental de
+    // nombre de tabla que la advertencia de arriba NO detecta solo porque
+    // las dos partes, sin relación, declararon `createdAt`. Si el struct
+    // declara al menos un campo FUERA de esta lista, la comparación de
+    // overlap lo ignora; si el struct no tiene NINGÚN campo fuera de ella
+    // (caso raro -- un struct compuesto solo por campos de auditoría), cae
+    // de vuelta a considerarlos a todos, mejor una señal débil que ninguna.
+    const GENERIC_AUDIT_FIELDS: [&str; 3] = ["createdAt", "updatedAt", "deletedAt"];
+    let meaningful: Vec<&str> = declared.iter().copied().filter(|name| !GENERIC_AUDIT_FIELDS.contains(name)).collect();
+    let evidence_set: &[&str] = if meaningful.is_empty() { &declared } else { &meaningful };
+    if evidence_set.iter().any(|name| existing.contains(*name)) {
         return;
     }
 

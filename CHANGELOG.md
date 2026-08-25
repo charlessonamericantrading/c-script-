@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.103.0] - 2026-08-25
+
+### 🔧 Corregido
+- **Aviso de colisión de tabla en Postgres (GRAMMAR.md §3.94): `createdAt`/`updatedAt`/`deletedAt` ya no cuentan solos como evidencia de que dos programas están relacionados.** Encontrado en un barrido propio de "límites honestos" pendientes en toda la documentación, motivado por el incidente real de puertos de IgnisLove (v1.102.0): un límite documentado con meses de anticipación recién se rompió cuando alguien lo tocó en producción -- ¿qué otros límites ya documentados tienen ese mismo perfil de riesgo? Auditando §3.94 con esa pregunta apareció que la convención de auditoría que el propio lenguaje promueve (`createdAt: Timestamp = now()`, `@autoUpdate`, `@softDelete`) hace casi seguro que dos programas SIN ninguna relación real compartan ese nombre de campo -- antes, un solo nombre en común alcanzaba para suprimir la advertencia de colisión de tabla, exactamente el escenario que existe para atrapar.
+
+  Ahora esa terna se ignora como evidencia de relación; si el struct declarado no tiene NINGÚN campo fuera de ella (caso raro), cae de vuelta al comportamiento anterior. Sin cambio de comportamiento para el resto de los nombres de campo (dominio propio, como `sessionId`/`productId`) -- la heurística general sigue siendo la misma.
+
+1158 tests (2 nuevos) en `pg_integration.rs` contra Postgres real: dos `.link` sin relación que SOLO comparten `createdAt` siguen disparando la advertencia (antes de este fix, no lo hacían); un struct compuesto únicamente por campos de auditoría cae de vuelta al comportamiento anterior sin regresión. Detalle completo: GRAMMAR.md §3.94, PLAN.md §9.3.
+
 ## [1.102.0] - 2026-08-25
 
 ### ✨ Nuevo

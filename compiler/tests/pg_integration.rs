@@ -2062,6 +2062,122 @@ service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
     assert!(!server_v2.stderr().to_lowercase().contains("advertencia"), "'name' se comparte -- no debería avisar nada: {}", server_v2.stderr());
 }
 
+/// GRAMMAR.md §3.94: el landmine real que este test cierra -- antes de
+/// esta ronda, DOS programas sin ninguna relación entre sí, que solo
+/// coinciden en seguir la convención de nombre `createdAt` (§3.68) que el
+/// propio lenguaje promueve, se veían como "relacionados" (un nombre en
+/// común alcanzaba para suprimir la advertencia de §3.94) -- exactamente el
+/// tipo de colisión accidental que la advertencia existe para atrapar,
+/// pasando desapercibida solo porque los dos siguieron la misma convención
+/// de campo de auditoría, no porque compartieran la tabla a propósito.
+#[test]
+fn sharing_only_a_generic_audit_field_name_like_created_at_still_warns() {
+    const COLLECTION: &str = "items_generic_field_collision";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("generic-field-collision");
+    let link_a = temp.write(
+        "a.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, orderTotal: Float, createdAt: Timestamp = now() }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc create(orderTotal: Float) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, orderTotal: orderTotal, createdAt: now() }}) }} }}
+"#
+        ),
+    );
+    let server_a = Serve::start(&link_a, &url);
+    server_a.rpc("Items/create", r#"{"orderTotal":9.5}"#);
+    drop(server_a);
+
+    // "b.link" declara la MISMA colección, con el ÚNICO nombre en común
+    // siendo "createdAt" -- el escenario real: dos servicios sin relación
+    // que ambos siguen la convención `createdAt: Timestamp = now()` del
+    // lenguaje. Antes de esta ronda, ese solo nombre alcanzaba para NO
+    // avisar; ahora los campos de auditoría (createdAt/updatedAt/
+    // deletedAt) se ignoran como evidencia de relación real.
+    let link_b = temp.write(
+        "b.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, sessionId: String?, createdAt: Timestamp = now() }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+    let server_b = Serve::start(&link_b, &url);
+    let listed = server_b.rpc("Items/list", "{}");
+    assert!(listed.is_array(), "{listed:?}");
+
+    let stderr = server_b.stderr();
+    assert!(stderr.to_lowercase().contains("advertencia"), "compartir solo 'createdAt' no debe suprimir la advertencia: {stderr}");
+    assert!(stderr.contains(COLLECTION), "{stderr}");
+}
+
+/// GRAMMAR.md §3.94: caso de borde del fix de arriba -- si el struct
+/// declarado NO tiene NINGÚN campo fuera de la lista de auditoría
+/// genérica (createdAt/updatedAt/deletedAt), no hay ningún nombre
+/// "significativo" para comparar. En ese caso el código cae de vuelta a
+/// considerar los genéricos como evidencia (mejor una señal débil que
+/// ninguna) -- mismo comportamiento que antes de esta ronda, sin
+/// regresión, para este caso específico.
+#[test]
+fn when_every_declared_field_is_a_generic_audit_field_it_still_falls_back_to_comparing_them() {
+    const COLLECTION: &str = "items_only_audit_fields";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("only-audit-fields");
+    let link_v1 = temp.write(
+        "v1.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, createdAt: Timestamp = now() }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc create() -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, createdAt: now() }}) }} }}
+"#
+        ),
+    );
+    let server_v1 = Serve::start(&link_v1, &url);
+    server_v1.rpc("Items/create", "{}");
+    drop(server_v1);
+
+    // "updatedAt" nuevo declarado como OPCIONAL a propósito -- la fila que
+    // "v1.link" ya insertó no la tiene, así que la migración no destructiva
+    // la agrega NULL; si fuera requerida, `all()` fallaría con el guard de
+    // "fila con NULL en un campo requerido" (un chequeo real y deliberado,
+    // pero distinto de lo que este test verifica -- mismo motivo por el
+    // que el test de arriba usa `sessionId: String?`).
+    let link_v2 = temp.write(
+        "v2.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, createdAt: Timestamp = now(), updatedAt: Timestamp? }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+    let server_v2 = Serve::start(&link_v2, &url);
+    let listed = server_v2.rpc("Items/list", "{}");
+    assert!(listed.is_array(), "{listed:?}");
+    assert!(
+        !server_v2.stderr().to_lowercase().contains("advertencia"),
+        "sin ningún campo significativo declarado, debe caer de vuelta a comparar los genéricos: {}",
+        server_v2.stderr()
+    );
+}
+
 /// GRAMMAR.md §3.96: `@check` crea una restricción `CHECK` real en
 /// PostgreSQL, no solo del lado de la aplicación -- este test escribe SQL
 /// crudo, sin pasar por `linkc serve`/`apply_field_validators` en absoluto,
