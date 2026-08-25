@@ -187,7 +187,18 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     // SOLO para fallos de infraestructura (red, 5xx, timeout) — los errores de
     // dominio que un rpc declaró en su Result<T,E> siempre vuelven como valor,
     // nunca se lanzan.
-    out.push_str("export class LinkTransportError extends Error {}\n\n");
+    // `status` viaja como propiedad TIPADA, no solo interpolado en el
+    // mensaje -- un consumidor real (un hook, un catch a mano) necesita
+    // distinguir un 401 (redirigir a login) de un 404 (mostrar "no
+    // encontrado") de un 500 (reintentar) sin parsear el string del
+    // mensaje con una regex. GRAMMAR.md §3.126.
+    out.push_str("export class LinkTransportError extends Error {\n");
+    out.push_str("  status: number;\n");
+    out.push_str("  constructor(message: string, status: number) {\n");
+    out.push_str("    super(message);\n");
+    out.push_str("    this.status = status;\n");
+    out.push_str("  }\n");
+    out.push_str("}\n\n");
     // Distinta de las dos anteriores: ni un error de dominio declarado
     // (Result<T,E>) ni un fallo de transporte -- "el servidor respondió 200
     // pero el payload no matchea el contrato", su propia categoría (GRAMMAR.md
@@ -272,7 +283,7 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
                 render_type(ret_ty)
             ));
             push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names);
-            out.push_str("    if (!res.body) throw new LinkTransportError(\"el servidor no devolvió un body de stream\");\n");
+            out.push_str("    if (!res.body) throw new LinkTransportError(\"el servidor no devolvió un body de stream\", res.status);\n");
             out.push_str("    const reader = res.body.getReader();\n");
             out.push_str("    const decoder = new TextDecoder();\n");
             out.push_str("    let buffer = \"\";\n");
@@ -732,7 +743,7 @@ fn push_fetch_call(out: &mut String, service_name: &str, rpc_name: &str, arg_nam
     );
     out.push_str(&format!("      body: JSON.stringify({{ {} }}),\n", arg_names.join(", ")));
     out.push_str("    });\n");
-    out.push_str("    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);\n");
+    out.push_str("    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);\n");
 }
 
 /// `<T, U>` para una declaración genérica, o "" si no tiene type_params.
@@ -1253,10 +1264,39 @@ mod tests {
     #[test]
     fn client_never_throws_for_declared_result_and_wraps_transport_errors() {
         let (_, client) = emit_both(&users_demo_src());
-        assert!(client.contains("class LinkTransportError extends Error {}"));
+        assert!(client.contains("class LinkTransportError extends Error"));
         assert!(client.contains("if (!res.ok) throw new LinkTransportError"));
         assert!(client.contains("class UsersClientImpl implements UsersClient"));
         assert!(client.contains("export function createUsersClient(baseUrl: string): UsersClient"));
+    }
+
+    #[test]
+    fn link_transport_error_carries_a_typed_status_property_not_just_a_string_message() {
+        // Real gap encontrado auditando client.ts: el HTTP status solo
+        // viajaba interpolado en el mensaje (`HTTP ${res.status}`), sin
+        // ninguna propiedad tipada -- un consumidor real (un catch a mano,
+        // un hook) tenía que parsear el string con una regex para saber si
+        // fue un 401/404/500. GRAMMAR.md §3.126.
+        let (_, client) = emit_both(&users_demo_src());
+        assert!(client.contains("export class LinkTransportError extends Error {\n  status: number;\n"), "{client}");
+        assert!(
+            client.contains("throw new LinkTransportError(`HTTP ${res.status}`, res.status);"),
+            "{client}"
+        );
+    }
+
+    #[test]
+    fn a_missing_stream_body_also_carries_the_real_http_status() {
+        let src = r#"
+service Ticks {
+  stream watch() -> Int { [] }
+}
+"#;
+        let (_, client) = emit_both(src);
+        assert!(
+            client.contains("if (!res.body) throw new LinkTransportError(\"el servidor no devolvió un body de stream\", res.status);"),
+            "{client}"
+        );
     }
 
     #[test]

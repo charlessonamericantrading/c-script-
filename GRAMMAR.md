@@ -147,6 +147,7 @@
   - [3.123 Hooks de React generados: guarda contra respuestas fuera de orden — RESUELTO](#3123-hooks-de-react-generados-guarda-contra-respuestas-fuera-de-orden--resuelto)
   - [3.124 Hooks de React generados: cache compartido entre instancias — RESUELTO](#3124-hooks-de-react-generados-cache-compartido-entre-instancias--resuelto)
   - [3.125 Hooks de React generados: invalidación de cache tras una Mutation — RESUELTO](#3125-hooks-de-react-generados-invalidación-de-cache-tras-una-mutation--resuelto)
+  - [3.126 `LinkTransportError`: el status HTTP viaja tipado, no solo en el mensaje — RESUELTO](#3126-linktransporterror-el-status-http-viaja-tipado-no-solo-en-el-mensaje--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -784,7 +785,7 @@ Planeado desde el documento original (`PLAN.md` §3.1: *"[4b] Emisor de contrato
 ```typescript
 async getById(id: number): Promise<User | null> {
   const res = await fetch(...);
-  if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+  if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
   const json: unknown = await res.json();
   if (!(json === null || isUser(json))) throw new LinkValidationError("getById", json);
   return json as User | null;
@@ -5332,6 +5333,39 @@ Deliberadamente NO dispara un fetch nuevo -- solo resetea `entry.state` a `data:
 **Demostración real**: `examples/taskboard/backend/taskboard.link` anota sus tres mutations (`create`, `update`, `remove`) con `@invalidates(list, listByColumn, stats)` -- las tres Queries reales del tablero que dependen del conjunto de tareas.
 
 **Verificado**: 2 tests nuevos en parser (`@invalidates(a, b)` parsea la lista; `@invalidates()` vacío es error de parseo), 6 tests nuevos en checker (target válido de la misma service; target inexistente; target de OTRA service; target que no es forma de Query; anotación sobre un stream; anotación declarada dos veces), 2 tests nuevos en `codegen::ts_emit` (el helper de invalidación se emite solo en la rama de éxito de la Mutation, nunca en el `catch`; sin ningún `@invalidates` en el programa, no se emite el helper). Verificado a mano contra el binario real: el camino feliz y los 5 caminos de error de la validación, cada uno reproduciendo exactamente el mensaje diseñado. Verificado end-to-end contra React real: `examples/taskboard/frontend` regenerado con el binario (ahora con `@invalidates` de verdad en sus tres mutations) y tipando limpio con `tsc --noEmit` en modo estricto -- primera vez que un `hooks.ts` con invalidación de cache se compila contra React 18 real.
+
+---
+
+### 3.126 `LinkTransportError`: el status HTTP viaja tipado, no solo en el mensaje — RESUELTO
+
+Auditando `client.ts` (mismo pedido del usuario de seguir mejorando TypeScript/React tras §3.123–§3.125) apareció un gap chico pero real: `LinkTransportError` (§3.5, la excepción que el cliente lanza para un fallo de transporte -- red caída, 5xx, timeout, cualquier `!res.ok`) solo llevaba el status HTTP interpolado DENTRO del mensaje (`` `HTTP ${res.status}` ``), sin ninguna propiedad tipada. Un componente real que necesita distinguir un 401 (redirigir a login) de un 404 (mostrar "no encontrado") de un 500 (ofrecer reintentar) no tenía forma de hacerlo sin parsear ese string a mano con una regex -- exactamente el tipo de "tipos poco ergonómicos" que este pedido del usuario venía a resolver.
+
+```typescript
+export class LinkTransportError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+```
+
+```tsx
+function TaskList({ client }: { client: TasksClient }) {
+  const { error } = useTasksListQuery(client);
+  if (error instanceof LinkTransportError && error.status === 401) {
+    return <LoginPrompt />;
+  }
+  if (error instanceof LinkTransportError && error.status >= 500) {
+    return <RetryPrompt />;
+  }
+  // ...
+}
+```
+
+**Los dos puntos donde `client.ts` lanza `LinkTransportError` pasan `res.status` real**, no un valor inventado: el camino normal (`!res.ok`, cualquier rpc o stream) y el caso borde de un stream cuyo `res.body` viene nulo pese a `res.ok` (ahí el status sigue siendo el 2xx real de esa respuesta -- información correcta aunque no sea la causa del fallo, nunca un placeholder). Como `LinkTransportError` sigue extendiendo `Error`, no cambia nada del lado de los hooks (§3.123–§3.125): `QueryState.error`/`MutationState.error` siguen tipados `Error | null`, y el narrowing (`error instanceof LinkTransportError`) es responsabilidad de quien consume el hook, igual que ya lo era para distinguir `LinkTransportError` de `LinkValidationError`.
+
+**Verificado**: 2 tests nuevos en `codegen::ts_emit` (la clase emitida tiene la propiedad `status: number` y el constructor la asigna; el `throw` real pasa `res.status` en los dos call sites -- el de `!res.ok` y el del stream sin body) + el test ya existente de "el cliente nunca lanza para un `Result` declarado" sigue pasando sin cambios (la forma pública -- qué lanza y cuándo -- no cambió, solo qué datos lleva encima).
 
 ---
 

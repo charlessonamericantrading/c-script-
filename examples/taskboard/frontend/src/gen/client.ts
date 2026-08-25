@@ -1,9 +1,15 @@
-// Generado automáticamente por linkc v1.88.0 — no editar a mano.
+// Generado automáticamente por linkc v1.89.0 — no editar a mano.
 
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
 import { isBoardStats, isTask } from "./validators.ts";
 
-export class LinkTransportError extends Error {}
+export class LinkTransportError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
 
 export class LinkValidationError extends Error {
   rpcName: string;
@@ -40,7 +46,7 @@ class TasksClientImpl implements TasksClient {
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({  }),
     });
-    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
     if (!((Array.isArray(json) && json.every((item: unknown) => isTask(item))))) throw new LinkValidationError("list", json);
     return json as Task[];
@@ -52,7 +58,7 @@ class TasksClientImpl implements TasksClient {
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ id }),
     });
-    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
     if (!((json === null || isTask(json)))) throw new LinkValidationError("getById", json);
     return json as Task | null;
@@ -64,7 +70,7 @@ class TasksClientImpl implements TasksClient {
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ input }),
     });
-    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
     if (!(isTask(json))) throw new LinkValidationError("create", json);
     return json as Task;
@@ -76,7 +82,7 @@ class TasksClientImpl implements TasksClient {
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ id, patch }),
     });
-    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
     if (!(isTask(json))) throw new LinkValidationError("update", json);
     return json as Task;
@@ -88,7 +94,7 @@ class TasksClientImpl implements TasksClient {
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ id }),
     });
-    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
     if (!(typeof json === "boolean")) throw new LinkValidationError("remove", json);
     return json as boolean;
@@ -100,7 +106,7 @@ class TasksClientImpl implements TasksClient {
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ col }),
     });
-    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
     if (!((Array.isArray(json) && json.every((item: unknown) => isTask(item))))) throw new LinkValidationError("listByColumn", json);
     return json as Task[];
@@ -112,7 +118,7 @@ class TasksClientImpl implements TasksClient {
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({  }),
     });
-    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
     if (!(isBoardStats(json))) throw new LinkValidationError("stats", json);
     return json as BoardStats;
@@ -124,8 +130,8 @@ class TasksClientImpl implements TasksClient {
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({  }),
     });
-    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`);
-    if (!res.body) throw new LinkTransportError("el servidor no devolvió un body de stream");
+    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
+    if (!res.body) throw new LinkTransportError("el servidor no devolvió un body de stream", res.status);
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";

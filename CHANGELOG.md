@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.89.0] - 2026-08-25
+
+### 🐛 Arreglado
+- **`LinkTransportError` ahora lleva `status: number` tipado, no solo interpolado en el mensaje.** Continuación del pedido de seguir profundizando TypeScript/React tras §3.123-§3.125: auditando `client.ts` apareció que el status HTTP de un fallo de transporte (401/404/500/...) solo viajaba dentro del string del mensaje (`` `HTTP ${res.status}` ``) -- un componente que necesitaba distinguir un 401 (redirigir a login) de un 500 (ofrecer reintentar) tenía que parsear ese mensaje a mano con una regex, exactamente el tipo de tipo poco ergonómico que este pedido venía a resolver. Ahora `status: number` es una propiedad real, poblada con el `res.status` genuino en los dos puntos donde `client.ts` la lanza (`!res.ok` y el caso borde de un stream con `res.body` nulo). Sin cambios del lado de los hooks -- `QueryState.error`/`MutationState.error` siguen `Error | null`; `error instanceof LinkTransportError && error.status === 401` es el patrón de narrowing que ahora queda disponible.
+
+1026 tests (2 nuevos) en `codegen::ts_emit`: la clase emitida tiene la propiedad y el constructor la asigna; los dos call sites reales pasan `res.status`, no un valor inventado. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto. Detalle completo: GRAMMAR.md §3.126, PLAN.md §9.13.
+
 ## [1.88.0] - 2026-08-25
 
 ### ✨ Nuevo
