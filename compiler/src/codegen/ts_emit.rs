@@ -383,7 +383,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
 
     let mut out = String::new();
     out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
-    out.push_str("import { useState, useEffect, useCallback } from \"react\";\n");
+    out.push_str("import { useState, useEffect, useCallback, useRef } from \"react\";\n");
     if !imported_types.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./contract\";\n\n",
@@ -501,26 +501,47 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     out.push_str("  const enabled = options?.enabled ?? true;\n");
                     out.push_str(&format!("  const [data, setData] = useState<{} | null>(null);\n", ret_str));
                     out.push_str("  const [loading, setLoading] = useState(enabled);\n");
-                    out.push_str("  const [error, setError] = useState<Error | null>(null);\n\n");
+                    out.push_str("  const [error, setError] = useState<Error | null>(null);\n");
+                    // Guarda de "solo la respuesta más reciente gana" -- sin
+                    // esto, si `params`/`client` cambian mientras una request
+                    // anterior sigue en vuelo (ej. tipeando en un buscador
+                    // que llama a este hook por cada letra), la más LENTA
+                    // puede resolver DESPUÉS de la más nueva y pisar `data`
+                    // con una respuesta vieja -- silenciosamente, sin ningún
+                    // error visible. `requestIdRef` es un contador
+                    // monotónico: cada llamada a `refetch` (desde el
+                    // `useEffect` de abajo o llamada a mano) se queda con SU
+                    // número, y solo actualiza estado si sigue siendo la más
+                    // reciente cuando la respuesta llega.
+                    out.push_str("  const requestIdRef = useRef(0);\n\n");
                     out.push_str(&format!("  const refetch = useCallback(async (): Promise<{} | null> => {{\n", ret_str));
+                    out.push_str("    const requestId = ++requestIdRef.current;\n");
                     out.push_str("    setLoading(true);\n");
                     out.push_str("    setError(null);\n");
                     out.push_str("    try {\n");
                     out.push_str(&format!("      const res = await client.{}({});\n", rpc.name, param_names.join(", ")));
-                    out.push_str("      setData(res);\n");
+                    out.push_str("      if (requestIdRef.current === requestId) setData(res);\n");
                     out.push_str("      return res;\n");
                     out.push_str("    } catch (err) {\n");
                     out.push_str("      const e = err instanceof Error ? err : new Error(String(err));\n");
-                    out.push_str("      setError(e);\n");
+                    out.push_str("      if (requestIdRef.current === requestId) setError(e);\n");
                     out.push_str("      return null;\n");
                     out.push_str("    } finally {\n");
-                    out.push_str("      setLoading(false);\n");
+                    out.push_str("      if (requestIdRef.current === requestId) setLoading(false);\n");
                     out.push_str("    }\n");
                     out.push_str(&format!("  }}, [{}]);\n\n", deps));
                     out.push_str("  useEffect(() => {\n");
                     out.push_str("    if (enabled) {\n");
                     out.push_str("      refetch();\n");
                     out.push_str("    }\n");
+                    // Al desmontar, o antes de que el próximo efecto corra
+                    // (`params`/`client` cambiaron), invalida cualquier
+                    // request de ESTE efecto que siga en vuelo -- mismo
+                    // criterio que el `cancelled = true` que ya usa el hook
+                    // de `stream` más abajo, adaptado al contador en vez de
+                    // un booleano porque acá conviven requests disparadas
+                    // por el efecto Y por una llamada manual a `refetch`.
+                    out.push_str("    return () => { requestIdRef.current++; };\n");
                     out.push_str("  }, [enabled, refetch]);\n\n");
                     out.push_str("  return { data, loading, error, refetch };\n");
                     out.push_str("}\n\n");
@@ -534,27 +555,39 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 ));
                 out.push_str(&format!("  const [data, setData] = useState<{} | null>(null);\n", ret_str));
                 out.push_str("  const [loading, setLoading] = useState(false);\n");
-                out.push_str("  const [error, setError] = useState<Error | null>(null);\n\n");
+                out.push_str("  const [error, setError] = useState<Error | null>(null);\n");
+                // Misma guarda de "solo la respuesta más reciente gana" que
+                // el hook de Query -- un doble click en un botón de submit
+                // dispara dos `mutate()` casi juntos, y sin esto la
+                // respuesta más LENTA de las dos puede resolver después y
+                // pisar `data`/`error` con el resultado de la llamada vieja.
+                out.push_str("  const requestIdRef = useRef(0);\n\n");
                 out.push_str(&format!(
                     "  const mutate = useCallback(async ({}): Promise<{}> => {{\n",
                     params_typed.join(", "),
                     ret_str
                 ));
+                out.push_str("    const requestId = ++requestIdRef.current;\n");
                 out.push_str("    setLoading(true);\n");
                 out.push_str("    setError(null);\n");
                 out.push_str("    try {\n");
                 out.push_str(&format!("      const res = await client.{}({});\n", rpc.name, param_names.join(", ")));
-                out.push_str("      setData(res);\n");
+                out.push_str("      if (requestIdRef.current === requestId) setData(res);\n");
                 out.push_str("      return res;\n");
                 out.push_str("    } catch (err) {\n");
                 out.push_str("      const e = err instanceof Error ? err : new Error(String(err));\n");
-                out.push_str("      setError(e);\n");
+                out.push_str("      if (requestIdRef.current === requestId) setError(e);\n");
                 out.push_str("      throw e;\n");
                 out.push_str("    } finally {\n");
-                out.push_str("      setLoading(false);\n");
+                out.push_str("      if (requestIdRef.current === requestId) setLoading(false);\n");
                 out.push_str("    }\n");
                 out.push_str("  }, [client]);\n\n");
                 out.push_str("  const reset = useCallback(() => {\n");
+                // Invalida cualquier `mutate()` que siga en vuelo -- sin
+                // esto, una respuesta tardía de ANTES del reset podría
+                // llegar después y pisar el estado recién limpiado con el
+                // resultado de la llamada vieja.
+                out.push_str("    requestIdRef.current++;\n");
                 out.push_str("    setData(null);\n");
                 out.push_str("    setLoading(false);\n");
                 out.push_str("    setError(null);\n");
@@ -1334,6 +1367,61 @@ mod tests {
         assert!(hooks.contains("export function useUsersCreateMutation"), "{hooks}");
         assert!(hooks.contains("export function useUsersWatch("), "{hooks}");
         assert!(hooks.contains("for await (const item of client.watch())"), "{hooks}");
+    }
+
+    /// El hook de Query (`use{Servicio}{Rpc}Query`) tiene que descartar una
+    /// respuesta VIEJA que llega después de una más nueva -- ej. un
+    /// buscador que llama al hook por cada letra tipeada dispara una
+    /// request nueva antes de que la anterior resuelva; si esa anterior
+    /// (más lenta) resuelve DESPUÉS, sin guarda pisaría `data` con el
+    /// resultado de una búsqueda vieja, en silencio, sin ningún error
+    /// visible. `requestIdRef` (`useRef`) es el mecanismo: cada llamada a
+    /// `refetch` se queda con su propio número, y solo llama a
+    /// `setData`/`setError`/`setLoading` si sigue siendo la request más
+    /// reciente cuando la promesa resuelve.
+    #[test]
+    fn query_hook_guards_against_a_stale_response_overwriting_newer_state() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            service Users {
+                rpc get(id: Int) -> User { User { id: id, name: "x" } }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(hooks.contains("import { useState, useEffect, useCallback, useRef } from \"react\";"), "{hooks}");
+        assert!(hooks.contains("const requestIdRef = useRef(0);"), "{hooks}");
+        assert!(hooks.contains("const requestId = ++requestIdRef.current;"), "{hooks}");
+        assert!(hooks.contains("if (requestIdRef.current === requestId) setData(res);"), "{hooks}");
+        assert!(hooks.contains("if (requestIdRef.current === requestId) setError(e);"), "{hooks}");
+        assert!(hooks.contains("if (requestIdRef.current === requestId) setLoading(false);"), "{hooks}");
+        // Al desmontar/cambiar deps, invalida cualquier request de ESE
+        // efecto que siga en vuelo -- mismo criterio que el `cancelled`
+        // del hook de stream, adaptado al contador.
+        assert!(hooks.contains("return () => { requestIdRef.current++; };"), "{hooks}");
+    }
+
+    /// Misma guarda que el hook de Query, pero para Mutation -- un doble
+    /// click en un botón de submit dispara dos `mutate()` casi juntos, y
+    /// `reset()` también invalida cualquier `mutate()` en vuelo (si no,
+    /// una respuesta tardía de ANTES del reset podría pisar el estado
+    /// recién limpiado).
+    #[test]
+    fn mutation_hook_guards_against_a_stale_response_and_reset_invalidates_in_flight_requests() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            service Users {
+                rpc create(name: String) -> User { User { id: 1, name: name } }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(hooks.contains("export function useUsersCreateMutation"), "{hooks}");
+        assert!(hooks.contains("const requestIdRef = useRef(0);"), "{hooks}");
+        assert!(hooks.contains("const requestId = ++requestIdRef.current;"), "{hooks}");
+        assert!(hooks.contains("if (requestIdRef.current === requestId) setData(res);"), "{hooks}");
+        let reset_block = hooks.split("const reset = useCallback(() => {").nth(1).expect("bloque de reset");
+        assert!(reset_block.trim_start().starts_with("requestIdRef.current++;"), "{hooks}");
     }
 
     /// `@deprecated("...")` sobre un campo se propaga como comentario JSDoc

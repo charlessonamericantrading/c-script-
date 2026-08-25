@@ -1,0 +1,14 @@
+# examples/taskboard/backend/taskboard.link
+
+> API generada automáticamente por Link (c-script). Servicios y rpcs disponibles, cada uno con su firma y (si tiene) su docstring `///`.
+
+## Tasks
+
+- [rpc list() -> Task[]](/Tasks/list)
+- [rpc getById(id: Int) -> Task?](/Tasks/getById)
+- [rpc create(input: NewTask) -> Task](/Tasks/create)
+- [rpc update(id: Int, patch: Patch<Task>) -> Task](/Tasks/update)
+- [rpc remove(id: Int) -> Bool](/Tasks/remove)
+- [rpc listByColumn(col: ColumnId) -> Task[]](/Tasks/listByColumn)
+- [rpc stats() -> BoardStats](/Tasks/stats)
+- [stream watchTasks() -> Task](/Tasks/watchTasks)

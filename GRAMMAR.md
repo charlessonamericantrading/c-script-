@@ -144,6 +144,7 @@
   - [3.120 `linkc systemd`: generador de unidad systemd — RESUELTO](#3120-linkc-systemd-generador-de-unidad-systemd--resuelto)
   - [3.121 `linkc pm2-config`: generador de configuración PM2 — RESUELTO](#3121-linkc-pm2-config-generador-de-configuración-pm2--resuelto)
   - [3.122 `--log-format`/`--log-level`: logging estructurado JSON y nivel configurable — RESUELTO](#3122---log-format---log-level-logging-estructurado-json-y-nivel-configurable--resuelto)
+  - [3.123 Hooks de React generados: guarda contra respuestas fuera de orden — RESUELTO](#3123-hooks-de-react-generados-guarda-contra-respuestas-fuera-de-orden--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5210,6 +5211,33 @@ linkc serve app.link 3000 --log-format json --log-level warn
 **Alcance**: solo las líneas POR REQUEST (`log_done` + la línea de "request recibida") -- la línea de arranque (`"c-script server escuchando en..."`) y un error de `accept()` de la conexión TCP siguen como `println!`/`eprintln!` planos, sin cambios: son eventos raros, de una sola vez, no la fuente de volumen que este ítem ataca.
 
 **Verificado**: 6 tests de CLI end-to-end contra el binario real en `cli_log_format.rs` (formato texto default sigue imprimiendo las dos líneas de siempre; `--log-format json` produce JSON parseable de verdad con los campos documentados, no solo "no crashea"; `--log-level warn` suprime una request exitosa PERO sigue mostrando un 404; `--log-format`/`--log-level` inválidos rechazados con un mensaje claro). Probado a mano además contra el binario real (`curl` + lectura de stdout), confirmando las tres combinaciones (texto default, JSON, `warn` con éxito vs. error) byte a byte.
+
+---
+
+### 3.123 Hooks de React generados: guarda contra respuestas fuera de orden — RESUELTO
+
+PLAN.md §9.13: pedido explícito del usuario de mejorar cómo los hooks de React generados (`hooks.ts`) se integran con componentes reales. Auditando `codegen::ts_emit::emit_hooks` para eso apareció algo más urgente que ergonomía: **`use{Servicio}{Rpc}Query`/`use{Servicio}{Rpc}Mutation` no tenían ninguna protección contra una respuesta VIEJA resolviendo DESPUÉS de una más nueva** -- el caso real es un buscador que llama al hook de Query por cada letra tipeada (el `useEffect` interno re-dispara `refetch` en cada cambio de parámetros): si la request de la letra ANTERIOR es más lenta que la de la letra ACTUAL, puede resolver después y pisar `data` con un resultado ya desactualizado, en SILENCIO, sin ningún error visible. El hook de `stream` ya se protegía de esto con un `cancelled` booleano en su `useEffect`; los de Query/Mutation, agregados en una ronda anterior, no.
+
+```
+export function useUsersSearchQuery(client: UsersClient, term: string) { /* ... */ }
+
+function SearchBox() {
+  const [term, setTerm] = useState("");
+  const { data } = useUsersSearchQuery(client, term);
+  // term="a" dispara una request; term="ab" (medio segundo después) dispara
+  // otra -- sin la guarda, si la de "a" es más lenta, `data` podría
+  // terminar mostrando resultados de "a" aunque el input ya diga "ab".
+  return <input value={term} onChange={(e) => setTerm(e.target.value)} />;
+}
+```
+
+**Guarda de "solo la respuesta más reciente gana"**: un `requestIdRef` (`useRef(0)`, contador monotónico) por instancia del hook. Cada llamada a `refetch`/`mutate` toma su propio número al arrancar (`const requestId = ++requestIdRef.current`), y las tres actualizaciones de estado (`setData`/`setError`/`setLoading`) solo corren si `requestIdRef.current === requestId` sigue siendo cierto cuando la promesa resuelve -- si otra llamada más nueva ya avanzó el contador mientras tanto, la respuesta vieja se descarta en silencio, que es exactamente lo correcto (nunca fue la que el usuario está mirando ahora).
+
+**El `useEffect` del hook de Query además invalida en su `cleanup`** cualquier request de ESE efecto que siga en vuelo al desmontar el componente o antes de que `enabled`/`refetch` cambien (`return () => { requestIdRef.current++; }`) -- mismo criterio que el `cancelled` del hook de `stream`, adaptado a un contador porque acá conviven requests disparadas por el efecto automático Y por una llamada manual a `refetch()` desde el componente (ej. un botón "Reintentar"). **`reset()` del hook de Mutation también invalida cualquier `mutate()` en vuelo** -- sin esto, una respuesta tardía de ANTES del reset (ej. cerrar un formulario mientras el submit todavía está en curso) podría resolver después y pisar el estado recién limpiado con el resultado de la llamada vieja.
+
+**Gap adyacente encontrado y cerrado de paso: `hooks.ts` no tenía NINGUNA cobertura de type-check automatizada.** El único frontend que corre en CI (`frontend/`, el "demo insignia" de `.github/workflows/ci.yml`) solo importa `client.ts` -- nunca `hooks.ts`, ni siquiera usa React -- y `examples/taskboard/frontend` (el único ejemplo real del repo que sí consume los hooks, contra React 18 de verdad) no está conectado a ningún workflow. Verificado a mano regenerando `examples/taskboard/frontend/src/gen/` con el binario real (`linkc build`) y corriendo `npx tsc --noEmit` contra ese proyecto -- pasó limpio. Antes de esta ronda ni siquiera podía correr: al `package.json` de ese ejemplo le faltaba la dependencia `zod` que `schemas.ts` importa (agregada de paso, gap independiente encontrado al intentar verificar). De paso, `.gitignore` tenía dos entradas puntuales de `node_modules` (`/frontend/`, `/editors/vscode/`) que no cubrían `examples/taskboard/frontend/` -- generalizado a `**/node_modules/` para que cualquier ejemplo nuevo con su propio `package.json` quede cubierto sin depender de acordarse de sumar una entrada.
+
+**Verificado**: 2 tests nuevos en `codegen::ts_emit` (el hook de Query tiene el `requestIdRef`/las tres guardas condicionales/el `useRef` importado/el cleanup que invalida en desmontaje; el hook de Mutation tiene la misma guarda y `reset()` invalida requests en vuelo) + el test ya existente de `emit_hooks_generates_queries_mutations_and_subscriptions` sigue pasando sin cambios (la forma pública de los hooks -- nombres, firmas, tipos de retorno -- no cambió, solo su cuerpo interno). Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto.
 
 ---
 

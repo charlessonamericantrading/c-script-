@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.86.0] - 2026-08-25
+
+### 🐛 Arreglado
+- **Hooks de React generados: guarda contra respuestas fuera de orden.** Pedido explícito del usuario de mejorar la integración de `hooks.ts` con componentes reales. Auditando `codegen::ts_emit::emit_hooks` apareció algo más urgente que ergonomía: `use{Servicio}{Rpc}Query`/`use{Servicio}{Rpc}Mutation` no tenían ninguna protección contra una respuesta VIEJA resolviendo después de una más nueva (el caso real: un buscador llamando al hook por cada letra tipeada) -- sin guarda, la respuesta más lenta podía pisar `data` con un resultado desactualizado, en silencio, sin ningún error visible. El hook de `stream` ya se protegía de esto (`cancelled` en su `useEffect`); Query/Mutation, agregados en una ronda anterior, no. Ahora un `requestIdRef` (`useRef`, contador monotónico) por instancia del hook descarta cualquier respuesta que ya no sea la más reciente; el `useEffect` de Query invalida en su cleanup cualquier request en vuelo al desmontar/cambiar deps; `reset()` de Mutation invalida cualquier `mutate()` en vuelo.
+
+**Gap adyacente cerrado de paso**: `hooks.ts` no tenía NINGUNA cobertura de type-check automatizada -- el frontend que corre en CI nunca lo importa, y `examples/taskboard/frontend` (el único ejemplo real que sí lo usa, con React 18 de verdad) no está conectado a ningún workflow. Verificado a mano regenerando ese ejemplo y corriendo `npx tsc --noEmit` -- pasó limpio (antes ni corría: le faltaba `zod` en el `package.json`, agregado de paso). `.gitignore` generalizado de dos entradas puntuales de `node_modules` a `**/node_modules/`.
+
+1013 tests (2 nuevos) en `codegen::ts_emit` (Query tiene el `requestIdRef`/las guardas condicionales/el cleanup; Mutation tiene la misma guarda y `reset()` invalida en vuelo) -- el test ya existente de generación de hooks sigue pasando sin cambios (la forma pública no cambió, solo el cuerpo interno). Verificado también end-to-end contra React real. Detalle completo: GRAMMAR.md §3.123, PLAN.md §9.13.
+
 ## [1.85.0] - 2026-08-25
 
 ### ✨ Nuevo

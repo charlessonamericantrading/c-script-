@@ -1,7 +1,11 @@
 /compiler/target/
 /compiler/playground-wasm/target/
-/frontend/node_modules/
-/editors/vscode/node_modules/
+# Genérico a propósito (antes eran dos entradas puntuales, /frontend/ y
+# /editors/vscode/) -- examples/taskboard/frontend/ tiene el suyo propio
+# desde GRAMMAR.md §3.123, y cualquier ejemplo nuevo con su propio
+# package.json lo va a necesitar también sin tener que acordarse de sumar
+# una entrada acá cada vez.
+**/node_modules/
 /editors/vscode/out/
 /gen/
 .claude/

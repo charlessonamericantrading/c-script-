@@ -1,6 +1,6 @@
-// Generado automáticamente por linkc v1.48.0 — no editar a mano.
+// Generado automáticamente por linkc v1.86.0 — no editar a mano.
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
 
 export interface QueryState<T> {
@@ -29,20 +29,22 @@ export function useTasksListQuery(client: TasksClient, options?: { enabled?: boo
   const [data, setData] = useState<Task[] | null>(null);
   const [loading, setLoading] = useState(enabled);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const refetch = useCallback(async (): Promise<Task[] | null> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.list();
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       return null;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client]);
 
@@ -50,6 +52,7 @@ export function useTasksListQuery(client: TasksClient, options?: { enabled?: boo
     if (enabled) {
       refetch();
     }
+    return () => { requestIdRef.current++; };
   }, [enabled, refetch]);
 
   return { data, loading, error, refetch };
@@ -61,24 +64,27 @@ export function useTasksListMutation(client: TasksClient): MutationState<Task[]>
   const [data, setData] = useState<Task[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const mutate = useCallback(async (): Promise<Task[]> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.list();
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       throw e;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client]);
 
   const reset = useCallback(() => {
+    requestIdRef.current++;
     setData(null);
     setLoading(false);
     setError(null);
@@ -92,20 +98,22 @@ export function useTasksGetByIdQuery(client: TasksClient, id: number, options?: 
   const [data, setData] = useState<Task | null | null>(null);
   const [loading, setLoading] = useState(enabled);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const refetch = useCallback(async (): Promise<Task | null | null> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.getById(id);
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       return null;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client, id]);
 
@@ -113,6 +121,7 @@ export function useTasksGetByIdQuery(client: TasksClient, id: number, options?: 
     if (enabled) {
       refetch();
     }
+    return () => { requestIdRef.current++; };
   }, [enabled, refetch]);
 
   return { data, loading, error, refetch };
@@ -124,24 +133,27 @@ export function useTasksGetByIdMutation(client: TasksClient): MutationState<Task
   const [data, setData] = useState<Task | null | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const mutate = useCallback(async (id: number): Promise<Task | null> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.getById(id);
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       throw e;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client]);
 
   const reset = useCallback(() => {
+    requestIdRef.current++;
     setData(null);
     setLoading(false);
     setError(null);
@@ -156,24 +168,27 @@ export function useTasksCreateMutation(client: TasksClient): MutationState<Task>
   const [data, setData] = useState<Task | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const mutate = useCallback(async (input: NewTask): Promise<Task> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.create(input);
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       throw e;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client]);
 
   const reset = useCallback(() => {
+    requestIdRef.current++;
     setData(null);
     setLoading(false);
     setError(null);
@@ -188,24 +203,27 @@ export function useTasksUpdateMutation(client: TasksClient): MutationState<Task>
   const [data, setData] = useState<Task | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const mutate = useCallback(async (id: number, patch: Patch<Task>): Promise<Task> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.update(id, patch);
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       throw e;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client]);
 
   const reset = useCallback(() => {
+    requestIdRef.current++;
     setData(null);
     setLoading(false);
     setError(null);
@@ -220,24 +238,27 @@ export function useTasksRemoveMutation(client: TasksClient): MutationState<boole
   const [data, setData] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const mutate = useCallback(async (id: number): Promise<boolean> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.remove(id);
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       throw e;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client]);
 
   const reset = useCallback(() => {
+    requestIdRef.current++;
     setData(null);
     setLoading(false);
     setError(null);
@@ -251,20 +272,22 @@ export function useTasksListByColumnQuery(client: TasksClient, col: ColumnId, op
   const [data, setData] = useState<Task[] | null>(null);
   const [loading, setLoading] = useState(enabled);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const refetch = useCallback(async (): Promise<Task[] | null> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.listByColumn(col);
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       return null;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client, col]);
 
@@ -272,6 +295,7 @@ export function useTasksListByColumnQuery(client: TasksClient, col: ColumnId, op
     if (enabled) {
       refetch();
     }
+    return () => { requestIdRef.current++; };
   }, [enabled, refetch]);
 
   return { data, loading, error, refetch };
@@ -283,24 +307,27 @@ export function useTasksListByColumnMutation(client: TasksClient): MutationState
   const [data, setData] = useState<Task[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const mutate = useCallback(async (col: ColumnId): Promise<Task[]> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.listByColumn(col);
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       throw e;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client]);
 
   const reset = useCallback(() => {
+    requestIdRef.current++;
     setData(null);
     setLoading(false);
     setError(null);
@@ -314,20 +341,22 @@ export function useTasksStatsQuery(client: TasksClient, options?: { enabled?: bo
   const [data, setData] = useState<BoardStats | null>(null);
   const [loading, setLoading] = useState(enabled);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const refetch = useCallback(async (): Promise<BoardStats | null> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.stats();
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       return null;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client]);
 
@@ -335,6 +364,7 @@ export function useTasksStatsQuery(client: TasksClient, options?: { enabled?: bo
     if (enabled) {
       refetch();
     }
+    return () => { requestIdRef.current++; };
   }, [enabled, refetch]);
 
   return { data, loading, error, refetch };
@@ -346,24 +376,27 @@ export function useTasksStatsMutation(client: TasksClient): MutationState<BoardS
   const [data, setData] = useState<BoardStats | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const requestIdRef = useRef(0);
 
   const mutate = useCallback(async (): Promise<BoardStats> => {
+    const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
     try {
       const res = await client.stats();
-      setData(res);
+      if (requestIdRef.current === requestId) setData(res);
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
-      setError(e);
+      if (requestIdRef.current === requestId) setError(e);
       throw e;
     } finally {
-      setLoading(false);
+      if (requestIdRef.current === requestId) setLoading(false);
     }
   }, [client]);
 
   const reset = useCallback(() => {
+    requestIdRef.current++;
     setData(null);
     setLoading(false);
     setError(null);
