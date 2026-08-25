@@ -31,6 +31,7 @@ pub mod systemd;
 pub mod pm2;
 pub mod lsp;
 pub mod parser;
+pub mod idempotency;
 pub mod rate_limit;
 pub mod route;
 // Detrás de un feature (default-on, así que `cargo build` normal no cambia)

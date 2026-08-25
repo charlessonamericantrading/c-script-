@@ -19,6 +19,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 
 const PROGRAM: &str = r#"
+type SmtpAttachment = { filename: String, contentType: String, contentBase64: String }
+type SmtpMessage = { to: String[], cc?: String[], bcc?: String[], subject: String, body: String, html?: Bool, attachments?: SmtpAttachment[] }
+
 service Sys {
   rpc notify(to: String, subject: String, body: String) -> String {
     smtp.send(to, subject, body);
@@ -32,6 +35,11 @@ service Sys {
 
   rpc notifyHtml(to: String[], subject: String, html: String) -> String {
     smtp.sendHtml(to, subject, html);
+    "enviado"
+  }
+
+  rpc notifyAdvanced(msg: SmtpMessage) -> String {
+    smtp.sendMessage(msg);
     "enviado"
   }
 }
@@ -378,4 +386,109 @@ fn smtp_send_against_an_unreachable_host_fails_cleanly_not_with_a_panic() {
     let (status, body) = server.post("/Sys/notify", r#"{"to":"a@example.com","subject":"x","body":"y"}"#);
     assert_eq!(status, 500, "body: {body}");
     assert!(!body.contains("panicked"), "una conexión caída es una condición operativa normal, no un panic: {body}");
+}
+
+/// GRAMMAR.md §3.141: `smtp.sendMessage` gana cc/bcc -- las dos aparecen
+/// como `RCPT TO:` en el sobre SMTP (así reciben el mensaje de verdad), pero
+/// `Bcc:` nunca debe aparecer en el HEADER del mensaje mismo (la "B" es
+/// justamente "blind" -- ningún destinatario debe poder ver a quién más se
+/// mandó en copia oculta leyendo el mensaje que recibió).
+#[test]
+fn smtp_send_message_sends_cc_and_bcc_as_envelope_recipients_without_leaking_bcc_in_the_header() {
+    let smtp = FakeSmtp::start();
+    let temp = TempDir::new("send-message-cc-bcc");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(
+        &src,
+        &[("LINK_SMTP_URL", &format!("smtp://127.0.0.1:{}", smtp.port)), ("LINK_SMTP_FROM", "remitente@example.com")],
+    );
+
+    let (status, body) = server.post(
+        "/Sys/notifyAdvanced",
+        &serde_json::json!({
+            "msg": {
+                "to": ["destino@example.com"],
+                "cc": ["copia@example.com"],
+                "bcc": ["oculto@example.com"],
+                "subject": "Con copia",
+                "body": "Cuerpo.",
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(status, 200, "body: {body}");
+
+    let mail = smtp.recv(Duration::from_secs(5)).expect("el servidor SMTP de mentira debió recibir un mensaje");
+    assert_eq!(
+        mail.rcpt_to,
+        vec!["<destino@example.com>".to_string(), "<copia@example.com>".to_string(), "<oculto@example.com>".to_string()],
+        "to+cc+bcc, todos como destinatarios reales del sobre: {mail:?}"
+    );
+    assert!(mail.data.contains("Cc: copia@example.com"), "Cc SÍ va en el header: {}", mail.data);
+    assert!(!mail.data.contains("oculto@example.com") || mail.data.matches("oculto@example.com").count() == 1, "data: {}", mail.data);
+    assert!(!mail.data.contains("Bcc:"), "Bcc NUNCA debe aparecer en el header del mensaje: {}", mail.data);
+}
+
+/// GRAMMAR.md §3.141: un adjunto real viaja como una parte MIME separada
+/// (`multipart/mixed`), con su propio `Content-Type`/`Content-Disposition`
+/// nombrando el archivo -- no una simple concatenación de texto.
+#[test]
+fn smtp_send_message_delivers_a_real_attachment_as_a_mime_part() {
+    let smtp = FakeSmtp::start();
+    let temp = TempDir::new("send-message-attachment");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(
+        &src,
+        &[("LINK_SMTP_URL", &format!("smtp://127.0.0.1:{}", smtp.port)), ("LINK_SMTP_FROM", "remitente@example.com")],
+    );
+
+    // "hola" en base64 -> "aG9sYQ=="
+    let (status, body) = server.post(
+        "/Sys/notifyAdvanced",
+        &serde_json::json!({
+            "msg": {
+                "to": ["destino@example.com"],
+                "subject": "Con adjunto",
+                "body": "Ver adjunto.",
+                "attachments": [{"filename": "saludo.txt", "contentType": "text/plain", "contentBase64": "aG9sYQ=="}],
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(status, 200, "body: {body}");
+
+    let mail = smtp.recv(Duration::from_secs(5)).expect("el servidor SMTP de mentira debió recibir un mensaje");
+    assert!(mail.data.to_ascii_lowercase().contains("content-type: multipart/mixed"), "data: {}", mail.data);
+    assert!(mail.data.contains("saludo.txt"), "el nombre del archivo tiene que aparecer en la parte MIME: {}", mail.data);
+    assert!(mail.data.to_ascii_lowercase().contains("content-disposition: attachment"), "data: {}", mail.data);
+    // "aG9sYQ==" en base64 es "hola" -- lettre elige el transfer-encoding
+    // (7bit/base64) según el contenido decodificado, así que lo que hay que
+    // confirmar es que el BYTE ORIGINAL llegó, no una codificación puntual.
+    assert!(mail.data.contains("hola"), "el contenido decodificado del adjunto tiene que llegar: {}", mail.data);
+}
+
+#[test]
+fn smtp_send_message_rejects_invalid_base64_cleanly_not_with_a_panic() {
+    let smtp = FakeSmtp::start();
+    let temp = TempDir::new("send-message-bad-base64");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(
+        &src,
+        &[("LINK_SMTP_URL", &format!("smtp://127.0.0.1:{}", smtp.port)), ("LINK_SMTP_FROM", "remitente@example.com")],
+    );
+
+    let (status, body) = server.post(
+        "/Sys/notifyAdvanced",
+        &serde_json::json!({
+            "msg": {
+                "to": ["destino@example.com"],
+                "subject": "x",
+                "body": "y",
+                "attachments": [{"filename": "a.txt", "contentType": "text/plain", "contentBase64": "no-es-base64-valido!!"}],
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(status, 500, "body: {body}");
+    assert!(!body.contains("panicked"), "base64 inválido es un error normal, no un panic: {body}");
 }

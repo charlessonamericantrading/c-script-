@@ -634,11 +634,29 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::Route(value)
                 }
+                // `@rate_limit("N/ventana")` o, desde GRAMMAR.md §3.142,
+                // `@rate_limit("N/ventana", key: <param>)` -- `key` es la
+                // ÚNICA palabra clave aceptada acá (no un loop de claves
+                // arbitrarias como `@example`, porque solo hay una cosa que
+                // nombrar).
                 "rate_limit" => {
                     self.eat(&TokenKind::LParen)?;
-                    let value = self.eat_string()?;
+                    let spec = self.eat_string()?;
+                    let key_param = if self.check(&TokenKind::Comma) {
+                        self.advance();
+                        let kw = self.eat_ident()?;
+                        if kw != "key" {
+                            return Err(self.error(format!(
+                                "'@rate_limit' solo acepta 'key: <parámetro>' como segundo argumento, no '{kw}'"
+                            )));
+                        }
+                        self.eat(&TokenKind::Colon)?;
+                        Some(self.eat_ident()?)
+                    } else {
+                        None
+                    };
                     self.eat(&TokenKind::RParen)?;
-                    Annotation::RateLimit(value)
+                    Annotation::RateLimit { spec, key_param }
                 }
                 "deprecated" => {
                     self.eat(&TokenKind::LParen)?;
@@ -715,9 +733,12 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::Infinite { cursor_param, limit_param }
                 }
+                // Sin argumentos, igual que "authenticated" (GRAMMAR.md
+                // §3.140) -- ninguna clave que parsear.
+                "idempotent" => Annotation::Idempotent,
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)' o '@infinite(cursor, limit)')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)' o '@idempotent')"
                     )))
                 }
             };
@@ -2052,6 +2073,46 @@ mod tests {
     #[test]
     fn infinite_annotation_requires_exactly_two_names() {
         let tokens = tokenize("service S { @infinite(cursor) rpc f(cursor: Int?) -> Int[] { [] } }").unwrap();
+        assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn rate_limit_annotation_without_a_key_parses_as_before() {
+        let prog = parse_source(r#"service S { @rate_limit("5/1m") rpc f() -> Int { 1 } }"#);
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(r.annotations, vec![Annotation::RateLimit { spec: "5/1m".to_string(), key_param: None }]);
+    }
+
+    #[test]
+    fn rate_limit_annotation_parses_an_optional_key_clause() {
+        let prog =
+            parse_source(r#"service S { @rate_limit("5/1m", key: email) rpc f(email: String) -> Int { 1 } }"#);
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(
+            r.annotations,
+            vec![Annotation::RateLimit { spec: "5/1m".to_string(), key_param: Some("email".to_string()) }]
+        );
+    }
+
+    #[test]
+    fn rate_limit_annotation_rejects_a_second_argument_that_is_not_key() {
+        let tokens = tokenize(r#"service S { @rate_limit("5/1m", other: email) rpc f(email: String) -> Int { 1 } }"#).unwrap();
+        assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn idempotent_annotation_takes_no_arguments() {
+        let prog = parse_source("service S { @idempotent rpc create(name: String) -> Int { 1 } }");
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(r.annotations, vec![Annotation::Idempotent]);
+    }
+
+    #[test]
+    fn idempotent_annotation_rejects_parentheses() {
+        let tokens = tokenize("service S { @idempotent() rpc f() -> Int { 1 } }").unwrap();
         assert!(parse(tokens).is_err());
     }
 

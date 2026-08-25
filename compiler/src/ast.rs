@@ -394,12 +394,16 @@ impl RpcDecl {
         })
     }
 
-    /// El límite declarado con `@rate_limit("20/1m")`, si hay -- texto
-    /// crudo, sin parsear (GRAMMAR.md §3.39). El checker valida el formato;
-    /// acá es solo el string tal como se escribió.
-    pub fn rate_limit(&self) -> Option<&str> {
+    /// `(spec, key_param)` de `@rate_limit("20/1m")` o `@rate_limit("20/1m",
+    /// key: email)`, si hay -- `spec` es texto crudo, sin parsear (GRAMMAR.md
+    /// §3.39); `key_param` es el nombre de un parámetro adicional que se
+    /// combina con la IP del cliente para la clave del bucket (§3.142), o
+    /// `None` si el rate limit es solo-IP (comportamiento de siempre). El
+    /// checker valida el formato de `spec` y que `key_param`, si está,
+    /// nombre un parámetro real de tipo `String`/`Int`.
+    pub fn rate_limit(&self) -> Option<(&str, Option<&str>)> {
         self.annotations.iter().find_map(|a| match a {
-            Annotation::RateLimit(spec) => Some(spec.as_str()),
+            Annotation::RateLimit { spec, key_param } => Some((spec.as_str(), key_param.as_deref())),
             _ => None,
         })
     }
@@ -454,6 +458,14 @@ impl RpcDecl {
         })
     }
 
+    /// `true` si este rpc declaró `@idempotent` (GRAMMAR.md §3.140) -- el
+    /// server (`runtime::idempotency`) recuerda el resultado de la primera
+    /// ejecución exitosa por `Idempotency-Key` y lo repite en un reintento
+    /// con la misma clave, en vez de correr el cuerpo de nuevo.
+    pub fn idempotent(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, Annotation::Idempotent))
+    }
+
     /// Mismo heurístico "nombre por forma" en UN solo lugar -- lo usan
     /// `codegen::ts_emit::emit_hooks` (para decidir si un rpc genera un
     /// hook `use...Query`) Y `checker::check_invalidates_annotation` (para
@@ -495,7 +507,12 @@ pub enum Annotation {
     Route(String),
     /// `@rate_limit("20/1m")` -- como mucho N requests por ventana de
     /// tiempo, por (ip del cliente, servicio, rpc). Ver GRAMMAR.md §3.39.
-    RateLimit(String),
+    /// Con `key: <param>` (GRAMMAR.md §3.142) -- `@rate_limit("5/1m", key:
+    /// email)` -- la clave del bucket combina la IP CON el valor de ese
+    /// parámetro, para el caso real "limitar por IP+email, no solo IP" (un
+    /// abuso que rota de IP reusando el mismo email evade un límite
+    /// solo-IP).
+    RateLimit { spec: String, key_param: Option<String> },
     /// `@deprecated("usa X en su lugar")` sobre un rpc/stream -- el texto se
     /// propaga tal cual como comentario JSDoc `@deprecated` sobre el método
     /// correspondiente en el `.d.ts` generado (GRAMMAR.md §3.71). No cambia
@@ -542,6 +559,14 @@ pub enum Annotation {
     /// siguiente es el `id` del último elemento de la página, mismo
     /// criterio que `pageAfter` usa puertas adentro).
     Infinite { cursor_param: String, limit_param: String },
+    /// `@idempotent` (GRAMMAR.md §3.140) -- sin argumentos, como
+    /// `@authenticated`. Marca un rpc como elegible para deduplicación por
+    /// `Idempotency-Key`: si el caller manda ese header, el servidor
+    /// recuerda el resultado de la primera ejecución exitosa y lo repite en
+    /// un reintento con la MISMA clave, sin volver a correr el cuerpo. Un
+    /// caller que no manda el header no ve ningún cambio de comportamiento
+    /// -- la deduplicación es opt-in por REQUEST, no forzada por el rpc.
+    Idempotent,
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

@@ -1257,6 +1257,138 @@ fn send_email(to: &[String], subject: &str, body: &str, is_html: bool) -> Result
     Ok(())
 }
 
+/// Un adjunto ya validado, listo para `Attachment::new(...).body(bytes,
+/// content_type)` -- `bytes` viene de DECODIFICAR el `contentBase64` del
+/// struct, sin pasar por `base64.decode` (§3.43) porque ESE builtin exige
+/// UTF-8 válido en el resultado (piensa en un `String` de c-script), algo
+/// que un adjunto binario real (PDF, PNG, ...) casi nunca es -- acá se
+/// decodifica directo a `Vec<u8>` con el MISMO engine/alfabeto
+/// (`base64::engine::general_purpose::STANDARD`), sin esa restricción.
+struct SmtpAttachment {
+    filename: String,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+fn smtp_attachments_from_value(items: &[Value]) -> Result<Vec<SmtpAttachment>, RuntimeError> {
+    items
+        .iter()
+        .map(|item| {
+            let Value::Struct(fields) = item else {
+                return Err(err("smtp.sendMessage: cada adjunto tiene que ser un struct con 'filename'/'contentType'/'contentBase64'"));
+            };
+            let filename = match fields.iter().find(|(n, _)| n == "filename") {
+                Some((_, Value::Str(s))) => s.clone(),
+                _ => return Err(err("smtp.sendMessage: falta el campo 'filename' de un adjunto, o no es String")),
+            };
+            let content_type = match fields.iter().find(|(n, _)| n == "contentType") {
+                Some((_, Value::Str(s))) => s.clone(),
+                _ => return Err(err("smtp.sendMessage: falta el campo 'contentType' de un adjunto, o no es String")),
+            };
+            let content_base64 = match fields.iter().find(|(n, _)| n == "contentBase64") {
+                Some((_, Value::Str(s))) => s,
+                _ => return Err(err("smtp.sendMessage: falta el campo 'contentBase64' de un adjunto, o no es String")),
+            };
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(content_base64.as_bytes())
+                .map_err(|e| err(format!("smtp.sendMessage: 'contentBase64' del adjunto '{filename}' no es base64 válido: {e}")))?;
+            Ok(SmtpAttachment { filename, content_type, bytes })
+        })
+        .collect()
+}
+
+/// `smtp.sendMessage({ to, cc?, bcc?, subject, body, html?, attachments? })`
+/// (GRAMMAR.md §3.141) -- variante "kitchen sink" que cubre lo que
+/// `send`/`sendToMany`/`sendHtml` (arriba) no podían: copia oculta/visible y
+/// adjuntos reales. Función APARTE de `send_email` en vez de generalizarla
+/// -- las tres funciones simples cubren el caso común (texto o HTML a una
+/// lista de destinatarios) sin la complejidad de MIME multipart; agregar
+/// cc/bcc/attachments a esa función habría significado que el 99% de sus
+/// llamadas (sin ninguna de las tres) paguen el costo de un `Vec` vacío por
+/// parámetro nuevo para nada.
+fn send_email_advanced(fields: &[(String, Value)]) -> Result<(), RuntimeError> {
+    let to = match fields.iter().find(|(n, _)| n == "to") {
+        Some((_, Value::List(items))) => strings_from_value_list("smtp.sendMessage", "to", items)?,
+        _ => return Err(err("smtp.sendMessage: falta el campo 'to' o no es String[]")),
+    };
+    if to.is_empty() {
+        return Err(err("smtp.sendMessage: 'to' no puede ser una lista vacía -- hace falta al menos un destinatario"));
+    }
+    let cc = match fields.iter().find(|(n, _)| n == "cc") {
+        Some((_, Value::List(items))) => strings_from_value_list("smtp.sendMessage", "cc", items)?,
+        _ => Vec::new(),
+    };
+    let bcc = match fields.iter().find(|(n, _)| n == "bcc") {
+        Some((_, Value::List(items))) => strings_from_value_list("smtp.sendMessage", "bcc", items)?,
+        _ => Vec::new(),
+    };
+    let subject = match fields.iter().find(|(n, _)| n == "subject") {
+        Some((_, Value::Str(s))) => s.as_str(),
+        _ => return Err(err("smtp.sendMessage: falta el campo 'subject' o no es String")),
+    };
+    let body = match fields.iter().find(|(n, _)| n == "body") {
+        Some((_, Value::Str(s))) => s.as_str(),
+        _ => return Err(err("smtp.sendMessage: falta el campo 'body' o no es String")),
+    };
+    let is_html = matches!(fields.iter().find(|(n, _)| n == "html"), Some((_, Value::Bool(true))));
+    let attachments = match fields.iter().find(|(n, _)| n == "attachments") {
+        Some((_, Value::List(items))) => smtp_attachments_from_value(items)?,
+        _ => Vec::new(),
+    };
+
+    let url = std::env::var("LINK_SMTP_URL")
+        .map_err(|_| err("smtp: falta la variable de entorno LINK_SMTP_URL (ej. 'smtps://usuario:clave@smtp.proveedor.com')"))?;
+    let from = std::env::var("LINK_SMTP_FROM").map_err(|_| err("smtp: falta la variable de entorno LINK_SMTP_FROM (la dirección remitente)"))?;
+    let from_mbox: lettre::message::Mailbox =
+        from.parse().map_err(|e| err(format!("smtp: LINK_SMTP_FROM ('{from}') no es una dirección válida: {e}")))?;
+
+    let mut builder = lettre::Message::builder().from(from_mbox).subject(subject);
+    for addr in &to {
+        let mbox: lettre::message::Mailbox =
+            addr.parse().map_err(|e| err(format!("smtp.sendMessage: 'to' ('{addr}') no es una dirección válida: {e}")))?;
+        builder = builder.to(mbox);
+    }
+    for addr in &cc {
+        let mbox: lettre::message::Mailbox =
+            addr.parse().map_err(|e| err(format!("smtp.sendMessage: 'cc' ('{addr}') no es una dirección válida: {e}")))?;
+        builder = builder.cc(mbox);
+    }
+    for addr in &bcc {
+        let mbox: lettre::message::Mailbox =
+            addr.parse().map_err(|e| err(format!("smtp.sendMessage: 'bcc' ('{addr}') no es una dirección válida: {e}")))?;
+        builder = builder.bcc(mbox);
+    }
+
+    use lettre::message::{header::ContentType, Attachment, MultiPart, SinglePart};
+    let body_content_type = if is_html { ContentType::TEXT_HTML } else { ContentType::TEXT_PLAIN };
+    let mut multipart = MultiPart::mixed().singlepart(SinglePart::builder().header(body_content_type).body(body.to_string()));
+    for att in attachments {
+        let content_type = ContentType::parse(&att.content_type)
+            .map_err(|e| err(format!("smtp.sendMessage: 'contentType' ('{}') del adjunto '{}' no es un mime type válido: {e}", att.content_type, att.filename)))?;
+        multipart = multipart.singlepart(Attachment::new(att.filename).body(att.bytes, content_type));
+    }
+    let email = builder.multipart(multipart).map_err(|e| err(format!("smtp.sendMessage: no se pudo armar el mensaje: {e}")))?;
+
+    use lettre::Transport;
+    let mailer = lettre::SmtpTransport::from_url(&url).map_err(|e| err(format!("smtp: LINK_SMTP_URL inválida: {e}")))?.build();
+    mailer.send(&email).map_err(|e| err(format!("smtp: no se pudo mandar el email: {e}")))?;
+    Ok(())
+}
+
+/// Extrae `Vec<String>` de una `Value::List` ya confirmada -- mismo patrón
+/// que `sendToMany`/`sendHtml` ya usaban inline, factorizado acá porque
+/// `send_email_advanced` lo necesita tres veces (`to`/`cc`/`bcc`).
+fn strings_from_value_list(method: &str, field: &str, items: &[Value]) -> Result<Vec<String>, RuntimeError> {
+    items
+        .iter()
+        .map(|v| match v {
+            Value::Str(s) => Ok(s.clone()),
+            other => Err(err(format!("{method}: '{field}' tiene que ser una lista de String, se encontró {other:?}"))),
+        })
+        .collect()
+}
+
 fn http_headers_from_value(items: &[Value]) -> Result<Vec<(String, String)>, RuntimeError> {
     items
         .iter()
@@ -2205,6 +2337,15 @@ fn call_method(
                     })
                     .collect::<Result<_, _>>()?;
                 send_email(&to, subject, html, true)?;
+                Ok(Value::Null)
+            }
+            "sendMessage" => {
+                let Some(Value::Struct(fields)) = args.first() else {
+                    return Err(err(
+                        "smtp.sendMessage requiere 1 argumento: { to: String[], cc: String[]?, bcc: String[]?, subject: String, body: String, html: Bool?, attachments: {...}[]? }",
+                    ));
+                };
+                send_email_advanced(fields)?;
                 Ok(Value::Null)
             }
             other => Err(err(format!("método desconocido sobre smtp: '{other}'"))),
@@ -3222,18 +3363,35 @@ pub fn required_auth<'a>(program: &'a Program, service_name: &str, rpc_name: &st
     })
 }
 
-/// Anotación `@rate_limit("N/ventana")` de `{service_name}.{rpc_name}`, si
-/// tiene una -- hermana de `required_auth` (mismo archivo/patrón, mismo uso
-/// desde `server.rs` antes de invocar nada). El texto crudo, sin parsear:
-/// `server.rs` lo pasa a `rate_limit::RateLimitSpec::parse`, que el checker
-/// ya validó que nunca falla para un programa que compiló (GRAMMAR.md §3.39).
-pub fn required_rate_limit<'a>(program: &'a Program, service_name: &str, rpc_name: &str) -> Option<&'a str> {
+/// `(spec, key_param)` de `@rate_limit("N/ventana"[, key: <param>])` de
+/// `{service_name}.{rpc_name}`, si tiene una -- hermana de `required_auth`
+/// (mismo archivo/patrón, mismo uso desde `server.rs` antes de invocar
+/// nada). `spec` es texto crudo, sin parsear: `server.rs` lo pasa a
+/// `rate_limit::RateLimitSpec::parse`, que el checker ya validó que nunca
+/// falla para un programa que compiló (GRAMMAR.md §3.39). `key_param`, si
+/// está, ya fue validado por el checker como un parámetro real de tipo
+/// `String`/`Int` (GRAMMAR.md §3.142).
+pub fn required_rate_limit<'a>(program: &'a Program, service_name: &str, rpc_name: &str) -> Option<(&'a str, Option<&'a str>)> {
     program.items.iter().find_map(|i| match i {
         Item::Service(s) if s.name == service_name => s.members.iter().find_map(|m| match m {
             Member::Rpc(r) | Member::Stream(r) if r.name == rpc_name => r.rate_limit(),
             _ => None,
         }),
         _ => None,
+    })
+}
+
+/// `true` si `{service_name}.{rpc_name}` declaró `@idempotent` (GRAMMAR.md
+/// §3.140) -- hermana de `required_rate_limit` (mismo archivo/patrón, mismo
+/// uso desde `server.rs` antes de invocar nada). El checker ya garantizó
+/// que nunca aparece sobre un `stream`, así que `server.rs` solo necesita
+/// consultarlo en el camino de un `rpc` normal.
+pub fn required_idempotent(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) if s.name == service_name => {
+            s.members.iter().any(|m| matches!(m, Member::Rpc(r) if r.name == rpc_name && r.idempotent()))
+        }
+        _ => false,
     })
 }
 

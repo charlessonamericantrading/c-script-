@@ -324,22 +324,24 @@ fn render_service(s: &ServiceDecl) -> String {
                         r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string()
                     }
                     // `auth()` nunca devuelve ContentType, Route, RateLimit,
-                    // Deprecated, CacheControl, Example ni Invalidates; el
-                    // brazo existe para que agregar una anotación nueva
-                    // rompa acá y no pase de largo mostrando "Público" por
-                    // descarte.
+                    // Deprecated, CacheControl, Example, Invalidates,
+                    // Infinite ni Idempotent; el brazo existe para que
+                    // agregar una anotación nueva rompa acá y no pase de
+                    // largo mostrando "Público" por descarte.
                     Some(Annotation::ContentType(_))
                     | Some(Annotation::Route(_))
-                    | Some(Annotation::RateLimit(_))
+                    | Some(Annotation::RateLimit { .. })
                     | Some(Annotation::Deprecated(_))
                     | Some(Annotation::CacheControl(_))
                     | Some(Annotation::Example { .. })
                     | Some(Annotation::Invalidates(_))
                     | Some(Annotation::Infinite { .. })
+                    | Some(Annotation::Idempotent)
                     | None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
                 };
                 let rate_limit_badge = match r.rate_limit() {
-                    Some(spec) => format!(r#"<span class="badge">⏱️ @rate_limit("{spec}")</span>"#),
+                    Some((spec, Some(key_param))) => format!(r#"<span class="badge">⏱️ @rate_limit("{spec}", key: {key_param})</span>"#),
+                    Some((spec, None)) => format!(r#"<span class="badge">⏱️ @rate_limit("{spec}")</span>"#),
                     None => String::new(),
                 };
                 let content_type_badge = match r.content_type() {

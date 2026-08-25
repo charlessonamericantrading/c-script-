@@ -28,9 +28,12 @@
 
 use super::db::Db;
 use super::session::SessionStore;
-use super::{invoke_rpc_with_sessions, is_stream_member, live_subscribe_collection, required_auth, required_rate_limit};
+use super::{
+    invoke_rpc_with_sessions, is_stream_member, live_subscribe_collection, required_auth, required_idempotent, required_rate_limit,
+};
 use crate::ast::{Annotation, Item, Member};
 use crate::ast::Program;
+use crate::idempotency::{hash_request_body, IdempotencyStore, Lookup};
 use crate::rate_limit::{RateLimitSpec, RateLimiter};
 use crate::route::RoutePattern;
 use std::io::{Read, Write};
@@ -190,6 +193,16 @@ struct CorsHeaders {
     /// `*` la respuesta es la misma para cualquiera, así que `Vary` no
     /// aporta nada y no se manda.
     vary_origin: bool,
+    /// El valor de `Strict-Transport-Security` a mandar en TODA respuesta,
+    /// si `--hsts`/`LINK_HSTS` (GRAMMAR.md §3.143) lo configuró -- `None`
+    /// por default, mismo criterio que `allow_origin`: nunca se INVENTA un
+    /// valor, y HSTS nunca se manda solo. Constante para todo el proceso
+    /// (no depende de la request, a diferencia de `allow_origin`) -- vive
+    /// acá para que `cors_response_with_type`/`sse_preamble` (los dos
+    /// lugares que arman una respuesta) lo lean de la MISMA bolsa que ya
+    /// reciben, sin agregar un parámetro más a los 16 call-sites de
+    /// `cors_response`/`cors_response_with_type`.
+    hsts: Option<String>,
 }
 
 impl CorsConfig {
@@ -203,10 +216,10 @@ impl CorsConfig {
         // garantía ajena.
         let request_origin = request_origin.filter(|o| !o.contains(['\r', '\n']));
         match self {
-            CorsConfig::Any => CorsHeaders { allow_origin: Some("*".to_string()), vary_origin: false },
+            CorsConfig::Any => CorsHeaders { allow_origin: Some("*".to_string()), vary_origin: false, hsts: None },
             CorsConfig::Allowlist(list) => {
                 let matched = request_origin.filter(|o| list.iter().any(|a| a == o)).map(str::to_string);
-                CorsHeaders { allow_origin: matched, vary_origin: true }
+                CorsHeaders { allow_origin: matched, vary_origin: true, hsts: None }
             }
         }
     }
@@ -237,6 +250,14 @@ impl CorsConfig {
 /// balancer) que sobreescribe ese header con el valor real -- sin esto,
 /// cualquier cliente directo podría mandar el header que quiera y evadir el
 /// límite por completo.
+/// `hsts` (GRAMMAR.md §3.143): el valor de `Strict-Transport-Security` a
+/// mandar en toda respuesta, o `None` (default) para no mandarlo. `linkc
+/// serve` nunca termina TLS por sí solo -- este flag es un opt-in explícito
+/// para cuando el operador SABE que un proxy/balanceador de confianza
+/// termina TLS delante (mismo espíritu que `trust_proxy`, arriba: una
+/// garantía externa que c-script no puede verificar por su cuenta, así que
+/// hace falta pedirla a propósito en vez de asumirla).
+///
 /// GRAMMAR.md §3.92: devuelve `Err` en vez de panic!/`process::exit` en los
 /// dos fallos RECUPERABLES conocidos (puerto ya ocupado, Postgres caído al
 /// arrancar) -- antes de esta ronda, cualquiera de los dos tumbaba el
@@ -263,6 +284,7 @@ pub fn serve(
     trust_proxy: bool,
     service_api_key: Option<String>,
     log: LogConfig,
+    hsts: Option<String>,
 ) -> Result<(), String> {
     let server = tiny_http::Server::http((host, port)).map_err(|e| format!("no se pudo iniciar el servidor en {host}:{port}: {e}"))?;
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
@@ -324,6 +346,10 @@ pub fn serve(
     // proceso, igual criterio que `route_table` de arriba -- se arma/muta
     // en el hilo principal, nunca cruza a los hilos de escritura de stream.
     let mut rate_limiter = RateLimiter::new();
+    // `@idempotent` (GRAMMAR.md §3.140): mismo criterio que `rate_limiter`
+    // de arriba -- un solo store para todo el proceso, mutado en el hilo
+    // principal.
+    let mut idempotency_store = IdempotencyStore::new();
     println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     match remote_changes {
@@ -335,7 +361,9 @@ pub fn serve(
                     &sessions,
                     &route_table,
                     &mut rate_limiter,
+                    &mut idempotency_store,
                     &cors,
+                    hsts.as_deref(),
                     max_body_bytes,
                     trust_proxy,
                     service_api_key.as_deref(),
@@ -367,7 +395,9 @@ pub fn serve(
                         &sessions,
                         &route_table,
                         &mut rate_limiter,
+                        &mut idempotency_store,
                         &cors,
+                        hsts.as_deref(),
                         max_body_bytes,
                         trust_proxy,
                         service_api_key.as_deref(),
@@ -395,13 +425,16 @@ const REMOTE_CHANGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// sin duplicar esta lógica -- exactamente la clase de divergencia entre
 /// dos copias del mismo código que este proyecto viene evitando desde
 /// GRAMMAR.md §3.9.
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     program: &Program,
     db: &Db,
     sessions: &SessionStore,
     route_table: &[RouteEntry],
     rate_limiter: &mut RateLimiter,
+    idempotency_store: &mut IdempotencyStore,
     cors: &CorsConfig,
+    hsts: Option<&str>,
     max_body_bytes: u64,
     trust_proxy: bool,
     service_api_key: Option<&str>,
@@ -415,7 +448,12 @@ fn handle_request(
         .iter()
         .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Origin"))
         .map(|h| h.value.as_str().to_string());
-    let cors_headers = cors.headers_for(request_origin.as_deref());
+    let mut cors_headers = cors.headers_for(request_origin.as_deref());
+    // `--hsts`/`LINK_HSTS` (GRAMMAR.md §3.143): constante para todo el
+    // proceso -- se copia acá una vez por request, en la MISMA bolsa que
+    // ya viaja a cada respuesta, en vez de agregar un parámetro más a los
+    // 16 call-sites de `cors_response`/`cors_response_with_type`.
+    cors_headers.hsts = hsts.map(str::to_string);
 
     if *request.method() == tiny_http::Method::Options {
         let _ = request.respond(cors_response(204, String::new(), &cors_headers));
@@ -559,11 +597,25 @@ fn handle_request(
     // sale de la conexión TCP real (`remote_addr`) por default, o de
     // `X-Forwarded-For` SOLO si `--trust-proxy`/`LINK_TRUST_PROXY` lo pide
     // explícitamente (GRAMMAR.md §3.89) -- ver `client_ip_for_rate_limit`.
-    if let Some(raw_spec) = required_rate_limit(&program, service_name, rpc_name) {
+    if let Some((raw_spec, key_param)) = required_rate_limit(&program, service_name, rpc_name) {
         let spec = RateLimitSpec::parse(raw_spec)
             .expect("check_rate_limit_annotation (checker.rs) ya validó este formato en compilación");
         let client_ip = client_ip_for_rate_limit(&request, trust_proxy);
-        if !rate_limiter.check(&client_ip, service_name, rpc_name, spec) {
+        // `key: <param>` (GRAMMAR.md §3.142): la clave del bucket pasa de
+        // "solo IP" a "IP + valor del parámetro nombrado" -- el separador
+        // `|` no aparece en una IP real ni en la mayoría de los valores
+        // reales, así que dos (ip, valor) distintos no colisionan por
+        // casualidad en el mismo bucket. `RateLimiter` no cambia nada de su
+        // lado -- sigue recibiendo un solo string de identidad, como
+        // siempre.
+        let bucket_identity = match key_param {
+            Some(param_name) => {
+                let value = args_json.get(param_name).map(extra_rate_limit_key_as_string).unwrap_or_default();
+                format!("{client_ip}|{param_name}={value}")
+            }
+            None => client_ip,
+        };
+        if !rate_limiter.check(&bucket_identity, service_name, rpc_name, spec) {
             let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
             log_done(log, req_id, Some(&method), 429, start, "");
             return;
@@ -631,8 +683,49 @@ fn handle_request(
         return;
     }
 
+    // `@idempotent` (GRAMMAR.md §3.140): opt-in por REQUEST, no por rpc --
+    // si el caller no manda `Idempotency-Key`, este bloque entero es un
+    // no-op y el rpc corre exactamente como si la anotación no existiera.
+    // Corre DESPUÉS del gate de auth de arriba: repetir una respuesta
+    // grabada sigue exigiendo estar autorizado para pedirla, mismo criterio
+    // que el resto de la request.
+    let idempotency_key = if required_idempotent(&program, service_name, rpc_name) { extract_idempotency_key(&request) } else { None };
+    if let Some(key) = &idempotency_key {
+        let request_hash = hash_request_body(&body);
+        match idempotency_store.lookup(service_name, rpc_name, key, &request_hash) {
+            Lookup::Hit { status, body: cached_body, content_type } => {
+                let _ = request.respond(cors_response_with_type(status, cached_body, &content_type, &cors_headers, None, None));
+                log_done(log, req_id, Some(&method), status, start, "idempotent=\"replayed\"");
+                db.clear_request_context();
+                return;
+            }
+            Lookup::Conflict => {
+                let msg = format!(
+                    "'Idempotency-Key: {key}' ya se usó en '{method}' con un body distinto -- generá una clave nueva para una operación distinta"
+                );
+                let _ = request.respond(cors_response(409, error_json(&msg), &cors_headers));
+                log_done(log, req_id, Some(&method), 409, start, &format!("error={msg:?}"));
+                db.clear_request_context();
+                return;
+            }
+            Lookup::Miss => {}
+        }
+    }
+
     let (status, response_body, response_type, response_location, response_cache_control) =
         handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, args_json);
+    // `@idempotent`: solo se graba un ÉXITO (2xx) -- un error no se graba,
+    // para que el caller pueda corregir y reintentar con la MISMA clave
+    // (GRAMMAR.md §3.140, mismo criterio que Stripe: la clave protege
+    // contra duplicar una operación que funcionó, no contra reintentar una
+    // que falló). Location/Cache-Control de esta respuesta no se recuerdan
+    // -- un hit repite status+body+content-type, alcance v0 deliberado.
+    if let Some(key) = &idempotency_key {
+        if (200..300).contains(&status) {
+            let request_hash = hash_request_body(&body);
+            idempotency_store.store(service_name, rpc_name, key, &request_hash, status, response_body.clone(), response_type.clone());
+        }
+    }
     // `response_body` en una falla es `{"error": "<mensaje>"}`
     // (`error_json`, más abajo) -- se extrae el mensaje solo para el
     // log en vez de loguear el JSON completo escapado adentro de otro
@@ -843,6 +936,21 @@ fn client_ip_for_rate_limit(request: &tiny_http::Request, trust_proxy: bool) -> 
     request.remote_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "desconocida".to_string())
 }
 
+/// Convierte el valor JSON de un parámetro nombrado por `@rate_limit(...,
+/// key: <param>)` (GRAMMAR.md §3.142) a la forma texto que compone la clave
+/// del bucket -- el checker ya garantizó que el parámetro es `String`/`Int`,
+/// así que las dos ramas cubren todo lo que puede llegar acá; cualquier otra
+/// forma (ausente, `null`, tipo inesperado) cae a un string vacío en vez de
+/// entrar en pánico -- el peor caso es que ese request puntual comparta
+/// bucket con otros del mismo valor "faltante", nunca un crash.
+fn extra_rate_limit_key_as_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
 /// Resuelve (servicio, rpc, args) para esta request -- por una `@route` si el
 /// path matchea alguna, si no por el `/Service/rpc` de siempre leyendo
 /// `body` como el JSON de argumentos (GRAMMAR.md §3.37). Las dos direcciones
@@ -952,6 +1060,19 @@ fn extract_bearer_token(request: &tiny_http::Request) -> Option<String> {
     raw.strip_prefix("Bearer ").map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
 }
 
+/// `Idempotency-Key` (GRAMMAR.md §3.140) -- mismo nombre de header que
+/// Stripe usa para el mismo propósito, no un invento propio. `None` cubre
+/// tanto "no se mandó" como "se mandó vacío" -- un caller que no opta por
+/// esto no ve ningún cambio de comportamiento en un rpc `@idempotent`.
+fn extract_idempotency_key(request: &tiny_http::Request) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Idempotency-Key"))
+        .map(|h| h.value.as_str().trim().to_string())
+        .filter(|k| !k.is_empty())
+}
+
 /// ¿Puede ESTA request llamar a `{service_name}.{rpc_name}`? La ÚNICA
 /// decisión de autorización de todo el servidor -- vive acá, no en el
 /// intérprete (`runtime/mod.rs`), que solo recibe `sessions`/`token` ya
@@ -1000,12 +1121,13 @@ fn check_auth_gate(
         // llegaran a matchear, el bug está allá arriba, no acá.
         Annotation::ContentType(_)
         | Annotation::Route(_)
-        | Annotation::RateLimit(_)
+        | Annotation::RateLimit { .. }
         | Annotation::Deprecated(_)
         | Annotation::CacheControl(_)
         | Annotation::Example { .. }
         | Annotation::Invalidates(_)
-        | Annotation::Infinite { .. } => Ok(()),
+        | Annotation::Infinite { .. }
+        | Annotation::Idempotent => Ok(()),
     }
 }
 
@@ -1147,7 +1269,13 @@ fn sse_preamble(cors: &CorsHeaders) -> String {
             header.push_str("Vary: Origin\r\n");
         }
     }
-    header.push_str("X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n\r\n");
+    header.push_str("X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n");
+    if let Some(value) = &cors.hsts {
+        header.push_str("Strict-Transport-Security: ");
+        header.push_str(value);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
     header
 }
 
@@ -1396,11 +1524,19 @@ fn cors_response_with_type(
     //  - `Referrer-Policy: no-referrer`: la URL completa de una request a
     //    este servidor (que puede tener datos sensibles en el path o query)
     //    nunca sale en el header `Referer` de un link que salga desde acá.
-    // CSP y HSTS quedan afuera a propósito -- ver GRAMMAR.md §3.41 para el
-    // porqué (CSP depende del contenido de cada página; HSTS le corresponde
-    // a quien termina TLS, que no es `linkc serve`).
+    // CSP queda afuera a propósito (depende del contenido de cada página,
+    // GRAMMAR.md §3.41). HSTS (GRAMMAR.md §3.143) SÍ se manda, pero solo si
+    // `--hsts`/`LINK_HSTS` lo configuró explícitamente -- `linkc serve`
+    // nunca termina TLS por sí solo, así que sin ese opt-in no hay forma de
+    // saber que esta respuesta de verdad viajó (o va a viajar) sobre HTTPS.
     let nosniff = tiny_http::Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap();
     let frame_options = tiny_http::Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap();
     let referrer_policy = tiny_http::Header::from_bytes(&b"Referrer-Policy"[..], &b"no-referrer"[..]).unwrap();
-    response.with_header(nosniff).with_header(frame_options).with_header(referrer_policy)
+    response = response.with_header(nosniff).with_header(frame_options).with_header(referrer_policy);
+    if let Some(value) = &cors.hsts {
+        if let Ok(hsts_header) = tiny_http::Header::from_bytes(&b"Strict-Transport-Security"[..], value.as_bytes()) {
+            response = response.with_header(hsts_header);
+        }
+    }
+    response
 }

@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.100.0] - 2026-08-25
+
+### ✨ Nuevo
+- **Versión bundle: cuatro ítems del backlog general (PLAN.md §9.3/§9.4/§9.6), cerrados juntos.** A pedido explícito del usuario ("seguí con el backlog general pero no subas nueva versión hasta que estén varios hechos, mínimo la mitad"):
+
+  1. **`@idempotent`: idempotency keys nativas en rpcs de escritura** (§9.3). Sin argumentos sobre un `rpc` (rechazado sobre un `stream`) -- opt-in por REQUEST vía el header `Idempotency-Key` (mismo nombre que Stripe), nunca forzado. Con el header, un `idempotency::IdempotencyStore` en memoria (mismo modelo que `rate_limit::RateLimiter`) recuerda el resultado de la primera ejecución EXITOSA por `(service, rpc, clave)` -- un reintento con la misma clave y el mismo body (hasheado con SHA-256) repite la respuesta grabada sin correr el cuerpo de nuevo; la misma clave con un body distinto da 409. TTL de 24hs, no persiste entre reinicios.
+  2. **`smtp.sendMessage`: cc/bcc y adjuntos reales** (§9.6). Variante "kitchen sink" aparte de `send`/`sendToMany`/`sendHtml` -- `{ to, cc?, bcc?, subject, body, html?, attachments? }`, con `attachments` viajando en `contentBase64` (decodificado directo a bytes, sin pasar por `base64.decode` que exige UTF-8). cc/bcc llegan al sobre SMTP real; `cc` aparece en el header `Cc:`, `bcc` nunca aparece en ningún header. Adjuntos como partes MIME reales (`multipart/mixed`).
+  3. **`@rate_limit(..., key: <param>)`: una clave adicional a la IP** (§9.4). Segundo argumento opcional nombrando un parámetro `String`/`Int` del rpc -- la clave del bucket pasa de "solo IP" a "IP + valor del parámetro", cerrando el gap real de un middleware que rotaba de IP reusando el mismo email para seguir abusando.
+  4. **`--hsts`: `Strict-Transport-Security` opt-in** (§9.4, cierra la sección). `linkc serve` nunca termina TLS por sí solo, así que el header solo se manda si el operador lo pide explícitamente vía `--hsts <valor>`/`LINK_HSTS` (texto literal, mismo criterio que `@cache_control`) -- para el caso real de un proxy de confianza terminando TLS delante.
+
+1092 tests (31 nuevos) repartidos entre `idempotency.rs` (5), `checker.rs`/`parser.rs` (anotaciones nuevas), y tres archivos de integración contra un `linkc serve`/servidor SMTP de mentira REALES: `server_http.rs` (idempotencia, contando filas insertadas de verdad), `cli_smtp.rs` (cc/bcc en el sobre y el header, un adjunto real como parte MIME), `cli_rate_limit.rs` (clave combinada IP+valor), `cli_hsts.rs` (el header en `/health`, un rpc normal y un `stream`). Detalle completo: GRAMMAR.md §3.140-§3.143, PLAN.md §9.3/§9.4/§9.6.
+
 ## [1.99.0] - 2026-08-25
 
 ### ✨ Nuevo

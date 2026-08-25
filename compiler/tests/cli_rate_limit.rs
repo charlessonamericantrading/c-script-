@@ -34,6 +34,11 @@ service Sys {
   rpc adminPing() -> String {
     "pong"
   }
+
+  @rate_limit("2/1m", key: email)
+  rpc loginAttempt(email: String) -> String {
+    "ok"
+  }
 }
 "#;
 
@@ -342,6 +347,65 @@ fn rate_limit_combines_with_requires_and_still_applies_to_an_authenticated_calle
     // que la verificación de credenciales.
     let (status, body) = server.post("/Sys/adminPing", &json!({}), None);
     assert_eq!(status, 429, "body: {body:?}");
+}
+
+// ---- `key: <param>` (GRAMMAR.md §3.142) ----
+
+#[test]
+fn key_param_combines_with_ip_so_a_different_value_gets_its_own_bucket_even_from_the_same_connection() {
+    // Todas las requests de este test vienen de la MISMA conexión TCP real
+    // (mismo IP) -- lo único que cambia es 'email'. Si el bucket siguiera
+    // siendo solo-IP, agotar el balde con un email dejaría SIN cupo al otro
+    // también; con `key: email`, cada valor tiene su propio balde.
+    let temp = TempDir::new("key-param-separate-buckets");
+    let out = build(&temp, PROGRAM);
+    assert!(out.status.success(), "el programa debió compilar: {}", String::from_utf8_lossy(&out.stderr));
+    let server = Serve::start(&temp.0.join("app.link"));
+
+    for i in 1..=2 {
+        let (status, body) = server.post("/Sys/loginAttempt", &json!({"email": "a@example.com"}), None);
+        assert_eq!(status, 200, "a@example.com, request {i}: {body:?}");
+    }
+    let (status, body) = server.post("/Sys/loginAttempt", &json!({"email": "a@example.com"}), None);
+    assert_eq!(status, 429, "a@example.com ya agotó su balde: {body:?}");
+
+    // Mismo IP, OTRO email -- balde propio, sin verse afectado.
+    let (status, body) = server.post("/Sys/loginAttempt", &json!({"email": "b@example.com"}), None);
+    assert_eq!(status, 200, "b@example.com no debería verse afectado por el balde de a@example.com: {body:?}");
+}
+
+#[test]
+fn key_param_rejects_a_name_that_is_not_a_real_parameter() {
+    let temp = TempDir::new("key-param-unknown");
+    let out = build(
+        &temp,
+        r#"
+service S {
+  @rate_limit("5/1m", key: nombreQueNoExiste)
+  rpc ping(email: String) -> String { "pong" }
+}
+"#,
+    );
+    let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "debió fallar");
+    assert!(stderr.contains("no es un parámetro"), "mensaje inesperado: {stderr}");
+}
+
+#[test]
+fn key_param_rejects_a_parameter_that_is_not_string_or_int() {
+    let temp = TempDir::new("key-param-wrong-type");
+    let out = build(
+        &temp,
+        r#"
+service S {
+  @rate_limit("5/1m", key: active)
+  rpc ping(active: Bool) -> String { "pong" }
+}
+"#,
+    );
+    let stderr = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "debió fallar");
+    assert!(stderr.contains("tiene que ser"), "mensaje inesperado: {stderr}");
 }
 
 #[test]

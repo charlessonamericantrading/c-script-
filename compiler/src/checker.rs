@@ -154,6 +154,45 @@ fn open_graph_tag_type() -> Type {
     }
 }
 
+/// El tipo de cada entrada de `attachments` en `smtp.sendMessage(...)`
+/// (GRAMMAR.md §3.141) -- `contentBase64` porque c-script no tiene un tipo
+/// de bytes crudos: el contenido del archivo viaja codificado en base64,
+/// igual que cualquier binario dentro de JSON, y se decodifica del lado del
+/// runtime (`runtime::send_email_advanced`) directo a `Vec<u8>` sin pasar
+/// por `base64.decode` (que exige UTF-8 válido en el resultado, algo que un
+/// adjunto binario real casi nunca es).
+fn smtp_attachment_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "filename".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "contentType".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "contentBase64".to_string(), optional: false, ty: Type::String },
+        ],
+    }
+}
+
+/// El tipo que `smtp.sendMessage(message)` (GRAMMAR.md §3.141) espera --
+/// variante "kitchen sink" de `send`/`sendToMany`/`sendHtml` (arriba, sin
+/// cambios) para el caso que esos tres no cubren: copia oculta/visible y
+/// adjuntos reales. `cc`/`bcc`/`attachments` opcionales-por-clave (mismo
+/// criterio que `disallow`/`allow` de `robots_rule_type`) -- el caso más
+/// común (sin ninguno de los tres) no obliga a escribir `[]` a mano.
+fn smtp_message_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "to".to_string(), optional: false, ty: Type::List(Box::new(Type::String)) },
+            FieldType { name: "cc".to_string(), optional: true, ty: Type::List(Box::new(Type::String)) },
+            FieldType { name: "bcc".to_string(), optional: true, ty: Type::List(Box::new(Type::String)) },
+            FieldType { name: "subject".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "body".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "html".to_string(), optional: true, ty: Type::Bool },
+            FieldType { name: "attachments".to_string(), optional: true, ty: Type::List(Box::new(smtp_attachment_type())) },
+        ],
+    }
+}
+
 impl CheckError {
     /// El PRIMER stamp gana: a medida que un error burbujea desde adentro
     /// hacia afuera (ej. de una sub-expresión hasta la sentencia que la
@@ -1586,11 +1625,11 @@ impl Checker {
     /// No hay restricción de auth/content_type/route acá: rate limiting es
     /// una dimensión ortogonal, se puede combinar con cualquiera de esas.
     fn check_rate_limit_annotation(&self, r: &RpcDecl) -> Result<(), CheckError> {
-        let specs: Vec<&String> = r
+        let specs: Vec<(&String, &Option<String>)> = r
             .annotations
             .iter()
             .filter_map(|a| match a {
-                Annotation::RateLimit(spec) => Some(spec),
+                Annotation::RateLimit { spec, key_param } => Some((spec, key_param)),
                 _ => None,
             })
             .collect();
@@ -1600,10 +1639,29 @@ impl Checker {
                 r.name
             )));
         }
-        let Some(raw) = specs.first() else {
+        let Some((raw, key_param)) = specs.first() else {
             return Ok(());
         };
         crate::rate_limit::RateLimitSpec::parse(raw).map_err(|e| err(format!("`@rate_limit(\"{raw}\")` en '{}': {e}", r.name)))?;
+        // `key: <param>` (GRAMMAR.md §3.142) -- tiene que nombrar un
+        // parámetro REAL de este rpc, de tipo `String`/`Int` (los únicos dos
+        // que se pueden combinar con la IP en una clave de bucket de forma
+        // determinística y sin ambigüedad).
+        if let Some(key_param) = key_param {
+            let Some(param) = r.params.iter().find(|p| &p.name == key_param) else {
+                return Err(err(format!(
+                    "`@rate_limit(..., key: {key_param})` en '{}': '{key_param}' no es un parámetro de este rpc",
+                    r.name
+                )));
+            };
+            let ty = self.resolve_type(&param.ty)?;
+            if ty != Type::String && ty != Type::Int {
+                return Err(err(format!(
+                    "`@rate_limit(..., key: {key_param})` en '{}': '{key_param}' tiene que ser `String` o `Int` -- es `{ty}`",
+                    r.name
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1823,6 +1881,20 @@ impl Checker {
         if !has_id_int {
             return Err(err(format!(
                 "`@infinite` en '{}': el elemento de la lista de retorno tiene que tener un campo `id: Int` -- el hook generado usa el `id` del último elemento como el próximo cursor",
+                r.name
+            )));
+        }
+        Ok(())
+    }
+
+    /// `@idempotent` (GRAMMAR.md §3.140, PLAN.md §9.3) -- sin argumentos, así
+    /// que la única forma inválida es sobre un `stream`: una conexión SSE no
+    /// tiene un ÚNICO resultado que grabar y repetir, mismo motivo que
+    /// `@cache_control`/`@example` rechazan ahí (GRAMMAR.md §3.113/§3.119).
+    fn check_idempotent_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        if r.idempotent() && is_stream {
+            return Err(err(format!(
+                "`@idempotent` en el stream '{}': una conexión SSE no tiene un único resultado que grabar y repetir (GRAMMAR.md §3.140) -- llamalo desde un 'rpc' normal",
                 r.name
             )));
         }
@@ -2086,6 +2158,7 @@ impl Checker {
         self.check_example_annotation(r, is_stream)?;
         self.check_invalidates_annotation(r, is_stream, service)?;
         self.check_infinite_annotation(r, is_stream)?;
+        self.check_idempotent_annotation(r, is_stream)?;
         let Some(Annotation::Requires { enum_name, variant_names }) = r.auth() else {
             return Ok(());
         };
@@ -3740,6 +3813,15 @@ impl Checker {
                 self.check_expr(html, &Type::String, env)?;
                 Some(Type::Void)
             }
+            (Type::Smtp, "sendMessage") => {
+                let [message] = args else {
+                    return Err(err(
+                        "'smtp.sendMessage' toma exactamente 1 argumento (message: { to: String[], cc: String[]?, bcc: String[]?, subject: String, body: String, html: Bool?, attachments: {...}[]? })",
+                    ));
+                };
+                self.check_expr(message, &smtp_message_type(), env)?;
+                Some(Type::Void)
+            }
             (Type::Response, "setStatus") => {
                 let [code_arg] = args else {
                     return Err(err("'response.setStatus' toma exactamente 1 argumento (code: Int)"));
@@ -5025,6 +5107,73 @@ type T = { id: Int, s: Status }")
         assert!(check_source(src).is_err());
     }
 
+    /// `smtp.sendMessage(message)` (GRAMMAR.md §3.141) acepta cualquier
+    /// struct con la forma correcta -- `cc`/`bcc`/`html`/`attachments`
+    /// opcionales-POR-CLAVE (`x?: T`, se pueden omitir del todo), mismo
+    /// criterio que `disallow`/`allow` de `robots_rule_type`.
+    #[test]
+    fn smtp_send_message_accepts_the_minimal_shape_without_cc_bcc_html_or_attachments() {
+        let src = r#"
+            type Msg = { to: String[], subject: String, body: String }
+            service Sys {
+                rpc notify() -> Void { smtp.sendMessage(Msg { to: ["a@x.com"], subject: "s", body: "b" }) }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn smtp_send_message_accepts_the_full_shape_with_attachments() {
+        let src = r#"
+            type Att = { filename: String, contentType: String, contentBase64: String }
+            type Msg = { to: String[], cc?: String[], bcc?: String[], subject: String, body: String, html?: Bool, attachments?: Att[] }
+            service Sys {
+                rpc notify() -> Void {
+                    smtp.sendMessage(Msg {
+                        to: ["a@x.com"], cc: ["b@x.com"], bcc: ["c@x.com"], subject: "s", body: "b", html: true,
+                        attachments: [Att { filename: "f.txt", contentType: "text/plain", contentBase64: "aGk=" }],
+                    })
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn smtp_send_message_rejects_a_struct_missing_to() {
+        let src = r#"
+            type Msg = { subject: String, body: String }
+            service Sys {
+                rpc notify() -> Void { smtp.sendMessage(Msg { subject: "s", body: "b" }) }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn smtp_send_message_rejects_a_value_optional_cc_where_a_key_optional_field_is_expected() {
+        // `cc: String[]?` (valor opcional) NO es lo mismo que `cc?: String[]`
+        // (clave opcional, GRAMMAR.md §3.4) -- `T?` nunca es subtipo de `T`.
+        let src = r#"
+            type Msg = { to: String[], cc: String[]?, subject: String, body: String }
+            service Sys {
+                rpc notify() -> Void { smtp.sendMessage(Msg { to: ["a@x.com"], cc: null, subject: "s", body: "b" }) }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn smtp_send_message_rejects_the_wrong_number_of_arguments() {
+        let src = r#"
+            type Msg = { to: String[], subject: String, body: String }
+            service Sys {
+                rpc notify() -> Void { smtp.sendMessage(Msg { to: ["a@x.com"], subject: "s", body: "b" }, "extra") }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
     /// `metaTags`/`openGraphTags`/`canonicalLink`/`jsonLd` (GRAMMAR.md
     /// §3.117), mismo criterio estructural que `sitemapXml`/`robotsTxt` --
     /// cualquier `type` con la forma correcta sirve.
@@ -5870,6 +6019,49 @@ type T = { id: Int, s: Status }")
         "#;
         let err = check_source(src).unwrap_err();
         assert!(err.iter().any(|e| e.message.contains("más de una vez")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn idempotent_annotation_type_checks_on_a_plain_rpc() {
+        let src = r#"
+            service Orders {
+                @idempotent
+                rpc create(total: Int) -> Int { total }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn idempotent_combines_with_other_annotations() {
+        let src = r#"
+            service Orders {
+                @authenticated
+                @idempotent
+                @rate_limit("5/1m")
+                rpc create(total: Int) -> Int { total }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn idempotent_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @idempotent
+                stream list() -> Task {
+                    db.tasks.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("idempotent") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
     }
 
     #[test]

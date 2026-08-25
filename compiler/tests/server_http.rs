@@ -165,6 +165,51 @@ impl ServeProcess {
         (status, json)
     }
 
+    /// Como `post`, pero mandando además un header `Idempotency-Key`
+    /// (GRAMMAR.md §3.140) -- duplica el armado/lectura de la request en
+    /// vez de generalizar `post` (usado por decenas de tests de este
+    /// archivo que no necesitan tocar headers), para no arriesgar ninguno
+    /// de ellos con un cambio de firma compartido.
+    fn post_with_idempotency_key(&self, path: &str, body: &Value, key: &str) -> (u16, Value) {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", self.port)).expect("conectar al servidor 'linkc serve' real");
+        let body_str = body.to_string();
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nIdempotency-Key: {key}\r\nConnection: close\r\n\r\n{body_str}",
+            self.port,
+            body_str.len()
+        );
+        stream.write_all(request.as_bytes()).expect("escribir la request HTTP");
+        stream.flush().ok();
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("leer la línea de estado HTTP");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("línea de estado HTTP inesperada: {status_line:?}"));
+
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("leer un header de la respuesta");
+            if n == 0 || line.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.trim().split_once(':') {
+                if k.trim().eq_ignore_ascii_case("content-length") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf).expect("leer el body de la respuesta");
+        let json = if buf.is_empty() { Value::Null } else { serde_json::from_slice(&buf).expect("el body debe ser JSON") };
+        (status, json)
+    }
+
     /// Termina el proceso hijo por su PID exacto (`Child::kill`, jamás un
     /// kill por nombre de imagen) -- `serve()` corre un loop infinito sobre
     /// `incoming_requests()` sin ningún camino de apagado limpio por señal
@@ -654,6 +699,62 @@ fn without_jwt_secret_configured_a_jwt_shaped_token_is_just_unauthenticated() {
     let jwt = make_jwt("cualquier-secreto", "HS256", r#"{"role":"Admin","sub":1}"#);
     let (status, _) = server.post("/Secured/adminOnly", &json!({}), Some(&jwt));
     assert_eq!(status, 401);
+
+    server.shutdown();
+}
+
+/// `@idempotent` (GRAMMAR.md §3.140): `create` inserta una fila real -- el
+/// contador (`count`) es lo que prueba que un reintento con la MISMA clave
+/// nunca corre el cuerpo dos veces, no solo que devuelve un valor parecido.
+const IDEMPOTENT_PROGRAM: &str = r#"
+    type Order = { id: Int, total: Int }
+    db { orders: Order[] }
+    service Orders {
+        @idempotent
+        rpc create(total: Int) -> Order { db.orders.insert(Order { id: 0, total: total }) }
+        rpc count() -> Int { db.orders.all().length() }
+    }
+"#;
+
+#[test]
+fn idempotent_replays_the_stored_result_on_a_retry_with_the_same_key_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("idempotent-replay", IDEMPOTENT_PROGRAM);
+
+    let (status1, body1) = server.post_with_idempotency_key("/Orders/create", &json!({"total": 10}), "key-1");
+    assert_eq!(status1, 200, "body: {body1:?}");
+    let (status2, body2) = server.post_with_idempotency_key("/Orders/create", &json!({"total": 10}), "key-1");
+    assert_eq!(status2, 200, "body: {body2:?}");
+    assert_eq!(body1, body2, "un reintento con la misma clave tiene que devolver EXACTAMENTE el mismo resultado");
+
+    let (_, count) = server.post("/Orders/count", &json!({}), None);
+    assert_eq!(count, json!(1), "el segundo POST no debe haber insertado una segunda fila");
+
+    server.shutdown();
+}
+
+#[test]
+fn idempotent_without_a_key_runs_the_body_every_time_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("idempotent-no-key", IDEMPOTENT_PROGRAM);
+
+    server.post("/Orders/create", &json!({"total": 10}), None);
+    server.post("/Orders/create", &json!({"total": 10}), None);
+    let (_, count) = server.post("/Orders/count", &json!({}), None);
+    assert_eq!(count, json!(2), "sin 'Idempotency-Key' el rpc corre normal, sin ninguna deduplicación");
+
+    server.shutdown();
+}
+
+#[test]
+fn idempotent_rejects_the_same_key_reused_with_a_different_body_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("idempotent-conflict", IDEMPOTENT_PROGRAM);
+
+    let (status1, _) = server.post_with_idempotency_key("/Orders/create", &json!({"total": 10}), "key-1");
+    assert_eq!(status1, 200);
+    let (status2, body2) = server.post_with_idempotency_key("/Orders/create", &json!({"total": 20}), "key-1");
+    assert_eq!(status2, 409, "misma clave, body distinto: 409 -- body: {body2:?}");
+
+    let (_, count) = server.post("/Orders/count", &json!({}), None);
+    assert_eq!(count, json!(1), "el intento en conflicto no debe haber insertado nada");
 
     server.shutdown();
 }
