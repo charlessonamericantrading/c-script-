@@ -143,6 +143,7 @@
   - [3.119 `@example(request: ..., response: ...)`: ejemplos tipados en `openapi.json` — RESUELTO](#3119-examplerequest-response-ejemplos-tipados-en-openapijson--resuelto)
   - [3.120 `linkc systemd`: generador de unidad systemd — RESUELTO](#3120-linkc-systemd-generador-de-unidad-systemd--resuelto)
   - [3.121 `linkc pm2-config`: generador de configuración PM2 — RESUELTO](#3121-linkc-pm2-config-generador-de-configuración-pm2--resuelto)
+  - [3.122 `--log-format`/`--log-level`: logging estructurado JSON y nivel configurable — RESUELTO](#3122---log-format---log-level-logging-estructurado-json-y-nivel-configurable--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5187,6 +5188,28 @@ linkc pm2-config main.link 4200 -o ecosystem.json
 **Implementación**: `pm2::generate_pm2_config(source_file, port: u16, out_path) -> Result<PathBuf, io::Error>` (`compiler/src/pm2.rs`) -- mismo mecanismo que `docker::generate_docker_files`/`systemd::generate_systemd_unit` (`file_stem`/`file_name`, `format!` de plantilla), con `out_path` como archivo completo en vez de un directorio.
 
 **Verificado**: 2 tests en `pm2.rs` (JSON válido -- parseado de verdad con `serde_json`, no solo "no crashea" -- con el puerto real en `args` y SIN ninguna variable de conexión falsa; nombre de app del `file_stem`) + 2 tests de CLI end-to-end contra el binario real (`-o` explícito genera el `ecosystem.json` esperado; sin `-o` el default es `./ecosystem.json` en el directorio actual) + `cli_help.rs` actualizado (`pm2-config` sumado a la lista de subcomandos verificados). Probado a mano además contra el binario real, con y sin `-o`, confirmando el JSON generado byte a byte.
+
+---
+
+### 3.122 `--log-format`/`--log-level`: logging estructurado JSON y nivel configurable — RESUELTO
+
+PLAN.md §9.8, ítem 1: `linkc serve` ya dejaba una línea de log por request COMPLETADA, formato `clave=valor` (`log_done`, `runtime/server.rs`, greppable sin parsear JSON) -- lo que faltaba era (a) una forma de que un colector de logs real (CloudWatch, Datadog, `journald` con `-o json`) indexe los campos sin parsear texto libre, y (b) una forma de bajar el volumen en producción con tráfico real, donde una línea por cada request exitosa es demasiado ruido para mirar a mano.
+
+```
+linkc serve app.link 3000 --log-format json --log-level warn
+```
+
+**`--log-format text|json` / `LINK_LOG_FORMAT`** -- `text` (default, el comportamiento exacto de siempre) o `json`, una línea por evento. **`--log-level debug|info|warn|error` / `LINK_LOG_LEVEL`** -- `info` (default, IGUAL que antes de esta ronda: las dos líneas por request, recibida y completada, se siguen imprimiendo SIEMPRE) o `warn`/`error` para ver solo lo que amerita mirar: `warn` muestra únicamente requests que terminaron en 4xx o 5xx, `error` solo 5xx. `debug` es sinónimo de `info` hoy -- no hay todavía ninguna línea de nivel `Debug` propio, existe para que la jerarquía completa (`Debug < Info < Warn < Error`, orden real vía `derive(PartialOrd)`) sea un valor válido desde el principio, reservado para logging más fino a futuro.
+
+**Clasificación automática por `status`, no una anotación por call-site**: `status_level(status)` -- 5xx es `Error` (fallo del SERVIDOR), 4xx es `Warn` (rechazo esperado -- auth, rate limit, validación -- pero señal real), cualquier otra cosa (2xx/3xx, o el sentinel `0` que usa un cliente desconectado a mitad de un `stream`) es `Info`. La línea de "request recibida" (antes de saber el status final) queda fija en `Info` -- mismo criterio que un 2xx, así que a nivel `info` (el default) sigue imprimiéndose exactamente igual que siempre, y solo se suprime pidiendo `warn`/`error` explícitamente.
+
+**`LogConfig` (`format`+`level`, `Copy`) se arma UNA vez al arrancar** (`main.rs::resolve_log_format`/`resolve_log_level`) y cruza a los hilos de escritura de `stream` (`write_stream`/`write_live_stream`) exactamente igual que `max_body_bytes: u64` ya cruzaba -- sin ninguna sincronización, es un valor fijo para toda la vida del proceso.
+
+**Límite documentado, no escondido**: en `LogFormat::Json`, el campo libre `extra` (`error="..."` en una falla, `sent=N total=M` en un stream) viaja tal cual DENTRO de un string en el JSON (`"extra": "error=\"...\""`), no separado en campos propios -- no hay una gramática fija que partirlo sin inventar un schema que esta ronda no amerita. Un colector de logs puede indexar `req_id`/`method`/`status`/`duration_ms` de sobra; `extra` sigue necesitando lectura humana o un parseo aparte, igual que en `LogFormat::Text`.
+
+**Alcance**: solo las líneas POR REQUEST (`log_done` + la línea de "request recibida") -- la línea de arranque (`"c-script server escuchando en..."`) y un error de `accept()` de la conexión TCP siguen como `println!`/`eprintln!` planos, sin cambios: son eventos raros, de una sola vez, no la fuente de volumen que este ítem ataca.
+
+**Verificado**: 6 tests de CLI end-to-end contra el binario real en `cli_log_format.rs` (formato texto default sigue imprimiendo las dos líneas de siempre; `--log-format json` produce JSON parseable de verdad con los campos documentados, no solo "no crashea"; `--log-level warn` suprime una request exitosa PERO sigue mostrando un 404; `--log-format`/`--log-level` inválidos rechazados con un mensaje claro). Probado a mano además contra el binario real (`curl` + lectura de stdout), confirmando las tres combinaciones (texto default, JSON, `warn` con éxito vs. error) byte a byte.
 
 ---
 

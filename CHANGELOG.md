@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.85.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`--log-format text|json` / `--log-level debug|info|warn|error`.** PLAN.md §9.8: `linkc serve` ya dejaba una línea `clave=valor` por request completada; faltaba una forma de indexarla como JSON sin parsear texto libre, y una forma de bajar el volumen en producción con tráfico real (hoy cada request exitosa deja una línea). `--log-format`/`LINK_LOG_FORMAT` (default `text`, sin cambios de comportamiento) y `--log-level`/`LINK_LOG_LEVEL` (default `info`, EXACTAMENTE el comportamiento de siempre -- las dos líneas por request, recibida y completada, se siguen imprimiendo SIEMPRE). Clasificación automática por `status` (`status_level`: 5xx=`Error`, 4xx=`Warn`, resto=`Info`), no una anotación manual por call-site -- a `--log-level warn` una request exitosa no deja ninguna línea, pero un 404/500 sigue apareciendo. `LogConfig` (`Copy`, `format`+`level`) cruza a los hilos de escritura de `stream` (`write_stream`/`write_live_stream`) igual que `max_body_bytes: u64` ya cruzaba. Alcance deliberado: solo las líneas POR REQUEST -- la línea de arranque y un error de `accept()` siguen como `println!`/`eprintln!` planos, no son la fuente de volumen que este ítem ataca; el campo libre `extra` en `LogFormat::Json` viaja tal cual dentro de un string, sin partirse en campos propios (límite documentado, no escondido).
+
+1011 tests (6 nuevos): todos de CLI end-to-end contra el binario real en `cli_log_format.rs` (formato texto default sigue imprimiendo las dos líneas de siempre; `--log-format json` produce JSON parseable de verdad con los campos documentados; `--log-level warn` suprime una request exitosa pero sigue mostrando un 404; `--log-format`/`--log-level` inválidos rechazados con mensaje claro). Verificado también a mano contra el binario real (`curl` + lectura de stdout). Detalle completo: GRAMMAR.md §3.122, PLAN.md §9.8.
+
 ## [1.84.0] - 2026-08-25
 
 ### ✨ Nuevo

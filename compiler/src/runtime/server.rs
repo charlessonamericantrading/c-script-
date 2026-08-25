@@ -46,22 +46,103 @@ use std::time::Duration;
 /// ver `log_done` para el resto.
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+/// `--log-level`/`LINK_LOG_LEVEL` (GRAMMAR.md §3.122): orden de declaración
+/// = orden real (`derive(PartialOrd)`) -- `Debug < Info < Warn < Error`, así
+/// que "esta línea se imprime" es literalmente `entry_level >= config.level`
+/// en los dos call-sites de abajo. Sin entradas propias de nivel `Debug`
+/// todavía (reservado para logging más fino a futuro); existe igual para
+/// que la jerarquía completa esté declarada desde el principio.
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// `--log-format`/`LINK_LOG_FORMAT` (GRAMMAR.md §3.122).
+#[derive(Clone, Copy, PartialEq)]
+pub enum LogFormat {
+    /// El formato de siempre, sin cambios -- `key=value` legible/greppable.
+    Text,
+    /// Una línea JSON por evento -- lo que un colector de logs real
+    /// (CloudWatch, Datadog, `journald` con `journalctl -o json`) espera
+    /// para poder indexar campos sin parsear texto libre.
+    Json,
+}
+
+/// Armado UNA vez al arrancar (`main.rs`), `Copy` a propósito -- cruza a
+/// los hilos de escritura de `stream` (`write_stream`/`write_live_stream`)
+/// exactamente igual que `max_body_bytes: u64` ya cruza, sin necesitar
+/// ninguna sincronización: es un valor fijo para toda la vida del proceso.
+#[derive(Clone, Copy)]
+pub struct LogConfig {
+    pub format: LogFormat,
+    pub level: LogLevel,
+}
+
+impl Default for LogConfig {
+    /// Sin `--log-format`/`--log-level`: texto, nivel `Info` -- el
+    /// comportamiento exacto de siempre (las dos líneas por request,
+    /// recibida y completada, se siguen imprimiendo SIEMPRE). Solo pedir
+    /// `--log-level warn`/`error` explícitamente reduce el volumen.
+    fn default() -> Self {
+        LogConfig { format: LogFormat::Text, level: LogLevel::Info }
+    }
+}
+
+/// `status` -> el nivel que le corresponde a esa línea: `Error` (5xx) es un
+/// fallo del SERVIDOR, `Warn` (4xx) es un rechazo esperado (auth, rate
+/// limit, validación) pero igual señal de algo para mirar, cualquier otra
+/// cosa (2xx/3xx, o `0` -- el sentinel de "cliente se desconectó a mitad de
+/// un stream") es tráfico normal, `Info`.
+fn status_level(status: u16) -> LogLevel {
+    if status >= 500 {
+        LogLevel::Error
+    } else if status >= 400 {
+        LogLevel::Warn
+    } else {
+        LogLevel::Info
+    }
+}
+
 /// Tracing estructurado por RPC (GRAMMAR.md §2.1, auditoría post-push):
-/// una sola línea por request COMPLETADA, formato `clave=valor` (greppable
-/// sin parsear JSON, mismo espíritu que el logging de texto de `tracing`/
+/// una sola línea por request COMPLETADA (greppable sin parsear JSON en
+/// `LogFormat::Text`, mismo espíritu que el logging de texto de `tracing`/
 /// Heroku -- no se suma la dependencia `tracing` para esto, `println!` ya
 /// alcanza). `req_id` (existía desde antes, ver arriba) correlaciona esta
 /// línea con la de "request recibida"; `method` es `None` para los casos
 /// que nunca llegan a resolver `{service}.{rpc}` (ej. un 404 por URL mal
 /// formada). `extra` es libre -- `error="..."` en una falla,
-/// `sent=N total=M` en un stream, o simplemente vacío en un 200 normal.
-fn log_done(req_id: u64, method: Option<&str>, status: u16, start: std::time::Instant, extra: &str) {
+/// `sent=N total=M` en un stream, o simplemente vacío en un 200 normal --
+/// en `LogFormat::Json` viaja tal cual, como un string sin parsear, dentro
+/// del campo `"extra"` (`null` si está vacío): no hay una gramática fija
+/// que separarlo en campos propios sin inventar un schema que esta ronda
+/// no amerita, límite documentado en GRAMMAR.md §3.122, no escondido.
+fn log_done(log: LogConfig, req_id: u64, method: Option<&str>, status: u16, start: std::time::Instant, extra: &str) {
+    if status_level(status) < log.level {
+        return;
+    }
     let elapsed_ms = start.elapsed().as_millis();
     let method_field = method.unwrap_or("-");
-    if extra.is_empty() {
-        println!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms}");
-    } else {
-        println!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms} {extra}");
+    match log.format {
+        LogFormat::Text => {
+            if extra.is_empty() {
+                println!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms}");
+            } else {
+                println!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms} {extra}");
+            }
+        }
+        LogFormat::Json => {
+            let json = serde_json::json!({
+                "req_id": req_id,
+                "method": method,
+                "status": status,
+                "duration_ms": elapsed_ms,
+                "extra": if extra.is_empty() { None } else { Some(extra) },
+            });
+            println!("{json}");
+        }
     }
 }
 
@@ -181,6 +262,7 @@ pub fn serve(
     http_timeout: Duration,
     trust_proxy: bool,
     service_api_key: Option<String>,
+    log: LogConfig,
 ) -> Result<(), String> {
     let server = tiny_http::Server::http((host, port)).map_err(|e| format!("no se pudo iniciar el servidor en {host}:{port}: {e}"))?;
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
@@ -257,6 +339,7 @@ pub fn serve(
                     max_body_bytes,
                     trust_proxy,
                     service_api_key.as_deref(),
+                    log,
                     request,
                 );
             }
@@ -288,6 +371,7 @@ pub fn serve(
                         max_body_bytes,
                         trust_proxy,
                         service_api_key.as_deref(),
+                        log,
                         request,
                     ),
                     Ok(None) => {}
@@ -321,6 +405,7 @@ fn handle_request(
     max_body_bytes: u64,
     trust_proxy: bool,
     service_api_key: Option<&str>,
+    log: LogConfig,
     mut request: tiny_http::Request,
 ) {
     // Resuelto UNA vez por request, antes de cualquier otra cosa --
@@ -340,7 +425,18 @@ fn handle_request(
     let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let start = std::time::Instant::now();
     let path = request.url().to_string();
-    println!("[req {req_id}] {} {path}", request.method());
+    // Nivel `Info` fijo -- mismo criterio que un 2xx/3xx en `log_done`, así
+    // que a `--log-level info` (el default) esta línea sigue imprimiéndose
+    // SIEMPRE, byte a byte igual que antes de esta ronda; solo se suprime
+    // pidiendo `warn`/`error` explícitamente.
+    if LogLevel::Info >= log.level {
+        match log.format {
+            LogFormat::Text => println!("[req {req_id}] {} {path}", request.method()),
+            LogFormat::Json => {
+                println!("{}", serde_json::json!({"req_id": req_id, "http_method": request.method().to_string(), "path": path}))
+            }
+        }
+    }
 
     // `--service-api-key`/`LINK_SERVICE_API_KEY` (GRAMMAR.md §3.93): un
     // secreto compartido que autentica al LLAMADOR (típicamente un gateway
@@ -364,7 +460,7 @@ fn handle_request(
                     error_json("falta o es inválido el header X-Service-Api-Key -- este servidor requiere autenticación servidor-a-servidor"),
                     &cors_headers,
                 ));
-                log_done(req_id, None, 401, start, "error=\"service api key\"");
+                log_done(log, req_id, None, 401, start, "error=\"service api key\"");
                 return;
             }
         }
@@ -395,7 +491,7 @@ fn handle_request(
         // Todavía no se resolvió ningún `service.rpc` (eso pasa recién al
         // parsear el body) -- `None`, mismo criterio que cualquier rechazo
         // que ocurre antes de llegar tan lejos.
-        log_done(req_id, None, 413, start, "");
+        log_done(log, req_id, None, 413, start, "");
         return;
     }
 
@@ -438,7 +534,7 @@ fn handle_request(
         })
         .to_string();
         let _ = request.respond(cors_response(status, health_json, &cors_headers));
-        log_done(req_id, Some("health"), status, start, "");
+        log_done(log, req_id, Some("health"), status, start, "");
         return;
     }
 
@@ -446,12 +542,12 @@ fn handle_request(
         Ok(resolved) => resolved,
         Err(None) => {
             let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method"), &cors_headers));
-            log_done(req_id, None, 404, start, "");
+            log_done(log, req_id, None, 404, start, "");
             return;
         }
         Err(Some(msg)) => {
             let _ = request.respond(cors_response(400, error_json(&msg), &cors_headers));
-            log_done(req_id, None, 400, start, &format!("error={msg:?}"));
+            log_done(log, req_id, None, 400, start, &format!("error={msg:?}"));
             return;
         }
     };
@@ -469,7 +565,7 @@ fn handle_request(
         let client_ip = client_ip_for_rate_limit(&request, trust_proxy);
         if !rate_limiter.check(&client_ip, service_name, rpc_name, spec) {
             let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
-            log_done(req_id, Some(&method), 429, start, "");
+            log_done(log, req_id, Some(&method), 429, start, "");
             return;
         }
     }
@@ -482,7 +578,7 @@ fn handle_request(
     let token = extract_bearer_token(&request);
     if let Err((status, msg)) = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name) {
         let _ = request.respond(cors_response(status, error_json(msg), &cors_headers));
-        log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
+        log_done(log, req_id, Some(&method), status, start, &format!("error={msg:?}"));
         return;
     }
 
@@ -498,13 +594,13 @@ fn handle_request(
             match db.subscribe(collection) {
                 Ok((snapshot, events)) => {
                     let cors_headers = cors_headers.clone();
-                    std::thread::spawn(move || write_live_stream(request, snapshot, events, cors_headers, req_id, method, start));
+                    std::thread::spawn(move || write_live_stream(request, snapshot, events, cors_headers, req_id, method, start, log));
                 }
                 Err(e) => {
                     let status = status_for(&e);
                     let msg = e.to_string();
                     let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
-                    log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
+                    log_done(log, req_id, Some(&method), status, start, &format!("error={msg:?}"));
                 }
             }
             return;
@@ -527,11 +623,11 @@ fn handle_request(
                 let status = status_for(&e);
                 let msg = e.to_string();
                 let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
-                log_done(req_id, Some(&method), status, start, &format!("error={msg:?}"));
+                log_done(log, req_id, Some(&method), status, start, &format!("error={msg:?}"));
                 return;
             }
         };
-        std::thread::spawn(move || write_stream(request, elements, cors_headers, req_id, method, start));
+        std::thread::spawn(move || write_stream(request, elements, cors_headers, req_id, method, start, log));
         return;
     }
 
@@ -560,7 +656,7 @@ fn handle_request(
         response_location.as_deref(),
         response_cache_control.as_deref(),
     ));
-    log_done(req_id, Some(&method), status, start, &extra);
+    log_done(log, req_id, Some(&method), status, start, &extra);
     // Defensa en profundidad, no carga estructural: el `set_request_context`
     // de arriba ya garantiza que la PRÓXIMA request nunca ve el contexto de
     // esta. Limpiarlo acá además evita que sobreviva en memoria más de lo
@@ -1060,6 +1156,7 @@ fn write_stream(
     req_id: u64,
     method: String,
     start: std::time::Instant,
+    log: LogConfig,
 ) {
     // Escrito a mano en vez de tiny_http::Response + request.respond(): ese
     // camino sólo llama flush() UNA vez, al final (request.rs::respond_impl),
@@ -1088,7 +1185,7 @@ fn write_stream(
     let mut writer = request.into_writer();
     let header = sse_preamble(&cors);
     if writer.write_all(header.as_bytes()).is_err() {
-        log_done(req_id, Some(&method), 0, start, "client_disconnected=true stage=before_first_byte");
+        log_done(log, req_id, Some(&method), 0, start, "client_disconnected=true stage=before_first_byte");
         return;
     }
     let _ = writer.flush();
@@ -1110,6 +1207,7 @@ fn write_stream(
                 // lista ya estaba completamente calculada en memoria de
                 // entrada.
                 log_done(
+                    log,
                     req_id,
                     Some(&method),
                     200,
@@ -1125,7 +1223,7 @@ fn write_stream(
     // chunked_transfer::Encoder internamente, acá escrito a mano por la
     // misma razón que el resto de este framing).
     let _ = writer.write_all(b"0\r\n\r\n").and_then(|_| writer.flush());
-    log_done(req_id, Some(&method), 200, start, &format!("sent={sent} total={total}"));
+    log_done(log, req_id, Some(&method), 200, start, &format!("sent={sent} total={total}"));
 }
 
 /// Push real v0 (GRAMMAR.md §3.16): a diferencia de `write_stream`,
@@ -1152,11 +1250,12 @@ fn write_live_stream(
     req_id: u64,
     method: String,
     start: std::time::Instant,
+    log: LogConfig,
 ) {
     let mut writer = request.into_writer();
     let header = sse_preamble(&cors);
     if writer.write_all(header.as_bytes()).is_err() {
-        log_done(req_id, Some(&method), 0, start, "client_disconnected=true stage=before_first_byte");
+        log_done(log, req_id, Some(&method), 0, start, "client_disconnected=true stage=before_first_byte");
         return;
     }
     let _ = writer.flush();
@@ -1164,7 +1263,7 @@ fn write_live_stream(
     let mut sent = 0usize;
     for element in &snapshot {
         if write_chunk(&mut writer, format!("data: {element}\n\n").as_bytes()).is_err() {
-            log_done(req_id, Some(&method), 200, start, &format!("client_disconnected=true stage=snapshot sent={sent}"));
+            log_done(log, req_id, Some(&method), 200, start, &format!("client_disconnected=true stage=snapshot sent={sent}"));
             return;
         }
         sent += 1;
@@ -1175,13 +1274,13 @@ fn write_live_stream(
     // se queda esperando.
     for event in &events {
         if write_chunk(&mut writer, format!("data: {event}\n\n").as_bytes()).is_err() {
-            log_done(req_id, Some(&method), 200, start, &format!("client_disconnected=true stage=live sent={sent}"));
+            log_done(log, req_id, Some(&method), 200, start, &format!("client_disconnected=true stage=live sent={sent}"));
             return;
         }
         sent += 1;
     }
     let _ = writer.write_all(b"0\r\n\r\n").and_then(|_| writer.flush());
-    log_done(req_id, Some(&method), 200, start, &format!("sent={sent}"));
+    log_done(log, req_id, Some(&method), 200, start, &format!("sent={sent}"));
 }
 
 /// Un chunk de HTTP chunked transfer encoding: tamaño en hex + CRLF + datos

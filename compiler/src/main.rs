@@ -142,7 +142,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
     out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve')"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL)"));
     out(&format!("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {{\"nombre_archivo\": puerto, ...}} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
     out(&format!("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)"));
@@ -1246,7 +1246,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>]"
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error]"
         );
         return ExitCode::FAILURE;
     };
@@ -1340,6 +1340,21 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let log_format = match resolve_log_format(args) {
+        Ok(f) => f,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let log_level = match resolve_log_level(args) {
+        Ok(l) => l,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let log = runtime::server::LogConfig { format: log_format, level: log_level };
 
     let program = match load_and_check(path) {
         Ok(p) => p,
@@ -1361,6 +1376,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             http_timeout,
             trust_proxy,
             service_api_key.clone(),
+            log,
         )
     };
     match run_serve_with_backoff(attempt, restart_backoff, path) {
@@ -1471,7 +1487,7 @@ fn resolve_service_api_key(args: &[String]) -> Result<Option<String>, String> {
 fn cmd_serve_all(args: &[String]) -> ExitCode {
     let Some(dir) = args.first() else {
         eprintln!(
-            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>]"
+            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error]"
         );
         return ExitCode::FAILURE;
     };
@@ -1612,6 +1628,21 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let log_format = match resolve_log_format(args) {
+        Ok(f) => f,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let log_level = match resolve_log_level(args) {
+        Ok(l) => l,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let log = runtime::server::LogConfig { format: log_format, level: log_level };
 
     let mut services: Vec<(PathBuf, u16, Program)> = Vec::with_capacity(link_files.len());
     for (i, path) in link_files.iter().enumerate() {
@@ -1683,6 +1714,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
                         http_timeout,
                         trust_proxy,
                         service_api_key.clone(),
+                        log,
                     )
                 };
                 match run_serve_with_backoff(attempt, restart_backoff, &label) {
@@ -1798,6 +1830,36 @@ fn resolve_adopt_existing(args: &[String]) -> bool {
 /// cliente directo puede mandar con el valor que quiera.
 fn resolve_trust_proxy(args: &[String]) -> bool {
     args.iter().any(|a| a == "--trust-proxy") || std::env::var("LINK_TRUST_PROXY").ok().filter(|v| !v.trim().is_empty()).is_some()
+}
+
+/// `--log-format`/`LINK_LOG_FORMAT` (GRAMMAR.md §3.122): `text` (default,
+/// el comportamiento de siempre) o `json` -- cualquier otro valor es un
+/// error claro en vez de caer en silencio al default.
+fn resolve_log_format(args: &[String]) -> Result<runtime::server::LogFormat, String> {
+    let raw = read_flag_or_env(args, "--log-format", "LINK_LOG_FORMAT")?;
+    match raw.as_deref() {
+        None | Some("text") => Ok(runtime::server::LogFormat::Text),
+        Some("json") => Ok(runtime::server::LogFormat::Json),
+        Some(other) => Err(format!("--log-format/LINK_LOG_FORMAT: '{other}' inválido (se esperaba 'text' o 'json')")),
+    }
+}
+
+/// `--log-level`/`LINK_LOG_LEVEL` (GRAMMAR.md §3.122): `info` (default, el
+/// comportamiento de siempre -- las dos líneas por request, recibida y
+/// completada, se siguen imprimiendo SIEMPRE) o `warn`/`error` para reducir
+/// el volumen en producción con tráfico real, mostrando solo las requests
+/// que terminaron en 4xx/5xx respectivamente. `debug` acá es un sinónimo de
+/// `info` -- no hay todavía ninguna línea de nivel `Debug` propio, existe
+/// para que la jerarquía completa sea un valor válido desde el principio.
+fn resolve_log_level(args: &[String]) -> Result<runtime::server::LogLevel, String> {
+    use runtime::server::LogLevel;
+    let raw = read_flag_or_env(args, "--log-level", "LINK_LOG_LEVEL")?;
+    match raw.as_deref() {
+        None | Some("info") | Some("debug") => Ok(LogLevel::Info),
+        Some("warn") => Ok(LogLevel::Warn),
+        Some("error") => Ok(LogLevel::Error),
+        Some(other) => Err(format!("--log-level/LINK_LOG_LEVEL: '{other}' inválido (se esperaba 'debug', 'info', 'warn' o 'error')")),
+    }
 }
 
 /// Cuánto vive una sesión antes de expirar sola (GRAMMAR.md §3.50), en orden
