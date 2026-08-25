@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.91.0 — no editar a mano.
+// Generado automáticamente por linkc v1.92.0 — no editar a mano.
 
 export type Result<T, E> = { type: "Ok"; value: T } | { type: "Err"; error: E };
 export type Patch<T> = Partial<T>;
@@ -35,14 +35,14 @@ export interface BoardStats {
 }
 
 export interface TasksClient {
-  list(): Promise<Task[]>;
-  getById(id: number): Promise<Task | null>;
-  create(input: NewTask): Promise<Task>;
-  update(id: number, patch: Patch<Task>): Promise<Task>;
-  remove(id: number): Promise<boolean>;
-  listByColumn(col: ColumnId): Promise<Task[]>;
-  stats(): Promise<BoardStats>;
-  watchTasks(): AsyncIterable<Task>;
+  list(options?: { signal?: AbortSignal }): Promise<Task[]>;
+  getById(id: number, options?: { signal?: AbortSignal }): Promise<Task | null>;
+  create(input: NewTask, options?: { signal?: AbortSignal }): Promise<Task>;
+  update(id: number, patch: Patch<Task>, options?: { signal?: AbortSignal }): Promise<Task>;
+  remove(id: number, options?: { signal?: AbortSignal }): Promise<boolean>;
+  listByColumn(col: ColumnId, options?: { signal?: AbortSignal }): Promise<Task[]>;
+  stats(options?: { signal?: AbortSignal }): Promise<BoardStats>;
+  watchTasks(options?: { signal?: AbortSignal }): AsyncIterable<Task>;
   setToken(token: string | null): void;
 }
 

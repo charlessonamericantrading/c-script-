@@ -39,6 +39,7 @@ Works, verified by running it:
 - `LinkTransportError` (thrown by `client.ts` for a transport failure — network down, 5xx, timeout, any `!res.ok`) carries a typed `status: number` property, not just the HTTP status interpolated into the message string — `error instanceof LinkTransportError && error.status === 401` works without parsing anything. See GRAMMAR.md §3.126.
 - `use{Service}{Rpc}Query` distinguishes `loading` (true ONLY on the first fetch, no data yet) from `isFetching` (true on ANY fetch in flight, including a background `refetch()` over an already-cached entry) — a naive `if (loading) return <Spinner/>` no longer hides a list that's already showing valid data every time it refreshes. `loading` is derived (`data === null && isFetching`), not a separate flag, so the two can never disagree. See GRAMMAR.md §3.127.
 - `use{Service}{Rpc}Mutation` returns both `mutate` (never throws — returns `null` on failure, the error is already in the hook's `error` state) and `mutateAsync` (throws, for callers that want `try`/`catch` themselves) — same naming react-query uses for the same distinction. Prevents an unhandled promise rejection on the most natural call site (`await mutate(input)` with no surrounding try/catch). See GRAMMAR.md §3.128.
+- Every generated `client.ts` method (`rpc` and `stream` alike) takes an optional last `options?: { signal?: AbortSignal }` param, threaded into the real `fetch()` call — `client.getById(42, { signal: controller.signal })` cancels the actual request, not just the caller ignoring a late response. Scoped to `client.ts` only; the generated hooks don't wire this in automatically yet since Query's cache entry is shared across instances (aborting for one shouldn't cancel a fetch another mounted instance is still waiting on). See GRAMMAR.md §3.129.
 - `linkc serve` — real HTTP server, embedded SQLite that persists across restarts, SSE streams.
 - `linkc test` — runs `test "..."` blocks against an isolated in-memory database.
 - `linkc dev`, `linkc lint`, `linkc doc`, `linkc docker`, `linkc systemd`, `linkc pm2-config`, `linkc lsp`, `linkc new`, `linkc --help`.
@@ -270,7 +271,7 @@ linkc serve backend.link 8787 --restart-backoff 1s  # native exponential backoff
 linkc serve-all ./services --port-base 3000  # one process serves every .link in ./services, one thread+port each
 linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json  # write {"name": port, ...} before serving
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
-linkc --version                      # linkc 1.91.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.92.0 -- same version stamped in every generated file
 ```
 
 ## Verified example

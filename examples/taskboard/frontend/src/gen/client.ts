@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.91.0 — no editar a mano.
+// Generado automáticamente por linkc v1.92.0 — no editar a mano.
 
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
 import { isBoardStats, isTask } from "./validators.ts";
@@ -40,11 +40,12 @@ class TasksClientImpl implements TasksClient {
     this.token = token;
   }
 
-  async list(): Promise<Task[]> {
+  async list(options?: { signal?: AbortSignal }): Promise<Task[]> {
     const res = await fetch(`${this.baseUrl}/Tasks/list`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({  }),
+      signal: options?.signal,
     });
     if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
@@ -52,11 +53,12 @@ class TasksClientImpl implements TasksClient {
     return json as Task[];
   }
 
-  async getById(id: number): Promise<Task | null> {
+  async getById(id: number, options?: { signal?: AbortSignal }): Promise<Task | null> {
     const res = await fetch(`${this.baseUrl}/Tasks/getById`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ id }),
+      signal: options?.signal,
     });
     if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
@@ -64,11 +66,12 @@ class TasksClientImpl implements TasksClient {
     return json as Task | null;
   }
 
-  async create(input: NewTask): Promise<Task> {
+  async create(input: NewTask, options?: { signal?: AbortSignal }): Promise<Task> {
     const res = await fetch(`${this.baseUrl}/Tasks/create`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ input }),
+      signal: options?.signal,
     });
     if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
@@ -76,11 +79,12 @@ class TasksClientImpl implements TasksClient {
     return json as Task;
   }
 
-  async update(id: number, patch: Patch<Task>): Promise<Task> {
+  async update(id: number, patch: Patch<Task>, options?: { signal?: AbortSignal }): Promise<Task> {
     const res = await fetch(`${this.baseUrl}/Tasks/update`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ id, patch }),
+      signal: options?.signal,
     });
     if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
@@ -88,11 +92,12 @@ class TasksClientImpl implements TasksClient {
     return json as Task;
   }
 
-  async remove(id: number): Promise<boolean> {
+  async remove(id: number, options?: { signal?: AbortSignal }): Promise<boolean> {
     const res = await fetch(`${this.baseUrl}/Tasks/remove`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ id }),
+      signal: options?.signal,
     });
     if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
@@ -100,11 +105,12 @@ class TasksClientImpl implements TasksClient {
     return json as boolean;
   }
 
-  async listByColumn(col: ColumnId): Promise<Task[]> {
+  async listByColumn(col: ColumnId, options?: { signal?: AbortSignal }): Promise<Task[]> {
     const res = await fetch(`${this.baseUrl}/Tasks/listByColumn`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({ col }),
+      signal: options?.signal,
     });
     if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
@@ -112,11 +118,12 @@ class TasksClientImpl implements TasksClient {
     return json as Task[];
   }
 
-  async stats(): Promise<BoardStats> {
+  async stats(options?: { signal?: AbortSignal }): Promise<BoardStats> {
     const res = await fetch(`${this.baseUrl}/Tasks/stats`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({  }),
+      signal: options?.signal,
     });
     if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     const json: unknown = await res.json();
@@ -124,11 +131,12 @@ class TasksClientImpl implements TasksClient {
     return json as BoardStats;
   }
 
-  async *watchTasks(): AsyncIterable<Task> {
+  async *watchTasks(options?: { signal?: AbortSignal }): AsyncIterable<Task> {
     const res = await fetch(`${this.baseUrl}/Tasks/watchTasks`, {
       method: "POST",
       headers: { "Content-Type": "application/json", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },
       body: JSON.stringify({  }),
+      signal: options?.signal,
     });
     if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);
     if (!res.body) throw new LinkTransportError("el servidor no devolvió un body de stream", res.status);

@@ -150,6 +150,7 @@
   - [3.126 `LinkTransportError`: el status HTTP viaja tipado, no solo en el mensaje — RESUELTO](#3126-linktransporterror-el-status-http-viaja-tipado-no-solo-en-el-mensaje--resuelto)
   - [3.127 Hooks de React generados: `loading` vs `isFetching` — RESUELTO](#3127-hooks-de-react-generados-loading-vs-isfetching--resuelto)
   - [3.128 Hooks de React generados: `mutate` vs `mutateAsync` — RESUELTO](#3128-hooks-de-react-generados-mutate-vs-mutateasync--resuelto)
+  - [3.129 `client.ts`: cancelar una request con `AbortSignal` — RESUELTO](#3129-clientts-cancelar-una-request-con-abortsignal--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5441,6 +5442,25 @@ async function handleCreateStrict() {
 **Demostración real**: `examples/taskboard/frontend/src/App.tsx`, `handleCreate`, actualizado al patrón nuevo -- chequea el `null` de `mutate()` antes de limpiar el formulario/refrescar, en vez de depender de una excepción que nunca la iba a interrumpir.
 
 **Verificado**: 2 tests nuevos en `codegen::ts_emit` (la firma pública expone las dos funciones con los tipos de retorno correctos, `mutateAsync` sigue relanzando sin cambios, `mutate` envuelve a `mutateAsync` y devuelve `null` en el `catch`; y el fix de `nullable_ret_str` -- ningún `| null | null` en todo el archivo generado, verificado sobre una Mutation, una Query y un `stream`, los tres con retorno/item opcional) + los dos tests existentes de Mutation (`@invalidates` en el camino de éxito, guarda de `requestIdRef`/`reset`) siguen pasando sin cambios -- viven todos dentro de `mutateAsync`, que no cambió de comportamiento. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto, con `getById` (retorno opcional real) confirmando que `Task | null | null` desapareció del `hooks.ts` generado, y `App.tsx` usando la firma nueva de `mutate`.
+
+---
+
+### 3.129 `client.ts`: cancelar una request con `AbortSignal` — RESUELTO
+
+Quinta ronda seguida sobre TypeScript/React, esta vez fuera de `hooks.ts`: hasta esta ronda, ninguna request generada por `client.ts` (ni un `rpc` normal ni un `stream`) tenía forma de CANCELARSE. Un componente que se desmonta a mitad de un fetch, o un buscador que dispara una request nueva por cada letra tipeada, no podía abandonar la anterior -- solo ignorar su respuesta cuando llegara (que es justo lo que el cache de Query, §3.124, y la guarda de `requestIdRef`, §3.123, ya hacían). El `fetch()` real seguía corriendo en el servidor de todos modos, gastando trabajo por una respuesta que nadie iba a leer.
+
+```ts
+const controller = new AbortController();
+const task = await client.getById(42, { signal: controller.signal });
+// ...
+controller.abort(); // cancela el fetch real, no solo ignora la respuesta
+```
+
+**`options?: { signal?: AbortSignal }` como último parámetro de CADA método generado** -- `rpc` y `stream` por igual, en la interfaz (`contract.d.ts`) y en la implementación (`client.ts`), siempre opcional para que ningún caller existente se rompa. `push_fetch_call` (compartida entre el camino de `rpc` y el de `stream`, GRAMMAR.md §4.1) pasa `signal: options?.signal` al `fetch()` real -- `undefined` cuando el caller no pasó `options`, exactamente el mismo comportamiento que `fetch()` ya tiene para "sin `signal`". Un `AbortError` real (la promesa de `fetch()` rechaza cuando se aborta) llega al `catch` del caller como cualquier otro error -- no necesita manejo especial en el cliente generado, `LinkTransportError` sigue existiendo solo para `!res.ok`.
+
+**Alcance deliberado: solo `client.ts`, `hooks.ts` no cambia en esta ronda.** Integrar cancelación DENTRO de los hooks generados (ej. que `use{Servicio}{Rpc}Query` aborte automáticamente al desmontar, o que `refetch()` acepte un signal propio) es una decisión de diseño más grande: la entrada de cache de Query es COMPARTIDA entre instancias (§3.124) -- abortar el fetch de una instancia al desmontarse no debería cancelar la request que OTRA instancia montada sigue esperando. Resolver eso bien necesita su propio diseño, no una extensión mecánica de este ítem; mientras tanto, cualquier componente puede seguir usando `client.<rpc>(...)` directo con su propio `AbortController` fuera de los hooks, que es lo que este ítem habilita.
+
+**Verificado**: 1 test nuevo en `codegen::ts_emit` (`options?: { signal?: AbortSignal }` presente en la interfaz Y la implementación de un `rpc` sin parámetros y de un `stream`, siempre como último parámetro; `signal: options?.signal,` presente exactamente una vez por cada `fetch()` real) + todos los tests existentes que verificaban firmas exactas de métodos (`service_interface_and_rpc_signatures`, `patch_of_user_renders_as_utility_type_reference`, los de tipos genéricos `Box<T>`/`Option<T>`) actualizados a la nueva firma. Verificado también a mano contra un `linkc serve` real (`examples/taskboard`, bundle de `client.ts` vía `esbuild`, sin transpilar el resto del proyecto): abortar ANTES de que la respuesta llegue rechaza con `AbortError` real; abortar con un `setTimeout` de 1ms también; una llamada SIN `options` sigue funcionando exactamente igual que antes de esta ronda -- las tres contra el servidor real, no un mock. Alcance de lo verificado: el comportamiento del lado CLIENTE (la promesa rechaza, `signal: undefined` no rompe nada); qué hace el servidor con una conexión abortada a mitad de una query SQLite casi instantánea no es observable de forma significativa en este caso y no forma parte de esta afirmación.
 
 ---
 

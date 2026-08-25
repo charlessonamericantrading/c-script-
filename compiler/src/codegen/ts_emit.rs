@@ -251,7 +251,7 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     out.push_str("  setToken(token: string | null): void {\n    this.token = token;\n  }\n\n");
 
     for (rpc, is_stream, param_tys, ret_ty) in resolved {
-        let params: Vec<String> = rpc
+        let mut params: Vec<String> = rpc
             .params
             .iter()
             .zip(param_tys)
@@ -264,6 +264,9 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
                 )
             })
             .collect();
+        // Mismo parámetro que la interfaz (`emit_service_interface`) declara
+        // -- GRAMMAR.md §3.129.
+        params.push("options?: { signal?: AbortSignal }".to_string());
         let arg_names: Vec<&str> = rpc.params.iter().map(|p| p.name.as_str()).collect();
         let check = validators_emit::render_check_expr(ret_ty, "json");
 
@@ -803,6 +806,12 @@ fn push_fetch_call(out: &mut String, service_name: &str, rpc_name: &str, arg_nam
         "      headers: { \"Content-Type\": \"application/json\", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },\n",
     );
     out.push_str(&format!("      body: JSON.stringify({{ {} }}),\n", arg_names.join(", ")));
+    // `options?.signal` -- `undefined` cuando el caller no pasó `options`,
+    // que `fetch()` trata exactamente igual que no pasar `signal` (GRAMMAR.md
+    // §3.129). Un `AbortError` real al abortar llega al `catch` del caller
+    // como cualquier otro error de `fetch()` -- no necesita manejo especial
+    // acá, `LinkTransportError` sigue siendo solo para `!res.ok`.
+    out.push_str("      signal: options?.signal,\n");
     out.push_str("    });\n");
     out.push_str("    if (!res.ok) throw new LinkTransportError(`HTTP ${res.status}`, res.status);\n");
 }
@@ -1000,6 +1009,13 @@ fn emit_service_interface(out: &mut String, s: &ServiceDecl, checker: &Checker) 
         } else {
             format!("Promise<{}>", render_type(&ret_ty))
         };
+        // `options?: { signal?: AbortSignal }` (GRAMMAR.md §3.129): último
+        // parámetro, siempre opcional -- cancelar una request en curso (un
+        // componente que se desmonta, un buscador que dispara una nueva
+        // letra y quiere abandonar la anterior en vez de solo ignorarla) no
+        // tenía NINGÚN camino hasta esta ronda; el `fetch()` real seguía
+        // corriendo en el servidor aunque nadie fuera a leer la respuesta.
+        params.push("options?: { signal?: AbortSignal }".to_string());
         push_rpc_jsdoc(out, rpc.doc.as_deref(), rpc.deprecated());
         out.push_str(&format!("  {}({}): {};\n", rpc.name, params.join(", "), ret_str));
     }
@@ -1317,9 +1333,13 @@ mod tests {
     fn service_interface_and_rpc_signatures() {
         let (contract, _) = emit_both(&users_demo_src());
         assert!(contract.contains("export interface UsersClient {"));
-        assert!(contract.contains("list(limit?: number): Promise<User[]>;")); // default -> opcional
-        assert!(contract.contains("getById(id: number): Promise<User | null>;"));
-        assert!(contract.contains("create(input: NewUser): Promise<Result<User, ValidationError>>;"));
+        // default -> opcional; `options?: { signal?: AbortSignal }` siempre
+        // al final (GRAMMAR.md §3.129).
+        assert!(contract.contains("list(limit?: number, options?: { signal?: AbortSignal }): Promise<User[]>;"));
+        assert!(contract.contains("getById(id: number, options?: { signal?: AbortSignal }): Promise<User | null>;"));
+        assert!(contract.contains(
+            "create(input: NewUser, options?: { signal?: AbortSignal }): Promise<Result<User, ValidationError>>;"
+        ));
     }
 
     #[test]
@@ -1329,6 +1349,45 @@ mod tests {
         assert!(client.contains("if (!res.ok) throw new LinkTransportError"));
         assert!(client.contains("class UsersClientImpl implements UsersClient"));
         assert!(client.contains("export function createUsersClient(baseUrl: string): UsersClient"));
+    }
+
+    /// `options?: { signal?: AbortSignal }` (GRAMMAR.md §3.129): gap real --
+    /// cancelar una request en curso (desmontar un componente, abandonar un
+    /// buscador a mitad de tipeo) no tenía NINGÚN camino hasta esta ronda --
+    /// el `fetch()` real seguía en curso en el servidor aunque nadie fuera a
+    /// leer la respuesta. Presente en rpc normal, rpc con retorno `Void`
+    /// (sin parámetros) y `stream`, siempre como ÚLTIMO parámetro y
+    /// SIEMPRE opcional -- ningún caller existente se rompe.
+    #[test]
+    fn every_generated_method_accepts_an_optional_abort_signal() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                rpc get() -> Task { Task { id: 1 } }
+                stream watch() -> Task { [] }
+            }
+        "#;
+        let (contract, client) = emit_both(src);
+        assert!(
+            contract.contains("get(options?: { signal?: AbortSignal }): Promise<Task>;"),
+            "{contract}"
+        );
+        assert!(
+            contract.contains("watch(options?: { signal?: AbortSignal }): AsyncIterable<Task>;"),
+            "{contract}"
+        );
+        assert!(
+            client.contains("async get(options?: { signal?: AbortSignal }): Promise<Task> {"),
+            "{client}"
+        );
+        assert!(
+            client.contains("async *watch(options?: { signal?: AbortSignal }): AsyncIterable<Task> {"),
+            "{client}"
+        );
+        // El `signal` real viaja hasta el `fetch()`, no solo en la firma --
+        // `undefined` cuando no se pasa `options`, mismo comportamiento que
+        // omitir `signal` del todo.
+        assert_eq!(client.matches("signal: options?.signal,").count(), 2, "{client}");
     }
 
     #[test]
@@ -1377,8 +1436,8 @@ service Ticks {
     #[test]
     fn patch_of_user_renders_as_utility_type_reference() {
         let (contract, client) = emit_both(&users_demo_src());
-        assert!(contract.contains("update(id: number, patch: Patch<User>): Promise<User>;"));
-        assert!(client.contains("async update(id: number, patch: Patch<User>): Promise<User>"));
+        assert!(contract.contains("update(id: number, patch: Patch<User>, options?: { signal?: AbortSignal }): Promise<User>;"));
+        assert!(client.contains("async update(id: number, patch: Patch<User>, options?: { signal?: AbortSignal }): Promise<User>"));
     }
 
     #[test]
@@ -1487,7 +1546,7 @@ service Ticks {
         let (contract, _) = emit_both(src);
         assert!(contract.contains("export interface Box<T> {"));
         assert!(contract.contains("value: T;"));
-        assert!(contract.contains("get(): Promise<Box<number>>;"));
+        assert!(contract.contains("get(options?: { signal?: AbortSignal }): Promise<Box<number>>;"));
     }
 
     #[test]
@@ -1519,7 +1578,7 @@ service Ticks {
         let (contract, _) = emit_both(src);
         assert!(contract.contains("export type Option<T> ="));
         assert!(contract.contains("| { type: \"Some\"; value: T }"));
-        assert!(contract.contains("get(): Promise<Option<string>>;"));
+        assert!(contract.contains("get(options?: { signal?: AbortSignal }): Promise<Option<string>>;"));
     }
 
     // ---- auth v0 (GRAMMAR.md §3.14) ----
@@ -1848,7 +1907,7 @@ type User = { id: Int, name: String }
             }
         "#;
         let (contract, _) = emit_both(src);
-        assert!(contract.contains("/** @deprecated usa listV2 */\n  list()"), "{contract}");
+        assert!(contract.contains("/** @deprecated usa listV2 */\n  list("), "{contract}");
         assert!(!contract.contains("*/\n  listV2("), "{contract}");
     }
 

@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.92.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`options?: { signal?: AbortSignal }` en `client.ts`.** Quinta ronda seguida sobre TypeScript/React, esta vez fuera de `hooks.ts`: hasta esta ronda, ninguna request generada (`rpc` o `stream`) tenía forma de cancelarse -- un componente que se desmonta a mitad de un fetch, o un buscador que dispara una request nueva por cada letra tipeada, solo podía IGNORAR la respuesta vieja (mismo criterio que la guarda de `requestIdRef`, §3.123, y el cache de Query, §3.124), nunca cancelar el `fetch()` real -- que seguía corriendo en el servidor de todos modos. Nuevo último parámetro, siempre opcional, en CADA método generado (`rpc` y `stream` por igual, en la interfaz `contract.d.ts` Y la implementación `client.ts`) -- `push_fetch_call` (compartida entre ambos caminos) pasa `signal: options?.signal` al `fetch()` real, `undefined` cuando no se pasa `options`, mismo comportamiento que `fetch()` ya tiene sin `signal`. Ningún caller existente se rompe.
+
+Alcance deliberado: solo `client.ts` -- `hooks.ts` no cambia en esta ronda. Integrar cancelación DENTRO de los hooks generados (ej. que `use{Servicio}{Rpc}Query` aborte automático al desmontar) es una decisión de diseño más grande: la entrada de cache de Query es COMPARTIDA entre instancias (§3.124), así que abortar por una instancia no debería cancelar la request que OTRA instancia montada sigue esperando -- queda para una ronda aparte con su propio diseño. Mientras tanto, cualquier componente puede usar `client.<rpc>(...)` directo con su propio `AbortController`, fuera de los hooks.
+
+1030 tests (1 nuevo) en `codegen::ts_emit`: `options?: { signal?: AbortSignal }` presente en la interfaz y la implementación de un `rpc` sin parámetros y de un `stream`, siempre como último parámetro; `signal: options?.signal,` presente exactamente una vez por cada `fetch()` real. Todos los tests existentes que verificaban firmas exactas de métodos actualizados a la nueva firma. Verificado también a mano contra un `linkc serve` real (`examples/taskboard`, bundle de `client.ts` vía esbuild): abortar antes de que la respuesta llegue rechaza con `AbortError` real; abortar con un `setTimeout` de 1ms también; una llamada sin `options` sigue funcionando exactamente igual que antes -- las tres contra el servidor real. Detalle completo: GRAMMAR.md §3.129, PLAN.md §9.13.
+
 ## [1.91.0] - 2026-08-25
 
 ### ✨ Nuevo
