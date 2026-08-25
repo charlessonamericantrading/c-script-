@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.90.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`loading` vs `isFetching` en `use{Servicio}{Rpc}Query`.** Tercera ronda seguida sobre el mismo pedido del usuario de seguir profundizando TypeScript/React ("sigue"): desde v1.87.0, `loading` era un único flag verdadero durante CUALQUIER fetch -- tanto el inicial (sin datos todavía) como un `refetch()` de FONDO sobre una entrada que YA tenía datos cacheados. Un componente escrito de la forma más natural (`if (loading) return <Spinner/>`) ocultaba una lista que ya estaba mostrando datos válidos cada vez que alguien la refrescaba -- el clásico problema que react-query resuelve distinguiendo `isLoading` de `isFetching`. Ahora `isFetching` es el flag real (renombre del que `loading` ocupaba en `QueryCacheState<T>`, verdadero durante cualquier fetch), y `loading` pasa a ser un valor DERIVADO (`data === null && isFetching`, "no hay nada que mostrar todavía") en vez de un flag propio -- imposible que queden desincronizados. Sin cambios en cuándo fetchea (dedupe vía `entry.promise`, auto-fetch del `useEffect`, invalidación vía `@invalidates`) -- puramente qué expone el hook. `Mutation` queda deliberadamente afuera: no tiene el concepto de "dato cacheado que sigue siendo válido mientras se recarga".
+
+1027 tests (1 nuevo) en `codegen::ts_emit`: `QueryState<T>` expone `loading`+`isFetching`, `QueryCacheState<T>` interno usa `isFetching`, ningún `setQueryCacheState` en todo el archivo escribe un `loading: true`/`loading: false` -- el test existente de cache compartido actualizado a la nueva forma del `return`. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto. Detalle completo: GRAMMAR.md §3.127, PLAN.md §9.13.
+
 ## [1.89.0] - 2026-08-25
 
 ### 🐛 Arreglado

@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.89.0 — no editar a mano.
+// Generado automáticamente por linkc v1.90.0 — no editar a mano.
 
 import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "react";
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
@@ -6,6 +6,7 @@ import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./
 export interface QueryState<T> {
   data: T | null;
   loading: boolean;
+  isFetching: boolean;
   error: Error | null;
   refetch: () => Promise<T | null>;
 }
@@ -24,7 +25,7 @@ export interface SubscriptionState<T> {
   error: Error | null;
 }
 
-type QueryCacheState<T> = { data: T | null; loading: boolean; error: Error | null };
+type QueryCacheState<T> = { data: T | null; isFetching: boolean; error: Error | null };
 
 type QueryCacheEntry<T> = {
   state: QueryCacheState<T>;
@@ -37,7 +38,7 @@ const queryCache = new Map<string, QueryCacheEntry<unknown>>();
 function getQueryCacheEntry<T>(key: string): QueryCacheEntry<T> {
   let entry = queryCache.get(key) as QueryCacheEntry<T> | undefined;
   if (!entry) {
-    entry = { state: { data: null, loading: false, error: null }, promise: null, listeners: new Set() };
+    entry = { state: { data: null, isFetching: false, error: null }, promise: null, listeners: new Set() };
     queryCache.set(key, entry as QueryCacheEntry<unknown>);
   }
   return entry;
@@ -52,7 +53,7 @@ function invalidateQueryCache(rpcKeyPrefix: string): void {
   const prefix = rpcKeyPrefix + "(";
   queryCache.forEach((entry, key) => {
     if (!key.startsWith(prefix)) return;
-    entry.state = { data: null, loading: false, error: null };
+    entry.state = { data: null, isFetching: false, error: null };
     entry.listeners.forEach((listener) => listener());
   });
 }
@@ -71,15 +72,15 @@ export function useTasksListQuery(client: TasksClient, options?: { enabled?: boo
 
   const refetch = useCallback(async (): Promise<Task[] | null> => {
     if (!entry.promise) {
-      setQueryCacheState(entry, { loading: true, error: null });
+      setQueryCacheState(entry, { isFetching: true, error: null });
       entry.promise = client.list()
         .then((res) => {
-          setQueryCacheState(entry, { data: res, loading: false });
+          setQueryCacheState(entry, { data: res, isFetching: false });
           return res;
         })
         .catch((err) => {
           const e = err instanceof Error ? err : new Error(String(err));
-          setQueryCacheState(entry, { error: e, loading: false });
+          setQueryCacheState(entry, { error: e, isFetching: false });
           throw e;
         })
         .finally(() => {
@@ -94,12 +95,12 @@ export function useTasksListQuery(client: TasksClient, options?: { enabled?: boo
   }, [entry, client]);
 
   useEffect(() => {
-    if (enabled && state.data === null && !state.loading && !entry.promise) {
+    if (enabled && state.data === null && !state.isFetching && !entry.promise) {
       refetch();
     }
-  }, [enabled, refetch, entry, state.data, state.loading]);
+  }, [enabled, refetch, entry, state.data, state.isFetching]);
 
-  return { data: state.data, loading: state.loading, error: state.error, refetch };
+  return { data: state.data, loading: state.data === null && state.isFetching, isFetching: state.isFetching, error: state.error, refetch };
 }
 
 export function useTasksListMutation(client: TasksClient): MutationState<Task[]> & {
@@ -151,15 +152,15 @@ export function useTasksGetByIdQuery(client: TasksClient, id: number, options?: 
 
   const refetch = useCallback(async (): Promise<Task | null | null> => {
     if (!entry.promise) {
-      setQueryCacheState(entry, { loading: true, error: null });
+      setQueryCacheState(entry, { isFetching: true, error: null });
       entry.promise = client.getById(id)
         .then((res) => {
-          setQueryCacheState(entry, { data: res, loading: false });
+          setQueryCacheState(entry, { data: res, isFetching: false });
           return res;
         })
         .catch((err) => {
           const e = err instanceof Error ? err : new Error(String(err));
-          setQueryCacheState(entry, { error: e, loading: false });
+          setQueryCacheState(entry, { error: e, isFetching: false });
           throw e;
         })
         .finally(() => {
@@ -174,12 +175,12 @@ export function useTasksGetByIdQuery(client: TasksClient, id: number, options?: 
   }, [entry, client, id]);
 
   useEffect(() => {
-    if (enabled && state.data === null && !state.loading && !entry.promise) {
+    if (enabled && state.data === null && !state.isFetching && !entry.promise) {
       refetch();
     }
-  }, [enabled, refetch, entry, state.data, state.loading]);
+  }, [enabled, refetch, entry, state.data, state.isFetching]);
 
-  return { data: state.data, loading: state.loading, error: state.error, refetch };
+  return { data: state.data, loading: state.data === null && state.isFetching, isFetching: state.isFetching, error: state.error, refetch };
 }
 
 export function useTasksGetByIdMutation(client: TasksClient): MutationState<Task | null> & {
@@ -345,15 +346,15 @@ export function useTasksListByColumnQuery(client: TasksClient, col: ColumnId, op
 
   const refetch = useCallback(async (): Promise<Task[] | null> => {
     if (!entry.promise) {
-      setQueryCacheState(entry, { loading: true, error: null });
+      setQueryCacheState(entry, { isFetching: true, error: null });
       entry.promise = client.listByColumn(col)
         .then((res) => {
-          setQueryCacheState(entry, { data: res, loading: false });
+          setQueryCacheState(entry, { data: res, isFetching: false });
           return res;
         })
         .catch((err) => {
           const e = err instanceof Error ? err : new Error(String(err));
-          setQueryCacheState(entry, { error: e, loading: false });
+          setQueryCacheState(entry, { error: e, isFetching: false });
           throw e;
         })
         .finally(() => {
@@ -368,12 +369,12 @@ export function useTasksListByColumnQuery(client: TasksClient, col: ColumnId, op
   }, [entry, client, col]);
 
   useEffect(() => {
-    if (enabled && state.data === null && !state.loading && !entry.promise) {
+    if (enabled && state.data === null && !state.isFetching && !entry.promise) {
       refetch();
     }
-  }, [enabled, refetch, entry, state.data, state.loading]);
+  }, [enabled, refetch, entry, state.data, state.isFetching]);
 
-  return { data: state.data, loading: state.loading, error: state.error, refetch };
+  return { data: state.data, loading: state.data === null && state.isFetching, isFetching: state.isFetching, error: state.error, refetch };
 }
 
 export function useTasksListByColumnMutation(client: TasksClient): MutationState<Task[]> & {
@@ -425,15 +426,15 @@ export function useTasksStatsQuery(client: TasksClient, options?: { enabled?: bo
 
   const refetch = useCallback(async (): Promise<BoardStats | null> => {
     if (!entry.promise) {
-      setQueryCacheState(entry, { loading: true, error: null });
+      setQueryCacheState(entry, { isFetching: true, error: null });
       entry.promise = client.stats()
         .then((res) => {
-          setQueryCacheState(entry, { data: res, loading: false });
+          setQueryCacheState(entry, { data: res, isFetching: false });
           return res;
         })
         .catch((err) => {
           const e = err instanceof Error ? err : new Error(String(err));
-          setQueryCacheState(entry, { error: e, loading: false });
+          setQueryCacheState(entry, { error: e, isFetching: false });
           throw e;
         })
         .finally(() => {
@@ -448,12 +449,12 @@ export function useTasksStatsQuery(client: TasksClient, options?: { enabled?: bo
   }, [entry, client]);
 
   useEffect(() => {
-    if (enabled && state.data === null && !state.loading && !entry.promise) {
+    if (enabled && state.data === null && !state.isFetching && !entry.promise) {
       refetch();
     }
-  }, [enabled, refetch, entry, state.data, state.loading]);
+  }, [enabled, refetch, entry, state.data, state.isFetching]);
 
-  return { data: state.data, loading: state.loading, error: state.error, refetch };
+  return { data: state.data, loading: state.data === null && state.isFetching, isFetching: state.isFetching, error: state.error, refetch };
 }
 
 export function useTasksStatsMutation(client: TasksClient): MutationState<BoardStats> & {

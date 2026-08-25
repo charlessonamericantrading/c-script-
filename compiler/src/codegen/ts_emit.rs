@@ -423,9 +423,21 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
         ));
     }
 
+    // `loading` vs `isFetching` (GRAMMAR.md §3.127): antes de esta ronda había
+    // un solo flag booleano, verdadero durante CUALQUIER fetch -- incluido un
+    // `refetch()` de fondo sobre una entrada que YA tenía datos cacheados. Un
+    // componente escrito de forma naive (`if (loading) return <Spinner/>`)
+    // ocultaba una lista que ya estaba mostrando datos válidos cada vez que
+    // alguien refrescaba, en vez de mantenerla visible con un indicador
+    // aparte. `loading` ahora es SOLO "no hay nada que mostrar todavía"
+    // (`data === null` mientras hay un fetch en vuelo); `isFetching` es el
+    // flag de siempre, verdadero durante CUALQUIER fetch -- inicial o de
+    // fondo -- para quien sí quiera mostrar un indicador de refresco sin
+    // ocultar los datos existentes.
     out.push_str("export interface QueryState<T> {\n");
     out.push_str("  data: T | null;\n");
     out.push_str("  loading: boolean;\n");
+    out.push_str("  isFetching: boolean;\n");
     out.push_str("  error: Error | null;\n");
     out.push_str("  refetch: () => Promise<T | null>;\n");
     out.push_str("}\n\n");
@@ -462,7 +474,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     // misma clave, pero nada dispara eso solo porque una mutación
     // relacionada tuvo éxito.
     if has_any_query {
-        out.push_str("type QueryCacheState<T> = { data: T | null; loading: boolean; error: Error | null };\n\n");
+        out.push_str("type QueryCacheState<T> = { data: T | null; isFetching: boolean; error: Error | null };\n\n");
         out.push_str("type QueryCacheEntry<T> = {\n");
         out.push_str("  state: QueryCacheState<T>;\n");
         out.push_str("  promise: Promise<T> | null;\n");
@@ -472,7 +484,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
         out.push_str("function getQueryCacheEntry<T>(key: string): QueryCacheEntry<T> {\n");
         out.push_str("  let entry = queryCache.get(key) as QueryCacheEntry<T> | undefined;\n");
         out.push_str("  if (!entry) {\n");
-        out.push_str("    entry = { state: { data: null, loading: false, error: null }, promise: null, listeners: new Set() };\n");
+        out.push_str("    entry = { state: { data: null, isFetching: false, error: null }, promise: null, listeners: new Set() };\n");
         out.push_str("    queryCache.set(key, entry as QueryCacheEntry<unknown>);\n");
         out.push_str("  }\n");
         out.push_str("  return entry;\n");
@@ -502,7 +514,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
         out.push_str("  const prefix = rpcKeyPrefix + \"(\";\n");
         out.push_str("  queryCache.forEach((entry, key) => {\n");
         out.push_str("    if (!key.startsWith(prefix)) return;\n");
-        out.push_str("    entry.state = { data: null, loading: false, error: null };\n");
+        out.push_str("    entry.state = { data: null, isFetching: false, error: null };\n");
         out.push_str("    entry.listeners.forEach((listener) => listener());\n");
         out.push_str("  });\n");
         out.push_str("}\n\n");
@@ -611,7 +623,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     // suscribirse a un store FUERA del árbol de componentes
                     // sin roturas de consistencia entre renders concurrentes
                     // -- es lo que hace que dos instancias de este hook con
-                    // la MISMA `cacheKey` reciban la MISMA `data`/`loading`/
+                    // la MISMA `cacheKey` reciban la MISMA `data`/`isFetching`/
                     // `error` y se actualicen juntas cuando cualquiera de
                     // las dos llama a `refetch`.
                     out.push_str("  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);\n\n");
@@ -623,15 +635,15 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     // que cada `refetch()` dispare su propio fetch --
                     // `entry.promise` es el punto de sincronización.
                     out.push_str("    if (!entry.promise) {\n");
-                    out.push_str("      setQueryCacheState(entry, { loading: true, error: null });\n");
+                    out.push_str("      setQueryCacheState(entry, { isFetching: true, error: null });\n");
                     out.push_str(&format!("      entry.promise = client.{}({})\n", rpc.name, param_names.join(", ")));
                     out.push_str("        .then((res) => {\n");
-                    out.push_str("          setQueryCacheState(entry, { data: res, loading: false });\n");
+                    out.push_str("          setQueryCacheState(entry, { data: res, isFetching: false });\n");
                     out.push_str("          return res;\n");
                     out.push_str("        })\n");
                     out.push_str("        .catch((err) => {\n");
                     out.push_str("          const e = err instanceof Error ? err : new Error(String(err));\n");
-                    out.push_str("          setQueryCacheState(entry, { error: e, loading: false });\n");
+                    out.push_str("          setQueryCacheState(entry, { error: e, isFetching: false });\n");
                     out.push_str("          throw e;\n");
                     out.push_str("        })\n");
                     out.push_str("        .finally(() => {\n");
@@ -645,17 +657,23 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     out.push_str("    }\n");
                     out.push_str(&format!("  }}, [entry, {deps}]);\n\n"));
                     out.push_str("  useEffect(() => {\n");
-                    // `state.data === null && !state.loading` -- solo dispara
-                    // un fetch si esta entrada del cache está genuinamente
-                    // VACÍA (nadie la pidió todavía) y nada más ya la está
-                    // pidiendo; si otra instancia ya la cacheó o ya hay una
-                    // request en vuelo, este efecto no hace nada -- ahí está
-                    // el dedupe entre MONTAJES, no solo entre llamadas.
-                    out.push_str("    if (enabled && state.data === null && !state.loading && !entry.promise) {\n");
+                    // `state.data === null && !state.isFetching` -- solo
+                    // dispara un fetch si esta entrada del cache está
+                    // genuinamente VACÍA (nadie la pidió todavía) y nada más
+                    // ya la está pidiendo; si otra instancia ya la cacheó o
+                    // ya hay una request en vuelo, este efecto no hace nada
+                    // -- ahí está el dedupe entre MONTAJES, no solo entre
+                    // llamadas.
+                    out.push_str("    if (enabled && state.data === null && !state.isFetching && !entry.promise) {\n");
                     out.push_str("      refetch();\n");
                     out.push_str("    }\n");
-                    out.push_str("  }, [enabled, refetch, entry, state.data, state.loading]);\n\n");
-                    out.push_str("  return { data: state.data, loading: state.loading, error: state.error, refetch };\n");
+                    out.push_str("  }, [enabled, refetch, entry, state.data, state.isFetching]);\n\n");
+                    // `loading` (SOLO "todavía no hay nada que mostrar") se
+                    // deriva de `state.data === null && state.isFetching` --
+                    // no es un flag propio, para que nunca pueda quedar
+                    // desincronizado del par data/isFetching real. GRAMMAR.md
+                    // §3.127.
+                    out.push_str("  return { data: state.data, loading: state.data === null && state.isFetching, isFetching: state.isFetching, error: state.error, refetch };\n");
                     out.push_str("}\n\n");
                 }
 
@@ -1558,7 +1576,42 @@ service Ticks {
         // La forma pública del hook (lo que un componente consume) sigue
         // siendo exactamente `QueryState<T>` -- el cambio es interno.
         assert!(hooks.contains("export function useUsersGetQuery(client: UsersClient, id: number, options?: { enabled?: boolean }): QueryState<User> {"), "{hooks}");
-        assert!(hooks.contains("return { data: state.data, loading: state.loading, error: state.error, refetch };"), "{hooks}");
+        assert!(
+            hooks.contains(
+                "return { data: state.data, loading: state.data === null && state.isFetching, isFetching: state.isFetching, error: state.error, refetch };"
+            ),
+            "{hooks}"
+        );
+    }
+
+    #[test]
+    fn query_hook_distinguishes_loading_from_a_background_refetch() {
+        // Gap real encontrado auditando hooks.ts: antes de esta ronda había
+        // un solo flag `loading`, verdadero durante CUALQUIER fetch --
+        // incluido un `refetch()` de fondo sobre una entrada que YA tenía
+        // datos cacheados. Un componente naive (`if (loading) return
+        // <Spinner/>`) ocultaba una lista que ya estaba mostrando datos
+        // válidos cada vez que alguien refrescaba. GRAMMAR.md §3.127.
+        let src = r#"
+service Users {
+  rpc list() -> User[] { [] }
+}
+type User = { id: Int, name: String }
+"#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(hooks.contains("export interface QueryState<T> {\n  data: T | null;\n  loading: boolean;\n  isFetching: boolean;\n"), "{hooks}");
+        assert!(
+            hooks.contains("type QueryCacheState<T> = { data: T | null; isFetching: boolean; error: Error | null };"),
+            "{hooks}"
+        );
+        // El fetch (inicial o de fondo) marca SOLO `isFetching`, nunca un
+        // `loading` propio -- así `loading` puede derivarse siempre de
+        // `data === null && isFetching`, sin poder desincronizarse.
+        assert!(hooks.contains("setQueryCacheState(entry, { isFetching: true, error: null });"), "{hooks}");
+        assert!(hooks.contains("setQueryCacheState(entry, { data: res, isFetching: false });"), "{hooks}");
+        assert!(!hooks.contains("loading: true"), "{hooks}");
+        assert!(!hooks.contains("loading: false"), "{hooks}");
     }
 
     /// Un programa SIN ningún rpc que genere un hook de Query (todo

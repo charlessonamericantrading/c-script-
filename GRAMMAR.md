@@ -148,6 +148,7 @@
   - [3.124 Hooks de React generados: cache compartido entre instancias — RESUELTO](#3124-hooks-de-react-generados-cache-compartido-entre-instancias--resuelto)
   - [3.125 Hooks de React generados: invalidación de cache tras una Mutation — RESUELTO](#3125-hooks-de-react-generados-invalidación-de-cache-tras-una-mutation--resuelto)
   - [3.126 `LinkTransportError`: el status HTTP viaja tipado, no solo en el mensaje — RESUELTO](#3126-linktransporterror-el-status-http-viaja-tipado-no-solo-en-el-mensaje--resuelto)
+  - [3.127 Hooks de React generados: `loading` vs `isFetching` — RESUELTO](#3127-hooks-de-react-generados-loading-vs-isfetching--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5274,6 +5275,8 @@ function Sidebar({ client }: { client: TasksClient }) {
 
 **Verificado**: 2 tests nuevos en `codegen::ts_emit` (`use{Servicio}{Rpc}Query` genera la clave de cache correcta con params reales, la infraestructura compartida (`Map`/`getQueryCacheEntry`/`setQueryCacheState`) se emite UNA sola vez sin importar cuántos rpcs de Query tenga el programa, y la forma pública del hook -- `QueryState<T>` -- no cambió; un programa SIN ningún Query -- todo mutations -- NO emite `useSyncExternalStore` ni la infraestructura de cache, evitando un import/`const`/`function` sin usar que rompería cualquier build con `noUnusedLocals` prendido). Además, la lógica CENTRAL del dedupe (`getQueryCacheEntry`/`setQueryCacheState`/el patrón de `entry.promise`) se verificó aparte en un script de Node standalone (sin React, el mismo algoritmo copiado literal del `hooks.ts` generado): dos "instancias" pidiendo la misma clave casi al mismo tiempo comparten exactamente UN fetch real, ambas reciben el mismo resultado, dos claves con parámetros distintos nunca se pisan, y actualizar una entrada notifica a sus listeners suscriptos. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado con el binario y tipando limpio con `tsc --noEmit` en modo estricto.
 
+**Actualización (ver §3.127): el flag `loading` único descrito arriba (`state.loading`, verdadero durante CUALQUIER fetch incluida una recarga de fondo) queda SUPERADO** por la distinción `loading`/`isFetching` -- el campo interno de `QueryCacheState<T>` que este flag ocupaba se renombró a `isFetching`, y `loading` pasó a derivarse (`data === null && isFetching`) en vez de ser un flag propio. El resto de este ítem (cache compartido, dedupe, alcance) sigue exactamente igual, sin cambios.
+
 ---
 
 ### 3.125 Hooks de React generados: invalidación de cache tras una Mutation — RESUELTO
@@ -5366,6 +5369,34 @@ function TaskList({ client }: { client: TasksClient }) {
 **Los dos puntos donde `client.ts` lanza `LinkTransportError` pasan `res.status` real**, no un valor inventado: el camino normal (`!res.ok`, cualquier rpc o stream) y el caso borde de un stream cuyo `res.body` viene nulo pese a `res.ok` (ahí el status sigue siendo el 2xx real de esa respuesta -- información correcta aunque no sea la causa del fallo, nunca un placeholder). Como `LinkTransportError` sigue extendiendo `Error`, no cambia nada del lado de los hooks (§3.123–§3.125): `QueryState.error`/`MutationState.error` siguen tipados `Error | null`, y el narrowing (`error instanceof LinkTransportError`) es responsabilidad de quien consume el hook, igual que ya lo era para distinguir `LinkTransportError` de `LinkValidationError`.
 
 **Verificado**: 2 tests nuevos en `codegen::ts_emit` (la clase emitida tiene la propiedad `status: number` y el constructor la asigna; el `throw` real pasa `res.status` en los dos call sites -- el de `!res.ok` y el del stream sin body) + el test ya existente de "el cliente nunca lanza para un `Result` declarado" sigue pasando sin cambios (la forma pública -- qué lanza y cuándo -- no cambió, solo qué datos lleva encima).
+
+---
+
+### 3.127 Hooks de React generados: `loading` vs `isFetching` — RESUELTO
+
+Tercera ronda seguida sobre el mismo pedido del usuario ("sigue" -- continuar profundizando TypeScript/React), auditando `use{Servicio}{Rpc}Query`: desde §3.124, `loading` era un único flag booleano, verdadero durante CUALQUIER fetch -- tanto el fetch inicial (sin datos todavía) como un `refetch()` de FONDO sobre una entrada que YA tenía datos cacheados. Un componente escrito de la forma más natural (`if (loading) return <Spinner/>`) ocultaba una lista que ya estaba mostrando datos válidos cada vez que alguien la refrescaba -- el clásico problema que react-query resuelve distinguiendo `isLoading` de `isFetching`.
+
+```tsx
+function TaskList({ client }: { client: TasksClient }) {
+  const { data, loading, isFetching, refetch } = useTasksListQuery(client);
+  if (loading) return <Spinner />; // solo la PRIMERA carga, sin datos todavía
+  return (
+    <>
+      {isFetching && <RefreshingBadge />} {/* refetch de fondo, sin ocultar la lista */}
+      <ul>{data?.map((t) => <li key={t.id}>{t.title}</li>)}</ul>
+      <button onClick={() => refetch()}>Actualizar</button>
+    </>
+  );
+}
+```
+
+**`isFetching` es el flag real, verdadero durante CUALQUIER fetch en vuelo** (inicial o de fondo) -- ocupa exactamente el lugar que `loading` tenía en `QueryCacheState<T>` (el tipo interno de la entrada de cache, §3.124), solo renombrado. **`loading` pasó a ser un valor DERIVADO, no un flag propio**: `data === null && isFetching` -- "no hay absolutamente nada que mostrar todavía". Derivarlo en vez de guardarlo aparte elimina la posibilidad de que los dos queden desincronizados (ej. `loading: true` con `data` ya poblado, un estado que antes era representable aunque nunca debía ocurrir).
+
+**Sin cambios en la lógica de fetching**: el dedupe vía `entry.promise` (§3.124), el auto-fetch del `useEffect` (gated en `data === null && !isFetching && !entry.promise`, mismo criterio de siempre solo con el nombre nuevo), y la invalidación vía `@invalidates` (§3.125, que resetea `isFetching: false` igual que antes resetaba `loading: false`) siguen exactamente igual -- este ítem es puramente sobre qué información expone el hook, no sobre cuándo fetchea.
+
+**Mutation queda deliberadamente afuera de esta ronda**: su `loading` sigue siendo un único flag (`useState`), sin distinción `isFetching` -- una mutación no tiene el concepto de "dato cacheado que sigue siendo válido mientras se recarga", cada `mutate()` es una acción disparada a mano, no un fetch automático que compita con datos ya mostrados. Si en el futuro aparece un caso real que lo amerite, es una ronda aparte.
+
+**Verificado**: 1 test nuevo en `codegen::ts_emit` (`QueryState<T>` expone `loading`+`isFetching`, `QueryCacheState<T>` interno usa `isFetching`, ningún `setQueryCacheState` escribe un `loading: true`/`loading: false` -- todo el archivo generado usa `isFetching` para ese propósito) + el test existente de cache compartido actualizado a la nueva forma del `return` (`loading: state.data === null && state.isFetching, isFetching: state.isFetching`). Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto.
 
 ---
 
