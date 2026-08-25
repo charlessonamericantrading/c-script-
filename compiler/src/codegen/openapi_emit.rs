@@ -109,15 +109,32 @@ fn type_to_json_schema(ty: &Type) -> Value {
         Type::Enum(name) => {
             json!({ "$ref": format!("#/components/schemas/{}", name) })
         }
+        // Bug real, misma familia que `isOk`/`isErr` (ts_emit.rs) y el
+        // schema Zod de `Result<T,E>` (zod_emit.rs, GRAMMAR.md §3.131): esto
+        // describía el wire como `{ ok: boolean, value, error }` -- un
+        // `Result<T,E>` real NUNCA tiene un campo `ok`, el wire (y
+        // `Result<T, E>` en contract.d.ts) usa `{ type: "Ok"|"Err", ... }`
+        // desde siempre. `openapi.json` es la documentación pública de la
+        // API -- describir el shape equivocado ahí no es cosmético, es la
+        // referencia que un consumidor externo (Swagger UI, un generador de
+        // SDK en otro lenguaje) usa para saber qué esperar del servidor.
+        // `oneOf` + `const` (JSON Schema 2020-12, que OpenAPI 3.1 adopta
+        // completo) es el equivalente directo del `z.discriminatedUnion`
+        // que ya usa zod_emit.rs para lo mismo.
         Type::ResultOf(ok_ty, err_ty) => {
             json!({
-                "type": "object",
-                "properties": {
-                    "ok": { "type": "boolean" },
-                    "value": type_to_json_schema(ok_ty),
-                    "error": type_to_json_schema(err_ty)
-                },
-                "required": ["ok"]
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": { "type": { "const": "Ok" }, "value": type_to_json_schema(ok_ty) },
+                        "required": ["type", "value"]
+                    },
+                    {
+                        "type": "object",
+                        "properties": { "type": { "const": "Err" }, "error": type_to_json_schema(err_ty) },
+                        "required": ["type", "error"]
+                    }
+                ]
             })
         }
         Type::Union(members) => {
@@ -139,21 +156,72 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
     for item in &program.items {
         match item {
             Item::Enum(e) => {
-                let variants: Vec<Value> = e.variants.iter().map(|v| json!(v.name)).collect();
-                schemas.insert(
-                    e.name.clone(),
-                    json!({
-                        "type": "string",
-                        "enum": variants
-                    }),
-                );
+                // Bug real, misma familia que el schema Zod de un enum ADT
+                // (zod_emit.rs, GRAMMAR.md §3.132): esto describía CUALQUIER
+                // enum como `{"type":"string","enum":[...]}`, sin importar
+                // si sus variantes llevaban datos. Un ADT (`ValidationError
+                // { InvalidEmail { field: String }, ... }`, real en
+                // `examples/users.link`) viaja como un OBJETO con tag
+                // `type` -- documentarlo como un string en `openapi.json`
+                // describe algo que el servidor nunca manda. Mismo criterio
+                // `all_unit` que `emit_enum_decl` (ts_emit.rs) y
+                // `emit_zod_schemas` (zod_emit.rs) ya usan.
+                let all_unit = e.variants.iter().all(|v| v.fields.is_none());
+                let schema = if all_unit {
+                    let variants: Vec<Value> = e.variants.iter().map(|v| json!(v.name)).collect();
+                    json!({ "type": "string", "enum": variants })
+                } else {
+                    let mut variant_schemas = Vec::new();
+                    for v in &e.variants {
+                        let mut props = json!({ "type": { "const": v.name } });
+                        let mut required = vec!["type".to_string()];
+                        if let Some(fields) = &v.fields {
+                            for f in fields {
+                                // Mismo fix que en `zod_emit.rs` (GRAMMAR.md
+                                // §3.132) para un ADT genérico -- sin esto,
+                                // un `enum Result<T, E> { Ok { value: T },
+                                // ... }` (el ejemplo educativo de la propia
+                                // documentación) rompía `linkc build` entero.
+                                let ty = if e.type_params.is_empty() {
+                                    checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
+                                } else {
+                                    checker.resolve_type_abstract(&f.ty, &e.type_params).map_err(|e| e.to_string())?
+                                };
+                                props[f.name.as_str()] = type_to_json_schema(&ty);
+                                if !f.optional && f.default.is_none() {
+                                    required.push(f.name.clone());
+                                }
+                            }
+                        }
+                        variant_schemas.push(json!({
+                            "type": "object",
+                            "properties": props,
+                            "required": required
+                        }));
+                    }
+                    json!({ "oneOf": variant_schemas })
+                };
+                schemas.insert(e.name.clone(), schema);
             }
             Item::Type(t) => {
                 if let TypeExpr::Struct(fields) = &t.ty {
                     let mut props = json!({});
                     let mut required = Vec::new();
                     for f in fields {
-                        let ty = checker.resolve_type(&f.ty).map_err(|e| e.to_string())?;
+                        // Mismo bug/fix que en `zod_emit.rs` (GRAMMAR.md
+                        // §3.132): un `type Box<T> = { value: T }` rompía
+                        // `linkc build` ENTERO ("tipo desconocido: 'T'")
+                        // con `resolve_type` a secas -- confirmado a mano
+                        // contra el binario real. `resolve_type_abstract`
+                        // deja `T` como `Type::TypeParam`;
+                        // `type_to_json_schema` no tiene un caso especial
+                        // para eso, así que cae al `match` sin patrón
+                        // exhaustivo... -- ver el fix en esa función.
+                        let ty = if t.type_params.is_empty() {
+                            checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
+                        } else {
+                            checker.resolve_type_abstract(&f.ty, &t.type_params).map_err(|e| e.to_string())?
+                        };
                         let mut schema = type_to_json_schema(&ty);
                         // `@deprecated` sobre un campo (GRAMMAR.md §3.71) --
                         // "deprecated" es una keyword estándar de JSON Schema
@@ -386,6 +454,92 @@ mod tests {
         // documentada, no la del compilador).
         assert_eq!(spec["x-generated-by"], format!("linkc v{}", crate::VERSION));
         assert_ne!(spec["info"]["version"], format!("linkc v{}", crate::VERSION), "info.version es del API, no del compilador");
+    }
+
+    /// Bug real, misma familia que `isOk`/`isErr` (ts_emit.rs) y el schema
+    /// Zod de `Result<T,E>` (zod_emit.rs, GRAMMAR.md §3.131): esto describía
+    /// el wire de `Result<T,E>` como `{ ok: boolean, value, error }`, un
+    /// campo `ok` que NINGÚN `Result` real tiene -- el wire usa `{ type:
+    /// "Ok"|"Err", ... }` desde siempre.
+    #[test]
+    fn result_schema_uses_one_of_with_a_type_discriminant_not_a_fake_ok_field() {
+        let code = r#"
+            enum ValidationError { InvalidEmail }
+            type Task = { id: Int }
+            service Tasks {
+                rpc create(title: String) -> Result<Task, ValidationError> { Result.Ok { value: Task { id: 1 } } }
+            }
+        "#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let spec: Value = serde_json::from_str(&emit_openapi_json(&program, "Task API").unwrap()).unwrap();
+        let response_schema = &spec["paths"]["/Tasks/create"]["post"]["responses"]["200"]["content"]["application/json"]["schema"];
+        let one_of = response_schema["oneOf"].as_array().expect("oneOf array");
+        assert_eq!(one_of.len(), 2);
+        assert_eq!(one_of[0]["properties"]["type"]["const"], "Ok");
+        assert_eq!(one_of[0]["properties"]["value"]["$ref"], "#/components/schemas/Task");
+        assert_eq!(one_of[1]["properties"]["type"]["const"], "Err");
+        assert_eq!(one_of[1]["properties"]["error"]["$ref"], "#/components/schemas/ValidationError");
+        assert!(response_schema.get("properties").is_none(), "no debería quedar el shape viejo {{ok, value, error}}");
+    }
+
+    /// Bug real, misma familia (GRAMMAR.md §3.132): un enum ADT (variantes
+    /// con datos) se describía como `{"type":"string","enum":[...]}` --
+    /// CUALQUIER `ValidationError` real es un objeto con tag `type`, nunca
+    /// un string pelado.
+    #[test]
+    fn adt_enum_schema_uses_one_of_with_a_type_const_per_variant() {
+        let code = r#"
+            enum ValidationError {
+                InvalidEmail { field: String },
+                TooShort { field: String, min: Int },
+            }
+        "#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let spec: Value = serde_json::from_str(&emit_openapi_json(&program, "Task API").unwrap()).unwrap();
+        let schema = &spec["components"]["schemas"]["ValidationError"];
+        let one_of = schema["oneOf"].as_array().expect("oneOf array");
+        assert_eq!(one_of.len(), 2);
+        assert_eq!(one_of[0]["properties"]["type"]["const"], "InvalidEmail");
+        assert_eq!(one_of[0]["properties"]["field"]["type"], "string");
+        assert_eq!(one_of[1]["properties"]["type"]["const"], "TooShort");
+        assert_eq!(one_of[1]["properties"]["min"]["type"], "integer");
+        assert!(schema.get("enum").is_none(), "no debería quedar el shape viejo z.enum-like de strings");
+    }
+
+    /// Un enum SIN datos en ninguna variante sigue exactamente igual --
+    /// nunca tuvo el bug de arriba.
+    #[test]
+    fn plain_enum_schema_is_unchanged() {
+        let code = r#"enum Status { Active, Inactive }"#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let spec: Value = serde_json::from_str(&emit_openapi_json(&program, "Task API").unwrap()).unwrap();
+        let schema = &spec["components"]["schemas"]["Status"];
+        assert_eq!(schema["type"], "string");
+        assert_eq!(schema["enum"], json!(["Active", "Inactive"]));
+    }
+
+    /// Regresión real: un `type`/`enum` GENÉRICO (`Box<T>`, o el `Result<T,
+    /// E>` educativo de la documentación -- no el builtin del lenguaje) con
+    /// un campo que referencia su propio parámetro de tipo rompía `linkc
+    /// build` ENTERO ("tipo desconocido: 'T'") antes de este fix, tanto para
+    /// `Item::Type` como para un `Item::Enum` ADT genérico -- confirmado a
+    /// mano contra el binario real (`Box<T>` reventaba `openapi.json`
+    /// específicamente, DESPUÉS de arreglar el mismo bug en `schemas.ts`).
+    #[test]
+    fn a_generic_struct_and_a_generic_adt_enum_do_not_crash_the_whole_build() {
+        let code = r#"
+            type Box<T> = { value: T }
+            enum MyResult<T, E> {
+                Ok { value: T },
+                Err { error: E },
+            }
+        "#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let result = emit_openapi_json(&program, "Task API");
+        assert!(result.is_ok(), "no debería fallar sobre un genérico: {result:?}");
+        let spec: Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert!(spec["components"]["schemas"]["Box"].is_object());
+        assert!(spec["components"]["schemas"]["MyResult"].is_object());
     }
 
     /// `@deprecated` sobre un rpc se propaga como `deprecated: true` +

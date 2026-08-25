@@ -154,6 +154,7 @@
   - [3.130 Hook de `stream`: `reconnect()` manual — RESUELTO](#3130-hook-de-stream-reconnect-manual--resuelto)
   - [3.131 `isOk`/`isErr` y el schema Zod de `Result<T,E>` chequeaban un campo que no existe — RESUELTO (bug real)](#3131-isokiserr-y-el-schema-zod-de-resultte-chequeaban-un-campo-que-no-existe--resuelto-bug-real)
   - [3.132 Schema Zod de un enum ADT: `z.enum([...])` no alcanzaba — RESUELTO (bug real)](#3132-schema-zod-de-un-enum-adt-zenum-no-alcanzaba--resuelto-bug-real)
+  - [3.133 `openapi.json`: mismos tres bugs que `isOk`/`isErr` y el schema Zod, esta vez en la especificación pública de la API — RESUELTO (bug real)](#3133-openapijson-mismos-tres-bugs-que-isokiserr-y-el-schema-zod-esta-vez-en-la-especificación-pública-de-la-api--resuelto-bug-real)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5541,7 +5542,32 @@ ValidationErrorSchema.safeParse({ type: "InvalidEmail", field: "x" }).success; /
 
 **Regresión real, atrapada por `docs_examples.rs` (el suite que compila cada bloque marcado de la documentación con el binario real) antes de llegar a producción**: un ADT GENÉRICO (`enum Result<T, E> { Ok { value: T }, Err { error: E } }`, el ejemplo educativo de GRAMMAR.md/docs -- distinto del `Result<T,E>` builtin del lenguaje) tiene campos de variante que referencian su propio parámetro de tipo (`T`). El primer intento de este fix resolvía cada campo con `checker.resolve_type` a secas, que rechaza `T` ("tipo desconocido: 'T'") -- rompiendo `linkc build` ENTERO para cualquier programa con un ADT genérico, algo que el código viejo (que nunca miraba campos de variante) nunca hacía. Arreglado con `checker.resolve_type_abstract(&f.ty, &e.type_params)` -- mismo criterio que `resolve_field_ty` en ts_emit.rs ya usa -- que deja `T` como `Type::TypeParam` en vez de fallar; `render_zod_type` ya tenía un catch-all (`z.unknown()`) para cualquier tipo sin forma Zod razonable, así que el resultado es `z.object({ type: z.literal("Ok"), value: z.unknown() })` -- no del todo preciso (Zod no tiene generics reales como TS, un parámetro de tipo sin instanciar no tiene ningún schema posible mejor que ese), pero NUNCA rompe el build.
 
-**Verificado**: 3 tests nuevos en `codegen::zod_emit` (un ADT de dos variantes con datos genera el `discriminatedUnion` esperado, un enum sin datos sigue generando `z.enum` sin cambios; una variante SIN datos mezclada en un ADT lleva solo el discriminador; un ADT GENÉRICO no rompe el build, cae a `z.unknown()` en el campo con el parámetro de tipo) + el test existente de schemas simples (`test_zod_emit_generates_valid_schemas`) sigue pasando sin cambios + `docs_examples.rs` (todos los bloques marcados de la documentación, incluido el ADT genérico que originalmente rompía esto) vuelve a pasar. Verificado también con Zod REAL en runtime, mismo criterio que §3.131: el schema arreglado acepta `{ type: "InvalidEmail", field: "email" }` (y la segunda variante, `{ type: "TooShort", field: "password", min: 8 }`) y RECHAZA explícitamente el string pelado `"InvalidEmail"` que la forma vieja aceptaba.
+**El mismo bug de resolución (no de forma), en el branch hermano `Item::Type`**: auditando el archivo completo tras arreglar el enum genérico apareció que un `type` GENÉRICO (`type Box<T> = { value: T }`) tenía exactamente el mismo problema -- `resolve_type` a secas sobre un campo `T` de un STRUCT genérico, no solo de un ADT. Confirmado a mano contra el binario real (`linkc build` sobre un programa con `Box<T>` fallaba en `schemas.ts` con el mismo "tipo desconocido: 'T'"). Mismo fix, mismo patrón (`resolve_type_abstract` cuando `t.type_params` no está vacío).
+
+**Verificado**: 4 tests nuevos en `codegen::zod_emit` (un ADT de dos variantes con datos genera el `discriminatedUnion` esperado, un enum sin datos sigue generando `z.enum` sin cambios; una variante SIN datos mezclada en un ADT lleva solo el discriminador; un ADT GENÉRICO no rompe el build, cae a `z.unknown()` en el campo con el parámetro de tipo; un `type` GENÉRICO tampoco) + el test existente de schemas simples (`test_zod_emit_generates_valid_schemas`) sigue pasando sin cambios + `docs_examples.rs` (todos los bloques marcados de la documentación, incluido el ADT genérico que originalmente rompía esto) vuelve a pasar. Verificado también con Zod REAL en runtime, mismo criterio que §3.131: el schema arreglado acepta `{ type: "InvalidEmail", field: "email" }` (y la segunda variante, `{ type: "TooShort", field: "password", min: 8 }`) y RECHAZA explícitamente el string pelado `"InvalidEmail"` que la forma vieja aceptaba.
+
+---
+
+### 3.133 `openapi.json`: mismos tres bugs que `isOk`/`isErr` y el schema Zod, esta vez en la especificación pública de la API — RESUELTO (bug real)
+
+Continuación directa del mismo audit de §3.131/§3.132: `openapi_emit.rs` (`type_to_json_schema` + `emit_openapi_json`) tenía EXACTAMENTE los mismos tres bugs, en el archivo que además es la documentación PÚBLICA de la API -- lo que consume Swagger UI, un generador de SDK en otro lenguaje, o cualquier herramienta externa que confíe en `openapi.json` como la fuente de verdad del contrato.
+
+**(1) `Type::ResultOf` describía el wire como `{ ok: boolean, value, error }`** -- mismo campo `ok` inexistente que `isOk`/`isErr` (§3.131) tenían. Arreglado a `oneOf` + `const` (el equivalente en JSON Schema 2020-12, que OpenAPI 3.1 adopta completo, del `z.discriminatedUnion` que `zod_emit.rs` ya usa):
+
+```json
+{
+  "oneOf": [
+    { "type": "object", "properties": { "type": { "const": "Ok" }, "value": {...} }, "required": ["type", "value"] },
+    { "type": "object", "properties": { "type": { "const": "Err" }, "error": {...} }, "required": ["type", "error"] }
+  ]
+}
+```
+
+**(2) Un enum ADT se describía como `{"type":"string","enum":[...]}`** -- mismo bug que el schema Zod (§3.132), esta vez en la documentación pública. Mismo criterio `all_unit` para decidir entre las dos formas; el caso ADT ahora genera `oneOf` con un `{"type":"object", "properties": {"type": {"const": "Variante"}, ...campos}}` por variante, reusando `type_to_json_schema` para los campos -- el mismo camino que ya usan los campos de un `type` struct. Un enum sin datos en ninguna variante sigue exactamente igual, sin cambios.
+
+**(3) Mismo bug de generics que §3.132, en el branch `Item::Type` de este archivo**: un `type`/`enum` GENÉRICO con un campo que referencia su propio parámetro de tipo rompía `linkc build` ENTERO -- confirmado a mano contra el binario real, DESPUÉS de arreglar el mismo bug en `schemas.ts`: `Box<T>` seguía rompiendo, esta vez en `openapi.json` específicamente (`type_to_json_schema` ya tenía un catch-all -- `{"type":"object"}` -- para cualquier tipo sin JSON Schema razonable, así que el problema era la RESOLUCIÓN del tipo, nunca su renderizado). Mismo fix, mismo patrón: `resolve_type_abstract` en vez de `resolve_type` a secas cuando `type_params` no está vacío -- tanto en `Item::Type` como en el `Item::Enum` ADT nuevo del punto (2).
+
+**Verificado**: 4 tests nuevos en `codegen::openapi_emit` (el `Result<T,E>` de un rpc real usa `oneOf`/`const`, nunca el `{ok, ...}` viejo; un ADT usa `oneOf`/`const` por variante; un enum sin datos sigue igual; un `type`/`enum` genérico -- `Box<T>` y un ADT genérico juntos -- no rompe el build) + los 11 tests existentes de este archivo (deprecated, `@example`, defaults) siguen pasando sin cambios -- ninguno tocaba `Result<T,E>` ni un ADT. Verificado también a mano contra el binario real: `linkc build examples/users.link` regenerado, `openapi.json` inspeccionado byte a byte -- el `Result<Task, ValidationError>` de `create` y el `ValidationError` de `components/schemas` usan la forma nueva (`oneOf`/`const`) en el archivo real, no solo en un test aislado.
 
 ---
 

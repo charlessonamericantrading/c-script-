@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.96.0] - 2026-08-25
+
+### 🐛 Arreglado
+- **`openapi.json` tenía los mismos tres bugs que `isOk`/`isErr` y el schema Zod (v1.94.0/v1.95.0) -- esta vez en la especificación PÚBLICA de la API.** Continuación directa del mismo audit: `openapi_emit.rs` describía `Result<T,E>` como `{ ok: boolean, value, error }` (el mismo campo `ok` inexistente de `isOk`/`isErr`) y un enum ADT como `{"type":"string","enum":[...]}` (el mismo bug del schema Zod) -- `openapi.json` es lo que consume Swagger UI o un generador de SDK en otro lenguaje, así que describir el shape equivocado ahí no es cosmético. Arreglado a `oneOf`+`const` (el equivalente JSON Schema 2020-12 del `discriminatedUnion` que Zod ya usa) en ambos casos, con el mismo criterio `all_unit` para decidir entre enum simple y ADT.
+
+- **Regresión propia, encontrada auditando el archivo antes de que llegara a producción: un `type`/`enum` GENÉRICO (`Box<T>`, o el `Result<T,E>` educativo de la documentación) rompía `linkc build` ENTERO**, tanto en `schemas.ts` (zod_emit.rs, `Item::Type` -- el mismo branch del fix de v1.95.0, ahí solo se había arreglado `Item::Enum`) como en `openapi.json` (`openapi_emit.rs`, `Item::Type` e `Item::Enum` ADT). El primer intento de cada fix resolvía campos con `resolve_type` a secas, que rechaza un parámetro de tipo sin instanciar (`T`) -- arreglado con `resolve_type_abstract` (mismo criterio que `resolve_field_ty` en ts_emit.rs ya usa desde antes), que cae al catch-all seguro ya existente (`z.unknown()` en Zod, `{"type":"object"}` en JSON Schema) en vez de fallar.
+
+1042 tests (5 nuevos): 4 en `codegen::openapi_emit` (el `Result<T,E>` de un rpc real usa `oneOf`/`const`, nunca `{ok, ...}`; un ADT usa `oneOf`/`const` por variante; un enum sin datos sigue igual; un `type`/`enum` genérico no rompe el build) + 1 en `codegen::zod_emit` (un `type` genérico, complemento del test de enum genérico de v1.95.0). Verificado también a mano contra el binario real: `linkc build examples/users.link` regenerado, `openapi.json` inspeccionado byte a byte -- el `Result<Task, ValidationError>` de `create` y `ValidationError` en `components/schemas` usan la forma nueva en el archivo real. Detalle completo: GRAMMAR.md §3.133, PLAN.md §9.13.
+
 ## [1.95.0] - 2026-08-25
 
 ### 🐛 Arreglado

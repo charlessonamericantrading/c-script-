@@ -180,7 +180,19 @@ pub fn emit_zod_schemas(program: &Program) -> Result<String, String> {
                 if let TypeExpr::Struct(fields) = &t.ty {
                     out.push_str(&format!("export const {}Schema = z.object({{\n", t.name));
                     for f in fields {
-                        let ty = checker.resolve_type(&f.ty).map_err(|e| e.to_string())?;
+                        // Mismo bug/fix que el de los ADT genéricos arriba
+                        // (GRAMMAR.md §3.132) -- confirmado a mano contra el
+                        // binario real: un `type Box<T> = { value: T }`
+                        // rompía `linkc build` ENTERO ("tipo desconocido:
+                        // 'T'") con `resolve_type` a secas.
+                        // `resolve_type_abstract` deja `T` como
+                        // `Type::TypeParam`, que cae al `z.unknown()`
+                        // catch-all de `render_zod_type` en vez de fallar.
+                        let ty = if t.type_params.is_empty() {
+                            checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
+                        } else {
+                            checker.resolve_type_abstract(&f.ty, &t.type_params).map_err(|e| e.to_string())?
+                        };
                         let zod_ty = render_zod_type_for_field(&ty, f.validator());
                         // Un campo con `= default` (GRAMMAR.md §3.74) puede
                         // omitirse igual que uno `?:` -- `.optional()` nada
@@ -346,6 +358,18 @@ mod tests {
         let zod_out = emit_zod_schemas(&program).expect("no debería fallar sobre un ADT genérico");
         assert!(zod_out.contains("z.object({ type: z.literal(\"Ok\"), value: z.unknown() })"), "{zod_out}");
         assert!(zod_out.contains("z.object({ type: z.literal(\"Err\"), error: z.unknown() })"), "{zod_out}");
+    }
+
+    /// Mismo bug que la de arriba, pero para un `type` GENÉRICO (`Box<T> =
+    /// { value: T }`) en vez de un `enum` -- confirmado a mano contra el
+    /// binario real (`linkc build` sobre un programa con `Box<T>` rompía en
+    /// `schemas.ts` con "tipo desconocido: 'T'" antes de este fix).
+    #[test]
+    fn a_generic_struct_does_not_crash_the_whole_build() {
+        let code = r#"type Box<T> = { value: T }"#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let zod_out = emit_zod_schemas(&program).expect("no debería fallar sobre un struct genérico");
+        assert!(zod_out.contains("export const BoxSchema = z.object({\n  value: z.unknown(),\n});"), "{zod_out}");
     }
 
     /// `@validate(email)` se propaga como `.email()` encadenado (GRAMMAR.md
