@@ -7,7 +7,7 @@ const client = createTasksClient('http://localhost:8787');
 
 export function App() {
   const { data: initialTasks, loading, refetch } = useTasksListQuery(client);
-  const { mutate: createTask, loading: creating } = useTasksCreateMutation(client);
+  const { mutate: createTask, loading: creating, data: creatingTask } = useTasksCreateMutation(client);
   const { data: streamEvents, isConnected, reconnect } = useTasksWatchTasks(client);
 
   const [title, setTitle] = useState('');
@@ -50,7 +50,14 @@ export function App() {
     // `mutate` nunca relanza (GRAMMAR.md §3.128) -- devuelve `null` en el
     // fallo, ya reflejado en `error` del hook; sin este chequeo, un fallo
     // de creación limpiaría el formulario igual, como si hubiera salido bien.
-    const created = await createTask(input);
+    // `optimisticData` (GRAMMAR.md §3.137): `creatingTask` muestra ESTE
+    // valor de inmediato, ANTES de que la red responda -- reemplazado por
+    // el real en éxito (mismo `data`, ya con el `id` real del servidor) o
+    // revertido a `null` en fallo, sin que este componente maneje ese
+    // rollback a mano.
+    const created = await createTask(input, {
+      optimisticData: { id: -1, createdAt: new Date(0).toISOString(), ...input },
+    });
     if (!created) return;
     setTitle('');
     setDescription('');
@@ -140,6 +147,14 @@ export function App() {
             {creating ? 'Creando...' : '+ Agregar'}
           </button>
         </form>
+        {/* `optimisticData` real (GRAMMAR.md §3.137): mientras `creating`
+            está en true, `creatingTask` YA tiene el valor optimista --
+            visible antes de que el servidor confirme nada. */}
+        {creating && creatingTask && (
+          <p style={{ color: '#94a3b8', fontSize: '0.85rem', margin: '8px 0 0' }}>
+            ✓ "{creatingTask.title}" (confirmando con el servidor...)
+          </p>
+        )}
       </div>
 
       {/* Columnas Kanban */}

@@ -156,6 +156,10 @@
   - [3.132 Schema Zod de un enum ADT: `z.enum([...])` no alcanzaba — RESUELTO (bug real)](#3132-schema-zod-de-un-enum-adt-zenum-no-alcanzaba--resuelto-bug-real)
   - [3.133 `openapi.json`: mismos tres bugs que `isOk`/`isErr` y el schema Zod, esta vez en la especificación pública de la API — RESUELTO (bug real)](#3133-openapijson-mismos-tres-bugs-que-isokiserr-y-el-schema-zod-esta-vez-en-la-especificación-pública-de-la-api--resuelto-bug-real)
   - [3.134 `@infinite(cursor, limit)`: scroll infinito real — RESUELTO](#3134-infinitecursor-limit-scroll-infinito-real--resuelto)
+  - [3.135 Cache de Query: aislado por instancia de `client`, no solo por rpc+parámetros — RESUELTO](#3135-cache-de-query-aislado-por-instancia-de-client-no-solo-por-rpcparámetros--resuelto)
+  - [3.136 `AbortSignal` real dentro de los hooks (Query reference-counted, Mutation explícito) — RESUELTO](#3136-abortsignal-real-dentro-de-los-hooks-query-reference-counted-mutation-explícito--resuelto)
+  - [3.137 Mutaciones optimistas: `optimisticData` con rollback automático — RESUELTO](#3137-mutaciones-optimistas-optimisticdata-con-rollback-automático--resuelto)
+  - [3.138 Cache de Infinite compartido entre instancias — RESUELTO](#3138-cache-de-infinite-compartido-entre-instancias--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5609,6 +5613,89 @@ function PagedHistory() {
 **Demostración real**: `examples/taskboard/backend/taskboard.link` agrega `listPaged(cursor, limit)` sobre `db.tasks.pageAfter`; `examples/taskboard/frontend/src/App.tsx` consume `useTasksListPagedInfinite` en una sección nueva ("Historial paginado") con un botón "Cargar más" real.
 
 **Verificado**: 2 tests de parser (`@infinite(cursor, limit)` parsea los dos nombres; menos de dos es error de parseo), 8 de checker (firma `pageAfter`-shaped acepta; cursor no-`Int?` rechazado; limit no-`Int` rechazado; retorno sin `id: Int` rechazado; nombre de parámetro inexistente rechazado; mismo parámetro como cursor y limit rechazado; rechazado sobre un `stream`; declarado dos veces rechazado), 1 de `codegen::ts_emit` (la firma pública excluye `cursor`, incluye `limit`; NO coexiste con un hook de Query para el mismo rpc; el hook de Mutation se sigue emitiendo). Verificado también a mano contra un `linkc serve` real (`examples/taskboard`, 7 tareas creadas, `limit=3`): el mismo algoritmo que el hook generado implementa (sin React, bundle de `client.ts` vía esbuild) trajo exactamente 3 páginas (3+3+1=7), sin duplicados entre páginas, en orden ascendente, `hasNextPage` apagándose en el momento correcto. Verificado end-to-end contra React real: `examples/taskboard/frontend` regenerado, con `App.tsx` usando el hook de verdad, y tipando limpio con `tsc --noEmit` en modo estricto.
+
+**Actualización (ver §3.138): el "sin cache compartido entre instancias" de arriba queda SUPERADO** -- `useXInfinite` ahora comparte cache entre instancias con el mismo criterio que Query, incluido `AbortController` reference-counted. El resto de este ítem (la anotación, el heurístico de `hasNextPage`, el cursor por `id`) sigue exactamente igual.
+
+---
+
+### 3.135 Cache de Query: aislado por instancia de `client`, no solo por rpc+parámetros — RESUELTO
+
+Pedido explícito del usuario: "recopilá todo lo que haríamos en otras versiones relacionadas con TypeScript y la compatibilidad, y terminá todo eso en una sola versión" -- cuatro límites de alcance documentados a lo largo de la sesión (§3.124, §3.129, §3.134), todos cerrados juntos en esta ronda. Primero, el más simple: desde §3.124, el cache de Query (`Map<string, QueryCacheEntry<T>>`) era un único mapa a nivel de módulo, compartido incluso entre DOS INSTANCIAS DE `client` distintas contra el mismo rpc con los mismos parámetros -- una app multi-tenant o con múltiples sesiones (`clientA`/`clientB`, cada uno con su propio token/base URL) veía datos de una filtrarse en la otra.
+
+```ts
+const clientA = createUsersClient("https://tenant-a.example.com");
+const clientB = createUsersClient("https://tenant-b.example.com");
+// Antes: la MISMA clave de cache ("Users.list()") se compartía entre los
+// dos -- useUsersListQuery(clientA) y useUsersListQuery(clientB) podían
+// pisarse el resultado entre sí.
+```
+
+**`queryCache` pasa de `Map<string, QueryCacheEntry<T>>` a `WeakMap<object, Map<string, QueryCacheEntry<T>>>`** -- una capa extra keyeada por la instancia de `client` real. `getQueryCacheEntry(client, key)` busca primero el sub-`Map` de ESE client (creándolo si hace falta) y recién ahí la entrada por `key` -- dos clients JAMÁS comparten una entrada, pero múltiples componentes usando el MISMO client siguen compartiendo exactamente igual que antes (nada cambia para el caso real de todos los ejemplos del repo, un `client` único por app). `WeakMap`, no `Map` -- un `client` que ya nadie referencia puede recolectarse solo, sin que este cache lo retenga para siempre. `invalidateQueryCache(client, rpcKeyPrefix)` también gana el parámetro `client`, con el mismo criterio de aislamiento.
+
+**Verificado**: 1 test nuevo en `codegen::ts_emit` (`getQueryCacheEntry` busca dentro del sub-`Map` de `client`, nunca en un `Map` plano compartido) + a mano con Node real (sin React): dos instancias de `client` reales (`createTasksClient` dos veces contra el mismo `linkc serve`) con la MISMA clave de cache NUNCA comparten entrada; el MISMO client con la misma clave SÍ.
+
+---
+
+### 3.136 `AbortSignal` real dentro de los hooks (Query reference-counted, Mutation explícito) — RESUELTO
+
+Desde v1.92.0, `client.ts` soporta cancelar cualquier request vía `options?: { signal?: AbortSignal }`, pero NINGÚN hook lo exponía (§3.129, límite documentado explícitamente: "hooks.ts no cambia en esta ronda... es una decisión de diseño más grande"). El problema de fondo: la entrada de cache de Query es COMPARTIDA entre instancias (§3.124/§3.135) -- abortar el fetch de una instancia al desmontarse NO debe cancelar la request que OTRA instancia montada sigue esperando. Cancelar sin ese cuidado sería peor que no cancelar nada.
+
+**Query: `AbortController` reference-counted, vía `entry.listeners`.** Cada entrada de cache ahora tiene un `controller: AbortController | null` -- se crea junto con el `fetch()` real (pasado como `client.rpc(..., { signal: controller.signal })`) y se cancela SOLO cuando el conteo de listeners suscriptos llega a cero:
+
+```ts
+const subscribe = useCallback((onStoreChange) => {
+  entry.listeners.add(onStoreChange);
+  return () => {
+    entry.listeners.delete(onStoreChange);
+    if (entry.listeners.size === 0) entry.controller?.abort();
+  };
+}, [entry]);
+```
+
+Mientras quede AL MENOS UN componente montado mirando esa clave, el fetch sigue -- solo cuando el ÚLTIMO se desmonta (o nunca hubo ninguno más) se cancela la request real, evitando trabajo de red/servidor desperdiciado por una respuesta que ya nadie va a leer. Un `AbortError` disparado así **no es un error real** -- el `catch` lo detecta (`err instanceof DOMException && err.name === "AbortError"`) y resetea `isFetching` sin tocar `error`, para que un mount posterior de la misma clave no arranque viendo un error que nunca pidió.
+
+**Mutation e Infinite: `AbortController`/`AbortSignal` sin reference counting.** A diferencia de Query, el estado de `mutate`/`mutateAsync` y de `useXInfinite` (ya client-scoped y compartido, ver §3.138) es de UNA sola "línea de trabajo" a la vez -- cancelar ahí siempre es seguro sin contar listeners. Mutation gana `options?.signal` (ver §3.137, mismo parámetro que `optimisticData`) reenviado tal cual al `fetch()` real; Infinite crea su propio `AbortController` interno por `loadPage()`, cancelado automáticamente por el mismo mecanismo reference-counted que Query (comparte cache entre instancias desde §3.138, así que también necesita el mismo cuidado).
+
+**Regresión real encontrada por `tsc` -- no un test, el compilador mismo**: el primer intento del `catch` de Query, ante un abort, hacía `return;` (sin relanzar) -- TypeScript infería `entry.promise` como `Promise<T | void>`, incompatible con la firma declarada `Promise<T> | null` de `QueryCacheEntry<T>`. Arreglado relanzando (`throw err;`) en los DOS caminos del `catch` (abort y error real) -- el `try/catch` que envuelve `await entry.promise` en `refetch()` ya devuelve `null` ante CUALQUIER rechazo, así que el comportamiento visible no cambia, solo el tipo que TS infiere.
+
+**Verificado**: 2 tests nuevos en `codegen::ts_emit` (el `AbortController` se crea y se pasa al `fetch()` real; el `catch` distingue abort de error real, relanzando en ambos casos) + a mano contra un `linkc serve` real: dos "listeners" suscriptos a la misma entrada -- desmontar el primero NO aborta (el segundo sigue mirando), desmontar el ÚLTIMO SÍ aborta, y la promesa compartida rechaza con un `AbortError` genuino. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto (el error de tipo real de arriba se atrapó exactamente así, antes de llegar a producción).
+
+---
+
+### 3.137 Mutaciones optimistas: `optimisticData` con rollback automático — RESUELTO
+
+Cuarto ítem del mismo pedido bundle. `mutate`/`mutateAsync` ganan un último parámetro opcional, `options?: { optimisticData?: T }` (mismo objeto `options` que ahora también lleva `signal`, §3.136) -- el valor se muestra en `data` INMEDIATAMENTE, antes de que la request salga siquiera, reemplazado por el valor REAL en éxito (el `setData(res)` de siempre) o revertido a `null` si la mutación falla.
+
+```tsx
+const { mutate: createTask, data, loading } = useTasksCreateMutation(client);
+// ...
+const created = await createTask(input, {
+  optimisticData: { id: -1, createdAt: new Date(0).toISOString(), ...input },
+});
+// `data` muestra el valor optimista YA, sin esperar la red; si la
+// mutación falla, `data` vuelve a `null` solo -- este componente no
+// necesita ningún try/catch/rollback propio.
+```
+
+**Alcance deliberado: el optimismo es sobre el `data` PROPIO de la Mutation, no sobre el cache de una Query relacionada.** Una alternativa más ambiciosa -- que `create` actualice optimistamente el `data` de `useTasksListQuery` (mostrar la tarea en la lista antes de que el servidor confirme) -- se descartó para esta ronda: los targets de `@invalidates` pueden tener FORMAS heterogéneas (`list` devuelve `Task[]`, `stats` devuelve `BoardStats`, un tipo completamente distinto), así que un único updater tipado de forma segura contra targets de formas distintas necesitaría generar un mapeo de tipos por target -- una pieza de diseño bastante más grande que esta ronda no amerita. El optimismo sobre el `data` propio de la Mutation, en cambio, es siempre el MISMO tipo `T` en los dos lados (mostrado y confirmado), sin ese problema.
+
+**Rollback ligado al mismo `requestIdRef` que ya existía (§3.123)** -- si el optimista se mostró y la mutación falla, `setData(null)` corre solo si esta sigue siendo la request MÁS RECIENTE (nunca pisa el resultado de una llamada más nueva que ya haya resuelto).
+
+**Demostración real**: `examples/taskboard/frontend/src/App.tsx`, `handleCreate` -- pasa `optimisticData` a `createTask`, y un indicador nuevo ("✓ '{creatingTask.title}' (confirmando con el servidor...)") se muestra usando el `data` optimista mientras `creating` está en `true`.
+
+**Verificado**: 1 test nuevo en `codegen::ts_emit` (el optimista se muestra ANTES del `try`, el rollback corre en el `catch` gateado por `requestIdRef`) + a mano contra un `linkc serve` real, tres casos: el optimista se muestra antes de la red: `true`; una mutación exitosa reemplaza el optimista por el dato REAL del servidor (id real, no el `-1` optimista): `true`; una mutación contra un puerto muerto (fallo de red real) hace rollback a `null`: `true`. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado con la demostración real, tipando limpio con `tsc --noEmit` en modo estricto.
+
+---
+
+### 3.138 Cache de Infinite compartido entre instancias — RESUELTO
+
+Cierra el último límite del pedido bundle, el "Alcance v0 deliberado" que §3.134 dejó documentado explícitamente: `use{Servicio}{Rpc}Infinite` pasa del mismo `useState` local que Query tenía ANTES de v1.87.0 a exactamente la misma arquitectura de cache compartido que Query tiene desde entonces (§3.124/§3.135) -- `useSyncExternalStore` sobre una entrada de un `WeakMap<client, Map<string, InfiniteCacheEntry<T>>>`, dedupe real vía `entry.promise`, y el mismo `AbortController` reference-counted de §3.136.
+
+**Clave del cache: rpc + parámetros SIN `cursor`** (a diferencia de Query, que incluye TODOS los parámetros) -- dos instancias pidiendo "la misma lista paginada" comparten el MISMO historial de páginas aunque una ya haya avanzado más que la otra; el cursor es progreso interno de la entrada compartida, no parte de su identidad. `limit` sigue siendo parte de la clave (dos `limit` distintos son, con razón, dos listas paginadas distintas).
+
+**`entry.started` (compartido) reemplaza el `startedRef` (`useRef`, por instancia) que la v0 tenía** -- la primera página se pide UNA sola vez sin importar cuántos componentes monten el mismo `useXInfinite` a la vez, en vez de que cada instancia dispare su propio fetch inicial.
+
+**Verificado**: 1 test nuevo en `codegen::ts_emit` (`infiniteQueryCache` es un `WeakMap`, `getInfiniteCacheEntry` existe una sola vez, el dedupe vía `entry.promise` está presente, el abort reference-counted es idéntico al de Query) + el test existente de scroll infinito (§3.134) actualizado a la nueva forma compartida (`cacheKey`/`entry` en vez de `useState` local) + a mano contra un `linkc serve` real: dos "instancias" llamando `loadPage(null, true)` casi al mismo tiempo generan UN solo fetch real, no dos -- mismo patrón de verificación que el dedupe de Query (§3.124) usó originalmente. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto.
 
 ---
 

@@ -421,6 +421,11 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     // `useSyncExternalStore` de todos modos rompería el build de cualquiera
     // que compile con esa opción prendida.
     let has_any_query = services.iter().any(|(_, members)| members.iter().any(|(rpc, is_stream, _, _)| !is_stream && rpc.looks_like_a_query()));
+    // `@infinite` (GRAMMAR.md §3.134/§3.138) también usa `useSyncExternalStore`
+    // desde esta ronda -- comparte cache entre instancias con el mismo
+    // criterio que Query (§3.135), así que necesita el mismo import
+    // condicional.
+    let has_any_infinite = services.iter().any(|(_, members)| members.iter().any(|(rpc, is_stream, _, _)| !is_stream && rpc.infinite().is_some()));
     // GRAMMAR.md §3.125: `invalidateQueryCache` (el helper que limpia
     // entradas del cache tras una `Mutation` exitosa) solo hace falta si
     // ALGÚN rpc declaró `@invalidates(...)` -- el checker ya garantiza que
@@ -431,7 +436,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
 
     let mut out = String::new();
     out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
-    if has_any_query {
+    if has_any_query || has_any_infinite {
         out.push_str("import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from \"react\";\n");
     } else {
         out.push_str("import { useState, useEffect, useCallback, useRef } from \"react\";\n");
@@ -510,29 +515,46 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     // dispara su propio fetch por separado) y el resultado de UNO actualiza
     // a los DOS a la vez (`useSyncExternalStore`, la forma que React 18
     // documenta para suscribirse a un store externo al árbol de
-    // componentes). Alcance: cache por rpc+parámetros, NO por instancia de
-    // `client` -- si la misma app usara dos clients distintos contra el
-    // mismo rpc comparten cache igual; el caso real (`examples/taskboard/
-    // frontend` y el resto de los ejemplos) siempre tiene un client único
-    // por app. Invalidación tras una `Mutation` relacionada: opt-in vía
-    // `@invalidates(...)` sobre el rpc de la mutación (GRAMMAR.md §3.125,
-    // `invalidateQueryCache` más abajo) -- sin esa anotación, `refetch()`
-    // de una instancia sigue actualizando a todas las que comparten esa
-    // misma clave, pero nada dispara eso solo porque una mutación
-    // relacionada tuvo éxito.
+    // componentes).
+    //
+    // Cache por CLIENT + rpc + parámetros (GRAMMAR.md §3.135, cerrando el
+    // límite documentado en §3.124): antes de esta ronda el cache era un
+    // único `Map<string, ...>` a nivel de módulo, compartido incluso entre
+    // dos INSTANCIAS DE CLIENT distintas contra el mismo rpc -- una app
+    // multi-tenant con `clientA`/`clientB` apuntando a dos backends (o dos
+    // sesiones) veía datos de una filtrarse en la otra. `queryCache` ahora
+    // es un `WeakMap<object, Map<string, ...>>` -- una capa extra keyeada
+    // por la instancia de `client` real, así que dos clients NUNCA
+    // comparten una entrada, pero múltiples componentes usando el MISMO
+    // client siguen compartiendo exactamente igual que antes. `WeakMap`
+    // (no `Map`) para que un `client` que ya nadie referencia pueda
+    // recolectarse solo, sin que este cache lo retenga para siempre.
     if has_any_query {
         out.push_str("type QueryCacheState<T> = { data: T | null; isFetching: boolean; error: Error | null };\n\n");
+        // `controller` (GRAMMAR.md §3.136): el `AbortController` del fetch
+        // en vuelo de ESTA entrada, si hay uno -- permite cancelar la
+        // request real cuando ya NADIE la está mirando (ver `subscribe`
+        // más abajo), sin arriesgar cancelar una que otra instancia
+        // todavía necesita.
         out.push_str("type QueryCacheEntry<T> = {\n");
         out.push_str("  state: QueryCacheState<T>;\n");
         out.push_str("  promise: Promise<T> | null;\n");
         out.push_str("  listeners: Set<() => void>;\n");
+        out.push_str("  controller: AbortController | null;\n");
         out.push_str("};\n\n");
-        out.push_str("const queryCache = new Map<string, QueryCacheEntry<unknown>>();\n\n");
-        out.push_str("function getQueryCacheEntry<T>(key: string): QueryCacheEntry<T> {\n");
-        out.push_str("  let entry = queryCache.get(key) as QueryCacheEntry<T> | undefined;\n");
+        out.push_str("const queryCache = new WeakMap<object, Map<string, QueryCacheEntry<unknown>>>();\n\n");
+        out.push_str("function getQueryCacheEntry<T>(client: object, key: string): QueryCacheEntry<T> {\n");
+        out.push_str("  let clientCache = queryCache.get(client);\n");
+        out.push_str("  if (!clientCache) {\n");
+        out.push_str("    clientCache = new Map();\n");
+        out.push_str("    queryCache.set(client, clientCache);\n");
+        out.push_str("  }\n");
+        out.push_str("  let entry = clientCache.get(key) as QueryCacheEntry<T> | undefined;\n");
         out.push_str("  if (!entry) {\n");
-        out.push_str("    entry = { state: { data: null, isFetching: false, error: null }, promise: null, listeners: new Set() };\n");
-        out.push_str("    queryCache.set(key, entry as QueryCacheEntry<unknown>);\n");
+        out.push_str(
+            "    entry = { state: { data: null, isFetching: false, error: null }, promise: null, listeners: new Set(), controller: null };\n",
+        );
+        out.push_str("    clientCache.set(key, entry as QueryCacheEntry<unknown>);\n");
         out.push_str("  }\n");
         out.push_str("  return entry;\n");
         out.push_str("}\n\n");
@@ -555,15 +577,65 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     // desperdiciado. `prefix` matchea CUALQUIER variante de parámetros de
     // ese rpc (`"Servicio.rpc("`, sin el resto de la clave) -- invalidar
     // `search` invalida TODOS los términos de búsqueda cacheados, no solo
-    // uno puntual.
+    // uno puntual. `client` acota la invalidación al cache de ESE client --
+    // mismo criterio de aislamiento que `getQueryCacheEntry`.
     if has_any_invalidates {
-        out.push_str("function invalidateQueryCache(rpcKeyPrefix: string): void {\n");
+        out.push_str("function invalidateQueryCache(client: object, rpcKeyPrefix: string): void {\n");
+        out.push_str("  const clientCache = queryCache.get(client);\n");
+        out.push_str("  if (!clientCache) return;\n");
         out.push_str("  const prefix = rpcKeyPrefix + \"(\";\n");
-        out.push_str("  queryCache.forEach((entry, key) => {\n");
+        out.push_str("  clientCache.forEach((entry, key) => {\n");
         out.push_str("    if (!key.startsWith(prefix)) return;\n");
         out.push_str("    entry.state = { data: null, isFetching: false, error: null };\n");
         out.push_str("    entry.listeners.forEach((listener) => listener());\n");
         out.push_str("  });\n");
+        out.push_str("}\n\n");
+    }
+
+    // Cache compartido entre instancias de `use{Servicio}{Rpc}Infinite`
+    // (GRAMMAR.md §3.138, cerrando el límite documentado en §3.134): mismo
+    // criterio EXACTO que el cache de Query (§3.124/§3.135) -- por client +
+    // rpc + parámetros (sin `cursor`, que no es parte de la clave: dos
+    // instancias pidiendo "la misma lista paginada" comparten historial
+    // aunque una ya haya avanzado más páginas que la otra), con
+    // `useSyncExternalStore` y dedupe real vía `entry.promise`. Antes de
+    // esta ronda cada instancia tenía su PROPIO estado (`useState` local)
+    // -- dos componentes con el mismo `useXInfinite` mantenían historiales
+    // independientes, cada uno disparando sus propias requests.
+    if has_any_infinite {
+        out.push_str(
+            "type InfiniteCacheState<T> = { pages: T[][]; nextCursor: number | null; hasNextPage: boolean; loading: boolean; isFetchingNextPage: boolean; error: Error | null };\n\n",
+        );
+        out.push_str("type InfiniteCacheEntry<T> = {\n");
+        out.push_str("  state: InfiniteCacheState<T>;\n");
+        out.push_str("  promise: Promise<void> | null;\n");
+        out.push_str("  listeners: Set<() => void>;\n");
+        out.push_str("  controller: AbortController | null;\n");
+        // `started` reemplaza el `startedRef` (`useRef`) de antes de esta
+        // ronda -- ahora vive en la entrada COMPARTIDA, no por instancia,
+        // para que la primera página se pida UNA sola vez sin importar
+        // cuántos componentes monten el mismo `useXInfinite` a la vez.
+        out.push_str("  started: boolean;\n");
+        out.push_str("};\n\n");
+        out.push_str("const infiniteQueryCache = new WeakMap<object, Map<string, InfiniteCacheEntry<unknown>>>();\n\n");
+        out.push_str("function getInfiniteCacheEntry<T>(client: object, key: string): InfiniteCacheEntry<T> {\n");
+        out.push_str("  let clientCache = infiniteQueryCache.get(client);\n");
+        out.push_str("  if (!clientCache) {\n");
+        out.push_str("    clientCache = new Map();\n");
+        out.push_str("    infiniteQueryCache.set(client, clientCache);\n");
+        out.push_str("  }\n");
+        out.push_str("  let entry = clientCache.get(key) as InfiniteCacheEntry<T> | undefined;\n");
+        out.push_str("  if (!entry) {\n");
+        out.push_str(
+            "    entry = { state: { pages: [], nextCursor: null, hasNextPage: true, loading: false, isFetchingNextPage: false, error: null }, promise: null, listeners: new Set(), controller: null, started: false };\n",
+        );
+        out.push_str("    clientCache.set(key, entry as InfiniteCacheEntry<unknown>);\n");
+        out.push_str("  }\n");
+        out.push_str("  return entry;\n");
+        out.push_str("}\n\n");
+        out.push_str("function setInfiniteCacheState<T>(entry: InfiniteCacheEntry<T>, patch: Partial<InfiniteCacheState<T>>): void {\n");
+        out.push_str("  entry.state = { ...entry.state, ...patch };\n");
+        out.push_str("  entry.listeners.forEach((listener) => listener());\n");
         out.push_str("}\n\n");
     }
 
@@ -708,68 +780,91 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                         .map(|p| if p.name == cursor_param { "cursorArg".to_string() } else { p.name.clone() })
                         .collect();
 
+                    // Clave del cache: rpc + parámetros SIN `cursor` (dos
+                    // instancias pidiendo "la misma lista paginada"
+                    // comparten historial aunque una ya haya avanzado más
+                    // páginas -- el cursor es progreso interno, no
+                    // identidad de la lista). GRAMMAR.md §3.138.
+                    let cache_key_expr = format!(
+                        "\"{}.{}(\" + JSON.stringify([{}]) + \")\"",
+                        service.name,
+                        rpc.name,
+                        hook_param_names.join(", ")
+                    );
                     out.push_str(&format!(
                         "export function use{service}{cap_rpc}Infinite({params_sig}): InfiniteQueryState<{elem_str}> {{\n",
                         service = service.name
                     ));
                     out.push_str("  const enabled = options?.enabled ?? true;\n");
-                    out.push_str(&format!("  const [pages, setPages] = useState<{elem_str}[][]>([]);\n"));
-                    out.push_str("  const [nextCursor, setNextCursor] = useState<number | null>(null);\n");
-                    out.push_str("  const [hasNextPage, setHasNextPage] = useState(true);\n");
-                    out.push_str("  const [loading, setLoading] = useState(false);\n");
-                    out.push_str("  const [isFetchingNextPage, setIsFetchingNextPage] = useState(false);\n");
-                    out.push_str("  const [error, setError] = useState<Error | null>(null);\n");
-                    // Misma guarda de "solo la respuesta más reciente gana"
-                    // que el resto de los hooks -- una llamada a
-                    // `fetchNextPage()` disparada dos veces casi junta (o
-                    // un `refetch()` a mitad de un `fetchNextPage()` en
-                    // vuelo) no debe dejar una página vieja pisando una más
-                    // nueva.
-                    out.push_str("  const requestIdRef = useRef(0);\n");
-                    // Distingue "todavía no se pidió nada" de "ya se pidió
-                    // la primera página" -- sin esto, alternar `enabled`
-                    // false->true->false->true re-dispararía la primera
-                    // página cada vez, perdiendo las páginas ya cargadas.
-                    out.push_str("  const startedRef = useRef(false);\n\n");
+                    out.push_str(&format!("  const cacheKey = {cache_key_expr};\n"));
+                    out.push_str(&format!("  const entry = getInfiniteCacheEntry<{elem_str}>(client, cacheKey);\n\n"));
+                    out.push_str("  const subscribe = useCallback((onStoreChange: () => void) => {\n");
+                    out.push_str("    entry.listeners.add(onStoreChange);\n");
+                    out.push_str("    return () => {\n");
+                    out.push_str("      entry.listeners.delete(onStoreChange);\n");
+                    out.push_str("      if (entry.listeners.size === 0) entry.controller?.abort();\n");
+                    out.push_str("    };\n");
+                    out.push_str("  }, [entry]);\n");
+                    out.push_str("  const getSnapshot = useCallback(() => entry.state, [entry]);\n");
+                    out.push_str("  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);\n\n");
+                    // Dedupe real: si YA hay una carga en curso para esta
+                    // entrada (inicial o de una página siguiente, disparada
+                    // por CUALQUIER instancia), una llamada nueva no hace
+                    // nada -- la que ya está en vuelo va a actualizar el
+                    // estado compartido de todos modos.
                     out.push_str("  const loadPage = useCallback(async (cursorArg: number | null, replace: boolean): Promise<void> => {\n");
-                    out.push_str("    const requestId = ++requestIdRef.current;\n");
-                    out.push_str("    if (replace) setLoading(true); else setIsFetchingNextPage(true);\n");
-                    out.push_str("    setError(null);\n");
-                    out.push_str("    try {\n");
-                    out.push_str(&format!("      const res = await client.{}({});\n", rpc.name, call_args.join(", ")));
-                    out.push_str("      if (requestIdRef.current !== requestId) return;\n");
-                    out.push_str("      setPages((prev) => (replace ? [res] : [...prev, res]));\n");
-                    out.push_str(&format!("      setHasNextPage(res.length === {limit_param});\n"));
-                    out.push_str("      setNextCursor(res.length > 0 ? res[res.length - 1].id : cursorArg);\n");
-                    out.push_str("    } catch (err) {\n");
-                    out.push_str("      if (requestIdRef.current === requestId) setError(err instanceof Error ? err : new Error(String(err)));\n");
-                    out.push_str("    } finally {\n");
-                    out.push_str(
-                        "      if (requestIdRef.current === requestId) { if (replace) setLoading(false); else setIsFetchingNextPage(false); }\n",
-                    );
-                    out.push_str("    }\n");
-                    out.push_str(&format!("  }}, [{deps}]);\n\n"));
+                    out.push_str("    if (entry.promise) return;\n");
+                    out.push_str("    setInfiniteCacheState(entry, replace ? { loading: true, error: null } : { isFetchingNextPage: true, error: null });\n");
+                    out.push_str("    const controller = new AbortController();\n");
+                    out.push_str("    entry.controller = controller;\n");
+                    out.push_str("    entry.promise = (async () => {\n");
+                    out.push_str("      try {\n");
+                    let call_args_with_signal = format!("{}, {{ signal: controller.signal }}", call_args.join(", "));
+                    out.push_str(&format!("        const res = await client.{}({call_args_with_signal});\n", rpc.name));
+                    out.push_str("        setInfiniteCacheState(entry, {\n");
+                    out.push_str("          pages: replace ? [res] : [...entry.state.pages, res],\n");
+                    out.push_str(&format!("          hasNextPage: res.length === {limit_param},\n"));
+                    out.push_str("          nextCursor: res.length > 0 ? res[res.length - 1].id : cursorArg,\n");
+                    out.push_str("          loading: false,\n");
+                    out.push_str("          isFetchingNextPage: false,\n");
+                    out.push_str("        });\n");
+                    out.push_str("      } catch (err) {\n");
+                    // Mismo criterio que Query (§3.136): un abort porque
+                    // nadie sigue mirando esta entrada no es un error real.
+                    out.push_str("        if (err instanceof DOMException && err.name === \"AbortError\") {\n");
+                    out.push_str("          setInfiniteCacheState(entry, { loading: false, isFetchingNextPage: false });\n");
+                    out.push_str("          return;\n");
+                    out.push_str("        }\n");
+                    out.push_str("        const e = err instanceof Error ? err : new Error(String(err));\n");
+                    out.push_str("        setInfiniteCacheState(entry, { error: e, loading: false, isFetchingNextPage: false });\n");
+                    out.push_str("      } finally {\n");
+                    out.push_str("        entry.promise = null;\n");
+                    out.push_str("        entry.controller = null;\n");
+                    out.push_str("      }\n");
+                    out.push_str("    })();\n");
+                    out.push_str("    await entry.promise;\n");
+                    out.push_str(&format!("  }}, [entry, {deps}]);\n\n"));
                     out.push_str("  useEffect(() => {\n");
-                    out.push_str("    if (enabled && !startedRef.current) {\n");
-                    out.push_str("      startedRef.current = true;\n");
+                    // `entry.started` (compartido, no un `useRef` por
+                    // instancia) -- la primera página se pide UNA sola vez
+                    // sin importar cuántos componentes monten el mismo
+                    // `useXInfinite` a la vez.
+                    out.push_str("    if (enabled && !entry.started && !entry.promise) {\n");
+                    out.push_str("      entry.started = true;\n");
                     out.push_str("      loadPage(null, true);\n");
                     out.push_str("    }\n");
-                    out.push_str("  }, [enabled, loadPage]);\n\n");
+                    out.push_str("  }, [enabled, loadPage, entry]);\n\n");
                     out.push_str("  const fetchNextPage = useCallback(async (): Promise<void> => {\n");
-                    // No dispara una request nueva si ya no hay más
-                    // páginas, o si ya hay una carga en curso (inicial o de
-                    // otra página) -- mismo criterio de "no fetch
-                    // superpuesto" que el resto de los hooks.
-                    out.push_str("    if (!hasNextPage || isFetchingNextPage || loading) return;\n");
-                    out.push_str("    await loadPage(nextCursor, false);\n");
-                    out.push_str("  }, [hasNextPage, isFetchingNextPage, loading, nextCursor, loadPage]);\n\n");
+                    out.push_str("    if (!state.hasNextPage || state.isFetchingNextPage || state.loading) return;\n");
+                    out.push_str("    await loadPage(state.nextCursor, false);\n");
+                    out.push_str("  }, [state.hasNextPage, state.isFetchingNextPage, state.loading, state.nextCursor, loadPage]);\n\n");
                     out.push_str("  const refetch = useCallback(async (): Promise<void> => {\n");
-                    out.push_str("    startedRef.current = true;\n");
-                    out.push_str("    setHasNextPage(true);\n");
+                    out.push_str("    entry.started = true;\n");
+                    out.push_str("    setInfiniteCacheState(entry, { hasNextPage: true });\n");
                     out.push_str("    await loadPage(null, true);\n");
-                    out.push_str("  }, [loadPage]);\n\n");
+                    out.push_str("  }, [entry, loadPage]);\n\n");
                     out.push_str(
-                        "  return { data: pages.flat(), loading, isFetchingNextPage, hasNextPage, error, fetchNextPage, refetch };\n",
+                        "  return { data: state.pages.flat(), loading: state.loading, isFetchingNextPage: state.isFetchingNextPage, hasNextPage: state.hasNextPage, error: state.error, fetchNextPage, refetch };\n",
                     );
                     out.push_str("}\n\n");
                 } else if rpc.looks_like_a_query() {
@@ -803,10 +898,18 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     // `entry` es una referencia estable entre renders
                     // mientras `cacheKey` no cambie, sin necesitar un
                     // `useMemo` propio para eso.
-                    out.push_str(&format!("  const entry = getQueryCacheEntry<{ret_str}>(cacheKey);\n\n"));
+                    out.push_str(&format!("  const entry = getQueryCacheEntry<{ret_str}>(client, cacheKey);\n\n"));
                     out.push_str("  const subscribe = useCallback((onStoreChange: () => void) => {\n");
                     out.push_str("    entry.listeners.add(onStoreChange);\n");
-                    out.push_str("    return () => { entry.listeners.delete(onStoreChange); };\n");
+                    out.push_str("    return () => {\n");
+                    out.push_str("      entry.listeners.delete(onStoreChange);\n");
+                    // AbortSignal (GRAMMAR.md §3.136): cuando el ÚLTIMO
+                    // componente que miraba esta entrada se desmonta,
+                    // cancela el fetch real en vuelo -- nadie más lo va a
+                    // leer. Mientras quede AL MENOS UN listener suscripto,
+                    // nunca se aborta (otra instancia todavía lo necesita).
+                    out.push_str("      if (entry.listeners.size === 0) entry.controller?.abort();\n");
+                    out.push_str("    };\n");
                     out.push_str("  }, [entry]);\n");
                     out.push_str("  const getSnapshot = useCallback(() => entry.state, [entry]);\n");
                     // `useSyncExternalStore` (React 18): la forma real de
@@ -826,18 +929,46 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     // `entry.promise` es el punto de sincronización.
                     out.push_str("    if (!entry.promise) {\n");
                     out.push_str("      setQueryCacheState(entry, { isFetching: true, error: null });\n");
-                    out.push_str(&format!("      entry.promise = client.{}({})\n", rpc.name, param_names.join(", ")));
+                    // Un `AbortController` real por fetch -- `subscribe`
+                    // (arriba) lo cancela cuando el último listener se
+                    // desmonta (GRAMMAR.md §3.136).
+                    out.push_str("      const controller = new AbortController();\n");
+                    out.push_str("      entry.controller = controller;\n");
+                    let args_with_signal =
+                        if param_names.is_empty() { "{ signal: controller.signal }".to_string() } else { format!("{}, {{ signal: controller.signal }}", param_names.join(", ")) };
+                    out.push_str(&format!("      entry.promise = client.{}({args_with_signal})\n", rpc.name));
                     out.push_str("        .then((res) => {\n");
                     out.push_str("          setQueryCacheState(entry, { data: res, isFetching: false });\n");
                     out.push_str("          return res;\n");
                     out.push_str("        })\n");
                     out.push_str("        .catch((err) => {\n");
+                    // Un abort disparado porque el último interesado se
+                    // desmontó no es un ERROR real -- ninguna instancia
+                    // sigue mirando este estado, y si una nueva se monta
+                    // después, no debería arrancar viendo un error que
+                    // nunca pidió. Se resetea `isFetching` sin tocar
+                    // `error`, dejando la entrada lista para un fetch
+                    // nuevo.
+                    // Los DOS caminos de este `catch` relanzan (nunca
+                    // `return` un valor) -- si el de abort devolviera
+                    // `void`, TS infiere `entry.promise` como `Promise<T |
+                    // void>`, incompatible con `Promise<T> | null`
+                    // (`QueryCacheEntry<T>`). `refetch()` ya envuelve el
+                    // `await entry.promise` en su propio `try/catch` que
+                    // devuelve `null` ante CUALQUIER rechazo -- relanzar
+                    // acá no cambia el comportamiento visible, solo el
+                    // tipo que TS infiere.
+                    out.push_str("          if (err instanceof DOMException && err.name === \"AbortError\") {\n");
+                    out.push_str("            setQueryCacheState(entry, { isFetching: false });\n");
+                    out.push_str("            throw err;\n");
+                    out.push_str("          }\n");
                     out.push_str("          const e = err instanceof Error ? err : new Error(String(err));\n");
                     out.push_str("          setQueryCacheState(entry, { error: e, isFetching: false });\n");
                     out.push_str("          throw e;\n");
                     out.push_str("        })\n");
                     out.push_str("        .finally(() => {\n");
                     out.push_str("          entry.promise = null;\n");
+                    out.push_str("          entry.controller = null;\n");
                     out.push_str("        });\n");
                     out.push_str("    }\n");
                     out.push_str("    try {\n");
@@ -884,10 +1015,23 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 // un wrapper que nunca relanza -- devuelve `null` en el
                 // fallo, mismo patrón que `refetch()` del hook de Query
                 // (§3.124) ya usa para lo mismo.
+                // `options?: { signal?: AbortSignal; optimisticData?: T }`
+                // (GRAMMAR.md §3.136/§3.137): último parámetro, siempre
+                // opcional, en las dos funciones. `signal` se reenvía tal
+                // cual al `fetch()` real (mismo parámetro que `client.ts`
+                // ya expone desde v1.92.0, ahora conectado -- Mutation no
+                // tiene el problema de "fetch compartido" de Query, así
+                // que cancelar acá siempre es seguro). `optimisticData`
+                // muestra un valor YA, antes de que la red responda --
+                // reemplazado por el valor real en éxito (el `setData(res)`
+                // de siempre), revertido a `null` en fallo.
+                let mutate_opts_ty = format!("{{ signal?: AbortSignal; optimisticData?: {ret_str} }}");
+                let mut mutate_params_typed = params_typed.clone();
+                mutate_params_typed.push(format!("options?: {mutate_opts_ty}"));
+                let mutate_params_sig = mutate_params_typed.join(", ");
                 out.push_str(&format!(
-                    "export function use{service}{cap_rpc}Mutation(client: {service}Client): MutationState<{ret_str}> & {{\n  mutate: ({params}) => Promise<{nullable_ret_str}>;\n  mutateAsync: ({params}) => Promise<{ret_str}>;\n}} {{\n",
-                    service = service.name,
-                    params = params_typed.join(", ")
+                    "export function use{service}{cap_rpc}Mutation(client: {service}Client): MutationState<{ret_str}> & {{\n  mutate: ({mutate_params_sig}) => Promise<{nullable_ret_str}>;\n  mutateAsync: ({mutate_params_sig}) => Promise<{ret_str}>;\n}} {{\n",
+                    service = service.name
                 ));
                 out.push_str(&format!("  const [data, setData] = useState<{}>(null);\n", nullable_ret_str));
                 out.push_str("  const [loading, setLoading] = useState(false);\n");
@@ -899,15 +1043,22 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 // pisar `data`/`error` con el resultado de la llamada vieja.
                 out.push_str("  const requestIdRef = useRef(0);\n\n");
                 out.push_str(&format!(
-                    "  const mutateAsync = useCallback(async ({}): Promise<{}> => {{\n",
-                    params_typed.join(", "),
-                    ret_str
+                    "  const mutateAsync = useCallback(async ({mutate_params_sig}): Promise<{ret_str}> => {{\n",
                 ));
                 out.push_str("    const requestId = ++requestIdRef.current;\n");
                 out.push_str("    setLoading(true);\n");
                 out.push_str("    setError(null);\n");
+                // Optimista: si el caller pasó un valor, se muestra YA --
+                // antes de que la request siquiera salga -- y se pisa con
+                // el valor real en cuanto la red responde (abajo).
+                out.push_str("    if (options?.optimisticData !== undefined) setData(options.optimisticData);\n");
                 out.push_str("    try {\n");
-                out.push_str(&format!("      const res = await client.{}({});\n", rpc.name, param_names.join(", ")));
+                let call_args_with_signal = if param_names.is_empty() {
+                    "{ signal: options?.signal }".to_string()
+                } else {
+                    format!("{}, {{ signal: options?.signal }}", param_names.join(", "))
+                };
+                out.push_str(&format!("      const res = await client.{}({call_args_with_signal});\n", rpc.name));
                 out.push_str("      if (requestIdRef.current === requestId) setData(res);\n");
                 // `@invalidates(rpc1, rpc2, ...)` (GRAMMAR.md §3.125) --
                 // limpia el cache de Query de cada rpc nombrado DESPUÉS de
@@ -916,29 +1067,35 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 // que valga la pena refrescar).
                 if let Some(names) = rpc.invalidates() {
                     for name in names {
-                        out.push_str(&format!("      invalidateQueryCache(\"{}.{name}\");\n", service.name));
+                        out.push_str(&format!("      invalidateQueryCache(client, \"{}.{name}\");\n", service.name));
                     }
                 }
                 out.push_str("      return res;\n");
                 out.push_str("    } catch (err) {\n");
                 out.push_str("      const e = err instanceof Error ? err : new Error(String(err));\n");
-                out.push_str("      if (requestIdRef.current === requestId) setError(e);\n");
+                // Rollback: el valor optimista mostrado arriba nunca pasó a
+                // ser real -- sin esto, `data` quedaría mostrando para
+                // siempre un valor que el servidor NUNCA confirmó.
+                out.push_str("      if (requestIdRef.current === requestId) {\n");
+                out.push_str("        setError(e);\n");
+                out.push_str("        if (options?.optimisticData !== undefined) setData(null);\n");
+                out.push_str("      }\n");
                 out.push_str("      throw e;\n");
                 out.push_str("    } finally {\n");
                 out.push_str("      if (requestIdRef.current === requestId) setLoading(false);\n");
                 out.push_str("    }\n");
                 out.push_str("  }, [client]);\n\n");
                 out.push_str(&format!(
-                    "  const mutate = useCallback(async ({}): Promise<{}> => {{\n",
-                    params_typed.join(", "),
-                    nullable_ret_str
+                    "  const mutate = useCallback(async ({mutate_params_sig}): Promise<{nullable_ret_str}> => {{\n",
                 ));
                 out.push_str("    try {\n");
-                out.push_str(&format!("      return await mutateAsync({});\n", param_names.join(", ")));
+                let mutate_call_args =
+                    if param_names.is_empty() { "options".to_string() } else { format!("{}, options", param_names.join(", ")) };
+                out.push_str(&format!("      return await mutateAsync({mutate_call_args});\n"));
                 out.push_str("    } catch {\n");
-                // El error YA quedó en el estado (`error`, seteado dentro de
-                // `mutateAsync` de arriba) -- `mutate` no necesita hacer
-                // nada más que no relanzar.
+                // El error (y el rollback del optimista, si hubo uno) YA
+                // quedaron en el estado dentro de `mutateAsync` de arriba
+                // -- `mutate` no necesita hacer nada más que no relanzar.
                 out.push_str("      return null;\n");
                 out.push_str("    }\n");
                 out.push_str("  }, [mutateAsync]);\n\n");
@@ -1921,19 +2078,61 @@ service Ticks {
         // @infinite lo reemplaza, no coexisten.
         assert!(!hooks.contains("useTasksListQuery"), "{hooks}");
         let block = hooks.split("export function useTasksListInfinite(").nth(1).expect("bloque del hook");
-        assert!(block.contains("const [pages, setPages] = useState<Task[][]>([]);"), "{hooks}");
-        assert!(block.contains("const res = await client.list(cursorArg, limit);"), "{hooks}");
-        assert!(block.contains("setHasNextPage(res.length === limit);"), "{hooks}");
-        assert!(block.contains("setNextCursor(res.length > 0 ? res[res.length - 1].id : cursorArg);"), "{hooks}");
+        // Cache compartido entre instancias (GRAMMAR.md §3.138), mismo
+        // criterio que Query -- clave SIN `cursor` (progreso interno, no
+        // identidad de la lista).
+        assert!(block.contains("const cacheKey = \"Tasks.list(\" + JSON.stringify([limit]) + \")\";"), "{hooks}");
+        assert!(block.contains("const entry = getInfiniteCacheEntry<Task>(client, cacheKey);"), "{hooks}");
+        assert!(block.contains("const res = await client.list(cursorArg, limit, { signal: controller.signal });"), "{hooks}");
+        assert!(block.contains("hasNextPage: res.length === limit,"), "{hooks}");
+        assert!(block.contains("nextCursor: res.length > 0 ? res[res.length - 1].id : cursorArg,"), "{hooks}");
         assert!(
             block.contains(
-                "return { data: pages.flat(), loading, isFetchingNextPage, hasNextPage, error, fetchNextPage, refetch };"
+                "return { data: state.pages.flat(), loading: state.loading, isFetchingNextPage: state.isFetchingNextPage, hasNextPage: state.hasNextPage, error: state.error, fetchNextPage, refetch };"
             ),
             "{hooks}"
         );
+        // `entry.started` (compartido) reemplaza el `startedRef` por
+        // instancia -- la primera página se pide UNA sola vez sin importar
+        // cuántos componentes monten el mismo hook a la vez.
+        assert!(block.contains("if (enabled && !entry.started && !entry.promise) {"), "{hooks}");
         // El hook de Mutation se sigue emitiendo igual (sin cambios de
         // alcance ahí) -- @infinite solo reemplaza el hook de Query.
         assert!(hooks.contains("export function useTasksListMutation"), "{hooks}");
+    }
+
+    /// Cache de Infinite compartido entre instancias (GRAMMAR.md §3.138) --
+    /// gap real cerrado en esta ronda: antes, dos componentes con el mismo
+    /// `useXInfinite` mantenían historiales INDEPENDIENTES (alcance v0
+    /// documentado en §3.134), cada uno disparando sus propias requests.
+    #[test]
+    fn infinite_hook_shares_cache_across_instances_and_aborts_when_unmounted() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @infinite(cursor, limit)
+                rpc list(cursor: Int?, limit: Int) -> Task[] { db.tasks.pageAfter(cursor, limit) }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(
+            hooks.contains("const infiniteQueryCache = new WeakMap<object, Map<string, InfiniteCacheEntry<unknown>>>();"),
+            "{hooks}"
+        );
+        assert_eq!(hooks.matches("function getInfiniteCacheEntry").count(), 1, "{hooks}");
+        // Dedupe real: si ya hay una carga en curso para esta entrada, una
+        // llamada nueva no dispara su propio fetch.
+        assert!(hooks.contains("if (entry.promise) return;"), "{hooks}");
+        // Abort cuando el último listener se desmonta -- mismo criterio
+        // reference-counted que Query (§3.136).
+        assert!(
+            hooks.contains(
+                "    return () => {\n      entry.listeners.delete(onStoreChange);\n      if (entry.listeners.size === 0) entry.controller?.abort();\n    };"
+            ),
+            "{hooks}"
+        );
     }
 
     /// El hook de Query (`use{Servicio}{Rpc}Query`) comparte cache entre
@@ -1960,23 +2159,95 @@ service Ticks {
             "{hooks}"
         );
         // Infraestructura de cache emitida UNA sola vez, no por hook.
-        assert_eq!(hooks.matches("const queryCache = new Map").count(), 1, "{hooks}");
+        assert_eq!(hooks.matches("const queryCache = new WeakMap").count(), 1, "{hooks}");
         assert_eq!(hooks.matches("function getQueryCacheEntry").count(), 1, "{hooks}");
         assert_eq!(hooks.matches("function setQueryCacheState").count(), 1, "{hooks}");
-        // Clave del cache: rpc + parámetros serializados, NO el `client`.
+        // Clave del cache: rpc + parámetros serializados -- el `client` ya
+        // no forma parte de la CLAVE (va aparte, como capa del `WeakMap`,
+        // GRAMMAR.md §3.135), pero SÍ se pasa a `getQueryCacheEntry` para
+        // que dos clients distintos nunca compartan una entrada.
         assert!(hooks.contains("const cacheKey = \"Users.get(\" + JSON.stringify([id]) + \")\";"), "{hooks}");
-        assert!(hooks.contains("const entry = getQueryCacheEntry<User>(cacheKey);"), "{hooks}");
+        assert!(hooks.contains("const entry = getQueryCacheEntry<User>(client, cacheKey);"), "{hooks}");
         assert!(hooks.contains("const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);"), "{hooks}");
         // Dedupe real: una sola request en vuelo por entrada, compartida
         // entre quien la disparó y cualquier otra instancia/llamada.
         assert!(hooks.contains("if (!entry.promise) {"), "{hooks}");
-        assert!(hooks.contains("entry.promise = client.get(id)"), "{hooks}");
+        assert!(hooks.contains("entry.promise = client.get(id, { signal: controller.signal })"), "{hooks}");
         // La forma pública del hook (lo que un componente consume) sigue
         // siendo exactamente `QueryState<T>` -- el cambio es interno.
         assert!(hooks.contains("export function useUsersGetQuery(client: UsersClient, id: number, options?: { enabled?: boolean }): QueryState<User> {"), "{hooks}");
         assert!(
             hooks.contains(
                 "return { data: state.data, loading: state.data === null && state.isFetching, isFetching: state.isFetching, error: state.error, refetch };"
+            ),
+            "{hooks}"
+        );
+    }
+
+    /// Cache de Query por CLIENT + rpc + parámetros (GRAMMAR.md §3.135) --
+    /// gap real: antes de esta ronda dos instancias de `client` distintas
+    /// contra el mismo rpc compartían cache igual, filtrando datos de una
+    /// app multi-tenant/multi-sesión a la otra.
+    #[test]
+    fn query_cache_is_scoped_per_client_instance() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            service Users {
+                rpc get(id: Int) -> User { User { id: id, name: "x" } }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(
+            hooks.contains("const queryCache = new WeakMap<object, Map<string, QueryCacheEntry<unknown>>>();"),
+            "{hooks}"
+        );
+        assert!(
+            hooks.contains("function getQueryCacheEntry<T>(client: object, key: string): QueryCacheEntry<T> {"),
+            "{hooks}"
+        );
+        assert!(hooks.contains("let clientCache = queryCache.get(client);"), "{hooks}");
+        // La entrada real se busca DENTRO del sub-Map de ESE client -- dos
+        // clients nunca comparten `clientCache.get(key)`.
+        assert!(hooks.contains("let entry = clientCache.get(key) as QueryCacheEntry<T> | undefined;"), "{hooks}");
+    }
+
+    /// `AbortController` real por entrada de cache (GRAMMAR.md §3.136) --
+    /// gap real: `client.ts` ya soporta cancelar una request desde v1.92.0,
+    /// pero ningún hook lo usaba. Cancelar el fetch de una entrada
+    /// COMPARTIDA solo es seguro cuando el ÚLTIMO componente que la miraba
+    /// se desmonta -- referencia contada vía `entry.listeners.size`.
+    #[test]
+    fn query_hook_aborts_the_shared_fetch_only_when_the_last_listener_unmounts() {
+        let src = r#"
+            type User = { id: Int }
+            service Users {
+                rpc get(id: Int) -> User { User { id: id } }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(hooks.contains("controller: AbortController | null;"), "{hooks}");
+        assert!(
+            hooks.contains(
+                "    return () => {\n      entry.listeners.delete(onStoreChange);\n      if (entry.listeners.size === 0) entry.controller?.abort();\n    };"
+            ),
+            "{hooks}"
+        );
+        // El `AbortController` real se crea junto con el fetch y se pasa a
+        // `client.get(...)` -- el mismo parámetro `options?.signal` que
+        // `client.ts` expone desde v1.92.0 (§3.129), ahora conectado.
+        assert!(hooks.contains("const controller = new AbortController();"), "{hooks}");
+        assert!(hooks.contains("entry.promise = client.get(id, { signal: controller.signal })"), "{hooks}");
+        // Un abort NO es un error real -- no pisa `error`, solo resetea
+        // `isFetching` para que un mount nuevo pueda refetchear limpio.
+        // Relanza igual que el otro camino (nunca `return` un valor) para
+        // que TS infiera `entry.promise` como `Promise<T>`, no `Promise<T
+        // | void>` -- el `try/catch` de `refetch()` ya devuelve `null`
+        // ante cualquier rechazo, así que el comportamiento no cambia.
+        assert!(
+            hooks.contains(
+                "          if (err instanceof DOMException && err.name === \"AbortError\") {\n            setQueryCacheState(entry, { isFetching: false });\n            throw err;\n          }"
             ),
             "{hooks}"
         );
@@ -2052,8 +2323,8 @@ type User = { id: Int, name: String }
         assert_eq!(hooks.matches("function invalidateQueryCache").count(), 1, "{hooks}");
         let mutation_block = hooks.split("export function useTasksCreateMutation").nth(1).expect("bloque de la mutación");
         let success_block = mutation_block.split("} catch").next().unwrap();
-        assert!(success_block.contains("invalidateQueryCache(\"Tasks.list\");"), "{hooks}");
-        assert!(success_block.contains("invalidateQueryCache(\"Tasks.search\");"), "{hooks}");
+        assert!(success_block.contains("invalidateQueryCache(client, \"Tasks.list\");"), "{hooks}");
+        assert!(success_block.contains("invalidateQueryCache(client, \"Tasks.search\");"), "{hooks}");
         // Nunca en el camino de error -- una mutación que falló no cambió
         // nada que valga la pena refrescar.
         let catch_block = mutation_block.split("} catch").nth(1).unwrap().split("} finally").next().unwrap();
@@ -2079,21 +2350,33 @@ type User = { id: Int, name: String }
         let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
         let hooks = emit_hooks(&program).expect("hooks generation");
         // Firma pública: las dos funciones, con los tipos de retorno que
-        // dejan clara la diferencia (`| null` vs. no).
+        // dejan clara la diferencia (`| null` vs. no) -- `options` (signal
+        // + optimisticData, GRAMMAR.md §3.136/§3.137) como último
+        // parámetro, siempre opcional.
         assert!(
             hooks.contains(
-                "export function useUsersCreateMutation(client: UsersClient): MutationState<User> & {\n  mutate: (name: string) => Promise<User | null>;\n  mutateAsync: (name: string) => Promise<User>;\n} {"
+                "export function useUsersCreateMutation(client: UsersClient): MutationState<User> & {\n  mutate: (name: string, options?: { signal?: AbortSignal; optimisticData?: User }) => Promise<User | null>;\n  mutateAsync: (name: string, options?: { signal?: AbortSignal; optimisticData?: User }) => Promise<User>;\n} {"
             ),
             "{hooks}"
         );
         let mutation_block = hooks.split("export function useUsersCreateMutation").nth(1).expect("bloque de la mutación");
         // `mutateAsync` sigue relanzando -- sin cambios de comportamiento
         // para quien ya lo consumía como `mutate` antes de esta ronda.
-        assert!(mutation_block.contains("const mutateAsync = useCallback(async (name: string): Promise<User> => {"), "{hooks}");
+        assert!(
+            mutation_block.contains(
+                "const mutateAsync = useCallback(async (name: string, options?: { signal?: AbortSignal; optimisticData?: User }): Promise<User> => {"
+            ),
+            "{hooks}"
+        );
         assert!(mutation_block.contains("throw e;"), "{hooks}");
         // `mutate` envuelve a `mutateAsync`, nunca relanza.
-        assert!(mutation_block.contains("const mutate = useCallback(async (name: string): Promise<User | null> => {"), "{hooks}");
-        assert!(mutation_block.contains("return await mutateAsync(name);"), "{hooks}");
+        assert!(
+            mutation_block.contains(
+                "const mutate = useCallback(async (name: string, options?: { signal?: AbortSignal; optimisticData?: User }): Promise<User | null> => {"
+            ),
+            "{hooks}"
+        );
+        assert!(mutation_block.contains("return await mutateAsync(name, options);"), "{hooks}");
         assert!(mutation_block.contains("} catch {\n      return null;\n    }"), "{hooks}");
         assert!(mutation_block.contains("return { mutate, mutateAsync, data, loading, error, reset };"), "{hooks}");
     }
@@ -2120,18 +2403,55 @@ type User = { id: Int, name: String }
         assert!(!hooks.contains("| null | null"), "{hooks}");
         assert!(
             hooks.contains(
-                "export function useUsersClaimMutation(client: UsersClient): MutationState<User | null> & {\n  mutate: (id: number) => Promise<User | null>;\n  mutateAsync: (id: number) => Promise<User | null>;\n} {"
+                "export function useUsersClaimMutation(client: UsersClient): MutationState<User | null> & {\n  mutate: (id: number, options?: { signal?: AbortSignal; optimisticData?: User | null }) => Promise<User | null>;\n  mutateAsync: (id: number, options?: { signal?: AbortSignal; optimisticData?: User | null }) => Promise<User | null>;\n} {"
             ),
             "{hooks}"
         );
         let mutation_block = hooks.split("export function useUsersClaimMutation").nth(1).expect("bloque de la mutación");
-        assert!(mutation_block.contains("const mutate = useCallback(async (id: number): Promise<User | null> => {"), "{hooks}");
+        assert!(
+            mutation_block.contains(
+                "const mutate = useCallback(async (id: number, options?: { signal?: AbortSignal; optimisticData?: User | null }): Promise<User | null> => {"
+            ),
+            "{hooks}"
+        );
         // El hook de Query sobre el mismo tipo de retorno opcional -- su
         // `refetch()` tiene el mismo problema potencial.
         let query_block = hooks.split("export function useUsersGetByIdQuery").nth(1).expect("bloque de la query");
         assert!(query_block.contains("const refetch = useCallback(async (): Promise<User | null> => {"), "{hooks}");
         // El hook de stream sobre un item opcional -- `latest` también.
         assert!(hooks.contains("const [latest, setLatest] = useState<number | null>(null);"), "{hooks}");
+    }
+
+    /// `mutate`/`mutateAsync` con `AbortSignal` real y `optimisticData`
+    /// (GRAMMAR.md §3.136/§3.137): gap real -- `client.ts` ya soportaba
+    /// cancelar una request desde v1.92.0, pero ningún hook de Mutation lo
+    /// exponía; y no había forma de mostrar un resultado ANTES de que la
+    /// red respondiera, con rollback automático si la mutación fallaba.
+    #[test]
+    fn mutation_hook_supports_abort_signal_and_optimistic_data_with_rollback() {
+        let src = r#"
+            type Task = { id: Int, title: String }
+            service Tasks {
+                rpc create(title: String) -> Task { Task { id: 1, title: title } }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        let block = hooks.split("export function useTasksCreateMutation").nth(1).expect("bloque de la mutación");
+        // El `signal` real llega hasta el `fetch()` -- mismo parámetro que
+        // `client.ts` ya expone.
+        assert!(block.contains("const res = await client.create(title, { signal: options?.signal });"), "{block}");
+        // Optimista: se muestra ANTES de que la request salga.
+        assert!(block.contains("if (options?.optimisticData !== undefined) setData(options.optimisticData);"), "{block}");
+        // Rollback: si la mutación falla, el valor optimista nunca pasó a
+        // ser real -- se limpia, no queda mostrando para siempre algo que
+        // el servidor nunca confirmó.
+        assert!(
+            block.contains(
+                "      if (requestIdRef.current === requestId) {\n        setError(e);\n        if (options?.optimisticData !== undefined) setData(null);\n      }"
+            ),
+            "{block}"
+        );
     }
 
     /// Sin ningún `@invalidates` en el programa, `invalidateQueryCache` no

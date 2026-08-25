@@ -3,6 +3,20 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.98.0] - 2026-08-25
+
+### ✨ Nuevo
+- **Versión bundle: los cuatro límites de "compatibilidad" documentados a lo largo de la sesión (§3.124, §3.129, §3.134), cerrados juntos.** A pedido explícito del usuario ("recopilá todo lo que haríamos en otras versiones relacionadas con TypeScript y la compatibilidad, y terminá todo eso en una sola versión"):
+
+  1. **Cache de Query aislado por instancia de `client`** -- de `Map<string, ...>` a nivel de módulo a `WeakMap<client, Map<string, ...>>`: dos instancias de `client` distintas (multi-tenant, múltiples sesiones) nunca vuelven a compartir cache entre sí, mientras múltiples componentes con el MISMO client lo siguen compartiendo igual que antes.
+  2. **`AbortSignal` real dentro de los hooks.** Query gana un `AbortController` reference-counted por entrada de cache -- cancela el fetch compartido SOLO cuando el ÚLTIMO componente que lo mira se desmonta (`entry.listeners.size === 0`), nunca mientras otra instancia siga esperando. Mutation e Infinite ganan `AbortSignal`/`AbortController` sin reference counting (su estado no es una entrada compartida entre "líneas de trabajo" concurrentes, cancelar siempre es seguro). De paso, `tsc` -- no un test -- atrapó una regresión real: el primer intento del `catch` de Query ante un abort hacía `return;` sin relanzar, y TypeScript infería `entry.promise` como `Promise<T | void>`, incompatible con `QueryCacheEntry<T>`; arreglado relanzando (`throw`) en los dos caminos del `catch`.
+  3. **Mutaciones optimistas.** `mutate`/`mutateAsync` ganan `options?.optimisticData` -- se muestra en `data` INMEDIATAMENTE, antes de que la request salga, reemplazado por el valor real en éxito o revertido a `null` en fallo (rollback gateado por el mismo `requestIdRef` de siempre). Alcance deliberado: el optimismo es sobre el `data` PROPIO de la Mutation, no sobre el cache de una Query relacionada -- los targets de `@invalidates` pueden tener formas heterogéneas (`list` devuelve `Task[]`, `stats` devuelve `BoardStats`), un updater tipado de forma segura contra eso necesitaría un mapeo de tipos por target, una pieza de diseño más grande que esta ronda no amerita.
+  4. **Cache de Infinite compartido entre instancias.** `use{Servicio}{Rpc}Infinite` pasa de `useState` local a la MISMA arquitectura de cache compartido que Query (`WeakMap`/`useSyncExternalStore`/dedupe real vía `entry.promise`/`AbortController` reference-counted) -- cierra el último "alcance v0" que quedaba documentado. Clave del cache: rpc + parámetros SIN `cursor` (progreso interno, no identidad de la lista paginada).
+
+Demostrado en `examples/taskboard/frontend/src/App.tsx`: `createTask` ahora pasa `optimisticData`, con un indicador visible ("confirmando con el servidor...") mientras la mutación está en vuelo.
+
+1057 tests (8 nuevos) en `codegen::ts_emit`: cache aislado por client (dos clients con la misma clave nunca comparten entrada), `AbortController` reference-counted de Query, `AbortSignal`/`optimisticData` de Mutation con rollback, cache compartido + abort de Infinite. Verificado también a mano contra un `linkc serve` real (Node, sin React, mismo criterio que las verificaciones anteriores de esta sesión): cache aislado por client confirmado con DOS instancias de `client` reales; `AbortController` reference-counted confirmado con dos "listeners" simulados (desmontar el primero no aborta, desmontar el último sí); rollback optimista confirmado con una mutación real EXITOSA (reemplaza el optimista por el dato real) y una FALLIDA (rollback a `null`); dedupe de Infinite confirmado con dos "instancias" simultáneas generando un solo fetch real. `examples/taskboard/frontend` regenerado tipando limpio contra React 18 real -- atrapando de paso la regresión de tipos del punto 2 antes de llegar a producción. Detalle completo: GRAMMAR.md §3.135-§3.138, PLAN.md §9.13.
+
 ## [1.97.0] - 2026-08-25
 
 ### ✨ Nuevo
