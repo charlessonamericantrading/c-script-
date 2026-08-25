@@ -140,6 +140,7 @@
   - [3.116 `sitemapXml`/`robotsTxt`: builtins declarativos para SEO — RESUELTO](#3116-sitemapxmlrobotstxt-builtins-declarativos-para-seo--resuelto)
   - [3.117 `metaTags`/`openGraphTags`/`canonicalLink`/`jsonLd`: metadata SEO clásica como helpers de `String` — RESUELTO](#3117-metatagsopengraphtagscanonicallinkjsonld-metadata-seo-clásica-como-helpers-de-string--resuelto)
   - [3.118 `llms.txt` auto-generado por proyecto — RESUELTO](#3118-llmstxt-auto-generado-por-proyecto--resuelto)
+  - [3.119 `@example(request: ..., response: ...)`: ejemplos tipados en `openapi.json` — RESUELTO](#3119-examplerequest-response-ejemplos-tipados-en-openapijson--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5111,6 +5112,37 @@ service Tasks {
 **Implementación**: `codegen::llms_txt_emit::emit_llms_txt(program, title) -> Result<String, String>` -- mismo mecanismo que `emit_openapi_json` (`Checker::build_symbols` para resolver tipos sin repetir el chequeo completo del programa), llamado desde `build_once` en `main.rs` junto al resto de los emisores, escribiendo `{outdir}/llms.txt`. `title` es el mismo `display_path` del `.link` de entrada que ya usa `openapi.json` como `info.title`.
 
 **Verificado**: 5 tests en `codegen::llms_txt_emit` -- título + una sección por `service` con un bullet por rpc, docstring como nota, docstring multi-línea aporta solo la primera línea, un rpc sin docstring sigue apareciendo sin nota, y un `stream` se etiqueta distinto de un `rpc` en la firma. Probado a mano además con `linkc build` real sobre un `.link` con dos servicios y un docstring, confirmando el archivo `llms.txt` generado byte a byte.
+
+---
+
+### 3.119 `@example(request: ..., response: ...)`: ejemplos tipados en `openapi.json` — RESUELTO
+
+Último ítem de PLAN.md §9.9 (SEO y descubribilidad para IA), y a diferencia de los ocho anteriores de la sección, este SÍ necesitaba gramática nueva: más allá de la descripción de `///` (§3.72), hacía falta una forma de declarar un ejemplo de request/response REAL, para que un agente que consume la API (o un humano generando código desde el contrato) entienda la forma exacta sin adivinar a partir del tipo solo.
+
+```
+type Task = { id: Int, title: String }
+type CreateInput = { title: String }
+
+service Tasks {
+  @example(response: [Task { id: 1, title: "Comprar leche" }])
+  rpc list() -> Task[] { db.tasks.all() }
+
+  @example(request: CreateInput { title: "Comprar leche" }, response: Task { id: 1, title: "Comprar leche" })
+  rpc create(title: String) -> Task { db.tasks.insert(Task { id: 1, title: title }) }
+}
+```
+
+**A diferencia de TODAS las demás anotaciones (`@route`, `@rate_limit`, `@deprecated`, `@cache_control`, ...), sus valores son EXPRESIONES de c-script, no `String` crudo.** El parser reusa `parse_expr` (el mismo que ya arma un `StructLit`/`ArrayLit` normal) en vez de inventar una segunda sintaxis para "JSON dentro de un string" -- misma gramática de par `clave: valor` separado por comas que un literal de struct (`parse_field_init_list`), pero con claves fijas (`request`/`response`, al menos una de las dos) en vez de nombres de campo arbitrarios.
+
+**Las dos expresiones se TIPAN contra la forma real del rpc, con el mismo mecanismo que `= default` de un campo/param (`check_expr` con `Env::new()` vacío, autocontenido)**: `request` contra un struct anónimo armado de los parámetros del rpc (un param con default es opcional ahí también, mismo criterio que `req_props` en `openapi_emit`), `response` contra el `return_type` resuelto. Esto es la diferencia real frente a poner el ejemplo en un comentario o una `String` de JSON a mano: **un ejemplo desincronizado del contrato es un error de compilación**, no un dato que puede mentir en silencio en `openapi.json` para siempre.
+
+**Restringidas a expresiones LITERALES** (`is_literal_expr`, checker.rs: escalares, `Unary(Neg, ...)` sobre un número, y `ArrayLit`/`TupleLit`/`StructLit` recursivamente) -- rechaza cualquier llamada (`crypto.uuid()`, `now()`), variable o acceso a `db`/`http`/etc. Un ejemplo es un valor FIJO conocido en compilación, no algo recalculado en cada build: si `@example(response: crypto.uuid())` tipara, `openapi.json` cambiaría en cada `linkc build` sin que el `.link` cambiara, rompiendo `--diff` (§3.79) de la peor manera posible -- silenciosamente.
+
+**Reglas adicionales, todas en `check_example_annotation` (checker.rs)**: `@example` una sola vez por rpc (mismo criterio que `@cache_control`); `request` solo si el rpc toma parámetros (si no, no hay ningún request body que ejemplificar); rechazado sobre un `stream` (mismo motivo que `@cache_control`/`response.redirect` ahí -- una conexión SSE no tiene una única respuesta que ejemplificar); `@example()` vacío es un error del PARSER (ni siquiera llega al checker), con un mensaje dedicado en vez del genérico "se esperaba un identificador".
+
+**Propagación a `openapi.json`**: `literal_expr_to_json` (`openapi_emit.rs`, hermana de `is_literal_expr` -- el checker ya garantizó que `e` es literal, así que esta conversión es total) arma el JSON y lo pone en `"example"` dentro del Media Type Object correspondiente, mismo nivel que `"schema"` -- `requestBody.content["application/json"].example` para `request`, `responses["200"].content[<content-type>].example` para `response` (respeta `@content_type` si el rpc lo declaró, §3.35). Ningún cambio en `contract.d.ts`/`client.ts`/`schemas.ts` -- alcance deliberadamente atado a lo que PLAN.md pedía, "ejemplos... en `openapi.json`", no una feature nueva de docs en todo el pipeline.
+
+**Verificado**: 4 tests en `parser.rs` (parsea `request`/`response` como expresiones de verdad -- acepta un `StructLit` completo --, `@example()` vacío es un error de sintaxis con mensaje propio, clave desconocida rechazada, clave repetida rechazada) + 7 en `checker.rs` (tipa contra la forma real, rechaza un tipo que no matchea, `request` respeta params con default como opcionales, `request` rechazado sin parámetros, rechaza una llamada como `crypto.uuid()`, rechazado en un `stream`, rechaza declararse dos veces) + 3 en `openapi_emit.rs` (`request`+`response` propagados byte a byte, un ejemplo con solo `response` no toca `requestBody` para nada, sin `@example` no aparece ninguna clave `"example"` de la nada). Probado a mano además con `linkc build` real: caso feliz de punta a punta más los 7 casos de error, todos con el mensaje esperado.
 
 ---
 

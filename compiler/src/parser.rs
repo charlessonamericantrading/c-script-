@@ -652,9 +652,46 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::CacheControl(value)
                 }
+                // `@example(request: <expr>, response: <expr>)` (GRAMMAR.md
+                // §3.119) -- a diferencia de las demás anotaciones, sus
+                // valores son EXPRESIONES (mismo `parse_expr` que un
+                // literal/struct-literal normal), no `String` crudo. Mismo
+                // loop de coma que `parse_field_init_list`, pero con claves
+                // fijas ('request'/'response') en vez de nombres de campo
+                // arbitrarios.
+                "example" => {
+                    self.eat(&TokenKind::LParen)?;
+                    if self.check(&TokenKind::RParen) {
+                        return Err(self.error("'@example()' vacío no aporta nada -- declará al menos 'request' o 'response'"));
+                    }
+                    let mut request = None;
+                    let mut response = None;
+                    loop {
+                        let key = self.eat_ident()?;
+                        self.eat(&TokenKind::Colon)?;
+                        let value = self.parse_expr()?;
+                        match key.as_str() {
+                            "request" if request.is_none() => request = Some(Box::new(value)),
+                            "response" if response.is_none() => response = Some(Box::new(value)),
+                            "request" | "response" => return Err(self.error(format!("'@example' declara '{key}' más de una vez"))),
+                            other => return Err(self.error(format!("'@example' solo acepta 'request'/'response', no '{other}'"))),
+                        }
+                        if self.check(&TokenKind::Comma) {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    self.eat(&TokenKind::RParen)?;
+                    // El chequeo de `()` vacío ya pasó ANTES del loop: si se
+                    // llega acá, el loop parseó al menos un 'request:'/
+                    // 'response:', así que esta rama siempre tiene alguno de
+                    // los dos -- nunca los dos `None` a la vez.
+                    Annotation::Example { request, response }
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")' o '@cache_control(\"public, max-age=N\")')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")' o '@example(request: ..., response: ...)')"
                     )))
                 }
             };
@@ -1910,6 +1947,48 @@ mod tests {
         // GRAMMAR.md §3.7: if siempre exige else -- es una expresión total.
         let tokens = tokenize("fn f() -> Int { if true { 1 } }").unwrap();
         assert!(parse(tokens).is_err());
+    }
+
+    /// `@example(request: <expr>, response: <expr>)` (GRAMMAR.md §3.119) --
+    /// a diferencia del resto de las anotaciones, sus valores son
+    /// expresiones de verdad (acepta un `StructLit` completo), no `String`.
+    #[test]
+    fn example_annotation_parses_request_and_response_as_expressions() {
+        let prog = parse_source(
+            r#"
+            service Tasks {
+                @example(request: Input { title: "x" }, response: Task { id: 1 })
+                rpc create(title: String) -> Task { Task { id: 1 } }
+            }
+        "#,
+        );
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        let Some(Annotation::Example { request, response }) = r.annotations.first() else {
+            panic!("se esperaba Annotation::Example, fue {:?}", r.annotations);
+        };
+        assert!(matches!(request.as_deref().map(|s| &s.node), Some(Expr::StructLit { name, .. }) if name == "Input"));
+        assert!(matches!(response.as_deref().map(|s| &s.node), Some(Expr::StructLit { name, .. }) if name == "Task"));
+    }
+
+    #[test]
+    fn example_annotation_with_empty_parens_is_a_parse_error() {
+        let tokens = tokenize("service S { @example() rpc f() -> Int { 1 } }").unwrap();
+        let err = parse(tokens).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("vacío")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn example_annotation_rejects_a_key_other_than_request_or_response() {
+        let tokens = tokenize(r#"service S { @example(bogus: 1) rpc f() -> Int { 1 } }"#).unwrap();
+        assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn example_annotation_rejects_the_same_key_twice() {
+        let tokens = tokenize("service S { @example(response: 1, response: 2) rpc f() -> Int { 1 } }").unwrap();
+        let err = parse(tokens).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("más de una vez")), "mensaje inesperado: {err:?}");
     }
 
     #[test]

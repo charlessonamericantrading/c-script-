@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use serde_json::{json, Value};
-use crate::ast::{Expr, FieldValidator, Item, Member, Program, TypeExpr};
+use crate::ast::{Expr, FieldValidator, Item, Member, Program, TypeExpr, UnaryOp};
 use crate::checker::Checker;
 use crate::types::Type;
 
@@ -19,6 +19,40 @@ fn scalar_literal_json(e: &Expr) -> Option<Value> {
         Expr::Bool(b) => Some(json!(b)),
         Expr::Null => Some(Value::Null),
         _ => None,
+    }
+}
+
+/// Convierte una expresión de `@example(request: ..., response: ...)`
+/// (GRAMMAR.md §3.119) a JSON -- el checker ya garantizó, con
+/// `is_literal_expr` (checker.rs), que `e` es un valor literal (nunca una
+/// llamada/variable/`db`/etc.), así que esta conversión es total: cualquier
+/// nodo no cubierto explícitamente es letra muerta en la práctica, y cae a
+/// `Value::Null` en vez de entrar en pánico -- un ejemplo mal armado no
+/// tiene por qué tirar abajo `linkc build` en un `unwrap`. `StructLit`
+/// ignora `name`/`variant` (solo importan para el checker, que ya validó el
+/// tipo) y emite un objeto plano con sus campos -- mismo criterio que
+/// `type_to_json_schema` usa para un struct anónimo.
+fn literal_expr_to_json(e: &Expr) -> Value {
+    match e {
+        Expr::Int(n) => json!(n),
+        Expr::Float(n) => json!(n),
+        Expr::Str(s) => json!(s),
+        Expr::Bool(b) => json!(b),
+        Expr::Null => Value::Null,
+        Expr::Unary { op: UnaryOp::Neg, operand } => match &operand.node {
+            Expr::Int(n) => json!(-n),
+            Expr::Float(n) => json!(-n),
+            _ => Value::Null,
+        },
+        Expr::ArrayLit(items) | Expr::TupleLit(items) => Value::Array(items.iter().map(|i| literal_expr_to_json(&i.node)).collect()),
+        Expr::StructLit { fields, .. } => {
+            let mut obj = serde_json::Map::new();
+            for (name, value) in fields {
+                obj.insert(name.clone(), literal_expr_to_json(&value.node));
+            }
+            Value::Object(obj)
+        }
+        _ => Value::Null,
     }
 }
 
@@ -267,6 +301,24 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
                 });
             }
 
+            // `@example(request: ..., response: ...)` (GRAMMAR.md §3.119) --
+            // el checker ya validó las dos expresiones contra la forma real
+            // del rpc (`request` contra sus params, `response` contra
+            // `return_type`), así que acá solo hace falta convertirlas a
+            // JSON y ponerlas donde OpenAPI espera un ejemplo: `"example"`
+            // dentro del Media Type Object, mismo nivel que `"schema"` --
+            // `request` solo puede estar presente si `rpc.params` no está
+            // vacío (ya lo garantiza el checker), así que `requestBody` ya
+            // existe acá cuando hace falta.
+            if let Some((request, response)) = rpc.example() {
+                if let Some(req_expr) = request {
+                    operation["requestBody"]["content"]["application/json"]["example"] = literal_expr_to_json(&req_expr.node);
+                }
+                if let Some(res_expr) = response {
+                    operation["responses"]["200"]["content"][response_content_type]["example"] = literal_expr_to_json(&res_expr.node);
+                }
+            }
+
             let path_key = format!("/{}/{}", service.name, rpc.name);
             paths[path_key.as_str()] = json!({
                 "post": operation
@@ -479,5 +531,67 @@ mod tests {
         let required: Vec<&str> = schema["required"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
         assert!(!required.contains(&"token"), "{required:?}");
         assert!(schema["properties"]["token"]["default"].is_null());
+    }
+
+    /// `@example(request: ..., response: ...)` (GRAMMAR.md §3.119) -- las
+    /// dos mitades se propagan como `"example"` dentro del Media Type
+    /// Object correspondiente, mismo nivel que `"schema"`.
+    #[test]
+    fn example_annotation_sets_the_request_and_response_examples() {
+        let code = r#"
+            type Task = { id: Int, title: String }
+            type CreateInput = { title: String }
+            service Tasks {
+                @example(request: CreateInput { title: "Comprar leche" }, response: Task { id: 1, title: "Comprar leche" })
+                rpc create(title: String) -> Task { Task { id: 1, title: title } }
+            }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        let op = &spec["paths"]["/Tasks/create"]["post"];
+        assert_eq!(op["requestBody"]["content"]["application/json"]["example"], json!({"title": "Comprar leche"}));
+        assert_eq!(op["responses"]["200"]["content"]["application/json"]["example"], json!({"id": 1, "title": "Comprar leche"}));
+    }
+
+    /// Un `@example` con solo `response` (el caso común de un rpc sin
+    /// parámetros, ej. `list()`) no toca `requestBody` para nada -- no
+    /// aparece ni siquiera vacío.
+    #[test]
+    fn example_annotation_with_only_a_response_leaves_request_body_untouched() {
+        let code = r#"
+            type Task = { id: Int }
+            service Tasks {
+                @example(response: [Task { id: 1 }])
+                rpc list() -> Task[] { [] }
+            }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        let op = &spec["paths"]["/Tasks/list"]["post"];
+        assert!(op["requestBody"].is_null());
+        assert_eq!(op["responses"]["200"]["content"]["application/json"]["example"], json!([{"id": 1}]));
+    }
+
+    /// Sin `@example`, ningún path gana una clave `"example"` de la nada --
+    /// mismo criterio que el resto de las anotaciones opcionales.
+    #[test]
+    fn no_example_annotation_means_no_example_key_at_all() {
+        let code = r#"
+            service Tasks {
+                rpc list() -> Int { 1 }
+            }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Task API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        assert!(spec["paths"]["/Tasks/list"]["post"]["responses"]["200"]["content"]["application/json"]["example"].is_null());
     }
 }

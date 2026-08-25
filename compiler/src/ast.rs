@@ -424,6 +424,16 @@ impl RpcDecl {
             _ => None,
         })
     }
+
+    /// El `@example(request: ..., response: ...)`, si hay (GRAMMAR.md
+    /// §3.119) -- las dos mitades son independientes, `None` para la que no
+    /// se declaró.
+    pub fn example(&self) -> Option<(Option<&Spanned<Expr>>, Option<&Spanned<Expr>>)> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::Example { request, response } => Some((request.as_deref(), response.as_deref())),
+            _ => None,
+        })
+    }
 }
 
 /// Anotaciones de un rpc/stream. Se permiten varias, pero no cualquier
@@ -459,6 +469,19 @@ pub enum Annotation {
     /// `stream`, GRAMMAR.md §3.113). Texto crudo, tal cual el valor de
     /// HTTP: c-script no valida su gramática interna.
     CacheControl(String),
+    /// `@example(request: <expr>, response: <expr>)` (GRAMMAR.md §3.119) --
+    /// a diferencia del resto de las anotaciones, sus valores son
+    /// EXPRESIONES de c-script (típicamente un `StructLit`), no `String`
+    /// crudo: el checker las tipa contra la forma real del rpc (`request`
+    /// contra sus parámetros, `response` contra su `return_type`), así que
+    /// un ejemplo desincronizado del contrato es un error de compilación,
+    /// no un blob de JSON que puede mentir en silencio. Restringidas a
+    /// expresiones LITERALES (`is_literal_expr`, checker.rs) -- un ejemplo
+    /// es un valor fijo, no algo recalculado en cada build. Al menos una de
+    /// las dos siempre está presente (`@example()` vacío es un error del
+    /// parser); ambas son independientes -- un rpc sin parámetros solo
+    /// puede declarar `response`.
+    Example { request: Option<Box<Spanned<Expr>>>, response: Option<Box<Spanned<Expr>>> },
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

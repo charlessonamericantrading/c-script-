@@ -902,7 +902,12 @@ fn check_auth_gate(
         Annotation::Requires { .. } => Err((403, "no tenés permiso para esta operación")),
         // `required_auth` solo devuelve anotaciones de auth: si estas
         // llegaran a matchear, el bug está allá arriba, no acá.
-        Annotation::ContentType(_) | Annotation::Route(_) | Annotation::RateLimit(_) | Annotation::Deprecated(_) | Annotation::CacheControl(_) => Ok(()),
+        Annotation::ContentType(_)
+        | Annotation::Route(_)
+        | Annotation::RateLimit(_)
+        | Annotation::Deprecated(_)
+        | Annotation::CacheControl(_)
+        | Annotation::Example { .. } => Ok(()),
     }
 }
 

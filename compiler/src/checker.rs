@@ -106,6 +106,24 @@ fn robots_rule_type() -> Type {
     }
 }
 
+/// `@example(request: <expr>, response: <expr>)` (GRAMMAR.md §3.119) solo
+/// acepta expresiones LITERALES -- un valor fijo conocido en compilación,
+/// nunca algo recalculado en cada build (`crypto.uuid()`/`now()` darían un
+/// `openapi.json` distinto cada vez, rompiendo `linkc build --diff`,
+/// GRAMMAR.md §3.79). Recorre `ArrayLit`/`TupleLit`/`StructLit` porque un
+/// ejemplo real es casi siempre un struct anidado, no un escalar suelto;
+/// `Unary(Neg, ...)` sobre un número es el único caso no-atómico admitido,
+/// para que `-1` siga siendo un literal y no una "expresión calculada".
+fn is_literal_expr(e: &Expr) -> bool {
+    match e {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
+        Expr::Unary { op: UnaryOp::Neg, operand } => matches!(operand.node, Expr::Int(_) | Expr::Float(_)),
+        Expr::ArrayLit(items) | Expr::TupleLit(items) => items.iter().all(|i| is_literal_expr(&i.node)),
+        Expr::StructLit { fields, .. } => fields.iter().all(|(_, v)| is_literal_expr(&v.node)),
+        _ => false,
+    }
+}
+
 /// El tipo que `metaTags(tags)` (GRAMMAR.md §3.117) espera para cada
 /// entrada -- mismo criterio estructural sin nombre que `sitemap_url_type`.
 /// Meta tags clásicos (`description`, `robots`, `viewport`, ...) usan el
@@ -1627,6 +1645,71 @@ impl Checker {
         Ok(())
     }
 
+    /// `@example(request: <expr>, response: <expr>)` (GRAMMAR.md §3.119,
+    /// PLAN.md §9.9 último ítem) -- las dos expresiones se tipan con el
+    /// MISMO mecanismo que `= default` de un campo/param (`check_expr` con
+    /// `Env::new()` vacío, ver `check_field_defaults`): `request` contra un
+    /// struct anónimo armado de los parámetros del rpc (mismo criterio que
+    /// `req_props` en `openapi_emit`, un param CON default es opcional ahí
+    /// también), `response` contra el `return_type` resuelto. Un ejemplo
+    /// desincronizado del contrato real es un error de compilación, no un
+    /// dato que puede mentir en silencio en `openapi.json`.
+    fn check_example_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        let examples: Vec<(Option<&Spanned<Expr>>, Option<&Spanned<Expr>>)> = r
+            .annotations
+            .iter()
+            .filter_map(|a| match a {
+                Annotation::Example { request, response } => Some((request.as_deref(), response.as_deref())),
+                _ => None,
+            })
+            .collect();
+        if examples.len() > 1 {
+            return Err(err(format!("'{}' declara `@example` más de una vez: un rpc tiene un solo ejemplo de request/response", r.name)));
+        }
+        let Some((request, response)) = examples.into_iter().next() else {
+            return Ok(());
+        };
+        if is_stream {
+            return Err(err(format!(
+                "`@example` en el stream '{}': un stream no tiene una única respuesta que ejemplificar (GRAMMAR.md §3.119) -- llamalo desde un 'rpc' normal",
+                r.name
+            )));
+        }
+        if let Some(req_expr) = request {
+            if r.params.is_empty() {
+                return Err(err(format!(
+                    "`@example(request: ...)` en '{}': el rpc no toma parámetros, no hay ningún request body que ejemplificar",
+                    r.name
+                ))
+                .with_span(req_expr.span));
+            }
+            if !is_literal_expr(&req_expr.node) {
+                return Err(err(format!(
+                    "`@example(request: ...)` en '{}': solo acepta un valor literal (struct/lista/escalar), no una expresión calculada",
+                    r.name
+                ))
+                .with_span(req_expr.span));
+            }
+            let mut fields = Vec::with_capacity(r.params.len());
+            for p in &r.params {
+                fields.push(FieldType { name: p.name.clone(), optional: p.default.is_some(), ty: self.resolve_type(&p.ty)? });
+            }
+            self.check_expr(req_expr, &Type::Struct { name: None, fields }, &Env::new())?;
+        }
+        if let Some(res_expr) = response {
+            if !is_literal_expr(&res_expr.node) {
+                return Err(err(format!(
+                    "`@example(response: ...)` en '{}': solo acepta un valor literal (struct/lista/escalar), no una expresión calculada",
+                    r.name
+                ))
+                .with_span(res_expr.span));
+            }
+            let ret_ty = self.resolve_type(&r.return_type)?;
+            self.check_expr(res_expr, &ret_ty, &Env::new())?;
+        }
+        Ok(())
+    }
+
     /// `@validate(...)` (GRAMMAR.md §3.73) sobre cada campo de `fields` --
     /// llamado tanto para un `type X = { ... }` como para los campos de cada
     /// variante de un `enum` (comparten `Field`, ver `ast.rs`). Dos cosas se
@@ -1881,6 +1964,7 @@ impl Checker {
         self.check_route_annotation(r, is_stream)?;
         self.check_rate_limit_annotation(r)?;
         self.check_cache_control_annotation(r, is_stream)?;
+        self.check_example_annotation(r, is_stream)?;
         let Some(Annotation::Requires { enum_name, variant_names }) = r.auth() else {
             return Ok(());
         };
@@ -5353,6 +5437,116 @@ type T = { id: Int, s: Status }")
         ] {
             assert!(check_source(bad).is_err(), "debería rechazarse: {bad}");
         }
+    }
+
+    /// `@example(request: ..., response: ...)` (GRAMMAR.md §3.119) -- las
+    /// dos expresiones se tipan contra la forma real del rpc, mismo
+    /// mecanismo que `= default` de un campo/param.
+    #[test]
+    fn example_response_with_a_matching_literal_typechecks() {
+        let src = r#"
+            type Task = { id: Int, title: String }
+            service Tasks {
+                @example(response: Task { id: 1, title: "Comprar leche" })
+                rpc get() -> Task { Task { id: 1, title: "x" } }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn example_response_rejects_a_type_mismatch() {
+        let src = r#"
+            type Task = { id: Int, title: String }
+            service Tasks {
+                @example(response: Task { id: 1, title: 123 })
+                rpc get() -> Task { Task { id: 1, title: "x" } }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    /// `request` se tipa contra un struct armado de los PARÁMETROS del rpc
+    /// (mismo criterio que `req_props` en `openapi_emit`) -- un param con
+    /// default es opcional en el ejemplo también.
+    #[test]
+    fn example_request_typechecks_against_the_rpcs_params_including_optional_ones_with_defaults() {
+        let src = r#"
+            type CreateInput = { title: String, priority: Int }
+            service Tasks {
+                @example(request: CreateInput { title: "Comprar leche", priority: 1 })
+                rpc create(title: String, priority: Int = 0) -> Int { 1 }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+        // Omitiendo el param con default -- sigue tipando, es opcional.
+        let src2 = r#"
+            type CreateInput = { title: String }
+            service Tasks {
+                @example(request: CreateInput { title: "Comprar leche" })
+                rpc create(title: String, priority: Int = 0) -> Int { 1 }
+            }
+        "#;
+        assert!(check_source(src2).is_ok());
+    }
+
+    #[test]
+    fn example_request_is_rejected_when_the_rpc_takes_no_params() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                @example(request: Task { id: 1 })
+                rpc get() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("no toma parámetros")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn example_rejects_a_non_literal_expression_like_a_function_call() {
+        let src = r#"
+            service Tasks {
+                @example(response: crypto.uuid())
+                rpc get() -> String { "x" }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("valor literal")), "mensaje inesperado: {err:?}");
+    }
+
+    /// Mismo motivo que `cache_control`/`redirect` dentro de un `stream`: no
+    /// hay una única respuesta que ejemplificar en una conexión SSE.
+    #[test]
+    fn example_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @example(response: Task { id: 1 })
+                stream watchAll() -> Task {
+                    db.tasks.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("example") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn example_rejects_being_declared_twice() {
+        let src = r#"
+            service Tasks {
+                @example(response: 1)
+                @example(response: 2)
+                rpc get() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("más de una vez")), "mensaje inesperado: {err:?}");
     }
 
     #[test]

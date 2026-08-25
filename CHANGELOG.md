@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.82.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`@example(request: ..., response: ...)`: ejemplos tipados en `openapi.json`.** Último ítem de PLAN.md §9.9 (SEO y descubribilidad para IA) -- con este, la sección queda completamente resuelta. A diferencia de las demás anotaciones (`@route`, `@rate_limit`, `@deprecated`, `@cache_control`, ...), sus valores son EXPRESIONES de c-script (reusa `parse_expr`, acepta un `StructLit`/`ArrayLit` completo), no `String` crudo. Las dos mitades se TIPAN contra la forma real del rpc con el mismo mecanismo que `= default` de un campo/param (`check_expr` con `Env::new()` vacío): `request` contra un struct anónimo armado de los parámetros (un param con default es opcional ahí también), `response` contra el `return_type` resuelto. **Un ejemplo desincronizado del contrato es un error de compilación**, no un dato que puede mentir en silencio en `openapi.json`. Restringido a expresiones LITERALES (`is_literal_expr`, checker.rs) -- rechaza cualquier llamada (`crypto.uuid()`, `now()`), para que `openapi.json` no cambie en cada `linkc build` sin que el `.link` cambie, lo que rompería `--diff` (§3.79) en silencio. `@example` una sola vez por rpc, `request` solo si el rpc toma parámetros, rechazado sobre un `stream` (mismo motivo que `@cache_control` ahí). Propagado a `openapi.json` como `"example"` dentro del Media Type Object correspondiente (`requestBody`/`responses`, respetando `@content_type` si el rpc lo declaró) -- sin cambios en `contract.d.ts`/`client.ts`/`schemas.ts`, alcance atado exactamente a lo que pedía PLAN.md.
+
+997 tests (14 nuevos): 4 en `parser.rs` (parsea expresiones de verdad, `@example()` vacío con mensaje propio, clave desconocida/repetida rechazadas) + 7 en `checker.rs` (tipa contra la forma real, rechaza type mismatch, respeta params con default como opcionales, rechaza `request` sin parámetros, rechaza una llamada no-literal, rechazado en `stream`, rechaza declararse dos veces) + 3 en `openapi_emit.rs` (propagación byte a byte, un ejemplo con solo `response` no toca `requestBody`, sin `@example` no aparece ninguna clave `"example"`). Verificado también a mano con `linkc build` real: caso feliz de punta a punta más los 7 casos de error. Detalle completo: GRAMMAR.md §3.119, PLAN.md §9.9 (sección completa).
+
 ## [1.81.0] - 2026-08-25
 
 ### ✨ Nuevo
