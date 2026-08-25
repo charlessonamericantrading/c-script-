@@ -123,6 +123,56 @@ fn linkc_systemd_rejects_an_invalid_port() {
     assert!(String::from_utf8_lossy(&res.stderr).contains("puerto inválido"));
 }
 
+/// `linkc pm2-config` (GRAMMAR.md §3.121, PLAN.md §9.7) -- mismo criterio
+/// de test que `linkc docker`/`linkc systemd`, contra el binario real. Usa
+/// `-o` explícito, la forma de uso que PLAN.md documenta.
+#[test]
+fn linkc_pm2_config_generates_a_valid_ecosystem_json_with_the_real_port() {
+    let temp = TempDir::new("pm2-test");
+    let file = temp.write("main.link", "service S { rpc f() -> Int { 1 } }");
+    let out_path = temp.0.join("ecosystem.json");
+
+    let res = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("pm2-config")
+        .arg(&file)
+        .arg("4200")
+        .arg("-o")
+        .arg(&out_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(res.status.success(), "{}", String::from_utf8_lossy(&res.stderr));
+
+    let content = fs::read_to_string(&out_path).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&content).expect("debe ser JSON válido");
+    assert_eq!(json["apps"][0]["name"], "main");
+    assert_eq!(json["apps"][0]["args"][1], "main.link");
+    assert_eq!(json["apps"][0]["args"][2], "4200");
+}
+
+/// Sin `-o`, el default es `./ecosystem.json` en el directorio actual --
+/// se corre desde el propio tempdir para no ensuciar el repo real.
+#[test]
+fn linkc_pm2_config_defaults_the_output_path_to_ecosystem_json() {
+    let temp = TempDir::new("pm2-default-test");
+    let file = temp.write("main.link", "service S { rpc f() -> Int { 1 } }");
+
+    let res = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("pm2-config")
+        .arg(&file)
+        .arg("4200")
+        .current_dir(&temp.0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(res.status.success(), "{}", String::from_utf8_lossy(&res.stderr));
+    assert!(temp.0.join("ecosystem.json").exists());
+}
+
 #[test]
 fn linkc_build_emits_postgres_ddl_when_db_is_declared() {
     let temp = TempDir::new("pg-build-test");

@@ -142,6 +142,7 @@
   - [3.118 `llms.txt` auto-generado por proyecto — RESUELTO](#3118-llmstxt-auto-generado-por-proyecto--resuelto)
   - [3.119 `@example(request: ..., response: ...)`: ejemplos tipados en `openapi.json` — RESUELTO](#3119-examplerequest-response-ejemplos-tipados-en-openapijson--resuelto)
   - [3.120 `linkc systemd`: generador de unidad systemd — RESUELTO](#3120-linkc-systemd-generador-de-unidad-systemd--resuelto)
+  - [3.121 `linkc pm2-config`: generador de configuración PM2 — RESUELTO](#3121-linkc-pm2-config-generador-de-configuración-pm2--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5163,6 +5164,29 @@ linkc systemd main.link 4200 ./deploy
 **Implementación**: `systemd::generate_systemd_unit(source_file, port: u16, out_dir) -> Result<PathBuf, io::Error>` (`compiler/src/systemd.rs`) -- mismo mecanismo que `docker::generate_docker_files` (mismo criterio de `file_stem`/`file_name`, mismo `format!` de plantilla), devolviendo un solo `PathBuf` en vez de un `Vec` porque acá hay un solo archivo que generar, no tres.
 
 **Verificado**: 2 tests en `systemd.rs` (unidad bien formada con el puerto real y la variable correcta -- nunca `DATABASE_PATH`, mismo motivo que el test de `docker.rs` --, y el nombre de archivo sale del `file_stem` del `.link` de entrada, no de su ruta completa) + 2 tests de CLI end-to-end contra el binario real (`linkc systemd` genera el `.service` esperado; puerto inválido rechazado con el mismo mensaje que `linkc serve`) + `cli_help.rs` actualizado (`systemd` sumado a la lista de subcomandos que `--help` tiene que listar, el mismo test que ya existía para que esa lista nunca se desactualice en silencio). Probado a mano además contra el binario real, confirmando el `.service` generado byte a byte.
+
+---
+
+### 3.121 `linkc pm2-config`: generador de configuración PM2 — RESUELTO
+
+PLAN.md §9.7, el último ítem chico de esta subsección: mismo criterio que `linkc docker`/`linkc systemd` (§3.120), pero para quien ya usa PM2 como supervisor de procesos -- Node.js/PM2 siguen siendo comunes en el mismo tipo de VM/bare metal donde `linkc systemd` también aplica, y PM2 en particular ya aparece citado en PLAN.md §9.3 como topología real de un adoptador ("varios procesos `linkc serve-all`/pm2 compartiendo un único Postgres", el motivo detrás de `db.<c>.increment`, §3.105).
+
+```
+linkc pm2-config main.link 4200 -o ecosystem.json
+# configuración PM2 generada exitosamente: ecosystem.json
+```
+
+**`linkc pm2-config <archivo.link> <puerto> [-o <archivo>]`** -- a diferencia de `linkc docker`/`linkc systemd` (un directorio de salida con nombre de archivo fijo), acá el CALLER elige el nombre completo del archivo con `-o` (default `./ecosystem.json` si se omite) -- un `ecosystem.json` de PM2 suele vivir junto a otros ecosystems del mismo repo, no en un directorio propio. `-o` toma un valor (mismo criterio de parseo que `--diff` en `linkc build`, §3.79); igual que `linkc systemd`, el puerto es un argumento requerido con el mismo parseo y mensaje de error que `linkc serve`.
+
+**Formato NATIVO de PM2** (`pm2 start ecosystem.json` lo entiende sin conversión, a diferencia de `ecosystem.config.js`): un `app` con `"script": "linkc"` + `"interpreter": "none"` (PM2 necesita ese flag para ejecutar un binario nativo directo en vez de asumir un intérprete de JS) y `"args": ["serve", "<archivo>", "<puerto>", "--restart-backoff", "30s"]` como array, no un string armado a mano -- evita cualquier ambigüedad de quoting.
+
+**`--restart-backoff 30s` va DENTRO de `args`, no como `restart_delay` del lado de PM2** -- §3.92 documenta que ese flag nativo de `linkc serve`/`serve-all` existe justamente para reemplazar la mitigación externa de PM2 (`--restart-delay`, una espera fija) por un backoff exponencial real ante un fallo de conexión a la base. `"autorestart": true` sigue siendo responsabilidad de PM2 -- reinicio del PROCESO ante un crash, complementario y no redundante con el backoff de conexión, mismo criterio que `Restart=on-failure` + `RestartSec` en la unidad systemd de §3.120.
+
+**Sin `LINK_DATABASE_URL` en el `env` generado** -- a diferencia de la variable comentada que `linkc docker`/`linkc systemd` sí dejan como referencia inerte (`#Environment=...`), JSON no tiene comentarios: un placeholder ahí sería un valor REAL que PM2 pasaría al proceso, apuntando en silencio a una base de datos falsa en vez de quedar como una pista visual. La variable real sigue siendo la misma (§3.36); agregarla queda en manos de quien complete el `env` a mano.
+
+**Implementación**: `pm2::generate_pm2_config(source_file, port: u16, out_path) -> Result<PathBuf, io::Error>` (`compiler/src/pm2.rs`) -- mismo mecanismo que `docker::generate_docker_files`/`systemd::generate_systemd_unit` (`file_stem`/`file_name`, `format!` de plantilla), con `out_path` como archivo completo en vez de un directorio.
+
+**Verificado**: 2 tests en `pm2.rs` (JSON válido -- parseado de verdad con `serde_json`, no solo "no crashea" -- con el puerto real en `args` y SIN ninguna variable de conexión falsa; nombre de app del `file_stem`) + 2 tests de CLI end-to-end contra el binario real (`-o` explícito genera el `ecosystem.json` esperado; sin `-o` el default es `./ecosystem.json` en el directorio actual) + `cli_help.rs` actualizado (`pm2-config` sumado a la lista de subcomandos verificados). Probado a mano además contra el binario real, con y sin `-o`, confirmando el JSON generado byte a byte.
 
 ---
 

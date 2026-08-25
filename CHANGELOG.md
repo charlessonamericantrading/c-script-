@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.84.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`linkc pm2-config <archivo.link> <puerto> [-o <archivo>]`.** PLAN.md §9.7: generador de configuración PM2, mismo criterio que `linkc docker`/`linkc systemd` (v1.83.0) -- PM2 ya aparecía citado como topología real de un adoptador (varios procesos `linkc serve-all`/pm2 compartiendo un único Postgres, GRAMMAR.md §3.105). A diferencia de esos dos comandos (directorio de salida con nombre fijo por archivo), acá el CALLER elige el archivo completo con `-o` (default `./ecosystem.json`). Genera un `ecosystem.json` en formato NATIVO de PM2 (`pm2 start ecosystem.json` lo entiende sin conversión) -- `"script": "linkc"` + `"interpreter": "none"` para ejecutar el binario directo, `"args"` como array evitando cualquier ambigüedad de quoting. `--restart-backoff 30s` va DENTRO de `args` (el backoff exponencial de conexión sigue siendo responsabilidad de `linkc serve`, GRAMMAR.md §3.92, no de PM2); `"autorestart": true` del lado de PM2 sigue siendo el reinicio de PROCESO ante un crash, complementario. Sin `LINK_DATABASE_URL` en el `env` generado -- a diferencia de la variable comentada que `linkc docker`/`linkc systemd` sí dejan como referencia, JSON no tiene comentarios, así que un placeholder ahí sería un valor REAL en vez de una pista inerte.
+
+Nuevo módulo `pm2.rs`, mismo mecanismo que `docker::generate_docker_files`/`systemd::generate_systemd_unit`. 1005 tests (4 nuevos): 2 en `pm2.rs` (JSON válido -- parseado de verdad con `serde_json` -- con el puerto real y sin ninguna variable de conexión falsa; nombre de app del `file_stem`) + 2 de CLI end-to-end contra el binario real (`-o` explícito, y el default `./ecosystem.json` sin `-o`); `cli_help.rs` actualizado (`pm2-config` sumado a la lista de subcomandos verificados). Verificado también a mano contra el binario real, con y sin `-o`. Detalle completo: GRAMMAR.md §3.121, PLAN.md §9.7.
+
 ## [1.83.0] - 2026-08-25
 
 ### ✨ Nuevo

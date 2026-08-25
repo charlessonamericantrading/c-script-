@@ -15,7 +15,7 @@ fn help_lists_every_dispatched_subcommand() {
     let text = String::from_utf8_lossy(&out.stdout);
 
     for sub in [
-        "build", "test", "serve", "new", "dev", "lsp", "wasm", "fmt", "lint", "doc", "docker", "systemd",
+        "build", "test", "serve", "new", "dev", "lsp", "wasm", "fmt", "lint", "doc", "docker", "systemd", "pm2-config",
     ] {
         assert!(
             text.contains(&format!("linkc {sub}")),

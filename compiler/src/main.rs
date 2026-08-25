@@ -91,6 +91,7 @@ fn main() -> ExitCode {
         Some("doc") => cmd_doc(&args[2..]),
         Some("docker") => cmd_docker(&args[2..]),
         Some("systemd") => cmd_systemd(&args[2..]),
+        Some("pm2-config") => cmd_pm2_config(&args[2..]),
         Some("introspect") => cmd_introspect(&args[2..]),
         // `--help` es una peticion valida, no un error: va a stdout y sale 0.
         // Sin este brazo caia en `cmd_check("--help")`, que respondia con un
@@ -136,6 +137,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
     out(&format!("     linkc systemd <archivo.link> <puerto> [outdir]   (genera una unidad systemd lista para /etc/systemd/system/)"));
+    out(&format!("     linkc pm2-config <archivo.link> <puerto> [-o <archivo>]   (genera un ecosystem.json de PM2, default ./ecosystem.json)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
     out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve')"));
@@ -288,6 +290,48 @@ fn cmd_systemd(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error al generar la unidad systemd: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `linkc pm2-config <archivo.link> <puerto> [-o <archivo>]` (GRAMMAR.md
+/// §3.121, PLAN.md §9.7) -- `-o` toma un VALOR (mismo criterio de filtrado
+/// que `--diff` en `cmd_build`, extraerlo antes de tratar el resto como
+/// posicional), default `./ecosystem.json` si se omite.
+fn cmd_pm2_config(args: &[String]) -> ExitCode {
+    let mut positional = Vec::new();
+    let mut out_path: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-o" {
+            let Some(value) = args.get(i + 1) else {
+                eprintln!("uso: linkc pm2-config <archivo.link> <puerto> [-o <archivo>]");
+                return ExitCode::FAILURE;
+            };
+            out_path = Some(value);
+            i += 2;
+        } else {
+            positional.push(args[i].as_str());
+            i += 1;
+        }
+    }
+    let (Some(path), Some(port_str)) = (positional.first(), positional.get(1)) else {
+        eprintln!("uso: linkc pm2-config <archivo.link> <puerto> [-o <archivo>]");
+        return ExitCode::FAILURE;
+    };
+    let Ok(port) = port_str.parse::<u16>() else {
+        eprintln!("puerto inválido: '{port_str}'");
+        return ExitCode::FAILURE;
+    };
+    let out_path = Path::new(out_path.unwrap_or("ecosystem.json"));
+    match linkc::pm2::generate_pm2_config(path, port, out_path) {
+        Ok(generated) => {
+            println!("configuración PM2 generada exitosamente: {}", generated.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error al generar la configuración PM2: {e}");
             ExitCode::FAILURE
         }
     }
