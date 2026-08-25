@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.83.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`linkc systemd <archivo.link> <puerto> [outdir]`.** PLAN.md §9.7 ítem 4: generador de unidad systemd, a la par de `linkc docker` que ya existía (`Dockerfile`/`docker-compose.yml`/`.dockerignore`) para quien despliega contra una VM/bare metal en vez de un contenedor -- armar la unidad a mano significa adivinar las opciones de hardening correctas sin ninguna guía. A diferencia de `linkc docker` (puerto siempre `3000` en la plantilla), acá el puerto es un argumento REQUERIDO -- `linkc serve` no tiene un puerto por default, mismo parseo y mismo mensaje de error (`"puerto inválido: '...'"`) que ese comando. Genera `<nombre>.service` (el `file_stem` del `.link`) con `ExecStart=/usr/local/bin/linkc serve <archivo> <puerto>`, `WorkingDirectory=/opt/<nombre>`, `Restart=on-failure`+`RestartSec=5` (reinicio de PROCESO ante un crash, complementario a `--restart-backoff` de `serve`/`serve-all`, que maneja un fallo de conexión a Postgres sin que el proceso muera), la variable `LINK_DATABASE_URL` comentada como referencia, y hardening mínimo (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths` acotado, `PrivateTmp`).
+
+Nuevo módulo `systemd.rs`, mismo mecanismo que `docker::generate_docker_files`. 1001 tests (4 nuevos): 2 en `systemd.rs` (unidad bien formada con el puerto real, nombre de archivo del `file_stem`) + 2 de CLI end-to-end contra el binario real (`linkc systemd` genera lo esperado, puerto inválido rechazado); `cli_help.rs` actualizado sin sumar un test nuevo (`systemd` agregado a la lista que el test ya existente recorre, para que esa lista nunca se desactualice en silencio). Detalle completo: GRAMMAR.md §3.120, PLAN.md §9.7.
+
 ## [1.82.0] - 2026-08-25
 
 ### ✨ Nuevo

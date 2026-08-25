@@ -90,6 +90,7 @@ fn main() -> ExitCode {
         Some("lint") => cmd_lint(&args[2..]),
         Some("doc") => cmd_doc(&args[2..]),
         Some("docker") => cmd_docker(&args[2..]),
+        Some("systemd") => cmd_systemd(&args[2..]),
         Some("introspect") => cmd_introspect(&args[2..]),
         // `--help` es una peticion valida, no un error: va a stdout y sale 0.
         // Sin este brazo caia en `cmd_check("--help")`, que respondia con un
@@ -134,6 +135,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)"));
     out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
     out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
+    out(&format!("     linkc systemd <archivo.link> <puerto> [outdir]   (genera una unidad systemd lista para /etc/systemd/system/)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
     out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve')"));
@@ -260,6 +262,32 @@ fn cmd_docker(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             eprintln!("error al generar configuración Docker: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `linkc systemd <archivo.link> <puerto> [outdir]` (GRAMMAR.md §3.120,
+/// PLAN.md §9.7) -- a diferencia de `linkc docker`, el puerto es un
+/// argumento REQUERIDO (mismo motivo que `linkc serve`: no hay un puerto
+/// por default que la unidad pudiera asumir).
+fn cmd_systemd(args: &[String]) -> ExitCode {
+    let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
+        eprintln!("uso: linkc systemd <archivo.link> <puerto> [outdir]");
+        return ExitCode::FAILURE;
+    };
+    let Ok(port) = port_str.parse::<u16>() else {
+        eprintln!("puerto inválido: '{port_str}'");
+        return ExitCode::FAILURE;
+    };
+    let out_dir = args.get(2).map(Path::new).unwrap_or_else(|| Path::new("."));
+    match linkc::systemd::generate_systemd_unit(path, port, out_dir) {
+        Ok(unit_path) => {
+            println!("unidad systemd generada exitosamente: {}", unit_path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error al generar la unidad systemd: {e}");
             ExitCode::FAILURE
         }
     }

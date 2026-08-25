@@ -27,6 +27,7 @@ pub mod fmt;
 pub mod lint;
 pub mod doc;
 pub mod docker;
+pub mod systemd;
 pub mod lsp;
 pub mod parser;
 pub mod rate_limit;

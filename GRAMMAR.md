@@ -141,6 +141,7 @@
   - [3.117 `metaTags`/`openGraphTags`/`canonicalLink`/`jsonLd`: metadata SEO clásica como helpers de `String` — RESUELTO](#3117-metatagsopengraphtagscanonicallinkjsonld-metadata-seo-clásica-como-helpers-de-string--resuelto)
   - [3.118 `llms.txt` auto-generado por proyecto — RESUELTO](#3118-llmstxt-auto-generado-por-proyecto--resuelto)
   - [3.119 `@example(request: ..., response: ...)`: ejemplos tipados en `openapi.json` — RESUELTO](#3119-examplerequest-response-ejemplos-tipados-en-openapijson--resuelto)
+  - [3.120 `linkc systemd`: generador de unidad systemd — RESUELTO](#3120-linkc-systemd-generador-de-unidad-systemd--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5143,6 +5144,25 @@ service Tasks {
 **Propagación a `openapi.json`**: `literal_expr_to_json` (`openapi_emit.rs`, hermana de `is_literal_expr` -- el checker ya garantizó que `e` es literal, así que esta conversión es total) arma el JSON y lo pone en `"example"` dentro del Media Type Object correspondiente, mismo nivel que `"schema"` -- `requestBody.content["application/json"].example` para `request`, `responses["200"].content[<content-type>].example` para `response` (respeta `@content_type` si el rpc lo declaró, §3.35). Ningún cambio en `contract.d.ts`/`client.ts`/`schemas.ts` -- alcance deliberadamente atado a lo que PLAN.md pedía, "ejemplos... en `openapi.json`", no una feature nueva de docs en todo el pipeline.
 
 **Verificado**: 4 tests en `parser.rs` (parsea `request`/`response` como expresiones de verdad -- acepta un `StructLit` completo --, `@example()` vacío es un error de sintaxis con mensaje propio, clave desconocida rechazada, clave repetida rechazada) + 7 en `checker.rs` (tipa contra la forma real, rechaza un tipo que no matchea, `request` respeta params con default como opcionales, `request` rechazado sin parámetros, rechaza una llamada como `crypto.uuid()`, rechazado en un `stream`, rechaza declararse dos veces) + 3 en `openapi_emit.rs` (`request`+`response` propagados byte a byte, un ejemplo con solo `response` no toca `requestBody` para nada, sin `@example` no aparece ninguna clave `"example"` de la nada). Probado a mano además con `linkc build` real: caso feliz de punta a punta más los 7 casos de error, todos con el mensaje esperado.
+
+---
+
+### 3.120 `linkc systemd`: generador de unidad systemd — RESUELTO
+
+PLAN.md §9.7 ítem 4: `linkc docker` (`docker.rs`) ya generaba `Dockerfile`/`docker-compose.yml`/`.dockerignore` para quien despliega en contenedores -- quien despliega contra una VM/bare metal con systemd no tenía el equivalente, y armar una unidad a mano significa adivinar las opciones de hardening correctas (`NoNewPrivileges`, `ProtectSystem`, ...) sin ninguna guía.
+
+```
+linkc systemd main.link 4200 ./deploy
+# unidad systemd generada exitosamente: ./deploy/main.service
+```
+
+**`linkc systemd <archivo.link> <puerto> [outdir]`** -- a diferencia de `linkc docker` (puerto siempre `3000` dentro de la plantilla), acá el puerto es un argumento REQUERIDO: `linkc serve` no tiene un puerto por default, así que la unidad tampoco puede inventarse uno. Mismo parseo y mismo mensaje de error que `linkc serve` (`port_str.parse::<u16>()`, `"puerto inválido: '{port_str}'"` si falla) -- consistencia entre los dos comandos que terminan invocando lo mismo.
+
+**`<nombre>.service` generado** (el `file_stem` del `.link` de entrada, mismo criterio que `linkc docker` para `app_name`) con `ExecStart=/usr/local/bin/linkc serve <archivo> <puerto>`, `WorkingDirectory=/opt/<nombre>` (de ahí sale el SQLite embebido, si no se pasa `LINK_DATABASE_URL`), `Restart=on-failure` + `RestartSec=5` (reinicio del PROCESO ante un crash -- complementario, no redundante, con `--restart-backoff` de `linkc serve`/`serve-all`, §3.92, que maneja un fallo de conexión a Postgres SIN que el proceso llegue a morir), un `Environment=LINK_DATABASE_URL=...` comentado como referencia (misma variable real que `linkc docker` ya documenta, GRAMMAR.md §3.36), y hardening mínimo (`NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths` acotado al propio directorio de trabajo, `PrivateTmp`) -- el proceso no necesita privilegios de root ni escritura fuera de donde vive su propia base.
+
+**Implementación**: `systemd::generate_systemd_unit(source_file, port: u16, out_dir) -> Result<PathBuf, io::Error>` (`compiler/src/systemd.rs`) -- mismo mecanismo que `docker::generate_docker_files` (mismo criterio de `file_stem`/`file_name`, mismo `format!` de plantilla), devolviendo un solo `PathBuf` en vez de un `Vec` porque acá hay un solo archivo que generar, no tres.
+
+**Verificado**: 2 tests en `systemd.rs` (unidad bien formada con el puerto real y la variable correcta -- nunca `DATABASE_PATH`, mismo motivo que el test de `docker.rs` --, y el nombre de archivo sale del `file_stem` del `.link` de entrada, no de su ruta completa) + 2 tests de CLI end-to-end contra el binario real (`linkc systemd` genera el `.service` esperado; puerto inválido rechazado con el mismo mensaje que `linkc serve`) + `cli_help.rs` actualizado (`systemd` sumado a la lista de subcomandos que `--help` tiene que listar, el mismo test que ya existía para que esa lista nunca se desactualice en silencio). Probado a mano además contra el binario real, confirmando el `.service` generado byte a byte.
 
 ---
 

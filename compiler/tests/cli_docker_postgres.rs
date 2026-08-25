@@ -72,6 +72,57 @@ fn linkc_docker_generates_valid_dockerfile_and_compose_yml() {
     assert!(ignore.contains("node_modules/"));
 }
 
+/// `linkc systemd` (GRAMMAR.md §3.120, PLAN.md §9.7) -- mismo criterio de
+/// test que `linkc docker` arriba, contra el binario real.
+#[test]
+fn linkc_systemd_generates_a_valid_service_file_with_the_real_port() {
+    let temp = TempDir::new("systemd-test");
+    let src = r#"
+    type User = { id: Int, name: String }
+    db { users: User[] }
+    service UserService {
+        rpc list() -> User[] { db.users.findMany() }
+    }
+    "#;
+    let file = temp.write("main.link", src);
+    let out_dir = temp.0.join("systemd_output");
+
+    let res = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("systemd")
+        .arg(&file)
+        .arg("4200")
+        .arg(&out_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(res.status.success(), "{}", String::from_utf8_lossy(&res.stderr));
+
+    let unit = fs::read_to_string(out_dir.join("main.service")).unwrap();
+    assert!(unit.contains("ExecStart=/usr/local/bin/linkc serve main.link 4200"));
+    assert!(unit.contains("[Install]"));
+    assert!(unit.contains("WantedBy=multi-user.target"));
+}
+
+#[test]
+fn linkc_systemd_rejects_an_invalid_port() {
+    let temp = TempDir::new("systemd-bad-port-test");
+    let file = temp.write("main.link", "service S { rpc f() -> Int { 1 } }");
+
+    let res = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("systemd")
+        .arg(&file)
+        .arg("no-es-un-puerto")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(!res.status.success());
+    assert!(String::from_utf8_lossy(&res.stderr).contains("puerto inválido"));
+}
+
 #[test]
 fn linkc_build_emits_postgres_ddl_when_db_is_declared() {
     let temp = TempDir::new("pg-build-test");
