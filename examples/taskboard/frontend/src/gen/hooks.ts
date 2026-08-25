@@ -1,6 +1,6 @@
-// Generado automáticamente por linkc v1.86.0 — no editar a mano.
+// Generado automáticamente por linkc v1.87.0 — no editar a mano.
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "react";
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
 
 export interface QueryState<T> {
@@ -24,38 +24,73 @@ export interface SubscriptionState<T> {
   error: Error | null;
 }
 
+type QueryCacheState<T> = { data: T | null; loading: boolean; error: Error | null };
+
+type QueryCacheEntry<T> = {
+  state: QueryCacheState<T>;
+  promise: Promise<T> | null;
+  listeners: Set<() => void>;
+};
+
+const queryCache = new Map<string, QueryCacheEntry<unknown>>();
+
+function getQueryCacheEntry<T>(key: string): QueryCacheEntry<T> {
+  let entry = queryCache.get(key) as QueryCacheEntry<T> | undefined;
+  if (!entry) {
+    entry = { state: { data: null, loading: false, error: null }, promise: null, listeners: new Set() };
+    queryCache.set(key, entry as QueryCacheEntry<unknown>);
+  }
+  return entry;
+}
+
+function setQueryCacheState<T>(entry: QueryCacheEntry<T>, patch: Partial<QueryCacheState<T>>): void {
+  entry.state = { ...entry.state, ...patch };
+  entry.listeners.forEach((listener) => listener());
+}
+
 export function useTasksListQuery(client: TasksClient, options?: { enabled?: boolean }): QueryState<Task[]> {
   const enabled = options?.enabled ?? true;
-  const [data, setData] = useState<Task[] | null>(null);
-  const [loading, setLoading] = useState(enabled);
-  const [error, setError] = useState<Error | null>(null);
-  const requestIdRef = useRef(0);
+  const cacheKey = "Tasks.list(" + JSON.stringify([]) + ")";
+  const entry = getQueryCacheEntry<Task[]>(cacheKey);
+
+  const subscribe = useCallback((onStoreChange: () => void) => {
+    entry.listeners.add(onStoreChange);
+    return () => { entry.listeners.delete(onStoreChange); };
+  }, [entry]);
+  const getSnapshot = useCallback(() => entry.state, [entry]);
+  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   const refetch = useCallback(async (): Promise<Task[] | null> => {
-    const requestId = ++requestIdRef.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await client.list();
-      if (requestIdRef.current === requestId) setData(res);
-      return res;
-    } catch (err) {
-      const e = err instanceof Error ? err : new Error(String(err));
-      if (requestIdRef.current === requestId) setError(e);
-      return null;
-    } finally {
-      if (requestIdRef.current === requestId) setLoading(false);
+    if (!entry.promise) {
+      setQueryCacheState(entry, { loading: true, error: null });
+      entry.promise = client.list()
+        .then((res) => {
+          setQueryCacheState(entry, { data: res, loading: false });
+          return res;
+        })
+        .catch((err) => {
+          const e = err instanceof Error ? err : new Error(String(err));
+          setQueryCacheState(entry, { error: e, loading: false });
+          throw e;
+        })
+        .finally(() => {
+          entry.promise = null;
+        });
     }
-  }, [client]);
+    try {
+      return await entry.promise;
+    } catch {
+      return null;
+    }
+  }, [entry, client]);
 
   useEffect(() => {
-    if (enabled) {
+    if (enabled && state.data === null && !state.loading && !entry.promise) {
       refetch();
     }
-    return () => { requestIdRef.current++; };
-  }, [enabled, refetch]);
+  }, [enabled, refetch, entry, state.data, state.loading]);
 
-  return { data, loading, error, refetch };
+  return { data: state.data, loading: state.loading, error: state.error, refetch };
 }
 
 export function useTasksListMutation(client: TasksClient): MutationState<Task[]> & {
@@ -95,36 +130,47 @@ export function useTasksListMutation(client: TasksClient): MutationState<Task[]>
 
 export function useTasksGetByIdQuery(client: TasksClient, id: number, options?: { enabled?: boolean }): QueryState<Task | null> {
   const enabled = options?.enabled ?? true;
-  const [data, setData] = useState<Task | null | null>(null);
-  const [loading, setLoading] = useState(enabled);
-  const [error, setError] = useState<Error | null>(null);
-  const requestIdRef = useRef(0);
+  const cacheKey = "Tasks.getById(" + JSON.stringify([id]) + ")";
+  const entry = getQueryCacheEntry<Task | null>(cacheKey);
+
+  const subscribe = useCallback((onStoreChange: () => void) => {
+    entry.listeners.add(onStoreChange);
+    return () => { entry.listeners.delete(onStoreChange); };
+  }, [entry]);
+  const getSnapshot = useCallback(() => entry.state, [entry]);
+  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   const refetch = useCallback(async (): Promise<Task | null | null> => {
-    const requestId = ++requestIdRef.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await client.getById(id);
-      if (requestIdRef.current === requestId) setData(res);
-      return res;
-    } catch (err) {
-      const e = err instanceof Error ? err : new Error(String(err));
-      if (requestIdRef.current === requestId) setError(e);
-      return null;
-    } finally {
-      if (requestIdRef.current === requestId) setLoading(false);
+    if (!entry.promise) {
+      setQueryCacheState(entry, { loading: true, error: null });
+      entry.promise = client.getById(id)
+        .then((res) => {
+          setQueryCacheState(entry, { data: res, loading: false });
+          return res;
+        })
+        .catch((err) => {
+          const e = err instanceof Error ? err : new Error(String(err));
+          setQueryCacheState(entry, { error: e, loading: false });
+          throw e;
+        })
+        .finally(() => {
+          entry.promise = null;
+        });
     }
-  }, [client, id]);
+    try {
+      return await entry.promise;
+    } catch {
+      return null;
+    }
+  }, [entry, client, id]);
 
   useEffect(() => {
-    if (enabled) {
+    if (enabled && state.data === null && !state.loading && !entry.promise) {
       refetch();
     }
-    return () => { requestIdRef.current++; };
-  }, [enabled, refetch]);
+  }, [enabled, refetch, entry, state.data, state.loading]);
 
-  return { data, loading, error, refetch };
+  return { data: state.data, loading: state.loading, error: state.error, refetch };
 }
 
 export function useTasksGetByIdMutation(client: TasksClient): MutationState<Task | null> & {
@@ -269,36 +315,47 @@ export function useTasksRemoveMutation(client: TasksClient): MutationState<boole
 
 export function useTasksListByColumnQuery(client: TasksClient, col: ColumnId, options?: { enabled?: boolean }): QueryState<Task[]> {
   const enabled = options?.enabled ?? true;
-  const [data, setData] = useState<Task[] | null>(null);
-  const [loading, setLoading] = useState(enabled);
-  const [error, setError] = useState<Error | null>(null);
-  const requestIdRef = useRef(0);
+  const cacheKey = "Tasks.listByColumn(" + JSON.stringify([col]) + ")";
+  const entry = getQueryCacheEntry<Task[]>(cacheKey);
+
+  const subscribe = useCallback((onStoreChange: () => void) => {
+    entry.listeners.add(onStoreChange);
+    return () => { entry.listeners.delete(onStoreChange); };
+  }, [entry]);
+  const getSnapshot = useCallback(() => entry.state, [entry]);
+  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   const refetch = useCallback(async (): Promise<Task[] | null> => {
-    const requestId = ++requestIdRef.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await client.listByColumn(col);
-      if (requestIdRef.current === requestId) setData(res);
-      return res;
-    } catch (err) {
-      const e = err instanceof Error ? err : new Error(String(err));
-      if (requestIdRef.current === requestId) setError(e);
-      return null;
-    } finally {
-      if (requestIdRef.current === requestId) setLoading(false);
+    if (!entry.promise) {
+      setQueryCacheState(entry, { loading: true, error: null });
+      entry.promise = client.listByColumn(col)
+        .then((res) => {
+          setQueryCacheState(entry, { data: res, loading: false });
+          return res;
+        })
+        .catch((err) => {
+          const e = err instanceof Error ? err : new Error(String(err));
+          setQueryCacheState(entry, { error: e, loading: false });
+          throw e;
+        })
+        .finally(() => {
+          entry.promise = null;
+        });
     }
-  }, [client, col]);
+    try {
+      return await entry.promise;
+    } catch {
+      return null;
+    }
+  }, [entry, client, col]);
 
   useEffect(() => {
-    if (enabled) {
+    if (enabled && state.data === null && !state.loading && !entry.promise) {
       refetch();
     }
-    return () => { requestIdRef.current++; };
-  }, [enabled, refetch]);
+  }, [enabled, refetch, entry, state.data, state.loading]);
 
-  return { data, loading, error, refetch };
+  return { data: state.data, loading: state.loading, error: state.error, refetch };
 }
 
 export function useTasksListByColumnMutation(client: TasksClient): MutationState<Task[]> & {
@@ -338,36 +395,47 @@ export function useTasksListByColumnMutation(client: TasksClient): MutationState
 
 export function useTasksStatsQuery(client: TasksClient, options?: { enabled?: boolean }): QueryState<BoardStats> {
   const enabled = options?.enabled ?? true;
-  const [data, setData] = useState<BoardStats | null>(null);
-  const [loading, setLoading] = useState(enabled);
-  const [error, setError] = useState<Error | null>(null);
-  const requestIdRef = useRef(0);
+  const cacheKey = "Tasks.stats(" + JSON.stringify([]) + ")";
+  const entry = getQueryCacheEntry<BoardStats>(cacheKey);
+
+  const subscribe = useCallback((onStoreChange: () => void) => {
+    entry.listeners.add(onStoreChange);
+    return () => { entry.listeners.delete(onStoreChange); };
+  }, [entry]);
+  const getSnapshot = useCallback(() => entry.state, [entry]);
+  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
   const refetch = useCallback(async (): Promise<BoardStats | null> => {
-    const requestId = ++requestIdRef.current;
-    setLoading(true);
-    setError(null);
-    try {
-      const res = await client.stats();
-      if (requestIdRef.current === requestId) setData(res);
-      return res;
-    } catch (err) {
-      const e = err instanceof Error ? err : new Error(String(err));
-      if (requestIdRef.current === requestId) setError(e);
-      return null;
-    } finally {
-      if (requestIdRef.current === requestId) setLoading(false);
+    if (!entry.promise) {
+      setQueryCacheState(entry, { loading: true, error: null });
+      entry.promise = client.stats()
+        .then((res) => {
+          setQueryCacheState(entry, { data: res, loading: false });
+          return res;
+        })
+        .catch((err) => {
+          const e = err instanceof Error ? err : new Error(String(err));
+          setQueryCacheState(entry, { error: e, loading: false });
+          throw e;
+        })
+        .finally(() => {
+          entry.promise = null;
+        });
     }
-  }, [client]);
+    try {
+      return await entry.promise;
+    } catch {
+      return null;
+    }
+  }, [entry, client]);
 
   useEffect(() => {
-    if (enabled) {
+    if (enabled && state.data === null && !state.loading && !entry.promise) {
       refetch();
     }
-    return () => { requestIdRef.current++; };
-  }, [enabled, refetch]);
+  }, [enabled, refetch, entry, state.data, state.loading]);
 
-  return { data, loading, error, refetch };
+  return { data: state.data, loading: state.loading, error: state.error, refetch };
 }
 
 export function useTasksStatsMutation(client: TasksClient): MutationState<BoardStats> & {

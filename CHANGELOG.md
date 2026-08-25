@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.87.0] - 2026-08-25
+
+### ✨ Nuevo
+- **Cache compartido entre instancias del hook de Query.** Continuación explícita del usuario ("avanza con el cache") sobre v1.86.0. Antes de esta ronda, dos componentes llamando al mismo `use{Servicio}{Rpc}Query` con los mismos parámetros disparaban dos fetches independientes, sin relación entre sí -- el problema clásico que react-query/SWR resuelven con un cache global, ahora resuelto DENTRO del propio `hooks.ts` generado, sin sumar ninguna librería nueva como dependencia. Un `Map<string, QueryCacheEntry<T>>` a nivel de módulo (singleton por archivo cargado), clave por rpc+parámetros (`JSON.stringify`), con `useSyncExternalStore` (la API que React 18 documenta para suscribirse a un store externo sin roturas de consistencia) reemplazando los `useState` locales del hook -- dos instancias con la misma clave comparten la misma entrada y se re-renderizan juntas cuando cualquiera actualiza el estado. Dedupe REAL vía `entry.promise`: si ya hay un fetch en vuelo para esa clave, un `refetch()` nuevo se une a la MISMA promesa en vez de disparar su propio request -- dos componentes montándose juntos generan una sola request HTTP, no dos. El `requestIdRef` que v1.86.0 le había agregado al hook de Query queda superado (el cache resuelve el mismo problema de respuestas fuera de orden por construcción); el de `Mutation` sigue exactamente igual, sin cambios -- una mutación no comparte cache.
+
+Alcance documentado: cache por rpc+parámetros, NO por instancia de `client`; sin invalidación automática después de una `Mutation` relacionada (cada componente sigue responsable de llamar a `refetch()` a mano tras una mutación exitosa). Un programa sin ningún Query (todo mutations/streams) no emite `useSyncExternalStore` ni la infraestructura de cache, para no romper un build con `noUnusedLocals` por un import/const sin usar.
+
+1014 tests (2 nuevos, netos: se removió el test de `requestIdRef` en Query -- ya no aplica -- y se sumaron dos): la clave de cache se arma correcta con params reales, la infraestructura compartida se emite UNA sola vez sin importar cuántos Query tenga el programa, la forma pública del hook no cambió; un programa sin Query no emite nada de la infraestructura de cache. Además, la lógica central del dedupe (sin React) verificada aparte con un script de Node standalone: dos "instancias" pidiendo la misma clave casi simultáneo comparten exactamente un fetch real, dos claves con parámetros distintos nunca se pisan, actualizar una entrada notifica a sus listeners. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto. Detalle completo: GRAMMAR.md §3.124, PLAN.md §9.13.
+
 ## [1.86.0] - 2026-08-25
 
 ### 🐛 Arreglado

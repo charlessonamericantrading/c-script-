@@ -145,6 +145,7 @@
   - [3.121 `linkc pm2-config`: generador de configuración PM2 — RESUELTO](#3121-linkc-pm2-config-generador-de-configuración-pm2--resuelto)
   - [3.122 `--log-format`/`--log-level`: logging estructurado JSON y nivel configurable — RESUELTO](#3122---log-format---log-level-logging-estructurado-json-y-nivel-configurable--resuelto)
   - [3.123 Hooks de React generados: guarda contra respuestas fuera de orden — RESUELTO](#3123-hooks-de-react-generados-guarda-contra-respuestas-fuera-de-orden--resuelto)
+  - [3.124 Hooks de React generados: cache compartido entre instancias — RESUELTO](#3124-hooks-de-react-generados-cache-compartido-entre-instancias--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5238,6 +5239,38 @@ function SearchBox() {
 **Gap adyacente encontrado y cerrado de paso: `hooks.ts` no tenía NINGUNA cobertura de type-check automatizada.** El único frontend que corre en CI (`frontend/`, el "demo insignia" de `.github/workflows/ci.yml`) solo importa `client.ts` -- nunca `hooks.ts`, ni siquiera usa React -- y `examples/taskboard/frontend` (el único ejemplo real del repo que sí consume los hooks, contra React 18 de verdad) no está conectado a ningún workflow. Verificado a mano regenerando `examples/taskboard/frontend/src/gen/` con el binario real (`linkc build`) y corriendo `npx tsc --noEmit` contra ese proyecto -- pasó limpio. Antes de esta ronda ni siquiera podía correr: al `package.json` de ese ejemplo le faltaba la dependencia `zod` que `schemas.ts` importa (agregada de paso, gap independiente encontrado al intentar verificar). De paso, `.gitignore` tenía dos entradas puntuales de `node_modules` (`/frontend/`, `/editors/vscode/`) que no cubrían `examples/taskboard/frontend/` -- generalizado a `**/node_modules/` para que cualquier ejemplo nuevo con su propio `package.json` quede cubierto sin depender de acordarse de sumar una entrada.
 
 **Verificado**: 2 tests nuevos en `codegen::ts_emit` (el hook de Query tiene el `requestIdRef`/las tres guardas condicionales/el `useRef` importado/el cleanup que invalida en desmontaje; el hook de Mutation tiene la misma guarda y `reset()` invalida requests en vuelo) + el test ya existente de `emit_hooks_generates_queries_mutations_and_subscriptions` sigue pasando sin cambios (la forma pública de los hooks -- nombres, firmas, tipos de retorno -- no cambió, solo su cuerpo interno). Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto.
+
+**Actualización (mismo día, ver §3.124): el `requestIdRef` del hook de Query descrito arriba quedó SUPERADO**, no vigente -- la ronda de cache compartido entre instancias reemplazó por completo el mecanismo interno del hook de Query (ahora usa `useSyncExternalStore` sobre una entrada de cache por rpc+parámetros, que resuelve el mismo problema de fondo -- una respuesta vieja pisando una más nueva -- por construcción, sin necesitar un contador). El de **Mutation sigue exactamente como se describe acá**, sin cambios -- las mutaciones no comparten cache (ver §3.124 para el porqué).
+
+---
+
+### 3.124 Hooks de React generados: cache compartido entre instancias — RESUELTO
+
+Mismo pedido del usuario que motivó §3.123 ("mejora las conexiones del backend con componentes"), continuado explícitamente ("avanza con el cache"): hoy, dos componentes que llaman al MISMO `use{Servicio}{Rpc}Query` con los MISMOS parámetros (ej. un `<Header>` y un `<Sidebar>` mostrando el mismo conteo de notificaciones) disparaban DOS fetches independientes y mantenían DOS copias de estado sin relación entre sí -- ni comparten el resultado, ni una que refresca actualiza a la otra. Es el problema clásico que react-query/SWR resuelven con un cache global; acá se resuelve DENTRO del propio `hooks.ts` generado, sin sumar ninguna de esas librerías como dependencia nueva.
+
+```
+function Header({ client }: { client: TasksClient }) {
+  const { data } = useTasksListQuery(client); // dispara UNA request (o la comparte si ya hay una)
+  return <span>{data?.length ?? 0} tareas</span>;
+}
+
+function Sidebar({ client }: { client: TasksClient }) {
+  const { data } = useTasksListQuery(client); // MISMA clave -> misma entrada de cache, sin fetch propio
+  return <ul>{data?.map((t) => <li key={t.id}>{t.title}</li>)}</ul>;
+}
+```
+
+**Un `Map<string, QueryCacheEntry<T>>` a nivel de MÓDULO** (`queryCache`, una sola instancia por archivo `hooks.ts` cargado -- el mismo módulo ES singleton entre todos los componentes de la app), clave `"{Servicio}.{rpc}(" + JSON.stringify([...params]) + ")"`. `getQueryCacheEntry(key)` devuelve SIEMPRE el mismo objeto para la misma clave (lo cachea el propio `Map`), así que dos instancias del hook con los mismos parámetros terminan apuntando al mismo `entry` -- sin necesitar contexto de React ni un provider envolvente.
+
+**`useSyncExternalStore`** (la API que React 18 documenta exactamente para esto -- suscribirse a un store FUERA del árbol de componentes sin roturas de consistencia entre renders concurrentes) reemplaza los `useState` locales del hook de Query: `subscribe` agrega/saca un listener del `Set` de la entrada, `getSnapshot` devuelve `entry.state` tal cual. Cuando `setQueryCacheState` corre (dentro de `refetch`, al resolver o fallar el fetch), reemplaza `entry.state` por un objeto NUEVO (nunca lo muta in-place -- `useSyncExternalStore` necesita esa referencia nueva para notar el cambio) y llama a cada listener suscripto -- todas las instancias con esa clave se re-renderizan juntas, con el mismo dato.
+
+**Dedupe real, no solo cache de lectura**: `entry.promise` es el punto de sincronización -- si YA hay un fetch en vuelo para esa clave (disparado por CUALQUIER instancia, o por el `useEffect` automático), un `refetch()` nuevo no dispara su propio `client.rpc(...)`, se queda esperando la MISMA promesa. Dos componentes montándose al mismo tiempo con los mismos parámetros generan UNA sola request HTTP, no dos. El `useEffect` automático (el que reemplaza el fetch-al-montar de siempre) solo llama a `refetch()` si la entrada está genuinamente vacía (`state.data === null && !state.loading && !entry.promise`) -- si otra instancia ya la pobló o ya la está pidiendo, no hace nada.
+
+**`refetch()` sigue siendo una función real que cualquier instancia puede llamar a mano** (un botón "Actualizar") -- a diferencia del auto-fetch del efecto, una llamada MANUAL siempre dispara un fetch nuevo (o se une a uno ya en vuelo si hay uno), nunca se queda callada solo porque ya hay datos viejos cacheados; y como actualiza la entrada COMPARTIDA, todas las instancias con esa clave ven el resultado, no solo la que llamó.
+
+**Alcance deliberado, documentado**: (1) el cache es por rpc+parámetros, NO por instancia de `client` -- si la misma app usa dos `client`s distintos contra el mismo rpc (multi-tenant, poco común) comparten cache igual; el caso real de todos los ejemplos del repo es un `client` único por app. (2) SIN invalidación automática después de una `Mutation` -- `useUsersCreateMutation` no sabe hoy que existe un `useUsersListQuery` que debería refrescar tras crear un usuario; cada componente sigue siendo responsable de llamar a `refetch()` a mano donde corresponda tras una mutación exitosa (mismo patrón que ya usa `examples/taskboard/frontend/src/App.tsx`). Automatizar eso necesitaría una forma de declarar qué Query invalida cada Mutation -- fuera de esta ronda. (3) `Mutation` NO comparte cache -- una mutación es una acción, no un dato para leer desde varios lugares a la vez, así que sigue con el `useState` local + guarda de `requestIdRef` de §3.123 sin cambios.
+
+**Verificado**: 2 tests nuevos en `codegen::ts_emit` (`use{Servicio}{Rpc}Query` genera la clave de cache correcta con params reales, la infraestructura compartida (`Map`/`getQueryCacheEntry`/`setQueryCacheState`) se emite UNA sola vez sin importar cuántos rpcs de Query tenga el programa, y la forma pública del hook -- `QueryState<T>` -- no cambió; un programa SIN ningún Query -- todo mutations -- NO emite `useSyncExternalStore` ni la infraestructura de cache, evitando un import/`const`/`function` sin usar que rompería cualquier build con `noUnusedLocals` prendido). Además, la lógica CENTRAL del dedupe (`getQueryCacheEntry`/`setQueryCacheState`/el patrón de `entry.promise`) se verificó aparte en un script de Node standalone (sin React, el mismo algoritmo copiado literal del `hooks.ts` generado): dos "instancias" pidiendo la misma clave casi al mismo tiempo comparten exactamente UN fetch real, ambas reciben el mismo resultado, dos claves con parámetros distintos nunca se pisan, y actualizar una entrada notifica a sus listeners suscriptos. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado con el binario y tipando limpio con `tsc --noEmit` en modo estricto.
 
 ---
 

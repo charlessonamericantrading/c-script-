@@ -350,6 +350,20 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+/// Mismo heurístico "nombre por forma" que separa el hook `Query` del
+/// `Mutation` en `emit_hooks` (GRAMMAR.md §3.124) -- un rpc sin parámetros
+/// también cuenta como Query, no hay forma más segura de mutar sin nada que
+/// pasarle.
+fn is_query_rpc(rpc: &RpcDecl) -> bool {
+    rpc.name.starts_with("get")
+        || rpc.name.starts_with("list")
+        || rpc.name.starts_with("find")
+        || rpc.name.starts_with("search")
+        || rpc.name.starts_with("read")
+        || rpc.name.starts_with("fetch")
+        || rpc.params.is_empty()
+}
+
 pub fn emit_hooks(program: &Program) -> Result<String, String> {
     let (checker, errors) = Checker::build_symbols(program);
     if let Some(e) = errors.into_iter().next() {
@@ -381,9 +395,23 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
         services.push((service, members));
     }
 
+    // GRAMMAR.md §3.124: si HAY algún rpc que va a generar un hook de Query,
+    // el archivo entero necesita `useSyncExternalStore` (el cache
+    // compartido) -- calculado ACÁ, antes de armar la línea de import,
+    // porque `noUnusedLocals` (la config real de `examples/taskboard/
+    // frontend/tsconfig.json`, entre otras) rechaza un import sin usar: si
+    // el programa no declara ningún Query (todo streams/mutations), sumar
+    // `useSyncExternalStore` de todos modos rompería el build de cualquiera
+    // que compile con esa opción prendida.
+    let has_any_query = services.iter().any(|(_, members)| members.iter().any(|(rpc, is_stream, _, _)| !is_stream && is_query_rpc(rpc)));
+
     let mut out = String::new();
     out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
-    out.push_str("import { useState, useEffect, useCallback, useRef } from \"react\";\n");
+    if has_any_query {
+        out.push_str("import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from \"react\";\n");
+    } else {
+        out.push_str("import { useState, useEffect, useCallback, useRef } from \"react\";\n");
+    }
     if !imported_types.is_empty() {
         out.push_str(&format!(
             "import type {{ {} }} from \"./contract\";\n\n",
@@ -411,6 +439,44 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     out.push_str("  isConnected: boolean;\n");
     out.push_str("  error: Error | null;\n");
     out.push_str("}\n\n");
+
+    // Cache compartido entre TODAS las instancias de un mismo hook de Query
+    // (GRAMMAR.md §3.124) -- dos componentes llamando a
+    // `use{Servicio}{Rpc}Query` con los MISMOS parámetros comparten una
+    // sola entrada: una sola request en vuelo (dedupe, ninguno de los dos
+    // dispara su propio fetch por separado) y el resultado de UNO actualiza
+    // a los DOS a la vez (`useSyncExternalStore`, la forma que React 18
+    // documenta para suscribirse a un store externo al árbol de
+    // componentes). Alcance: cache por rpc+parámetros, NO por instancia de
+    // `client` -- si la misma app usara dos clients distintos contra el
+    // mismo rpc comparten cache igual; el caso real (`examples/taskboard/
+    // frontend` y el resto de los ejemplos) siempre tiene un client único
+    // por app. Sin invalidación automática tras una `Mutation` todavía --
+    // `refetch()` de una instancia sigue actualizando a todas las que
+    // comparten esa misma clave, pero nada dispara eso solo porque una
+    // mutación relacionada tuvo éxito (necesitaría una forma de declarar
+    // qué Query invalida cada Mutation, que no existe hoy).
+    if has_any_query {
+        out.push_str("type QueryCacheState<T> = { data: T | null; loading: boolean; error: Error | null };\n\n");
+        out.push_str("type QueryCacheEntry<T> = {\n");
+        out.push_str("  state: QueryCacheState<T>;\n");
+        out.push_str("  promise: Promise<T> | null;\n");
+        out.push_str("  listeners: Set<() => void>;\n");
+        out.push_str("};\n\n");
+        out.push_str("const queryCache = new Map<string, QueryCacheEntry<unknown>>();\n\n");
+        out.push_str("function getQueryCacheEntry<T>(key: string): QueryCacheEntry<T> {\n");
+        out.push_str("  let entry = queryCache.get(key) as QueryCacheEntry<T> | undefined;\n");
+        out.push_str("  if (!entry) {\n");
+        out.push_str("    entry = { state: { data: null, loading: false, error: null }, promise: null, listeners: new Set() };\n");
+        out.push_str("    queryCache.set(key, entry as QueryCacheEntry<unknown>);\n");
+        out.push_str("  }\n");
+        out.push_str("  return entry;\n");
+        out.push_str("}\n\n");
+        out.push_str("function setQueryCacheState<T>(entry: QueryCacheEntry<T>, patch: Partial<QueryCacheState<T>>): void {\n");
+        out.push_str("  entry.state = { ...entry.state, ...patch };\n");
+        out.push_str("  entry.listeners.forEach((listener) => listener());\n");
+        out.push_str("}\n\n");
+    }
 
     for (service, members) in services {
         for (rpc, is_stream, param_tys, ret_ty) in members {
@@ -474,15 +540,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 out.push_str("  return { data, latest, isConnected, error };\n");
                 out.push_str("}\n\n");
             } else {
-                let is_query = rpc.name.starts_with("get")
-                    || rpc.name.starts_with("list")
-                    || rpc.name.starts_with("find")
-                    || rpc.name.starts_with("search")
-                    || rpc.name.starts_with("read")
-                    || rpc.name.starts_with("fetch")
-                    || rpc.params.is_empty();
-
-                if is_query {
+                if is_query_rpc(rpc) {
                     let params_sig = if params_typed.is_empty() {
                         format!("client: {}Client, options?: {{ enabled?: boolean }}", service.name)
                     } else {
@@ -493,57 +551,81 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     } else {
                         format!("client, {}", param_names.join(", "))
                     };
+                    // La clave incluye rpc+parámetros (no `client`, ver el
+                    // comentario sobre el cache más arriba) -- `JSON.stringify`
+                    // sobre el array de parámetros posicionales, así que dos
+                    // instancias del hook con los MISMOS argumentos siempre
+                    // caen en la MISMA entrada del `Map`, sin importar en qué
+                    // componente estén montadas.
+                    let cache_key_expr =
+                        format!("\"{}.{}(\" + JSON.stringify([{}]) + \")\"", service.name, rpc.name, param_names.join(", "));
 
                     out.push_str(&format!(
                         "export function use{service}{cap_rpc}Query({params_sig}): QueryState<{ret_str}> {{\n",
                         service = service.name
                     ));
                     out.push_str("  const enabled = options?.enabled ?? true;\n");
-                    out.push_str(&format!("  const [data, setData] = useState<{} | null>(null);\n", ret_str));
-                    out.push_str("  const [loading, setLoading] = useState(enabled);\n");
-                    out.push_str("  const [error, setError] = useState<Error | null>(null);\n");
-                    // Guarda de "solo la respuesta más reciente gana" -- sin
-                    // esto, si `params`/`client` cambian mientras una request
-                    // anterior sigue en vuelo (ej. tipeando en un buscador
-                    // que llama a este hook por cada letra), la más LENTA
-                    // puede resolver DESPUÉS de la más nueva y pisar `data`
-                    // con una respuesta vieja -- silenciosamente, sin ningún
-                    // error visible. `requestIdRef` es un contador
-                    // monotónico: cada llamada a `refetch` (desde el
-                    // `useEffect` de abajo o llamada a mano) se queda con SU
-                    // número, y solo actualiza estado si sigue siendo la más
-                    // reciente cuando la respuesta llega.
-                    out.push_str("  const requestIdRef = useRef(0);\n\n");
-                    out.push_str(&format!("  const refetch = useCallback(async (): Promise<{} | null> => {{\n", ret_str));
-                    out.push_str("    const requestId = ++requestIdRef.current;\n");
-                    out.push_str("    setLoading(true);\n");
-                    out.push_str("    setError(null);\n");
-                    out.push_str("    try {\n");
-                    out.push_str(&format!("      const res = await client.{}({});\n", rpc.name, param_names.join(", ")));
-                    out.push_str("      if (requestIdRef.current === requestId) setData(res);\n");
-                    out.push_str("      return res;\n");
-                    out.push_str("    } catch (err) {\n");
-                    out.push_str("      const e = err instanceof Error ? err : new Error(String(err));\n");
-                    out.push_str("      if (requestIdRef.current === requestId) setError(e);\n");
-                    out.push_str("      return null;\n");
-                    out.push_str("    } finally {\n");
-                    out.push_str("      if (requestIdRef.current === requestId) setLoading(false);\n");
+                    out.push_str(&format!("  const cacheKey = {cache_key_expr};\n"));
+                    // `getQueryCacheEntry` siempre devuelve el MISMO objeto
+                    // para la MISMA clave (lo cachea el `Map`) -- por eso
+                    // `entry` es una referencia estable entre renders
+                    // mientras `cacheKey` no cambie, sin necesitar un
+                    // `useMemo` propio para eso.
+                    out.push_str(&format!("  const entry = getQueryCacheEntry<{ret_str}>(cacheKey);\n\n"));
+                    out.push_str("  const subscribe = useCallback((onStoreChange: () => void) => {\n");
+                    out.push_str("    entry.listeners.add(onStoreChange);\n");
+                    out.push_str("    return () => { entry.listeners.delete(onStoreChange); };\n");
+                    out.push_str("  }, [entry]);\n");
+                    out.push_str("  const getSnapshot = useCallback(() => entry.state, [entry]);\n");
+                    // `useSyncExternalStore` (React 18): la forma real de
+                    // suscribirse a un store FUERA del árbol de componentes
+                    // sin roturas de consistencia entre renders concurrentes
+                    // -- es lo que hace que dos instancias de este hook con
+                    // la MISMA `cacheKey` reciban la MISMA `data`/`loading`/
+                    // `error` y se actualicen juntas cuando cualquiera de
+                    // las dos llama a `refetch`.
+                    out.push_str("  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);\n\n");
+                    out.push_str(&format!("  const refetch = useCallback(async (): Promise<{ret_str} | null> => {{\n"));
+                    // Dedupe real: si YA hay una request en vuelo para esta
+                    // clave (disparada por esta instancia, por OTRA
+                    // instancia del mismo hook, o por el `useEffect` de
+                    // abajo), todas comparten esa MISMA promesa en vez de
+                    // que cada `refetch()` dispare su propio fetch --
+                    // `entry.promise` es el punto de sincronización.
+                    out.push_str("    if (!entry.promise) {\n");
+                    out.push_str("      setQueryCacheState(entry, { loading: true, error: null });\n");
+                    out.push_str(&format!("      entry.promise = client.{}({})\n", rpc.name, param_names.join(", ")));
+                    out.push_str("        .then((res) => {\n");
+                    out.push_str("          setQueryCacheState(entry, { data: res, loading: false });\n");
+                    out.push_str("          return res;\n");
+                    out.push_str("        })\n");
+                    out.push_str("        .catch((err) => {\n");
+                    out.push_str("          const e = err instanceof Error ? err : new Error(String(err));\n");
+                    out.push_str("          setQueryCacheState(entry, { error: e, loading: false });\n");
+                    out.push_str("          throw e;\n");
+                    out.push_str("        })\n");
+                    out.push_str("        .finally(() => {\n");
+                    out.push_str("          entry.promise = null;\n");
+                    out.push_str("        });\n");
                     out.push_str("    }\n");
-                    out.push_str(&format!("  }}, [{}]);\n\n", deps));
+                    out.push_str("    try {\n");
+                    out.push_str("      return await entry.promise;\n");
+                    out.push_str("    } catch {\n");
+                    out.push_str("      return null;\n");
+                    out.push_str("    }\n");
+                    out.push_str(&format!("  }}, [entry, {deps}]);\n\n"));
                     out.push_str("  useEffect(() => {\n");
-                    out.push_str("    if (enabled) {\n");
+                    // `state.data === null && !state.loading` -- solo dispara
+                    // un fetch si esta entrada del cache está genuinamente
+                    // VACÍA (nadie la pidió todavía) y nada más ya la está
+                    // pidiendo; si otra instancia ya la cacheó o ya hay una
+                    // request en vuelo, este efecto no hace nada -- ahí está
+                    // el dedupe entre MONTAJES, no solo entre llamadas.
+                    out.push_str("    if (enabled && state.data === null && !state.loading && !entry.promise) {\n");
                     out.push_str("      refetch();\n");
                     out.push_str("    }\n");
-                    // Al desmontar, o antes de que el próximo efecto corra
-                    // (`params`/`client` cambiaron), invalida cualquier
-                    // request de ESTE efecto que siga en vuelo -- mismo
-                    // criterio que el `cancelled = true` que ya usa el hook
-                    // de `stream` más abajo, adaptado al contador en vez de
-                    // un booleano porque acá conviven requests disparadas
-                    // por el efecto Y por una llamada manual a `refetch`.
-                    out.push_str("    return () => { requestIdRef.current++; };\n");
-                    out.push_str("  }, [enabled, refetch]);\n\n");
-                    out.push_str("  return { data, loading, error, refetch };\n");
+                    out.push_str("  }, [enabled, refetch, entry, state.data, state.loading]);\n\n");
+                    out.push_str("  return { data: state.data, loading: state.loading, error: state.error, refetch };\n");
                     out.push_str("}\n\n");
                 }
 
@@ -1369,18 +1451,17 @@ mod tests {
         assert!(hooks.contains("for await (const item of client.watch())"), "{hooks}");
     }
 
-    /// El hook de Query (`use{Servicio}{Rpc}Query`) tiene que descartar una
-    /// respuesta VIEJA que llega después de una más nueva -- ej. un
-    /// buscador que llama al hook por cada letra tipeada dispara una
-    /// request nueva antes de que la anterior resuelva; si esa anterior
-    /// (más lenta) resuelve DESPUÉS, sin guarda pisaría `data` con el
-    /// resultado de una búsqueda vieja, en silencio, sin ningún error
-    /// visible. `requestIdRef` (`useRef`) es el mecanismo: cada llamada a
-    /// `refetch` se queda con su propio número, y solo llama a
-    /// `setData`/`setError`/`setLoading` si sigue siendo la request más
-    /// reciente cuando la promesa resuelve.
+    /// El hook de Query (`use{Servicio}{Rpc}Query`) comparte cache entre
+    /// TODAS sus instancias (GRAMMAR.md §3.124) -- `useSyncExternalStore`
+    /// sobre una entrada de un `Map` global, clave por rpc+parámetros. Esto
+    /// también resuelve el problema de la respuesta fuera de orden (ej. un
+    /// buscador llamando al hook por cada letra tipeada): la clave de una
+    /// request vieja Y una nueva son DISTINTAS entradas del cache (params
+    /// distintos), así que nunca se pisan entre sí -- y dos instancias con
+    /// los MISMOS parámetros comparten una sola request en vuelo en vez de
+    /// disparar un fetch cada una.
     #[test]
-    fn query_hook_guards_against_a_stale_response_overwriting_newer_state() {
+    fn query_hook_shares_a_cache_entry_keyed_by_rpc_and_params() {
         let src = r#"
             type User = { id: Int, name: String }
             service Users {
@@ -1389,16 +1470,47 @@ mod tests {
         "#;
         let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
         let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(
+            hooks.contains("import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from \"react\";"),
+            "{hooks}"
+        );
+        // Infraestructura de cache emitida UNA sola vez, no por hook.
+        assert_eq!(hooks.matches("const queryCache = new Map").count(), 1, "{hooks}");
+        assert_eq!(hooks.matches("function getQueryCacheEntry").count(), 1, "{hooks}");
+        assert_eq!(hooks.matches("function setQueryCacheState").count(), 1, "{hooks}");
+        // Clave del cache: rpc + parámetros serializados, NO el `client`.
+        assert!(hooks.contains("const cacheKey = \"Users.get(\" + JSON.stringify([id]) + \")\";"), "{hooks}");
+        assert!(hooks.contains("const entry = getQueryCacheEntry<User>(cacheKey);"), "{hooks}");
+        assert!(hooks.contains("const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);"), "{hooks}");
+        // Dedupe real: una sola request en vuelo por entrada, compartida
+        // entre quien la disparó y cualquier otra instancia/llamada.
+        assert!(hooks.contains("if (!entry.promise) {"), "{hooks}");
+        assert!(hooks.contains("entry.promise = client.get(id)"), "{hooks}");
+        // La forma pública del hook (lo que un componente consume) sigue
+        // siendo exactamente `QueryState<T>` -- el cambio es interno.
+        assert!(hooks.contains("export function useUsersGetQuery(client: UsersClient, id: number, options?: { enabled?: boolean }): QueryState<User> {"), "{hooks}");
+        assert!(hooks.contains("return { data: state.data, loading: state.loading, error: state.error, refetch };"), "{hooks}");
+    }
+
+    /// Un programa SIN ningún rpc que genere un hook de Query (todo
+    /// mutations) no debe sumar `useSyncExternalStore` al import ni la
+    /// infraestructura de cache -- un import/`const`/`function` de nivel
+    /// superior sin usar rompe cualquier build con `noUnusedLocals`
+    /// (`examples/taskboard/frontend/tsconfig.json`, entre otras).
+    #[test]
+    fn a_program_with_only_mutations_does_not_emit_the_query_cache_infrastructure() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            service Users {
+                rpc create(name: String) -> User { User { id: 1, name: name } }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(!hooks.contains("useSyncExternalStore"), "{hooks}");
+        assert!(!hooks.contains("queryCache"), "{hooks}");
+        assert!(!hooks.contains("getQueryCacheEntry"), "{hooks}");
         assert!(hooks.contains("import { useState, useEffect, useCallback, useRef } from \"react\";"), "{hooks}");
-        assert!(hooks.contains("const requestIdRef = useRef(0);"), "{hooks}");
-        assert!(hooks.contains("const requestId = ++requestIdRef.current;"), "{hooks}");
-        assert!(hooks.contains("if (requestIdRef.current === requestId) setData(res);"), "{hooks}");
-        assert!(hooks.contains("if (requestIdRef.current === requestId) setError(e);"), "{hooks}");
-        assert!(hooks.contains("if (requestIdRef.current === requestId) setLoading(false);"), "{hooks}");
-        // Al desmontar/cambiar deps, invalida cualquier request de ESE
-        // efecto que siga en vuelo -- mismo criterio que el `cancelled`
-        // del hook de stream, adaptado al contador.
-        assert!(hooks.contains("return () => { requestIdRef.current++; };"), "{hooks}");
     }
 
     /// Misma guarda que el hook de Query, pero para Mutation -- un doble

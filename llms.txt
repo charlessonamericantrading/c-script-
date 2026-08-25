@@ -33,7 +33,8 @@ disagrees with any prose elsewhere in the repo, this section wins.
 Works, verified by running it:
 
 - `linkc build` — emits `contract.d.ts`, `client.ts`, `validators.ts`, `hooks.ts`, `schemas.ts`, `openapi.json`, `llms.txt`.
-- `hooks.ts`'s generated `use{Service}{Rpc}Query`/`use{Service}{Rpc}Mutation` guard against an out-of-order response overwriting newer state — a monotonic `requestIdRef` (`useRef`) per hook instance discards any response that's no longer the most recent one dispatched (the real scenario: a search box calling the Query hook on every keystroke, where a slower earlier request could otherwise resolve after a faster later one and silently show stale data). The Query hook's `useEffect` cleanup and the Mutation hook's `reset()` both invalidate any request still in flight. See GRAMMAR.md §3.123.
+- `hooks.ts`'s generated `use{Service}{Rpc}Mutation` guards against an out-of-order response overwriting newer state — a monotonic `requestIdRef` (`useRef`) per hook instance discards any response that's no longer the most recent one dispatched (the real scenario: a double-click firing two `mutate()` calls, where the slower one could otherwise resolve after the faster one and silently overwrite fresh state). `reset()` also invalidates any request still in flight. See GRAMMAR.md §3.123.
+- `hooks.ts`'s generated `use{Service}{Rpc}Query` shares a cache across every instance of the same hook called with the same params — a module-level `Map<string, QueryCacheEntry<T>>` keyed by `"{Service}.{rpc}(" + JSON.stringify(params) + ")"`, with `useSyncExternalStore` (React 18's documented way to subscribe to an external store) replacing the hook's local `useState`. Two components mounting the same query at once share ONE in-flight request (deduped via `entry.promise`, not two independent fetches) and re-render together when either one refetches — no react-query/SWR dependency added, it's all inside the generated file. Scope: keyed by rpc+params only (not by `client` instance); no automatic cache invalidation after a related `Mutation` succeeds yet (call `refetch()` by hand where needed, same as `examples/taskboard/frontend/src/App.tsx` already does). A program with zero Query hooks emits none of this (no unused `useSyncExternalStore` import to trip `noUnusedLocals`). See GRAMMAR.md §3.124.
 - `linkc serve` — real HTTP server, embedded SQLite that persists across restarts, SSE streams.
 - `linkc test` — runs `test "..."` blocks against an isolated in-memory database.
 - `linkc dev`, `linkc lint`, `linkc doc`, `linkc docker`, `linkc systemd`, `linkc pm2-config`, `linkc lsp`, `linkc new`, `linkc --help`.
@@ -265,7 +266,7 @@ linkc serve backend.link 8787 --restart-backoff 1s  # native exponential backoff
 linkc serve-all ./services --port-base 3000  # one process serves every .link in ./services, one thread+port each
 linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json  # write {"name": port, ...} before serving
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
-linkc --version                      # linkc 1.86.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.87.0 -- same version stamped in every generated file
 ```
 
 ## Verified example
