@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.102.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`linkc serve-all --port-registry <archivo.json>`: puerto estable por nombre de servicio** (GRAMMAR.md §3.153, PLAN.md §9.7). Diagnosticado por otra sesión de Claude ("skynet-d3") investigando en vivo el VPS de producción de un adoptador (IgnisLove): confirmó el mecanismo EXACTO del incidente de colisión de puerto ya conocido -- `serve-all` asigna por orden alfabético de archivo, así que con 17 servicios el puerto `8792` cayó en `bot_defense`, el mismo que otra app (`myfinance`) tenía hardcodeado -- y de paso descartó a `linkc` como sospechoso de ningún problema de RAM (12.8 MB / 0% CPU en un solo proceso de 103 hilos, el componente más barato de los cuatro de esa app).
+
+  `--port-map-out` (§3.107, existente) ya hacía LEGIBLE la asignación pero era de solo escritura -- cada arranque la recalculaba entera. `--port-registry` LEE el archivo primero si ya existe (misma forma `{"nombre": puerto, ...}`): un nombre ya presente conserva su puerto de siempre sin importar qué otro `.link` se agregue/borre/renombre alrededor; un nombre nuevo recibe el próximo puerto libre desde `--port-base`. Un servicio borrado deja su entrada intacta en el registro A PROPÓSITO -- su puerto nunca se reasigna solo a un servicio distinto, para no reproducir el mismo incidente al revés (un gateway externo con ese puerto viejo todavía hardcodeado). JSON inválido en el archivo falla limpio antes de arrancar cualquier hilo, mismo criterio que un `.link` con error de tipos. Combina libremente con `--port-map-out`.
+
+1156 tests (4 nuevos) en `cli_port_registry.rs`, contra el binario real bindeando puertos de verdad: sin historial previo la asignación es idéntica a la de siempre; agregar un `.link` que cae antes alfabéticamente no mueve el puerto de los ya registrados; borrar un `.link` y agregar uno nuevo confirma que el nuevo nunca hereda el puerto liberado por el viejo; un registro con JSON inválido falla limpio sin abrir ningún puerto. Detalle completo: GRAMMAR.md §3.153, PLAN.md §9.7.
+
 ## [1.101.0] - 2026-08-25
 
 ### ✨ Nuevo

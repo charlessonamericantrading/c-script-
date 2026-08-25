@@ -1517,10 +1517,65 @@ fn resolve_hsts(args: &[String]) -> Result<Option<String>, String> {
 /// compiló) es peor que no arrancar nada; un error de tipos en cualquiera
 /// de los archivos aborta TODO el comando, con el mismo reporte de error de
 /// siempre.
+/// GRAMMAR.md §3.153: con `--port-registry <archivo.json>`, el puerto de
+/// cada servicio se fija por NOMBRE de archivo (sin `.link`) en vez de por
+/// posición alfabética -- agregar, quitar o renombrar OTRO `.link` en la
+/// carpeta ya no corre el puerto de los que ya estaban asignados. El
+/// archivo tiene la misma forma que `--port-map-out` (`{"nombre": puerto,
+/// ...}`): si ya existe, se lee primero -- cada nombre ya presente ahí
+/// conserva su puerto tal cual, sin importar el orden alfabético actual de
+/// los archivos descubiertos. Un nombre nuevo recibe el próximo puerto
+/// libre desde `--port-base`, saltando cualquiera ya usado por otro nombre
+/// (incluidos los de servicios que ya no están, ver abajo).
+///
+/// Un nombre que ya NO tiene `.link` correspondiente (borrado o renombrado)
+/// queda igual en el registro devuelto -- su puerto nunca se reasigna a
+/// otro servicio en un arranque futuro, a propósito: un gateway externo
+/// puede seguir teniendo ESE puerto hardcodeado apuntando a lo que ya no
+/// existe, y reasignarlo en silencio a un servicio distinto sería el mismo
+/// incidente de colisión que este flag existe para evitar, solo que al
+/// revés. Limpiar una entrada obsoleta del archivo es una decisión manual
+/// del operador, nunca automática acá.
+fn resolve_stable_ports(link_files: &[PathBuf], port_base: u16, registry_path: &str) -> Result<(Vec<u16>, serde_json::Map<String, serde_json::Value>), String> {
+    let mut registry: serde_json::Map<String, serde_json::Value> = if Path::new(registry_path).exists() {
+        let text = fs::read_to_string(registry_path).map_err(|e| format!("no se pudo leer --port-registry '{registry_path}': {e}"))?;
+        match serde_json::from_str(&text).map_err(|e| format!("--port-registry '{registry_path}' no es JSON válido: {e}"))? {
+            serde_json::Value::Object(map) => map,
+            _ => return Err(format!("--port-registry '{registry_path}' debe ser un objeto JSON {{\"nombre\": puerto, ...}}")),
+        }
+    } else {
+        serde_json::Map::new()
+    };
+
+    let mut taken: std::collections::HashSet<u16> = registry.values().filter_map(|v| v.as_u64()).filter_map(|p| u16::try_from(p).ok()).collect();
+
+    let mut ports = Vec::with_capacity(link_files.len());
+    for path in link_files {
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
+        let existing = registry.get(&name).and_then(|v| v.as_u64()).and_then(|p| u16::try_from(p).ok());
+        let port = match existing {
+            Some(p) => p,
+            None => {
+                let mut candidate = port_base;
+                while taken.contains(&candidate) {
+                    candidate = candidate
+                        .checked_add(1)
+                        .ok_or_else(|| format!("--port-registry '{registry_path}': no quedan puertos libres desde --port-base {port_base} para el nuevo servicio '{name}'"))?;
+                }
+                taken.insert(candidate);
+                registry.insert(name.clone(), serde_json::json!(candidate));
+                candidate
+            }
+        };
+        ports.push(port);
+    }
+    Ok((ports, registry))
+}
+
 fn cmd_serve_all(args: &[String]) -> ExitCode {
     let Some(dir) = args.first() else {
         eprintln!(
-            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>]"
+            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>]"
         );
         return ExitCode::FAILURE;
     };
@@ -1564,6 +1619,14 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
     };
 
     let port_map_out = match extract_flag_value(args, "--port-map-out") {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let port_registry = match extract_flag_value(args, "--port-registry") {
         Ok(v) => v,
         Err(msg) => {
             eprintln!("{msg}");
@@ -1684,18 +1747,35 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
         }
     };
 
+    let (ports, updated_registry): (Vec<u16>, Option<serde_json::Map<String, serde_json::Value>>) = match &port_registry {
+        Some(path) => match resolve_stable_ports(&link_files, port_base, path) {
+            Ok((ports, registry)) => (ports, Some(registry)),
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            let mut ports = Vec::with_capacity(link_files.len());
+            for i in 0..link_files.len() {
+                let Some(port) = port_base.checked_add(i as u16) else {
+                    eprintln!("--port-base {port_base}: no alcanzan los puertos para {} archivos .link (se pasaría de 65535)", link_files.len());
+                    return ExitCode::FAILURE;
+                };
+                ports.push(port);
+            }
+            (ports, None)
+        }
+    };
+
     let mut services: Vec<(PathBuf, u16, Program)> = Vec::with_capacity(link_files.len());
-    for (i, path) in link_files.iter().enumerate() {
-        let Some(port) = port_base.checked_add(i as u16) else {
-            eprintln!("--port-base {port_base}: no alcanzan los puertos para {} archivos .link (se pasaría de 65535)", link_files.len());
-            return ExitCode::FAILURE;
-        };
+    for (path, port) in link_files.iter().zip(ports.iter()) {
         let path_str = path.to_string_lossy().to_string();
         let program = match load_and_check(&path_str) {
             Ok(p) => p,
             Err(code) => return code,
         };
-        services.push((path.clone(), port, program));
+        services.push((path.clone(), *port, program));
     }
 
     println!("linkc serve-all: {} servicio(s) en un proceso (datos en SQLite separado por servicio)", services.len());
@@ -1726,6 +1806,22 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
         println!("mapeo de puertos escrito en {out_path}");
+    }
+
+    // GRAMMAR.md §3.153: a diferencia de `--port-map-out` (arriba, siempre
+    // sobreescribe con la asignación de ESTA corrida), `--port-registry` ya
+    // leyó el archivo existente dentro de `resolve_stable_ports` -- lo que
+    // se escribe acá es esa MISMA estructura, con los nombres nuevos ya
+    // insertados y las entradas de servicios que ya no están (borrados o
+    // renombrados) todavía presentes, apuntando a su puerto de siempre.
+    if let Some(registry) = &updated_registry {
+        let out_path = port_registry.as_deref().expect("updated_registry solo es Some junto con port_registry");
+        let json = serde_json::to_string_pretty(registry).expect("serializar el registro de puertos no puede fallar");
+        if let Err(e) = fs::write(out_path, json) {
+            eprintln!("no se pudo escribir --port-registry en '{out_path}': {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("registro de puertos actualizado en {out_path}");
     }
 
     let handles: Vec<std::thread::JoinHandle<bool>> = services

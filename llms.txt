@@ -63,6 +63,7 @@ Works, verified by running it:
 - Cross-instance NOTIFY (§3.44 above) now retries a TRANSIENT send failure from a bounded FIFO queue (`MAX_PENDING_NOTIFY_RETRIES = 50`, drained on the same 200ms tick that already drains remote changes) instead of losing the event forever — an oversized (>8000 byte) payload still never gets queued, since retrying can't fix a structural size limit. See GRAMMAR.md §3.150.
 - `db.vacuum() -> Void` / `db.tableStats() -> Map<String, Int>`: two builtins directly on `db` (expose them yourself behind `@requires(Role.Admin)` in your own service — no auto-injected `_admin` service). `tableStats` counts physical rows per declared collection, ignoring `@softDelete` on purpose. See GRAMMAR.md §3.151.
 - `auth.recordFailedLogin(identifier: String) -> Void` / `auth.failedLoginCount(identifier: String, windowSeconds: Int) -> Int` / `auth.resetFailedLogins(identifier: String) -> Void`: three small primitives over the same `SessionStore` for a hand-written `login` rpc to implement its own lockout threshold and window — no magic mechanism, no new server flag. See GRAMMAR.md §3.152.
+- `linkc serve-all --port-registry <archivo.json>`: reads a `{"name": port, ...}` file (same shape `--port-map-out` writes) before assigning ports — a name already present keeps its port forever, no matter what other `.link` file gets added/removed/renamed around it; a new name gets the next free port from `--port-base`. A removed service's entry (and port) stays in the file on purpose — never silently reassigned to a different service. See GRAMMAR.md §3.153.
 - `linkc serve` — real HTTP server, embedded SQLite that persists across restarts, SSE streams.
 - `linkc test` — runs `test "..."` blocks against an isolated in-memory database.
 - `linkc dev`, `linkc lint`, `linkc doc`, `linkc docker`, `linkc systemd`, `linkc pm2-config`, `linkc lsp`, `linkc new`, `linkc --help`.
@@ -293,8 +294,9 @@ linkc serve backend.link 8787 --trust-proxy  # @rate_limit uses X-Forwarded-For 
 linkc serve backend.link 8787 --restart-backoff 1s  # native exponential backoff on a port-bind/DB-connect failure
 linkc serve-all ./services --port-base 3000  # one process serves every .link in ./services, one thread+port each
 linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json  # write {"name": port, ...} before serving
+linkc serve-all ./services --port-base 3000 --port-registry ./services/ports.json  # same shape, but read back first -- a name keeps its port forever
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
-linkc --version                      # linkc 1.101.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.102.0 -- same version stamped in every generated file
 ```
 
 ## Verified example
