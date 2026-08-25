@@ -139,6 +139,7 @@
   - [3.115 Lint `unused-var`: 14 falsos positivos dentro de closures y struct-literals — RESUELTO](#3115-lint-unused-var-14-falsos-positivos-dentro-de-closures-y-struct-literals--resuelto)
   - [3.116 `sitemapXml`/`robotsTxt`: builtins declarativos para SEO — RESUELTO](#3116-sitemapxmlrobotstxt-builtins-declarativos-para-seo--resuelto)
   - [3.117 `metaTags`/`openGraphTags`/`canonicalLink`/`jsonLd`: metadata SEO clásica como helpers de `String` — RESUELTO](#3117-metatagsopengraphtagscanonicallinkjsonld-metadata-seo-clásica-como-helpers-de-string--resuelto)
+  - [3.118 `llms.txt` auto-generado por proyecto — RESUELTO](#3118-llmstxt-auto-generado-por-proyecto--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5074,6 +5075,42 @@ rpc productPage(id: Uuid) -> String {
 **Las cuatro son builtins SIN receptor** (como `sitemapXml`/`robotsTxt`/`dateFromParts`/`now`, no `crypto.X`/`json.X`) -- cableadas en los mismos cinco puntos que ese precedente: tipo en `checker.rs` (`Expr::Ident` + lista de sugerencias "quisiste decir"), y en `runtime/mod.rs`, valor `FnRef` (`Expr::Ident`), despacho directo (`Expr::Call`) y despacho indirecto vía `call_callable`. `metaTags`/`openGraphTags` son estructurales sin nombre (mismo criterio que `sitemap_url_type`/`http_header_type`) -- cualquier `type` que el programa declare con los campos exactos sirve.
 
 **Verificado**: 5 tests de tipos en `checker.rs` (acepta la forma correcta, rechaza `property` donde `metaTags` espera `name`, `canonicalLink`/`jsonLd` aceptan cualquier valor asignable a `String`/`Dynamic`) + 5 en `runtime/mod.rs` -- `metaTags` con dos entradas y contenido con comillas/`&` reales, lista vacía (`""`, nada inventado), `openGraphTags` con `property` en vez de `name`, `canonicalLink` escapando `&` en la query string, y `jsonLd` confirmando que el JSON serializado en el medio del bloque `<script>` no contiene ningún `<` literal (así que ningún `</script>` puede aparecer ahí adentro). Probado a mano además contra un servidor `linkc serve` real vía `curl`, confirmando las cuatro salidas byte a byte, incluida la mitigación de XSS de `jsonLd`.
+
+---
+
+### 3.118 `llms.txt` auto-generado por proyecto — RESUELTO
+
+Tercer y último ítem resuelto de PLAN.md §9.9. Convención [llmstxt.org](https://llmstxt.org/) -- **no confundir con el `llms.txt` de ESTE repo** (documenta el COMPILADOR c-script en sí, escrito a mano); este es el `llms.txt` que `linkc build` ahora emite para el proyecto DE QUIEN adopta el lenguaje, junto a `contract.d.ts`/`client.ts`/`validators.ts`/`hooks.ts`/`schemas.ts`/`openapi.json`. Antes de esta ronda, un agente de IA que llegaba a un proyecto c-script sin contexto previo tenía que leer el `.link` completo (o el `openapi.json` generado, mucho más verboso) para entender qué rpcs existen.
+
+```
+service Tasks {
+  /// Lista todas las tareas pendientes, ordenadas por id.
+  rpc list() -> Int { 1 }
+
+  rpc create(title: String) -> Int { 1 }
+}
+```
+
+`linkc build` de este programa emite, junto al resto de los archivos:
+
+```
+# mi_app.link
+
+> API generada automáticamente por Link (c-script). Servicios y rpcs disponibles, cada uno con su firma y (si tiene) su docstring `///`.
+
+## Tasks
+
+- [rpc list() -> Int](/Tasks/list): Lista todas las tareas pendientes, ordenadas por id.
+- [rpc create(title: String) -> Int](/Tasks/create)
+```
+
+**Un bullet por rpc/stream de cada `service`**, formato de lista de links que llmstxt.org pide (`- [nombre](url): nota`) -- la "URL" es la ruta real `/Servicio/rpc` (GRAMMAR.md §3.20) que ese rpc ya atiende: no es un GET navegable, pero sigue siendo la referencia exacta que un agente necesita para invocarlo, y evita inventar una convención de enlaces propia solo para este archivo. Cada bullet muestra la firma completa (`rpc`/`stream`, nombre, parámetros con tipo, `-> ReturnType`) resuelta por el checker (mismo `Type` que `openapi.json` usa, vía `Display`) -- así un agente ve de un vistazo qué pasar y qué esperar, sin abrir `contract.d.ts`.
+
+**El docstring `///` (§3.72) es la nota después de `:`** -- mismo dato que `openapi_emit` ya usa como `description` de cada operación, reusado tal cual (sin gramática nueva, como pedía PLAN.md §9.9). Un docstring de más de una línea aporta solo la PRIMERA como nota (llmstxt.org espera una línea por entrada); el resto del texto sigue disponible completo en `openapi.json`/`contract.d.ts` para quien necesite el detalle entero. **Un rpc/stream SIN docstring aparece igual, solo sin nota** -- omitirlo por completo escondería una capacidad real de la API, mismo criterio que `openapi_emit` ya sigue (un rpc sin `///` sigue apareciendo en `paths`, solo sin `description`).
+
+**Implementación**: `codegen::llms_txt_emit::emit_llms_txt(program, title) -> Result<String, String>` -- mismo mecanismo que `emit_openapi_json` (`Checker::build_symbols` para resolver tipos sin repetir el chequeo completo del programa), llamado desde `build_once` en `main.rs` junto al resto de los emisores, escribiendo `{outdir}/llms.txt`. `title` es el mismo `display_path` del `.link` de entrada que ya usa `openapi.json` como `info.title`.
+
+**Verificado**: 5 tests en `codegen::llms_txt_emit` -- título + una sección por `service` con un bullet por rpc, docstring como nota, docstring multi-línea aporta solo la primera línea, un rpc sin docstring sigue apareciendo sin nota, y un `stream` se etiqueta distinto de un `rpc` en la firma. Probado a mano además con `linkc build` real sobre un `.link` con dos servicios y un docstring, confirmando el archivo `llms.txt` generado byte a byte.
 
 ---
 

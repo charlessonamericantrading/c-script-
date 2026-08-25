@@ -1,3 +1,4 @@
+pub mod llms_txt_emit;
 pub mod openapi_emit;
 pub mod postgres_emit;
 pub mod ts_emit;

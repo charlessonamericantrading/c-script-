@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.81.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`llms.txt` auto-generado por proyecto.** Tercer y último ítem resuelto de PLAN.md §9.9 (SEO y descubribilidad para IA). Convención [llmstxt.org](https://llmstxt.org/) -- no confundir con el `llms.txt` de ESTE repo, que documenta el compilador a mano. `linkc build` ahora emite un `llms.txt` junto a `contract.d.ts`/`client.ts`/`validators.ts`/`hooks.ts`/`schemas.ts`/`openapi.json`: un bullet por rpc/stream de cada `service` (`- [firma](/Servicio/rpc): nota`), con la firma completa resuelta por el checker y el docstring `///` (§3.72) como nota -- mismo dato que `openapi_emit` ya usa como `description`, cero gramática nueva. Un rpc sin docstring sigue apareciendo (solo sin nota, nunca se oculta una capacidad real de la API); un docstring de más de una línea aporta solo la primera. Nuevo módulo `codegen::llms_txt_emit`, mismo mecanismo que `openapi_emit` (`Checker::build_symbols` para resolver tipos sin repetir el chequeo completo).
+
+983 tests (5 nuevos): título + una sección por `service` con un bullet por rpc, docstring como nota, docstring multi-línea aporta solo la primera línea, rpc sin docstring sigue apareciendo, `stream` etiquetado distinto de `rpc`. Verificado también a mano con `linkc build` real sobre un `.link` con dos servicios y un docstring, confirmando el archivo generado byte a byte. Detalle completo: GRAMMAR.md §3.118, PLAN.md §9.9 (queda un solo ítem abierto en la sección: ejemplos estructurados por rpc en `openapi.json`).
+
 ## [1.80.0] - 2026-08-25
 
 ### ✨ Nuevo
