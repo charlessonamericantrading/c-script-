@@ -151,6 +151,7 @@
   - [3.127 Hooks de React generados: `loading` vs `isFetching` — RESUELTO](#3127-hooks-de-react-generados-loading-vs-isfetching--resuelto)
   - [3.128 Hooks de React generados: `mutate` vs `mutateAsync` — RESUELTO](#3128-hooks-de-react-generados-mutate-vs-mutateasync--resuelto)
   - [3.129 `client.ts`: cancelar una request con `AbortSignal` — RESUELTO](#3129-clientts-cancelar-una-request-con-abortsignal--resuelto)
+  - [3.130 Hook de `stream`: `reconnect()` manual — RESUELTO](#3130-hook-de-stream-reconnect-manual--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5461,6 +5462,32 @@ controller.abort(); // cancela el fetch real, no solo ignora la respuesta
 **Alcance deliberado: solo `client.ts`, `hooks.ts` no cambia en esta ronda.** Integrar cancelación DENTRO de los hooks generados (ej. que `use{Servicio}{Rpc}Query` aborte automáticamente al desmontar, o que `refetch()` acepte un signal propio) es una decisión de diseño más grande: la entrada de cache de Query es COMPARTIDA entre instancias (§3.124) -- abortar el fetch de una instancia al desmontarse no debería cancelar la request que OTRA instancia montada sigue esperando. Resolver eso bien necesita su propio diseño, no una extensión mecánica de este ítem; mientras tanto, cualquier componente puede seguir usando `client.<rpc>(...)` directo con su propio `AbortController` fuera de los hooks, que es lo que este ítem habilita.
 
 **Verificado**: 1 test nuevo en `codegen::ts_emit` (`options?: { signal?: AbortSignal }` presente en la interfaz Y la implementación de un `rpc` sin parámetros y de un `stream`, siempre como último parámetro; `signal: options?.signal,` presente exactamente una vez por cada `fetch()` real) + todos los tests existentes que verificaban firmas exactas de métodos (`service_interface_and_rpc_signatures`, `patch_of_user_renders_as_utility_type_reference`, los de tipos genéricos `Box<T>`/`Option<T>`) actualizados a la nueva firma. Verificado también a mano contra un `linkc serve` real (`examples/taskboard`, bundle de `client.ts` vía `esbuild`, sin transpilar el resto del proyecto): abortar ANTES de que la respuesta llegue rechaza con `AbortError` real; abortar con un `setTimeout` de 1ms también; una llamada SIN `options` sigue funcionando exactamente igual que antes de esta ronda -- las tres contra el servidor real, no un mock. Alcance de lo verificado: el comportamiento del lado CLIENTE (la promesa rechaza, `signal: undefined` no rompe nada); qué hace el servidor con una conexión abortada a mitad de una query SQLite casi instantánea no es observable de forma significativa en este caso y no forma parte de esta afirmación.
+
+---
+
+### 3.130 Hook de `stream`: `reconnect()` manual — RESUELTO
+
+Sexta ronda seguida sobre TypeScript/React, auditando `use{Servicio}{Rpc}` (el hook de `stream`, el único de los tres tipos de hook que hasta ahora no tenía NINGUNA forma de recuperarse de un fallo: `use...Query` tiene `refetch()`, `use...Mutation` tiene `reset()`, pero el de `stream` solo dejaba `isConnected: false` y `error` seteado -- PARA SIEMPRE. Si la conexión SSE se corta (un blip de red, el servidor haciendo `--restart-backoff` tras perder Postgres, un despliegue que reinicia el proceso), el único camino para reconectar era desmontar y remontar el componente entero -- perdiendo de paso `data`/`latest` ya acumulados, algo que ningún consumidor real de una suscripción en vivo quiere.
+
+```tsx
+function LiveIndicator({ client }: { client: TasksClient }) {
+  const { isConnected, reconnect } = useTasksWatchTasks(client);
+  return (
+    <div>
+      {isConnected ? "Conectado" : "Desconectado"}
+      {!isConnected && <button onClick={() => reconnect()}>Reconectar</button>}
+    </div>
+  );
+}
+```
+
+**Un contador (`reconnectAttempt`, `useState(0)`) que solo importa como DEPENDENCIA del `useEffect`** -- incrementarlo re-ejecuta el efecto entero, re-suscribiéndose desde cero (nueva conexión SSE real, no un truco de estado). `reconnect()` es la función que lo incrementa, envuelta en `useCallback` igual que el resto de los hooks. `data`/`latest` NO se limpian al reconectar -- "seguir la conexión viva" no es "empezar de cero"; `error` sí se limpia, porque `run()` ya lo hacía al arrancar cada corrida (`setError(null)` al principio, sin cambios).
+
+**Manual, no automático con backoff -- mismo criterio que `refetch()`/`reset()`/`mutate()`.** Un reintento automático contra un servidor genuinamente caído (no un blip pasajero) sería un componente golpeando esa URL solo sin que nadie lo pidió; quien consume el hook decide CUÁNDO tiene sentido reconectar (ej. un botón visible solo cuando `!isConnected`, como en la demostración).
+
+**Demostración real**: `examples/taskboard/frontend/src/App.tsx` -- el indicador "Stream en Vivo" ahora muestra un botón "Reconectar" cuando `!isConnected`, llamando a `reconnect()` del hook real.
+
+**Verificado**: 1 test nuevo en `codegen::ts_emit` (`SubscriptionState<T>` expone `reconnect: () => void`; `reconnectAttempt` es dependencia real del efecto; `reconnect` incrementa el contador; el `return` del hook expone la función) + el test existente de generación de hooks (`emit_hooks_generates_queries_mutations_and_subscriptions`) sigue pasando sin cambios -- la forma pública del resto de los hooks no se tocó. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado, con `App.tsx` usando `reconnect()` de verdad, y tipando limpio con `tsc --noEmit` en modo estricto.
 
 ---
 

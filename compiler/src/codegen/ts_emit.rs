@@ -452,11 +452,20 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     out.push_str("  reset: () => void;\n");
     out.push_str("}\n\n");
 
+    // `reconnect` (GRAMMAR.md §3.130): hasta esta ronda, un `stream` que se
+    // cortaba (red caída, el servidor reinicia) dejaba `isConnected: false`
+    // y `error` seteado PARA SIEMPRE -- ninguna forma de recuperarse sin
+    // desmontar y remontar el componente entero (perdiendo `data`/`latest`
+    // acumulados de paso). Manual, no automático con backoff -- mismo
+    // criterio que `refetch()` de Query y `reset()` de Mutation: quien
+    // consume el hook decide CUÁNDO reintentar, en vez de que el hook
+    // reintente solo contra un servidor caído.
     out.push_str("export interface SubscriptionState<T> {\n");
     out.push_str("  data: T[];\n");
     out.push_str("  latest: T | null;\n");
     out.push_str("  isConnected: boolean;\n");
     out.push_str("  error: Error | null;\n");
+    out.push_str("  reconnect: () => void;\n");
     out.push_str("}\n\n");
 
     // Cache compartido entre TODAS las instancias de un mismo hook de Query
@@ -574,7 +583,15 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 out.push_str(&format!("  const [data, setData] = useState<{}[]>([]);\n", ret_str));
                 out.push_str(&format!("  const [latest, setLatest] = useState<{}>(null);\n", nullable_ret_str));
                 out.push_str("  const [isConnected, setIsConnected] = useState(false);\n");
-                out.push_str("  const [error, setError] = useState<Error | null>(null);\n\n");
+                out.push_str("  const [error, setError] = useState<Error | null>(null);\n");
+                // Contador que solo importa como DEPENDENCIA del efecto de
+                // abajo -- incrementarlo (`reconnect()`) re-ejecuta el
+                // efecto entero, re-suscribiendo desde cero. `data`/`latest`
+                // NO se limpian acá -- un reconnect es "seguir la conexión
+                // viva", no "empezar de nuevo"; `error` sí se limpia (al
+                // arrancar `run()` de nuevo, más abajo), como cualquier
+                // reintento real.
+                out.push_str("  const [reconnectAttempt, setReconnectAttempt] = useState(0);\n\n");
                 out.push_str("  useEffect(() => {\n");
                 out.push_str("    let cancelled = false;\n");
                 out.push_str("    async function run() {\n");
@@ -594,8 +611,11 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 out.push_str("    }\n");
                 out.push_str("    run();\n");
                 out.push_str("    return () => { cancelled = true; };\n");
-                out.push_str(&format!("  }}, [{}]);\n\n", deps));
-                out.push_str("  return { data, latest, isConnected, error };\n");
+                out.push_str(&format!("  }}, [{}, reconnectAttempt]);\n\n", deps));
+                out.push_str("  const reconnect = useCallback(() => {\n");
+                out.push_str("    setReconnectAttempt((a) => a + 1);\n");
+                out.push_str("  }, []);\n\n");
+                out.push_str("  return { data, latest, isConnected, error, reconnect };\n");
                 out.push_str("}\n\n");
             } else {
                 if rpc.looks_like_a_query() {
@@ -1638,6 +1658,30 @@ service Ticks {
         assert!(hooks.contains("export function useUsersCreateMutation"), "{hooks}");
         assert!(hooks.contains("export function useUsersWatch("), "{hooks}");
         assert!(hooks.contains("for await (const item of client.watch())"), "{hooks}");
+    }
+
+    /// `reconnect()` del hook de `stream` (GRAMMAR.md §3.130): gap real --
+    /// antes de esta ronda, una conexión SSE cortada (red caída, el
+    /// servidor reinicia) dejaba `isConnected: false`/`error` seteado para
+    /// SIEMPRE, sin ninguna forma de recuperarse salvo desmontar y remontar
+    /// el componente entero (perdiendo `data`/`latest` acumulados de paso).
+    #[test]
+    fn stream_hook_exposes_a_manual_reconnect() {
+        let src = r#"
+            service Ticks {
+                stream watch() -> Int { [] }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(hooks.contains("export interface SubscriptionState<T> {\n  data: T[];\n  latest: T | null;\n  isConnected: boolean;\n  error: Error | null;\n  reconnect: () => void;\n}"), "{hooks}");
+        let stream_block = hooks.split("export function useTicksWatch(").nth(1).expect("bloque del stream");
+        assert!(stream_block.contains("const [reconnectAttempt, setReconnectAttempt] = useState(0);"), "{hooks}");
+        // `reconnectAttempt` es dependencia del efecto -- incrementarlo
+        // re-ejecuta el efecto entero, re-suscribiendo desde cero.
+        assert!(stream_block.contains("}, [client, reconnectAttempt]);"), "{hooks}");
+        assert!(stream_block.contains("const reconnect = useCallback(() => {\n    setReconnectAttempt((a) => a + 1);\n  }, []);"), "{hooks}");
+        assert!(stream_block.contains("return { data, latest, isConnected, error, reconnect };"), "{hooks}");
     }
 
     /// El hook de Query (`use{Servicio}{Rpc}Query`) comparte cache entre

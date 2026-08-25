@@ -8,7 +8,7 @@ const client = createTasksClient('http://localhost:8787');
 export function App() {
   const { data: initialTasks, loading, refetch } = useTasksListQuery(client);
   const { mutate: createTask, loading: creating } = useTasksCreateMutation(client);
-  const { data: streamEvents, isConnected } = useTasksWatchTasks(client);
+  const { data: streamEvents, isConnected, reconnect } = useTasksWatchTasks(client);
 
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
@@ -79,6 +79,14 @@ export function App() {
         <div className="live-indicator">
           <span className="live-dot"></span>
           {isConnected ? 'Stream en Vivo Conectado' : 'Conectando Stream...'}
+          {/* reconnect() manual (GRAMMAR.md §3.130): si el stream se corta
+              (red caída, el servidor reinicia), esta es la única forma de
+              recuperarse sin recargar la página entera. */}
+          {!isConnected && (
+            <button onClick={() => reconnect()} style={{ marginLeft: '8px' }}>
+              Reconectar
+            </button>
+          )}
         </div>
       </header>
 

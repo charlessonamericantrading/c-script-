@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.92.0 — no editar a mano.
+// Generado automáticamente por linkc v1.93.0 — no editar a mano.
 
 import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "react";
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
@@ -23,6 +23,7 @@ export interface SubscriptionState<T> {
   latest: T | null;
   isConnected: boolean;
   error: Error | null;
+  reconnect: () => void;
 }
 
 type QueryCacheState<T> = { data: T | null; isFetching: boolean; error: Error | null };
@@ -560,6 +561,7 @@ export function useTasksWatchTasks(client: TasksClient): SubscriptionState<Task>
   const [latest, setLatest] = useState<Task | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -580,8 +582,12 @@ export function useTasksWatchTasks(client: TasksClient): SubscriptionState<Task>
     }
     run();
     return () => { cancelled = true; };
-  }, [client]);
+  }, [client, reconnectAttempt]);
 
-  return { data, latest, isConnected, error };
+  const reconnect = useCallback(() => {
+    setReconnectAttempt((a) => a + 1);
+  }, []);
+
+  return { data, latest, isConnected, error, reconnect };
 }
 

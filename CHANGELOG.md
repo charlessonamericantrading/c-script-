@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.93.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`reconnect()` manual en el hook de `stream`.** Sexta ronda seguida sobre TypeScript/React: `use{Servicio}{Rpc}Query` tiene `refetch()`, `use{Servicio}{Rpc}Mutation` tiene `reset()`, pero el hook de `stream` no tenía NINGUNA forma de recuperarse de un fallo -- una conexión SSE cortada (blip de red, el servidor reiniciando) dejaba `isConnected: false`/`error` seteado PARA SIEMPRE, sin más recurso que desmontar y remontar el componente entero, perdiendo `data`/`latest` acumulados de paso. Un contador `reconnectAttempt` (`useState(0)`) como dependencia del `useEffect` -- incrementarlo re-ejecuta el efecto entero, re-suscribiéndose desde cero con una conexión SSE real. `reconnect()` es la función que lo incrementa. `data`/`latest` NO se limpian al reconectar (seguir la conexión viva, no empezar de cero); `error` sí, como cualquier reintento. Manual, no automático con backoff -- mismo criterio que `refetch()`/`reset()`/`mutate()`: quien consume el hook decide cuándo tiene sentido reconectar.
+
+Demostrado en `examples/taskboard/frontend/src/App.tsx`: el indicador "Stream en Vivo" ahora muestra un botón "Reconectar" cuando `!isConnected`.
+
+1031 tests (1 nuevo) en `codegen::ts_emit`: `SubscriptionState<T>` expone `reconnect: () => void`, `reconnectAttempt` es dependencia real del efecto, `reconnect` lo incrementa, el `return` del hook lo expone -- el test existente de generación de hooks sigue pasando sin cambios. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado, con `App.tsx` usando `reconnect()` de verdad, y tipando limpio con `tsc --noEmit` en modo estricto. Detalle completo: GRAMMAR.md §3.130, PLAN.md §9.13.
+
 ## [1.92.0] - 2026-08-25
 
 ### ✨ Nuevo
