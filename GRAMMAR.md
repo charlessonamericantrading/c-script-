@@ -149,6 +149,7 @@
   - [3.125 Hooks de React generados: invalidación de cache tras una Mutation — RESUELTO](#3125-hooks-de-react-generados-invalidación-de-cache-tras-una-mutation--resuelto)
   - [3.126 `LinkTransportError`: el status HTTP viaja tipado, no solo en el mensaje — RESUELTO](#3126-linktransporterror-el-status-http-viaja-tipado-no-solo-en-el-mensaje--resuelto)
   - [3.127 Hooks de React generados: `loading` vs `isFetching` — RESUELTO](#3127-hooks-de-react-generados-loading-vs-isfetching--resuelto)
+  - [3.128 Hooks de React generados: `mutate` vs `mutateAsync` — RESUELTO](#3128-hooks-de-react-generados-mutate-vs-mutateasync--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5397,6 +5398,49 @@ function TaskList({ client }: { client: TasksClient }) {
 **Mutation queda deliberadamente afuera de esta ronda**: su `loading` sigue siendo un único flag (`useState`), sin distinción `isFetching` -- una mutación no tiene el concepto de "dato cacheado que sigue siendo válido mientras se recarga", cada `mutate()` es una acción disparada a mano, no un fetch automático que compita con datos ya mostrados. Si en el futuro aparece un caso real que lo amerite, es una ronda aparte.
 
 **Verificado**: 1 test nuevo en `codegen::ts_emit` (`QueryState<T>` expone `loading`+`isFetching`, `QueryCacheState<T>` interno usa `isFetching`, ningún `setQueryCacheState` escribe un `loading: true`/`loading: false` -- todo el archivo generado usa `isFetching` para ese propósito) + el test existente de cache compartido actualizado a la nueva forma del `return` (`loading: state.data === null && state.isFetching, isFetching: state.isFetching`). Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto.
+
+---
+
+### 3.128 Hooks de React generados: `mutate` vs `mutateAsync` — RESUELTO
+
+Cuarta ronda seguida sobre el mismo pedido ("sigue"), esta vez encontrando el gap directamente en la propia demostración del repo: `examples/taskboard/frontend/src/App.tsx`, `handleCreate`, hacía `await createTask(input)` (el `mutate` de `useTasksCreateMutation`) SIN ningún `try`/`catch` alrededor -- el uso más natural posible del hook. Hasta esta ronda, `mutate` SIEMPRE relanzaba (`throw`) el error de la mutación, así que un fallo real (red caída, validación del servidor, lo que sea) producía una promesa rechazada sin manejar -- visible en consola como *"Uncaught (in promise)"* -- pese a que el hook YA exponía ese mismo error en su propio estado (`error`), la forma pensada para enterarse sin necesitar `try`/`catch` a mano.
+
+```tsx
+// Antes: mutate() siempre relanzaba -- este handler nunca atrapaba el error.
+async function handleCreate() {
+  await createTask(input); // <- fallo real = "Uncaught (in promise)" en consola
+  setTitle('');
+}
+```
+
+```tsx
+// Ahora: mutate() nunca relanza -- devuelve null en el fallo (error ya
+// quedó en el estado del hook), mismo patrón que refetch() de Query.
+async function handleCreate() {
+  const created = await createTask(input);
+  if (!created) return; // fallo real: error ya está en el estado, sin excepción sin manejar
+  setTitle('');
+}
+
+// Para quien SÍ quiere try/catch a mano (ej. lógica de reintento propia):
+async function handleCreateStrict() {
+  try {
+    await mutateAsync(input);
+  } catch (err) {
+    // ...
+  }
+}
+```
+
+**Dos funciones, mismo nombre que react-query usa para la misma distinción** -- no es un término inventado, es la convención que cualquiera que ya conozca esa librería reconoce de inmediato. `mutateAsync` es la función original (renombrada, sin cambios de comportamiento): arma su propio `requestId` (guarda de "solo la respuesta más reciente gana", §3.123), setea `loading`/`data`/`error`, corre `@invalidates` en el camino de éxito (§3.125), y **relanza** en el camino de error. `mutate` es un wrapper nuevo y chico que llama a `mutateAsync` adentro de un `try`/`catch` propio: en éxito devuelve el valor tal cual, en fallo devuelve `null` -- exactamente el mismo patrón que `refetch()` del hook de Query (§3.124) ya usa para lo mismo, ahora consistente entre los dos hooks.
+
+**`MutationState<T>` (la interfaz, `data`/`loading`/`error`/`reset`) no cambia** -- el cambio vive en la intersección de tipos que cada hook de Mutation devuelve, agregando `mutateAsync` al lado de `mutate` con su tipo de retorno ajustado (`Promise<T | null>` para `mutate`, `Promise<T>` para `mutateAsync`).
+
+**Gap adyacente encontrado y cerrado de paso, real en el propio `examples/taskboard`**: al escribir el test de `mutate`/`mutateAsync` sobre un rpc con retorno YA opcional (`T?`) apareció `Promise<Task | null | null>` -- un `| null` agregado a mano sobre un `ret_str` que YA terminaba en `| null` (`getById(id: Int) -> Task?`, presente en el propio `taskboard.link`). Compilaba igual en TS (las uniones se aplanan), pero el `hooks.ts` generado quedaba con ese texto redundante en CUATRO lugares distintos: el `data` de Mutation, el `mutate`/`mutateAsync` de Mutation, el `refetch()` de Query, y el `latest` de un `stream` cuyo item es opcional. Los cuatro compartían el mismo patrón de bug (`format!("{ret_str} | null")` sin chequear si `ret_str` ya terminaba así) -- unificado en una única variable `nullable_ret_str`, calculada una vez por rpc/stream y reusada en los cuatro sitios, para que no puedan volver a desincronizarse entre sí.
+
+**Demostración real**: `examples/taskboard/frontend/src/App.tsx`, `handleCreate`, actualizado al patrón nuevo -- chequea el `null` de `mutate()` antes de limpiar el formulario/refrescar, en vez de depender de una excepción que nunca la iba a interrumpir.
+
+**Verificado**: 2 tests nuevos en `codegen::ts_emit` (la firma pública expone las dos funciones con los tipos de retorno correctos, `mutateAsync` sigue relanzando sin cambios, `mutate` envuelve a `mutateAsync` y devuelve `null` en el `catch`; y el fix de `nullable_ret_str` -- ningún `| null | null` en todo el archivo generado, verificado sobre una Mutation, una Query y un `stream`, los tres con retorno/item opcional) + los dos tests existentes de Mutation (`@invalidates` en el camino de éxito, guarda de `requestIdRef`/`reset`) siguen pasando sin cambios -- viven todos dentro de `mutateAsync`, que no cambió de comportamiento. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto, con `getById` (retorno opcional real) confirmando que `Task | null | null` desapareció del `hooks.ts` generado, y `App.tsx` usando la firma nueva de `mutate`.
 
 ---
 

@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.91.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`mutate` vs `mutateAsync` en `use{Servicio}{Rpc}Mutation`.** Cuarta ronda seguida sobre TypeScript/React, esta vez encontrando el gap directamente en la propia demostración del repo: `examples/taskboard/frontend/src/App.tsx`, `handleCreate`, hacía `await createTask(input)` (el `mutate` del hook) SIN try/catch -- el uso más natural. `mutate` SIEMPRE relanzaba, así que un fallo real producía una promesa rechazada sin manejar ("Uncaught (in promise)" en consola), pese a que `error` YA quedaba en el estado del hook. `mutateAsync` (mismo nombre que react-query usa para el mismo contrato) es ahora la función que relanza, para quien de verdad quiere `try`/`catch` a mano; `mutate` pasa a ser un wrapper que nunca relanza -- devuelve `null` en el fallo, mismo patrón que `refetch()` de Query ya usaba. `MutationState<T>` no cambia; el cambio vive en la intersección de tipos que cada hook devuelve. `App.tsx` actualizado al patrón nuevo.
+
+### 🐛 Arreglado
+- **`hooks.ts` generado no duplica `| null` en un retorno ya opcional.** De paso, escribiendo el test de `mutate`/`mutateAsync` sobre un rpc con retorno YA opcional (`T?`) apareció `Promise<Task | null | null>` -- real en el propio `taskboard.link` (`getById(id) -> Task?`). Compilaba igual en TS (las uniones se aplanan) pero el archivo generado quedaba con texto redundante en CUATRO lugares: `data`/`mutate`/`mutateAsync` de Mutation, `refetch()` de Query, y `latest` de un `stream` con item opcional -- los cuatro compartían el mismo bug (agregar `| null` a mano sin chequear si el tipo ya terminaba así). Unificado en una sola variable `nullable_ret_str`, calculada una vez por rpc/stream y reusada en los cuatro sitios.
+
+1029 tests (2 nuevos) en `codegen::ts_emit`: la firma pública de Mutation expone las dos funciones con los tipos de retorno correctos, `mutateAsync` sigue relanzando sin cambios, `mutate` devuelve `null` en el `catch`; y ningún `| null | null` en todo el archivo generado, verificado sobre una Mutation, una Query y un `stream`, los tres con retorno/item opcional. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado y tipando limpio con `tsc --noEmit` en modo estricto, con `getById` confirmando que el texto redundante desapareció. Detalle completo: GRAMMAR.md §3.128, PLAN.md §9.13.
+
 ## [1.90.0] - 2026-08-25
 
 ### ✨ Nuevo

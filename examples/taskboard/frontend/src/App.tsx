@@ -47,7 +47,11 @@ export function App() {
       assigneeEmail: null,
     };
 
-    await createTask(input);
+    // `mutate` nunca relanza (GRAMMAR.md §3.128) -- devuelve `null` en el
+    // fallo, ya reflejado en `error` del hook; sin este chequeo, un fallo
+    // de creación limpiaría el formulario igual, como si hubiera salido bien.
+    const created = await createTask(input);
+    if (!created) return;
     setTitle('');
     setDescription('');
     refetch();

@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.90.0 — no editar a mano.
+// Generado automáticamente por linkc v1.91.0 — no editar a mano.
 
 import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "react";
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
@@ -104,14 +104,15 @@ export function useTasksListQuery(client: TasksClient, options?: { enabled?: boo
 }
 
 export function useTasksListMutation(client: TasksClient): MutationState<Task[]> & {
-  mutate: () => Promise<Task[]>;
+  mutate: () => Promise<Task[] | null>;
+  mutateAsync: () => Promise<Task[]>;
 } {
   const [data, setData] = useState<Task[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const requestIdRef = useRef(0);
 
-  const mutate = useCallback(async (): Promise<Task[]> => {
+  const mutateAsync = useCallback(async (): Promise<Task[]> => {
     const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
@@ -128,6 +129,14 @@ export function useTasksListMutation(client: TasksClient): MutationState<Task[]>
     }
   }, [client]);
 
+  const mutate = useCallback(async (): Promise<Task[] | null> => {
+    try {
+      return await mutateAsync();
+    } catch {
+      return null;
+    }
+  }, [mutateAsync]);
+
   const reset = useCallback(() => {
     requestIdRef.current++;
     setData(null);
@@ -135,7 +144,7 @@ export function useTasksListMutation(client: TasksClient): MutationState<Task[]>
     setError(null);
   }, []);
 
-  return { mutate, data, loading, error, reset };
+  return { mutate, mutateAsync, data, loading, error, reset };
 }
 
 export function useTasksGetByIdQuery(client: TasksClient, id: number, options?: { enabled?: boolean }): QueryState<Task | null> {
@@ -150,7 +159,7 @@ export function useTasksGetByIdQuery(client: TasksClient, id: number, options?: 
   const getSnapshot = useCallback(() => entry.state, [entry]);
   const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
-  const refetch = useCallback(async (): Promise<Task | null | null> => {
+  const refetch = useCallback(async (): Promise<Task | null> => {
     if (!entry.promise) {
       setQueryCacheState(entry, { isFetching: true, error: null });
       entry.promise = client.getById(id)
@@ -185,13 +194,14 @@ export function useTasksGetByIdQuery(client: TasksClient, id: number, options?: 
 
 export function useTasksGetByIdMutation(client: TasksClient): MutationState<Task | null> & {
   mutate: (id: number) => Promise<Task | null>;
+  mutateAsync: (id: number) => Promise<Task | null>;
 } {
-  const [data, setData] = useState<Task | null | null>(null);
+  const [data, setData] = useState<Task | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const requestIdRef = useRef(0);
 
-  const mutate = useCallback(async (id: number): Promise<Task | null> => {
+  const mutateAsync = useCallback(async (id: number): Promise<Task | null> => {
     const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
@@ -208,6 +218,14 @@ export function useTasksGetByIdMutation(client: TasksClient): MutationState<Task
     }
   }, [client]);
 
+  const mutate = useCallback(async (id: number): Promise<Task | null> => {
+    try {
+      return await mutateAsync(id);
+    } catch {
+      return null;
+    }
+  }, [mutateAsync]);
+
   const reset = useCallback(() => {
     requestIdRef.current++;
     setData(null);
@@ -215,18 +233,19 @@ export function useTasksGetByIdMutation(client: TasksClient): MutationState<Task
     setError(null);
   }, []);
 
-  return { mutate, data, loading, error, reset };
+  return { mutate, mutateAsync, data, loading, error, reset };
 }
 
 export function useTasksCreateMutation(client: TasksClient): MutationState<Task> & {
-  mutate: (input: NewTask) => Promise<Task>;
+  mutate: (input: NewTask) => Promise<Task | null>;
+  mutateAsync: (input: NewTask) => Promise<Task>;
 } {
   const [data, setData] = useState<Task | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const requestIdRef = useRef(0);
 
-  const mutate = useCallback(async (input: NewTask): Promise<Task> => {
+  const mutateAsync = useCallback(async (input: NewTask): Promise<Task> => {
     const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
@@ -246,6 +265,14 @@ export function useTasksCreateMutation(client: TasksClient): MutationState<Task>
     }
   }, [client]);
 
+  const mutate = useCallback(async (input: NewTask): Promise<Task | null> => {
+    try {
+      return await mutateAsync(input);
+    } catch {
+      return null;
+    }
+  }, [mutateAsync]);
+
   const reset = useCallback(() => {
     requestIdRef.current++;
     setData(null);
@@ -253,18 +280,19 @@ export function useTasksCreateMutation(client: TasksClient): MutationState<Task>
     setError(null);
   }, []);
 
-  return { mutate, data, loading, error, reset };
+  return { mutate, mutateAsync, data, loading, error, reset };
 }
 
 export function useTasksUpdateMutation(client: TasksClient): MutationState<Task> & {
-  mutate: (id: number, patch: Patch<Task>) => Promise<Task>;
+  mutate: (id: number, patch: Patch<Task>) => Promise<Task | null>;
+  mutateAsync: (id: number, patch: Patch<Task>) => Promise<Task>;
 } {
   const [data, setData] = useState<Task | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const requestIdRef = useRef(0);
 
-  const mutate = useCallback(async (id: number, patch: Patch<Task>): Promise<Task> => {
+  const mutateAsync = useCallback(async (id: number, patch: Patch<Task>): Promise<Task> => {
     const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
@@ -284,6 +312,14 @@ export function useTasksUpdateMutation(client: TasksClient): MutationState<Task>
     }
   }, [client]);
 
+  const mutate = useCallback(async (id: number, patch: Patch<Task>): Promise<Task | null> => {
+    try {
+      return await mutateAsync(id, patch);
+    } catch {
+      return null;
+    }
+  }, [mutateAsync]);
+
   const reset = useCallback(() => {
     requestIdRef.current++;
     setData(null);
@@ -291,18 +327,19 @@ export function useTasksUpdateMutation(client: TasksClient): MutationState<Task>
     setError(null);
   }, []);
 
-  return { mutate, data, loading, error, reset };
+  return { mutate, mutateAsync, data, loading, error, reset };
 }
 
 export function useTasksRemoveMutation(client: TasksClient): MutationState<boolean> & {
-  mutate: (id: number) => Promise<boolean>;
+  mutate: (id: number) => Promise<boolean | null>;
+  mutateAsync: (id: number) => Promise<boolean>;
 } {
   const [data, setData] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const requestIdRef = useRef(0);
 
-  const mutate = useCallback(async (id: number): Promise<boolean> => {
+  const mutateAsync = useCallback(async (id: number): Promise<boolean> => {
     const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
@@ -322,6 +359,14 @@ export function useTasksRemoveMutation(client: TasksClient): MutationState<boole
     }
   }, [client]);
 
+  const mutate = useCallback(async (id: number): Promise<boolean | null> => {
+    try {
+      return await mutateAsync(id);
+    } catch {
+      return null;
+    }
+  }, [mutateAsync]);
+
   const reset = useCallback(() => {
     requestIdRef.current++;
     setData(null);
@@ -329,7 +374,7 @@ export function useTasksRemoveMutation(client: TasksClient): MutationState<boole
     setError(null);
   }, []);
 
-  return { mutate, data, loading, error, reset };
+  return { mutate, mutateAsync, data, loading, error, reset };
 }
 
 export function useTasksListByColumnQuery(client: TasksClient, col: ColumnId, options?: { enabled?: boolean }): QueryState<Task[]> {
@@ -378,14 +423,15 @@ export function useTasksListByColumnQuery(client: TasksClient, col: ColumnId, op
 }
 
 export function useTasksListByColumnMutation(client: TasksClient): MutationState<Task[]> & {
-  mutate: (col: ColumnId) => Promise<Task[]>;
+  mutate: (col: ColumnId) => Promise<Task[] | null>;
+  mutateAsync: (col: ColumnId) => Promise<Task[]>;
 } {
   const [data, setData] = useState<Task[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const requestIdRef = useRef(0);
 
-  const mutate = useCallback(async (col: ColumnId): Promise<Task[]> => {
+  const mutateAsync = useCallback(async (col: ColumnId): Promise<Task[]> => {
     const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
@@ -402,6 +448,14 @@ export function useTasksListByColumnMutation(client: TasksClient): MutationState
     }
   }, [client]);
 
+  const mutate = useCallback(async (col: ColumnId): Promise<Task[] | null> => {
+    try {
+      return await mutateAsync(col);
+    } catch {
+      return null;
+    }
+  }, [mutateAsync]);
+
   const reset = useCallback(() => {
     requestIdRef.current++;
     setData(null);
@@ -409,7 +463,7 @@ export function useTasksListByColumnMutation(client: TasksClient): MutationState
     setError(null);
   }, []);
 
-  return { mutate, data, loading, error, reset };
+  return { mutate, mutateAsync, data, loading, error, reset };
 }
 
 export function useTasksStatsQuery(client: TasksClient, options?: { enabled?: boolean }): QueryState<BoardStats> {
@@ -458,14 +512,15 @@ export function useTasksStatsQuery(client: TasksClient, options?: { enabled?: bo
 }
 
 export function useTasksStatsMutation(client: TasksClient): MutationState<BoardStats> & {
-  mutate: () => Promise<BoardStats>;
+  mutate: () => Promise<BoardStats | null>;
+  mutateAsync: () => Promise<BoardStats>;
 } {
   const [data, setData] = useState<BoardStats | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const requestIdRef = useRef(0);
 
-  const mutate = useCallback(async (): Promise<BoardStats> => {
+  const mutateAsync = useCallback(async (): Promise<BoardStats> => {
     const requestId = ++requestIdRef.current;
     setLoading(true);
     setError(null);
@@ -482,6 +537,14 @@ export function useTasksStatsMutation(client: TasksClient): MutationState<BoardS
     }
   }, [client]);
 
+  const mutate = useCallback(async (): Promise<BoardStats | null> => {
+    try {
+      return await mutateAsync();
+    } catch {
+      return null;
+    }
+  }, [mutateAsync]);
+
   const reset = useCallback(() => {
     requestIdRef.current++;
     setData(null);
@@ -489,7 +552,7 @@ export function useTasksStatsMutation(client: TasksClient): MutationState<BoardS
     setError(null);
   }, []);
 
-  return { mutate, data, loading, error, reset };
+  return { mutate, mutateAsync, data, loading, error, reset };
 }
 
 export function useTasksWatchTasks(client: TasksClient): SubscriptionState<Task> {

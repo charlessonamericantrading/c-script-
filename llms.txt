@@ -38,6 +38,7 @@ Works, verified by running it:
 - `@invalidates(rpc1, rpc2, ...)` on a Mutation rpc clears the named sibling Queries' cache entries (reset to `data: null` + listener notification, not an active refetch) after `mutate()` succeeds — the Query hook's existing auto-fetch effect (see §3.124 above) picks it up from there. Targets must be a Query-shaped rpc in the same `service`, never a `stream`; checked by the same `RpcDecl::looks_like_a_query()` heuristic the codegen itself uses, so checker and codegen can't disagree about what counts as a Query. Cache matching is by key PREFIX — invalidating `search` clears every cached `search(...)` call regardless of params, since a Mutation can't know in advance which ones it affected. `examples/taskboard/backend/taskboard.link`'s `create`/`update`/`remove` mutations demonstrate it against `list`/`listByColumn`/`stats`. See GRAMMAR.md §3.125.
 - `LinkTransportError` (thrown by `client.ts` for a transport failure — network down, 5xx, timeout, any `!res.ok`) carries a typed `status: number` property, not just the HTTP status interpolated into the message string — `error instanceof LinkTransportError && error.status === 401` works without parsing anything. See GRAMMAR.md §3.126.
 - `use{Service}{Rpc}Query` distinguishes `loading` (true ONLY on the first fetch, no data yet) from `isFetching` (true on ANY fetch in flight, including a background `refetch()` over an already-cached entry) — a naive `if (loading) return <Spinner/>` no longer hides a list that's already showing valid data every time it refreshes. `loading` is derived (`data === null && isFetching`), not a separate flag, so the two can never disagree. See GRAMMAR.md §3.127.
+- `use{Service}{Rpc}Mutation` returns both `mutate` (never throws — returns `null` on failure, the error is already in the hook's `error` state) and `mutateAsync` (throws, for callers that want `try`/`catch` themselves) — same naming react-query uses for the same distinction. Prevents an unhandled promise rejection on the most natural call site (`await mutate(input)` with no surrounding try/catch). See GRAMMAR.md §3.128.
 - `linkc serve` — real HTTP server, embedded SQLite that persists across restarts, SSE streams.
 - `linkc test` — runs `test "..."` blocks against an isolated in-memory database.
 - `linkc dev`, `linkc lint`, `linkc doc`, `linkc docker`, `linkc systemd`, `linkc pm2-config`, `linkc lsp`, `linkc new`, `linkc --help`.
@@ -269,7 +270,7 @@ linkc serve backend.link 8787 --restart-backoff 1s  # native exponential backoff
 linkc serve-all ./services --port-base 3000  # one process serves every .link in ./services, one thread+port each
 linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json  # write {"name": port, ...} before serving
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
-linkc --version                      # linkc 1.90.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.91.0 -- same version stamped in every generated file
 ```
 
 ## Verified example

@@ -524,6 +524,19 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
         for (rpc, is_stream, param_tys, ret_ty) in members {
             let cap_rpc = capitalize(&rpc.name);
             let ret_str = render_type(&ret_ty);
+            // `ret_str` YA termina en " | null" cuando el rpc devuelve un
+            // tipo opcional (`T?`, `Type::Optional` en `render_type`) --
+            // reusar esto en cada lugar que necesita "el tipo de retorno,
+            // nullable" (el `latest` de un stream, el `refetch()` de Query,
+            // el `data`/`mutate()` de Mutation) evita el redundante `T |
+            // null | null` que aparecía antes de esta ronda -- compilaba
+            // igual en TS, pero era confuso de leer en el `hooks.ts`
+            // generado. GRAMMAR.md §3.128.
+            let nullable_ret_str = if ret_str.ends_with(" | null") {
+                ret_str.clone()
+            } else {
+                format!("{ret_str} | null")
+            };
             let params_typed: Vec<String> = rpc
                 .params
                 .iter()
@@ -556,7 +569,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     service = service.name
                 ));
                 out.push_str(&format!("  const [data, setData] = useState<{}[]>([]);\n", ret_str));
-                out.push_str(&format!("  const [latest, setLatest] = useState<{} | null>(null);\n", ret_str));
+                out.push_str(&format!("  const [latest, setLatest] = useState<{}>(null);\n", nullable_ret_str));
                 out.push_str("  const [isConnected, setIsConnected] = useState(false);\n");
                 out.push_str("  const [error, setError] = useState<Error | null>(null);\n\n");
                 out.push_str("  useEffect(() => {\n");
@@ -627,7 +640,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     // `error` y se actualicen juntas cuando cualquiera de
                     // las dos llama a `refetch`.
                     out.push_str("  const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);\n\n");
-                    out.push_str(&format!("  const refetch = useCallback(async (): Promise<{ret_str} | null> => {{\n"));
+                    out.push_str(&format!("  const refetch = useCallback(async (): Promise<{nullable_ret_str}> => {{\n"));
                     // Dedupe real: si YA hay una request en vuelo para esta
                     // clave (disparada por esta instancia, por OTRA
                     // instancia del mismo hook, o por el `useEffect` de
@@ -678,22 +691,38 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 }
 
                 // Mutation hook
+                //
+                // `mutate` vs `mutateAsync` (GRAMMAR.md §3.128): antes de
+                // esta ronda había una sola función, `mutate`, que SIEMPRE
+                // relanzaba (`throw`) el error -- exactamente el caso real
+                // de `examples/taskboard/frontend/src/App.tsx` (`await
+                // createTask(input)`, sin try/catch alrededor): un fallo de
+                // red o de validación producía una promesa rechazada sin
+                // manejar, visible en consola como "Uncaught (in promise)",
+                // pese a que `error` YA quedaba seteado en el estado del
+                // hook -- la forma "correcta" de enterarse. `mutateAsync`
+                // (el nombre que react-query usa para el mismo contrato) es
+                // ahora esa función que relanza, para quien de verdad
+                // necesita `await`/`try`/`catch` a mano; `mutate` pasa a ser
+                // un wrapper que nunca relanza -- devuelve `null` en el
+                // fallo, mismo patrón que `refetch()` del hook de Query
+                // (§3.124) ya usa para lo mismo.
                 out.push_str(&format!(
-                    "export function use{service}{cap_rpc}Mutation(client: {service}Client): MutationState<{ret_str}> & {{\n  mutate: ({params}) => Promise<{ret_str}>;\n}} {{\n",
+                    "export function use{service}{cap_rpc}Mutation(client: {service}Client): MutationState<{ret_str}> & {{\n  mutate: ({params}) => Promise<{nullable_ret_str}>;\n  mutateAsync: ({params}) => Promise<{ret_str}>;\n}} {{\n",
                     service = service.name,
                     params = params_typed.join(", ")
                 ));
-                out.push_str(&format!("  const [data, setData] = useState<{} | null>(null);\n", ret_str));
+                out.push_str(&format!("  const [data, setData] = useState<{}>(null);\n", nullable_ret_str));
                 out.push_str("  const [loading, setLoading] = useState(false);\n");
                 out.push_str("  const [error, setError] = useState<Error | null>(null);\n");
                 // Misma guarda de "solo la respuesta más reciente gana" que
                 // el hook de Query -- un doble click en un botón de submit
-                // dispara dos `mutate()` casi juntos, y sin esto la
+                // dispara dos `mutateAsync()` casi juntos, y sin esto la
                 // respuesta más LENTA de las dos puede resolver después y
                 // pisar `data`/`error` con el resultado de la llamada vieja.
                 out.push_str("  const requestIdRef = useRef(0);\n\n");
                 out.push_str(&format!(
-                    "  const mutate = useCallback(async ({}): Promise<{}> => {{\n",
+                    "  const mutateAsync = useCallback(async ({}): Promise<{}> => {{\n",
                     params_typed.join(", "),
                     ret_str
                 ));
@@ -722,9 +751,23 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 out.push_str("      if (requestIdRef.current === requestId) setLoading(false);\n");
                 out.push_str("    }\n");
                 out.push_str("  }, [client]);\n\n");
+                out.push_str(&format!(
+                    "  const mutate = useCallback(async ({}): Promise<{}> => {{\n",
+                    params_typed.join(", "),
+                    nullable_ret_str
+                ));
+                out.push_str("    try {\n");
+                out.push_str(&format!("      return await mutateAsync({});\n", param_names.join(", ")));
+                out.push_str("    } catch {\n");
+                // El error YA quedó en el estado (`error`, seteado dentro de
+                // `mutateAsync` de arriba) -- `mutate` no necesita hacer
+                // nada más que no relanzar.
+                out.push_str("      return null;\n");
+                out.push_str("    }\n");
+                out.push_str("  }, [mutateAsync]);\n\n");
                 out.push_str("  const reset = useCallback(() => {\n");
-                // Invalida cualquier `mutate()` que siga en vuelo -- sin
-                // esto, una respuesta tardía de ANTES del reset podría
+                // Invalida cualquier `mutateAsync()` que siga en vuelo --
+                // sin esto, una respuesta tardía de ANTES del reset podría
                 // llegar después y pisar el estado recién limpiado con el
                 // resultado de la llamada vieja.
                 out.push_str("    requestIdRef.current++;\n");
@@ -732,7 +775,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 out.push_str("    setLoading(false);\n");
                 out.push_str("    setError(null);\n");
                 out.push_str("  }, []);\n\n");
-                out.push_str("  return { mutate, data, loading, error, reset };\n");
+                out.push_str("  return { mutate, mutateAsync, data, loading, error, reset };\n");
                 out.push_str("}\n\n");
             }
         }
@@ -1660,6 +1703,80 @@ type User = { id: Int, name: String }
         // nada que valga la pena refrescar.
         let catch_block = mutation_block.split("} catch").nth(1).unwrap().split("} finally").next().unwrap();
         assert!(!catch_block.contains("invalidateQueryCache"), "{hooks}");
+    }
+
+    /// `mutate` vs `mutateAsync` (GRAMMAR.md §3.128): gap real encontrado en
+    /// `examples/taskboard/frontend/src/App.tsx` (`await createTask(input)`
+    /// sin try/catch) -- antes de esta ronda `mutate` SIEMPRE relanzaba,
+    /// produciendo una promesa rechazada sin manejar en el caso de uso más
+    /// natural. `mutateAsync` es ahora la función que relanza (para quien
+    /// de verdad quiere `try`/`catch` a mano); `mutate` nunca relanza --
+    /// devuelve `null` en el fallo, mismo patrón que `refetch()` del hook
+    /// de Query.
+    #[test]
+    fn mutate_never_throws_while_mutate_async_does() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            service Users {
+                rpc create(name: String) -> User { User { id: 1, name: name } }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        // Firma pública: las dos funciones, con los tipos de retorno que
+        // dejan clara la diferencia (`| null` vs. no).
+        assert!(
+            hooks.contains(
+                "export function useUsersCreateMutation(client: UsersClient): MutationState<User> & {\n  mutate: (name: string) => Promise<User | null>;\n  mutateAsync: (name: string) => Promise<User>;\n} {"
+            ),
+            "{hooks}"
+        );
+        let mutation_block = hooks.split("export function useUsersCreateMutation").nth(1).expect("bloque de la mutación");
+        // `mutateAsync` sigue relanzando -- sin cambios de comportamiento
+        // para quien ya lo consumía como `mutate` antes de esta ronda.
+        assert!(mutation_block.contains("const mutateAsync = useCallback(async (name: string): Promise<User> => {"), "{hooks}");
+        assert!(mutation_block.contains("throw e;"), "{hooks}");
+        // `mutate` envuelve a `mutateAsync`, nunca relanza.
+        assert!(mutation_block.contains("const mutate = useCallback(async (name: string): Promise<User | null> => {"), "{hooks}");
+        assert!(mutation_block.contains("return await mutateAsync(name);"), "{hooks}");
+        assert!(mutation_block.contains("} catch {\n      return null;\n    }"), "{hooks}");
+        assert!(mutation_block.contains("return { mutate, mutateAsync, data, loading, error, reset };"), "{hooks}");
+    }
+
+    /// `mutate`/`data`/`refetch`/`latest` sobre un rpc con retorno YA
+    /// opcional (`T?`, `render_type` devuelve `T | null`) no deben duplicar
+    /// el `| null` -- `Promise<T | null | null>` compila igual en TS pero es
+    /// redundante y confuso de leer; `nullable_ret_str` en el emisor evita
+    /// agregarlo dos veces, compartido entre Query/Mutation/stream.
+    #[test]
+    fn mutate_does_not_double_up_null_when_the_rpc_return_type_is_already_optional() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            service Users {
+                rpc claim(id: Int) -> User? { null }
+                rpc getById(id: Int) -> User? { null }
+            }
+            service Ticks {
+                stream watch() -> Int? { [] }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(!hooks.contains("| null | null"), "{hooks}");
+        assert!(
+            hooks.contains(
+                "export function useUsersClaimMutation(client: UsersClient): MutationState<User | null> & {\n  mutate: (id: number) => Promise<User | null>;\n  mutateAsync: (id: number) => Promise<User | null>;\n} {"
+            ),
+            "{hooks}"
+        );
+        let mutation_block = hooks.split("export function useUsersClaimMutation").nth(1).expect("bloque de la mutación");
+        assert!(mutation_block.contains("const mutate = useCallback(async (id: number): Promise<User | null> => {"), "{hooks}");
+        // El hook de Query sobre el mismo tipo de retorno opcional -- su
+        // `refetch()` tiene el mismo problema potencial.
+        let query_block = hooks.split("export function useUsersGetByIdQuery").nth(1).expect("bloque de la query");
+        assert!(query_block.contains("const refetch = useCallback(async (): Promise<User | null> => {"), "{hooks}");
+        // El hook de stream sobre un item opcional -- `latest` también.
+        assert!(hooks.contains("const [latest, setLatest] = useState<number | null>(null);"), "{hooks}");
     }
 
     /// Sin ningún `@invalidates` en el programa, `invalidateQueryCache` no
