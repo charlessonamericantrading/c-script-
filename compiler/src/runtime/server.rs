@@ -1003,7 +1003,8 @@ fn check_auth_gate(
         | Annotation::RateLimit(_)
         | Annotation::Deprecated(_)
         | Annotation::CacheControl(_)
-        | Annotation::Example { .. } => Ok(()),
+        | Annotation::Example { .. }
+        | Annotation::Invalidates(_) => Ok(()),
     }
 }
 

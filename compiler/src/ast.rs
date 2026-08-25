@@ -434,6 +434,35 @@ impl RpcDecl {
             _ => None,
         })
     }
+
+    /// Nombres de `@invalidates(rpc1, rpc2, ...)`, si hay (GRAMMAR.md
+    /// §3.125) -- rpcs de la MISMA `service` cuyo cache de Query se limpia
+    /// después de que este rpc (un Mutation) tiene éxito.
+    pub fn invalidates(&self) -> Option<&[String]> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::Invalidates(names) => Some(names.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// Mismo heurístico "nombre por forma" en UN solo lugar -- lo usan
+    /// `codegen::ts_emit::emit_hooks` (para decidir si un rpc genera un
+    /// hook `use...Query`) Y `checker::check_invalidates_annotation` (para
+    /// validar que `@invalidates` solo nombre rpcs que de verdad tienen una
+    /// entrada de cache que invalidar, GRAMMAR.md §3.125) -- duplicarlo en
+    /// los dos lugares habría sido exactamente la clase de divergencia
+    /// entre dos copias del mismo código que este proyecto evita desde
+    /// GRAMMAR.md §3.9. Un rpc sin parámetros también cuenta como Query, no
+    /// hay forma más segura de mutar sin nada que pasarle.
+    pub fn looks_like_a_query(&self) -> bool {
+        self.name.starts_with("get")
+            || self.name.starts_with("list")
+            || self.name.starts_with("find")
+            || self.name.starts_with("search")
+            || self.name.starts_with("read")
+            || self.name.starts_with("fetch")
+            || self.params.is_empty()
+    }
 }
 
 /// Anotaciones de un rpc/stream. Se permiten varias, pero no cualquier
@@ -482,6 +511,15 @@ pub enum Annotation {
     /// parser); ambas son independientes -- un rpc sin parámetros solo
     /// puede declarar `response`.
     Example { request: Option<Box<Spanned<Expr>>>, response: Option<Box<Spanned<Expr>>> },
+    /// `@invalidates(list, search)` (GRAMMAR.md §3.125) -- nombres de rpcs
+    /// de la MISMA `service` (identificadores sueltos, no `Enum.Variante`
+    /// como `@requires`) cuyo cache de Query se limpia en el frontend
+    /// generado después de que ESTE rpc (siempre un Mutation en la
+    /// práctica) resuelve con éxito. El checker valida que cada nombre sea
+    /// un rpc real del mismo service que además genere un hook de Query
+    /// (`RpcDecl::looks_like_a_query`) -- nombrar algo que no tiene cache
+    /// de Query no invalidaría nada.
+    Invalidates(Vec<String>),
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

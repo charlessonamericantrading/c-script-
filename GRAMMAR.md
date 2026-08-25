@@ -146,6 +146,7 @@
   - [3.122 `--log-format`/`--log-level`: logging estructurado JSON y nivel configurable — RESUELTO](#3122---log-format---log-level-logging-estructurado-json-y-nivel-configurable--resuelto)
   - [3.123 Hooks de React generados: guarda contra respuestas fuera de orden — RESUELTO](#3123-hooks-de-react-generados-guarda-contra-respuestas-fuera-de-orden--resuelto)
   - [3.124 Hooks de React generados: cache compartido entre instancias — RESUELTO](#3124-hooks-de-react-generados-cache-compartido-entre-instancias--resuelto)
+  - [3.125 Hooks de React generados: invalidación de cache tras una Mutation — RESUELTO](#3125-hooks-de-react-generados-invalidación-de-cache-tras-una-mutation--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -5271,6 +5272,66 @@ function Sidebar({ client }: { client: TasksClient }) {
 **Alcance deliberado, documentado**: (1) el cache es por rpc+parámetros, NO por instancia de `client` -- si la misma app usa dos `client`s distintos contra el mismo rpc (multi-tenant, poco común) comparten cache igual; el caso real de todos los ejemplos del repo es un `client` único por app. (2) SIN invalidación automática después de una `Mutation` -- `useUsersCreateMutation` no sabe hoy que existe un `useUsersListQuery` que debería refrescar tras crear un usuario; cada componente sigue siendo responsable de llamar a `refetch()` a mano donde corresponda tras una mutación exitosa (mismo patrón que ya usa `examples/taskboard/frontend/src/App.tsx`). Automatizar eso necesitaría una forma de declarar qué Query invalida cada Mutation -- fuera de esta ronda. (3) `Mutation` NO comparte cache -- una mutación es una acción, no un dato para leer desde varios lugares a la vez, así que sigue con el `useState` local + guarda de `requestIdRef` de §3.123 sin cambios.
 
 **Verificado**: 2 tests nuevos en `codegen::ts_emit` (`use{Servicio}{Rpc}Query` genera la clave de cache correcta con params reales, la infraestructura compartida (`Map`/`getQueryCacheEntry`/`setQueryCacheState`) se emite UNA sola vez sin importar cuántos rpcs de Query tenga el programa, y la forma pública del hook -- `QueryState<T>` -- no cambió; un programa SIN ningún Query -- todo mutations -- NO emite `useSyncExternalStore` ni la infraestructura de cache, evitando un import/`const`/`function` sin usar que rompería cualquier build con `noUnusedLocals` prendido). Además, la lógica CENTRAL del dedupe (`getQueryCacheEntry`/`setQueryCacheState`/el patrón de `entry.promise`) se verificó aparte en un script de Node standalone (sin React, el mismo algoritmo copiado literal del `hooks.ts` generado): dos "instancias" pidiendo la misma clave casi al mismo tiempo comparten exactamente UN fetch real, ambas reciben el mismo resultado, dos claves con parámetros distintos nunca se pisan, y actualizar una entrada notifica a sus listeners suscriptos. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado con el binario y tipando limpio con `tsc --noEmit` en modo estricto.
+
+---
+
+### 3.125 Hooks de React generados: invalidación de cache tras una Mutation — RESUELTO
+
+Mismo pedido del usuario, continuado explícitamente ("si, sigue con eso") tras el límite documentado en §3.124(2): hasta acá, `useUsersCreateMutation` no tenía forma de avisarle a `useUsersListQuery` que sus datos quedaron viejos -- cada componente era responsable de llamar a `refetch()` a mano tras una mutación exitosa, lo cual funciona pero es fácil de olvidar (y el compilador no puede avisar de un `refetch()` faltante en un componente que ni siquiera existe todavía). `@invalidates(rpc1, rpc2, ...)` cierra ese hueco de forma declarativa: se anota la Mutation, no cada Query que la consume.
+
+```
+service Tasks {
+  rpc list() -> Task[] { db.tasks.all() }
+  rpc stats() -> BoardStats { /* ... */ }
+
+  @invalidates(list, stats)
+  rpc create(input: NewTask) -> Task {
+    db.tasks.insert(/* ... */)
+  }
+}
+```
+
+```tsx
+function TaskList({ client }: { client: TasksClient }) {
+  const { data } = useTasksListQuery(client); // sigue mostrando la lista vieja...
+  return <ul>{data?.map((t) => <li key={t.id}>{t.title}</li>)}</ul>;
+}
+
+function NewTaskForm({ client }: { client: TasksClient }) {
+  const { mutate } = useTasksCreateMutation(client);
+  return <button onClick={() => mutate(input)}>Crear</button>;
+  // ...tras un create() exitoso, sin que NewTaskForm ni TaskList se
+  // conozcan entre sí, useTasksListQuery se re-renderiza con data: null
+  // y su useEffect de auto-fetch dispara un refetch solo.
+}
+```
+
+**Sintaxis**: nombres de rpc PELADOS separados por coma, no `Enum.Variant {}`, no strings -- `@invalidates(list, stats)`, nunca `@invalidates("list", "stats")`. `@invalidates()` vacío es un error de parseo explícito ("no aporta nada -- nombrá al menos un rpc") en vez de aceptarse como no-op silencioso.
+
+**Cuatro reglas de validación en el checker**, cada una con su propio mensaje: (1) un nombre tiene que existir como rpc en el MISMO `service` -- no hay invalidación cruzada entre services; (2) el rpc nombrado no puede ser un `stream` -- un stream no tiene cache de Query que invalidar; (3) el rpc nombrado tiene que ser "forma de Query" según `RpcDecl::looks_like_a_query()` -- el mismo heurístico de nombre/aridad que decide en `ts_emit.rs` si un rpc genera `use...Query` o `use...Mutation` (extraído a un único método compartido en `ast.rs` para que checker y codegen nunca puedan divergir sobre qué es una Query, ver GRAMMAR.md §3.9 sobre por qué evitar lógica duplicada); (4) `@invalidates` declarado dos veces sobre el mismo rpc es un error, igual que cualquier otra anotación repetida; y `@invalidates` sobre un `stream` mismo (no un target, la anotación en sí) también se rechaza -- invalidar cache no tiene sentido para algo que no devuelve una respuesta única.
+
+**Codegen: reset-y-notificar, no un refetch activo.** El hook de Mutation, tras un `mutate()` exitoso (nunca en la rama de error), llama a `invalidateQueryCache("{Servicio}.{rpc}")` por cada nombre en `@invalidates`, ANTES del `return`:
+
+```ts
+function invalidateQueryCache(rpcKeyPrefix: string): void {
+  const prefix = rpcKeyPrefix + "(";
+  queryCache.forEach((entry, key) => {
+    if (!key.startsWith(prefix)) return;
+    entry.state = { data: null, loading: false, error: null };
+    entry.listeners.forEach((listener) => listener());
+  });
+}
+```
+
+Deliberadamente NO dispara un fetch nuevo -- solo resetea `entry.state` a `data: null` y notifica a los listeners suscriptos vía `useSyncExternalStore`. Eso alcanza: el `useEffect` del hook de Query (§3.124) YA re-dispara `refetch()` automáticamente en cuanto ve `state.data === null && !state.loading && !entry.promise`, así que reusar esa lógica existente es más simple y menos riesgoso que construir un segundo camino de fetch dentro del helper de invalidación.
+
+**Coincidencia por PREFIJO de clave, deliberada.** La clave de cache es `"{Servicio}.{rpc}(" + JSON.stringify([...params]) + ")"` (§3.124) -- invalidar `search` limpia TODAS las entradas cacheadas de `search`, sin importar con qué parámetros se llamó cada una (`search("a")`, `search("ab")`, etc. caen todas bajo el mismo prefijo `"Users.search("`). Es la semántica correcta para el caso de uso real: una Mutation que cambia el conjunto de datos no sabe de antemano qué parámetros específicos de Query quedaron afectados, así que invalidar TODAS las variantes cacheadas de esa Query es más seguro que tratar de adivinar cuáles.
+
+**Emisión condicional, mismo criterio que `useSyncExternalStore` en §3.124**: `invalidateQueryCache` (y su import/const asociados) solo se emite si algún rpc del programa tiene `@invalidates` -- un programa sin esa anotación no paga el costo de una función sin usar bajo `noUnusedLocals`.
+
+**Demostración real**: `examples/taskboard/backend/taskboard.link` anota sus tres mutations (`create`, `update`, `remove`) con `@invalidates(list, listByColumn, stats)` -- las tres Queries reales del tablero que dependen del conjunto de tareas.
+
+**Verificado**: 2 tests nuevos en parser (`@invalidates(a, b)` parsea la lista; `@invalidates()` vacío es error de parseo), 6 tests nuevos en checker (target válido de la misma service; target inexistente; target de OTRA service; target que no es forma de Query; anotación sobre un stream; anotación declarada dos veces), 2 tests nuevos en `codegen::ts_emit` (el helper de invalidación se emite solo en la rama de éxito de la Mutation, nunca en el `catch`; sin ningún `@invalidates` en el programa, no se emite el helper). Verificado a mano contra el binario real: el camino feliz y los 5 caminos de error de la validación, cada uno reproduciendo exactamente el mensaje diseñado. Verificado end-to-end contra React real: `examples/taskboard/frontend` regenerado con el binario (ahora con `@invalidates` de verdad en sus tres mutations) y tipando limpio con `tsc --noEmit` en modo estricto -- primera vez que un `hooks.ts` con invalidación de cache se compila contra React 18 real.
 
 ---
 

@@ -689,9 +689,27 @@ impl Parser {
                     // los dos -- nunca los dos `None` a la vez.
                     Annotation::Example { request, response }
                 }
+                // `@invalidates(rpc1, rpc2, ...)` (GRAMMAR.md §3.125) --
+                // identificadores sueltos (nombres de rpc de la misma
+                // service), no `Enum.Variante` como `@requires` ni un
+                // `String` -- mismo loop de coma que el resto de las listas
+                // de este parser, sin claves.
+                "invalidates" => {
+                    self.eat(&TokenKind::LParen)?;
+                    if self.check(&TokenKind::RParen) {
+                        return Err(self.error("'@invalidates()' vacío no aporta nada -- nombrá al menos un rpc"));
+                    }
+                    let mut names = vec![self.eat_ident()?];
+                    while self.check(&TokenKind::Comma) {
+                        self.advance();
+                        names.push(self.eat_ident()?);
+                    }
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::Invalidates(names)
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")' o '@example(request: ..., response: ...)')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)' o '@invalidates(rpc1, rpc2, ...)')"
                     )))
                 }
             };
@@ -1989,6 +2007,23 @@ mod tests {
         let tokens = tokenize("service S { @example(response: 1, response: 2) rpc f() -> Int { 1 } }").unwrap();
         let err = parse(tokens).unwrap_err();
         assert!(err.iter().any(|e| e.message.contains("más de una vez")), "mensaje inesperado: {err:?}");
+    }
+
+    /// `@invalidates(rpc1, rpc2, ...)` (GRAMMAR.md §3.125) -- identificadores
+    /// sueltos (nombres de rpc), no `Enum.Variante` como `@requires`.
+    #[test]
+    fn invalidates_annotation_parses_a_list_of_bare_rpc_names() {
+        let prog = parse_source("service S { @invalidates(list, search) rpc create() -> Int { 1 } }");
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(r.annotations, vec![Annotation::Invalidates(vec!["list".to_string(), "search".to_string()])]);
+    }
+
+    #[test]
+    fn invalidates_annotation_with_empty_parens_is_a_parse_error() {
+        let tokens = tokenize("service S { @invalidates() rpc f() -> Int { 1 } }").unwrap();
+        let err = parse(tokens).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("vacío")), "mensaje inesperado: {err:?}");
     }
 
     #[test]

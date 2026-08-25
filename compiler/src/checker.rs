@@ -790,7 +790,7 @@ impl Checker {
                             }
                             errors.push(e);
                         }
-                        if let Err(e) = checker.check_rpc_annotation(rpc, is_stream) {
+                        if let Err(e) = checker.check_rpc_annotation(rpc, is_stream, s) {
                             let mut e = e.with_span(rpc.span);
                             if let Some(file) = file_for(index) {
                                 e = e.with_file(file);
@@ -1710,6 +1710,53 @@ impl Checker {
         Ok(())
     }
 
+    /// `@invalidates(rpc1, rpc2, ...)` (GRAMMAR.md §3.125) -- cada nombre
+    /// tiene que ser un rpc/stream declarado en la MISMA `service` (nunca
+    /// cruzando a otra: el cache de Query generado en el frontend está
+    /// organizado por `"{Servicio}.{rpc}(...)"`, invalidar algo de OTRO
+    /// servicio no tendría ninguna clave real que matchear) que además
+    /// genere un hook de Query (`RpcDecl::looks_like_a_query`, mismo
+    /// heurístico que `emit_hooks` usa para decidir eso mismo) -- nombrar
+    /// un rpc que nunca tuvo una entrada de cache no invalidaría nada.
+    /// Rechazado sobre un `stream` (el rpc ANOTADO, no el nombrado): un
+    /// stream no genera un hook de Mutation, el único lugar donde la
+    /// invalidación se dispara en el código generado.
+    fn check_invalidates_annotation(&self, r: &RpcDecl, is_stream: bool, service: &ServiceDecl) -> Result<(), CheckError> {
+        let values: Vec<&Vec<String>> =
+            r.annotations.iter().filter_map(|a| match a { Annotation::Invalidates(names) => Some(names), _ => None }).collect();
+        if values.len() > 1 {
+            return Err(err(format!("'{}' declara `@invalidates` más de una vez", r.name)));
+        }
+        let Some(names) = values.into_iter().next() else {
+            return Ok(());
+        };
+        if is_stream {
+            return Err(err(format!(
+                "`@invalidates` en el stream '{}': un stream no genera un hook de Mutation (GRAMMAR.md §3.125) -- llamalo desde un 'rpc' normal",
+                r.name
+            )));
+        }
+        for name in names {
+            let target = service.members.iter().find_map(|m| match m {
+                Member::Rpc(t) | Member::Stream(t) if &t.name == name => Some((t, matches!(m, Member::Stream(_)))),
+                _ => None,
+            });
+            let Some((target_rpc, target_is_stream)) = target else {
+                return Err(err(format!(
+                    "`@invalidates({name})` en '{}': '{name}' no es un rpc declarado en el service '{}'",
+                    r.name, service.name
+                )));
+            };
+            if target_is_stream || !target_rpc.looks_like_a_query() {
+                return Err(err(format!(
+                    "`@invalidates({name})` en '{}': '{name}' no genera un hook de Query -- no hay ninguna entrada de cache que invalidar",
+                    r.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// `@validate(...)` (GRAMMAR.md §3.73) sobre cada campo de `fields` --
     /// llamado tanto para un `type X = { ... }` como para los campos de cada
     /// variante de un `enum` (comparten `Field`, ver `ast.rs`). Dos cosas se
@@ -1959,12 +2006,13 @@ impl Checker {
     /// que nunca se puede satisfacer en runtime. Sin restricción de "enum
     /// simple" (ver `check_auth_method`): la comparación en runtime es solo
     /// por tag, nunca mira campos.
-    fn check_rpc_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+    fn check_rpc_annotation(&self, r: &RpcDecl, is_stream: bool, service: &ServiceDecl) -> Result<(), CheckError> {
         self.check_annotation_combination(r, is_stream)?;
         self.check_route_annotation(r, is_stream)?;
         self.check_rate_limit_annotation(r)?;
         self.check_cache_control_annotation(r, is_stream)?;
         self.check_example_annotation(r, is_stream)?;
+        self.check_invalidates_annotation(r, is_stream, service)?;
         let Some(Annotation::Requires { enum_name, variant_names }) = r.auth() else {
             return Ok(());
         };
@@ -5543,6 +5591,94 @@ type T = { id: Int, s: Status }")
                 @example(response: 1)
                 @example(response: 2)
                 rpc get() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("más de una vez")), "mensaje inesperado: {err:?}");
+    }
+
+    /// `@invalidates(rpc1, rpc2, ...)` (GRAMMAR.md §3.125) -- cada nombre
+    /// tiene que ser un rpc de Query real de la MISMA service.
+    #[test]
+    fn invalidates_accepts_query_shaped_rpcs_of_the_same_service() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                rpc list() -> Task[] { [] }
+                rpc search(term: String) -> Task[] { [] }
+                @invalidates(list, search)
+                rpc create(title: String) -> Task { Task { id: 1 } }
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn invalidates_rejects_a_name_that_is_not_an_rpc_in_the_same_service() {
+        let src = r#"
+            service Tasks {
+                @invalidates(noExiste)
+                rpc create() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("no es un rpc declarado")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn invalidates_rejects_a_name_from_a_different_service() {
+        let src = r#"
+            service Tasks { rpc list() -> Int { 1 } }
+            service Other {
+                @invalidates(list)
+                rpc create() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("no es un rpc declarado")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn invalidates_rejects_a_target_that_does_not_generate_a_query_hook() {
+        let src = r#"
+            service Tasks {
+                rpc create(title: String) -> Int { 1 }
+                @invalidates(create)
+                rpc update(id: Int, title: String) -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("no genera un hook de Query")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn invalidates_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                rpc list() -> Task[] { [] }
+                @invalidates(list)
+                stream watch() -> Task {
+                    db.tasks.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("invalidates") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn invalidates_rejects_being_declared_twice() {
+        let src = r#"
+            service Tasks {
+                rpc list() -> Int { 1 }
+                @invalidates(list)
+                @invalidates(list)
+                rpc create() -> Int { 1 }
             }
         "#;
         let err = check_source(src).unwrap_err();

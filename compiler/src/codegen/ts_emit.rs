@@ -350,20 +350,6 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// Mismo heurístico "nombre por forma" que separa el hook `Query` del
-/// `Mutation` en `emit_hooks` (GRAMMAR.md §3.124) -- un rpc sin parámetros
-/// también cuenta como Query, no hay forma más segura de mutar sin nada que
-/// pasarle.
-fn is_query_rpc(rpc: &RpcDecl) -> bool {
-    rpc.name.starts_with("get")
-        || rpc.name.starts_with("list")
-        || rpc.name.starts_with("find")
-        || rpc.name.starts_with("search")
-        || rpc.name.starts_with("read")
-        || rpc.name.starts_with("fetch")
-        || rpc.params.is_empty()
-}
-
 pub fn emit_hooks(program: &Program) -> Result<String, String> {
     let (checker, errors) = Checker::build_symbols(program);
     if let Some(e) = errors.into_iter().next() {
@@ -403,7 +389,14 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     // el programa no declara ningún Query (todo streams/mutations), sumar
     // `useSyncExternalStore` de todos modos rompería el build de cualquiera
     // que compile con esa opción prendida.
-    let has_any_query = services.iter().any(|(_, members)| members.iter().any(|(rpc, is_stream, _, _)| !is_stream && is_query_rpc(rpc)));
+    let has_any_query = services.iter().any(|(_, members)| members.iter().any(|(rpc, is_stream, _, _)| !is_stream && rpc.looks_like_a_query()));
+    // GRAMMAR.md §3.125: `invalidateQueryCache` (el helper que limpia
+    // entradas del cache tras una `Mutation` exitosa) solo hace falta si
+    // ALGÚN rpc declaró `@invalidates(...)` -- el checker ya garantiza que
+    // eso nunca pasa sin que `has_any_query` también sea `true` (no se
+    // puede invalidar un rpc que no genera hook de Query), así que emitir
+    // este helper acá adentro nunca deja `queryCache` sin definir.
+    let has_any_invalidates = services.iter().any(|(_, members)| members.iter().any(|(rpc, _, _, _)| rpc.invalidates().is_some()));
 
     let mut out = String::new();
     out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
@@ -451,11 +444,12 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     // `client` -- si la misma app usara dos clients distintos contra el
     // mismo rpc comparten cache igual; el caso real (`examples/taskboard/
     // frontend` y el resto de los ejemplos) siempre tiene un client único
-    // por app. Sin invalidación automática tras una `Mutation` todavía --
-    // `refetch()` de una instancia sigue actualizando a todas las que
-    // comparten esa misma clave, pero nada dispara eso solo porque una
-    // mutación relacionada tuvo éxito (necesitaría una forma de declarar
-    // qué Query invalida cada Mutation, que no existe hoy).
+    // por app. Invalidación tras una `Mutation` relacionada: opt-in vía
+    // `@invalidates(...)` sobre el rpc de la mutación (GRAMMAR.md §3.125,
+    // `invalidateQueryCache` más abajo) -- sin esa anotación, `refetch()`
+    // de una instancia sigue actualizando a todas las que comparten esa
+    // misma clave, pero nada dispara eso solo porque una mutación
+    // relacionada tuvo éxito.
     if has_any_query {
         out.push_str("type QueryCacheState<T> = { data: T | null; loading: boolean; error: Error | null };\n\n");
         out.push_str("type QueryCacheEntry<T> = {\n");
@@ -475,6 +469,31 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
         out.push_str("function setQueryCacheState<T>(entry: QueryCacheEntry<T>, patch: Partial<QueryCacheState<T>>): void {\n");
         out.push_str("  entry.state = { ...entry.state, ...patch };\n");
         out.push_str("  entry.listeners.forEach((listener) => listener());\n");
+        out.push_str("}\n\n");
+    }
+    // `@invalidates(rpc1, rpc2, ...)` (GRAMMAR.md §3.125) -- emitido SOLO
+    // si algún rpc de verdad lo declaró (`has_any_invalidates`), para no
+    // sumar una función sin usar que `noUnusedLocals` rechazaría en un
+    // programa que nunca la llama. Vacía la entrada correspondiente (vuelve
+    // a `data: null`) y notifica a sus listeners EN VEZ de borrarla del
+    // `Map` -- así cualquier instancia YA MONTADA que la esté mirando
+    // vuelve a pedir el dato sola (su propio `useEffect` ya sabe refetchear
+    // cuando ve `data === null`, la misma lógica que dispara el fetch
+    // inicial); nadie tiene que estar montado para que la invalidación
+    // "prenda" -- si no hay nadie mirando esa clave ahora mismo, se
+    // refetchea recién cuando alguien la monte de nuevo, sin trabajo
+    // desperdiciado. `prefix` matchea CUALQUIER variante de parámetros de
+    // ese rpc (`"Servicio.rpc("`, sin el resto de la clave) -- invalidar
+    // `search` invalida TODOS los términos de búsqueda cacheados, no solo
+    // uno puntual.
+    if has_any_invalidates {
+        out.push_str("function invalidateQueryCache(rpcKeyPrefix: string): void {\n");
+        out.push_str("  const prefix = rpcKeyPrefix + \"(\";\n");
+        out.push_str("  queryCache.forEach((entry, key) => {\n");
+        out.push_str("    if (!key.startsWith(prefix)) return;\n");
+        out.push_str("    entry.state = { data: null, loading: false, error: null };\n");
+        out.push_str("    entry.listeners.forEach((listener) => listener());\n");
+        out.push_str("  });\n");
         out.push_str("}\n\n");
     }
 
@@ -540,7 +559,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 out.push_str("  return { data, latest, isConnected, error };\n");
                 out.push_str("}\n\n");
             } else {
-                if is_query_rpc(rpc) {
+                if rpc.looks_like_a_query() {
                     let params_sig = if params_typed.is_empty() {
                         format!("client: {}Client, options?: {{ enabled?: boolean }}", service.name)
                     } else {
@@ -655,6 +674,16 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                 out.push_str("    try {\n");
                 out.push_str(&format!("      const res = await client.{}({});\n", rpc.name, param_names.join(", ")));
                 out.push_str("      if (requestIdRef.current === requestId) setData(res);\n");
+                // `@invalidates(rpc1, rpc2, ...)` (GRAMMAR.md §3.125) --
+                // limpia el cache de Query de cada rpc nombrado DESPUÉS de
+                // que esta mutación resolvió con éxito (nunca en el
+                // `catch` de abajo: una mutación que falló no cambió nada
+                // que valga la pena refrescar).
+                if let Some(names) = rpc.invalidates() {
+                    for name in names {
+                        out.push_str(&format!("      invalidateQueryCache(\"{}.{name}\");\n", service.name));
+                    }
+                }
                 out.push_str("      return res;\n");
                 out.push_str("    } catch (err) {\n");
                 out.push_str("      const e = err instanceof Error ? err : new Error(String(err));\n");
@@ -1511,6 +1540,50 @@ mod tests {
         assert!(!hooks.contains("queryCache"), "{hooks}");
         assert!(!hooks.contains("getQueryCacheEntry"), "{hooks}");
         assert!(hooks.contains("import { useState, useEffect, useCallback, useRef } from \"react\";"), "{hooks}");
+    }
+
+    /// `@invalidates(rpc1, rpc2, ...)` (GRAMMAR.md §3.125) -- el hook de
+    /// Mutation del rpc anotado limpia el cache de cada rpc nombrado
+    /// DESPUÉS de que la mutación resuelve con éxito, nunca en el `catch`.
+    #[test]
+    fn mutation_hook_invalidates_named_query_caches_after_a_successful_mutation() {
+        let src = r#"
+            type Task = { id: Int, title: String }
+            service Tasks {
+                rpc list() -> Task[] { [] }
+                rpc search(term: String) -> Task[] { [] }
+                @invalidates(list, search)
+                rpc create(title: String) -> Task { Task { id: 1, title: title } }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert_eq!(hooks.matches("function invalidateQueryCache").count(), 1, "{hooks}");
+        let mutation_block = hooks.split("export function useTasksCreateMutation").nth(1).expect("bloque de la mutación");
+        let success_block = mutation_block.split("} catch").next().unwrap();
+        assert!(success_block.contains("invalidateQueryCache(\"Tasks.list\");"), "{hooks}");
+        assert!(success_block.contains("invalidateQueryCache(\"Tasks.search\");"), "{hooks}");
+        // Nunca en el camino de error -- una mutación que falló no cambió
+        // nada que valga la pena refrescar.
+        let catch_block = mutation_block.split("} catch").nth(1).unwrap().split("} finally").next().unwrap();
+        assert!(!catch_block.contains("invalidateQueryCache"), "{hooks}");
+    }
+
+    /// Sin ningún `@invalidates` en el programa, `invalidateQueryCache` no
+    /// se emite -- una función de nivel superior sin usar rompe cualquier
+    /// build con `noUnusedLocals`.
+    #[test]
+    fn no_invalidates_annotation_means_no_invalidate_helper_emitted() {
+        let src = r#"
+            type Task = { id: Int }
+            service Tasks {
+                rpc list() -> Task[] { [] }
+                rpc create(title: String) -> Task { Task { id: 1 } }
+            }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let hooks = emit_hooks(&program).expect("hooks generation");
+        assert!(!hooks.contains("invalidateQueryCache"), "{hooks}");
     }
 
     /// Misma guarda que el hook de Query, pero para Mutation -- un doble

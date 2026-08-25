@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.87.0 — no editar a mano.
+// Generado automáticamente por linkc v1.88.0 — no editar a mano.
 
 import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "react";
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";
@@ -46,6 +46,15 @@ function getQueryCacheEntry<T>(key: string): QueryCacheEntry<T> {
 function setQueryCacheState<T>(entry: QueryCacheEntry<T>, patch: Partial<QueryCacheState<T>>): void {
   entry.state = { ...entry.state, ...patch };
   entry.listeners.forEach((listener) => listener());
+}
+
+function invalidateQueryCache(rpcKeyPrefix: string): void {
+  const prefix = rpcKeyPrefix + "(";
+  queryCache.forEach((entry, key) => {
+    if (!key.startsWith(prefix)) return;
+    entry.state = { data: null, loading: false, error: null };
+    entry.listeners.forEach((listener) => listener());
+  });
 }
 
 export function useTasksListQuery(client: TasksClient, options?: { enabled?: boolean }): QueryState<Task[]> {
@@ -223,6 +232,9 @@ export function useTasksCreateMutation(client: TasksClient): MutationState<Task>
     try {
       const res = await client.create(input);
       if (requestIdRef.current === requestId) setData(res);
+      invalidateQueryCache("Tasks.list");
+      invalidateQueryCache("Tasks.listByColumn");
+      invalidateQueryCache("Tasks.stats");
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
@@ -258,6 +270,9 @@ export function useTasksUpdateMutation(client: TasksClient): MutationState<Task>
     try {
       const res = await client.update(id, patch);
       if (requestIdRef.current === requestId) setData(res);
+      invalidateQueryCache("Tasks.list");
+      invalidateQueryCache("Tasks.listByColumn");
+      invalidateQueryCache("Tasks.stats");
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
@@ -293,6 +308,9 @@ export function useTasksRemoveMutation(client: TasksClient): MutationState<boole
     try {
       const res = await client.remove(id);
       if (requestIdRef.current === requestId) setData(res);
+      invalidateQueryCache("Tasks.list");
+      invalidateQueryCache("Tasks.listByColumn");
+      invalidateQueryCache("Tasks.stats");
       return res;
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));

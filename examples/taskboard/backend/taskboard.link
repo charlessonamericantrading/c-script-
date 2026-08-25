@@ -40,6 +40,7 @@ service Tasks {
     db.tasks.find(id)
   }
 
+  @invalidates(list, listByColumn, stats)
   rpc create(input: NewTask) -> Task {
     db.tasks.insert(Task {
       id: 0,
@@ -52,10 +53,12 @@ service Tasks {
     })
   }
 
+  @invalidates(list, listByColumn, stats)
   rpc update(id: Int, patch: Patch<Task>) -> Task {
     db.tasks.applyPatch(id, patch)
   }
 
+  @invalidates(list, listByColumn, stats)
   rpc remove(id: Int) -> Bool {
     db.tasks.delete(id)
   }

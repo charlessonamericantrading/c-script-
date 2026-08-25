@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.88.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`@invalidates(rpc1, rpc2, ...)`: invalidación automática de cache tras una Mutation.** Continuación explícita del usuario ("si, sigue con eso") sobre el límite documentado en v1.87.0: hasta esta ronda, `useUsersCreateMutation` no tenía forma de avisarle a `useUsersListQuery` que sus datos quedaron viejos -- cada componente era responsable de llamar a `refetch()` a mano tras una mutación exitosa. La nueva anotación se declara sobre la Mutation, no sobre cada Query que la consume: `@invalidates(list, stats)` sobre `create` limpia las entradas de cache de `list` y `stats` (reset a `data: null` + notificación a los listeners suscriptos vía `useSyncExternalStore`) tras un `mutate()` exitoso -- nunca en la rama de error. Deliberadamente NO dispara un fetch nuevo: reusa el `useEffect` de auto-fetch que el hook de Query ya tiene (v1.87.0), que re-dispara solo en cuanto ve `data === null`.
+
+Checker con 4 reglas de validación, cada una con su propio mensaje: el target tiene que ser un rpc de la MISMA service, no puede ser un `stream`, tiene que tener forma de Query (mismo heurístico que decide qué hook genera cada rpc, extraído a un único método compartido `RpcDecl::looks_like_a_query()` entre checker y codegen para que nunca puedan divergir), y la anotación no puede repetirse. La coincidencia de cache es por PREFIJO de clave -- invalidar `search` limpia TODAS las variantes cacheadas de `search(...)`, sin importar con qué parámetros se llamó cada una, porque una Mutation no puede adivinar cuáles quedaron afectadas. Emisión condicional del helper `invalidateQueryCache`, mismo criterio que `useSyncExternalStore` en v1.87.0 -- un programa sin `@invalidates` no paga el costo de una función sin usar bajo `noUnusedLocals`. `examples/taskboard/backend/taskboard.link` demuestra el uso real: sus tres mutations (`create`/`update`/`remove`) invalidan `list`/`listByColumn`/`stats`.
+
+1024 tests (10 nuevos): 2 en `parser.rs` (parsea la lista de nombres; `@invalidates()` vacío es error de parseo) + 6 en `checker.rs` (target válido, target inexistente, target de otra service, target que no es forma de Query, anotación sobre un `stream`, anotación repetida) + 2 en `codegen::ts_emit` (el helper se emite solo en la rama de éxito de la Mutation, nunca en el `catch`; sin `@invalidates` en el programa no se emite el helper). Verificado a mano contra el binario real: el camino feliz y los 5 caminos de error, cada uno con el mensaje exacto diseñado. Verificado también end-to-end contra React real: `examples/taskboard/frontend` regenerado (con `@invalidates` de verdad en sus tres mutations) y tipando limpio con `tsc --noEmit` en modo estricto -- primera vez que un `hooks.ts` con invalidación de cache se compila contra React 18 real. Detalle completo: GRAMMAR.md §3.125, PLAN.md §9.13.
+
 ## [1.87.0] - 2026-08-25
 
 ### ✨ Nuevo
