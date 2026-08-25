@@ -651,6 +651,17 @@ pub struct Db {
     /// -- descarta la más VIEJA al llenarse, nunca crece sin límite si la
     /// base queda caída por mucho tiempo.
     pending_notify_retries: RefCell<std::collections::VecDeque<(String, serde_json::Value)>>,
+    /// Conteo de payloads NOTIFY descartados por superar
+    /// `MAX_NOTIFY_PAYLOAD_BYTES`, por colección -- landmine encontrado en
+    /// un barrido de "límites honestos" (GRAMMAR.md §3.44/§3.150): antes de
+    /// esto, la única señal de que esto estaba pasando era un `eprintln!`
+    /// que nadie lee corriendo desatendido bajo `pm2`/`systemd` -- una
+    /// colección con filas grandes podía quedar desincronizada entre
+    /// instancias durante MESES sin que nadie se enterara. Expuesto en
+    /// `/metrics` (§3.149) como `linkc_notify_oversized_dropped_total`, el
+    /// mismo lugar que un operador YA está mirando para latencia/conteo de
+    /// requests -- no un canal de alertas nuevo.
+    oversized_notify_drops: RefCell<HashMap<String, u64>>,
     /// Contexto de LA request HTTP que está invocando un rpc ahora mismo --
     /// body crudo + headers, para `request.rawBody()`/`request.header()`
     /// (GRAMMAR.md §3.38). `server.rs` lo fija justo antes de invocar el rpc
@@ -1009,6 +1020,7 @@ impl Db {
             columns,
             subscribers: RefCell::new(HashMap::new()),
             pending_notify_retries: RefCell::new(std::collections::VecDeque::new()),
+            oversized_notify_drops: RefCell::new(HashMap::new()),
             current_request: RefCell::new(None),
             response_status_override: std::cell::Cell::new(None),
             response_location_override: RefCell::new(None),
@@ -1140,6 +1152,7 @@ impl Db {
                 columns,
                 subscribers: RefCell::new(HashMap::new()),
                 pending_notify_retries: RefCell::new(std::collections::VecDeque::new()),
+                oversized_notify_drops: RefCell::new(HashMap::new()),
                 current_request: RefCell::new(None),
                 response_status_override: std::cell::Cell::new(None),
                 response_location_override: RefCell::new(None),
@@ -1329,6 +1342,14 @@ db { users: User[] }
     /// forma de saber que un cliente se fue sin intentar escribirle.
     pub fn subscriber_counts(&self) -> Vec<(String, usize)> {
         self.subscribers.borrow().iter().map(|(collection, txs)| (collection.clone(), txs.len())).collect()
+    }
+
+    /// GRAMMAR.md §3.44/§3.150: cuántos payloads NOTIFY se descartaron por
+    /// superar `MAX_NOTIFY_PAYLOAD_BYTES`, por colección, desde que arrancó
+    /// el proceso -- expuesto en `/metrics` para que este landmine deje de
+    /// depender de que alguien lea stderr.
+    pub fn oversized_notify_drop_counts(&self) -> Vec<(String, u64)> {
+        self.oversized_notify_drops.borrow().iter().map(|(collection, count)| (collection.clone(), *count)).collect()
     }
 
     /// Ver la doc de `Db::current_request` (arriba). Llamado por
@@ -1691,6 +1712,7 @@ db { users: User[] }
                  ({MAX_NOTIFY_PAYLOAD_BYTES}) -- no se propaga a otras instancias (GRAMMAR.md §3.44)",
                 payload.len()
             );
+            *self.oversized_notify_drops.borrow_mut().entry(collection.to_string()).or_insert(0) += 1;
             return true;
         }
         match self.backend.notify(REMOTE_CHANGE_CHANNEL, &payload) {

@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.105.0] - 2026-08-26
+
+### ✨ Nuevo
+- **`linkc_notify_oversized_dropped_total` en `/metrics`.** Tercer hallazgo del barrido de "límites honestos" de GRAMMAR.md: un payload NOTIFY de más de 8000 bytes (el límite real de PostgreSQL) se descarta PARA SIEMPRE -- correcto, reintentarlo no lo arreglaría -- pero hasta esta ronda la única señal era un `eprintln!` por stderr, invisible corriendo desatendido bajo `pm2`/`systemd` sin revisar logs. Una colección con filas grandes (un catálogo de facets/búsqueda, por ejemplo) podía quedar desincronizada entre instancias durante meses sin que nadie lo notara -- descubierto por datos divergentes, nunca por un error visible.
+
+  `Db` ahora cuenta estos drops por colección, expuesto en `/metrics` como counter (solo aparece la línea de una colección si tuvo al menos un drop, mismo criterio que `linkc_notify_latency_seconds_*`) -- en la instancia que ESCRIBE el cambio, no la que lo hubiera recibido.
+
+1163 tests (2 nuevos) en `metrics.rs` (aparece solo cuando se provee, por colección) y `pg_integration.rs` contra Postgres real: un `insert` con un campo de 8200 caracteres confirma el contador en 1 sin afectar el insert local; un insert normal no lo incrementa. Detalle completo: GRAMMAR.md §3.150, PLAN.md §9.8.
+
 ## [1.104.0] - 2026-08-25
 
 ### ✨ Nuevo

@@ -1397,6 +1397,55 @@ fn metrics_reports_notify_propagation_latency_after_a_real_cross_instance_write(
     assert!(text.contains("linkc_notify_latency_seconds_sum "), "body: {text}");
 }
 
+/// GRAMMAR.md §3.44: landmine encontrado en un barrido de "límites
+/// honestos" -- un payload de NOTIFY de más de 8000 bytes se descarta PARA
+/// SIEMPRE (nunca se reintenta, no lo arreglaría), con la única señal antes
+/// de esta ronda un `eprintln!` que nadie lee corriendo desatendido. Este
+/// test confirma que el conteo real -- no solo el mensaje de stderr, ya
+/// probado en otro lado -- queda visible en `/metrics`, en la MISMA
+/// instancia que escribió (el drop pasa en el envío, no en la recepción).
+#[test]
+fn metrics_reports_an_oversized_notify_payload_dropped_for_real() {
+    const COLLECTION: &str = "items_metrics_oversized_notify";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("metrics-oversized-notify");
+    let src = temp.write("app.link", &PUSH_PROGRAM.replace("COLLECTION", COLLECTION));
+    let server = Serve::start(&src, &url);
+
+    // Un "name" de 8200 caracteres empuja el payload entero del NOTIFY
+    // (que envuelve la fila completa más instance/collection/sent_at_ms)
+    // bien por encima del límite real de Postgres (8000 bytes) -- la
+    // inserción en sí debe seguir funcionando normal, solo la propagación
+    // remota se descarta.
+    let huge_name = "x".repeat(8200);
+    let created = server.rpc("Items/create", &serde_json::json!({"name": huge_name}).to_string());
+    assert_eq!(created["name"], huge_name, "el insert local no debe verse afectado por el tamaño");
+
+    let text = ureq::get(&format!("http://127.0.0.1:{}/metrics", server.port))
+        .call()
+        .unwrap_or_else(|e| panic!("GET /metrics falló: {e}"))
+        .into_string()
+        .expect("leer el body");
+    assert!(text.contains(&format!("linkc_notify_oversized_dropped_total{{collection=\"{COLLECTION}\"}} 1")), "body: {text}");
+
+    // Un segundo insert normal (nombre chico) no debe sumar al contador de
+    // OTRA colección ni inflar este -- confirma que el conteo es real, no
+    // un valor fijo.
+    server.rpc("Items/create", r#"{"name":"chico"}"#);
+    let text_after = ureq::get(&format!("http://127.0.0.1:{}/metrics", server.port))
+        .call()
+        .unwrap_or_else(|e| panic!("GET /metrics falló: {e}"))
+        .into_string()
+        .expect("leer el body");
+    assert!(text_after.contains(&format!("linkc_notify_oversized_dropped_total{{collection=\"{COLLECTION}\"}} 1")), "body: {text_after}");
+}
+
 // GRAMMAR.md §3.66: `linkc introspect <db-url>` genera un .link de partida
 // desde una base PostgreSQL YA EXISTENTE -- estos tests crean una tabla A
 // MANO (simulando un sistema adoptado, no generado por linkc) y confirman

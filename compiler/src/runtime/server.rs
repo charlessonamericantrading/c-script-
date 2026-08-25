@@ -672,7 +672,7 @@ fn handle_request(
     // configuró esa capa, Prometheus también tiene que mandarla (soportado
     // nativamente por `scrape_configs.authorization` en `prometheus.yml`).
     if path == "/metrics" {
-        let metrics_text = metrics_store.render_prometheus_text(&db.subscriber_counts(), db.size_bytes());
+        let metrics_text = metrics_store.render_prometheus_text(&db.subscriber_counts(), db.size_bytes(), &db.oversized_notify_drop_counts());
         let _ = request.respond(cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None));
         log_done(log, req_id, Some("metrics"), 200, start, "");
         return;
