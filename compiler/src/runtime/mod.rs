@@ -428,6 +428,12 @@ pub(crate) fn eval_expr(
             if name == "dateFromParts" {
                 return Ok(Value::FnRef("dateFromParts".to_string()));
             }
+            if name == "sitemapXml" {
+                return Ok(Value::FnRef("sitemapXml".to_string()));
+            }
+            if name == "robotsTxt" {
+                return Ok(Value::FnRef("robotsTxt".to_string()));
+            }
             if name == "assert" {
                 return Ok(Value::FnRef("assert".to_string()));
             }
@@ -477,6 +483,14 @@ pub(crate) fn eval_expr(
                     if name == "dateFromParts" {
                         let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
                         return call_date_from_parts(arg_vs);
+                    }
+                    if name == "sitemapXml" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_sitemap_xml(arg_vs);
+                    }
+                    if name == "robotsTxt" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_robots_txt(arg_vs);
                     }
                     if name == "assert" {
                         let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
@@ -1087,6 +1101,12 @@ fn call_callable(
             if name == "dateFromParts" && !fns.contains_key("dateFromParts") {
                 return call_date_from_parts(arg_vs);
             }
+            if name == "sitemapXml" && !fns.contains_key("sitemapXml") {
+                return call_sitemap_xml(arg_vs);
+            }
+            if name == "robotsTxt" && !fns.contains_key("robotsTxt") {
+                return call_robots_txt(arg_vs);
+            }
             if name == "assert" && !fns.contains_key("assert") {
                 let cond = match arg_vs.first() {
                     Some(Value::Bool(b)) => *b,
@@ -1293,6 +1313,92 @@ fn call_date_from_parts(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
     let ms = timestamp::date_from_parts(as_int(&year)?, as_int(&month)?, as_int(&day)?, as_int(&hour)?, as_int(&minute)?, as_int(&second)?)
         .map_err(RuntimeError::bad_request)?;
     Ok(Value::Timestamp(ms))
+}
+
+/// `sitemapXml(urls: {loc: String, lastmod: Timestamp?}[]) -> String`
+/// (GRAMMAR.md §3.116): arma un `sitemap.xml` bien formado (protocolo
+/// sitemaps.org) -- el rpc sigue siendo responsable de la lista de URLs
+/// (viene de la base, `@route` no puede inferir rutas dinámicas por sí
+/// solo), esto solo arma el XML. Reusa `escape_html` para `<loc>` -- mismo
+/// conjunto de caracteres (`&`, `<`, `>`, `"`, `'`) que XML también exige
+/// escapar en contenido de texto, y sus referencias numéricas (`&#39;`
+/// incluido) son válidas en XML tal cual, no solo en HTML.
+fn call_sitemap_xml(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
+    let [urls]: [Value; 1] =
+        arg_vs.try_into().map_err(|_| err("'sitemapXml' requiere 1 argumento (urls: {loc, lastmod?}[])"))?;
+    let Value::List(items) = urls else {
+        return Err(err("'sitemapXml' requiere una lista de {loc, lastmod?}"));
+    };
+    let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
+    for item in items {
+        let Value::Struct(fields) = item else {
+            return Err(err("'sitemapXml': cada entrada tiene que ser un struct con 'loc'"));
+        };
+        let Some((_, Value::Str(loc))) = fields.iter().find(|(n, _)| n == "loc") else {
+            return Err(err("'sitemapXml': falta el campo 'loc' o no es String"));
+        };
+        out.push_str("  <url>\n    <loc>");
+        out.push_str(&escape_html(loc));
+        out.push_str("</loc>\n");
+        if let Some((_, Value::Timestamp(ms))) = fields.iter().find(|(n, _)| n == "lastmod") {
+            out.push_str("    <lastmod>");
+            out.push_str(&timestamp::format_iso8601_millis(*ms));
+            out.push_str("</lastmod>\n");
+        }
+        out.push_str("  </url>\n");
+    }
+    out.push_str("</urlset>");
+    Ok(Value::Str(out))
+}
+
+/// `robotsTxt(rules: {userAgent, disallow?, allow?}[], sitemapUrl: String?)
+/// -> String` (GRAMMAR.md §3.116): arma un `robots.txt` bien formado, un
+/// bloque `User-agent: ...` por regla con sus `Disallow`/`Allow` (en ese
+/// orden, mismo orden que el estándar de facto), y `Sitemap: <url>` al
+/// final si se pasó una. `disallow`/`allow` AUSENTES (campo entero
+/// faltante en el struct, o presente pero `null`) se tratan exactamente
+/// igual que una lista vacía -- ningún `Disallow`/`Allow` para ese bloque
+/// -- por eso el único match que le importa a este código es
+/// `Some((_, Value::List(paths)))`, cualquier otra forma simplemente no
+/// agrega nada, nunca un error.
+fn call_robots_txt(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
+    let [rules, sitemap_url]: [Value; 2] =
+        arg_vs.try_into().map_err(|_| err("'robotsTxt' requiere 2 argumentos (rules: {...}[], sitemapUrl: String?)"))?;
+    let Value::List(rule_items) = rules else {
+        return Err(err("'robotsTxt' requiere una lista de reglas"));
+    };
+    let mut blocks = Vec::with_capacity(rule_items.len());
+    for item in rule_items {
+        let Value::Struct(fields) = item else {
+            return Err(err("'robotsTxt': cada regla tiene que ser un struct"));
+        };
+        let Some((_, Value::Str(user_agent))) = fields.iter().find(|(n, _)| n == "userAgent") else {
+            return Err(err("'robotsTxt': falta el campo 'userAgent' o no es String"));
+        };
+        let mut block = format!("User-agent: {user_agent}");
+        for (field_name, directive) in [("disallow", "Disallow"), ("allow", "Allow")] {
+            if let Some((_, Value::List(paths))) = fields.iter().find(|(n, _)| n == field_name) {
+                for p in paths {
+                    if let Value::Str(p) = p {
+                        block.push('\n');
+                        block.push_str(directive);
+                        block.push_str(": ");
+                        block.push_str(p);
+                    }
+                }
+            }
+        }
+        blocks.push(block);
+    }
+    let mut out = blocks.join("\n\n");
+    if let Value::Str(url) = sitemap_url {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("Sitemap: ");
+        out.push_str(&url);
+    }
+    Ok(Value::Str(out))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4112,6 +4218,114 @@ mod tests {
         // `base64.decode` devuelve `String`, así que esto es un error
         // limpio, no bytes corruptos silenciosos. 0xFF 0xFE no es UTF-8 válido.
         invoke_rpc(&program, "Codec", "dec", &json!({"s": "//4="}), &db).expect_err("bytes no-UTF8 deberían rechazarse");
+    }
+
+    // ---- `sitemapXml`/`robotsTxt` (GRAMMAR.md §3.116) ----
+
+    #[test]
+    fn sitemap_xml_builds_a_well_formed_sitemap_with_and_without_lastmod() {
+        let program = program_from(
+            r#"
+            type Page = { loc: String, lastmod?: Timestamp }
+            service Site {
+                rpc sitemap() -> String {
+                    sitemapXml([
+                        Page { loc: "https://x.com/", lastmod: dateFromParts(2026, 8, 25, 0, 0, 0) },
+                        Page { loc: "https://x.com/about" },
+                    ])
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let xml = invoke_rpc(&program, "Site", "sitemap", &json!({}), &db).unwrap();
+        let xml = xml.as_str().unwrap();
+        assert!(xml.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"), "{xml}");
+        assert!(xml.contains("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">"), "{xml}");
+        assert!(xml.contains("<loc>https://x.com/</loc>"), "{xml}");
+        assert!(xml.contains("<lastmod>2026-08-25T00:00:00.000Z</lastmod>"), "{xml}");
+        // La segunda entrada NO tiene lastmod -- su <url> no debe llevar
+        // ningún <lastmod> (ni vacío, ni heredado de la entrada anterior).
+        let (_, second_url) = xml.rsplit_once("https://x.com/about").unwrap();
+        assert!(!second_url.contains("<lastmod>"), "{xml}");
+        assert!(xml.trim_end().ends_with("</urlset>"), "{xml}");
+    }
+
+    #[test]
+    fn sitemap_xml_escapes_a_loc_with_special_characters() {
+        let program = program_from(
+            r#"
+            type Page = { loc: String, lastmod?: Timestamp }
+            service Site {
+                rpc sitemap(loc: String) -> String { sitemapXml([Page { loc: loc }]) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let xml = invoke_rpc(&program, "Site", "sitemap", &json!({"loc": "https://x.com/a&b?c=<d>"}), &db).unwrap();
+        let xml = xml.as_str().unwrap();
+        assert!(xml.contains("<loc>https://x.com/a&amp;b?c=&lt;d&gt;</loc>"), "{xml}");
+        assert!(!xml.contains("c=<d>"), "el '<'/'>' crudo no debe llegar sin escapar: {xml}");
+    }
+
+    #[test]
+    fn sitemap_xml_on_an_empty_list_is_a_valid_empty_urlset() {
+        let program = program_from(
+            r#"
+            type Page = { loc: String, lastmod?: Timestamp }
+            service Site {
+                rpc sitemap() -> String { sitemapXml([]) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let xml = invoke_rpc(&program, "Site", "sitemap", &json!({}), &db).unwrap();
+        assert_eq!(
+            xml.as_str().unwrap(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n</urlset>"
+        );
+    }
+
+    #[test]
+    fn robots_txt_builds_blocks_with_disallow_and_allow_in_order_plus_a_trailing_sitemap() {
+        let program = program_from(
+            r#"
+            type Rule = { userAgent: String, disallow?: String[], allow?: String[] }
+            service Site {
+                rpc robots() -> String {
+                    robotsTxt([
+                        Rule { userAgent: "GPTBot", disallow: ["/"] },
+                        Rule { userAgent: "*", allow: ["/"], disallow: ["/admin"] },
+                    ], "https://x.com/sitemap.xml")
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let txt = invoke_rpc(&program, "Site", "robots", &json!({}), &db).unwrap();
+        assert_eq!(
+            txt.as_str().unwrap(),
+            "User-agent: GPTBot\nDisallow: /\n\nUser-agent: *\nDisallow: /admin\nAllow: /\n\nSitemap: https://x.com/sitemap.xml"
+        );
+    }
+
+    #[test]
+    fn robots_txt_without_a_sitemap_url_and_without_disallow_or_allow_omits_both() {
+        let program = program_from(
+            r#"
+            type Rule = { userAgent: String, disallow?: String[], allow?: String[] }
+            service Site {
+                rpc robots() -> String {
+                    robotsTxt([Rule { userAgent: "*" }], null)
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let txt = invoke_rpc(&program, "Site", "robots", &json!({}), &db).unwrap();
+        // Ni Disallow/Allow (ninguno de los dos se pasó) ni "Sitemap:" (se
+        // pasó null) -- un bloque de user-agent solo, nada inventado.
+        assert_eq!(txt.as_str().unwrap(), "User-agent: *");
     }
 
     // ---- `@validate(...)` (GRAMMAR.md §3.73) ----

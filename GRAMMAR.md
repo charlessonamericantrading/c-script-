@@ -137,6 +137,7 @@
   - [3.113 `@cache_control("...")` por rpc — RESUELTO](#3113-cache_control-por-rpc--resuelto)
   - [3.114 Flujo OAuth2 "client credentials" (servidor a servidor) — YA FUNCIONABA, sin un ejemplo que lo dijera](#3114-flujo-oauth2-client-credentials-servidor-a-servidor--ya-funcionaba-sin-un-ejemplo-que-lo-dijera)
   - [3.115 Lint `unused-var`: 14 falsos positivos dentro de closures y struct-literals — RESUELTO](#3115-lint-unused-var-14-falsos-positivos-dentro-de-closures-y-struct-literals--resuelto)
+  - [3.116 `sitemapXml`/`robotsTxt`: builtins declarativos para SEO — RESUELTO](#3116-sitemapxmlrobotstxt-builtins-declarativos-para-seo--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4998,6 +4999,42 @@ Antes de esta ronda, `linkc lint` marcaba `target` como `unused-var` en este có
 **Por qué importaba de verdad, más allá del ruido**: el propio issue lo señala -- si `linkc lint --fix` alguna vez renombra automáticamente estas variables a `_target`/`_reward`/etc. (o si alguien lo hace a mano confiando en el aviso), el prefijo `_` es una señal semántica real ("intencionalmente sin usar", GRAMMAR.md) que ninguna de estas 14 variables merecía -- un falso positivo de este lint, seguido de un `--fix` ciego, rompe código que funciona.
 
 **Verificado**: 5 tests nuevos en `lint.rs` -- los TRES repros del issue reproducidos literalmente (closure de `.filter()`, struct-literal de cola, closures+struct-literals de `upsert`) más un caso de `Expr::Match` (mismo bug de fondo, sin `.link` real citado en el issue pero cubierto de una vez) y un test de no-regresión confirmando que una variable genuinamente sin usar se sigue marcando.
+
+---
+
+### 3.116 `sitemapXml`/`robotsTxt`: builtins declarativos para SEO — RESUELTO
+
+PLAN.md §9.9 ítem 1 (SEO y descubribilidad para IA): antes de esta ronda, un `sitemap.xml`/`robots.txt` se escribía a mano armando el XML/texto como `String` (ver el ejemplo de §3.35) -- fácil de romper el formato (una etiqueta sin cerrar, un carácter especial sin escapar en una URL) sin que nada lo avisara hasta que un crawler real lo rechazara.
+
+```
+type Page = { loc: String, lastmod?: Timestamp }
+type Rule = { userAgent: String, disallow?: String[], allow?: String[] }
+
+@route("/sitemap.xml")
+@content_type("application/xml")
+rpc sitemap() -> String {
+  sitemapXml(db.pages.all().map(|p: Page| { Page { loc: "https://mi-sitio.com" + p.loc, lastmod: p.lastmod } }))
+}
+
+@route("/robots.txt")
+@content_type("text/plain")
+rpc robots() -> String {
+  robotsTxt([
+    Rule { userAgent: "GPTBot", disallow: ["/"] },
+    Rule { userAgent: "*", allow: ["/"], disallow: ["/admin"] },
+  ], "https://mi-sitio.com/sitemap.xml")
+}
+```
+
+**`sitemapXml(urls: {loc: String, lastmod?: Timestamp}[]) -> String`** arma un `sitemap.xml` bien formado (protocolo sitemaps.org) -- el rpc sigue siendo responsable de la lista de URLs (viene de la base, `@route` no puede inferir rutas dinámicas por sí solo), mismo criterio de "helper que devuelve `String`" que `escapeHtml`, no un motor de templates nuevo. `lastmod` es opcional-por-clave (`x?: T`, no `x: T?`) -- la mayoría de las URLs de un sitio real no tienen (o no vale la pena calcular) una fecha exacta de última modificación, y el protocolo también trata ese elemento como opcional. `loc` se escapa reusando `escape_html` (`&`/`<`/`>`/`"`/`'`) -- el mismo conjunto de caracteres que XML exige escapar en contenido de texto, y sus referencias numéricas (`&#39;` incluido) son válidas en XML tal cual, no solo en HTML, así que no hizo falta una segunda función de escape.
+
+**`robotsTxt(rules: {userAgent: String, disallow?: String[], allow?: String[]}[], sitemapUrl: String?) -> String`** arma un `robots.txt` bien formado -- un bloque `User-agent: ...` por regla, con sus `Disallow`/`Allow` (en ese orden), y `Sitemap: <url>` al final si se pasó una. `disallow`/`allow` opcionales-por-clave, no listas requeridas -- el caso real más común es "solo bloquear" o "solo permitir" un user-agent puntual, así que se puede omitir la lista que no haga falta en vez de escribir `[]` a mano; ausente (campo entero faltante) o presente pero `null` se tratan exactamente igual, ningún `Disallow`/`Allow` para ese bloque.
+
+**Los dos son estructurales, sin nombre** (`Type::Struct { name: None, ... }`, mismo criterio que `http_header_type()`/`http_response_type()` de §3.47/§3.60) -- cualquier `type` que el programa declare con estos campos exactos sirve, sin que el lenguaje tenga que inventar un `SitemapEntry`/`RobotsRule` propio. Los dos son builtins SIN receptor (como `dateFromParts`/`now`, no `crypto.X`/`http.X`) -- cableados en los mismos cinco puntos que ese precedente: tipo en `checker.rs` (`Expr::Ident` + lista de sugerencias "quisiste decir"), y en `runtime/mod.rs`, valor `FnRef` (`Expr::Ident`), despacho directo (`Expr::Call`) y despacho indirecto vía `call_callable` (para `let f = sitemapXml; f(...)`).
+
+**Alcance deliberado: preset de crawlers de IA NO incluido como código.** El ítem 3 original de PLAN.md §9.9 pedía un preset con los user-agents de IA conocidos (`GPTBot`, `ClaudeBot`, `PerplexityBot`, `Google-Extended`, etc.) ya armados adentro del compilador -- se descartó ese diseño a propósito: una lista de bots hardcodeada en el binario se desactualiza cada vez que aparece un crawler nuevo, y arreglarla requeriría una release del compilador en vez de solo cambiar el `.link` del adoptador. `robotsTxt` ya resuelve el caso completo -- un adoptador que quiera bloquear/permitir crawlers de IA específicos simplemente pasa esos `userAgent` como cualquier otra regla, sin que el lenguaje necesite saber sus nombres.
+
+**Verificado**: 4 tests de tipos en `checker.rs` (acepta cualquier `type` con la forma correcta, rechaza uno sin `loc`/`userAgent`, cantidad de argumentos) + 5 en `runtime/mod.rs` -- sitemap con y sin `lastmod` en la MISMA lista (confirma que la ausencia en una entrada no "hereda" el `lastmod` de la anterior), escape de caracteres especiales en `loc`, lista vacía (`<urlset></urlset>` válido, sin ninguna entrada), robots.txt con dos bloques + reglas + sitemap final byte a byte, y un bloque sin `disallow`/`allow`/sitemap (ninguno inventado). Probado a mano además contra un servidor `linkc serve` real vía `curl`, confirmando XML/texto válidos de punta a punta.
 
 ---
 

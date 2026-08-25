@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.79.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`sitemapXml(urls: {loc: String, lastmod: Timestamp?}[]) -> String` / `robotsTxt(rules: {userAgent: String, disallow: String[]?, allow: String[]?}[], sitemapUrl: String?) -> String`.** Primer ítem resuelto de PLAN.md §9.9 (SEO y descubribilidad para IA), pedido explícito del usuario ("sigue con el seo y ia"). Hoy un `sitemap.xml`/`robots.txt` se escribe a mano concatenando `String` (ver el ejemplo de §3.35) -- ambos builtins arman el documento bien formado (XML válido según sitemaps.org, formato clásico de bloques `User-agent`/`Disallow`/`Allow` para `robots.txt`), el rpc sigue siendo responsable de la lista de datos (viene de la base, `@route` no puede inferir rutas dinámicas por sí solo). Mismo patrón de 5 puntos de enganche que `dateFromParts`: tipo estructural anónimo en `checker.rs` (`Type::Struct { name: None, .. }`, subtipado estructural -- cualquier `type` nominal con los campos correctos sirve, igual que `http.getWithHeaders`), y dispatch en los 3 puntos de `runtime/mod.rs` (Ident->FnRef, Call directo, `call_callable`). `sitemapXml` reusa `escape_html` (ya existente) para el `loc` -- las entidades HTML `&`/`<`/`>`/`"`/`'` son también válidas en XML -- y `timestamp::format_iso8601_millis` para `lastmod`. Decisión de alcance deliberada: NO se hardcodeó un preset de user-agents de IA conocidos (`GPTBot`/`ClaudeBot`/`PerplexityBot`/`Google-Extended`, el ítem 3 original de PLAN.md §9.9) -- una lista así se desactualiza en cuanto aparece un crawler nuevo y obligaría a un release del compilador para corregirla; `robotsTxt` genérico ya cubre el caso completo, un adoptador declara cualquier `userAgent` como una regla más, sin conocimiento especial del lenguaje.
+
+968 tests (9 nuevos): 4 de tipos en `checker.rs` (acepta cualquier struct con la forma correcta, rechaza `loc` faltante, rechaza aridad incorrecta) + 5 en `runtime/mod.rs` (XML bien formado con y sin `lastmod`, escapado de caracteres especiales en `loc`, lista vacía sigue siendo un `urlset` válido, bloques `robots.txt` con `Disallow`/`Allow` en orden más `Sitemap:` final, ausencia de `sitemapUrl`/reglas vacías omite las líneas correspondientes). Detalle completo: GRAMMAR.md §3.116, PLAN.md §9.9.
+
 ## [1.78.0] - 2026-08-25
 
 ### 🐛 Arreglado

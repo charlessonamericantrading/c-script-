@@ -73,6 +73,39 @@ fn http_response_type() -> Type {
     }
 }
 
+/// El tipo que `sitemapXml(urls)` (GRAMMAR.md §3.116) espera para cada
+/// entrada -- mismo criterio estructural sin nombre que `http_header_type`.
+/// `lastmod` opcional: la mayoría de las URLs de un sitio real no tienen
+/// (o no vale la pena calcular) una fecha de última modificación exacta --
+/// el protocolo de sitemaps.org ya trata ese elemento como opcional.
+fn sitemap_url_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "loc".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "lastmod".to_string(), optional: true, ty: Type::Timestamp },
+        ],
+    }
+}
+
+/// El tipo que `robotsTxt(rules, sitemapUrl)` (GRAMMAR.md §3.116) espera
+/// para cada bloque `User-agent: ...` -- `allow`/`disallow` OPCIONALES
+/// (`String[]?`, no listas requeridas): el caso real más común es
+/// "solo bloquear" o "solo permitir" un user-agent, así que se puede omitir
+/// la que no haga falta en vez de escribir `[]` a mano; en runtime, ausente
+/// (`null`) se trata exactamente igual que una lista vacía -- ningún
+/// `Disallow`/`Allow` para ese bloque.
+fn robots_rule_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "userAgent".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "disallow".to_string(), optional: true, ty: Type::List(Box::new(Type::String)) },
+            FieldType { name: "allow".to_string(), optional: true, ty: Type::List(Box::new(Type::String)) },
+        ],
+    }
+}
+
 impl CheckError {
     /// El PRIMER stamp gana: a medida que un error burbujea desde adentro
     /// hacia afuera (ej. de una sub-expresión hasta la sentencia que la
@@ -2709,6 +2742,21 @@ impl Checker {
                         Box::new(Type::Timestamp),
                     ));
                 }
+                // GRAMMAR.md §3.116: builtins sin receptor, mismo criterio
+                // que `dateFromParts` -- "helper que devuelve String", no un
+                // motor de templates nuevo. `sitemapXml` arma un
+                // `sitemap.xml` bien formado (protocolo sitemaps.org);
+                // `robotsTxt` arma un `robots.txt` bien formado, con
+                // `Sitemap: <url>` al final si se pasa una.
+                if name == "sitemapXml" {
+                    return Ok(Type::Function(vec![Type::List(Box::new(sitemap_url_type()))], Box::new(Type::String)));
+                }
+                if name == "robotsTxt" {
+                    return Ok(Type::Function(
+                        vec![Type::List(Box::new(robots_rule_type())), Type::Optional(Box::new(Type::String))],
+                        Box::new(Type::String),
+                    ));
+                }
                 if name == "assert" {
                     return Ok(Type::Function(vec![Type::Bool], Box::new(Type::Void)));
                 }
@@ -2727,7 +2775,7 @@ impl Checker {
                 if let Some((params, ret)) = self.fns.get(name) {
                     return Ok(Type::Function(params.clone(), Box::new(ret.clone())));
                 }
-                let mut candidates: Vec<&str> = vec!["db", "auth", "now", "dateFromParts", "assert", "panic"];
+                let mut candidates: Vec<&str> = vec!["db", "auth", "now", "dateFromParts", "assert", "panic", "sitemapXml", "robotsTxt"];
                 candidates.extend(env.keys().map(String::as_str));
                 candidates.extend(self.consts.keys().map(String::as_str));
                 candidates.extend(self.fns.keys().map(String::as_str));
@@ -4671,6 +4719,57 @@ type T = { id: Int, s: Status }")
 
         let wrong_ret = check_source("fn bad() -> Int { dateFromParts(2026, 1, 1, 0, 0, 0) }");
         assert!(wrong_ret.is_err());
+    }
+
+    /// `sitemapXml(urls: {loc, lastmod?}[]) -> String` (GRAMMAR.md §3.116) --
+    /// mismo criterio estructural que `http.getWithHeaders` (checker.rs,
+    /// `http_header_type`): cualquier `type` declarado por el programa con
+    /// estos campos exactos sirve, sin que el lenguaje tenga que inventar
+    /// un `SitemapEntry` propio.
+    #[test]
+    fn sitemap_xml_accepts_any_struct_shaped_like_loc_and_optional_lastmod() {
+        let src = r#"
+            type Page = { loc: String, lastmod?: Timestamp }
+            fn f() -> String { sitemapXml([Page { loc: "https://x.com/" }]) }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn sitemap_xml_rejects_a_struct_missing_loc() {
+        let src = r#"
+            type Page = { title: String }
+            fn f() -> String { sitemapXml([Page { title: "sin loc" }]) }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    /// `robotsTxt(rules: {userAgent, disallow?, allow?}[], sitemapUrl:
+    /// String?) -> String` (GRAMMAR.md §3.116).
+    #[test]
+    fn robots_txt_accepts_any_struct_shaped_like_user_agent_with_optional_lists() {
+        let src = r#"
+            type Rule = { userAgent: String, disallow?: String[] }
+            fn f() -> String { robotsTxt([Rule { userAgent: "GPTBot", disallow: ["/"] }], null) }
+        "#;
+        assert!(check_source(src).is_ok());
+        // `disallow`/`allow` omitidos del todo -- el struct del programa ni
+        // siquiera necesita declararlos si nunca los usa (mismo criterio
+        // que cualquier campo opcional del lado del supertipo).
+        let src2 = r#"
+            type Rule = { userAgent: String }
+            fn f() -> String { robotsTxt([Rule { userAgent: "*" }], "https://x.com/sitemap.xml") }
+        "#;
+        assert!(check_source(src2).is_ok());
+    }
+
+    #[test]
+    fn robots_txt_rejects_the_wrong_number_of_arguments() {
+        let src = r#"
+            type Rule = { userAgent: String }
+            fn f() -> String { robotsTxt([Rule { userAgent: "*" }]) }
+        "#;
+        assert!(check_source(src).is_err());
     }
 
     #[test]
