@@ -1575,7 +1575,7 @@ fn resolve_stable_ports(link_files: &[PathBuf], port_base: u16, registry_path: &
 fn cmd_serve_all(args: &[String]) -> ExitCode {
     let Some(dir) = args.first() else {
         eprintln!(
-            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>]"
+            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--service-api-key-exempt <nombre1,nombre2,...>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>]"
         );
         return ExitCode::FAILURE;
     };
@@ -1724,6 +1724,39 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let service_api_key_exempt: std::collections::HashSet<String> = match extract_flag_value(args, "--service-api-key-exempt") {
+        Ok(Some(v)) => v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+        Ok(None) => std::collections::HashSet::new(),
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !service_api_key_exempt.is_empty() && service_api_key.is_none() {
+        eprintln!("--service-api-key-exempt no tiene sentido sin --service-api-key/LINK_SERVICE_API_KEY -- no hay ningún chequeo del que eximir a nadie");
+        return ExitCode::FAILURE;
+    }
+    // Un nombre en --service-api-key-exempt que no corresponde a NINGÚN
+    // .link descubierto es casi seguro un typo -- silenciarlo dejaría a
+    // quien lo escribió creyendo que ese servicio quedó exento cuando en
+    // realidad sigue protegido (o, al revés, ningún nombre real quedó
+    // exento sin que nadie lo note). Falla acá, antes de arrancar nada,
+    // nombrando exactamente qué nombres no matchean.
+    let known_names: std::collections::HashSet<String> =
+        link_files.iter().filter_map(|p| p.file_stem()).filter_map(|s| s.to_str()).map(|s| s.to_string()).collect();
+    let unknown_exempt: Vec<&String> = service_api_key_exempt.iter().filter(|name| !known_names.contains(*name)).collect();
+    if !unknown_exempt.is_empty() {
+        let mut unknown_sorted: Vec<&str> = unknown_exempt.iter().map(|s| s.as_str()).collect();
+        unknown_sorted.sort();
+        let mut known_sorted: Vec<&str> = known_names.iter().map(|s| s.as_str()).collect();
+        known_sorted.sort();
+        eprintln!(
+            "--service-api-key-exempt nombra un servicio que no existe en '{dir}': [{}]. Servicios reales encontrados: [{}].",
+            unknown_sorted.join(", "),
+            known_sorted.join(", "),
+        );
+        return ExitCode::FAILURE;
+    }
     let log_format = match resolve_log_format(args) {
         Ok(f) => f,
         Err(msg) => {
@@ -1782,6 +1815,11 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
     for (path, port, _) in &services {
         println!("  {:<40} -> http://localhost:{port}", path.display());
     }
+    if !service_api_key_exempt.is_empty() {
+        let mut exempt_sorted: Vec<&str> = service_api_key_exempt.iter().map(|s| s.as_str()).collect();
+        exempt_sorted.sort();
+        println!("  exentos de --service-api-key: {}", exempt_sorted.join(", "));
+    }
 
     // GRAMMAR.md §3.107: la asignación real (orden alfabético de los
     // `.link` descubiertos, ver el comentario más arriba) queda escrita acá
@@ -1831,7 +1869,14 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             let cors = cors.clone();
             let jwt_config = jwt_config.clone();
             let argon2_params = argon2_params.clone();
-            let service_api_key = service_api_key.clone();
+            // GRAMMAR.md §3.93/§3.153: `--service-api-key` es un flag GLOBAL
+            // a la corrida entera de `serve-all` -- pero el chequeo en sí se
+            // aplica POR HILO (cada servicio corre su propio
+            // `runtime::server::serve`), así que un nombre presente en
+            // `--service-api-key-exempt` puede pasar `None` acá mismo, sin
+            // tocar el resto de los servicios que sí lo exigen.
+            let is_exempt = path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| service_api_key_exempt.contains(name));
+            let service_api_key = if is_exempt { None } else { service_api_key.clone() };
             let hsts = hsts.clone();
             let label = path.to_string_lossy().to_string();
             std::thread::spawn(move || {

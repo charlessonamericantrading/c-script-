@@ -361,6 +361,101 @@ fn restart_backoff_recovers_once_the_port_frees_up_while_the_other_service_stays
     assert!(stderr.contains("reintentando en"), "{stderr}");
 }
 
+/// GRAMMAR.md §3.153, extensión de §3.93: `--service-api-key` es un flag
+/// GLOBAL a toda la corrida de `serve-all` -- el landmine real que este
+/// test cierra es que, hasta esta ronda, no había forma de que UN servicio
+/// del workspace tuviera una política distinta al resto sin sacarlo de
+/// `serve-all` por completo. `--service-api-key-exempt <nombre>` deja a ese
+/// servicio puntual afuera del chequeo, sin tocar el resto.
+fn ping_with_header(port: u16, service: &str, header: Option<(&str, &str)>) -> (u16, String) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("conectar");
+    let body = "{}";
+    let header_line = header.map(|(k, v)| format!("{k}: {v}\r\n")).unwrap_or_default();
+    let request = format!(
+        "POST /{service}/ping HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{header_line}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    stream.flush().ok();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).ok();
+    let status: u16 = resp.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
+}
+
+#[test]
+fn service_api_key_exempt_lets_one_service_skip_the_check_while_the_other_still_requires_it() {
+    let _guard = port_guard();
+    let dir = TempDir::new("api-key-exempt");
+    dir.write("alpha.link", ALPHA);
+    dir.write("beta.link", BETA);
+    let port_base = free_port();
+    let server = ServeAll::start(&dir.0, port_base, &["--service-api-key", "s3cr3t", "--service-api-key-exempt", "alpha"]);
+
+    assert!(wait_for_port(port_base), "alpha no abrió a tiempo: {}", server.stderr());
+    assert!(wait_for_port(port_base + 1), "beta no abrió a tiempo: {}", server.stderr());
+
+    // alpha (exento): responde SIN el header.
+    let (status, body) = ping_with_header(port_base, "Alpha", None);
+    assert_eq!(status, 200, "alpha debería estar exento del chequeo: {body}");
+    assert_eq!(body, "\"alpha\"");
+
+    // beta (no exento): sigue exigiendo el header de siempre.
+    let (status, _) = ping_with_header(port_base + 1, "Beta", None);
+    assert_eq!(status, 401, "beta NO está exenta, debe seguir exigiendo la clave");
+    let (status, body) = ping_with_header(port_base + 1, "Beta", Some(("X-Service-Api-Key", "s3cr3t")));
+    assert_eq!(status, 200, "beta con la clave correcta debe responder normal: {body}");
+    assert_eq!(body, "\"beta\"");
+}
+
+#[test]
+fn service_api_key_exempt_naming_an_unknown_service_fails_clean_before_starting_anything() {
+    let _guard = port_guard();
+    let dir = TempDir::new("api-key-exempt-unknown");
+    dir.write("alpha.link", ALPHA);
+    let port_base = free_port();
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("serve-all")
+        .arg(&dir.0)
+        .arg("--port-base")
+        .arg(port_base.to_string())
+        .arg("--service-api-key")
+        .arg("s3cr3t")
+        .arg("--service-api-key-exempt")
+        .arg("gamma")
+        .output()
+        .expect("ejecutar linkc serve-all");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("gamma"), "{stderr}");
+    assert!(stderr.contains("alpha"), "debe listar los servicios reales conocidos: {stderr}");
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(TcpStream::connect(("127.0.0.1", port_base)).is_err(), "no debería haber arrancado ningún servicio con un nombre exento inválido");
+}
+
+#[test]
+fn service_api_key_exempt_without_service_api_key_is_a_clean_usage_error() {
+    let _guard = port_guard();
+    let dir = TempDir::new("api-key-exempt-no-key");
+    dir.write("alpha.link", ALPHA);
+    let port_base = free_port();
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("serve-all")
+        .arg(&dir.0)
+        .arg("--port-base")
+        .arg(port_base.to_string())
+        .arg("--service-api-key-exempt")
+        .arg("alpha")
+        .output()
+        .expect("ejecutar linkc serve-all");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("service-api-key-exempt"), "{stderr}");
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
 #[test]
 fn a_restart_backoff_flag_without_a_value_is_a_clean_cli_error() {
     let _guard = port_guard();

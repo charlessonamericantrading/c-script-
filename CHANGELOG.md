@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.104.0] - 2026-08-25
+
+### ✨ Nuevo
+- **`linkc serve-all --service-api-key-exempt <nombre1,nombre2,...>`.** Segundo hallazgo del barrido de "límites honestos" de GRAMMAR.md (después de v1.103.0): de todos los flags globales de `serve-all` (`--jwt-secret`/`--cors-origin`/`--session-ttl`/etc.), `--service-api-key` es el único que es una capa de SEGURIDAD real, no solo conveniencia -- el más caro de tener atascado como global sin excepción. Antes de este fix, un workspace con UN servicio que necesita quedar público (un healthcheck de terceros, un webhook entrante que no puede mandar el header) obligaba a sacar ese servicio de `serve-all` por completo y correrlo aparte con `linkc serve`.
+
+  Un nombre en la lista (validado contra los `.link` reales descubiertos en el directorio -- un typo falla limpio antes de arrancar cualquier servicio, listando los nombres reales) recibe `None` en su propio hilo, sin tocar el chequeo del resto de los servicios. Requiere `--service-api-key`/`LINK_SERVICE_API_KEY` configurado (error de CLI limpio si no hay nada de qué eximir a nadie).
+
+1161 tests (3 nuevos) en `cli_serve_all.rs`, contra el binario real: un servicio nombrado exento responde sin el header mientras el otro sigue exigiéndolo (401 sin clave, 200 con la clave correcta); un nombre exento inválido falla limpio antes de arrancar nada; usar el flag sin `--service-api-key` es un error de CLI limpio. Detalle completo: GRAMMAR.md §3.93, PLAN.md §9.5.
+
 ## [1.103.0] - 2026-08-25
 
 ### 🔧 Corregido
