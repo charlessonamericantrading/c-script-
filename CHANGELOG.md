@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.113.0] - 2026-08-26
+
+### 🐛 Arreglado
+Con el pedido explícito del usuario, se corrió una auditoría multi-agente adversarial (modo "ultracode") sobre las 6 features shippeadas en esta sesión (v1.107.0-v1.112.0): 6 agentes en paralelo, uno por feature, más una fase de verificación independiente de cada hallazgo antes de reportarlo. 5 de las 6 features auditadas tenían un bug real confirmado -- ninguno reportado externamente, todos encontrados y arreglados en la misma ronda:
+- **`upsert`/`findWhere`/`countWhere`/`deleteWhere` pusheados a SQL rompían la semántica de igualdad con NULL** -- `"campo" = ?` ligado a un parámetro NULL nunca es cierto en SQL, mientras el camino interpretado trata `Null == Null` como `true`. En `upsert` esto insertaba una fila DUPLICADA en vez de actualizar una existente con ese campo en NULL. Fix: `IS [NOT] NULL` para una hoja `==`/`!=` cuyo operando resultó NULL.
+- **`transaction` anidada, alcanzada a través de una llamada a función auxiliar** (no anidamiento sintáctico directo), compilaba limpio y fallaba en runtime con el error crudo del backend en vez de un mensaje claro. Fix: chequeo explícito antes del `BEGIN` real.
+- **Nombre de índice de `@unique` compuesto ambiguo**: dos constraints cuyos nombres de campo concatenados coincidían (`@unique(a_b, c)` vs `@unique(a, b_c)`) generaban el MISMO nombre de índice, y `CREATE UNIQUE INDEX IF NOT EXISTS` volvía el segundo un no-op silencioso -- su constraint nunca se enforcaba de verdad. Fix: codificación con prefijo de longitud, inyectiva por construcción.
+- **Revivido de `Union` con un miembro `Int64` nunca revivía ese miembro** -- la disambiguación validaba contra el valor SIN revivir con un chequeo que ya asumía post-revivido, así que un `Int64 | String` quedaba como string para siempre, en silencio, con la validación pasando igual. Fix: revivir cada candidato primero (con `try/catch`), validar después.
+- **Truncado de fecha en SQLite (`truncateToDay`/etc.) usaba división entera** en vez de real -- para un epoch pre-1970 con resto de milisegundos, redondeaba al día equivocado; Postgres ya hacía la división real y daba el resultado correcto, así que los dos backends discrepaban por un día entero en ese caso puntual. Fix: `/1000.0`.
+
+Los 5 bugs tienen test de regresión nuevo (unitario y, donde aplica, contra Postgres real) y quedaron documentados en detalle en sus respectivas secciones de GRAMMAR.md (§3.75, §3.154, §3.155, §3.156, §3.157).
+
 ## [1.112.0] - 2026-08-26
 
 ### ✨ Nuevo

@@ -254,16 +254,44 @@ pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checke
 /// `CREATE UNIQUE INDEX IF NOT EXISTS ...` de VARIAS columnas a la vez, uno
 /// por cada `@unique(...)` de nivel `type` (GRAMMAR.md §3.155) -- mismo
 /// criterio de idempotencia y nombre determinístico que `create_index_statements`
-/// (arriba), con el nombre de TODOS los campos concatenados para que dos
-/// constraints compuestos sobre la misma tabla nunca colisionen de nombre.
+/// (arriba), con el nombre de TODOS los campos codificados sin ambigüedad
+/// (`composite_unique_index_name` abajo) para que dos constraints
+/// compuestos sobre la misma tabla nunca colisionen de nombre.
 pub(crate) fn create_composite_unique_statements(collection: &str, sets: &[Vec<String>]) -> Vec<String> {
     sets.iter()
         .map(|fields| {
-            let idx_name = format!("idx_{collection}_{}", fields.join("_"));
+            let idx_name = composite_unique_index_name(collection, fields);
             let cols = fields.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
             format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{collection}\"({cols})")
         })
         .collect()
+}
+
+/// Nombre determinístico del índice para un `@unique(...)` compuesto --
+/// bug real encontrado por una auditoría multi-agente adversarial
+/// (26/08/2026): `format!("idx_{collection}_{}", fields.join("_"))` (la
+/// forma original) es AMBIGUO cuando un nombre de campo ya contiene un
+/// guion bajo -- `@unique(a_b, c)` y `@unique(a, b_c)` sobre el MISMO type
+/// generan el mismo string `"idx_<t>_a_b_c"`. Con `CREATE UNIQUE INDEX IF
+/// NOT EXISTS`, la segunda sentencia es un no-op silencioso: su constraint
+/// nunca se crea de verdad, y el checker no lo atrapa (dedup por CONJUNTO
+/// de campos, nunca por el nombre derivado) -- confirmado en vivo: una fila
+/// que violaba el segundo `@unique` se aceptaba con 200, no el 400
+/// documentado.
+///
+/// Codificación con prefijo de longitud (mismo principio que Bencode/
+/// netstrings, con `$` como separador longitud/contenido -- nunca aparece
+/// en un identificador c-script real): cada campo se codifica como
+/// `"{len}${nombre}"`, concatenados SIN separador extra entre campos. Esto
+/// es inyectivo -- dos secuencias DISTINTAS de nombres de campo nunca
+/// producen la misma codificación, porque el prefijo de longitud de cada
+/// entrada dice exactamente dónde termina, sin depender de que ningún
+/// caracter esté ausente del nombre del campo (a diferencia de un `join`
+/// con separador, que solo es seguro si el separador nunca puede aparecer
+/// DENTRO de un campo -- exactamente la garantía que `_` no daba).
+pub(crate) fn composite_unique_index_name(collection: &str, fields: &[String]) -> String {
+    let encoded: String = fields.iter().map(|f| format!("{}${f}", f.len())).collect();
+    format!("idx_{collection}_uniq_{encoded}")
 }
 
 /// ¿Es este el texto con el que SQLite o Postgres reportan una violación de
@@ -1728,12 +1756,29 @@ db { users: User[] }
 
     /// GRAMMAR.md §3.154: arranca la transacción SQL real detrás de un
     /// `transaction { ... }` -- llamado UNA vez, antes de evaluar el cuerpo
-    /// del bloque. El checker ya garantizó que no hay otra transacción
-    /// abierta (rechaza el anidamiento en compilación, GRAMMAR.md §3.154),
-    /// así que `transaction_pending_publishes` siempre está en `None` acá;
-    /// de todos modos no se sobreescribe hasta confirmar que el `BEGIN`
-    /// salió bien, para no dejar la cola "abierta" si el `BEGIN` falla.
+    /// del bloque.
+    ///
+    /// **El checker SOLO rechaza el anidamiento SINTÁCTICO** (un
+    /// `transaction` escrito literalmente dentro de otro, en el mismo
+    /// cuerpo de función) -- `in_transaction` (checker.rs) es un
+    /// `Cell<bool>` con alcance de UN `check_block`, sin visibilidad sobre
+    /// lo que hace una `fn` auxiliar llamada desde adentro. Antes de esta
+    /// ronda, un `transaction` alcanzado por una llamada a otra función que
+    /// a su vez abre su propio `transaction` (nesting real, pero a través
+    /// de un límite de función, no de sintaxis) compilaba limpio y recién
+    /// fallaba en RUNTIME con el error crudo del backend ("cannot start a
+    /// transaction within a transaction" de SQLite/Postgres), sin ninguna
+    /// pista de qué reglas de c-script se estaban violando -- encontrado
+    /// por una auditoría multi-agente adversarial (26/08/2026). Chequear
+    /// ACÁ, antes de intentar el `BEGIN` real, da el mismo mensaje claro
+    /// que el checker ya usa para el caso sintáctico, para el caso que el
+    /// checker estructuralmente no puede atrapar.
     pub(crate) fn begin_transaction(&self) -> Result<(), String> {
+        if self.transaction_pending_publishes.borrow().is_some() {
+            return Err(
+                "ya hay una transacción abierta en esta misma ejecución -- 'transaction { }' no admite anidamiento, ni siquiera a través de una función auxiliar que abre su propia transacción (GRAMMAR.md §3.154)".to_string(),
+            );
+        }
         self.backend.execute_ddl("BEGIN")?;
         *self.transaction_pending_publishes.borrow_mut() = Some(Vec::new());
         Ok(())
@@ -1928,7 +1973,35 @@ db { users: User[] }
         }
         let mut clauses = Vec::with_capacity(conditions.len());
         let mut cells = Vec::with_capacity(conditions.len());
-        for (idx, (field, op, value)) in conditions.iter().enumerate() {
+        for (field, op, value) in conditions.iter() {
+            // Bug real, encontrado en una auditoría propia: `"campo" = ?`
+            // ligado a un parámetro NULL nunca es cierto en SQL (NULL no es
+            // igual a nada, ni siquiera a sí mismo) -- pero el camino
+            // interpretado de siempre SÍ trata `Value::Null == Value::Null`
+            // como `true` (`==`/`!=` de Rust sobre el enum `Value`). Sin este
+            // caso especial, empujar a SQL una hoja `campo == variable` donde
+            // `variable` resultó ser `null` en runtime (ej. un parámetro
+            // opcional del propio rpc) hacía que la fila con ese campo en
+            // NULL nunca matcheara -- silenciosamente distinto del camino
+            // interpretado, y en `upsert` en particular, una fila "duplicada"
+            // insertada en vez de actualizada. `IS [NOT] NULL` es la forma
+            // SQL correcta, sin ningún parámetro ligado para esa hoja.
+            if matches!(value, Value::Null) {
+                let null_op = match op {
+                    BinaryOp::Eq => "IS NULL",
+                    BinaryOp::NotEq => "IS NOT NULL",
+                    // Los cuatro operadores relacionales no tienen una forma
+                    // NULL-segura razonable de todos modos (Rust ya niega
+                    // cualquier orden con Value::Null en el camino
+                    // interpretado) -- se cae al camino interpretado.
+                    _ => return None,
+                };
+                if field != "id" && columns.iter().find(|c| &c.field.name == field).is_none_or(|c| c.json) {
+                    return None;
+                }
+                clauses.push(format!("\"{field}\" {null_op}"));
+                continue;
+            }
             let sql_op = match op {
                 BinaryOp::Eq => "=",
                 BinaryOp::NotEq => "!=",
@@ -1950,7 +2023,7 @@ db { users: User[] }
                 }
                 self.write_param(col, Some(value))
             };
-            clauses.push(format!("\"{field}\" {sql_op} {}", self.backend.placeholder(idx + 1)));
+            clauses.push(format!("\"{field}\" {sql_op} {}", self.backend.placeholder(cells.len() + 1)));
             cells.push(cell);
         }
         let cond = clauses.join(" AND ");
@@ -2453,7 +2526,18 @@ fn truncate_timestamp_sql(field: &str, granularity: TimeGranularity, is_postgres
             TimeGranularity::Month => "start of month",
             TimeGranularity::Year => "start of year",
         };
-        format!("(CAST(strftime('%s', \"{field}\" / 1000, 'unixepoch', '{modifier}') AS INTEGER) * 1000)")
+        // Bug real, encontrado por una auditoría multi-agente adversarial
+        // (26/08/2026): `"campo" / 1000` con AMBOS operandos enteros es
+        // división entera de SQLite, que trunca HACIA CERO -- para un
+        // epoch PRE-1970 (negativo) con resto de milisegundos no nulo,
+        // redondea hacia arriba (más cerca de 1970) en vez de hacia abajo,
+        // empujando la fila al día/mes/año siguiente en vez del correcto.
+        // `/ 1000.0` (división real, como ya hacía el lado Postgres) deja
+        // que `strftime(..., 'unixepoch', ...)` reciba segundos
+        // fraccionarios de verdad y trunque el CALENDARIO correctamente --
+        // confirmado con SQLite real: `-500 / 1000` da `0` (1970-01-01),
+        // `-500 / 1000.0` da `-86400` segundos (1969-12-31), el día real.
+        format!("(CAST(strftime('%s', \"{field}\" / 1000.0, 'unixepoch', '{modifier}') AS INTEGER) * 1000)")
     }
 }
 

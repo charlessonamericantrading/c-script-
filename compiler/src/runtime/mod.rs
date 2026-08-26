@@ -5366,6 +5366,51 @@ mod tests {
         assert_eq!(second["count"], json!(2));
     }
 
+    /// Bug real, encontrado por una auditoría multi-agente adversarial
+    /// (26/08/2026) sobre el propio pushdown de conjunciones que reusan
+    /// `upsert`/`findWhere`/`countWhere`/`deleteWhere`: `"campo" = ?` ligado
+    /// a un parámetro NULL nunca es cierto en SQL (NULL no es igual a nada),
+    /// pero el camino INTERPRETADO trata `Value::Null == Value::Null` como
+    /// `true` -- así que un `matchFn = |c: T| { c.opcional == variable }`
+    /// donde `variable` resulta `null` en runtime encontraba la fila
+    /// existente por el camino interpretado pero NO por el pusheado,
+    /// insertando una fila duplicada en vez de actualizar. `conjunction_
+    /// condition` (runtime/db.rs) ahora genera `IS NULL`/`IS NOT NULL` para
+    /// una hoja `==`/`!=` cuyo operando resultó NULL, sin ningún parámetro
+    /// ligado para esa hoja -- mismo resultado que el camino interpretado.
+    #[test]
+    fn upsert_pushdown_matches_an_existing_null_valued_optional_field_instead_of_duplicating_the_row() {
+        let program = program_from(
+            r#"
+            type Item = { id: Int, name: String, note: String? }
+            type NewItem = { name: String, note: String? }
+            db { items: Item[] }
+            service S {
+                rpc upsertByNote(name: String, note: String?) -> Item {
+                    db.items.upsert(
+                        |c: Item| { c.note == note },
+                        NewItem { name: name, note: note },
+                        |c: Item| { NewItem { name: name, note: note } }
+                    )
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let first = invoke_rpc(&program, "S", "upsertByNote", &json!({"name": "first", "note": null}), &db).unwrap();
+        let second = invoke_rpc(&program, "S", "upsertByNote", &json!({"name": "second", "note": null}), &db).unwrap();
+        assert_eq!(first["id"], second["id"], "el segundo upsert con note=null debe ACTUALIZAR la misma fila, no insertar una nueva");
+        assert_eq!(second["name"], json!("second"));
+
+        // Regresión sobre el caso NO-null, que ya funcionaba: sigue andando
+        // igual con el fix (una hoja no-NULL sigue ligando un parámetro
+        // normal, ninguna fila con note distinto matchea por accidente).
+        let third = invoke_rpc(&program, "S", "upsertByNote", &json!({"name": "third", "note": "real"}), &db).unwrap();
+        assert_ne!(third["id"], second["id"], "un note real y distinto de null sigue insertando una fila nueva");
+        let fourth = invoke_rpc(&program, "S", "upsertByNote", &json!({"name": "fourth", "note": "real"}), &db).unwrap();
+        assert_eq!(third["id"], fourth["id"], "el mismo note real sigue actualizando la misma fila");
+    }
+
     // ---- transacciones multi-escritura: `transaction { ... }` (GRAMMAR.md §3.154) ----
 
     const TXN_PROGRAM: &str = r#"
@@ -5447,6 +5492,54 @@ mod tests {
         assert_eq!(stock, json!(3));
     }
 
+    /// Bug real, encontrado por una auditoría multi-agente adversarial
+    /// (26/08/2026): el checker SOLO rechaza el anidamiento SINTÁCTICO de
+    /// `transaction` (un `transaction` escrito literalmente dentro de
+    /// otro, en el mismo cuerpo de función) -- `in_transaction` no tiene
+    /// visibilidad sobre lo que hace una `fn` auxiliar llamada desde
+    /// adentro. Antes de esta ronda, alcanzar un `transaction` anidado a
+    /// través de una llamada a otra función compilaba limpio y fallaba en
+    /// RUNTIME con el error crudo del backend ("cannot start a transaction
+    /// within a transaction"), sin ninguna pista útil. `Db::begin_
+    /// transaction` ahora chequea ANTES de intentar el `BEGIN` real y da
+    /// el mismo mensaje claro que el caso sintáctico -- el servidor sigue
+    /// respondiendo con normalidad después (ninguna fila queda a medio
+    /// escribir).
+    #[test]
+    fn a_transaction_reached_through_a_helper_function_call_is_a_clear_runtime_error_not_a_raw_backend_message() {
+        let program = program_from(
+            r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            fn helper(name: String) -> Item {
+                transaction { db.items.insert(Item { id: 0, name: name }) }
+            }
+            service S {
+                rpc outer(name: String) -> Item {
+                    transaction {
+                        let x = helper(name);
+                        db.items.insert(Item { id: 0, name: name });
+                        x
+                    }
+                }
+                rpc count() -> Int { db.items.all().length() }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let err = invoke_rpc(&program, "S", "outer", &json!({"name": "x"}), &db).unwrap_err();
+        assert!(err.message.contains("no admite anidamiento"), "{}", err.message);
+
+        // La base sigue usable después -- ninguna fila quedó a medio
+        // escribir, y una segunda llamada falla de la misma forma clara
+        // (no corrompe estado ni deja la marca de "transacción abierta"
+        // pegada para siempre).
+        let count = invoke_rpc(&program, "S", "count", &json!({}), &db).unwrap();
+        assert_eq!(count, json!(0), "{count:?}");
+        let err2 = invoke_rpc(&program, "S", "outer", &json!({"name": "y"}), &db).unwrap_err();
+        assert!(err2.message.contains("no admite anidamiento"), "{}", err2.message);
+    }
+
     // ---- `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155) ----
 
     const COMPOSITE_UNIQUE_PROGRAM: &str = r#"
@@ -5481,6 +5574,42 @@ mod tests {
         let other_slug =
             invoke_rpc(&program, "Products", "create", &json!({"profileId": 1, "slug": "bar", "name": "D"}), &db).unwrap();
         assert_eq!(other_slug["slug"], json!("bar"), "mismo profileId, distinto slug: también tiene que aceptarse");
+    }
+
+    /// Bug real, encontrado por una auditoría multi-agente adversarial
+    /// (26/08/2026): el nombre de índice compuesto se armaba con
+    /// `fields.join("_")`, ambiguo cuando un nombre de campo ya tenía un
+    /// guion bajo -- `@unique(a_b, c)` y `@unique(a, b_c)` sobre el MISMO
+    /// type generaban el mismo `idx_<t>_a_b_c`, así que `CREATE UNIQUE INDEX
+    /// IF NOT EXISTS` volvía un no-op silencioso para el segundo -- su
+    /// constraint nunca se creaba de verdad. `composite_unique_index_name`
+    /// ahora codifica cada campo con prefijo de longitud, inyectivo por
+    /// construcción.
+    #[test]
+    fn two_composite_unique_constraints_whose_joined_field_names_would_collide_both_enforce() {
+        let program = program_from(
+            r#"
+            @unique(a_b, c)
+            @unique(a, b_c)
+            type T = { id: Int, a_b: Int, c: Int, a: Int, b_c: Int }
+            db { ts: T[] }
+            service Ts {
+                rpc create(a_b: Int, c: Int, a: Int, b_c: Int) -> T {
+                    db.ts.insert(T { id: 0, a_b: a_b, c: c, a: a, b_c: b_c })
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(&program, "Ts", "create", &json!({"a_b": 10, "c": 20, "a": 5, "b_c": 6}), &db).unwrap();
+
+        let violates_second =
+            invoke_rpc(&program, "Ts", "create", &json!({"a_b": 30, "c": 40, "a": 5, "b_c": 6}), &db);
+        assert!(violates_second.is_err(), "el segundo @unique(a, b_c) debe rechazar (a=5, b_c=6) repetido, no ser un no-op silencioso");
+
+        let violates_first =
+            invoke_rpc(&program, "Ts", "create", &json!({"a_b": 10, "c": 20, "a": 99, "b_c": 98}), &db);
+        assert!(violates_first.is_err(), "el primer @unique(a_b, c) sigue rechazando (a_b=10, c=20) repetido");
     }
 
     // ---- db.<c>.insertMany(items) (GRAMMAR.md §3.76) ----
@@ -7170,6 +7299,42 @@ mod tests {
         let summary = run_program_tests(&program).expect("ejecucion de tests");
         assert_eq!(summary.total, 1);
         assert_eq!(summary.passed, 1, "{:?}", summary.failed);
+    }
+
+    /// Bug real, encontrado por una auditoría multi-agente adversarial
+    /// (26/08/2026): `"campo" / 1000` con los dos operandos enteros es
+    /// división ENTERA de SQLite, que trunca hacia cero -- para un epoch
+    /// PRE-1970 (negativo) con resto de milisegundos no nulo, redondea
+    /// hacia 1970 en vez de hacia abajo, empujando la fila al día
+    /// siguiente. `dateFromParts` no alcanza para este repro (no tiene
+    /// parámetro de milisegundos) -- se manda el string ISO-8601 crudo vía
+    /// `invoke_rpc`, igual que llegaría por HTTP real.
+    #[test]
+    fn truncate_to_day_floors_correctly_for_a_pre_1970_timestamp_with_a_sub_second_remainder() {
+        let program = program_from(
+            r#"
+            type Sale = { id: Int, at: Timestamp, amount: Int }
+            type DayTotal = { key: Timestamp, value: Int }
+            db { sales: Sale[] }
+            service Sales {
+                rpc create(at: Timestamp, amount: Int) -> Sale {
+                    db.sales.insert(Sale { id: 0, at: at, amount: amount })
+                }
+                rpc byDay() -> DayTotal[] {
+                    db.sales.sumBy(|s: Sale| { s.at.truncateToDay() }, |s: Sale| { s.amount })
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(&program, "Sales", "create", &json!({"at": "1969-12-31T23:59:59.500Z", "amount": 1}), &db).unwrap();
+        let by_day = invoke_rpc(&program, "Sales", "byDay", &json!({}), &db).unwrap();
+        let rows = by_day.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0]["key"], json!("1969-12-31T00:00:00.000Z"),
+            "500ms antes de medianoche UTC del 31 sigue siendo 31 de diciembre, no 1 de enero: {rows:?}"
+        );
     }
 
     // GRAMMAR.md §3.102: `maxRow`/`minRow` -- caso real que los motiva

@@ -662,6 +662,54 @@ service Counters {{
     assert_ne!(other["id"], second["id"], "un name distinto sí inserta una fila nueva: {other:?}");
 }
 
+/// Bug real, encontrado por una auditoría multi-agente adversarial
+/// (26/08/2026): `"campo" = ?` ligado a un parámetro NULL nunca es cierto en
+/// SQL, así que un `upsert` con `matchFn = |c| { c.opcional == variable }`
+/// donde `variable` resulta `null` insertaba una fila duplicada en vez de
+/// actualizar la existente -- divergía del camino interpretado, que trata
+/// `Value::Null == Value::Null` como `true`. Lado Postgres del mismo test
+/// que ya existe contra SQLite (runtime/mod.rs).
+#[test]
+fn upsert_pushdown_matches_an_existing_null_valued_optional_field_against_real_postgres() {
+    const COLLECTION: &str = "items_upsert_null_pushdown";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("upsert-null-pushdown");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String, note: String? }}
+type NewItem = {{ name: String, note: String? }}
+db {{ {COLLECTION}: Item[] }}
+service S {{
+  rpc upsertByNote(name: String, note: String?) -> Item {{
+    db.{COLLECTION}.upsert(
+      |c: Item| {{ c.note == note }},
+      NewItem {{ name: name, note: note }},
+      |c: Item| {{ NewItem {{ name: name, note: note }} }}
+    )
+  }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    let first = server.rpc("S/upsertByNote", r#"{"name":"first","note":null}"#);
+    let second = server.rpc("S/upsertByNote", r#"{"name":"second","note":null}"#);
+    assert_eq!(first["id"], second["id"], "el segundo upsert con note=null debe ACTUALIZAR la misma fila: {first:?} vs {second:?}");
+    assert_eq!(second["name"], serde_json::json!("second"), "{second:?}");
+
+    let third = server.rpc("S/upsertByNote", r#"{"name":"third","note":"real"}"#);
+    assert_ne!(third["id"], second["id"], "un note real y distinto de null sigue insertando una fila nueva: {third:?}");
+    let fourth = server.rpc("S/upsertByNote", r#"{"name":"fourth","note":"real"}"#);
+    assert_eq!(third["id"], fourth["id"], "el mismo note real sigue actualizando la misma fila: {third:?} vs {fourth:?}");
+}
+
 /// GRAMMAR.md §3.154: `transaction { ... }` -- `BEGIN`/`COMMIT`/`ROLLBACK`
 /// reales contra Postgres, no solo SQLite (backend distinto, mismo
 /// `execute_ddl` pero otra implementación por debajo -- `client.batch_execute`

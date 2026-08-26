@@ -4,7 +4,7 @@
 
 use crate::ast::{FieldCheck, Program};
 use crate::checker::Checker;
-use crate::runtime::db::{check_clause_sql, check_fields_by_collection};
+use crate::runtime::db::{check_clause_sql, check_fields_by_collection, composite_unique_index_name};
 use crate::types::{FieldType, Type};
 use std::collections::HashSet;
 
@@ -149,7 +149,7 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
                 continue;
             }
             for crate::ast::TypeAnnotation::Unique(fields) in &t.annotations {
-                let idx_name = format!("idx_{coll_name}_{}", fields.join("_"));
+                let idx_name = composite_unique_index_name(coll_name, fields);
                 let cols = fields.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
                 statements.push(format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{coll_name}\"({cols});"));
             }
@@ -352,9 +352,41 @@ mod tests {
         let ddl = generate_postgres_ddl(&program).unwrap();
 
         assert!(
-            ddl.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_products_profileId_slug\" ON \"products\"(\"profileId\", \"slug\");"),
+            ddl.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_products_uniq_9$profileId4$slug\" ON \"products\"(\"profileId\", \"slug\");"),
             "{ddl}"
         );
+    }
+
+    /// Bug real, encontrado por una auditoría multi-agente adversarial
+    /// (26/08/2026): con el nombre viejo (`fields.join("_")`),
+    /// `@unique(a_b, c)` y `@unique(a, b_c)` producían el MISMO nombre de
+    /// índice (`idx_t_a_b_c`) -- `CREATE UNIQUE INDEX IF NOT EXISTS` volvía
+    /// el segundo un no-op silencioso. `composite_unique_index_name`
+    /// (runtime/db.rs, reusada acá) codifica con prefijo de longitud, así
+    /// que las dos sentencias tienen que tener nombres DISTINTOS.
+    #[test]
+    fn two_composite_unique_constraints_that_would_collide_under_naive_joining_get_distinct_index_names() {
+        let code = r#"
+        @unique(a_b, c)
+        @unique(a, b_c)
+        type T = { id: Int, a_b: Int, c: Int, a: Int, b_c: Int }
+        db { ts: T[] }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let ddl = generate_postgres_ddl(&program).unwrap();
+
+        assert!(ddl.contains("(\"a_b\", \"c\")"), "{ddl}");
+        assert!(ddl.contains("(\"a\", \"b_c\")"), "{ddl}");
+        // El punto real del test: los dos nombres de índice, extraídos de
+        // sus respectivas sentencias CREATE, tienen que ser DISTINTOS.
+        let names: Vec<&str> = ddl
+            .lines()
+            .filter(|l| l.contains("CREATE UNIQUE INDEX IF NOT EXISTS"))
+            .filter_map(|l| l.split('"').nth(1))
+            .collect();
+        assert_eq!(names.len(), 2, "esperaba 2 sentencias CREATE UNIQUE INDEX: {ddl}");
+        assert_ne!(names[0], names[1], "los dos nombres de índice no pueden colisionar: {ddl}");
     }
 
     #[test]

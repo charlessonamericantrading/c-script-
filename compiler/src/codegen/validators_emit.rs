@@ -687,18 +687,37 @@ fn render_revive(
                 "Object.fromEntries(Object.entries({expr} as any).map(([k, v]: [string, any]) => [k, {inner_expr}]))"
             )
         }
-        // Disambiguación vía el mismo chequeo `isX` que ya usa el
-        // validador de este miembro -- si `expr` matchea, se revive con
-        // el revividor de ESE miembro (o identidad si ese miembro no
-        // tiene Int64 adentro).
+        // Bug real, encontrado por una auditoría multi-agente adversarial
+        // (26/08/2026): la forma original disambiguaba corriendo el `isX`
+        // de cada miembro contra `expr` SIN REVIVIR -- pero `isX` para
+        // `Int64` (`render_check` arriba) ya asume la forma POST-revivida
+        // (`typeof === "bigint"`), nunca la del wire crudo (siempre
+        // string). Resultado: un miembro `Int64` de una unión NUNCA
+        // matcheaba contra el valor crudo, la disambiguación caía siempre
+        // al siguiente miembro (típicamente `String`, que sí matchea
+        // cualquier string), y el `Int64` real quedaba como string para
+        // siempre -- silencioso, porque `isX` sobre la unión completa
+        // también pasaba (el string sin revivir sigue siendo un `String`
+        // válido para ese chequeo). Fix: revivir CADA candidato primero
+        // (con su propio revividor, identidad si ese miembro no tiene
+        // Int64 adentro), y recién ahí correr `isX` sobre el candidato YA
+        // revivido -- el orden real tiene que ser revivir-después-validar,
+        // igual que en cualquier otra posición de este archivo.
         Type::Union(members) => {
-            let mut chain = format!("({expr} as any)");
-            for m in members.iter().rev() {
-                let check = render_check(m, expr, worklist, seen);
-                let revived = render_revive(m, expr, checker, worklist, seen)?.unwrap_or_else(|| expr.to_string());
-                chain = format!("({check} ? ({revived}) : {chain})");
+            let mut body = String::new();
+            for (i, m) in members.iter().enumerate() {
+                let var = format!("__u{i}");
+                let candidate = render_revive(m, expr, checker, worklist, seen)?.unwrap_or_else(|| format!("({expr} as any)"));
+                let check = render_check(m, &var, worklist, seen);
+                // `try/catch`: revivir un candidato que NO es de verdad este
+                // miembro puede lanzar de verdad (`BigInt("hello")` tira
+                // `SyntaxError`, no devuelve algo que falle el chequeo
+                // después) -- un candidato que revienta simplemente no es
+                // este miembro, se sigue probando el próximo.
+                body.push_str(&format!("try {{ const {var} = {candidate}; if ({check}) return {var}; }} catch {{}}\n"));
             }
-            chain
+            body.push_str(&format!("return ({expr} as any);\n"));
+            format!("((): any => {{\n{body}}})()")
         }
         Type::Struct { fields, .. } => render_struct_revive(fields, expr, checker, worklist, seen)?,
         _ => unreachable!("cubierto por reviver_fn_name o contains_int64 = false"),
@@ -973,6 +992,32 @@ mod tests {
         assert!(out.contains("export function reviveEvent"), "{out}");
         assert!(out.contains("(x as any).type === \"Created\""), "{out}");
         assert!(out.contains("amount: BigInt"), "{out}");
+    }
+
+    /// Bug real, encontrado por una auditoría multi-agente adversarial
+    /// (26/08/2026): la disambiguación de un `Union` durante el revivido
+    /// corría el `isX` de cada miembro contra el valor CRUDO (pre-revivir)
+    /// -- pero `isInt64` (desde esta misma ronda) ya asume la forma
+    /// POST-revivida (`typeof === "bigint"`), así que un miembro `Int64`
+    /// nunca matcheaba y la unión caía siempre al miembro `String`, que sí
+    /// matchea cualquier string. El fix revive CADA candidato primero,
+    /// envuelto en `try/catch` (`BigInt("no numérico")` tira de verdad, no
+    /// falla el chequeo después), y recién ahí valida el candidato ya
+    /// revivido.
+    #[test]
+    fn int64_inside_a_union_member_gets_revived_not_silently_left_as_a_string() {
+        let src = r#"
+            type Event = { payload: Int64 | String }
+            service S { rpc get() -> Event { db.thing.get() } }
+        "#;
+        let out = emit(src);
+        assert!(out.contains("export function reviveEvent"), "{out}");
+        // El candidato Int64 tiene que probarse ENVUELTO en try/catch (un
+        // string no numérico como candidato Int64 tira de verdad) y
+        // validarse YA revivido -- no `render_check` corriendo contra el
+        // string crudo.
+        assert!(out.contains("try {") && out.contains("catch {}"), "{out}");
+        assert!(out.contains("BigInt("), "el candidato Int64 tiene que intentar revivir de verdad: {out}");
     }
 
     #[test]
