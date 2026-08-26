@@ -2834,7 +2834,7 @@ fn run_tests_core(program: &Program, filter: Option<&str>, shared_db: Option<&Db
             }
         };
         let sessions = SessionStore::new();
-        let step_budget = Cell::new(1_000_000);
+        let step_budget = Cell::new(0u64);
         let env = Env::new();
         match eval_block(&test.body, &env, db, &fns, &checker, &sessions, None, &step_budget) {
             Ok(_) => passed += 1,

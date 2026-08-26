@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.110.0] - 2026-08-26
+
+### 🐛 Arreglado
+- **`while` real dentro de un bloque `test { }` fallaba siempre en su primera vuelta.** `run_tests_core` (el runner de `linkc test`) inicializaba el contador compartido de iteraciones de `while` (`MAX_WHILE_ITERATIONS = 1_000_000`, GRAMMAR.md §3.15) directamente en el propio tope en vez de en cero -- el camino normal de `rpc` (`invoke_rpc_with_sessions`) sí lo inicializaba bien. Efecto: la primerísima vuelta de CUALQUIER `while` dentro de un `test` empujaba el contador por encima del tope y disparaba de inmediato "límite de 1000000 iteraciones excedido -- posible loop infinito", sin que el loop hubiera corrido de verdad -- el propio ejemplo canónico de §3.15 (sumar una lista con `while`) fallaba siempre invocado desde un test, funcionando perfecto desde `serve`. Encontrado verificando (no asumiendo) un reporte externo de un `while` "colgado" solo bajo el test runner. Fix de una línea; test de regresión nuevo en `tests/cli_test_runner.rs` que cubre tanto el caso corto (debe pasar) como un `while true` genuino (debe seguir cortando).
+
 ## [1.109.0] - 2026-08-26
 
 ### ✨ Nuevo

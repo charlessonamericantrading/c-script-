@@ -193,3 +193,72 @@ fn filter_combined_with_a_snapshot_path_is_a_clean_cli_error() {
     assert!(stderr.contains("--filter"), "stderr: {stderr}");
     assert!(!std::path::Path::new(&snap).exists(), "no debería haber llegado a crear ningún snapshot");
 }
+
+// ---- regresión: `while` real dentro de `test { }` (GRAMMAR.md §3.15) ----
+
+#[test]
+fn a_while_loop_that_finishes_in_a_handful_of_iterations_passes_inside_a_test_block() {
+    // Bug real encontrado 26/08/2026 verificando un reporte de un colaborador:
+    // `run_tests_core` inicializaba el contador compartido de iteraciones de
+    // `while` en `Cell::new(1_000_000)` (el propio tope MAX_WHILE_ITERATIONS)
+    // en vez de `Cell::new(0)` -- el camino de rpc normal (invoke_rpc_with_sessions)
+    // sí arrancaba en 0. Efecto: CUALQUIER `while` que se ejecutara al menos
+    // una vez dentro de un `test { }` fallaba de inmediato en su primera
+    // iteración real con "límite de 1000000 iteraciones de 'while' excedido",
+    // sin importar cuán corto fuera el loop -- el ejemplo canónico de §3.15
+    // (sumar una lista con un `while`) nunca pasaba dentro de un test, aunque
+    // el mismo código funcionaba perfecto invocado vía `serve`.
+    let project = TempDir::new("while-in-test-block");
+    let entry = project.write(
+        "main.link",
+        r#"
+        test "while suma una lista sin colgarse" {
+            let xs = [1, 2, 3, 4, 5];
+            let mut total = 0;
+            let mut i = 0;
+            while i < xs.length() {
+                total = total + xs[i];
+                i = i + 1;
+            }
+            assert(total == 15, "la suma debe ser 15");
+        }
+        "#,
+    );
+
+    let output = run_linkc_test(&entry);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(output.status.success(), "stdout: {stdout} -- stderr: {stderr}");
+    assert!(stdout.contains("test result: ok. 1 passed; 0 failed"), "stdout: {stdout}");
+}
+
+#[test]
+fn a_genuinely_infinite_while_inside_a_test_block_still_hits_the_real_cap() {
+    // La contracara del fix de arriba: no basta con que el contador arranque
+    // en 0, tiene que seguir cortando un loop que de verdad nunca termina --
+    // si no, el fix de la regresión anterior podría haberse hecho subiendo
+    // el tope en vez de corrigiendo el punto de partida.
+    let project = TempDir::new("while-true-in-test-block");
+    let entry = project.write(
+        "main.link",
+        r#"
+        test "while true real se corta" {
+            let mut i = 0;
+            while true {
+                i = i + 1;
+            }
+            assert(i > 0);
+        }
+        "#,
+    );
+
+    let output = run_linkc_test(&entry);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!output.status.success(), "un while true real no debe pasar nunca");
+    assert!(
+        stdout.contains("límite de 1000000 iteraciones de 'while' excedido"),
+        "stdout: {stdout}"
+    );
+}
