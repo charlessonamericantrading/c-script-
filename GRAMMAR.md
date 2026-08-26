@@ -1984,6 +1984,17 @@ sería inútil contra fuerza bruta).
   - Reinicios frecuentes en un ambiente de despliegue agresivo (o correr N
     réplicas detrás de un balanceador) diluyen el límite real -- es un
     límite POR PROCESO, no global de la aplicación.
+  - **La dilución en sí es silenciosa -- pero el rechazo real ya no lo es
+    (26/08/2026).** `linkc_rate_limit_rejections_total{method="..."}` en
+    `/metrics` (§3.149) cuenta cada `429` real por rpc -- no arregla la
+    dilución entre réplicas (necesitaría estado compartido, ej. Redis o
+    una tabla Postgres con incremento atómico, fuera de alcance de esta
+    ronda), pero agregado entre réplicas en Prometheus (`sum by (method)
+    (linkc_rate_limit_rejections_total)`) le da a quien opera la señal
+    real de cuánto está rechazando el sistema en conjunto -- antes de
+    esto, la única forma de notar que un `@rate_limit` dejó de proteger
+    algo era ver el efecto (un endpoint caro golpeado sin control), nunca
+    la causa.
 - **Barrido de buckets inactivos, no eviction fina.** Cada 1000 checks se
   descartan los buckets sin actividad hace más de una hora, así un proceso
   de larga vida con muchos clientes distintos no crece sin límite en
@@ -5836,7 +5847,9 @@ PLAN.md §9.8 ítems 1 y 2, cerrados JUNTOS -- resultaron ser la misma pieza de 
 
 **`/metrics` NO está exento de `--service-api-key`**, a diferencia de `/health` -- los volúmenes/latencias por rpc son más sensibles que un simple "¿está vivo?", así que si el operador configuró esa capa, Prometheus también tiene que mandarla (`scrape_configs.authorization` en `prometheus.yml` la soporta nativamente).
 
-**Verificado**: 3 tests de `metrics::MetricsStore` (un método nunca registrado no aparece, conteo+duración se acumulan por método, `stream_subscribers`/`db_size_bytes` solo aparecen cuando se pasan) + 4 tests de integración en `cli_metrics.rs` contra un `linkc serve` real: el conteo y la suma de duración de `Sys.ping` después de dos llamadas reales; el tamaño de una base SQLite real con al menos una fila (> 0, no un valor inventado); DOS conexiones de `stream` REALES abiertas a la vez confirman `linkc_stream_subscribers{collection="tasks"} 2`, cero conexiones no muestra la línea; `/metrics` rechazado sin `X-Service-Api-Key` cuando `/health` sigue exento. Más 1 test contra un Postgres REAL (`pg_integration.rs`) confirmando `pg_database_size` con datos reales insertados.
+**`linkc_rate_limit_rejections_total{method="..."}` (26/08/2026): rechazos `429` reales de `@rate_limit` (§3.39), por rpc.** Landmine del mismo barrido de "límites honestos" que motivó §3.150 más abajo -- no arregla la dilución del límite entre réplicas (necesitaría estado compartido entre procesos, fuera de alcance), pero hace el rechazo real observable en el mismo lugar que un operador ya mira, agregable entre réplicas con una consulta Prometheus normal (`sum by (method) (...)`).
+
+**Verificado**: 4 tests de `metrics::MetricsStore` (un método nunca registrado no aparece, conteo+duración se acumulan por método, `stream_subscribers`/`db_size_bytes` solo aparecen cuando se pasan, rechazos de rate limit se acumulan por rpc y no aparecen hasta el primero) + 5 tests de integración en `cli_metrics.rs` contra un `linkc serve` real: el conteo y la suma de duración de `Sys.ping` después de dos llamadas reales; el tamaño de una base SQLite real con al menos una fila (> 0, no un valor inventado); DOS conexiones de `stream` REALES abiertas a la vez confirman `linkc_stream_subscribers{collection="tasks"} 2`, cero conexiones no muestra la línea; `/metrics` rechazado sin `X-Service-Api-Key` cuando `/health` sigue exento; un rpc con `@rate_limit("1/1h")` golpeado tres veces confirma exactamente 2 rechazos reales (no un valor inventado) en `linkc_rate_limit_rejections_total{method="Sys.limited"}`. Más 1 test contra un Postgres REAL (`pg_integration.rs`) confirmando `pg_database_size` con datos reales insertados.
 
 ### 3.150 Latencia de propagación NOTIFY + cola de reintento acotada — RESUELTO
 

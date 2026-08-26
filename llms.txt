@@ -125,7 +125,7 @@ Does NOT work today — do not propose designs that depend on these:
 
 - **Auto HTML escaping.** `"...".escapeHtml()` exists (GRAMMAR.md §3.45, escapes `& < > " '`) but is opt-in — nothing forces you to call it. Pages are still built by concatenating `String`; interpolate untrusted data through `.escapeHtml()` yourself, or it goes into the page as-is.
 - **`request.rawBody()` needs a JSON body.** Argument parsing runs before any rpc regardless of its parameter count, so a non-JSON body never reaches the rpc — a JSON webhook payload with extra fields is fine.
-- **`@rate_limit` is per-process, in-memory.** No persistence across restarts, no coordination across replicas. The client IP comes from the real TCP connection by default — never `X-Forwarded-For` unless `--trust-proxy`/`LINK_TRUST_PROXY` explicitly opts into it (off by default; behind a real reverse proxy, `remote_addr()` is always the proxy's own IP, sharing the limit across every real user — see GRAMMAR.md §3.89).
+- **`@rate_limit` is per-process, in-memory.** No persistence across restarts, no coordination across replicas — running N replicas behind a load balancer silently dilutes the real limit (each process still enforces its own quota correctly, but the aggregate across replicas can be N× what the `.link` asked for). `linkc_rate_limit_rejections_total{method="..."}` in `/metrics` (26/08/2026) doesn't fix the dilution (would need shared state across processes, e.g. Redis — out of scope without real demand) but makes real 429 rejections visible per rpc, aggregable across replicas with a normal Prometheus query. The client IP comes from the real TCP connection by default — never `X-Forwarded-For` unless `--trust-proxy`/`LINK_TRUST_PROXY` explicitly opts into it (off by default; behind a real reverse proxy, `remote_addr()` is always the proxy's own IP, sharing the limit across every real user — see GRAMMAR.md §3.89).
 - **`http.get`/`http.post`/`getWithHeaders`/`postWithHeaders` only return the response body.** No status code or response headers exposed to the program — a 4xx/5xx from the called API is a generic runtime error, not something the rpc can branch on.
 - **No `ctx.user` / full caller identity.** `auth.currentRole() -> String?` (GRAMMAR.md §3.51) exposes only the role name — the session never stores a reference to the actual `User` who logged in, only the role tag, same as v0.
 - **Native WASM codegen** (`linkc wasm`) is deliberately frozen at integer/boolean scalar functions.
@@ -297,7 +297,7 @@ linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json
 linkc serve-all ./services --port-base 3000 --port-registry ./services/ports.json  # same shape, but read back first -- a name keeps its port forever
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
 linkc serve-all ./services --port-base 3000 --service-api-key s3cr3t --service-api-key-exempt webhooks  # every service but "webhooks" requires the header
-linkc --version                      # linkc 1.105.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.106.0 -- same version stamped in every generated file
 ```
 
 ## Verified example

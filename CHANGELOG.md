@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.106.0] - 2026-08-26
+
+### ✨ Nuevo
+- **`linkc_rate_limit_rejections_total{method="..."}` en `/metrics`.** Quinto hallazgo del barrido de "límites honestos" de GRAMMAR.md: `@rate_limit` vive en memoria POR PROCESO (ya documentado como límite honesto desde v1.39.0) -- correr N réplicas detrás de un balanceador diluye el límite real sin ningún aviso, así que un endpoint caro (email, cobro) protegido "en el papel" puede estar recibiendo N veces más tráfico real del que su `.link` pidió, sin que nadie lo note hasta que ya duele.
+
+  No arregla la dilución en sí -- eso necesitaría estado compartido entre procesos (Redis, o una tabla Postgres con incremento atómico), una pieza bastante más grande y sin evidencia real de demanda todavía. Lo que sí hace: cuenta cada `429` real por rpc y lo expone en `/metrics`, el mismo lugar que un operador ya mira -- agregable entre réplicas con una consulta Prometheus normal (`sum by (method) (linkc_rate_limit_rejections_total)`), convirtiendo un problema silencioso en una señal visible.
+
+1165 tests (2 nuevos) en `metrics.rs` (se acumula por rpc, no aparece hasta el primer rechazo) y `cli_metrics.rs` contra el binario real: un rpc con `@rate_limit("1/1h")` golpeado tres veces confirma exactamente 2 rechazos reales en el contador. Detalle completo: GRAMMAR.md §3.39/§3.149, PLAN.md §9.8.
+
 ## [1.105.0] - 2026-08-26
 
 ### ✨ Nuevo

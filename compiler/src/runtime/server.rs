@@ -718,6 +718,7 @@ fn handle_request(
             None => client_ip,
         };
         if !rate_limiter.check(&bucket_identity, service_name, rpc_name, spec) {
+            metrics_store.record_rate_limit_rejection(&method);
             let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
             log_done(log, req_id, Some(&method), 429, start, "");
             return;

@@ -21,11 +21,29 @@ pub struct MetricsStore {
     /// par conteo+suma que `by_method`, mismo motivo (`rate(sum)/rate(count)`
     /// sin declarar buckets).
     notify_latency: (u64, f64),
+    /// Rechazos `429` de `@rate_limit`, por rpc -- landmine del barrido de
+    /// "límites honestos" (GRAMMAR.md §3.39): el límite vive en memoria por
+    /// PROCESO, así que correr N réplicas detrás de un balanceador diluye
+    /// el límite real de forma silenciosa (cada proceso sigue cumpliendo
+    /// SU cupo, pero la suma entre réplicas puede ser N veces más alta de
+    /// lo que el `.link` pidió). No hay forma de arreglar la dilución sin
+    /// estado compartido entre procesos (fuera de alcance) -- pero contar
+    /// los 429 reales por rpc, agregable entre réplicas en Prometheus, es
+    /// la señal que le permite a un operador NOTAR el problema en vez de
+    /// enterarse por un endpoint caro sin protección real.
+    rate_limit_rejections: HashMap<String, u64>,
 }
 
 impl MetricsStore {
     pub fn new() -> Self {
-        MetricsStore { by_method: HashMap::new(), notify_latency: (0, 0.0) }
+        MetricsStore { by_method: HashMap::new(), notify_latency: (0, 0.0), rate_limit_rejections: HashMap::new() }
+    }
+
+    /// Registra UN rechazo `429` de `@rate_limit` para `method`
+    /// (`Servicio.rpc`) -- llamado por `runtime/server.rs` en el mismo
+    /// punto que ya arma la respuesta 429, antes de devolverla.
+    pub fn record_rate_limit_rejection(&mut self, method: &str) {
+        *self.rate_limit_rejections.entry(method.to_string()).or_insert(0) += 1;
     }
 
     /// Registra la latencia de UN evento de propagación NOTIFY recibido
@@ -97,6 +115,13 @@ impl MetricsStore {
                 out.push_str(&format!("linkc_notify_oversized_dropped_total{{collection=\"{}\"}} {count}\n", escape_label(collection)));
             }
         }
+        if !self.rate_limit_rejections.is_empty() {
+            out.push_str("# HELP linkc_rate_limit_rejections_total Requests rechazadas 429 por @rate_limit, por rpc.\n");
+            out.push_str("# TYPE linkc_rate_limit_rejections_total counter\n");
+            for (method, count) in &self.rate_limit_rejections {
+                out.push_str(&format!("linkc_rate_limit_rejections_total{{method=\"{}\"}} {count}\n", escape_label(method)));
+            }
+        }
         out
     }
 }
@@ -148,6 +173,20 @@ mod tests {
         let out_without = store.render_prometheus_text(&[], None, &[]);
         assert!(!out_without.contains("linkc_stream_subscribers{"));
         assert!(!out_without.contains("linkc_db_size_bytes"));
+    }
+
+    #[test]
+    fn rate_limit_rejections_accumulate_per_method_and_are_absent_until_recorded() {
+        let mut store = MetricsStore::new();
+        let out = store.render_prometheus_text(&[], None, &[]);
+        assert!(!out.contains("linkc_rate_limit_rejections_total"), "{out}");
+
+        store.record_rate_limit_rejection("Auth.login");
+        store.record_rate_limit_rejection("Auth.login");
+        store.record_rate_limit_rejection("Orders.create");
+        let out = store.render_prometheus_text(&[], None, &[]);
+        assert!(out.contains("linkc_rate_limit_rejections_total{method=\"Auth.login\"} 2"), "{out}");
+        assert!(out.contains("linkc_rate_limit_rejections_total{method=\"Orders.create\"} 1"), "{out}");
     }
 
     #[test]

@@ -178,6 +178,18 @@ impl OpenStream {
     }
 }
 
+const RATE_LIMITED_PROGRAM: &str = r#"
+type Task = { id: Int, title: String }
+db { tasks: Task[] }
+
+service Sys {
+  @rate_limit("1/1h")
+  rpc limited() -> String {
+    "ok"
+  }
+}
+"#;
+
 fn build(temp: &TempDir, source: &str) -> std::process::Output {
     let src = temp.write("app.link", source);
     Command::new(env!("CARGO_BIN_EXE_linkc")).arg("build").arg(&src).arg(temp.0.join("gen")).output().expect("ejecutar linkc build")
@@ -234,6 +246,38 @@ fn metrics_reports_the_real_number_of_connected_stream_subscribers() {
 
     let (_, body) = server.request("GET", "/metrics", "", &[]);
     assert!(body.contains("linkc_stream_subscribers{collection=\"tasks\"} 2"), "body: {body}");
+}
+
+/// GRAMMAR.md §3.39, landmine del barrido de "límites honestos": el
+/// `RateLimiter` es por PROCESO -- correr N réplicas detrás de un
+/// balanceador diluye el límite real sin ningún aviso. Este contador no
+/// arregla la dilución (necesitaría estado compartido entre procesos,
+/// fuera de alcance), pero hace el rechazo real VISIBLE en `/metrics`, el
+/// mismo lugar que un operador ya mira -- agregable entre réplicas en
+/// Prometheus para notar cuándo el 429 real está pasando de verdad.
+#[test]
+fn metrics_reports_real_rate_limit_rejections_per_rpc() {
+    let temp = TempDir::new("rate-limit-rejections");
+    let out = build(&temp, RATE_LIMITED_PROGRAM);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let server = Serve::start(&temp.0.join("app.link"), &[]);
+
+    // Sin ningún rechazo todavía: la métrica no aparece (mismo criterio
+    // "nunca inventar un 0" que el resto de las métricas condicionales).
+    let (_, body) = server.request("GET", "/metrics", "", &[]);
+    assert!(!body.contains("linkc_rate_limit_rejections_total"), "body: {body}");
+
+    // Primera pasa (cupo de 1/1h), la segunda y tercera se rechazan de
+    // verdad con 429 -- no un valor inventado.
+    let (status, _) = server.request("POST", "/Sys/limited", "{}", &[]);
+    assert_eq!(status, 200);
+    let (status, _) = server.request("POST", "/Sys/limited", "{}", &[]);
+    assert_eq!(status, 429);
+    let (status, _) = server.request("POST", "/Sys/limited", "{}", &[]);
+    assert_eq!(status, 429);
+
+    let (_, body) = server.request("GET", "/metrics", "", &[]);
+    assert!(body.contains("linkc_rate_limit_rejections_total{method=\"Sys.limited\"} 2"), "body: {body}");
 }
 
 #[test]
