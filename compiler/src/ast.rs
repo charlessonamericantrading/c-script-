@@ -1040,6 +1040,49 @@ pub fn recognize_field_selector<'a>(param_names: &[String], body: &'a Block) -> 
     matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
 }
 
+/// Granularidad de truncado de fecha para el selector de AGRUPACIÓN de
+/// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.157) -- el
+/// límite que §3.65 dejaba abierto a propósito ("sin truncado de fechas").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeGranularity {
+    Day,
+    Month,
+    Year,
+}
+
+/// Reconoce el selector de CLAVE de agrupación: `|item: T| item.campo`
+/// (como `recognize_field_selector`, sin truncar) o `|item: T|
+/// item.campo.truncateToDay/Month/Year()` (GRAMMAR.md §3.157). Es la
+/// ÚNICA posición de todo el lenguaje donde un método existe sobre un
+/// `Timestamp` -- §3.31 sigue prohibiendo cualquier otro uso; esto NUNCA
+/// evalúa el método de verdad, solo lo reconoce sintácticamente, mismo
+/// espíritu que `recognize_live_subscribe` con `db.<c>.subscribe()`.
+/// Nunca se usa para el selector de VALOR (`field_selector` sola alcanza
+/// ahí) -- solo `check_aggregate_by`/`select_grouped` llaman a esta.
+pub fn recognize_group_key_selector<'a>(param_names: &[String], body: &'a Block) -> Option<(&'a str, Option<TimeGranularity>)> {
+    let [param] = param_names else { return None };
+    if !body.stmts.is_empty() {
+        return None;
+    }
+    let tail = &body.tail.as_ref()?.node;
+    if let Expr::FieldAccess { base, field } = tail {
+        return matches!(&base.node, Expr::Ident(n) if n == param).then(|| (field.as_str(), None));
+    }
+    let Expr::Call { callee, args } = tail else { return None };
+    if !args.is_empty() {
+        return None;
+    }
+    let Expr::FieldAccess { base: receiver, field: method } = &callee.node else { return None };
+    let granularity = match method.as_str() {
+        "truncateToDay" => TimeGranularity::Day,
+        "truncateToMonth" => TimeGranularity::Month,
+        "truncateToYear" => TimeGranularity::Year,
+        _ => return None,
+    };
+    let Expr::FieldAccess { base, field } = &receiver.node else { return None };
+    matches!(&base.node, Expr::Ident(n) if n == param).then(|| (field.as_str(), Some(granularity)))
+}
+
 /// El lado "valor" de una hoja de conjunción (ver `recognize_conjunction_predicate`
 /// abajo). Normalmente una expresión del código fuente sin evaluar todavía
 /// (mismo criterio que la versión de un solo operador) -- pero `!item.campo`

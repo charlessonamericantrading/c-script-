@@ -840,6 +840,77 @@ fn aggregation_by_int64_key_and_value_pushes_group_by_to_real_sql_against_postgr
     assert_eq!(by_key.get("2"), Some(&300), "{by_key:?}");
 }
 
+const TIMESTAMP_TRUNCATE_AGGREGATE_PROGRAM: &str = r#"
+type Sale = { id: Int, at: Timestamp, amount: Int }
+type DayTotal = { key: Timestamp, value: Int }
+
+db { COLLECTION: Sale[], }
+
+service Sales {
+  rpc create(at: Timestamp, amount: Int) -> Sale {
+    db.COLLECTION.insert(Sale { id: 0, at: at, amount: amount })
+  }
+
+  rpc byDay() -> DayTotal[] {
+    db.COLLECTION.sumBy(|s: Sale| { s.at.truncateToDay() }, |s: Sale| { s.amount })
+  }
+
+  rpc byMonth() -> DayTotal[] {
+    db.COLLECTION.sumBy(|s: Sale| { s.at.truncateToMonth() }, |s: Sale| { s.amount })
+  }
+}
+"#;
+
+#[test]
+fn sum_by_truncated_to_day_and_month_pushes_a_utc_date_trunc_to_real_postgres() {
+    // GRAMMAR.md §3.157: cierra el límite que §3.65 dejaba abierto -- agrupar
+    // por un Timestamp truncado. Este test importa especialmente contra
+    // Postgres porque es el backend donde el truncado depende de verdad del
+    // manejo de timezone (`date_trunc(unit, ts, 'UTC')`, el overload de 3
+    // argumentos que NO depende del `TimeZone` de la sesión) -- SQLite no
+    // tiene esa clase de bug posible, su `strftime('start of day', ...)`
+    // siempre opera sobre el valor tal cual. También confirma que la `key`
+    // agrupada viaja como STRING ISO-8601 en el JSON (GRAMMAR.md §3.31), no
+    // como número -- `scalar_cell_to_value` no tenía brazo para `Timestamp`
+    // antes de esta ronda (un bug real, encontrado en la propia verificación
+    // manual antes de shippear, no solo la ausencia de la feature).
+    const COLLECTION: &str = "sales_timestamp_trunc";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("timestamp-trunc-aggregate");
+    let src = temp.write("app.link", &TIMESTAMP_TRUNCATE_AGGREGATE_PROGRAM.replace("COLLECTION", COLLECTION));
+    let server = Serve::start(&src, &url);
+
+    server.rpc("Sales/create", r#"{"at":"2026-03-15T10:30:00.000Z","amount":10}"#);
+    server.rpc("Sales/create", r#"{"at":"2026-03-15T23:59:59.999Z","amount":5}"#);
+    server.rpc("Sales/create", r#"{"at":"2026-03-20T00:00:00.000Z","amount":7}"#);
+    server.rpc("Sales/create", r#"{"at":"2027-01-05T05:00:00.000Z","amount":3}"#);
+
+    let by_day = server.rpc("Sales/byDay", "{}");
+    let day_rows = by_day.as_array().unwrap();
+    assert_eq!(day_rows.len(), 3, "3 dias distintos: {day_rows:?}");
+    for row in day_rows {
+        assert!(row["key"].is_string(), "la key Timestamp debe viajar como string ISO-8601: {row:?}");
+    }
+    let by_day_key: std::collections::HashMap<String, i64> =
+        day_rows.iter().map(|r| (r["key"].as_str().unwrap().to_string(), r["value"].as_i64().unwrap())).collect();
+    assert_eq!(by_day_key.get("2026-03-15T00:00:00.000Z"), Some(&15), "10 + 5 en el mismo dia: {by_day_key:?}");
+    assert_eq!(by_day_key.get("2026-03-20T00:00:00.000Z"), Some(&7), "{by_day_key:?}");
+    assert_eq!(by_day_key.get("2027-01-05T00:00:00.000Z"), Some(&3), "{by_day_key:?}");
+
+    let by_month = server.rpc("Sales/byMonth", "{}");
+    let month_rows = by_month.as_array().unwrap();
+    assert_eq!(month_rows.len(), 2, "2 meses distintos: {month_rows:?}");
+    let by_month_key: std::collections::HashMap<String, i64> =
+        month_rows.iter().map(|r| (r["key"].as_str().unwrap().to_string(), r["value"].as_i64().unwrap())).collect();
+    assert_eq!(by_month_key.get("2026-03-01T00:00:00.000Z"), Some(&22), "10 + 5 + 7 en marzo: {by_month_key:?}");
+    assert_eq!(by_month_key.get("2027-01-01T00:00:00.000Z"), Some(&3), "{by_month_key:?}");
+}
+
 #[test]
 fn rows_survive_a_restart_and_are_readable_from_plain_sql() {
     const COLLECTION: &str = "leads_persist";

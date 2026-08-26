@@ -7120,6 +7120,58 @@ mod tests {
         assert_eq!(summary.passed, 1, "{:?}", summary.failed);
     }
 
+    // GRAMMAR.md §3.157: cierra el límite que §3.65 dejaba abierto -- agrupar
+    // por un Timestamp truncado a día/mes/año, corriendo contra el SQLite en
+    // memoria real de `test` (no un mock). Confirma tanto la SUMA agrupada
+    // como que la `key` que vuelve es un `Timestamp` exacto -- comparado
+    // contra `dateFromParts(...)`, no solo que el conteo de grupos cierre.
+    #[test]
+    fn sum_by_with_a_truncated_timestamp_group_key_groups_by_day_month_and_year() {
+        let code = r#"
+        type Sale = { id: Int, at: Timestamp, amount: Int }
+        type DayTotal = { key: Timestamp, value: Int }
+        db { sales: Sale[] }
+
+        service Sales {
+            rpc add(at: Timestamp, amount: Int) -> Sale {
+                db.sales.insert(Sale { id: 0, at: at, amount: amount })
+            }
+        }
+
+        test "sumBy agrupado por Timestamp truncado" {
+            Sales.add(dateFromParts(2026, 3, 15, 10, 30, 0), 10);
+            Sales.add(dateFromParts(2026, 3, 15, 23, 59, 59), 5);
+            Sales.add(dateFromParts(2026, 3, 20, 0, 0, 0), 7);
+            Sales.add(dateFromParts(2027, 1, 5, 5, 0, 0), 3);
+
+            let byDay = db.sales.sumBy(|s: Sale| { s.at.truncateToDay() }, |s: Sale| { s.amount });
+            assert(byDay.length() == 3, "3 dias distintos");
+
+            let byMonth = db.sales.sumBy(|s: Sale| { s.at.truncateToMonth() }, |s: Sale| { s.amount });
+            assert(byMonth.length() == 2, "2 meses distintos");
+
+            let byYear = db.sales.sumBy(|s: Sale| { s.at.truncateToYear() }, |s: Sale| { s.amount });
+            assert(byYear.length() == 2, "2 anios distintos");
+
+            let mut found = false;
+            let mut i = 0;
+            while i < byDay.length() {
+                if byDay[i].key == dateFromParts(2026, 3, 15, 0, 0, 0) {
+                    assert(byDay[i].value == 15, "10 + 5 en el mismo dia");
+                    found = true;
+                } else {
+                }
+                i = i + 1;
+            }
+            assert(found, "el grupo del 15 de marzo debe existir con la key exacta truncada");
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let summary = run_program_tests(&program).expect("ejecucion de tests");
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.passed, 1, "{:?}", summary.failed);
+    }
+
     // GRAMMAR.md §3.102: `maxRow`/`minRow` -- caso real que los motiva
     // (IgnisLove, `bandit_rewards.link`, `getBestArm()`): `db.arms.all()[0]`
     // devuelve la fila de menor `id`, NUNCA la de mejor recompensa, pese al

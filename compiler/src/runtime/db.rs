@@ -10,7 +10,7 @@
 // de la misma fuente de verdad, cero duplicación manual).
 
 use super::{as_int, json_to_typed_value, simple_enum_names, value_to_json, RuntimeError, Value};
-use crate::ast::{BinaryOp, FieldCheck, Item, Program, TypeAnnotation, TypeExpr};
+use crate::ast::{BinaryOp, FieldCheck, Item, Program, TimeGranularity, TypeAnnotation, TypeExpr};
 use crate::checker::Checker;
 use crate::types::{FieldType, Type};
 use super::store::{Backend, Cell, ColumnKind};
@@ -2102,7 +2102,7 @@ db { users: User[] }
     /// `ast::recognize_live_subscribe` (usado por checker.rs Y por
     /// runtime::live_subscribe_collection, cada uno en su propio momento).
     fn select_grouped(&self, collection: &str, columns: &[ColumnPlan], method: &str, args: &[Value]) -> Result<Vec<Value>, RuntimeError> {
-        let key_field = closure_field_name(args.first(), "de agrupación")?;
+        let (key_field, granularity) = closure_group_key(args.first())?;
         let key_col = columns
             .iter()
             .find(|c| c.field.name == key_field)
@@ -2159,10 +2159,17 @@ db { users: User[] }
 
         let key_ty = key_col.field.ty.clone();
         let value_ty = value_field_ty;
+        // GRAMMAR.md §3.157: con truncado, la expresión de agrupación deja
+        // de ser la columna cruda -- se repite la MISMA expresión en SELECT
+        // y GROUP BY (portable en los dos motores; referenciar el alias
+        // "key" en GROUP BY no es seguro en todo dialecto/versión).
+        let key_expr = match granularity {
+            Some(g) => truncate_timestamp_sql(&key_field, g, self.backend.is_postgres()),
+            None => format!("\"{key_field}\""),
+        };
         let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
-        let sql = format!(
-            "SELECT \"{key_field}\" AS \"key\", {value_expr} AS \"value\" FROM \"{collection}\" {where_clause}GROUP BY \"{key_field}\""
-        );
+        let sql =
+            format!("SELECT {key_expr} AS \"key\", {value_expr} AS \"value\" FROM \"{collection}\" {where_clause}GROUP BY {key_expr}");
         let kinds = vec![key_col.kind(), value_kind];
         let rows = self
             .backend
@@ -2402,6 +2409,54 @@ fn closure_field_name(arg: Option<&Value>, role: &str) -> Result<String, Runtime
         .ok_or_else(|| RuntimeError::new(format!("selector {role} inválido: se esperaba `|item: T| item.campo`")))
 }
 
+/// Igual que `closure_field_name`, pero para el selector de CLAVE de
+/// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` -- admite además la forma con
+/// truncado de fecha (GRAMMAR.md §3.157). El checker ya validó el shape en
+/// compilación; esto vuelve a correr el mismo reconocedor sobre el
+/// `Value::Closure` que de verdad llegó, mismo criterio que
+/// `closure_field_name`.
+fn closure_group_key(arg: Option<&Value>) -> Result<(String, Option<TimeGranularity>), RuntimeError> {
+    let Some(Value::Closure(params, body, _)) = arg else {
+        return Err(RuntimeError::new("selector de agrupación inválido: se esperaba un closure"));
+    };
+    crate::ast::recognize_group_key_selector(params, body)
+        .map(|(field, g)| (field.to_string(), g))
+        .ok_or_else(|| RuntimeError::new("selector de agrupación inválido: se esperaba `|item: T| item.campo`"))
+}
+
+/// Expresión SQL que trunca un campo `Timestamp` (milisegundos-desde-epoch
+/// UTC, `Type::Timestamp` -- GRAMMAR.md §3.31) al inicio de su día/mes/año
+/// EN UTC, devolviendo de nuevo milisegundos-desde-epoch como un entero
+/// plano -- nunca un tipo de fecha nativo del motor, para que
+/// `scalar_cell_to_value`/`ColumnKind::Timestamp` lo decodifiquen exacto
+/// igual que cualquier otra columna `Timestamp` (que ya intenta `i64`
+/// primero, `postgres_timestamp_cell`, store.rs). Los dos backends
+/// DIVERGEN de verdad acá (GRAMMAR.md §3.65 lo documentaba como el motivo
+/// para no apurar esto): SQLite trunca con los modificadores nativos de
+/// `strftime` (`'start of day'`/`'start of month'`/`'start of year'`),
+/// Postgres con `date_trunc(unit, ts, 'UTC')` (el overload de 3 argumentos,
+/// PG 9.4+, que trunca EN una zona horaria explícita sin depender del
+/// `TimeZone` de la sesión -- usar la variante de 2 argumentos habría dado
+/// un resultado distinto según cómo esté configurado el servidor, un bug
+/// real y silencioso, no solo una diferencia de estilo).
+fn truncate_timestamp_sql(field: &str, granularity: TimeGranularity, is_postgres: bool) -> String {
+    if is_postgres {
+        let unit = match granularity {
+            TimeGranularity::Day => "day",
+            TimeGranularity::Month => "month",
+            TimeGranularity::Year => "year",
+        };
+        format!("CAST(EXTRACT(EPOCH FROM date_trunc('{unit}', to_timestamp(\"{field}\" / 1000.0), 'UTC')) * 1000 AS BIGINT)")
+    } else {
+        let modifier = match granularity {
+            TimeGranularity::Day => "start of day",
+            TimeGranularity::Month => "start of month",
+            TimeGranularity::Year => "start of year",
+        };
+        format!("(CAST(strftime('%s', \"{field}\" / 1000, 'unixepoch', '{modifier}') AS INTEGER) * 1000)")
+    }
+}
+
 /// Convierte la celda de `key`/`value` que devuelve `select_grouped` --
 /// más simple que `row_to_fields` porque acá NUNCA hay JSON: el checker ya
 /// exigió que tanto el campo de agrupación como el de valor sean
@@ -2429,6 +2484,15 @@ fn scalar_cell_to_value(ty: &Type, cell: &Cell) -> Value {
         // de los dos `Value` armar es mirando el `Type` declarado, no la
         // `Cell` -- que es idéntica para los dos.
         (Type::Int64, Cell::Int(n)) => Value::Int64(*n),
+        // Mismo motivo que el brazo de Int64 de arriba, agregado en la
+        // MISMA ronda que hace a `Timestamp` alcanzable como clave de
+        // agrupación por primera vez (GRAMMAR.md §3.157, truncado de
+        // fecha): sin este brazo, una clave `Timestamp` caía al genérico
+        // de abajo y viajaba como NÚMERO plano en el wire, rompiendo la
+        // promesa de §3.31 (siempre string ISO-8601) en silencio -- el
+        // mismo bug de etiquetado que §3.65 ya había encontrado y cerrado
+        // para Int64, ahora con Timestamp en vez de descubrirlo tarde.
+        (Type::Timestamp, Cell::Int(n)) => Value::Timestamp(*n),
         (_, Cell::Int(n)) => Value::Int(*n),
         (_, Cell::Float(f)) => Value::Float(*f),
         (_, Cell::Text(t)) => Value::Str(t.clone()),

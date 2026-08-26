@@ -4488,6 +4488,44 @@ impl Checker {
         Ok((field_name.to_string(), field.ty.clone()))
     }
 
+    /// Igual que `field_selector`, pero SOLO para el selector de CLAVE de
+    /// agrupación (`sumBy`/etc.) -- admite además la forma con truncado de
+    /// fecha, `|item: T| item.campo.truncateToDay/Month/Year()`
+    /// (GRAMMAR.md §3.157). Nunca se usa para el selector de VALOR ni para
+    /// ningún otro selector del lenguaje (`maxRow`/`minRow`/`increment`) --
+    /// esos siguen con `field_selector` sola, sin truncado.
+    fn group_key_selector(
+        &self,
+        element_ty: &Type,
+        arg: &Spanned<Expr>,
+        method: &str,
+    ) -> Result<(String, Type, Option<crate::ast::TimeGranularity>), CheckError> {
+        let shape_err = || {
+            err(format!(
+                "'{method}' espera un selector de agrupación de la forma `|item: T| item.campo` (o `|item: T| item.campo.truncateToDay/Month/Year()` sobre un Timestamp) -- un acceso de campo simple, sin otras expresiones derivadas ni llamadas a método (no hay forma de traducir eso a una columna SQL real)"
+            ))
+        };
+        let Expr::Closure { params, body } = &arg.node else {
+            return Err(shape_err());
+        };
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        let Some((field_name, granularity)) = crate::ast::recognize_group_key_selector(&param_names, body) else {
+            return Err(shape_err());
+        };
+        let Type::Struct { fields, .. } = element_ty else {
+            return Err(err("una colección de 'db' debe resolver a un struct"));
+        };
+        let Some(field) = fields.iter().find(|f| f.name == field_name) else {
+            return Err(err(format!("'{method}': '{field_name}' no es un campo de este struct")));
+        };
+        if field.optional || matches!(field.ty, Type::Optional(_)) {
+            return Err(err(format!(
+                "'{method}': el campo de agrupación '{field_name}' es opcional -- agrupar por un campo que puede faltar (por clave, `campo?: T`, o nullable, `campo: T?`) todavía no está soportado"
+            )));
+        }
+        Ok((field_name.to_string(), field.ty.clone(), granularity))
+    }
+
     /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.52):
     /// agregación con `GROUP BY` empujada a SQL de verdad -- a diferencia de
     /// `findWhere`/`deleteWhere` (predicado como closure, evaluado en el
@@ -4505,11 +4543,22 @@ impl Checker {
             return Err(err(format!("'{method}' toma exactamente {expected} argumento(s) {shape}")));
         }
 
-        let (key_field, key_ty) = self.field_selector(element_ty, &args[0], method, "de agrupación")?;
-        if !matches!(key_ty, Type::String | Type::Int | Type::Int64 | Type::Bool | Type::Enum(_)) {
-            return Err(err(format!(
-                "'{method}': el campo de agrupación '{key_field}' es {key_ty} -- solo se puede agrupar por String, Int, Int64, Bool o un enum (fechas/horas necesitan truncar antes, que todavía no está soportado; Float tampoco, GRAMMAR.md §3.52/§3.65)"
-            )));
+        let (key_field, key_ty, granularity) = self.group_key_selector(element_ty, &args[0], method)?;
+        match granularity {
+            // GRAMMAR.md §3.157: truncado explícito -- SOLO válido sobre un
+            // campo `Timestamp` de verdad, el resultado agrupado sigue
+            // siendo `Timestamp` (con menos precisión), no un tipo nuevo.
+            Some(_) if key_ty != Type::Timestamp => {
+                return Err(err(format!(
+                    "'{method}': '.truncateTo...()' solo es válido sobre un campo Timestamp -- '{key_field}' es {key_ty}"
+                )));
+            }
+            None if !matches!(key_ty, Type::String | Type::Int | Type::Int64 | Type::Bool | Type::Enum(_)) => {
+                return Err(err(format!(
+                    "'{method}': el campo de agrupación '{key_field}' es {key_ty} -- solo se puede agrupar por String, Int, Int64, Bool, un enum, o un Timestamp truncado con .truncateToDay()/.truncateToMonth()/.truncateToYear() (Float no, GRAMMAR.md §3.52/§3.65/§3.157)"
+                )));
+            }
+            _ => {}
         }
 
         let value_ty = if needs_value {
@@ -7950,7 +7999,7 @@ type T = { id: Int, s: Status }")
             }
         "#;
         let msg = format!("{:?}", check_source(src).unwrap_err());
-        assert!(msg.contains("selector de campo"), "{msg}");
+        assert!(msg.contains("selector de agrupación"), "{msg}");
     }
 
     #[test]
@@ -8126,6 +8175,55 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn aggregate_by_accepts_a_truncated_timestamp_as_group_key() {
+        // GRAMMAR.md §3.157: cierra el límite que §3.65 dejaba abierto --
+        // agrupar por un Timestamp truncado a día/mes/año, no el
+        // Timestamp exacto (que seguiría dando un grupo por fila).
+        let src = r#"
+            type Sale = { id: Int, at: Timestamp, amount: Int }
+            type DayTotal = { key: Timestamp, value: Int }
+            db { sales: Sale[] }
+            service S {
+                rpc byDay() -> DayTotal[] { db.sales.sumBy(|s: Sale| { s.at.truncateToDay() }, |s: Sale| { s.amount }) }
+                rpc byMonth() -> DayTotal[] { db.sales.sumBy(|s: Sale| { s.at.truncateToMonth() }, |s: Sale| { s.amount }) }
+                rpc byYear() -> DayTotal[] { db.sales.sumBy(|s: Sale| { s.at.truncateToYear() }, |s: Sale| { s.amount }) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn aggregate_by_still_rejects_an_untruncated_timestamp_as_group_key() {
+        // El límite original de §3.65 sigue en pie para el caso SIN
+        // truncar -- solo `.truncateToDay/Month/Year()` habilita Timestamp
+        // como clave, nunca el campo crudo.
+        let src = r#"
+            type Sale = { id: Int, at: Timestamp, amount: Int }
+            db { sales: Sale[] }
+            fn f() -> Int {
+                let rows = db.sales.sumBy(|s: Sale| { s.at }, |s: Sale| { s.amount });
+                rows.length()
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("Timestamp truncado") || msg.contains("truncateTo"), "{msg}");
+    }
+
+    #[test]
+    fn aggregate_by_rejects_truncate_to_x_on_a_non_timestamp_field() {
+        let src = r#"
+            type Sale = { id: Int, amount: Int }
+            db { sales: Sale[] }
+            fn f() -> Int {
+                let rows = db.sales.sumBy(|s: Sale| { s.amount.truncateToDay() }, |s: Sale| { s.amount });
+                rows.length()
+            }
+        "#;
+        let msg = format!("{:?}", check_source(src).unwrap_err());
+        assert!(msg.contains("solo es válido sobre un campo Timestamp"), "{msg}");
     }
 
     #[test]

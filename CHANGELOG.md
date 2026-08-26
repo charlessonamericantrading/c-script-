@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.112.0] - 2026-08-26
+
+### ✨ Nuevo
+- **`.truncateToDay()`/`.truncateToMonth()`/`.truncateToYear()`: agregación agrupada por fecha.** Cuarto ítem de la auditoría propia de Glowapp: §3.65 dejaba documentado a propósito que agrupar por un `Timestamp` sin truncar produce un grupo por fila -- esta ronda agrega el método de truncado que faltaba, reconocido SOLO sintácticamente en el selector de clave de `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (la única posición de todo el lenguaje donde un método existe sobre `Timestamp`, nunca evaluado como llamada real). SQL específico por backend -- SQLite con `strftime`/`'start of day'` etc., Postgres con `date_trunc(unit, ts, 'UTC')` (el overload de 3 argumentos, para no depender en silencio del `TimeZone` de la sesión) -- ambos devolviendo milisegundos-desde-epoch planos. Bug real encontrado en la verificación manual: `scalar_cell_to_value` no tenía brazo para `Timestamp` (nunca hizo falta antes), así que la clave truncada viajaba como número en el JSON en vez de string ISO-8601 -- corregido con el mismo criterio que ya se usaba para `Int64`. Verificado con tests de checker, runtime contra SQLite real, integración contra Postgres real, y una verificación manual con fecha pre-1970 en los dos motores. Ver GRAMMAR.md §3.157.
+
 ## [1.111.0] - 2026-08-26
 
 ### ✨ Nuevo
