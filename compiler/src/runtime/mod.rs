@@ -1845,9 +1845,16 @@ fn call_method(
                 Ok(Value::List(inserted))
             }
             // GRAMMAR.md §3.75: `matchFn` corre en el intérprete sobre
-            // TODAS las filas (mismo criterio que `findWhere`/`deleteWhere`
-            // arriba -- no empujado a SQL, ver PLAN.md §9.3.4), se queda con
-            // la PRIMERA que matchea. `updateFn` se llama con la fila
+            // TODAS las filas -- salvo que tenga la forma pusheable
+            // reconocida (`recognize_pushable_conjunction`, la MISMA que
+            // `findWhere`/`countWhere`/`deleteWhere` ya usan), en cuyo caso
+            // la SELECCIÓN se empuja a SQL igual que esos tres (26/08/2026,
+            // landmine del barrido de "límites honestos": una colección que
+            // crece de cientos a decenas de miles de filas hacía que un
+            // `upsert` antes instantáneo empezara a tardar segundos, sin
+            // ningún error ni aviso -- se notaba por quejas de latencia,
+            // nunca por el compilador). Se queda con la PRIMERA fila que
+            // matchea (pusheada o no). `updateFn` se llama con la fila
             // EXISTENTE completa y devuelve un valor `Omit<T,"id">`
             // COMPLETO (no un `Patch<T>` parcial -- ver el porqué en
             // checker.rs::check_db_method) que se aplica entero vía
@@ -1858,13 +1865,21 @@ fn call_method(
                 let (Some(match_fn), Some(insert_value), Some(update_fn)) = (it.next(), it.next(), it.next()) else {
                     return Err(err("'upsert' requiere 3 argumentos (matchFn, insertValue, updateFn)"));
                 };
-                let all_val = db.call(&coll, "all", vec![])?;
-                let Value::List(items) = all_val else {
-                    return Err(err("'upsert': no se pudo leer la colección"));
+                let (items, already_filtered) = match recognize_pushable_conjunction(&match_fn) {
+                    Some(conditions) => match db.find_where_conjunction(&coll, &conditions)? {
+                        Some(rows) => (rows, true),
+                        None => (all_items(db, &coll)?, false),
+                    },
+                    None => (all_items(db, &coll)?, false),
                 };
                 let mut existing = None;
                 for item in items {
-                    if as_bool(&call_callable(match_fn.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)? {
+                    let matches = if already_filtered {
+                        true
+                    } else {
+                        as_bool(&call_callable(match_fn.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)?
+                    };
+                    if matches {
                         existing = Some(item);
                         break;
                     }
@@ -5294,6 +5309,37 @@ mod tests {
 
         let all = invoke_rpc(&program, "S", "bump", &json!({"name": "otro"}), &db).unwrap();
         assert_ne!(all["id"], second["id"], "un name distinto SÍ inserta una fila nueva");
+    }
+
+    /// GRAMMAR.md §3.75, landmine del barrido de "límites honestos"
+    /// (26/08/2026): un `matchFn` con forma NO pusheable (acá, `||`, que
+    /// `recognize_pushable_conjunction` no reconoce) tiene que seguir
+    /// funcionando IGUAL que antes de esta ronda -- camino interpretado de
+    /// siempre, sin ningún cambio de comportamiento observable, solo sin el
+    /// atajo de SQL.
+    #[test]
+    fn upsert_with_a_non_pushable_match_fn_still_works_via_the_interpreted_fallback() {
+        let program = program_from(
+            r#"
+            type Counter = { id: Int, name: String, count: Int }
+            type NewCounter = { name: String, count: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(name: String) -> Counter {
+                    db.counters.upsert(
+                        |c: Counter| { c.name == name || c.name == "alias" },
+                        NewCounter { name: name, count: 1 },
+                        |c: Counter| { NewCounter { name: c.name, count: c.count + 1 } }
+                    )
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let first = invoke_rpc(&program, "S", "bump", &json!({"name": "clics"}), &db).unwrap();
+        let second = invoke_rpc(&program, "S", "bump", &json!({"name": "clics"}), &db).unwrap();
+        assert_eq!(first["id"], second["id"], "misma fila, mismo id, aunque el predicado no sea pusheable");
+        assert_eq!(second["count"], json!(2));
     }
 
     // ---- db.<c>.insertMany(items) (GRAMMAR.md §3.76) ----

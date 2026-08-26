@@ -616,6 +616,52 @@ service Notifications {{
     assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
 }
 
+/// GRAMMAR.md §3.75, landmine del barrido de "límites honestos" (26/08/2026):
+/// `upsert` con un `matchFn` pusheable (`|c: T| { c.campo == valor }`) ahora
+/// usa el mismo `find_where_conjunction` que `findWhere`/`countWhere`/
+/// `deleteWhere` -- este test confirma que el camino nuevo funciona de
+/// verdad contra Postgres (backend distinto, generación de SQL distinta a
+/// SQLite): un segundo `upsert` sobre el MISMO valor actualiza la fila
+/// existente (mismo id), nunca inserta una fila nueva.
+#[test]
+fn upsert_with_a_pushable_match_fn_updates_the_same_row_against_real_postgres() {
+    const COLLECTION: &str = "counters_upsert_pushdown";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("upsert-pushdown");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Counter = {{ id: Int, name: String, count: Int }}
+type NewCounter = {{ name: String, count: Int }}
+db {{ {COLLECTION}: Counter[] }}
+service Counters {{
+  rpc bump(name: String) -> Counter {{
+    db.{COLLECTION}.upsert(
+      |c: Counter| {{ c.name == name }},
+      NewCounter {{ name: name, count: 1 }},
+      |c: Counter| {{ NewCounter {{ name: c.name, count: c.count + 1 }} }}
+    )
+  }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    let first = server.rpc("Counters/bump", r#"{"name":"clics"}"#);
+    let second = server.rpc("Counters/bump", r#"{"name":"clics"}"#);
+    assert_eq!(first["id"], second["id"], "misma fila, mismo id: {first:?} vs {second:?}");
+    assert_eq!(second["count"], serde_json::json!(2), "{second:?}");
+
+    let other = server.rpc("Counters/bump", r#"{"name":"otro"}"#);
+    assert_ne!(other["id"], second["id"], "un name distinto sí inserta una fila nueva: {other:?}");
+}
+
 /// GRAMMAR.md §3.105: `db.<c>.increment` es un `UPDATE campo = campo +
 /// delta` atómico -- SIN ida y vuelta de lectura previa. La prueba real de
 /// que esto arregla el lost-update reportado (IgnisLove, varios procesos

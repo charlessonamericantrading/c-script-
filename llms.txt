@@ -56,6 +56,7 @@ Works, verified by running it:
 - `--hsts <value>`/`LINK_HSTS` for `linkc serve`/`serve-all`: sends `Strict-Transport-Security` with the literal value on every response (success, error, and `stream` alike) — but only when set explicitly. `linkc serve` never terminates TLS itself, so this is an opt-in for when a trusted reverse proxy does (same spirit as `--trust-proxy` for `X-Forwarded-For`). No flag/env var: no header, byte-for-byte the same as always. See GRAMMAR.md §3.143.
 - `@cache("60s")` on an rpc (never a `stream`): caches the first SUCCESSFUL result server-side, keyed by `(service, rpc, arguments)` — a retry within the TTL replays the stored response without re-running the body. Orthogonal to `@cache_control` (client hint) and `@idempotent` (writes). See GRAMMAR.md §3.144.
 - `deleteWhere` now pushes a pusheable predicate's SELECTION down to real SQL (same `find_where_conjunction` as `findWhere`/`countWhere`) instead of loading the whole collection into memory — the delete itself stays row-by-row so each deleted row still publishes to a `stream`. See GRAMMAR.md §3.145.
+- `db.<c>.upsert(matchFn, insertValue, updateFn)`'s `matchFn` now pushes to SQL too (26/08/2026) when it has the same recognized shape (`|x| x.field == value`, or a `&&` conjunction of such leaves) — a collection growing from hundreds to tens of thousands of rows no longer makes an upsert that used to be instant start taking seconds. Any other shape (`||`, comparing two fields to each other) still works exactly as before via the interpreted fallback, no behavior change. See GRAMMAR.md §3.75.
 - `@check(minLength, N)` / `@check(maxLength, N)` on a `String` field: enforced both in the app (`chars().count()`, Unicode-aware) and as a real `CHECK (length(...) >= N)` constraint on both SQLite and Postgres. `@check(minLength, 1)` is the idiom for "not empty". See GRAMMAR.md §3.146.
 - `@cors("https://a.com, https://b.com")` / `@cors("*")` on an rpc or `stream`: replaces the global `--cors-origin` allowlist for that ONE endpoint — applies to both the real response and the `OPTIONS` preflight. See GRAMMAR.md §3.147.
 - Structured authorization audit log: any request that passed through `@authenticated`/`@requires` now logs `auth_role`/`auth_user_id`/`auth_allowed` as top-level fields (JSON mode) or `key=value` pairs (text mode) in the existing per-request log line. A public rpc logs none of the three. See GRAMMAR.md §3.148.
@@ -297,7 +298,7 @@ linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json
 linkc serve-all ./services --port-base 3000 --port-registry ./services/ports.json  # same shape, but read back first -- a name keeps its port forever
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
 linkc serve-all ./services --port-base 3000 --service-api-key s3cr3t --service-api-key-exempt webhooks  # every service but "webhooks" requires the header
-linkc --version                      # linkc 1.106.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.107.0 -- same version stamped in every generated file
 ```
 
 ## Verified example

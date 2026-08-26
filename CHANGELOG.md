@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.107.0] - 2026-08-26
+
+### ✨ Nuevo
+- **`upsert` empuja `matchFn` a SQL cuando es pusheable.** Sexto y último hallazgo del barrido de "límites honestos" de GRAMMAR.md: `db.<c>.upsert(matchFn, insertValue, updateFn)` traía la colección ENTERA a memoria para evaluar `matchFn` sobre cada fila -- una colección que crecía de cientos a decenas de miles de filas hacía que un `upsert` antes instantáneo empezara a tardar segundos, sin ningún error ni aviso. Se notaba por quejas de latencia, nunca por el compilador.
+
+  Mismo criterio que `findWhere`/`countWhere`/`deleteWhere` (§3.95/§3.108/§3.109/§3.145): si `matchFn` tiene la forma `|x| x.campo == valor` (o una conjunción `&&` de varias hojas así), la selección se empuja a `find_where_conjunction` real en vez de traer la tabla entera. Cualquier otra forma (`||`, comparar dos campos entre sí) sigue funcionando exactamente igual que antes, vía el camino interpretado -- sin ningún cambio de comportamiento observable, solo sin el atajo de SQL.
+
+1167 tests (2 nuevos) en `runtime/mod.rs` (un `matchFn` no pusheable sigue funcionando idéntico al de siempre) y `pg_integration.rs` contra Postgres real (el camino pusheado genera SQL válido en ese backend, no solo SQLite). Detalle completo: GRAMMAR.md §3.75, PLAN.md §9.3.
+
+Con esto quedan cerrados los seis landmines identificados en el barrido de "límites honestos" iniciado tras el incidente de puertos de IgnisLove (v1.102.0).
+
 ## [1.106.0] - 2026-08-26
 
 ### ✨ Nuevo
