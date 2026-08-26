@@ -28,6 +28,13 @@ pub fn emit_validators(program: &Program) -> Result<String, String> {
 
     let mut worklist: Vec<Type> = Vec::new();
     let mut seen: Vec<Type> = Vec::new();
+    // Segundo worklist, mismas semillas: no toda firma necesita un
+    // "revividor" (GRAMMAR.md §3.156, Int64 -> bigint) -- solo las que
+    // contienen un Int64 en algún lado, así que `enqueue_reviver` filtra
+    // antes de encolar (`contains_int64`), a diferencia de `enqueue` que
+    // encola todo tipo con nombre sin condición.
+    let mut reviver_worklist: Vec<Type> = Vec::new();
+    let mut reviver_seen: Vec<Type> = Vec::new();
 
     // Semillas: cada firma de rpc que efectivamente cruza el wire -- lo
     // mismo que ya recorre emit_client para collect_type_names (ts_emit.rs).
@@ -40,9 +47,11 @@ pub fn emit_validators(program: &Program) -> Result<String, String> {
                 for p in &rpc.params {
                     let ty = checker.resolve_type(&p.ty).map_err(|e| e.to_string())?;
                     enqueue(&ty, &mut worklist, &mut seen);
+                    enqueue_reviver(&ty, &checker, &mut reviver_worklist, &mut reviver_seen)?;
                 }
                 let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
                 enqueue(&ret_ty, &mut worklist, &mut seen);
+                enqueue_reviver(&ret_ty, &checker, &mut reviver_worklist, &mut reviver_seen)?;
             }
         }
     }
@@ -56,6 +65,9 @@ pub fn emit_validators(program: &Program) -> Result<String, String> {
     while let Some(ty) = worklist.pop() {
         emit_named_validator(&mut body, &ty, &checker, &mut worklist, &mut seen)?;
     }
+    while let Some(ty) = reviver_worklist.pop() {
+        emit_reviver(&mut body, &ty, &checker, &mut reviver_worklist, &mut reviver_seen)?;
+    }
 
     let mut out = String::new();
     out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
@@ -66,7 +78,7 @@ pub fn emit_validators(program: &Program) -> Result<String, String> {
     // Sin esto, además, un archivo sin ningún import/export no es un módulo
     // TS real -- tsc lo trataría como script ambiental.
     let mut imported_names = BTreeSet::new();
-    for ty in &seen {
+    for ty in seen.iter().chain(reviver_seen.iter()) {
         ts_emit::collect_type_names(ty, &mut imported_names);
     }
     if !imported_names.is_empty() {
@@ -251,12 +263,13 @@ fn render_check(ty: &Type, expr: &str, worklist: &mut Vec<Type>, seen: &mut Vec<
     }
     match ty {
         Type::Int => format!("(typeof {expr} === \"number\" && Number.isInteger({expr}))"),
-        // String en el wire (GRAMMAR.md §3.30), no número -- el chequeo
-        // real es que `BigInt(...)` no tire (rechaza "abc", "1.5", "") Y que
-        // el valor entre en el rango de un i64 real (rechaza un string
-        // numéricamente válido pero fuera de rango, ej. 2^100).
+        // El wire sigue mandando un string (GRAMMAR.md §3.30), pero para
+        // cuando este chequeo corre en `client.ts` el valor YA pasó por el
+        // revividor de tipo (GRAMMAR.md §3.156, `render_revive` arriba) --
+        // acá se valida el `bigint` real, con el mismo rango de un i64 que
+        // antes se validaba sobre el string.
         Type::Int64 => format!(
-            "(typeof {expr} === \"string\" && (() => {{ try {{ const n = BigInt({expr}); return n >= -9223372036854775808n && n <= 9223372036854775807n; }} catch {{ return false; }} }})())"
+            "(typeof {expr} === \"bigint\" && {expr} >= -9223372036854775808n && {expr} <= 9223372036854775807n)"
         ),
         // Regex fija a la forma exacta que el servidor produce/acepta
         // (GRAMMAR.md §3.31: sin offset de timezone, milisegundos siempre
@@ -499,6 +512,366 @@ fn emit_named_validator(
     Ok(())
 }
 
+// ---- Int64 -> bigint: "revividores" tras JSON.parse (GRAMMAR.md §3.156) ----
+//
+// El wire sigue mandando un Int64 como string (GRAMMAR.md §3.30, sin
+// cambios) -- lo nuevo es que `client.ts` ahora declara `bigint` de verdad
+// (ts_emit.rs::render_type) y necesita convertir cada string de vuelta a
+// bigint DESPUÉS de `res.json()`, dirigido por el tipo real de la
+// respuesta -- no hay forma estructural de distinguir "este string es un
+// Int64" de "este campo String que por casualidad es numérico" sin esa
+// guía. Mismo patrón worklist/seen que los validadores de arriba, pero
+// filtrado por `contains_int64`: un tipo sin ningún Int64 adentro no
+// genera ningún revividor (cero costo para el caso común).
+
+/// ¿`ty` es, o contiene recursivamente (en un campo, elemento, variante de
+/// enum, instanciación de genérico, etc.), un `Type::Int64`? A diferencia
+/// de `type_contains_function` (checker.rs), que se detiene en un genérico
+/// opaco, ACÁ hay que expandir Generic/Enum de verdad (vía `checker`) --
+/// dejar alguno sin expandir sería un Int64 escondido que `contract.d.ts`
+/// promete como `bigint` pero que en runtime nunca se revive (mentira de
+/// tipos silenciosa, peor que no tener la feature).
+fn contains_int64(ty: &Type, checker: &Checker) -> Result<bool, String> {
+    Ok(match ty {
+        Type::Int64 => true,
+        Type::Optional(inner) | Type::List(inner) | Type::PatchOf(inner) => contains_int64(inner, checker)?,
+        Type::Tuple(items) | Type::Union(items) => {
+            let mut any = false;
+            for i in items {
+                if contains_int64(i, checker)? {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        }
+        Type::MapOf(k, v) => contains_int64(k, checker)? || contains_int64(v, checker)?,
+        Type::ResultOf(a, b) => contains_int64(a, checker)? || contains_int64(b, checker)?,
+        Type::Struct { fields, .. } => {
+            let mut any = false;
+            for f in fields {
+                if contains_int64(&f.ty, checker)? {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        }
+        Type::Enum(name) => enum_contains_int64(checker, ty, name)?,
+        Type::Generic(name, args) => {
+            if checker.types.contains_key(name) {
+                let fields = checker.expand_generic_struct(name, args).map_err(|e| e.to_string())?;
+                let mut any = false;
+                for f in &fields {
+                    if contains_int64(&f.ty, checker)? {
+                        any = true;
+                        break;
+                    }
+                }
+                any
+            } else if checker.enums.contains_key(name) {
+                enum_contains_int64(checker, ty, name)?
+            } else {
+                false
+            }
+        }
+        _ => false,
+    })
+}
+
+fn enum_contains_int64(checker: &Checker, scrutinee_ty: &Type, enum_name: &str) -> Result<bool, String> {
+    let decl = checker.enums.get(enum_name).ok_or_else(|| format!("enum desconocido: '{enum_name}'"))?;
+    for v in &decl.variants {
+        for (_, fty) in checker.variant_field_types(scrutinee_ty, enum_name, &v.name).map_err(|e| e.to_string())? {
+            if contains_int64(&fty, checker)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Nombre del revividor para un tipo con identidad propia -- mismo criterio
+/// de "con nombre vs. estructural" que `validator_fn_name`, con el mismo
+/// prefijo `revive` en vez de `is`.
+fn reviver_fn_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Struct { name: Some(n), .. } => Some(format!("revive{n}")),
+        Type::Enum(n) => Some(format!("revive{n}")),
+        Type::ResultOf(a, b) => Some(format!("reviveResult_{}_{}", type_key(a), type_key(b))),
+        Type::PatchOf(inner) => Some(format!("revivePatch_{}", type_key(inner))),
+        Type::Generic(name, args) => Some(format!("revive{name}_{}", args.iter().map(type_key).collect::<Vec<_>>().join("_"))),
+        _ => None,
+    }
+}
+
+/// Encola `ty` para tener su propio revividor SOLO si contiene algún
+/// Int64 -- a diferencia de `enqueue` (validadores), que encola todo tipo
+/// con nombre sin condición.
+fn enqueue_reviver(ty: &Type, checker: &Checker, worklist: &mut Vec<Type>, seen: &mut Vec<Type>) -> Result<(), String> {
+    if !contains_int64(ty, checker)? {
+        return Ok(());
+    }
+    if reviver_fn_name(ty).is_some() {
+        if !seen.contains(ty) {
+            seen.push(ty.clone());
+            worklist.push(ty.clone());
+        }
+        return Ok(());
+    }
+    match ty {
+        Type::Optional(inner) | Type::List(inner) => enqueue_reviver(inner, checker, worklist, seen)?,
+        Type::Tuple(items) | Type::Union(items) => {
+            for i in items {
+                enqueue_reviver(i, checker, worklist, seen)?;
+            }
+        }
+        Type::Struct { fields, .. } => {
+            for f in fields {
+                enqueue_reviver(&f.ty, checker, worklist, seen)?;
+            }
+        }
+        Type::MapOf(k, v) => {
+            enqueue_reviver(k, checker, worklist, seen)?;
+            enqueue_reviver(v, checker, worklist, seen)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Expresión TS que revive `expr` (ya parseado de JSON) contra `ty`,
+/// devolviendo `None` si `ty` no contiene ningún Int64 -- nada que revivir,
+/// el llamador reusa `expr` tal cual (identidad, sin costo en runtime).
+fn render_revive(
+    ty: &Type,
+    expr: &str,
+    checker: &Checker,
+    worklist: &mut Vec<Type>,
+    seen: &mut Vec<Type>,
+) -> Result<Option<String>, String> {
+    if !contains_int64(ty, checker)? {
+        return Ok(None);
+    }
+    if let Some(fn_name) = reviver_fn_name(ty) {
+        enqueue_reviver(ty, checker, worklist, seen)?;
+        return Ok(Some(format!("{fn_name}({expr})")));
+    }
+    Ok(Some(match ty {
+        // `as any`: `expr` puede ser el `json`/`revived` de tope (tipado
+        // `unknown`, `BigInt(unknown)` no tipa bajo `strict`) o un acceso de
+        // campo ya casteado (`(x as any).campo`, donde el cast es
+        // redundante pero inofensivo).
+        Type::Int64 => format!("BigInt({expr} as any)"),
+        Type::Optional(inner) => {
+            let inner_expr =
+                render_revive(inner, expr, checker, worklist, seen)?.expect("contains_int64 ya confirmó Int64 adentro");
+            format!("({expr} === null ? null : {inner_expr})")
+        }
+        Type::List(inner) => {
+            let inner_expr =
+                render_revive(inner, "item", checker, worklist, seen)?.expect("contains_int64 ya confirmó Int64 adentro");
+            format!("(({expr} as any[]).map((item: any) => {inner_expr}))")
+        }
+        Type::Tuple(items) => {
+            let mut parts = Vec::new();
+            for (i, t) in items.iter().enumerate() {
+                let e = format!("({expr} as any)[{i}]");
+                parts.push(render_revive(t, &e, checker, worklist, seen)?.unwrap_or(e));
+            }
+            format!("[{}]", parts.join(", "))
+        }
+        Type::MapOf(_, v) => {
+            let inner_expr = render_revive(v, "v", checker, worklist, seen)?.expect("contains_int64 ya confirmó Int64 adentro");
+            format!(
+                "Object.fromEntries(Object.entries({expr} as any).map(([k, v]: [string, any]) => [k, {inner_expr}]))"
+            )
+        }
+        // Disambiguación vía el mismo chequeo `isX` que ya usa el
+        // validador de este miembro -- si `expr` matchea, se revive con
+        // el revividor de ESE miembro (o identidad si ese miembro no
+        // tiene Int64 adentro).
+        Type::Union(members) => {
+            let mut chain = format!("({expr} as any)");
+            for m in members.iter().rev() {
+                let check = render_check(m, expr, worklist, seen);
+                let revived = render_revive(m, expr, checker, worklist, seen)?.unwrap_or_else(|| expr.to_string());
+                chain = format!("({check} ? ({revived}) : {chain})");
+            }
+            chain
+        }
+        Type::Struct { fields, .. } => render_struct_revive(fields, expr, checker, worklist, seen)?,
+        _ => unreachable!("cubierto por reviver_fn_name o contains_int64 = false"),
+    }))
+}
+
+fn render_struct_revive(
+    fields: &[FieldType],
+    expr: &str,
+    checker: &Checker,
+    worklist: &mut Vec<Type>,
+    seen: &mut Vec<Type>,
+) -> Result<String, String> {
+    let mut assignments = Vec::new();
+    for f in fields {
+        let field_expr = format!("({expr} as any).{}", f.name);
+        if let Some(revived) = render_revive(&f.ty, &field_expr, checker, worklist, seen)? {
+            if f.optional {
+                assignments.push(format!("{}: {field_expr} === undefined ? undefined : ({revived})", f.name));
+            } else {
+                assignments.push(format!("{}: {revived}", f.name));
+            }
+        }
+    }
+    Ok(format!("{{ ...({expr} as any), {} }}", assignments.join(", ")))
+}
+
+/// Igual que `render_struct_revive`, pero tratando TODOS los campos como
+/// opcionales -- misma contraparte que `render_patch_fields_check` para
+/// `Patch<T>` (omitido = no tocar, no `undefined` a propósito).
+fn render_patch_revive(
+    fields: &[FieldType],
+    expr: &str,
+    checker: &Checker,
+    worklist: &mut Vec<Type>,
+    seen: &mut Vec<Type>,
+) -> Result<String, String> {
+    let mut assignments = Vec::new();
+    for f in fields {
+        let field_expr = format!("({expr} as any).{}", f.name);
+        if let Some(revived) = render_revive(&f.ty, &field_expr, checker, worklist, seen)? {
+            assignments.push(format!("{}: {field_expr} === undefined ? undefined : ({revived})", f.name));
+        }
+    }
+    Ok(format!("{{ ...({expr} as any), {} }}", assignments.join(", ")))
+}
+
+fn render_enum_revive_body(
+    checker: &Checker,
+    scrutinee_ty: &Type,
+    enum_name: &str,
+    variant_names: &[String],
+    expr: &str,
+    worklist: &mut Vec<Type>,
+    seen: &mut Vec<Type>,
+) -> Result<String, String> {
+    let mut lines = Vec::new();
+    for v in variant_names {
+        let fields = checker
+            .variant_field_types(scrutinee_ty, enum_name, v)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|(name, ty)| FieldType { name, optional: false, ty })
+            .collect::<Vec<_>>();
+        let body = render_struct_revive(&fields, expr, checker, worklist, seen)?;
+        lines.push(format!("  if (({expr} as any).type === \"{v}\") return {body} as any;"));
+    }
+    lines.push(format!("  return {expr} as any;"));
+    Ok(lines.join("\n"))
+}
+
+fn emit_reviver(
+    out: &mut String,
+    ty: &Type,
+    checker: &Checker,
+    worklist: &mut Vec<Type>,
+    seen: &mut Vec<Type>,
+) -> Result<(), String> {
+    let fn_name = reviver_fn_name(ty).expect("solo se llama para tipos con reviver_fn_name propio");
+    let type_annotation = ts_emit::render_type(ty);
+    match ty {
+        Type::Struct { name: Some(_), fields } => {
+            let body = render_struct_revive(fields, "x", checker, worklist, seen)?;
+            out.push_str(&format!("export function {fn_name}(x: any): {type_annotation} {{\n  return {body};\n}}\n\n"));
+        }
+        Type::Enum(name) => {
+            let decl = checker.enums.get(name).ok_or_else(|| format!("enum desconocido: '{name}'"))?;
+            let variant_names: Vec<String> = decl.variants.iter().map(|v| v.name.clone()).collect();
+            let body = render_enum_revive_body(checker, ty, name, &variant_names, "x", worklist, seen)?;
+            out.push_str(&format!("export function {fn_name}(x: any): {type_annotation} {{\n{body}\n}}\n\n"));
+        }
+        Type::ResultOf(ok_ty, err_ty) => {
+            let ok_revived = render_revive(ok_ty, "(x as any).value", checker, worklist, seen)?;
+            let err_revived = render_revive(err_ty, "(x as any).error", checker, worklist, seen)?;
+            let ok_expr = match ok_revived {
+                Some(r) => format!("{{ type: \"Ok\", value: {r} }}"),
+                None => "x as any".to_string(),
+            };
+            let err_expr = match err_revived {
+                Some(r) => format!("{{ type: \"Err\", error: {r} }}"),
+                None => "x as any".to_string(),
+            };
+            out.push_str(&format!(
+                "export function {fn_name}(x: any): {type_annotation} {{\n  return (x as any).type === \"Ok\" ? {ok_expr} : {err_expr};\n}}\n\n"
+            ));
+        }
+        Type::PatchOf(inner) => {
+            let Type::Struct { fields, .. } = inner.as_ref() else {
+                return Err(format!("Patch<T> requiere que T resuelva a un struct -- inesperado en el emisor: {inner:?}"));
+            };
+            let body = render_patch_revive(fields, "x", checker, worklist, seen)?;
+            out.push_str(&format!("export function {fn_name}(x: any): {type_annotation} {{\n  return {body};\n}}\n\n"));
+        }
+        Type::Generic(name, args) => {
+            if checker.types.contains_key(name) {
+                let fields = checker.expand_generic_struct(name, args).map_err(|e| e.to_string())?;
+                let body = render_struct_revive(&fields, "x", checker, worklist, seen)?;
+                out.push_str(&format!("export function {fn_name}(x: any): {type_annotation} {{\n  return {body};\n}}\n\n"));
+            } else if let Some(decl) = checker.enums.get(name) {
+                let variant_names: Vec<String> = decl.variants.iter().map(|v| v.name.clone()).collect();
+                let body = render_enum_revive_body(checker, ty, name, &variant_names, "x", worklist, seen)?;
+                out.push_str(&format!("export function {fn_name}(x: any): {type_annotation} {{\n{body}\n}}\n\n"));
+            } else {
+                return Err(format!("tipo genérico desconocido: '{name}'"));
+            }
+        }
+        other => return Err(format!("emit_reviver llamado sobre un tipo sin nombre: {other:?}")),
+    }
+    Ok(())
+}
+
+/// Igual que `render_check_expr`: se apoya en que `emit_validators` ya
+/// recorrió las MISMAS semillas de rpc y emitió cualquier revividor con
+/// nombre que este cálculo pudiera necesitar -- acá se descarta el
+/// worklist/seen locales después de calcular la expresión.
+pub(crate) fn render_revive_expr(ty: &Type, expr: &str, checker: &Checker) -> Result<Option<String>, String> {
+    let mut worklist = Vec::new();
+    let mut seen = Vec::new();
+    render_revive(ty, expr, checker, &mut worklist, &mut seen)
+}
+
+/// Nombres de revividor que un `client.ts` que revive `ty` necesita
+/// importar de "./validators" -- mismo criterio de corte que
+/// `collect_validator_names`.
+pub(crate) fn collect_reviver_names(ty: &Type, checker: &Checker, names: &mut BTreeSet<String>) -> Result<(), String> {
+    if !contains_int64(ty, checker)? {
+        return Ok(());
+    }
+    if let Some(fn_name) = reviver_fn_name(ty) {
+        names.insert(fn_name);
+        return Ok(());
+    }
+    match ty {
+        Type::Optional(inner) | Type::List(inner) => collect_reviver_names(inner, checker, names)?,
+        Type::Tuple(items) | Type::Union(items) => {
+            for i in items {
+                collect_reviver_names(i, checker, names)?;
+            }
+        }
+        Type::Struct { fields, .. } => {
+            for f in fields {
+                collect_reviver_names(&f.ty, checker, names)?;
+            }
+        }
+        Type::MapOf(k, v) => {
+            collect_reviver_names(k, checker, names)?;
+            collect_reviver_names(v, checker, names)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,15 +907,72 @@ mod tests {
     }
 
     #[test]
-    fn int64_check_requires_a_string_that_bigint_parses_within_i64_range() {
+    fn int64_check_requires_a_real_bigint_within_i64_range() {
+        // GRAMMAR.md §3.156: para cuando este chequeo corre en client.ts el
+        // valor ya pasó por el revividor de tipo (string del wire ->
+        // bigint) -- acá se valida el bigint real, no el string.
         let src = r#"
             type Counter = { big: Int64 }
             service S { rpc get() -> Counter { db.thing.get() } }
         "#;
         let out = emit(src);
-        assert!(out.contains("typeof") && out.contains("=== \"string\""), "debe exigir string: {out}");
-        assert!(out.contains("BigInt("), "debe intentar BigInt(...) para validar de verdad: {out}");
-        assert!(out.contains("9223372036854775807"), "debe acotar al rango real de i64: {out}");
+        assert!(out.contains("typeof") && out.contains("=== \"bigint\""), "debe exigir bigint: {out}");
+        assert!(out.contains("9223372036854775807n"), "debe acotar al rango real de i64: {out}");
+        assert!(out.contains("export function reviveCounter"), "debe emitir un revividor: {out}");
+        assert!(out.contains("BigInt("), "el revividor debe convertir el string del wire a bigint: {out}");
+    }
+
+    #[test]
+    fn a_type_with_no_int64_anywhere_gets_no_reviver_at_all() {
+        // Cero costo para el caso común (GRAMMAR.md §3.156): un tipo sin
+        // ningún Int64 adentro no genera NINGÚN "revive..." -- ni siquiera
+        // uno identidad.
+        let src = r#"
+            type Point = { x: Int, y: Int, label: String }
+            service S { rpc get() -> Point { db.thing.get() } }
+        "#;
+        let out = emit(src);
+        assert!(!out.contains("revive"), "no debería emitir ningún revividor: {out}");
+    }
+
+    #[test]
+    fn int64_inside_a_list_and_an_optional_gets_revived_recursively() {
+        let src = r#"
+            type Row = { tags: Int64[], maybe: Int64? }
+            service S { rpc get() -> Row { db.thing.get() } }
+        "#;
+        let out = emit(src);
+        assert!(out.contains("export function reviveRow"), "{out}");
+        assert!(out.contains(".map((item: any) => BigInt(item as any))"), "List<Int64> debe revivir cada elemento: {out}");
+        assert!(out.contains("=== null ? null : BigInt"), "Int64? debe preservar null sin llamar BigInt sobre null: {out}");
+    }
+
+    #[test]
+    fn int64_inside_a_generic_instantiation_gets_revived() {
+        // Un genérico opaco (`Box<Int64>`) NO puede tratarse como "no
+        // contiene Int64" solo porque está detrás de un nombre -- eso sería
+        // una mentira de tipos silenciosa (contract.d.ts diría `bigint`,
+        // runtime seguiría entregando un string). `contains_int64` expande
+        // el genérico vía el checker para evitar justo eso.
+        let src = r#"
+            type Box<T> = { value: T }
+            service S { rpc get() -> Box<Int64> { db.thing.get() } }
+        "#;
+        let out = emit(src);
+        assert!(out.contains("export function reviveBox_Int64"), "{out}");
+        assert!(out.contains("value: BigInt"), "{out}");
+    }
+
+    #[test]
+    fn int64_inside_an_enum_variant_gets_revived() {
+        let src = r#"
+            enum Event { Created { amount: Int64 }, Cancelled }
+            service S { rpc get() -> Event { db.thing.get() } }
+        "#;
+        let out = emit(src);
+        assert!(out.contains("export function reviveEvent"), "{out}");
+        assert!(out.contains("(x as any).type === \"Created\""), "{out}");
+        assert!(out.contains("amount: BigInt"), "{out}");
     }
 
     #[test]

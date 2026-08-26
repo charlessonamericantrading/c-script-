@@ -130,6 +130,11 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     // nunca tuvieron el bug -- solo esta funcion se detenia en el primero.
     let mut imported_names = std::collections::BTreeSet::new();
     let mut validator_names = std::collections::BTreeSet::new();
+    // GRAMMAR.md §3.156: ¿algún rpc de ESTE programa manda o recibe un
+    // Int64 en algún lado? Si no, `client.ts` sale byte-a-byte igual que
+    // antes de esta ronda -- el helper de abajo (__int64SafeStringify) ni
+    // se emite.
+    let mut program_has_int64 = false;
     let mut services: Vec<(&ServiceDecl, Vec<(&RpcDecl, bool, Vec<Type>, Type)>)> = Vec::new();
     for item in &program.items {
         let Item::Service(service) = item else { continue };
@@ -143,11 +148,15 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
             for p in &rpc.params {
                 let ty = checker.resolve_type(&p.ty).map_err(|e| e.to_string())?;
                 collect_type_names(&ty, &mut imported_names);
+                if validators_emit::render_revive_expr(&ty, "_", &checker).map_err(|e| e.to_string())?.is_some() {
+                    program_has_int64 = true;
+                }
                 param_tys.push(ty);
             }
             let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
             collect_type_names(&ret_ty, &mut imported_names);
             validators_emit::collect_validator_names(&ret_ty, &mut validator_names);
+            validators_emit::collect_reviver_names(&ret_ty, &checker, &mut validator_names).map_err(|e| e.to_string())?;
             resolved.push((rpc, is_stream, param_tys, ret_ty));
         }
         imported_names.insert(format!("{}Client", service.name));
@@ -222,6 +231,17 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     out.push_str("  }\n");
     out.push_str("}\n\n");
 
+    // GRAMMAR.md §3.156: solo se emite si ALGÚN rpc de este programa manda
+    // un Int64 -- un `bigint` real revienta `JSON.stringify` sin este
+    // replacer ("Do not know how to serialize a BigInt"), y ningún otro
+    // valor del contrato pasa nunca por acá (Int/Float/Timestamp/Uuid ya
+    // son string/number planos en el wire).
+    if program_has_int64 {
+        out.push_str("function __int64SafeStringify(value: unknown): string {\n");
+        out.push_str("  return JSON.stringify(value, (_key, v) => (typeof v === \"bigint\" ? v.toString() : v));\n");
+        out.push_str("}\n\n");
+    }
+
     // Bug real encontrado auditando este archivo (GRAMMAR.md §3.131):
     // `isOk`/`isErr` tipaban y chequeaban contra `{ ok: true|false, ... }`,
     // una forma que NINGÚN `Result<T,E>` real tiene -- el wire (y el propio
@@ -286,6 +306,26 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         params.push("options?: { signal?: AbortSignal }".to_string());
         let arg_names: Vec<&str> = rpc.params.iter().map(|p| p.name.as_str()).collect();
         let check = validators_emit::render_check_expr(ret_ty, "json");
+        // GRAMMAR.md §3.156: si la respuesta trae algún Int64 en algún
+        // lado, hay que revivirlo (string del wire -> bigint real) ANTES
+        // de validar -- `isInt64` ya espera un `bigint`, no un string
+        // (validators_emit.rs). Sin Int64 en el tipo de retorno, `revive`
+        // es `None` y el código generado es idéntico al de siempre.
+        let revive = validators_emit::render_revive_expr(ret_ty, "json", &checker).map_err(|e| e.to_string())?;
+        // Mismo criterio del lado de los ARGUMENTOS salientes: un `bigint`
+        // real revienta `JSON.stringify` sin más ("Do not know how to
+        // serialize a BigInt") -- acá no hace falta saber CUÁL argumento es
+        // Int64 (a diferencia de la respuesta, la dirección de ida no tiene
+        // ambigüedad: cualquier bigint en el árbol se vuelve texto, punto),
+        // así que un replacer estructural alcanza sin ningún walker dirigido
+        // por tipo.
+        let params_have_int64 = param_tys
+            .iter()
+            .map(|ty| validators_emit::render_revive_expr(ty, "_", &checker).map(|r| r.is_some()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .any(|b| b);
 
         if *is_stream {
             // Alcance v0 explícito (GRAMMAR.md §3.13): el servidor manda la
@@ -302,7 +342,7 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
                 params.join(", "),
                 render_type(ret_ty)
             ));
-            push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names);
+            push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names, params_have_int64);
             out.push_str("    if (!res.body) throw new LinkTransportError(\"el servidor no devolvió un body de stream\", res.status);\n");
             out.push_str("    const reader = res.body.getReader();\n");
             out.push_str("    const decoder = new TextDecoder();\n");
@@ -317,11 +357,21 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
             out.push_str("        buffer = buffer.slice(sep + 2);\n");
             out.push_str("        if (!frame.startsWith(\"data: \")) continue;\n");
             out.push_str("        const json: unknown = JSON.parse(frame.slice(6));\n");
-            out.push_str(&format!(
-                "        if (!({check})) throw new LinkValidationError(\"{}\", json);\n",
-                rpc.name
-            ));
-            out.push_str(&format!("        yield json as {};\n", render_type(ret_ty)));
+            if let Some(rev) = &revive {
+                out.push_str(&format!("        const revived: unknown = {rev};\n"));
+                let check_revived = validators_emit::render_check_expr(ret_ty, "revived");
+                out.push_str(&format!(
+                    "        if (!({check_revived})) throw new LinkValidationError(\"{}\", revived);\n",
+                    rpc.name
+                ));
+                out.push_str(&format!("        yield revived as {};\n", render_type(ret_ty)));
+            } else {
+                out.push_str(&format!(
+                    "        if (!({check})) throw new LinkValidationError(\"{}\", json);\n",
+                    rpc.name
+                ));
+                out.push_str(&format!("        yield json as {};\n", render_type(ret_ty)));
+            }
             out.push_str("      }\n");
             out.push_str("    }\n");
             out.push_str("  }\n\n");
@@ -340,7 +390,7 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         if let Some(pattern) = rpc.route() {
             out.push_str(&format!("    // También accesible en: {pattern}\n"));
         }
-        push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names);
+        push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names, params_have_int64);
 
         // Un rpc con `@content_type` responde el String tal cual, sin comillas
         // de JSON alrededor (GRAMMAR.md §3.35) -- llamar a `res.json()` acá
@@ -355,11 +405,21 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         }
 
         out.push_str("    const json: unknown = await res.json();\n");
-        out.push_str(&format!(
-            "    if (!({check})) throw new LinkValidationError(\"{}\", json);\n",
-            rpc.name
-        ));
-        out.push_str(&format!("    return json as {};\n", render_type(ret_ty)));
+        if let Some(rev) = &revive {
+            out.push_str(&format!("    const revived: unknown = {rev};\n"));
+            let check_revived = validators_emit::render_check_expr(ret_ty, "revived");
+            out.push_str(&format!(
+                "    if (!({check_revived})) throw new LinkValidationError(\"{}\", revived);\n",
+                rpc.name
+            ));
+            out.push_str(&format!("    return revived as {};\n", render_type(ret_ty)));
+        } else {
+            out.push_str(&format!(
+                "    if (!({check})) throw new LinkValidationError(\"{}\", json);\n",
+                rpc.name
+            ));
+            out.push_str(&format!("    return json as {};\n", render_type(ret_ty)));
+        }
         out.push_str("  }\n\n");
     }
     out.push_str("}\n\n");
@@ -433,6 +493,39 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     // puede invalidar un rpc que no genera hook de Query), así que emitir
     // este helper acá adentro nunca deja `queryCache` sin definir.
     let has_any_invalidates = services.iter().any(|(_, members)| members.iter().any(|(rpc, _, _, _)| rpc.invalidates().is_some()));
+    // GRAMMAR.md §3.156: la clave de cache de un hook de Query/Infinite es
+    // `JSON.stringify` sobre sus argumentos posicionales -- un argumento
+    // Int64 real es un `bigint`, que revienta ese `JSON.stringify` sin un
+    // replacer. Mismo criterio de import condicional que el resto de este
+    // archivo: sin ningún Int64 entre los parámetros de ALGÚN rpc, el
+    // helper ni se emite.
+    let has_any_int64_param = services
+        .iter()
+        .map(|(_, members)| {
+            members.iter().try_fold(false, |acc, (rpc, is_stream, param_tys, _)| {
+                if acc {
+                    return Ok(true);
+                }
+                // Solo rpcs que de verdad generan una `cacheKey` (Query o
+                // Infinite) llegan a usar el helper -- un rpc Int64 que
+                // solo genera un hook de Mutation (o ninguno) no lo
+                // necesita, y emitirlo sin uso real dispara
+                // `noUnusedLocals` en hooks.ts (mismo criterio que
+                // `has_any_query`/`has_any_invalidates` arriba).
+                if *is_stream || !(rpc.looks_like_a_query() || rpc.infinite().is_some()) {
+                    return Ok(false);
+                }
+                for ty in param_tys {
+                    if validators_emit::render_revive_expr(ty, "_", &checker).map_err(|e| e.to_string())?.is_some() {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+        })
+        .collect::<Result<Vec<bool>, String>>()?
+        .into_iter()
+        .any(|b| b);
 
     let mut out = String::new();
     out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
@@ -446,6 +539,11 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
             "import type {{ {} }} from \"./contract\";\n\n",
             imported_types.into_iter().collect::<Vec<_>>().join(", ")
         ));
+    }
+    if has_any_int64_param {
+        out.push_str("function __int64SafeStringify(value: unknown): string {\n");
+        out.push_str("  return JSON.stringify(value, (_key, v) => (typeof v === \"bigint\" ? v.toString() : v));\n");
+        out.push_str("}\n\n");
     }
 
     // `loading` vs `isFetching` (GRAMMAR.md §3.127): antes de esta ronda había
@@ -785,8 +883,20 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     // comparten historial aunque una ya haya avanzado más
                     // páginas -- el cursor es progreso interno, no
                     // identidad de la lista). GRAMMAR.md §3.138.
+                    let rpc_stringify_fn = if param_tys
+                        .iter()
+                        .map(|ty| validators_emit::render_revive_expr(ty, "_", &checker).map(|r| r.is_some()))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .any(|b| b)
+                    {
+                        "__int64SafeStringify"
+                    } else {
+                        "JSON.stringify"
+                    };
                     let cache_key_expr = format!(
-                        "\"{}.{}(\" + JSON.stringify([{}]) + \")\"",
+                        "\"{}.{}(\" + {rpc_stringify_fn}([{}]) + \")\"",
                         service.name,
                         rpc.name,
                         hook_param_names.join(", ")
@@ -884,8 +994,20 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
                     // instancias del hook con los MISMOS argumentos siempre
                     // caen en la MISMA entrada del `Map`, sin importar en qué
                     // componente estén montadas.
+                    let rpc_stringify_fn = if param_tys
+                        .iter()
+                        .map(|ty| validators_emit::render_revive_expr(ty, "_", &checker).map(|r| r.is_some()))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| e.to_string())?
+                        .into_iter()
+                        .any(|b| b)
+                    {
+                        "__int64SafeStringify"
+                    } else {
+                        "JSON.stringify"
+                    };
                     let cache_key_expr =
-                        format!("\"{}.{}(\" + JSON.stringify([{}]) + \")\"", service.name, rpc.name, param_names.join(", "));
+                        format!("\"{}.{}(\" + {rpc_stringify_fn}([{}]) + \")\"", service.name, rpc.name, param_names.join(", "));
 
                     out.push_str(&format!(
                         "export function use{service}{cap_rpc}Query({params_sig}): QueryState<{ret_str}> {{\n",
@@ -1123,7 +1245,7 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
 /// que difiere entre los dos es qué se hace DESPUÉS con `res` (un solo
 /// `res.json()` vs. leer `res.body` incrementalmente), así que solo esta
 /// parte vale la pena compartir.
-fn push_fetch_call(out: &mut String, service_name: &str, rpc_name: &str, arg_names: &[&str]) {
+fn push_fetch_call(out: &mut String, service_name: &str, rpc_name: &str, arg_names: &[&str], use_safe_stringify: bool) {
     out.push_str(&format!(
         "    const res = await fetch(`${{this.baseUrl}}/{service_name}/{rpc_name}`, {{\n"
     ));
@@ -1136,7 +1258,15 @@ fn push_fetch_call(out: &mut String, service_name: &str, rpc_name: &str, arg_nam
     out.push_str(
         "      headers: { \"Content-Type\": \"application/json\", ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}) },\n",
     );
-    out.push_str(&format!("      body: JSON.stringify({{ {} }}),\n", arg_names.join(", ")));
+    // GRAMMAR.md §3.156: un argumento Int64 real es un `bigint`, y
+    // `JSON.stringify` revienta sobre cualquier bigint sin un replacer --
+    // `__int64SafeStringify` (emitido una sola vez arriba, GRAMMAR.md §3.156)
+    // lo vuelve texto antes de mandarlo, sin tocar el resto del payload. Sin
+    // ningún Int64 entre los argumentos de ESTE rpc puntual, el código sigue
+    // siendo el `JSON.stringify` de siempre -- cero costo, cero cambio de
+    // texto generado.
+    let stringify_fn = if use_safe_stringify { "__int64SafeStringify" } else { "JSON.stringify" };
+    out.push_str(&format!("      body: {stringify_fn}({{ {} }}),\n", arg_names.join(", ")));
     // `options?.signal` -- `undefined` cuando el caller no pasó `options`,
     // que `fetch()` trata exactamente igual que no pasar `signal` (GRAMMAR.md
     // §3.129). Un `AbortError` real al abortar llega al `catch` del caller
@@ -1363,15 +1493,16 @@ fn emit_service_interface(out: &mut String, s: &ServiceDecl, checker: &Checker) 
 pub(crate) fn render_type(ty: &Type) -> String {
     match ty {
         Type::Int | Type::Float => "number".to_string(),
-        // NO "bigint" -- ver GRAMMAR.md §3.30. El wire ya manda un string
-        // (json_to_typed_value/value_to_json en runtime/mod.rs) para no
-        // perder precisión; emitir el mismo `string` acá evita necesitar
-        // cualquier glue de (de)serialización nueva en el cliente generado
-        // (push_fetch_call/emit_client no tienen hoy ningún punto de
-        // conversión dirigido por tipo, y agregarlo sería arquitectura
-        // nueva, no una extensión del patrón de Int). Quien necesite
-        // aritmética real hace `BigInt(x)` a mano.
-        Type::Int64 => "string".to_string(),
+        // `bigint` real, no `string` -- GRAMMAR.md §3.156 cierra el límite
+        // que dejaba abierto §3.30 ("agregar esto sería arquitectura nueva").
+        // El wire SIGUE mandando un string (json_to_typed_value/value_to_json
+        // en runtime/mod.rs no cambian acá, GRAMMAR.md §3.30) -- lo que
+        // cambia es que ahora `client.ts` tiene un walker dirigido por tipo
+        // (validators_emit.rs::render_revive/emit_reviver) que convierte
+        // cada Int64 alcanzable de vuelta a `bigint` después de `res.json()`,
+        // y las llamadas salientes usan un `JSON.stringify` con replacer que
+        // vuelve a pasar cualquier `bigint` a texto antes de mandarlo.
+        Type::Int64 => "bigint".to_string(),
         // String ISO-8601 plano, no branded -- GRAMMAR.md §3.31: el mismo
         // criterio minimalista que el resto del proyecto, revisar branding
         // si aparece un caso real que lo pida.
@@ -1617,17 +1748,17 @@ mod tests {
     }
 
     #[test]
-    fn int64_emits_as_ts_string_not_number_or_bigint() {
-        // GRAMMAR.md §3.30: string en el wire y en TS, para no perder
-        // precisión -- ni "number" (perdería precisión arriba de 2^53) ni
-        // "bigint" (necesitaría glue de (de)serialización nueva en el
-        // cliente que esta ronda deliberadamente no construye).
+    fn int64_emits_as_ts_bigint_not_number_or_string() {
+        // GRAMMAR.md §3.156: `bigint` real, no "number" (perdería precisión
+        // arriba de 2^53) ni "string" (el límite que dejaba abierto §3.30
+        // antes de que `validators_emit.rs` sumara el revividor de tipo).
+        // El wire SIGUE mandando un string -- eso no cambia acá.
         let src = r#"
             type Counter = { id: Int, big: Int64 }
             service S { rpc get() -> Counter { db.thing.get() } }
         "#;
         let (contract, _) = emit_both(src);
-        assert!(contract.contains("big: string;"), "contrato real: {contract}");
+        assert!(contract.contains("big: bigint;"), "contrato real: {contract}");
     }
 
     #[test]

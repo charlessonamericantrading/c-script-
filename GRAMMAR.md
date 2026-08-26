@@ -177,6 +177,7 @@
   - [3.153 `linkc serve-all --port-registry <archivo.json>`: puerto estable por nombre de servicio — RESUELTO](#3153-linkc-serve-all---port-registry-archivojson-puerto-estable-por-nombre-de-servicio--resuelto)
   - [3.154 `transaction { ... }`: transacciones SQL multi-escritura — RESUELTO, alcance acotado](#3154-transaction--transacciones-sql-multi-escritura--resuelto-alcance-acotado)
   - [3.155 `@unique(campo1, campo2, ...)`: constraint UNIQUE compuesto a nivel de `type` — RESUELTO](#3155-uniquecampo1-campo2--constraint-unique-compuesto-a-nivel-de-type--resuelto)
+  - [3.156 `Int64` como `bigint` real en `client.ts` — RESUELTO, cierra el límite que dejaba abierto §3.30](#3156-int64-como-bigint-real-en-clientts--resuelto-cierra-el-límite-que-dejaba-abierto-330)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1327,7 +1328,7 @@ PLAN.md §2.3 (la propuesta original, no el estado real) siempre tuvo una fila `
 
 **No es un bignum de precisión arbitraria.** `Int64` es exactamente el mismo rango que `Int` (`i64`) -- una variante propia, `Value::Int64(i64)`/`Type::Int64`, no una reinterpretación de `Value::Int`. Necesita ser su propia variante porque `value_to_json` (`runtime/mod.rs`) no recibe ningún contexto de `Type`, solo hace match estructural sobre `Value` -- sin una variante propia no hay forma de saber, en ese punto, si un entero debe serializarse como número nativo o como string.
 
-**Wire format: string en ambas direcciones, y el tipo TS emitido es `string`, no `bigint`.** El wire ya estaba decidido en PLAN.md (string, "para no perder precisión") -- lo que se resolvió en esta ronda fue el lado TS. `push_fetch_call`/`emit_client` (`ts_emit.rs`) no tienen ningún punto de conversión dirigido por tipo hoy: el request hace `JSON.stringify({args})` sin replacer, la respuesta hace `res.json()` sin reviver. Emitir `bigint` correctamente necesitaría un reviver real que distinga "este string es semánticamente un Int64" de "este campo `String` que por casualidad parece un número" -- eso es un walker recursivo dirigido por tipo nuevo, arquitectura nueva, no una extensión del patrón que `Int`/`Bool`/`String` ya siguen. Emitiendo `string`, el wire format y el tipo TS coinciden exactamente y el cliente generado no necesita ningún cambio de codegen -- quien necesite aritmética real hace `BigInt(x)` a mano, consistente con que el lenguaje ya no hace ninguna coerción implícita en ningún otro punto (§3.7). La opción `bigint` queda como una ronda futura separada, con su propio walker de (de)serialización, si alguna vez hay un caso concreto que la pida.
+**Wire format: string en ambas direcciones -- el tipo TS emitido, en cambio, ES `bigint` desde §3.156, no `string`. [ACTUALIZADO -- ver §3.156].** El wire siguió decidido en PLAN.md (string, "para no perder precisión") y NO cambió. Lo que sí cambió fue el lado TS: al momento de escribir este párrafo, `push_fetch_call`/`emit_client` (`ts_emit.rs`) no tenían ningún punto de conversión dirigido por tipo, así que emitir `bigint` de verdad hubiera necesitado "un walker recursivo dirigido por tipo nuevo, arquitectura nueva" -- exactamente lo que §3.156 terminó construyendo (`validators_emit.rs`, revividores `reviveX`), cuando apareció un caso concreto real (Glowapp) que lo pedía. Este párrafo queda como registro histórico de la decisión ORIGINAL y su motivo -- ver §3.156 para el diseño final.
 
 **`.toInt64()`/`.toInt()` son la ÚNICA forma de obtener un `Int64` desde código fuente en v0 -- no un nice-to-have.** Un literal entero (`Expr::Int`) siempre sintetiza `Type::Int`, nunca `Type::Int64` directamente, e `is_subtype(Int, Int64)` es `false` (tipos distintos, sin coerción implícita) -- así que `let x: Int64 = 5;` no compila. Ambas conversiones son exactas, nunca lossy (mismo rango `i64` en los dos lados), a diferencia de `toFloat`/`toInt` entre `Int` y `Float`. Consecuencia honesta de lo mismo: `is_const_literal_shape` no permite llamadas a método, así que **`const X: Int64 = ...` no tiene ninguna forma válida de escribirse en v0**; tampoco puede ser el `id` de una colección `db` (`validate_db_element_type` exige `Type::Int` exacto) -- ambos límites de diseño, no bugs.
 
@@ -5975,6 +5976,56 @@ type Product = {
 
 **Verificado**: 8 tests de checker (tipa con 2 y con 3+ campos; campo inexistente rechazado; menos de 2 campos rechazado; campo repetido dentro del mismo `@unique` rechazado; sobre un `type` que no es struct rechazado; el MISMO conjunto declarado dos veces -- en cualquier orden -- rechazado por redundante; dos `@unique` con conjuntos DISTINTOS conviven sin problema) + 1 en `runtime/mod.rs` contra SQLite real vía `invoke_rpc` (mismo `(profileId, slug)` rechazado; compartir solo UNO de los dos campos con una fila existente sigue siendo válido, confirmando que es compuesto de verdad, no dos constraints de un campo) + 1 en `codegen::postgres_emit` (el DDL estático de `linkc build` incluye la sentencia multi-columna exacta) + 2 contra un Postgres REAL (`pg_integration.rs`): el constraint compuesto enforced de punta a punta (mismo par rechazado, cualquiera de los dos campos distinto acepta), y un test dedicado al fix del bug de arriba confirmando el status `400` real por HTTP, no solo por inspección de código.
 
+### 3.156 `Int64` como `bigint` real en `client.ts` — RESUELTO, cierra el límite que dejaba abierto §3.30
+
+Tercer ítem de la auditoría propia de Glowapp (PLAN.md §9.3): §3.30 había resuelto la corrección del WIRE (string, para no perder precisión arriba de `2^53`) pero dejó el tipo TS emitido en `string`, documentando explícitamente que subir a `bigint` real "sería arquitectura nueva" -- un walker recursivo dirigido por tipo que distinga "este string es semánticamente un Int64" de "este campo `String` que por casualidad parece un número", cosa que ninguna otra feature de este proyecto necesitaba todavía. Con un caso concreto real pidiéndolo, esta ronda construye exactamente eso.
+
+**El wire NO cambia -- sigue siendo string en las dos direcciones (§3.30, `Value::Int64(n) => json!(n.to_string())` en `runtime/mod.rs`, intacto).** Lo único que cambia es el lado TypeScript: `contract.d.ts`/`client.ts`/`hooks.ts` ahora declaran `bigint` de verdad (`render_type`, `ts_emit.rs`) donde antes decían `string`, y el cliente generado hace la conversión en las dos direcciones -- sin que el servidor Rust necesite tocarse en absoluto.
+
+**Ida (request): un replacer estructural, sin walker dirigido por tipo -- esa mitad SÍ era simple.** Un `bigint` real revienta `JSON.stringify` sin más ("Do not know how to serialize a BigInt"). A diferencia de la vuelta, acá no hace falta saber CUÁL argumento es `Int64`: cualquier `bigint` en el árbol se vuelve texto sin ambigüedad posible, así que un único replacer (`__int64SafeStringify`, emitido en `client.ts` y en `hooks.ts` -- las dos únicas superficies que serializan args a JSON) alcanza. Se emite condicionalmente: si NINGÚN rpc del programa manda un `Int64`, el helper ni aparece (mismo criterio de `noUnusedLocals`-safe que el resto de este archivo, ej. `has_any_query`).
+
+**Vuelta (response): acá SÍ hace falta el walker dirigido por tipo -- un string no dice por sí solo si es un `Int64`, un `Timestamp`, un `Uuid` o un `String` que por casualidad es numérico.** `validators_emit.rs` suma un segundo juego de funciones exportadas junto a los `isX` de siempre, con el mismo mecanismo worklist/seen: `contains_int64(ty, checker)` (¿este tipo contiene un `Int64` en algún lado, expandiendo `Generic`/`Enum` de verdad vía el checker -- a diferencia de `type_contains_function`, checker.rs, que se detiene en un genérico opaco, porque dejar uno sin expandir acá sería una MENTIRA de tipos silenciosa: `contract.d.ts` prometiendo `bigint` sobre un valor que en runtime sigue siendo string) y `reviveX(x: any): X` (un `revive<Nombre>` por cada tipo con nombre que efectivamente contiene algún `Int64` -- ninguno para los que no, cero costo generado para el caso común). `client.ts` llama al revividor correspondiente ANTES de validar (`isInt64` ahora exige `typeof x === "bigint"`, no `"string"` -- el orden importa: revivir primero, validar después) y antes de devolver el valor al caller.
+
+<!-- linkc:fragment -->
+```rust
+type Counter = { id: Int, big: Int64 }
+db { counters: Counter[] }
+
+service Counters {
+  rpc addAmounts(a: Int64, b: Int64) -> Int64 { a + b }
+}
+```
+
+Genera (recortado):
+
+```typescript
+// contract.d.ts
+export interface Counter { id: number; big: bigint; }
+
+// validators.ts
+export function isCounter(x: unknown): x is Counter {
+  return (... && (typeof (x as any).big === "bigint" && (x as any).big >= -9223372036854775808n && (x as any).big <= 9223372036854775807n));
+}
+export function reviveCounter(x: any): Counter {
+  return { ...(x as any), big: BigInt((x as any).big as any) };
+}
+
+// client.ts
+async addAmounts(a: bigint, b: bigint, options?: { signal?: AbortSignal }): Promise<bigint> {
+  const res = await fetch(..., { body: __int64SafeStringify({ a, b }), ... });
+  const json: unknown = await res.json();
+  const revived: unknown = BigInt(json as any);
+  if (!(typeof revived === "bigint" && ...)) throw new LinkValidationError("addAmounts", revived);
+  return revived as bigint;
+}
+```
+
+**Cobertura del walker: struct (con nombre y anónimo), `Optional<T>`, `List<T>`, `Tuple`, `MapOf` (posición de valor -- la clave nunca es `Int64`, el checker ya limita `Map<K,V>` a `K: String|Int`), `Union`, `Result<Ok,Err>`, `Patch<T>`, y `Generic<...>`/`enum` con datos -- estos dos últimos expandidos de verdad vía el checker, no tratados como opacos.** `Union` se resuelve probando el `isX` de cada miembro en orden (la misma disambiguación que ya usa el validador) y revive con el revividor del miembro que matcheó. `Patch<T>` tiene el mismo tratamiento "todo opcional, omitido = no tocar" que ya usa su validador (`render_patch_fields_check`).
+
+**Verificado**: 5 tests unitarios nuevos en `validators_emit.rs` (un tipo sin `Int64` no emite ningún `revive...`; `List<Int64>`/`Int64?` revividos recursivamente, preservando `null`; un genérico opaco `Box<Int64>` revivido igual, sin tratarlo como caja negra; una variante de `enum` con un campo `Int64` revivida) + los dos tests existentes de §3.30 actualizados a la nueva forma (`bigint`, no `string`). Verificado además con el binario real y `tsc --strict --noUnusedLocals` de verdad (no solo inspección): un programa `.link` con un campo `Int64`, compilado de punta a punta, tipa limpio contra un `tsconfig.json` real; y contra un `linkc serve` real -- `i64::MAX` como parámetro `bigint` real, ida y vuelta por HTTP contra una lista, un scalar de retorno y un `findWhere` filtrando por ese campo, confirmando en runtime real (no solo en el tipo declarado) que el valor sigue siendo `9223372036854775807n` exacto en cada punto.
+
+**Límites honestos, alcance de esta ronda:** `schemas.ts` (Zod) sigue aceptando la unión laxa `number | string | bigint` para `Int64` (sin cambios) -- ese archivo existe para validar FORMULARIOS (un input de React puede llegar como string antes de convertirse), un propósito distinto al de `validators.ts`/`client.ts`, que validan la forma exacta del wire ya revivido; no se tocó a propósito. `openapi.json` sigue documentando `Int64` como `{"type": "integer", "format": "int64"}` (sin cambios, preexistente a esta ronda) -- convención común en APIs reales (Stripe, entre otras) para precisión de 64 bits, aunque no coincide 1:1 con el wire real (string); fuera de alcance de este ítem puntual.
+
 ---
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
@@ -5982,7 +6033,7 @@ type Product = {
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
 |---|---|---|---|
 | `Int`, `Float` | `number` | número | — |
-| `Int64` | `string` | string (decimal, ej. `"9223372036854775807"`) | mismo rango `i64` que `Int`, serializado como string para no perder precisión arriba de `2^53` -- ver §3.30. `.toInt64()`/`.toInt()` para convertir; sin mezcla implícita con `Int` |
+| `Int64` | `bigint` | string en el wire (decimal, ej. `"9223372036854775807"`), revivido a `bigint` real del lado TS | mismo rango `i64` que `Int` -- el WIRE sigue siendo string (§3.30) para no perder precisión, pero `client.ts` ahora lo revive a `bigint` real (§3.156). `.toInt64()`/`.toInt()` para convertir; sin mezcla implícita con `Int` |
 | `Timestamp` | `string` | string ISO-8601 de forma fija, ej. `"2026-08-08T14:30:00.000Z"` | milisegundos desde epoch UTC internamente -- ver §3.31. Obtenible con `now() -> Timestamp` (§3.32) o `dateFromParts(...) -> Timestamp` (§3.90). Solo comparable (`< <= > >= == !=`); sin aritmética |
 | `now()` | `now(): Timestamp` | `"2026-08-15T12:00:00.000Z"` | función builtin de fecha y hora actual en UTC (§3.32) |
 | `dateFromParts(year, month, day, hour, minute, second)` | `dateFromParts(year: number, month: number, day: number, hour: number, minute: number, second: number): Timestamp` | `"2026-07-01T00:00:00.000Z"` | función builtin que construye un `Timestamp` arbitrario a partir de sus componentes de calendario; `bad_request` (400) si la fecha no existe (§3.90) |

@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.111.0] - 2026-08-26
+
+### ✨ Nuevo
+- **`Int64` como `bigint` real en `client.ts`.** Tercer ítem de la auditoría propia de Glowapp: §3.30 (v1.35.0) dejaba `Int64` emitido como `string` en TypeScript a propósito ("cambiar a bigint sería arquitectura nueva"). Esta ronda construye esa arquitectura: `contract.d.ts`/`client.ts`/`hooks.ts` ahora declaran `bigint` de verdad, y `validators.ts` gana un segundo juego de funciones (`reviveX`, junto a los `isX` de siempre) que convierte cada `Int64` alcanzable (struct, `Optional`/`List`/`Tuple`/`MapOf`/`Union`/`Result`/`Patch`, `Generic`/`enum` expandidos de verdad) de string a `bigint` justo después de `res.json()`. El wire NO cambia -- sigue siendo string en las dos direcciones; del lado de ida, un replacer estructural de `JSON.stringify` (`__int64SafeStringify`) vuelve cualquier `bigint` saliente a texto sin ambigüedad. Ambos helpers se emiten solo si el programa realmente usa `Int64` -- cero costo para el caso común. Verificado con tests unitarios nuevos, `tsc --strict --noUnusedLocals` real sobre el código generado, y un `linkc serve` real ida y vuelta con `i64::MAX` exacto por HTTP. Ver GRAMMAR.md §3.156.
+
 ## [1.110.0] - 2026-08-26
 
 ### 🐛 Arreglado
