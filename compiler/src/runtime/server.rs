@@ -36,8 +36,8 @@
 use super::db::{now_ms, Db};
 use super::session::SessionStore;
 use super::{
-    invoke_rpc_with_sessions, is_stream_member, live_subscribe_collection, required_auth, required_cache, required_cors,
-    required_idempotent, required_rate_limit,
+    invoke_rpc_with_sessions, is_cron_member, is_stream_member, live_subscribe_collection, required_auth, required_cache,
+    required_cors, required_idempotent, required_rate_limit,
 };
 use crate::ast::{Annotation, Item, Member};
 use crate::ast::Program;
@@ -190,6 +190,37 @@ fn log_done_with_audit(
                 json["auth_user_id"] = a.user_id.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null);
                 json["auth_allowed"] = serde_json::Value::Bool(a.allowed);
             }
+            println!("{json}");
+        }
+    }
+}
+
+/// Una línea por corrida de una tarea `@cron` (GRAMMAR.md §3.159) -- mismo
+/// espíritu que `log_done`, pero sin `req_id`/`status` HTTP (una tarea
+/// programada no es una request). `ok=false` cuenta como `Error` para
+/// `--log-level`, igual criterio que un 5xx en `status_level`.
+fn log_cron_tick(log: LogConfig, method: &str, ok: bool, elapsed: std::time::Duration, extra: &str) {
+    let level = if ok { LogLevel::Info } else { LogLevel::Error };
+    if level < log.level {
+        return;
+    }
+    let elapsed_ms = elapsed.as_millis();
+    match log.format {
+        LogFormat::Text => {
+            let mut line = format!("[cron] method={method} ok={ok} duration_ms={elapsed_ms}");
+            if !extra.is_empty() {
+                line.push(' ');
+                line.push_str(extra);
+            }
+            println!("{line}");
+        }
+        LogFormat::Json => {
+            let json = serde_json::json!({
+                "cron": method,
+                "ok": ok,
+                "duration_ms": elapsed_ms,
+                "extra": if extra.is_empty() { None } else { Some(extra) },
+            });
             println!("{json}");
         }
     }
@@ -438,6 +469,47 @@ pub fn serve(
     let idempotency_store = std::sync::Arc::new(parking_lot::Mutex::new(idempotency_store));
     let cache_store = std::sync::Arc::new(parking_lot::Mutex::new(cache_store));
     let metrics_store = std::sync::Arc::new(parking_lot::Mutex::new(metrics_store));
+
+    // `@cron("Ns"/"Nm"/"Nh"/"Nd")` (GRAMMAR.md §3.159): un hilo dedicado
+    // POR tarea, spawneado una sola vez acá, nunca por request (a
+    // diferencia de `spawn_handler!` más abajo). Duerme el intervalo
+    // COMPLETO antes de la primera corrida (mismo criterio que
+    // `setInterval` de JS) -- así arrancar `serve`/`serve-all` con varias
+    // tareas no las dispara todas a la vez contra la base en el instante
+    // 0. Un error del cuerpo (panic, `@check`/`@unique`, lo que sea) se
+    // loguea y el loop SIGUE -- una corrida fallida nunca apaga la tarea
+    // entera ni el servidor.
+    for item in program.items.iter() {
+        let Item::Service(service) = item else { continue };
+        for member in &service.members {
+            let Member::Rpc(rpc) = member else { continue };
+            let Some(raw_interval) = rpc.cron() else { continue };
+            let interval = crate::cron::parse_interval(raw_interval)
+                .expect("check_cron_annotation (checker.rs) ya validó este formato en compilación");
+            let method = format!("{}.{}", service.name, rpc.name);
+            let service_name = service.name.clone();
+            let rpc_name = rpc.name.clone();
+            let program = std::sync::Arc::clone(&program);
+            let db = std::sync::Arc::clone(&db);
+            let sessions = std::sync::Arc::clone(&sessions);
+            let metrics_store = std::sync::Arc::clone(&metrics_store);
+            std::thread::spawn(move || loop {
+                std::thread::sleep(interval);
+                let start = std::time::Instant::now();
+                let no_args = serde_json::Value::Object(serde_json::Map::new());
+                match invoke_rpc_with_sessions(&program, &service_name, &rpc_name, &no_args, &db, &sessions, None) {
+                    Ok(_) => {
+                        metrics_store.lock().record_cron_run(&method, true);
+                        log_cron_tick(log, &method, true, start.elapsed(), "");
+                    }
+                    Err(e) => {
+                        metrics_store.lock().record_cron_run(&method, false);
+                        log_cron_tick(log, &method, false, start.elapsed(), &format!("error={:?}", e.message));
+                    }
+                }
+            });
+        }
+    }
 
     // Un hilo por request (Pilar 1, arriba) -- cada `Arc`/`Arc<Mutex<...>>`
     // se clona (barato: un incremento de refcount, nunca una copia real de
@@ -737,6 +809,17 @@ fn handle_request(
         }
     };
     let method = format!("{service_name}.{rpc_name}");
+
+    // `@cron` (GRAMMAR.md §3.159): nunca alcanzable vía HTTP -- el checker
+    // ya garantiza que nunca coexiste con `@route`, pero el path por
+    // defecto `POST /{Service}/{rpc}` de arriba encuentra cualquier rpc por
+    // NOMBRE sin mirar sus anotaciones. 404, no 403 -- desde afuera, este
+    // rpc "no existe" como endpoint, exactamente como uno mal escrito.
+    if is_cron_member(&program, service_name, rpc_name) {
+        let _ = request.respond(cors_response(404, error_json("no existe ese rpc"), &cors_headers));
+        log_done(log, req_id, Some(&method), 404, start, "");
+        return;
+    }
 
     // `@rate_limit` (GRAMMAR.md §3.39): corre ANTES del gate de auth de
     // abajo, a propósito -- si corriera después, un rpc protegido dejaría
@@ -1341,7 +1424,8 @@ fn check_auth_gate(
         | Annotation::Infinite { .. }
         | Annotation::Idempotent
         | Annotation::Cache(_)
-        | Annotation::Cors(_) => Ok(()),
+        | Annotation::Cors(_)
+        | Annotation::Cron(_) => Ok(()),
     };
     AuthGateResult { audit: mk_audit(outcome.is_ok()), outcome }
 }

@@ -805,9 +805,15 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::Cors(value)
                 }
+                "cron" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let every = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    Annotation::Cron(every)
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)', '@idempotent', '@cache(\"60s\")' o '@cors(\"https://origen.com\")')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)', '@idempotent', '@cache(\"60s\")', '@cors(\"https://origen.com\")' o '@cron(\"5m\")')"
                     )))
                 }
             };

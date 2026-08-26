@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.116.0] - 2026-08-27
+
+### ✨ Nuevo
+- **`@cron("Ns"/"Nm"/"Nh"/"Nd")`: tareas recurrentes nativas dentro de `linkc serve`.** Reprorizado el 24/08/2026 por evidencia fuerte de Glowapp (10+ schedulers hand-rolled con `setInterval` más un `schedulerSupervisor.ts` completo), atacado recién ahora porque necesitaba la infraestructura de hilos reales de v1.114.0 (un hilo por request) -- antes de esa ronda, esto hubiera significado inventar concurrencia de un solo uso.
+- Una anotación sobre un `rpc` normal (`@cron("5m")`), no una palabra reservada nueva. Tiene que ser la ÚNICA anotación del rpc (ninguna otra -- `@route`/`@authenticated`/`@rate_limit`/etc. -- tiene efecto sobre algo que nunca recibe una request HTTP real), sin parámetros, retorno `Void` obligatorio.
+- Nunca alcanzable vía HTTP -- ni en su path por defecto (404 explícito, no solo ausencia de `@route`), ni en `client.ts`/`openapi.json`/`llms.txt`/hooks generados.
+- Un hilo de sistema operativo dedicado por tarea, spawneado una vez al arrancar `serve()`, reusando `Arc<Db>`/`Arc<Program>`/`Arc<SessionStore>` -- sin scheduling nuevo. Duerme el intervalo completo antes de la primera corrida (mismo criterio que `setInterval` de JS). Un error del cuerpo se loguea y el loop sigue -- nunca apaga la tarea ni el servidor.
+- Observabilidad: una línea de log por corrida (`log_cron_tick`) y dos contadores nuevos en `/metrics` (`linkc_cron_runs_total`/`linkc_cron_failures_total`, el segundo solo si hubo una falla real).
+- Límites honestos documentados: sin coordinación entre instancias (N réplicas corren la tarea N veces), sin catch-up tras downtime, sin disparo manual, sin guard contra solapamiento entre corridas.
+
+Verificado con 9 tests de checker + 2 de parseo + 2 de integración contra un `linkc serve` real (subproceso real, confirmando que corre sola y que da 404 en su path por defecto) + 1 de `/metrics` real. Suite completa: 1229 tests, 0 fallos. Ver GRAMMAR.md §3.159, PLAN.md §9.7.
+
 ## [1.115.0] - 2026-08-26
 
 ### 🐛 Arreglado

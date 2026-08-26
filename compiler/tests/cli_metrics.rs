@@ -280,6 +280,47 @@ fn metrics_reports_real_rate_limit_rejections_per_rpc() {
     assert!(body.contains("linkc_rate_limit_rejections_total{method=\"Sys.limited\"} 2"), "body: {body}");
 }
 
+/// GRAMMAR.md §3.159: una tarea `@cron` corre sola, sin ningún caller HTTP
+/// que note un 5xx si su cuerpo empieza a fallar -- este contador la hace
+/// visible en `/metrics`, el mismo lugar que ya expone el resto de las
+/// métricas del servidor.
+#[test]
+fn metrics_reports_real_cron_runs_and_failures() {
+    let temp = TempDir::new("cron-runs");
+    let out = build(
+        &temp,
+        r#"
+            type Counter = { id: Int, hits: Int }
+            db { counters: Counter[] }
+            service Jobs {
+                @cron("1s")
+                rpc tick() -> Void {
+                    let rows = db.counters.all();
+                    if (rows.length() == 0) {
+                        db.counters.insert(Counter { id: 0, hits: 1 });
+                    } else {
+                        db.counters.increment(rows[0].id, |c: Counter| { c.hits }, 1);
+                    }
+                }
+            }
+        "#,
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let server = Serve::start(&temp.0.join("app.link"), &[]);
+
+    // Sin ninguna corrida todavía: la métrica no aparece.
+    let (_, body) = server.request("GET", "/metrics", "", &[]);
+    assert!(!body.contains("linkc_cron_runs_total"), "body: {body}");
+
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+
+    let (_, body) = server.request("GET", "/metrics", "", &[]);
+    let line = body.lines().find(|l| l.starts_with("linkc_cron_runs_total{method=\"Jobs.tick\"}")).unwrap_or_else(|| panic!("body: {body}"));
+    let count: u64 = line.rsplit(' ').next().unwrap().parse().expect("conteo numérico");
+    assert!(count >= 2, "esperaba al menos 2 corridas de @cron(\"1s\") en 2.5s: {line}");
+    assert!(!body.contains("linkc_cron_failures_total{method=\"Jobs.tick\"}"), "ninguna corrida falló, no debería haber contador de fallas: {body}");
+}
+
 #[test]
 fn metrics_is_not_exempt_from_the_service_api_key_unlike_health() {
     let temp = TempDir::new("api-key");

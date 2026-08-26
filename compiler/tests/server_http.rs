@@ -809,3 +809,51 @@ fn a_rpc_without_cache_runs_its_body_every_time_over_a_real_subprocess() {
     server.shutdown();
 }
 
+// ---- `@cron("Ns"/"Nm"/"Nh"/"Nd")` (GRAMMAR.md §3.159) ----
+
+const CRON_PROGRAM: &str = r#"
+    type Counter = { id: Int, hits: Int }
+    db { counters: Counter[] }
+    service Jobs {
+        @cron("1s")
+        rpc tick() -> Void {
+            let rows = db.counters.all();
+            if (rows.length() == 0) {
+                db.counters.insert(Counter { id: 0, hits: 1 });
+            } else {
+                db.counters.increment(rows[0].id, |c: Counter| { c.hits }, 1);
+            }
+        }
+        rpc getHits() -> Int {
+            let rows = db.counters.all();
+            if (rows.length() == 0) { 0 } else { rows[0].hits }
+        }
+    }
+"#;
+
+#[test]
+fn a_cron_rpc_runs_on_its_own_without_any_http_request_triggering_it() {
+    let server = ServeProcess::start_with_program("cron-fires", CRON_PROGRAM);
+    // El scheduler duerme el intervalo COMPLETO antes de la primera corrida
+    // (mismo criterio que setInterval de JS, ver runtime/server.rs::serve)
+    // -- 2.5s alcanza para dos vueltas de un intervalo de 1s sin ser un test
+    // frágil por un margen demasiado ajustado.
+    std::thread::sleep(Duration::from_millis(2500));
+    let (status, hits) = server.post("/Jobs/getHits", &json!({}), None);
+    assert_eq!(status, 200, "body: {hits:?}");
+    assert!(hits.as_i64().unwrap_or(0) >= 2, "esperaba al menos 2 corridas de @cron(\"1s\") en 2.5s, dio: {hits:?}");
+    server.shutdown();
+}
+
+#[test]
+fn a_cron_rpc_is_never_reachable_over_http_even_at_its_default_path() {
+    let server = ServeProcess::start_with_program("cron-unreachable", CRON_PROGRAM);
+    // El checker ya garantiza que `@cron` nunca coexiste con `@route`, pero
+    // el path por DEFECTO (`POST /{Service}/{rpc}`) encuentra cualquier rpc
+    // por nombre -- esto prueba que server.rs lo bloquea ahí también, antes
+    // de que is_cron_member exista solo en el papel.
+    let (status, body) = server.post("/Jobs/tick", &json!({}), None);
+    assert_eq!(status, 404, "un rpc @cron no puede ser invocado por HTTP, ni siquiera en su path por defecto: {body:?}");
+    server.shutdown();
+}
+

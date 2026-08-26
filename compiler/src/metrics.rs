@@ -34,11 +34,34 @@ pub struct MetricsStore {
     /// la señal que le permite a un operador NOTAR el problema en vez de
     /// enterarse por un endpoint caro sin protección real.
     rate_limit_rejections: HashMap<String, u64>,
+    /// (corridas OK, corridas fallidas) de cada tarea `@cron` (GRAMMAR.md
+    /// §3.159), por `Servicio.rpc` -- una tarea recurrente corre sola, sin
+    /// ningún caller HTTP que note un 5xx si su cuerpo empieza a fallar;
+    /// sin esto, la única señal seria leer stdout/stderr bajo `pm2`/
+    /// `systemd`, mismo problema ya resuelto para NOTIFY oversized
+    /// (GRAMMAR.md §3.150).
+    cron_runs: HashMap<String, (u64, u64)>,
 }
 
 impl MetricsStore {
     pub fn new() -> Self {
-        MetricsStore { by_method: HashMap::new(), notify_latency: (0, 0.0), rate_limit_rejections: HashMap::new() }
+        MetricsStore {
+            by_method: HashMap::new(),
+            notify_latency: (0, 0.0),
+            rate_limit_rejections: HashMap::new(),
+            cron_runs: HashMap::new(),
+        }
+    }
+
+    /// Registra UNA corrida de una tarea `@cron` -- `runtime/server.rs` la
+    /// llama en cada tick, junto con `log_cron_tick`.
+    pub fn record_cron_run(&mut self, method: &str, ok: bool) {
+        let entry = self.cron_runs.entry(method.to_string()).or_insert((0, 0));
+        if ok {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
     }
 
     /// Registra UN rechazo `429` de `@rate_limit` para `method`
@@ -124,6 +147,26 @@ impl MetricsStore {
                 out.push_str(&format!("linkc_rate_limit_rejections_total{{method=\"{}\"}} {count}\n", escape_label(method)));
             }
         }
+        if !self.cron_runs.is_empty() {
+            out.push_str("# HELP linkc_cron_runs_total Corridas de una tarea @cron, por rpc.\n");
+            out.push_str("# TYPE linkc_cron_runs_total counter\n");
+            for (method, (ok, _)) in &self.cron_runs {
+                out.push_str(&format!("linkc_cron_runs_total{{method=\"{}\"}} {ok}\n", escape_label(method)));
+            }
+            // Mismo criterio que `rate_limit_rejections` arriba: solo los
+            // rpcs que de verdad tuvieron al menos una falla, nunca un `0`
+            // inventado para el resto.
+            let any_failed = self.cron_runs.values().any(|(_, failed)| *failed > 0);
+            if any_failed {
+                out.push_str("# HELP linkc_cron_failures_total Corridas de una tarea @cron que terminaron en error, por rpc.\n");
+                out.push_str("# TYPE linkc_cron_failures_total counter\n");
+                for (method, (_, failed)) in &self.cron_runs {
+                    if *failed > 0 {
+                        out.push_str(&format!("linkc_cron_failures_total{{method=\"{}\"}} {failed}\n", escape_label(method)));
+                    }
+                }
+            }
+        }
         out
     }
 }
@@ -199,5 +242,22 @@ mod tests {
 
         let out_without = store.render_prometheus_text(&[], None, &[]);
         assert!(!out_without.contains("linkc_notify_oversized_dropped_total"));
+    }
+
+    #[test]
+    fn cron_runs_accumulate_per_method_and_failures_only_appear_for_methods_that_actually_failed() {
+        let mut store = MetricsStore::new();
+        let out = store.render_prometheus_text(&[], None, &[]);
+        assert!(!out.contains("linkc_cron_runs_total"), "{out}");
+
+        store.record_cron_run("Jobs.sweep", true);
+        store.record_cron_run("Jobs.sweep", true);
+        store.record_cron_run("Jobs.sweep", false);
+        store.record_cron_run("Jobs.reindex", true);
+        let out = store.render_prometheus_text(&[], None, &[]);
+        assert!(out.contains("linkc_cron_runs_total{method=\"Jobs.sweep\"} 2"), "{out}");
+        assert!(out.contains("linkc_cron_runs_total{method=\"Jobs.reindex\"} 1"), "{out}");
+        assert!(out.contains("linkc_cron_failures_total{method=\"Jobs.sweep\"} 1"), "{out}");
+        assert!(!out.contains("linkc_cron_failures_total{method=\"Jobs.reindex\"}"), "un rpc sin fallas no debe llevar un 0 inventado: {out}");
     }
 }

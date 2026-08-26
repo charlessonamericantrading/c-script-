@@ -293,6 +293,9 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
 
         for member in &service.members {
             let (rpc, is_stream) = match member {
+                // `@cron` (GRAMMAR.md §3.159): nunca alcanzable vía HTTP --
+                // no describe ningún path real en la especificación pública.
+                Member::Rpc(r) if r.cron().is_some() => continue,
                 Member::Rpc(r) => (r, false),
                 Member::Stream(r) => (r, true),
             };

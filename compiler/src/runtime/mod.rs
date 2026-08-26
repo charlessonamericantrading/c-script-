@@ -3562,6 +3562,22 @@ pub fn is_stream_member(program: &Program, service_name: &str, rpc_name: &str) -
     })
 }
 
+/// Si `service_name.rpc_name` declaró `@cron("...")` (GRAMMAR.md §3.159) --
+/// mismo patrón que `is_stream_member`: `server.rs` lo consulta ANTES de
+/// invocar nada, para devolver 404 en vez de correr una tarea que no está
+/// pensada para recibir requests HTTP reales (el checker ya garantiza que
+/// nunca coexiste con `@route`, pero el path por defecto
+/// `POST /{Service}/{rpc}` sigue alcanzando a CUALQUIER rpc por nombre sin
+/// este chequeo).
+pub fn is_cron_member(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) if s.name == service_name => {
+            s.members.iter().any(|m| matches!(m, Member::Rpc(r) if r.name == rpc_name && r.cron().is_some()))
+        }
+        _ => false,
+    })
+}
+
 /// Anotación `@authenticated`/`@requires(...)` de `{service_name}.{rpc_name}`,
 /// si tiene una -- hermana de `is_stream_member` (mismo archivo/patrón, ya
 /// usada por `server.rs` antes de invocar nada). `None` cubre tanto "sin

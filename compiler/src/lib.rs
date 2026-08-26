@@ -32,6 +32,7 @@ pub mod pm2;
 pub mod lsp;
 pub mod parser;
 pub mod cache;
+pub mod cron;
 pub mod idempotency;
 pub mod metrics;
 pub mod rate_limit;

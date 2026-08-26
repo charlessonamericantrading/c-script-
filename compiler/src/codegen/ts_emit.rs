@@ -141,6 +141,10 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
         let mut resolved: Vec<(&RpcDecl, bool, Vec<Type>, Type)> = Vec::new();
         for m in &service.members {
             let (rpc, is_stream) = match m {
+                // `@cron` (GRAMMAR.md §3.159): nunca alcanzable vía HTTP,
+                // así que no genera ningún método de cliente -- no hay nada
+                // que un frontend pudiera llamar.
+                Member::Rpc(r) if r.cron().is_some() => continue,
                 Member::Rpc(r) => (r, false),
                 Member::Stream(r) => (r, true),
             };
@@ -455,6 +459,10 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
         let mut members = Vec::new();
         for m in &service.members {
             let (rpc, is_stream) = match m {
+                // `@cron` (GRAMMAR.md §3.159): nunca alcanzable vía HTTP,
+                // así que no genera ningún método de cliente -- no hay nada
+                // que un frontend pudiera llamar.
+                Member::Rpc(r) if r.cron().is_some() => continue,
                 Member::Rpc(r) => (r, false),
                 Member::Stream(r) => (r, true),
             };

@@ -38,6 +38,9 @@ pub fn emit_llms_txt(program: &Program, title: &str) -> Result<String, String> {
         out.push_str(&format!("\n## {}\n\n", service.name));
         for member in &service.members {
             let (rpc, is_stream) = match member {
+                // `@cron` (GRAMMAR.md §3.159): nunca alcanzable vía HTTP --
+                // no tiene ningún path real que documentar acá.
+                Member::Rpc(r) if r.cron().is_some() => continue,
                 Member::Rpc(r) => (r, false),
                 Member::Stream(r) => (r, true),
             };
@@ -90,6 +93,9 @@ pub fn emit_llms_txt_full(program: &Program, title: &str) -> Result<String, Stri
         out.push_str(&format!("\n## {}\n\n", service.name));
         for member in &service.members {
             let (rpc, is_stream) = match member {
+                // `@cron` (GRAMMAR.md §3.159): nunca alcanzable vía HTTP --
+                // no tiene ningún path real que documentar acá.
+                Member::Rpc(r) if r.cron().is_some() => continue,
                 Member::Rpc(r) => (r, false),
                 Member::Stream(r) => (r, true),
             };

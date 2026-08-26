@@ -1980,6 +1980,54 @@ impl Checker {
         Ok(())
     }
 
+    /// `@cron("5m")` (GRAMMAR.md §3.159) -- tarea recurrente nativa, nunca
+    /// alcanzable vía HTTP. A diferencia del resto de las anotaciones (que
+    /// se combinan libremente), esta tiene que ser la ÚNICA: ninguna otra
+    /// anotación (`@route`/`@authenticated`/`@rate_limit`/`@cache`/etc.)
+    /// tiene sentido sobre algo que nunca recibe una request real -- en vez
+    /// de dejarlas ahí sin efecto (una fuente clásica de confusión, "¿por
+    /// qué mi `@rate_limit` no hace nada?"), el checker las rechaza de
+    /// entrada. Sin parámetros (nada externo lo dispara) y retorno `Void`
+    /// (nada consume una respuesta) -- mismo criterio de forma que
+    /// `check_rpc_crosses_the_wire` ya aplica en general, pero acá son
+    /// obligatorios, no solo permitidos.
+    fn check_cron_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        let values: Vec<&String> = r.annotations.iter().filter_map(|a| match a { Annotation::Cron(v) => Some(v), _ => None }).collect();
+        if values.len() > 1 {
+            return Err(err(format!("'{}' declara `@cron` más de una vez: un rpc corre con un solo intervalo", r.name)));
+        }
+        let Some(raw) = values.first() else {
+            return Ok(());
+        };
+        if is_stream {
+            return Err(err(format!(
+                "`@cron` en el stream '{}': una tarea recurrente no es una conexión SSE que alguien pueda suscribirse -- llamalo desde un 'rpc' normal (GRAMMAR.md §3.159)",
+                r.name
+            )));
+        }
+        if r.annotations.len() > 1 {
+            return Err(err(format!(
+                "'{}' combina `@cron` con otra anotación -- un rpc con `@cron` nunca se llama vía HTTP, así que `@route`/`@authenticated`/`@rate_limit`/`@cache`/etc. no tendrían ningún efecto ahí (GRAMMAR.md §3.159)",
+                r.name
+            )));
+        }
+        crate::cron::parse_interval(raw).map_err(|e| err(format!("`@cron(\"{raw}\")` en '{}': {e}", r.name)))?;
+        if !r.params.is_empty() {
+            return Err(err(format!(
+                "'{}' declara `@cron` con parámetros -- nada externo dispara una tarea recurrente, así que no hay de dónde sacar sus argumentos en cada corrida (GRAMMAR.md §3.159)",
+                r.name
+            )));
+        }
+        let ret = self.resolve_type(&r.return_type)?;
+        if !matches!(ret, Type::Void) {
+            return Err(err(format!(
+                "'{}' declara `@cron` con retorno '{}' -- una tarea recurrente no tiene ningún caller que reciba una respuesta, así que su retorno tiene que ser 'Void' (GRAMMAR.md §3.159)",
+                r.name, ret
+            )));
+        }
+        Ok(())
+    }
+
     /// `@validate(...)` (GRAMMAR.md §3.73) sobre cada campo de `fields` --
     /// llamado tanto para un `type X = { ... }` como para los campos de cada
     /// variante de un `enum` (comparten `Field`, ver `ast.rs`). Dos cosas se
@@ -2322,6 +2370,7 @@ impl Checker {
         self.check_idempotent_annotation(r, is_stream)?;
         self.check_cache_annotation(r, is_stream)?;
         self.check_cors_annotation(r)?;
+        self.check_cron_annotation(r, is_stream)?;
         let Some(Annotation::Requires { enum_name, variant_names }) = r.auth() else {
             return Ok(());
         };
@@ -6398,6 +6447,97 @@ type T = { id: Int, s: Status }")
             err.iter().any(|e| e.message.contains("cache") && e.message.contains("stream")),
             "mensaje inesperado: {err:?}"
         );
+    }
+
+    #[test]
+    fn cron_annotation_type_checks_alone_with_no_params_and_void_return() {
+        let src = r#"
+            service Jobs {
+                @cron("5m")
+                rpc sweep() -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn cron_annotation_rejects_a_malformed_interval() {
+        let src = r#"
+            service Jobs {
+                @cron("5")
+                rpc sweep() -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn cron_annotation_rejects_being_declared_twice() {
+        let src = r#"
+            service Jobs {
+                @cron("5m")
+                @cron("1h")
+                rpc sweep() -> Void { }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("más de una vez")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn cron_annotation_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @cron("5m")
+                stream list() -> Task {
+                    db.tasks.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("cron") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn cron_annotation_rejects_combining_with_another_annotation() {
+        let src = r#"
+            service Jobs {
+                @cron("5m")
+                @rate_limit("1/1m")
+                rpc sweep() -> Void { }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("combina")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn cron_annotation_rejects_parameters() {
+        let src = r#"
+            service Jobs {
+                @cron("5m")
+                rpc sweep(n: Int) -> Void { }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("parámetros")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn cron_annotation_rejects_a_non_void_return_type() {
+        let src = r#"
+            service Jobs {
+                @cron("5m")
+                rpc sweep() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("Void")), "mensaje inesperado: {err:?}");
     }
 
     #[test]

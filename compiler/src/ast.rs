@@ -521,6 +521,16 @@ impl RpcDecl {
         })
     }
 
+    /// El valor crudo de `@cron("5m")`, si hay (GRAMMAR.md §3.159) -- texto
+    /// sin parsear, mismo criterio que `cache()`. El checker ya garantizó
+    /// que si esto es `Some`, es la ÚNICA anotación del rpc.
+    pub fn cron(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::Cron(v) => Some(v.as_str()),
+            _ => None,
+        })
+    }
+
     /// Mismo heurístico "nombre por forma" en UN solo lugar -- lo usan
     /// `codegen::ts_emit::emit_hooks` (para decidir si un rpc genera un
     /// hook `use...Query`) Y `checker::check_invalidates_annotation` (para
@@ -640,6 +650,14 @@ pub enum Annotation {
     /// detrás de un allowlist, salvo un endpoint público (un widget, un
     /// sitemap) que necesita otro origen o `*`.
     Cors(String),
+    /// `@cron("5m")` (GRAMMAR.md §3.159) -- tarea recurrente nativa dentro
+    /// de `linkc serve`: el rpc corre solo, cada `Ns`/`Nm`/`Nh`/`Nd`
+    /// (mismo formato que `@cache`/`--session-ttl`), en su propio hilo,
+    /// nunca alcanzable vía HTTP. El checker exige que sea la ÚNICA
+    /// anotación del rpc (sin `@route`/`@authenticated`/`@rate_limit`/etc.
+    /// -- ninguna tiene sentido sobre algo que nunca recibe una request
+    /// real), sin parámetros, y retorno `Void`.
+    Cron(String),
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

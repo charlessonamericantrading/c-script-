@@ -180,6 +180,7 @@
   - [3.156 `Int64` como `bigint` real en `client.ts` — RESUELTO, cierra el límite que dejaba abierto §3.30](#3156-int64-como-bigint-real-en-clientts--resuelto-cierra-el-límite-que-dejaba-abierto-330)
   - [3.157 `.truncateToDay()`/`.truncateToMonth()`/`.truncateToYear()`: agregación agrupada por fecha — RESUELTO, cierra el límite que dejaba abierto §3.65](#3157-truncatetodaytruncatetomonthtruncatetoyear-agregación-agrupada-por-fecha--resuelto-cierra-el-límite-que-dejaba-abierto-365)
   - [3.158 `linkc serve`: un hilo por request — RESUELTO, Etapa 1 de un roadmap de concurrencia mayor](#3158-linkc-serve-un-hilo-por-request--resuelto-etapa-1-de-un-roadmap-de-concurrencia-mayor)
+  - [3.159 `@cron("Ns"/"Nm"/"Nh"/"Nd")`: tareas recurrentes nativas dentro de `linkc serve` — RESUELTO](#3159-cronnsnmnhnd-tareas-recurrentes-nativas-dentro-de-linkc-serve--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6149,6 +6150,41 @@ service Bench {
 Ver §3.16 para el detalle completo de los dos bugs y su fix.
 
 **Verificado**: 2 tests unitarios con hilos de sistema operativo reales de la primera ronda (`runtime/mod.rs`, 40 inserts concurrentes sin pérdida ni duplicado de id; 40 transacciones concurrentes sobre la misma fila dando exactamente 40) + 2 tests de compilación (`Db: Send + Sync`, `store.rs`; los tipos de conexión de `rusqlite`/`postgres` siguen siendo `Send`, invariante de la que depende toda esta arquitectura) + 2 tests MÁS de hilos reales de la segunda ronda (`subscribing_concurrently_with_a_real_insert_never_loses_the_new_row`, 300 vueltas con `std::sync::Barrier` forzando la carrera -- falla de forma reproducible con el orden viejo, confirmado revirtiendo el fix a mano antes de restaurarlo; `a_transaction_committing_concurrently_with_a_subscribe_on_the_same_collection_never_deadlocks`, 100 vueltas -- con la entrega adentro del candado de conexión el test literalmente SE CUELGA, confirmado matando a mano el proceso colgado tras 30s) + la suite completa (1215 tests, incluida integración contra Postgres real) sin ninguna regresión.
+
+### 3.159 `@cron("Ns"/"Nm"/"Nh"/"Nd")`: tareas recurrentes nativas dentro de `linkc serve` — RESUELTO
+
+**Origen**: PLAN.md §9.7 ítem 4, reprorizado el 24/08/2026 por evidencia fuerte de Glowapp (no usa c-script, pero es la señal de demanda) -- 10+ schedulers hand-rolled con `setInterval` (`appointmentReminderScheduler.ts`, `abandonedCartScheduler.ts`, `automationScheduler.ts`, `enrichmentScheduler.ts`, `goalsRecalculator.ts`, etc.), más un `schedulerSupervisor.ts` completo (registro de jobs, guard contra solapamiento, arranque escalonado, hasta un workaround para el límite de 32 bits de `setInterval` en intervalos largos). Atacado recién ahora porque necesitaba, sin saberlo hasta escribirlo, la infraestructura de hilos reales de §3.158 -- antes de esa ronda, correr una tarea de fondo real hubiera significado inventar concurrencia de un solo uso solo para esto.
+
+**Sintaxis: una anotación sobre un `rpc` normal, reusando la gramática de anotaciones que ya existe -- ninguna palabra reservada ni bloque de nivel superior nuevo.**
+
+<!-- linkc:fragment -->
+```rust
+service Jobs {
+  @cron("5m")
+  rpc sendReminders() -> Void {
+    let due = db.appointments.findWhere(|a: Appointment| { a.remindedAt == null })
+    // ... enviar recordatorios, marcar a.remindedAt = now() ...
+  }
+}
+```
+
+`"Ns"`/`"Nm"`/`"Nh"`/`"Nd"` -- mismo formato que `@cache`/`--session-ttl` (parser propio, `cron::parse_interval`, reimplementado a propósito en vez de compartir código con `cache::parse_ttl`: mismo criterio que el resto de estos parsers chicos del proyecto, ver el comentario de `cache.rs`). El servidor duerme el intervalo COMPLETO antes de la primera corrida (mismo criterio que `setInterval` de JS) -- así arrancar `serve`/`serve-all` con varias tareas no las dispara todas a la vez contra la base en el instante 0.
+
+**`@cron` tiene que ser la ÚNICA anotación del rpc -- a diferencia del resto, que se combinan libremente.** Ninguna otra (`@route`/`@authenticated`/`@requires`/`@rate_limit`/`@cache`/`@idempotent`/`@cors`/`@cache_control`/etc.) tiene ningún efecto sobre algo que nunca recibe una request HTTP real -- en vez de dejarlas ahí sin efecto (la clase de confusión silenciosa que este proyecto evita sistemáticamente, GRAMMAR.md §3.9), el checker las rechaza de entrada, nombrando la combinación. Rechazado también sobre un `stream` (una tarea programada no es una conexión SSE que alguien suscribe). Sin parámetros -- nada externo dispara una corrida, así que no hay de dónde sacar sus argumentos -- y retorno obligatoriamente `Void` -- no hay ningún caller que reciba una respuesta.
+
+**Nunca alcanzable vía HTTP, ni siquiera en su path por defecto.** El checker ya garantiza que `@cron` nunca coexiste con `@route`, pero eso solo bloquea una ruta amigable explícita -- el path `POST /{Service}/{rpc}` de siempre encuentra cualquier rpc por NOMBRE sin mirar sus anotaciones. `runtime::server::handle_request` chequea `is_cron_member` ANTES de cualquier otro procesamiento (antes de `@rate_limit`, antes del gate de auth) y devuelve 404 -- "no existe ese rpc", no 403: desde afuera, este endpoint genuinamente no existe. Tampoco aparece en ningún artefacto generado (`contract.d.ts`/`client.ts`/`hooks.ts`/`schemas.ts`/`openapi.json`/`llms.txt`/`llms-full.txt`) -- tanto la superficie generada como la superficie servida coinciden en que esto no es parte de la API pública.
+
+**Ejecución: un hilo del sistema operativo dedicado POR tarea, spawneado una sola vez al arrancar `serve()`** -- reusa exactamente la infraestructura de §3.158 (`Arc<Db>`/`Arc<Program>`/`Arc<SessionStore>` clonados baratos hacia el hilo), sin ningún mecanismo nuevo de scheduling. Un error del cuerpo (`panic`, una violación de `@check`/`@unique`, lo que sea) se loguea (ver abajo) y el loop SIGUE -- una corrida fallida nunca apaga la tarea entera ni el servidor. Bajo `serve-all` (§3.92), cada servicio con tareas `@cron` las corre de forma independiente, sin relación entre sí.
+
+**Observabilidad: una línea de log por corrida + dos contadores nuevos en `/metrics`.** `log_cron_tick` (mismo formato text/JSON que `log_done`, GRAMMAR.md §3.122, pero sin `req_id`/`status` HTTP -- una tarea programada no es una request) imprime `method`/`ok`/`duration_ms` en cada corrida; `ok=false` cuenta como `Error` para `--log-level`, mismo criterio que un 5xx. `linkc_cron_runs_total{method="..."}`/`linkc_cron_failures_total{method="..."}` (GRAMMAR.md §3.149) -- el segundo solo aparece para un rpc que de verdad tuvo al menos una falla, mismo criterio "nunca inventar un 0" que `linkc_rate_limit_rejections_total`.
+
+**Límites honestos, alcance de esta ronda:**
+- **Sin coordinación entre instancias.** Bajo N réplicas de `linkc serve` contra la misma base (detrás de un balanceador, GRAMMAR.md §3.92), CADA instancia corre su propia copia de la tarea de forma independiente -- una tarea pensada para correr "una vez cada 5 minutos" corre en realidad N veces cada 5 minutos, una por réplica. Mismo tipo de límite ya documentado para `@rate_limit` (GRAMMAR.md §3.39) y `IdempotencyStore`/`CacheStore` -- estado en memoria de UN proceso, sin coordinación distribuida. Resolverlo de verdad necesitaría un lock distribuido (una fila en la base con `SELECT ... FOR UPDATE`, o Redis) -- fuera de alcance sin evidencia real de demanda todavía; el cuerpo del rpc puede implementar su propia idempotencia si el caso real lo necesita (ej. un `@unique` que rechace un duplicado).
+- **Sin catch-up.** Si el proceso está caído cuando "debería" haber corrido una tarea, esa corrida simplemente no pasa -- nunca se recupera al reiniciar. Mismo criterio de "aceptado a propósito" que el resto del estado en memoria de este proyecto.
+- **Sin disparo manual ni introspección de "próxima corrida".** No hay forma de forzar una corrida fuera de horario ni de preguntarle al proceso cuándo va a correr de nuevo -- para eso, todavía hay que mirar los logs o `/metrics`.
+- **Sin límite de concurrencia entre corridas de la MISMA tarea.** Si una corrida tarda más que su propio intervalo (una tarea de `"10s"` cuyo cuerpo tarda 30s), la próxima arranca igual, sin esperar a que la anterior termine ni saltear la vuelta -- dos ejecuciones de la misma tarea pueden solaparse en el tiempo. El `schedulerSupervisor.ts` de Glowapp que motivó este ítem SÍ tenía guard contra esto -- no se replicó acá por falta de evidencia de que el caso real (una tarea más lenta que su propio intervalo) haya ocurrido de verdad; queda para una ronda dedicada si aparece.
+
+**Verificado**: 9 tests de checker (formato inválido, declarado dos veces, rechazado en un `stream`, rechaza combinar con `@rate_limit`, rechaza parámetros, rechaza retorno no-`Void`, camino feliz) + 2 tests unitarios de `cron::parse_interval` + 2 tests de integración contra un `linkc serve` REAL (subproceso real, `tests/server_http.rs`): una tarea `@cron("1s")` corre sola sin ningún request HTTP que la dispare (al menos 2 corridas confirmadas en 2.5s reales) y esa misma tarea da 404 al intentar invocarla por su path por defecto -- más 1 test de integración de `/metrics` (`tests/cli_metrics.rs`) confirmando el contador real de corridas y que el contador de fallas está ausente cuando ninguna corrida falló.
 
 ---
 

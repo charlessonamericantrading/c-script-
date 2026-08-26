@@ -339,6 +339,7 @@ fn render_service(s: &ServiceDecl) -> String {
                     | Some(Annotation::Idempotent)
                     | Some(Annotation::Cache(_))
                     | Some(Annotation::Cors(_))
+                    | Some(Annotation::Cron(_))
                     | None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
                 };
                 let rate_limit_badge = match r.rate_limit() {
@@ -358,7 +359,11 @@ fn render_service(s: &ServiceDecl) -> String {
                     Some(reason) => format!(r#"<span class="badge" style="background:#7a1f1f;">⚠️ deprecated: {reason}</span>"#),
                     None => String::new(),
                 };
-                let auth_badge = format!("{auth_badge}{content_type_badge}{route_badge}{rate_limit_badge}{deprecated_badge}");
+                let cron_badge = match r.cron() {
+                    Some(interval) => format!(r#"<span class="badge">⏰ @cron("{interval}") -- nunca alcanzable vía HTTP</span>"#),
+                    None => String::new(),
+                };
+                let auth_badge = format!("{auth_badge}{content_type_badge}{route_badge}{rate_limit_badge}{deprecated_badge}{cron_badge}");
 
                 let mut params_str = Vec::new();
                 let mut params_table = String::new();
