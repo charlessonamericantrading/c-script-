@@ -357,6 +357,7 @@ fn lint_secret_comparisons_in_expr(expr: &Spanned<Expr>, warnings: &mut Vec<Lint
             }
         }
         Expr::Closure { body, .. } => lint_secret_comparisons_in_block(body, warnings),
+        Expr::Transaction(block) => lint_secret_comparisons_in_block(block, warnings),
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Ident(_) => {}
     }
 }
@@ -448,6 +449,11 @@ fn expr_count_ident(expr: &Expr, target: &str) -> usize {
         Expr::TupleIndex { base, .. } => expr_count_ident(&base.node, target),
         Expr::StructLit { fields, .. } => fields.iter().map(|(_, v)| expr_count_ident(&v.node, target)).sum(),
         Expr::Closure { body, .. } => usize::from(block_uses_ident(body, target)),
+        // GRAMMAR.md §3.154: mismo motivo que el bloque de comentario de
+        // arriba -- sin este arm, `target` usado SOLO adentro de un
+        // `transaction { ... }` sería invisible para `unused-var`, mismo
+        // bug que el de issue #11 pero para esta forma nueva.
+        Expr::Transaction(block) => usize::from(block_uses_ident(block, target)),
         Expr::Match { scrutinee, arms } => {
             let mut c = expr_count_ident(&scrutinee.node, target);
             for arm in arms {

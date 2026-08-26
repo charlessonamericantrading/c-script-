@@ -1013,13 +1013,14 @@ impl Parser {
                     self.eat(&TokenKind::Semi)?;
                     stmts.push(Spanned { node: Stmt::Assign { name, value }, span });
                 }
-                // `if`/`match` son "block-like": terminan en '}', así que no
-                // deberían necesitar un ';' para seguir siendo una sentencia
-                // seguida de más código (`if cond { x = 1; } else { x = 2; }`
-                // sin ';' y con algo más abajo). Sin este caso, el `_` de
-                // abajo los trataría como el tail apenas ve que no hay ';',
-                // y rompería con cualquier código real después.
-                TokenKind::If | TokenKind::Match => {
+                // `if`/`match`/`transaction` son "block-like": terminan en
+                // '}', así que no deberían necesitar un ';' para seguir
+                // siendo una sentencia seguida de más código (`if cond { x
+                // = 1; } else { x = 2; }` sin ';' y con algo más abajo).
+                // Sin este caso, el `_` de abajo los trataría como el tail
+                // apenas ve que no hay ';', y rompería con cualquier código
+                // real después.
+                TokenKind::If | TokenKind::Match | TokenKind::Transaction => {
                     let e = self.parse_expr()?;
                     if self.check(&TokenKind::RBrace) {
                         tail = Some(Box::new(e));
@@ -1132,9 +1133,24 @@ impl Parser {
             self.parse_match_expr()
         } else if self.check(&TokenKind::If) {
             self.parse_if_expr()
+        } else if self.check(&TokenKind::Transaction) {
+            self.parse_transaction_expr()
         } else {
             self.parse_coalesce_expr(no_struct_lit)
         }
+    }
+
+    /// `transaction { ... }` (GRAMMAR.md §3.154) -- más simple que
+    /// `parse_if_expr`: sin condición, un solo `Block`, ninguna rama `else`
+    /// que resolver. No hay ambigüedad de struct-lit que evitar (a
+    /// diferencia de `if`/`match`, acá no hay ningún escrutinio/condición
+    /// antes de la llave de apertura).
+    fn parse_transaction_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
+        let start = self.span();
+        self.eat(&TokenKind::Transaction)?;
+        let block = self.parse_block()?;
+        let span = merge(start, self.prev_span());
+        Ok(Spanned { node: Expr::Transaction(block), span })
     }
 
     /// `a ?? b` (GRAMMAR.md §3.9) -- la precedencia más floja de todas (ata

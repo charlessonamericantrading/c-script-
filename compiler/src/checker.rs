@@ -527,6 +527,12 @@ pub struct Checker {
     /// que llamarlo desde un `stream` pasaba desapercibido en v0 -- un
     /// no-op silencioso que un desarrollador solo descubría en producción.
     in_stream_body: std::cell::Cell<bool>,
+    /// GRAMMAR.md §3.154: `true` mientras se chequea el CUERPO de un
+    /// `transaction { ... }` -- mismo mecanismo que `in_stream_body`, para
+    /// rechazar anidar una `transaction` dentro de otra en compilación
+    /// (una sola transacción SQL por vez; savepoints/anidamiento real
+    /// quedan fuera de v0).
+    in_transaction: std::cell::Cell<bool>,
 }
 
 impl Checker {
@@ -546,6 +552,7 @@ impl Checker {
             hover_target: None,
             hover_result: std::cell::RefCell::new(None),
             in_stream_body: std::cell::Cell::new(false),
+            in_transaction: std::cell::Cell::new(false),
         };
         let mut errors = Vec::new();
 
@@ -1209,7 +1216,7 @@ impl Checker {
             self.check_stmt(stmt, &Type::Void, &mut local).map_err(|ce| ce.with_span(stmt.span))?;
         }
         if let Some(tail) = &t.body.tail {
-            if matches!(tail.node, Expr::If { .. } | Expr::Match { .. }) {
+            if matches!(tail.node, Expr::If { .. } | Expr::Match { .. } | Expr::Transaction(_)) {
                 self.check_expr(tail, &Type::Void, &local)?;
             } else {
                 self.synth_expr(tail, &local)?;
@@ -1384,7 +1391,7 @@ impl Checker {
             // son de modo chequeo). Guard en vez de un binding-pattern con
             // or-pattern anidado: `Spanned<Expr>` no se puede matchear como
             // si fuera el enum `Expr` un nivel más abajo.
-            Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. }) => {
+            Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. } | Expr::Transaction(_)) => {
                 self.check_expr(e, &Type::Void, local)
             }
             Stmt::Expr(e) => self.synth_expr(e, local).map(|_| ()),
@@ -2319,7 +2326,7 @@ impl Checker {
                 self.check_expr(value, &binding.ty, local)
             }
             Stmt::Return(_) => unreachable!("descartado por block_has_return arriba"),
-            Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. }) => {
+            Stmt::Expr(e) if matches!(e.node, Expr::If { .. } | Expr::Match { .. } | Expr::Transaction(_)) => {
                 self.check_expr(e, &Type::Void, local)
             }
             Stmt::Expr(e) => self.synth_expr(e, local).map(|_| ()),
@@ -2380,6 +2387,31 @@ impl Checker {
                 self.check_expr(cond, &Type::Bool, env)?;
                 self.check_block(then_block, expected, env)?;
                 self.check_block(else_block, expected, env)
+            }
+            // GRAMMAR.md §3.154: mismo criterio de modo-chequeo que
+            // if/match, arriba. `return` alcanzable adentro se rechaza de
+            // entrada, mismo motivo/mensaje que `Stmt::While` (más abajo,
+            // check_stmt) -- reescribir el mecanismo de señalización de
+            // control de flujo para que "atraviese" un commit/rollback es
+            // un cambio mucho más grande que este ítem amerita. El
+            // anidamiento se rechaza con `in_transaction`: una sola
+            // transacción SQL real por vez, sin savepoints en v0.
+            Expr::Transaction(block) => {
+                if self.in_transaction.get() {
+                    return Err(err(
+                        "'transaction' no puede anidarse dentro de otra 'transaction' -- una sola transacción SQL por vez en v0 (GRAMMAR.md §3.154)",
+                    ));
+                }
+                if block_has_return(block) {
+                    return Err(err(
+                        "'return' no está permitido dentro del cuerpo de un 'transaction' en v0 (GRAMMAR.md §3.154) -- \
+                         usá una variable 'mut' declarada antes del bloque y un valor de cola después de él",
+                    ));
+                }
+                self.in_transaction.set(true);
+                let result = self.check_block(block, expected, env);
+                self.in_transaction.set(false);
+                result
             }
             Expr::StructLit { name, variant: Some(v), fields } if name == "Result" => {
                 self.check_result_lit(v, fields, expected, env)
@@ -3292,6 +3324,9 @@ impl Checker {
             )),
             Expr::If { .. } => Err(err(
                 "'if' en posición de síntesis no soportado — necesita un tipo esperado del contexto (GRAMMAR.md §3.7, misma familia que match)",
+            )),
+            Expr::Transaction { .. } => Err(err(
+                "'transaction' en posición de síntesis no soportado — necesita un tipo esperado del contexto (GRAMMAR.md §3.154, misma familia que if/match)",
             )),
             Expr::Binary { op, left, right } => self.synth_binary(*op, left, right, env),
             Expr::Unary { op, operand } => self.synth_unary(*op, operand, env),
@@ -7515,6 +7550,95 @@ type T = { id: Int, s: Status }")
     #[test]
     fn assigning_to_a_non_mut_variable_inside_a_while_body_is_rejected() {
         let result = check_source("fn f() -> Int { let total = 0; while true { total = 1; } total }");
+        assert!(result.is_err());
+    }
+
+    // ---- transacciones multi-escritura: `transaction { ... }` (GRAMMAR.md §3.154) ----
+
+    #[test]
+    fn transaction_with_db_writes_typechecks_against_the_rpc_return_type() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                rpc create(name: String) -> Item {
+                    transaction {
+                        db.items.insert(Item { id: 0, name: name })
+                    }
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn transaction_as_a_non_tail_statement_is_checked_against_void() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                rpc create(name: String) -> Int {
+                    transaction {
+                        db.items.insert(Item { id: 0, name: name });
+                    }
+                    db.items.count()
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn nesting_a_transaction_inside_another_is_rejected() {
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                rpc bad() -> Item {
+                    transaction {
+                        transaction {
+                            db.items.insert(Item { id: 0, name: "x" })
+                        }
+                    }
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "una 'transaction' anidada dentro de otra debería rechazarse");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("anidar"), "{msg}");
+    }
+
+    #[test]
+    fn return_inside_a_transaction_body_is_rejected() {
+        let result = check_source("fn f() -> Int { transaction { return 1; } }");
+        assert!(result.is_err(), "un 'return' dentro de una 'transaction' debería rechazarse en v0");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("'return'"), "{msg}");
+    }
+
+    #[test]
+    fn return_nested_inside_an_if_inside_a_transaction_body_is_also_rejected() {
+        let result = check_source("fn f(x: Int) -> Int { transaction { if x > 0 { return 1; } else { } 0 } }");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn transaction_in_synthesis_position_is_rejected() {
+        // Mismo motivo que if/match: sin un `expected` del contexto, no se
+        // puede sintetizar -- acá un `let` SIN anotación de tipo fuerza
+        // síntesis (`Stmt::Let { ty: None, .. }` -> `synth_expr`).
+        let src = r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                rpc bad() -> Item {
+                    let x = transaction { db.items.insert(Item { id: 0, name: "x" }) };
+                    x
+                }
+            }
+        "#;
+        let result = check_source(src);
         assert!(result.is_err());
     }
 

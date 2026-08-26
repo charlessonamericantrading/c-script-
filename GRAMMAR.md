@@ -175,6 +175,7 @@
   - [3.151 `db.vacuum()`/`db.tableStats()`: RPCs de administración — RESUELTO](#3151-dbvacuumdbtablestats-rpcs-de-administración--resuelto)
   - [3.152 Bloqueo de cuenta configurable — RESUELTO](#3152-bloqueo-de-cuenta-configurable--resuelto)
   - [3.153 `linkc serve-all --port-registry <archivo.json>`: puerto estable por nombre de servicio — RESUELTO](#3153-linkc-serve-all---port-registry-archivojson-puerto-estable-por-nombre-de-servicio--resuelto)
+  - [3.154 `transaction { ... }`: transacciones SQL multi-escritura — RESUELTO, alcance acotado](#3154-transaction--transacciones-sql-multi-escritura--resuelto-alcance-acotado)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -202,7 +203,7 @@ block_comment = "/*" , { ? cualquier carácter ? } , "*/" ;
 keyword      = "type" | "enum" | "service" | "rpc" | "stream" | "match"
              | "import" | "from" | "pub" | "const" | "fn" | "let" | "mut"
              | "return" | "if" | "else" | "while" | "true" | "false" | "null"
-             | "test" ;
+             | "test" | "transaction" ;
 ```
 
 **Reservado pero fuera del v0 de la gramática:** `async`, `await`, `trait`, `impl` — el modelo de concurrencia y de polimorfismo ad-hoc se diseña en una iteración posterior (ver PLAN.md §4, Fase 1). `for`, `in`, `break`, `continue` — v0 de loops (§3.15) es solo `while`; ninguno de estos cuatro es todavía una palabra reservada de verdad (no aparecen en `keyword_from_str`, `compiler/src/token.rs`), esto es prosa preparatoria, no una reserva real.
@@ -335,9 +336,11 @@ return_stmt  = "return" , [ expr ] , ";" ;
 expr_stmt    = expr , ";" ;
 while_stmt   = "while" , or_expr , block ;          (* nunca produce un valor -- ver §3.15 *)
 
-expr         = match_expr | if_expr | or_expr ;
+expr         = match_expr | if_expr | transaction_expr | or_expr ;
 
 if_expr      = "if" , or_expr , block , "else" , ( if_expr | block ) ;
+
+transaction_expr = "transaction" , block ;   (* §3.154 -- de modo chequeo nada más, igual que if_expr/match_expr *)
 
 (* Precedence climbing estándar, de menor a mayor precedencia. Cada nivel
    solo delega al siguiente si no encuentra su propio operador — así `&&`
@@ -5896,6 +5899,51 @@ linkc serve-all ./services --port-base 3000 --port-registry ./services/ports.jso
 **JSON inválido en el archivo falla limpio, antes de arrancar cualquier hilo** -- mismo criterio que un `.link` con error de tipos (§3.92): mejor no levantar nada que arriesgar una asignación de puerto silenciosamente distinta a la que el operador esperaba. Combina libremente con `--port-map-out` (pueden apuntar al mismo archivo o a dos distintos, sin conflicto -- uno lee-y-escribe, el otro solo escribe con el resultado final).
 
 **Verificado**: 4 tests de integración en `cli_port_registry.rs` contra el binario real, bindeando puertos de verdad: sin historial previo, la asignación es idéntica a la de siempre (secuencial desde `--port-base`); agregar un `.link` que alfabéticamente cae ANTES que uno ya registrado no mueve el puerto de ninguno de los dos ya asignados, el nuevo recibe el siguiente libre; borrar un `.link` y agregar uno distinto confirma que el nuevo NUNCA hereda el puerto liberado por el viejo (que sigue reservado en el archivo); un archivo de registro con JSON inválido falla limpio sin abrir ningún puerto.
+
+---
+
+### 3.154 `transaction { ... }`: transacciones SQL multi-escritura — RESUELTO, alcance acotado
+
+Pedido real de un adoptador en fase de discovery (vía otra sesión de Claude coordinando la migración -- IgnisLove, checkout/pedidos): "crear pedido + descontar stock + cerrar carrito, con rollback si falla algo" no tenía forma segura de expresarse en un `.link` -- cada `insert`/`applyPatch`/`delete`/`increment` es autocommit individual (GRAMMAR.md §3.17/§2.1), así que un fallo a mitad de una secuencia de escrituras relacionadas dejaba la base en un estado a medias, sin ningún mecanismo del lenguaje para deshacerlo. Era el ÚNICO bloqueo real (no de conveniencia) para migrar un flujo de checkout completo -- confirmado explícitamente en esa misma conversación: "es el único punto de vuestra lista que bloquea migración completa por diseño, no por falta de código".
+
+<!-- linkc:fragment -->
+```
+rpc checkout(productId: Int, qty: Int) -> Order {
+  transaction {
+    let matches = db.stock.findWhere(|s: Stock| { s.productId == productId });
+    if matches.length() == 0 {
+      panic("sin stock para ese producto");
+    } else {
+    }
+    let s = matches[0];
+    if s.quantity < qty {
+      panic("stock insuficiente");
+    } else {
+    }
+    db.stock.increment(s.id, |x: Stock| { x.quantity }, 0 - qty);
+    db.orders.insert(Order { id: 0, productId: productId, qty: qty })
+  }
+}
+```
+
+**`transaction { ... }` es una expresión de BLOQUE, misma familia que `if`/`match` (GRAMMAR.md §3.7): retorna el valor de la última sentencia, y es de modo CHEQUEO nada más -- no se puede sintetizar sin un tipo esperado del contexto (`let x = transaction { ... };` sin anotación es un error de compilación, mismo motivo que `if`/`match` ahí). `BEGIN` real arranca antes de evaluar el cuerpo; si el bloque termina de correr normal, `COMMIT`; si CUALQUIER `RuntimeError` se propaga desde adentro (un `panic`, una violación de `@check`/`@unique` en una de las escrituras, un error de tipo en runtime, lo que sea), `ROLLBACK` automático y el error se propaga tal cual (mismo `500`/`400` de siempre, según el tipo de error) -- el caller nunca ve un pedido a medias.
+
+**`panic(...)` es el mecanismo para abortar por una regla de negocio, no una novedad -- reusa exactamente lo que ya existía (§3.34).** No hay ningún `db.rollback()`/`abortTransaction()` nuevo: un chequeo con `panic` en el medio del bloque (guard clause, `if cond { panic(...); } else { }` como SENTENCIA, no como el tail -- ver el ejemplo arriba) hace exactamente lo que hace falta, sin agregar superficie de lenguaje nueva. `Result<T,E>`/`Result.Err{}` como tail del bloque NO dispara rollback -- se evaluó deliberadamente y se descartó: detectar "esto es un Result" tendría que ser estructural (por nombre de variante `"Err"`, ya que `Result<T,E>` no es un tipo especial del compilador, es una convención de enum declarado por el usuario, GRAMMAR.md §3.6) y ambiguo (¿cualquier enum con una variante `Err` cuenta?) -- `panic` es la señal inequívoca y ya establecida de "esto no debe seguir", sin inventar una regla nueva de detección.
+
+**Publicación a `stream` DIFERIDA hasta el `COMMIT` -- el punto no negociable de todo el diseño.** Cada `insert`/`applyPatch`/`delete`/`increment` normalmente anuncia la fila a cualquier `stream` suscripto (`Db::publish`, §3.16) EN EL MOMENTO en que corre -- adentro de una `transaction` sin cerrar, eso mentiría: un suscriptor vería una fila que la base todavía podría rollbackear. `Db::commit_transaction`/`rollback_transaction` (nuevo, `transaction_pending_publishes: RefCell<Option<Vec<...>>>`) encola cada publicación mientras la transacción sigue abierta, y recién las entrega -- en el mismo orden en que se generaron, por el mismo camino (`deliver_local`/`notify_remote`, incluida la propagación cross-instancia de §3.44) -- si el `COMMIT` sale bien; si sale `ROLLBACK` (o el `COMMIT` en sí falla, tratado como rollback a todo efecto), la cola se descarta entera, sin publicar nada.
+
+**No se puede anidar, y no admite `return` en su cuerpo (v0).** Las dos reglas se verifican en `checker.rs`, no en runtime: anidar una `transaction` dentro de otra es un error de compilación (`in_transaction`, mismo mecanismo `Cell<bool>` que `in_stream_body` ya usaba para el mismo tipo de restricción) -- una sola transacción SQL real por vez, sin savepoints en esta ronda. Un `return` alcanzable desde el cuerpo también se rechaza de entrada (`block_has_return`, mismo criterio y mismo mensaje que ya aplicaba a `while`, §3.15) -- reescribir el mecanismo de señalización de control de flujo para que "atraviese" un commit/rollback es un cambio bastante más grande que este ítem amerita; el patrón de guard-clause con `panic` (arriba) cubre el caso real sin necesitarlo.
+
+**Los dos backends comparten la MISMA implementación -- sin código nuevo por motor.** `Backend::execute_ddl("BEGIN"/"COMMIT"/"ROLLBACK")` ya existía (`conn.execute_batch` en SQLite, `client.batch_execute` vía `with_reconnect` en Postgres) -- ningún método nuevo en la capa de `store.rs`, la transacción sale de reusar exactamente lo que `linkc migrate`/las migraciones no destructivas ya usaban para DDL. Una conexión Postgres que se cae A MITAD de la transacción (`with_reconnect` la repara para la SIGUIENTE llamada, nunca reintenta la que falló, §3.40) se comporta de forma segura por construcción: Postgres aborta cualquier transacción en curso al perder la conexión, así que ni el `COMMIT` puede colarse por una conexión "nueva" que nunca vio el `BEGIN` -- el error se propaga como cualquier otro, con rollback best-effort (que puede fallar/no-op sin problema, la base ya descartó todo por su cuenta).
+
+**Límites honestos:**
+- **Sin savepoints ni anidamiento real.** Una transacción anidada necesitaría un mecanismo aparte (`SAVEPOINT`/`RELEASE`) -- rechazada de entrada en vez de fingir soportarla mal.
+- **Sin control fino de nivel de aislamiento.** Corre con el nivel default de cada motor (`READ COMMITTED` en Postgres) -- no hay forma de pedir `SERIALIZABLE`/`REPEATABLE READ` desde el `.link`.
+- **`return` no se puede usar adentro (ver arriba) -- `panic` para abortar, un valor de cola normal para terminar bien.**
+- **No hay forma de leer si la transacción actual sigue "viva" desde dentro de una función auxiliar** -- `db.transaction` no es un valor que se pueda pasar/inspeccionar, es puramente sintáctico.
+- **`matchFn`/predicados usados ADENTRO de una transacción no ganan ningún pushdown especial nuevo** -- `findWhere`/`countWhere`/`upsert` (§3.95/§3.108/§3.145/§3.75) siguen empujando a SQL exactamente igual que fuera de una transacción, ni mejor ni peor.
+
+**Verificado**: 6 tests de checker (tipa contra el retorno del rpc; en posición de sentencia se chequea contra `Void`; anidar una transacción dentro de otra se rechaza; `return` directo y anidado dentro de un `if` se rechazan; en posición de síntesis -- un `let` sin anotación -- se rechaza) + 3 de `runtime/mod.rs` contra SQLite real vía `invoke_rpc` (una transacción exitosa confirma CADA escritura, por conteo real de filas y valores; un `panic` a mitad de camino confirma que NINGUNA escritura sobrevive, ni el `increment` ni el `insert` posterior que nunca llegó a correr; la base sigue perfectamente utilizable después de un rollback, sin ningún estado atascado) + 2 tests de integración en `cli_transaction.rs` contra el binario real, con un `stream` conectado por un socket de verdad: un checkout que rollbackea NUNCA genera ningún evento SSE (confirmado con un timeout real, no solo "no lo vi"), mientras uno exitoso sí genera exactamente uno, después de confirmar; más el mismo commit/rollback confirmado por HTTP puro (status + valores). Más 1 test contra un Postgres REAL (`pg_integration.rs`) confirmando que `BEGIN`/`COMMIT`/`ROLLBACK` funcionan igual en ese backend, no solo en SQLite.
 
 ---
 

@@ -95,6 +95,7 @@ pub fn format_source(src: &str) -> Result<String, String> {
             TokenKind::Match => out.push_str("match"),
             TokenKind::Return => out.push_str("return"),
             TokenKind::Test => out.push_str("test"),
+            TokenKind::Transaction => out.push_str("transaction"),
             TokenKind::Import => out.push_str("import"),
             TokenKind::From => out.push_str("from"),
             TokenKind::Pub => out.push_str("pub"),

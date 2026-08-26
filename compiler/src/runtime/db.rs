@@ -662,6 +662,14 @@ pub struct Db {
     /// mismo lugar que un operador YA está mirando para latencia/conteo de
     /// requests -- no un canal de alertas nuevo.
     oversized_notify_drops: RefCell<HashMap<String, u64>>,
+    /// `None` = no hay ninguna `transaction { ... }` abierta ahora mismo
+    /// (comportamiento de siempre: `publish()` entrega de inmediato).
+    /// `Some(vec)` = hay una transacción abierta -- `publish()` encola acá
+    /// en vez de entregar, hasta que `commit_transaction`/
+    /// `rollback_transaction` la vacíen o la descarten (GRAMMAR.md §3.154).
+    /// `Option` en vez de un `bool` aparte + un `Vec` siempre vivo: un solo
+    /// campo no puede quedar desincronizado del otro por accidente.
+    transaction_pending_publishes: RefCell<Option<Vec<(String, serde_json::Value)>>>,
     /// Contexto de LA request HTTP que está invocando un rpc ahora mismo --
     /// body crudo + headers, para `request.rawBody()`/`request.header()`
     /// (GRAMMAR.md §3.38). `server.rs` lo fija justo antes de invocar el rpc
@@ -1021,6 +1029,7 @@ impl Db {
             subscribers: RefCell::new(HashMap::new()),
             pending_notify_retries: RefCell::new(std::collections::VecDeque::new()),
             oversized_notify_drops: RefCell::new(HashMap::new()),
+            transaction_pending_publishes: RefCell::new(None),
             current_request: RefCell::new(None),
             response_status_override: std::cell::Cell::new(None),
             response_location_override: RefCell::new(None),
@@ -1153,6 +1162,7 @@ impl Db {
                 subscribers: RefCell::new(HashMap::new()),
                 pending_notify_retries: RefCell::new(std::collections::VecDeque::new()),
                 oversized_notify_drops: RefCell::new(HashMap::new()),
+                transaction_pending_publishes: RefCell::new(None),
                 current_request: RefCell::new(None),
                 response_status_override: std::cell::Cell::new(None),
                 response_location_override: RefCell::new(None),
@@ -1642,12 +1652,70 @@ db { users: User[] }
     /// best-effort: si falla, esta instancia YA entregó local (arriba), así
     /// que no es pérdida de datos para nadie conectado acá -- solo una
     /// propagación cross-instancia que no llegó esta vez.
+    /// GRAMMAR.md §3.154: si esta escritura ocurre DENTRO de un
+    /// `transaction { ... }` todavía sin cerrar, la publicación se DIFIERE
+    /// (encolada en `transaction_pending_publishes`) en vez de entregarse
+    /// ahora mismo -- publicar una fila que la transacción después
+    /// rollbackea le mentiría a cualquier `stream` suscripto (le llegaría un
+    /// cambio que, a nivel de la base, nunca pasó de verdad). El commit
+    /// exitoso vacía la cola llamando exactamente este mismo camino
+    /// (`deliver_local`/`notify_remote`) para cada evento pendiente, en
+    /// orden; el rollback la descarta entera, sin publicar nada.
     fn publish(&self, collection: &str, row: &Value) {
         let json = value_to_json(row, &self.simple_enums);
+        if let Some(pending) = self.transaction_pending_publishes.borrow_mut().as_mut() {
+            pending.push((collection.to_string(), json));
+            return;
+        }
         self.deliver_local(collection, &json);
         if self.backend.is_postgres() {
             self.notify_remote(collection, &json);
         }
+    }
+
+    /// GRAMMAR.md §3.154: arranca la transacción SQL real detrás de un
+    /// `transaction { ... }` -- llamado UNA vez, antes de evaluar el cuerpo
+    /// del bloque. El checker ya garantizó que no hay otra transacción
+    /// abierta (rechaza el anidamiento en compilación, GRAMMAR.md §3.154),
+    /// así que `transaction_pending_publishes` siempre está en `None` acá;
+    /// de todos modos no se sobreescribe hasta confirmar que el `BEGIN`
+    /// salió bien, para no dejar la cola "abierta" si el `BEGIN` falla.
+    pub(crate) fn begin_transaction(&self) -> Result<(), String> {
+        self.backend.execute_ddl("BEGIN")?;
+        *self.transaction_pending_publishes.borrow_mut() = Some(Vec::new());
+        Ok(())
+    }
+
+    /// `COMMIT` real -- si sale bien, entrega cada publicación que quedó en
+    /// cola durante la transacción, en el mismo orden en que se generaron,
+    /// por el mismo camino (`deliver_local`/`notify_remote`) que `publish`
+    /// usa fuera de una transacción. Si el `COMMIT` en sí falla (raro, pero
+    /// posible -- ej. una constraint diferida), la cola se descarta SIN
+    /// entregar nada -- un `COMMIT` fallido es, a todo efecto, un rollback.
+    pub(crate) fn commit_transaction(&self) -> Result<(), String> {
+        self.backend.execute_ddl("COMMIT")?;
+        let pending = self.transaction_pending_publishes.borrow_mut().take().unwrap_or_default();
+        for (collection, json) in pending {
+            self.deliver_local(&collection, &json);
+            if self.backend.is_postgres() {
+                self.notify_remote(&collection, &json);
+            }
+        }
+        Ok(())
+    }
+
+    /// `ROLLBACK` best-effort -- si el `ROLLBACK` en sí falla (ej. la
+    /// conexión ya se cayó, en cuyo caso Postgres/SQLite ya abortaron la
+    /// transacción solos por su cuenta), no hay nada más que hacer del lado
+    /// de acá: se loguea y se sigue. La cola de publicaciones pendientes se
+    /// descarta SIEMPRE, haya salido bien el `ROLLBACK` o no -- ninguna de
+    /// esas filas quedó firme en la base, así que ningún `stream` debe
+    /// enterarse de ellas.
+    pub(crate) fn rollback_transaction(&self) {
+        if let Err(e) = self.backend.execute_ddl("ROLLBACK") {
+            eprintln!("aviso: 'ROLLBACK' de una transacción falló ({e}) -- probablemente la conexión ya se había cerrado, en cuyo caso la base ya descartó la transacción por su cuenta");
+        }
+        *self.transaction_pending_publishes.borrow_mut() = None;
     }
 
     /// Reinyecta LOCAL un cambio que anunció OTRA instancia (drenado del

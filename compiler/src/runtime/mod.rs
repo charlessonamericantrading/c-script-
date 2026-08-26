@@ -708,6 +708,30 @@ pub(crate) fn eval_expr(
                 other => Err(err(format!("la condición de 'if' no es Bool en runtime: {other:?}"))),
             }
         }
+        // GRAMMAR.md §3.154: `BEGIN` real antes de evaluar el cuerpo,
+        // `COMMIT` (con la publicación diferida de escrituras, ver
+        // `Db::commit_transaction`) si termina de correr normal,
+        // `ROLLBACK` si CUALQUIER `RuntimeError` se propaga desde adentro
+        // -- el checker ya garantizó que no hay ningún `return` alcanzable
+        // (block_has_return, checker.rs) ni ninguna otra `transaction`
+        // anidada, así que acá no hace falta ningún manejo especial más
+        // allá de propagar lo que `eval_block` devuelva.
+        Expr::Transaction(block) => {
+            db.begin_transaction().map_err(|e| err(format!("no se pudo iniciar la transacción: {e}")))?;
+            match eval_block(block, env, db, fns, checker, sessions, current_token, step_budget) {
+                Ok(value) => match db.commit_transaction() {
+                    Ok(()) => Ok(value),
+                    Err(e) => {
+                        db.rollback_transaction();
+                        Err(err(format!("no se pudo confirmar la transacción: {e}")))
+                    }
+                },
+                Err(e) => {
+                    db.rollback_transaction();
+                    Err(e)
+                }
+            }
+        }
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, checker, sessions, current_token, step_budget),
         Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, checker, sessions, current_token, step_budget),
         Expr::ArrayLit(items) => {
@@ -5340,6 +5364,87 @@ mod tests {
         let second = invoke_rpc(&program, "S", "bump", &json!({"name": "clics"}), &db).unwrap();
         assert_eq!(first["id"], second["id"], "misma fila, mismo id, aunque el predicado no sea pusheable");
         assert_eq!(second["count"], json!(2));
+    }
+
+    // ---- transacciones multi-escritura: `transaction { ... }` (GRAMMAR.md §3.154) ----
+
+    const TXN_PROGRAM: &str = r#"
+        type Order = { id: Int, productId: Int, qty: Int }
+        type Stock = { id: Int, productId: Int, quantity: Int }
+        db { orders: Order[], stock: Stock[] }
+        service Shop {
+            rpc seedStock(productId: Int, qty: Int) -> Stock {
+                db.stock.insert(Stock { id: 0, productId: productId, quantity: qty })
+            }
+            rpc checkout(productId: Int, qty: Int) -> Order {
+                transaction {
+                    let matches = db.stock.findWhere(|s: Stock| { s.productId == productId });
+                    if matches.length() == 0 {
+                        panic("sin stock para ese producto");
+                    } else {
+                    }
+                    let s = matches[0];
+                    if s.quantity < qty {
+                        panic("stock insuficiente");
+                    } else {
+                    }
+                    db.stock.increment(s.id, |x: Stock| { x.quantity }, 0 - qty);
+                    db.orders.insert(Order { id: 0, productId: productId, qty: qty })
+                }
+            }
+            rpc orderCount() -> Int { db.orders.count() }
+            rpc stockFor(productId: Int) -> Int {
+                let matches = db.stock.findWhere(|s: Stock| { s.productId == productId });
+                matches[0].quantity
+            }
+        }
+    "#;
+
+    #[test]
+    fn a_successful_transaction_commits_every_write_inside_it() {
+        let program = program_from(TXN_PROGRAM);
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(&program, "Shop", "seedStock", &json!({"productId": 1, "qty": 10}), &db).unwrap();
+        let order = invoke_rpc(&program, "Shop", "checkout", &json!({"productId": 1, "qty": 3}), &db).unwrap();
+        assert_eq!(order["qty"], json!(3), "{order:?}");
+        let stock = invoke_rpc(&program, "Shop", "stockFor", &json!({"productId": 1}), &db).unwrap();
+        assert_eq!(stock, json!(7), "el stock tiene que reflejar el descuento real");
+        let count = invoke_rpc(&program, "Shop", "orderCount", &json!({}), &db).unwrap();
+        assert_eq!(count, json!(1));
+    }
+
+    /// El caso real que motiva todo el ítem: un `panic` a MITAD del bloque
+    /// (después de que `increment` YA corrió, si el checkout llegara a
+    /// intentarlo) tiene que deshacer TODO lo que la transacción alcanzó a
+    /// escribir -- acá el panic dispara ANTES del `increment`/`insert`
+    /// (stock insuficiente), así que ninguno de los dos debe haber pasado.
+    #[test]
+    fn a_panic_inside_a_transaction_rolls_back_every_write_attempted_before_it() {
+        let program = program_from(TXN_PROGRAM);
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(&program, "Shop", "seedStock", &json!({"productId": 2, "qty": 5}), &db).unwrap();
+        let result = invoke_rpc(&program, "Shop", "checkout", &json!({"productId": 2, "qty": 999}), &db);
+        assert!(result.is_err(), "stock insuficiente debe fallar, no devolver un pedido a medias");
+        let stock = invoke_rpc(&program, "Shop", "stockFor", &json!({"productId": 2}), &db).unwrap();
+        assert_eq!(stock, json!(5), "el stock NO debe haberse tocado -- el panic rollbackea todo");
+        let count = invoke_rpc(&program, "Shop", "orderCount", &json!({}), &db).unwrap();
+        assert_eq!(count, json!(0), "ningún pedido debe haberse insertado");
+    }
+
+    /// Después de un rollback, la MISMA base sigue perfectamente utilizable
+    /// -- un checkout posterior con stock real tiene que funcionar normal,
+    /// sin ningún rastro del intento fallido anterior (mismo id de stock,
+    /// nada "atascado" en un estado de transacción a medio cerrar).
+    #[test]
+    fn the_database_stays_usable_normally_after_a_rolled_back_transaction() {
+        let program = program_from(TXN_PROGRAM);
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(&program, "Shop", "seedStock", &json!({"productId": 3, "qty": 4}), &db).unwrap();
+        assert!(invoke_rpc(&program, "Shop", "checkout", &json!({"productId": 3, "qty": 999}), &db).is_err());
+        let order = invoke_rpc(&program, "Shop", "checkout", &json!({"productId": 3, "qty": 1}), &db).unwrap();
+        assert_eq!(order["qty"], json!(1), "{order:?}");
+        let stock = invoke_rpc(&program, "Shop", "stockFor", &json!({"productId": 3}), &db).unwrap();
+        assert_eq!(stock, json!(3));
     }
 
     // ---- db.<c>.insertMany(items) (GRAMMAR.md §3.76) ----

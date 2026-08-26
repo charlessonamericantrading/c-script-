@@ -821,6 +821,18 @@ pub enum Expr {
         params: Vec<ClosureParam>,
         body: Block,
     },
+    /// `transaction { ... }` (GRAMMAR.md §3.154) -- una expresión de
+    /// bloque, misma forma que el cuerpo de un `if`/`match`: retorna el
+    /// valor de la última sentencia, de modo CHEQUEO nada más (no se puede
+    /// sintetizar sin contexto, mismo motivo que `Expr::If`/`Expr::Match`
+    /// en checker.rs). Envuelve TODAS las escrituras a `db` adentro en una
+    /// transacción SQL real -- `COMMIT` si el bloque termina de correr
+    /// normal, `ROLLBACK` si cualquier error de runtime se propaga desde
+    /// adentro (`panic`, una violación de `@check`/`@unique`, etc.). No se
+    /// puede anidar, y no admite `return` en su cuerpo (mismo límite que
+    /// `while`, GRAMMAR.md §3.15) -- las dos reglas se verifican en
+    /// checker.rs, no acá.
+    Transaction(Block),
 }
 
 /// `nombre` o `nombre: Tipo` dentro de `|...|`. Sin anotación solo es válido

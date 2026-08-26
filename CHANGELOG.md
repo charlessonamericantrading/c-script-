@@ -3,6 +3,30 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.108.0] - 2026-08-26
+
+### ✨ Nuevo
+- **`transaction { ... }`: transacciones SQL multi-escritura reales.** Pedido real de un adoptador en fase de discovery de migración (IgnisLove, coordinado vía otra sesión de Claude en su VPS de producción), confirmado como el ÚNICO bloqueo real -- no de conveniencia -- para migrar un flujo de checkout/pedidos completo: "crear pedido + descontar stock + cerrar carrito, con rollback si falla algo" no tenía forma segura de expresarse en un `.link`, porque cada escritura (`insert`/`applyPatch`/`delete`/`increment`) es autocommit individual.
+
+  ```
+  rpc checkout(productId: Int, qty: Int) -> Order {
+    transaction {
+      let matches = db.stock.findWhere(|s: Stock| { s.productId == productId });
+      if matches.length() == 0 { panic("sin stock para ese producto"); } else { }
+      let s = matches[0];
+      if s.quantity < qty { panic("stock insuficiente"); } else { }
+      db.stock.increment(s.id, |x: Stock| { x.quantity }, 0 - qty);
+      db.orders.insert(Order { id: 0, productId: productId, qty: qty })
+    }
+  }
+  ```
+
+  `transaction { ... }` es una expresión de bloque, misma familia que `if`/`match` -- `BEGIN` real antes del cuerpo, `COMMIT` si termina de correr normal, `ROLLBACK` automático si cualquier error de runtime se propaga desde adentro (`panic`, una violación de `@check`/`@unique`, lo que sea). `panic(...)` (ya existente) es el mecanismo para abortar por una regla de negocio -- sin ningún `db.rollback()` nuevo, sin superficie de lenguaje extra. La publicación a `stream` de cada escritura se DIFIERE hasta el `COMMIT` -- el punto no negociable del diseño: un rollback nunca le miente a un suscriptor en vivo sobre una fila que la base terminó descartando. Sin anidamiento ni `return` en el cuerpo (v0, mismo criterio que `while`) -- los dos se rechazan en compilación. Los dos backends (SQLite/Postgres) comparten la misma implementación, sin código nuevo por motor.
+
+  **`transaction` pasa a ser palabra reservada** (mismo criterio que `test`/`while`/`match`) -- sigue siendo válida como nombre de CAMPO (`type Log = { transaction: String }`), igual que otras palabras clave del lenguaje, pero ya no puede usarse como nombre de variable/función.
+
+1179 tests (12 nuevos): 6 de checker (tipa contra el retorno del rpc, se checkea contra `Void` en posición de sentencia, anidamiento rechazado, `return` directo y anidado rechazados, síntesis sin contexto rechazada), 3 de runtime contra SQLite real (commit completo verificado por conteo real de filas, rollback completo -- ninguna escritura sobrevive un `panic` a mitad de camino --, la base sigue perfectamente usable después de un rollback), 2 de integración en `cli_transaction.rs` contra el binario real con un `stream` conectado por un socket de verdad (un rollback NUNCA genera un evento SSE, un commit genera exactamente uno), y 1 test contra un Postgres REAL confirmando que `BEGIN`/`COMMIT`/`ROLLBACK` funcionan igual en ese backend. Detalle completo: GRAMMAR.md §3.154, PLAN.md §9.3/§8.2.3.
+
 ## [1.107.0] - 2026-08-26
 
 ### ✨ Nuevo

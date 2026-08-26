@@ -662,6 +662,65 @@ service Counters {{
     assert_ne!(other["id"], second["id"], "un name distinto sí inserta una fila nueva: {other:?}");
 }
 
+/// GRAMMAR.md §3.154: `transaction { ... }` -- `BEGIN`/`COMMIT`/`ROLLBACK`
+/// reales contra Postgres, no solo SQLite (backend distinto, mismo
+/// `execute_ddl` pero otra implementación por debajo -- `client.batch_execute`
+/// vía `with_reconnect`). Un `panic` a mitad del bloque tiene que deshacer
+/// TODO lo que la transacción alcanzó a escribir; una transacción exitosa
+/// tiene que confirmar de verdad.
+#[test]
+fn transaction_commits_and_rolls_back_for_real_against_postgres() {
+    const COLLECTION: &str = "stock_transaction_pushdown";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("transaction-pushdown");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Stock = {{ id: Int, productId: Int, quantity: Int }}
+db {{ {COLLECTION}: Stock[] }}
+service Shop {{
+  rpc seedStock(productId: Int, qty: Int) -> Stock {{
+    db.{COLLECTION}.insert(Stock {{ id: 0, productId: productId, quantity: qty }})
+  }}
+  rpc reserve(productId: Int, qty: Int) -> Stock {{
+    transaction {{
+      let matches = db.{COLLECTION}.findWhere(|s: Stock| {{ s.productId == productId }});
+      let s = matches[0];
+      if s.quantity < qty {{
+        panic("stock insuficiente");
+      }} else {{
+      }}
+      db.{COLLECTION}.increment(s.id, |x: Stock| {{ x.quantity }}, 0 - qty)
+    }}
+  }}
+  rpc stockFor(productId: Int) -> Int {{
+    let matches = db.{COLLECTION}.findWhere(|s: Stock| {{ s.productId == productId }});
+    matches[0].quantity
+  }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Shop/seedStock", r#"{"productId":1,"qty":10}"#);
+
+    let failed = server.try_rpc("Shop/reserve", r#"{"productId":1,"qty":999}"#);
+    assert!(failed.is_err(), "stock insuficiente debe fallar: {failed:?}");
+    let stock = server.rpc("Shop/stockFor", r#"{"productId":1}"#);
+    assert_eq!(stock, serde_json::json!(10), "el ROLLBACK real debe dejar el stock intacto: {stock:?}");
+
+    let reserved = server.rpc("Shop/reserve", r#"{"productId":1,"qty":4}"#);
+    assert_eq!(reserved["quantity"], serde_json::json!(6), "{reserved:?}");
+    let stock = server.rpc("Shop/stockFor", r#"{"productId":1}"#);
+    assert_eq!(stock, serde_json::json!(6), "el COMMIT real debe reflejarse: 10 - 4 = 6");
+}
+
 /// GRAMMAR.md §3.105: `db.<c>.increment` es un `UPDATE campo = campo +
 /// delta` atómico -- SIN ida y vuelta de lectura previa. La prueba real de
 /// que esto arregla el lost-update reportado (IgnisLove, varios procesos
