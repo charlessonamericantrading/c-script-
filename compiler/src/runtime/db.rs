@@ -10,7 +10,7 @@
 // de la misma fuente de verdad, cero duplicación manual).
 
 use super::{as_int, json_to_typed_value, simple_enum_names, value_to_json, RuntimeError, Value};
-use crate::ast::{BinaryOp, FieldCheck, Item, Program, TypeExpr};
+use crate::ast::{BinaryOp, FieldCheck, Item, Program, TypeAnnotation, TypeExpr};
 use crate::checker::Checker;
 use crate::types::{FieldType, Type};
 use super::store::{Backend, Cell, ColumnKind};
@@ -223,6 +223,45 @@ pub(crate) fn create_index_statements(collection: &str, indexed: &[(String, bool
         .map(|(field, unique)| {
             let unique_kw = if *unique { "UNIQUE " } else { "" };
             format!("CREATE {unique_kw}INDEX IF NOT EXISTS \"idx_{collection}_{field}\" ON \"{collection}\"(\"{field}\")")
+        })
+        .collect()
+}
+
+/// Nombre de colección -> lista de conjuntos de campos con `@unique(...)`
+/// COMPUESTO de su tipo de elemento (GRAMMAR.md §3.155) -- mismo cruce
+/// `checker.db_collections()` + `program.items` que `index_fields_by_collection`
+/// arriba, mismo motivo (la anotación vive en `ast::TypeDecl`, no en el
+/// `Type` ya resuelto).
+pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<Vec<String>>> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let sets: Vec<Vec<String>> =
+                t.annotations.iter().map(|TypeAnnotation::Unique(fields)| fields.clone()).collect();
+            if !sets.is_empty() {
+                result.insert(coll_name.clone(), sets);
+            }
+        }
+    }
+    result
+}
+
+/// `CREATE UNIQUE INDEX IF NOT EXISTS ...` de VARIAS columnas a la vez, uno
+/// por cada `@unique(...)` de nivel `type` (GRAMMAR.md §3.155) -- mismo
+/// criterio de idempotencia y nombre determinístico que `create_index_statements`
+/// (arriba), con el nombre de TODOS los campos concatenados para que dos
+/// constraints compuestos sobre la misma tabla nunca colisionen de nombre.
+pub(crate) fn create_composite_unique_statements(collection: &str, sets: &[Vec<String>]) -> Vec<String> {
+    sets.iter()
+        .map(|fields| {
+            let idx_name = format!("idx_{collection}_{}", fields.join("_"));
+            let cols = fields.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
+            format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{collection}\"({cols})")
         })
         .collect()
 }
@@ -1018,6 +1057,13 @@ impl Db {
                         .unwrap_or_else(|e| panic!("no se pudo crear un índice sobre '{name}' en '{db_path_display}': {e}"));
                 }
             }
+            for (name, sets) in composite_unique_by_collection(program, &checker) {
+                for stmt in create_composite_unique_statements(&name, &sets) {
+                    connection.execute(&stmt, []).unwrap_or_else(|e| {
+                        panic!("no se pudo crear un constraint UNIQUE compuesto sobre '{name}' en '{db_path_display}': {e}")
+                    });
+                }
+            }
         }
         let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
 
@@ -1145,6 +1191,13 @@ impl Db {
             for (name, indexed) in index_fields_by_collection(program, &checker) {
                 for stmt in create_index_statements(&name, &indexed) {
                     backend.execute_ddl(&stmt).map_err(|e| format!("no se pudo crear un índice sobre '{name}': {e}"))?;
+                }
+            }
+            for (name, sets) in composite_unique_by_collection(program, &checker) {
+                for stmt in create_composite_unique_statements(&name, &sets) {
+                    backend
+                        .execute_ddl(&stmt)
+                        .map_err(|e| format!("no se pudo crear un constraint UNIQUE compuesto sobre '{name}': {e}"))?;
                 }
             }
         }

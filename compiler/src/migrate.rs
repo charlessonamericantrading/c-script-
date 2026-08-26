@@ -18,7 +18,10 @@
 use crate::ast::Program;
 use crate::checker::Checker;
 use crate::codegen::postgres_emit::{alter_table_add_column_postgres, create_postgres_table_sql};
-use crate::runtime::db::{check_fields_by_collection, connect_postgres_client, create_index_statements, index_fields_by_collection, validate_existing_id_column};
+use crate::runtime::db::{
+    check_fields_by_collection, composite_unique_by_collection, connect_postgres_client, create_composite_unique_statements,
+    create_index_statements, index_fields_by_collection, validate_existing_id_column,
+};
 use crate::runtime::store::{Backend, Cell, ColumnKind};
 use crate::types::{FieldType, Type};
 use std::cell::RefCell;
@@ -45,6 +48,7 @@ pub fn dry_run_postgres(program: &Program, url: &str) -> Result<String, String> 
     let backend = Backend::Postgres { client: RefCell::new(client), url: url.to_string() };
     let checks_by_collection = check_fields_by_collection(program, &checker);
     let indexed_by_collection = index_fields_by_collection(program, &checker);
+    let composite_unique_by_collection_map = composite_unique_by_collection(program, &checker);
 
     let mut out = String::new();
     out.push_str("-- 'linkc migrate --dry-run': DDL que 'linkc serve'/'linkc serve-all' ejecutaría\n");
@@ -95,6 +99,14 @@ pub fn dry_run_postgres(program: &Program, url: &str) -> Result<String, String> 
 
         if let Some(indexed) = indexed_by_collection.get(coll_name) {
             for stmt in create_index_statements(coll_name, indexed) {
+                out.push_str(&stmt);
+                out.push_str(";\n");
+            }
+            out.push('\n');
+        }
+
+        if let Some(sets) = composite_unique_by_collection_map.get(coll_name) {
+            for stmt in create_composite_unique_statements(coll_name, sets) {
                 out.push_str(&stmt);
                 out.push_str(";\n");
             }

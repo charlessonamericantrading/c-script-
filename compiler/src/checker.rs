@@ -872,21 +872,29 @@ impl Checker {
                 // validación "motivo no vacío" de `@deprecated`, que es
                 // puramente sintáctica.
                 Item::Type(t) => {
+                    // `check_type_annotations` corre SIEMPRE (incluso si
+                    // `t.ty` no es un struct -- ahí mismo es donde rechaza
+                    // '@unique' sobre un alias/unión), a diferencia del
+                    // resto de los `check_field_*` de abajo, que solo tienen
+                    // sentido sobre la forma struct.
+                    let mut item_errors: Vec<CheckError> = checker.check_type_annotations(t);
                     if let TypeExpr::Struct(fields) = &t.ty {
-                        for e in checker
-                            .check_field_validators(fields, &t.type_params)
-                            .into_iter()
-                            .chain(checker.check_field_defaults(fields, &t.type_params))
-                            .chain(checker.check_field_auto_update(fields, &t.type_params))
-                            .chain(checker.check_field_soft_delete(fields, &t.type_params))
-                            .chain(checker.check_field_checks(fields, &t.type_params))
-                        {
-                            let mut e = e;
-                            if let Some(file) = file_for(index) {
-                                e = e.with_file(file);
-                            }
-                            errors.push(e);
+                        item_errors.extend(
+                            checker
+                                .check_field_validators(fields, &t.type_params)
+                                .into_iter()
+                                .chain(checker.check_field_defaults(fields, &t.type_params))
+                                .chain(checker.check_field_auto_update(fields, &t.type_params))
+                                .chain(checker.check_field_soft_delete(fields, &t.type_params))
+                                .chain(checker.check_field_checks(fields, &t.type_params)),
+                        );
+                    }
+                    for e in item_errors {
+                        let mut e = e;
+                        if let Some(file) = file_for(index) {
+                            e = e.with_file(file);
                         }
+                        errors.push(e);
                     }
                 }
                 Item::Enum(en) => {
@@ -2178,6 +2186,61 @@ impl Checker {
                     );
                 }
                 _ => {}
+            }
+        }
+        errors
+    }
+
+    /// `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155)
+    /// -- constraint compuesto, complementa al `@unique` de un solo campo
+    /// ya existente (`FieldAnnotation::Index`, §3.80). Vive en un método
+    /// aparte de `check_field_checks` (arriba) porque opera sobre el
+    /// `TypeDecl` entero, no field por field -- necesita la lista COMPLETA
+    /// de nombres declarados para validar que cada uno exista.
+    fn check_type_annotations(&self, t: &TypeDecl) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        if t.annotations.is_empty() {
+            return errors;
+        }
+        let TypeExpr::Struct(fields) = &t.ty else {
+            errors.push(err(format!(
+                "'{}': '@unique(...)' solo aplica sobre un `type` con forma de struct (`{{ campo: Tipo, ... }}`), no sobre un alias/unión",
+                t.name
+            )));
+            return errors;
+        };
+        let field_names: std::collections::HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        let mut seen_sets: Vec<std::collections::BTreeSet<String>> = Vec::new();
+        for ann in &t.annotations {
+            let TypeAnnotation::Unique(names) = ann;
+            if names.len() < 2 {
+                errors.push(err(format!(
+                    "'{}': '@unique(...)' a nivel de type necesita al menos 2 campos -- para uno solo, poné '@unique' directamente sobre ESE campo (GRAMMAR.md §3.80)",
+                    t.name
+                )));
+                continue;
+            }
+            let set: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+            if set.len() != names.len() {
+                errors.push(err(format!("'{}': '@unique({})' repite el mismo campo más de una vez", t.name, names.join(", "))));
+                continue;
+            }
+            for name in names {
+                if !field_names.contains(name.as_str()) {
+                    errors.push(err(format!(
+                        "'{}': '@unique(...)' nombra '{name}', que no es un campo declarado de este type",
+                        t.name
+                    )));
+                }
+            }
+            if seen_sets.contains(&set) {
+                errors.push(err(format!(
+                    "'{}': '@unique({})' ya está declarado -- dos '@unique' con exactamente el mismo conjunto de campos son redundantes",
+                    t.name,
+                    names.join(", ")
+                )));
+            } else {
+                seen_sets.push(set);
             }
         }
         errors
@@ -8626,5 +8689,85 @@ type T = { id: Int, s: Status }")
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         let err = parse(tokens).expect_err("'@index' + '@unique' en el mismo campo debe rechazarse");
         assert!(format!("{err:?}").contains("repetido"), "{err:?}");
+    }
+
+    // ---- `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155) ----
+
+    #[test]
+    fn composite_unique_with_real_fields_typechecks() {
+        let src = r#"
+            @unique(profileId, slug)
+            type Product = { id: Int, profileId: Int, slug: String }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn composite_unique_naming_more_than_two_fields_typechecks() {
+        let src = r#"
+            @unique(a, b, c)
+            type T = { id: Int, a: Int, b: Int, c: Int }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn composite_unique_naming_an_unknown_field_is_rejected() {
+        let src = r#"
+            @unique(profileId, doesNotExist)
+            type Product = { id: Int, profileId: Int, slug: String }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("doesNotExist"), "{msg}");
+    }
+
+    #[test]
+    fn composite_unique_with_fewer_than_two_fields_is_rejected() {
+        let src = r#"
+            @unique(profileId)
+            type Product = { id: Int, profileId: Int }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "un solo campo en '@unique(...)' a nivel de type debe rechazarse -- usá '@unique' de campo");
+    }
+
+    #[test]
+    fn composite_unique_repeating_the_same_field_twice_is_rejected() {
+        let src = r#"
+            @unique(profileId, profileId)
+            type Product = { id: Int, profileId: Int }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn composite_unique_on_a_non_struct_type_is_rejected() {
+        let src = "@unique(a, b) type NotAStruct = Int[];";
+        let result = check_source(src);
+        assert!(result.is_err(), "'@unique(...)' sobre un alias que no es struct debe rechazarse");
+    }
+
+    #[test]
+    fn declaring_the_exact_same_composite_unique_twice_is_rejected() {
+        let src = r#"
+            @unique(a, b)
+            @unique(b, a)
+            type T = { id: Int, a: Int, b: Int }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "el MISMO conjunto de campos (sin importar el orden) declarado dos veces debe rechazarse por redundante");
+    }
+
+    #[test]
+    fn two_composite_uniques_with_different_field_sets_both_typecheck() {
+        let src = r#"
+            @unique(a, b)
+            @unique(a, c)
+            type T = { id: Int, a: Int, b: Int, c: Int }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 }

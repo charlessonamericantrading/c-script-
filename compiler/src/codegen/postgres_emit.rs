@@ -138,6 +138,24 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
         }
     }
 
+    // `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155)
+    // -- mismo criterio que el bloque de arriba (duplicado acá por el mismo
+    // motivo: DDL estático, sin `Db` real).
+    for (coll_name, elem_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = elem_ty else { continue };
+        for item in &program.items {
+            let crate::ast::Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            for crate::ast::TypeAnnotation::Unique(fields) in &t.annotations {
+                let idx_name = format!("idx_{coll_name}_{}", fields.join("_"));
+                let cols = fields.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
+                statements.push(format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{coll_name}\"({cols});"));
+            }
+        }
+    }
+
     Ok(statements.join("\n\n"))
 }
 
@@ -317,6 +335,26 @@ mod tests {
             "{ddl}"
         );
         assert!(!ddl.contains("idx_users_name"), "'name' no lleva anotación, no debería generar índice: {ddl}");
+    }
+
+    /// `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155)
+    /// -- misma idea que el test de arriba, para el DDL estático del
+    /// constraint COMPUESTO.
+    #[test]
+    fn composite_unique_annotation_emits_a_multi_column_create_unique_index() {
+        let code = r#"
+        @unique(profileId, slug)
+        type Product = { id: Int, profileId: Int, slug: String, name: String }
+        db { products: Product[] }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let ddl = generate_postgres_ddl(&program).unwrap();
+
+        assert!(
+            ddl.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_products_profileId_slug\" ON \"products\"(\"profileId\", \"slug\");"),
+            "{ddl}"
+        );
     }
 
     #[test]

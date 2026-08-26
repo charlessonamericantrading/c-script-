@@ -241,9 +241,23 @@ impl Parser {
     }
 
     fn parse_item(&mut self) -> Result<Item, ParseError> {
+        // `@unique(campo1, campo2, ...)` (GRAMMAR.md §3.155) -- la ÚNICA
+        // anotación de nivel superior hoy, y solo válida antes de `type`.
+        // Capturado ANTES de la anotación (mismo motivo que `parse_member`
+        // con `rpc`/`stream`): el span del ítem entero tiene que incluirla.
+        if self.check(&TokenKind::At) {
+            let start = self.span();
+            let annotations = self.parse_type_annotations()?;
+            if !self.check(&TokenKind::Type) {
+                return Err(self.error(
+                    "una '@anotación' de nivel superior solo es válida antes de 'type' (ej. '@unique(campo1, campo2)')",
+                ));
+            }
+            return Ok(Item::Type(self.parse_type_decl(start, annotations)?));
+        }
         match self.peek().clone() {
             TokenKind::Import => Ok(Item::Import(self.parse_import_decl()?)),
-            TokenKind::Type => Ok(Item::Type(self.parse_type_decl()?)),
+            TokenKind::Type => Ok(Item::Type(self.parse_type_decl(self.span(), Vec::new())?)),
             TokenKind::Enum => Ok(Item::Enum(self.parse_enum_decl()?)),
             TokenKind::Service => Ok(Item::Service(self.parse_service_decl()?)),
             TokenKind::Const => Ok(Item::Const(self.parse_const_decl()?)),
@@ -313,8 +327,7 @@ impl Parser {
 
     /// El `;` final es opcional (ver nota en GRAMMAR.md §2.1): `type X = {...}`
     /// ya termina en `}`, exigir además `;` es la incomodidad que Rust/Go evitan.
-    fn parse_type_decl(&mut self) -> Result<TypeDecl, ParseError> {
-        let start = self.span();
+    fn parse_type_decl(&mut self, start: Span, annotations: Vec<TypeAnnotation>) -> Result<TypeDecl, ParseError> {
         self.eat(&TokenKind::Type)?;
         let name = self.eat_ident()?;
         let type_params = self.parse_type_params()?;
@@ -324,7 +337,38 @@ impl Parser {
         if self.check(&TokenKind::Semi) {
             self.advance();
         }
-        Ok(TypeDecl { name, type_params, ty, span })
+        Ok(TypeDecl { name, type_params, ty, annotations, span })
+    }
+
+    /// `@unique(campo1, campo2, ...)` antes de `type` (GRAMMAR.md §3.155) --
+    /// mismo loop de coma que `@invalidates` (`parse_optional_annotation`),
+    /// pero en un punto de entrada APARTE porque vive antes de un ítem de
+    /// nivel superior, no antes de `rpc`/`stream` dentro de un `service`.
+    fn parse_type_annotations(&mut self) -> Result<Vec<TypeAnnotation>, ParseError> {
+        let mut annotations = Vec::new();
+        while self.check(&TokenKind::At) {
+            self.advance();
+            let name = self.eat_ident()?;
+            let annotation = match name.as_str() {
+                "unique" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let mut fields = vec![self.eat_ident()?];
+                    while self.check(&TokenKind::Comma) {
+                        self.advance();
+                        fields.push(self.eat_ident()?);
+                    }
+                    self.eat(&TokenKind::RParen)?;
+                    TypeAnnotation::Unique(fields)
+                }
+                other => {
+                    return Err(self.error(format!(
+                        "'@{other}' no es una anotación válida antes de 'type' -- la única disponible hoy es '@unique(campo1, campo2, ...)'"
+                    )))
+                }
+            };
+            annotations.push(annotation);
+        }
+        Ok(annotations)
     }
 
     fn parse_enum_decl(&mut self) -> Result<EnumDecl, ParseError> {

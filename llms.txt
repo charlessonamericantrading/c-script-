@@ -58,6 +58,7 @@ Works, verified by running it:
 - `deleteWhere` now pushes a pusheable predicate's SELECTION down to real SQL (same `find_where_conjunction` as `findWhere`/`countWhere`) instead of loading the whole collection into memory — the delete itself stays row-by-row so each deleted row still publishes to a `stream`. See GRAMMAR.md §3.145.
 - `db.<c>.upsert(matchFn, insertValue, updateFn)`'s `matchFn` now pushes to SQL too (26/08/2026) when it has the same recognized shape (`|x| x.field == value`, or a `&&` conjunction of such leaves) — a collection growing from hundreds to tens of thousands of rows no longer makes an upsert that used to be instant start taking seconds. Any other shape (`||`, comparing two fields to each other) still works exactly as before via the interpreted fallback, no behavior change. See GRAMMAR.md §3.75.
 - `transaction { ... }` (26/08/2026, new reserved keyword — still usable as a field name, e.g. `type Log = { transaction: String }`): real multi-write SQL transactions, same block-expression family as `if`/`match` — real `BEGIN` before the body, `COMMIT` if it runs to completion, automatic `ROLLBACK` if any runtime error propagates from inside (`panic`, a `@check`/`@unique` violation, anything). `panic(...)` (already existing) is the abort-on-business-rule mechanism, no new `db.rollback()` builtin. Every `stream` publish for a write inside the block is DEFERRED until `COMMIT` succeeds — a rollback never lies to a live subscriber about a row the database ended up discarding. No nesting, no `return` inside the body (v0, same rule as `while`) — both rejected at compile time. Both backends (SQLite/Postgres) share the same implementation. See GRAMMAR.md §3.154.
+- `@unique(field1, field2, ...)` before `type` (26/08/2026): a composite UNIQUE constraint across several fields at once — e.g. a slug unique per profile, not globally — complementing (not replacing) field-level `@unique`. Same DDL idempotency/naming as the field-level form, emitted by both the real runtime and `linkc build`/`linkc migrate --dry-run`. See rule 20 below and GRAMMAR.md §3.155. Bug fixed in the same round: a `@unique`/`@check` violation against real Postgres was returning 500, not the documented 400 — `postgres::Error::to_string()` for a server-side error is the fixed literal `"db error"`, so the existing message-substring check never matched anything real against that backend. Fixed by classifying on SQLSTATE (`23505`/`23514`, never localized) instead of the human message (which IS localized per the server's `lc_messages` — confirmed with a Spanish-locale test Postgres). See GRAMMAR.md §3.155.
 - `@check(minLength, N)` / `@check(maxLength, N)` on a `String` field: enforced both in the app (`chars().count()`, Unicode-aware) and as a real `CHECK (length(...) >= N)` constraint on both SQLite and Postgres. `@check(minLength, 1)` is the idiom for "not empty". See GRAMMAR.md §3.146.
 - `@cors("https://a.com, https://b.com")` / `@cors("*")` on an rpc or `stream`: replaces the global `--cors-origin` allowlist for that ONE endpoint — applies to both the real response and the `OPTIONS` preflight. See GRAMMAR.md §3.147.
 - Structured authorization audit log: any request that passed through `@authenticated`/`@requires` now logs `auth_role`/`auth_user_id`/`auth_allowed` as top-level fields (JSON mode) or `key=value` pairs (text mode) in the existing per-request log line. A public rpc logs none of the three. See GRAMMAR.md §3.148.
@@ -252,18 +253,20 @@ difference between code that compiles and code that does not.
     single-row `find(id)` never does. No `includeDeleted` escape hatch on the filtered methods
     either — direct `find(id)` is the only way to see a soft-deleted row today. See GRAMMAR.md
     §3.78.
-18. **`@index`/`@unique` are single-FIELD only — no composite (multi-field) index/constraint
-    yet, and neither annotation requires a particular field type** (unlike `@autoUpdate`/
-    `@softDelete`, which are restricted to `Timestamp`/`Timestamp?`). At most one of the two per
-    field. The index is created for real at startup in BOTH backends —
-    `CREATE [UNIQUE] INDEX IF NOT EXISTS "idx_<table>_<field>" ...`, idempotent, same
-    deterministic name every restart — and `linkc build` emits the identical statement in the
+18. **`@index`/`@unique` (field-level) are single-FIELD only, and neither annotation requires a
+    particular field type** (unlike `@autoUpdate`/`@softDelete`, which are restricted to
+    `Timestamp`/`Timestamp?`). At most one of the two per field. For a composite (multi-field)
+    UNIQUE constraint, use `@unique(field1, field2, ...)` on the `type` itself instead (26/08/2026,
+    rule 20 below) — a completely separate annotation (`type`-level, at least 2 fields), not an
+    extension of this field-level one. The field-level index is created for real at startup in
+    BOTH backends — `CREATE [UNIQUE] INDEX IF NOT EXISTS "idx_<table>_<field>" ...`, idempotent,
+    same deterministic name every restart — and `linkc build` emits the identical statement in the
     static Postgres DDL. A `@unique` violation on `insert`/`applyPatch` (and `upsert`'s update
-    path) comes back as a 400, matched against the literal message SQLite
-    (`UNIQUE constraint failed`) and Postgres (`duplicate key value violates unique
-    constraint`) return for that specific case — any other SQL failure is still a plain 500.
-    `--adopt-existing` never runs this DDL, same rule as the rest of the schema in adopt mode.
-    See GRAMMAR.md §3.80.
+    path) comes back as a 400 — classified by SQLSTATE against Postgres (`23505`, locale-
+    independent — the earlier substring-match on the English message string was a real bug,
+    fixed 26/08/2026, see rule 20) and by the literal message against SQLite (`UNIQUE constraint
+    failed`, never localized there). Any other SQL failure is still a plain 500. `--adopt-existing`
+    never runs this DDL, same rule as the rest of the schema in adopt mode. See GRAMMAR.md §3.80.
 19. **`panic(...)` types as `Void`, not a bottom/never type — a guard clause that calls it needs
     an explicit empty `else {}`, and has to be a STATEMENT, not the tail.** `if cond { panic(...); }`
     with nothing after it (used as the block's tail) is a compile error whenever the expected
@@ -274,6 +277,14 @@ difference between code that compiles and code that does not.
     types as `Void`) — never as the last thing in the block. For an EXPECTED, recoverable
     failure (as opposed to "this should never happen"), `Result<T,E>`/`Result.Err{}` is almost
     always the better fit than `panic` — see GRAMMAR.md §3.5.
+20. **`@unique(field1, field2, ...)` before `type` is a composite constraint — a different
+    annotation from field-level `@unique`, not the same one with a list.** `@unique(a, b)` needs
+    at least 2 fields (a single one is a compile error — use field-level `@unique` for that), each
+    naming a real field of the struct; the `type` has to actually be a struct (not an alias like
+    `type Ids = Int[]`); and two `@unique(...)` on the same `type` can't declare the exact same
+    field set (order doesn't matter — `@unique(a, b)` and `@unique(b, a)` count as the same
+    declaration). Multiple `@unique(...)` with DIFFERENT field sets on the same `type` are fine,
+    each gets its own index. See GRAMMAR.md §3.155.
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `page(limit: Int, offset: Int) -> T[]` (LIMIT/OFFSET pushed to real SQL, not `all().take(n)`
@@ -309,7 +320,7 @@ linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json
 linkc serve-all ./services --port-base 3000 --port-registry ./services/ports.json  # same shape, but read back first -- a name keeps its port forever
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
 linkc serve-all ./services --port-base 3000 --service-api-key s3cr3t --service-api-key-exempt webhooks  # every service but "webhooks" requires the header
-linkc --version                      # linkc 1.108.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.109.0 -- same version stamped in every generated file
 ```
 
 ## Verified example

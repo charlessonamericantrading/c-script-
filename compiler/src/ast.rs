@@ -93,13 +93,38 @@ pub struct TypeDecl {
     pub name: String,
     pub type_params: Vec<String>,
     pub ty: TypeExpr,
+    /// `@unique(campo1, campo2, ...)` antes de `type` (GRAMMAR.md §3.155) --
+    /// vacío para la inmensa mayoría de los `type`, que no declaran ningún
+    /// constraint compuesto. Enum APARTE de `FieldAnnotation`/`Annotation`
+    /// (mismo criterio que esos dos: cada punto de anclaje tiene su propio
+    /// enum chico, en vez de reusar uno más grande que obligaría a rechazar
+    /// en el checker combinaciones que el parser ya podría haber
+    /// descartado por forma).
+    pub annotations: Vec<TypeAnnotation>,
     pub span: Span,
 }
 
 impl PartialEq for TypeDecl {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.type_params == other.type_params && self.ty == other.ty
+        self.name == other.name
+            && self.type_params == other.type_params
+            && self.ty == other.ty
+            && self.annotations == other.annotations
     }
+}
+
+/// Anotaciones que un `type` (no un campo suelto) admite -- ver la doc de
+/// `TypeDecl::annotations`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeAnnotation {
+    /// `@unique(campo1, campo2, ...)` (GRAMMAR.md §3.155): constraint
+    /// UNIQUE COMPUESTO sobre varios campos a la vez -- complementa, nunca
+    /// reemplaza, el `@unique` de un solo campo ya existente
+    /// (`FieldAnnotation::Index { unique: true }`, §3.80). Al menos 2
+    /// nombres -- un solo campo ya tiene su propia forma, más simple,
+    /// arriba (el checker rechaza menos de 2). Identificadores sueltos,
+    /// mismo criterio sintáctico que `Annotation::Invalidates`.
+    Unique(Vec<String>),
 }
 
 #[derive(Debug, Clone)]

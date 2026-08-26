@@ -244,7 +244,48 @@ fn with_reconnect<T>(
             }
         }
     }
-    result.map_err(|e| e.to_string())
+    result.map_err(|e| describe_postgres_error(&e))
+}
+
+/// Bug real, encontrado verificando a mano el `@unique` COMPUESTO nuevo
+/// (GRAMMAR.md §3.155) contra Postgres real -- pero preexistente, no
+/// introducido por esa ronda: `postgres::Error::to_string()` para un error
+/// devuelto por el SERVIDOR (`as_db_error()`, ej. una violación de
+/// `UNIQUE`/`CHECK`) imprime solo la categoría genérica ("db error"), sin el
+/// mensaje real que Postgres mandó -- el texto real vive en
+/// `DbError::message()`, un nivel más adentro. `db::is_unique_violation`/
+/// `is_check_violation` (GRAMMAR.md §3.80/§3.96) buscan un substring
+/// EXACTO ("duplicate key value violates unique constraint"/"violates
+/// check constraint") en ese texto para traducir a 400 -- contra "db
+/// error" a secas, ninguno de los dos matcheaba nunca, así que TODA
+/// violación de `@unique`/`@check` contra Postgres real caía como 500
+/// genérico, nunca el 400 documentado. SQLite nunca tuvo este bug (su
+/// propio `rusqlite::Error::to_string()` sí incluye el mensaje real).
+fn describe_postgres_error(e: &postgres::Error) -> String {
+    match e.as_db_error() {
+        // Segunda mitad del mismo bug: el MENSAJE de un DbError viene
+        // LOCALIZADO según `lc_messages` del servidor Postgres ("llave
+        // duplicada viola restricción de unicidad" en un servidor en
+        // español, no "duplicate key value..." -- encontrado en la propia
+        // verificación manual de esta ronda) -- comparar por SUBSTRING de
+        // ese mensaje (`is_unique_violation`/`is_check_violation`, arriba)
+        // sería frágil ante cualquier locale que no sea inglés. El
+        // SQLSTATE (`db_err.code()`) es la parte del protocolo que NUNCA
+        // se traduce -- `23505`/`23514` significan lo mismo sin importar
+        // el idioma del servidor. Se antepone la frase fija en inglés que
+        // `is_unique_violation`/`is_check_violation` ya buscan (texto que
+        // YO agrego acá, no algo que Postgres mandó) para que esas dos
+        // funciones seguir funcionando SIN TOCARLAS -- el mensaje real
+        // (posiblemente en otro idioma) se conserva igual, al lado.
+        Some(db_err) => match *db_err.code() {
+            postgres::error::SqlState::UNIQUE_VIOLATION => {
+                format!("duplicate key value violates unique constraint -- {}", db_err.message())
+            }
+            postgres::error::SqlState::CHECK_VIOLATION => format!("violates check constraint -- {}", db_err.message()),
+            _ => db_err.message().to_string(),
+        },
+        None => e.to_string(),
+    }
 }
 
 fn sqlite_cell(row: &rusqlite::Row, i: usize, kind: ColumnKind) -> rusqlite::Result<Cell> {

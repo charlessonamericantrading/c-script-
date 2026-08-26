@@ -2416,6 +2416,103 @@ service Posts {{ rpc add(title: String) -> Post {{ db.{COLLECTION}.insert(Post {
     assert!(detail.contains("check"), "detalle real del error: {detail:?} (err: {err})");
 }
 
+/// Bug real, encontrado verificando a mano `@unique` COMPUESTO (GRAMMAR.md
+/// §3.155) contra Postgres real -- pero preexistente, afecta también al
+/// `@unique` de un solo campo (§3.80) que ya estaba shippeado: una
+/// violación de `@unique`/`@check` contra Postgres real daba **500**, no el
+/// **400** que GRAMMAR.md documenta -- `postgres::Error::to_string()` para
+/// un error del servidor es el literal fijo "db error" (ver los dos tests
+/// de arriba), así que `is_unique_violation`/`is_check_violation`
+/// (`runtime/db.rs`, buscan un substring en el mensaje) nunca matcheaban
+/// nada real. Arreglado clasificando por SQLSTATE (`db_err.code()`,
+/// `runtime/store.rs::describe_postgres_error`) -- el código NUNCA se
+/// traduce, a diferencia del mensaje humano (este Postgres de test corre
+/// en español: "llave duplicada viola restricción de unicidad...", no en
+/// inglés -- confirmando de paso que el fix también es a prueba de locale,
+/// no solo del bug de "db error" a secas).
+#[test]
+fn a_unique_violation_over_real_http_against_postgres_is_a_400_not_a_500() {
+    const COLLECTION: &str = "products_unique_status_code";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("unique-status-code");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Product = {{ id: Int, profileId: Int, @unique slug: String }}
+db {{ {COLLECTION}: Product[] }}
+service Products {{
+  rpc create(profileId: Int, slug: String) -> Product {{
+    db.{COLLECTION}.insert(Product {{ id: 0, profileId: profileId, slug: slug }})
+  }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Products/create", r#"{"profileId":1,"slug":"unique-slug"}"#);
+    let failed = server.try_rpc("Products/create", r#"{"profileId":2,"slug":"unique-slug"}"#);
+    let msg = failed.expect_err("un slug repetido debe rechazarse");
+    assert!(msg.contains("devolvió 400"), "el status real tiene que ser 400, no 500: {msg}");
+    assert!(msg.to_lowercase().contains("unique") || msg.contains("único"), "{msg}");
+}
+
+/// GRAMMAR.md §3.155: `@unique(campo1, campo2, ...)` a nivel de `type` --
+/// un constraint COMPUESTO real contra Postgres. Confirma tres cosas a la
+/// vez: el índice compuesto se crea de verdad, una violación real da 400
+/// (mismo fix que el test de arriba), y -- lo que distingue "compuesto" de
+/// "un solo campo" -- cambiar CUALQUIERA de los dos campos alcanza para
+/// que la fila sea válida de nuevo.
+#[test]
+fn a_composite_unique_constraint_is_enforced_for_real_against_postgres() {
+    const COLLECTION: &str = "products_composite_unique";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("composite-unique-postgres");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+@unique(profileId, slug)
+type Product = {{ id: Int, profileId: Int, slug: String, name: String }}
+db {{ {COLLECTION}: Product[] }}
+service Products {{
+  rpc create(profileId: Int, slug: String, name: String) -> Product {{
+    db.{COLLECTION}.insert(Product {{ id: 0, profileId: profileId, slug: slug, name: name }})
+  }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Products/create", r#"{"profileId":1,"slug":"foo","name":"A"}"#);
+
+    // MISMO (profileId, slug): rechazado con 400 real.
+    let failed = server.try_rpc("Products/create", r#"{"profileId":1,"slug":"foo","name":"B"}"#);
+    let msg = failed.expect_err("el mismo (profileId, slug) debe rechazarse");
+    assert!(msg.contains("devolvió 400"), "{msg}");
+
+    // Distinto profileId, MISMO slug: el constraint es COMPUESTO, no dos
+    // constraints de un solo campo -- esto tiene que aceptarse.
+    let other_profile = server.rpc("Products/create", r#"{"profileId":2,"slug":"foo","name":"C"}"#);
+    assert_eq!(other_profile["profileId"], serde_json::json!(2), "{other_profile:?}");
+
+    // Mismo profileId, distinto slug: también válido por el mismo motivo.
+    let other_slug = server.rpc("Products/create", r#"{"profileId":1,"slug":"bar","name":"D"}"#);
+    assert_eq!(other_slug["slug"], serde_json::json!("bar"), "{other_slug:?}");
+}
+
 /// GRAMMAR.md §3.149: `GET /metrics` sobre Postgres usa `pg_database_size`
 /// (una función SQL distinta a la de SQLite, `PRAGMA page_count/page_size`)
 /// -- este test es la contraparte real de

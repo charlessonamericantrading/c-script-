@@ -5447,6 +5447,42 @@ mod tests {
         assert_eq!(stock, json!(3));
     }
 
+    // ---- `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155) ----
+
+    const COMPOSITE_UNIQUE_PROGRAM: &str = r#"
+        @unique(profileId, slug)
+        type Product = { id: Int, profileId: Int, slug: String, name: String }
+        db { products: Product[] }
+        service Products {
+            rpc create(profileId: Int, slug: String, name: String) -> Product {
+                db.products.insert(Product { id: 0, profileId: profileId, slug: slug, name: name })
+            }
+        }
+    "#;
+
+    /// El caso real que motiva el ítem: dos filas con el MISMO
+    /// `(profileId, slug)` se rechazan, pero compartir SOLO uno de los dos
+    /// campos con otra fila existente sigue siendo válido -- confirma que
+    /// es un constraint COMPUESTO real (columna `(profileId, slug)` en el
+    /// índice), no dos constraints de un solo campo por separado.
+    #[test]
+    fn a_composite_unique_constraint_is_enforced_for_real_against_sqlite() {
+        let program = program_from(COMPOSITE_UNIQUE_PROGRAM);
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(&program, "Products", "create", &json!({"profileId": 1, "slug": "foo", "name": "A"}), &db).unwrap();
+
+        let same_pair = invoke_rpc(&program, "Products", "create", &json!({"profileId": 1, "slug": "foo", "name": "B"}), &db);
+        assert!(same_pair.is_err(), "el mismo (profileId, slug) debe rechazarse");
+
+        let other_profile =
+            invoke_rpc(&program, "Products", "create", &json!({"profileId": 2, "slug": "foo", "name": "C"}), &db).unwrap();
+        assert_eq!(other_profile["profileId"], json!(2), "distinto profileId, mismo slug: tiene que aceptarse");
+
+        let other_slug =
+            invoke_rpc(&program, "Products", "create", &json!({"profileId": 1, "slug": "bar", "name": "D"}), &db).unwrap();
+        assert_eq!(other_slug["slug"], json!("bar"), "mismo profileId, distinto slug: también tiene que aceptarse");
+    }
+
     // ---- db.<c>.insertMany(items) (GRAMMAR.md §3.76) ----
 
     #[test]

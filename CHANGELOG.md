@@ -3,6 +3,23 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.109.0] - 2026-08-26
+
+### ✨ Nuevo
+- **`@unique(campo1, campo2, ...)`: constraint UNIQUE compuesto a nivel de `type`.** Segundo ítem del pedido de discovery de migración (Glowapp, vía auditoría propia): `@unique`/`@index` de campo (v1.45.0) resuelven "este valor no se repite en toda la tabla", pero un caso real muy común -- "un slug único POR PERFIL, no globalmente" -- necesita un constraint sobre VARIOS campos a la vez.
+
+  ```
+  @unique(profileId, slug)
+  type Product = { id: Int, profileId: Int, slug: String, name: String }
+  ```
+
+  `TypeDecl` gana `annotations: Vec<TypeAnnotation>` (enum propio, mismo criterio que `FieldAnnotation`/`Annotation`). Al menos 2 campos, cada uno tiene que existir de verdad, sin repetidos dentro del mismo `@unique`, sin declararse sobre un `type` que no sea struct, y sin dos `@unique` con el mismo conjunto de campos (redundante). DDL idéntico en los dos backends, emitido tanto por el runtime real como por `linkc build`/`linkc migrate --dry-run`.
+
+### 🐛 Arreglado
+- **Una violación de `@unique`/`@check` contra Postgres real daba 500, no el 400 documentado desde v1.45.0/v1.60.0.** Bug preexistente, encontrado verificando a mano el ítem de arriba: `postgres::Error::to_string()` para un error devuelto por el servidor es el literal fijo `"db error"`, sin el mensaje real -- el chequeo por substring de mensaje (`is_unique_violation`/`is_check_violation`) nunca matcheaba nada real contra ese backend, así que TODA violación contra Postgres caía como 500 genérico, en silencio, desde que esas dos anotaciones existen. Arreglado clasificando por **SQLSTATE** (`23505`/`23514`) en vez de por el mensaje humano -- el código nunca se traduce, a diferencia del mensaje, que SÍ está localizado según `lc_messages` del servidor (confirmado con un Postgres de prueba corriendo en español: "llave duplicada viola restricción de unicidad", no "duplicate key...").
+
+1191 tests (12 nuevos): 8 de checker, 1 en `runtime/mod.rs` contra SQLite real, 1 en `codegen::postgres_emit` confirmando el DDL estático, y 2 contra un Postgres REAL (`pg_integration.rs`) -- uno del constraint compuesto de punta a punta, otro dedicado al fix del bug de status code confirmando el 400 real por HTTP. Detalle completo: GRAMMAR.md §3.155, PLAN.md §9.3.
+
 ## [1.108.0] - 2026-08-26
 
 ### ✨ Nuevo
