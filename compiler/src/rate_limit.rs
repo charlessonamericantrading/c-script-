@@ -63,9 +63,9 @@ impl RateLimitSpec {
 }
 
 /// Un token bucket por (ip, servicio, rpc). Vive una sola instancia por
-/// proceso servidor, mutada request a request en el hilo principal (mismo
-/// modelo de concurrencia que el resto de `serve()`, ver runtime/server.rs)
-/// -- no hace falta `Mutex`, ya que nunca se accede desde otro hilo.
+/// proceso servidor. Desde GRAMMAR.md §3.158 (v1.114.0, un hilo real por
+/// request) vive detrás de `Arc<parking_lot::Mutex<RateLimiter>>` en
+/// `runtime/server.rs`, ya no mutado desde un único hilo principal.
 pub struct RateLimiter {
     buckets: HashMap<(String, String, String), Bucket>,
     checks_since_sweep: u32,

@@ -717,31 +717,59 @@ pub(crate) fn eval_expr(
         // anidada SINTÁCTICA, así que acá no hace falta ningún manejo
         // especial más allá de propagar lo que `eval_block` devuelva.
         //
-        // Pilar 1 del roadmap de concurrencia (26/08/2026): TODO esto corre
-        // adentro de `with_exclusive_connection` -- sostiene el candado
-        // reentrante de la conexión física por la duración COMPLETA de
-        // `BEGIN` + el cuerpo + `COMMIT`/`ROLLBACK`, para que otro hilo (otra
-        // request) nunca pueda intercalar una escritura suya en la MISMA
-        // conexión a mitad de esta transacción. Sin esto, con un hilo por
-        // request, dos `transaction { }` concurrentes en la MISMA conexión
-        // podrían interlear sus escrituras entre sí -- exactamente el bug
-        // que una transacción SQL existe para impedir.
-        Expr::Transaction(block) => db.with_exclusive_connection(|| {
-            db.begin_transaction().map_err(|e| err(format!("no se pudo iniciar la transacción: {e}")))?;
-            match eval_block(block, env, db, fns, checker, sessions, current_token, step_budget) {
-                Ok(value) => match db.commit_transaction() {
-                    Ok(()) => Ok(value),
+        // Pilar 1 del roadmap de concurrencia (26/08/2026): BEGIN+cuerpo+
+        // COMMIT/ROLLBACK corren adentro de `with_exclusive_connection` --
+        // sostiene el candado reentrante de la conexión física por esa
+        // duración COMPLETA, para que otro hilo (otra request) nunca pueda
+        // intercalar una escritura suya en la MISMA conexión a mitad de
+        // esta transacción. Sin esto, con un hilo por request, dos
+        // `transaction { }` concurrentes en la MISMA conexión podrían
+        // interlear sus escrituras entre sí -- exactamente el bug que una
+        // transacción SQL existe para impedir.
+        //
+        // La entrega de los eventos DIFERIDOS de `stream` (`pending`, ver
+        // `commit_transaction`) pasa a propósito FUERA de ese candado --
+        // bug real encontrado auditando esta misma sección después de
+        // shippear GRAMMAR.md §3.158: `deliver_local` pide el candado de
+        // `subscribers`, y `subscribe()` pide esos DOS candados en el orden
+        // opuesto (subscribers primero, conexión después -- ver su propio
+        // comentario en db.rs) para no perder un evento contra un `insert`
+        // concurrente. Entregar acá adentro, con la conexión todavía
+        // tomada, habría sido conexión→subscribers en este camino y
+        // subscribers→conexión en el otro -- un deadlock clásico de orden
+        // de candados cruzado, no una carrera rara: se hubiera disparado la
+        // primera vez que un `transaction{}` confirmando y un `stream`
+        // suscribiéndose a la misma colección coincidieran en el tiempo.
+        Expr::Transaction(block) => {
+            let outcome = db.with_exclusive_connection(|| {
+                db.begin_transaction().map_err(|e| err(format!("no se pudo iniciar la transacción: {e}")))?;
+                match eval_block(block, env, db, fns, checker, sessions, current_token, step_budget) {
+                    Ok(value) => match db.commit_transaction() {
+                        Ok(pending) => Ok((value, pending)),
+                        Err(e) => {
+                            db.rollback_transaction();
+                            Err(err(format!("no se pudo confirmar la transacción: {e}")))
+                        }
+                    },
                     Err(e) => {
                         db.rollback_transaction();
-                        Err(err(format!("no se pudo confirmar la transacción: {e}")))
+                        Err(e)
                     }
-                },
-                Err(e) => {
-                    db.rollback_transaction();
-                    Err(e)
                 }
+            });
+            match outcome {
+                Ok((value, pending)) => {
+                    for (collection, json) in pending {
+                        db.deliver_local(&collection, &json);
+                        if db.is_postgres() {
+                            db.notify_remote(&collection, &json);
+                        }
+                    }
+                    Ok(value)
+                }
+                Err(e) => Err(e),
             }
-        }),
+        }
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, checker, sessions, current_token, step_budget),
         Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, checker, sessions, current_token, step_budget),
         Expr::ArrayLit(items) => {
@@ -1894,7 +1922,23 @@ fn call_method(
             // checker.rs::check_db_method) que se aplica entero vía
             // `applyPatch` sobre el MISMO id -- nunca borra e inserta de
             // nuevo, así que el id de la fila actualizada no cambia.
-            "upsert" => {
+            // Bug real, encontrado auditando GRAMMAR.md §3.158 (26/08/2026,
+            // mismo día): buscar la fila existente y decidir insert-o-patch
+            // eran dos pasos SEPARADOS, sin ningún candado compartido entre
+            // ellos -- ya documentado como no-atómico ENTRE INSTANCIAS
+            // distintas de `linkc serve` (§3.44), pero con un hilo real por
+            // request (§3.158) la MISMA carrera se volvió posible DENTRO de
+            // un solo proceso: dos hilos podían ver "no hay match" a la vez
+            // y los dos insertar, duplicando la fila que `upsert` promete
+            // que nunca se duplica. `with_exclusive_connection` (el mismo
+            // candado reentrante que ya usa `transaction{}`) sostiene la
+            // conexión durante TODO el ciclo buscar+decidir+escribir --
+            // `match_fn`/`update_fn` pueden llamar de vuelta a `db.<c>.*`
+            // sin deadlock porque el candado es reentrante para el MISMO
+            // hilo. La carrera entre procesos distintos (§3.44) sigue sin
+            // resolver -- eso necesitaría un constraint real de la base,
+            // no un candado en memoria de un solo proceso.
+            "upsert" => db.with_exclusive_connection(|| {
                 let mut it = args.into_iter();
                 let (Some(match_fn), Some(insert_value), Some(update_fn)) = (it.next(), it.next(), it.next()) else {
                     return Err(err("'upsert' requiere 3 argumentos (matchFn, insertValue, updateFn)"));
@@ -1934,7 +1978,7 @@ fn call_method(
                     }
                     None => db.call(&coll, "insert", vec![insert_value]),
                 }
-            }
+            }),
             _ => db.call(&coll, method, args),
         },
 
@@ -5644,6 +5688,177 @@ mod tests {
         }
         let result = invoke_rpc(&program, "S", "get", &json!({"id": id}), &db).unwrap();
         assert_eq!(result["hits"], json!(40), "40 transacciones concurrentes tienen que dar exactamente 40, sin updates perdidos ni entrelazados: {result:?}");
+    }
+
+    /// Bug real, encontrado auditando la sección de arriba (no reportado
+    /// externamente): `Db::subscribe` sacaba la foto y RECIÉN DESPUÉS se
+    /// registraba como suscriptor, dos pasos separados sin ningún candado
+    /// compartido con `publish`/`deliver_local` -- correcto cuando el
+    /// servidor procesaba una request a la vez, pero con un hilo real por
+    /// request (GRAMMAR.md §3.158) un `insert` de OTRO hilo podía commitear
+    /// y publicar EXACTAMENTE en esa ventana: ni quedaba en la foto (ya
+    /// tomada) ni llegaba por el canal (todavía sin registrar) -- una fila
+    /// perdida en silencio. `std::sync::Barrier` fuerza a los dos hilos a
+    /// arrancar en el mismo instante en CADA vuelta, maximizando las
+    /// chances de pegarle a la ventana de la carrera; muchas vueltas en vez
+    /// de una sola porque la ventana es angosta y no siempre se dispara.
+    #[test]
+    fn subscribing_concurrently_with_a_real_insert_never_loses_the_new_row() {
+        for round in 0..300 {
+            let program = program_from(
+                r#"
+                type Item = { id: Int, name: String }
+                db { items: Item[] }
+                service S {
+                    rpc create(name: String) -> Item { db.items.insert(Item { id: 0, name: name }) }
+                }
+            "#,
+            );
+            let db = std::sync::Arc::new(Db::new(&program, std::path::Path::new(":memory:")));
+            let program = std::sync::Arc::new(program);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+            let insert_handle = {
+                let db = std::sync::Arc::clone(&db);
+                let program = std::sync::Arc::clone(&program);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    invoke_rpc(&program, "S", "create", &json!({"name": "x"}), &db).unwrap();
+                })
+            };
+            let subscribe_handle = {
+                let db = std::sync::Arc::clone(&db);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.subscribe("items").unwrap()
+                })
+            };
+
+            insert_handle.join().unwrap();
+            let (snapshot, rx) = subscribe_handle.join().unwrap();
+
+            // `try_recv` (no bloqueante), no `recv_timeout`: para cuando los
+            // dos hilos ya hicieron `join()`, cualquier evento que exista
+            // ya está sentado en el buffer del channel -- `deliver_local`
+            // corre sincrónicamente dentro de `create`, antes de que
+            // `invoke_rpc` devuelva. Esperar con timeout acá multiplicaría
+            // por 300 vueltas sin necesidad.
+            let mut seen_as_event = false;
+            while let Ok(_ev) = rx.try_recv() {
+                seen_as_event = true;
+            }
+            assert!(
+                !snapshot.is_empty() || seen_as_event,
+                "vuelta {round}: la fila insertada concurrentemente nunca llegó -- ni en la foto ni como evento (la carrera que rompía esto volvió)"
+            );
+        }
+    }
+
+    /// El fix del test de arriba (candado de `subscribers` sostenido
+    /// durante `select_rows` en `subscribe`) casi introduce un deadlock
+    /// nuevo: si `commit_transaction` entregara sus eventos diferidos
+    /// DENTRO de `with_exclusive_connection` (como hacía antes de este
+    /// mismo fix), un `transaction{}` confirmando (candado de conexión
+    /// tomado, pidiendo el de `subscribers` para entregar) y un
+    /// `subscribe()` concurrente a la MISMA colección (candado de
+    /// `subscribers` tomado, pidiendo el de conexión para `select_rows`)
+    /// se esperarían mutuamente para siempre -- orden de candados cruzado
+    /// clásico. Este test no verifica ningún VALOR -- si el deadlock
+    /// existiera, `.join()` nunca volvería y el test colgaría hasta que el
+    /// runner lo mate por timeout, en vez de fallar con un mensaje. Que
+    /// termine en tiempo razonable ES la prueba.
+    #[test]
+    fn a_transaction_committing_concurrently_with_a_subscribe_on_the_same_collection_never_deadlocks() {
+        let program = program_from(
+            r#"
+            type Counter = { id: Int, hits: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc seed() -> Counter { db.counters.insert(Counter { id: 0, hits: 0 }) }
+                rpc bump(id: Int) -> Counter {
+                    transaction { db.counters.increment(id, |c: Counter| { c.hits }, 1) }
+                }
+            }
+        "#,
+        );
+        let db = std::sync::Arc::new(Db::new(&program, std::path::Path::new(":memory:")));
+        let program = std::sync::Arc::new(program);
+        let seeded = invoke_rpc(&program, "S", "seed", &json!({}), &db).unwrap();
+        let id = seeded["id"].as_i64().unwrap();
+
+        for _round in 0..100 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let bump_handle = {
+                let db = std::sync::Arc::clone(&db);
+                let program = std::sync::Arc::clone(&program);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    invoke_rpc(&program, "S", "bump", &json!({"id": id}), &db).unwrap();
+                })
+            };
+            let subscribe_handle = {
+                let db = std::sync::Arc::clone(&db);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.subscribe("counters").unwrap();
+                })
+            };
+            bump_handle.join().unwrap();
+            subscribe_handle.join().unwrap();
+        }
+    }
+
+    /// Otro bug real de la misma auditoría: `upsert` buscaba la fila
+    /// existente y decidía insert-o-patch en dos pasos SEPARADOS, sin
+    /// candado compartido -- ya documentado como no-atómico ENTRE
+    /// instancias de `linkc serve` (GRAMMAR.md §3.44), pero con hilos
+    /// reales la MISMA carrera se volvía posible DENTRO de un proceso: 20
+    /// hilos corriendo `upsert(matchFn: |x| x.email == "a@b.com", ...)` a
+    /// la vez tenían que dar UNA sola fila, no hasta 20 duplicadas. Fix:
+    /// `upsert` entero corre bajo `with_exclusive_connection`.
+    #[test]
+    fn twenty_real_threads_upserting_on_the_same_match_fn_concurrently_never_duplicate_the_row() {
+        let program = program_from(
+            r#"
+            type Profile = { id: Int, email: String, hits: Int }
+            db { profiles: Profile[] }
+            service S {
+                rpc touch(email: String) -> Profile {
+                    db.profiles.upsert(
+                        |p: Profile| { p.email == email },
+                        Profile { id: 0, email: email, hits: 1 },
+                        |p: Profile| { Profile { email: p.email, hits: p.hits + 1 } }
+                    )
+                }
+                rpc all() -> Profile[] { db.profiles.all() }
+            }
+        "#,
+        );
+        let db = std::sync::Arc::new(Db::new(&program, std::path::Path::new(":memory:")));
+        let program = std::sync::Arc::new(program);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(20));
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let db = std::sync::Arc::clone(&db);
+                let program = std::sync::Arc::clone(&program);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    invoke_rpc(&program, "S", "touch", &json!({"email": "a@b.com"}), &db).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let rows = invoke_rpc(&program, "S", "all", &json!({}), &db).unwrap();
+        let arr = rows.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "20 upserts concurrentes sobre el mismo matchFn tienen que dar UNA sola fila, no {}: {arr:?}", arr.len());
+        assert_eq!(arr[0]["hits"], json!(20), "cada upsert que encontró la fila ya creada tenía que sumar 1: {:?}", arr[0]);
     }
 
     // ---- `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155) ----

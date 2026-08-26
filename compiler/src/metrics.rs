@@ -1,8 +1,10 @@
 //! `GET /metrics` en formato de exposición de Prometheus (GRAMMAR.md
-//! §3.149). Mismo modelo de un solo proceso, mutado en el hilo principal,
-//! que `rate_limit::RateLimiter`/`cache::CacheStore`/
-//! `idempotency::IdempotencyStore` -- no persiste entre reinicios, no hace
-//! falta `Mutex`.
+//! §3.149). Mismo modelo de un solo proceso que
+//! `rate_limit::RateLimiter`/`cache::CacheStore`/
+//! `idempotency::IdempotencyStore` -- no persiste entre reinicios. Desde
+//! GRAMMAR.md §3.158 (v1.114.0, un hilo real por request) vive detrás de
+//! `Arc<parking_lot::Mutex<MetricsStore>>` en `server.rs`, ya no mutado
+//! desde un único hilo principal.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -56,7 +58,7 @@ impl MetricsStore {
     }
 
     /// Alcance v0 deliberado: solo se llama desde el camino de dispatch
-    /// NORMAL de un `rpc` (`server.rs`, hilo principal) -- un hit de
+    /// NORMAL de un `rpc` (`server.rs`) -- un hit de
     /// `@idempotent`/`@cache` y un `stream` no suman acá (ver GRAMMAR.md
     /// §3.149 para el porqué de cada uno).
     pub fn record(&mut self, method: &str, duration: Duration) {

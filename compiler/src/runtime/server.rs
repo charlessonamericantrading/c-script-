@@ -4,24 +4,31 @@
 // abierto porque el frontend de la demo corre en otro puerto (ver
 // examples/frontend/).
 //
-// `stream` (GRAMMAR.md §2.1, streaming real v0): el CÓMPUTO (`invoke_rpc`)
-// siempre corre en el loop principal, igual que cualquier `rpc` normal --
-// solo la ESCRITURA de los eventos SSE (potencialmente lenta si el cliente
-// lee despacio) se manda a un hilo aparte, así no bloquea al servidor de
-// aceptar el resto de las conexiones mientras un stream largo todavía se
-// está enviando. Diseño revisado durante la ronda de closures (GRAMMAR.md
-// §3.10): `Value::Closure` guarda un `Env` (`Rc<RefCell<Value>>>`, no
-// `Send`), así que `Value`/`Db`/`Program` ya no pueden cruzar un borde de
-// hilo -- de ahí que `invoke_rpc` (que sí los toca) tenga que quedarse en
-// el hilo principal, y el hilo de escritura reciba solamente el resultado
-// YA CONVERTIDO a `serde_json::Value` (sin ningún `Rc` adentro, `Send` de
-// sobra) más el propio `Request` (`Send` por diseño de tiny_http).
+// Concurrencia (GRAMMAR.md §3.158, v1.114.0 -- Pilar 1 de un roadmap
+// mayor): cada request atendida corre su propio `invoke_rpc`/cómputo en un
+// `std::thread::spawn` DEDICADO, no en un único loop principal como antes
+// de esta versión -- ver `spawn_handler!` más abajo. `Value::Closure` guarda
+// un `Env` (`Rc<RefCell<Value>>`, no `Send`, desde la ronda de closures de
+// GRAMMAR.md §3.10) sigue sin poder cruzar un borde de hilo -- pero eso ya
+// no es un problema: cada `Value`/`Env` nace y muere ENTERO dentro del hilo
+// de SU PROPIA request, nunca necesita viajar a otro. Lo que sí cruza hacia
+// el hilo spawneado son `Arc<Db>`/`Arc<Program>`/`Arc<SessionStore>` (ya
+// `Send + Sync` por diseño, ver runtime/db.rs) y el propio `Request`
+// (`Send` por diseño de tiny_http).
+//
+// `stream` (GRAMMAR.md §2.1, streaming real v0): dentro del hilo de SU
+// PROPIA request, el CÓMPUTO (`invoke_rpc`) sigue corriendo primero -- solo
+// la ESCRITURA de los eventos SSE (potencialmente lenta si el cliente lee
+// despacio) se manda a un hilo aparte todavía, así un stream largo no
+// bloquea a ESA misma request de seguir procesando. El resultado que cruza
+// hacia el hilo escritor sigue siendo `serde_json::Value` YA CONVERTIDO
+// (sin ningún `Rc` adentro, `Send` de sobra), nunca `Db`/`Value` crudos.
 //
 // Push real v0 (GRAMMAR.md §3.16): un `stream` cuyo cuerpo matchea el
 // shape reconocido (`ast::recognize_live_subscribe`) NUNCA pasa por
 // `invoke_rpc_with_sessions` -- `live_subscribe_collection` lo detecta
-// ANTES, y `Db::subscribe` (sincrónico, hilo principal) da la foto inicial
-// más un `Receiver<serde_json::Value>` que el hilo escritor
+// ANTES, y `Db::subscribe` (sincrónico, en el hilo de esa request) da la
+// foto inicial más un `Receiver<serde_json::Value>` que el hilo escritor
 // (`write_live_stream`) bloquea leyendo indefinidamente. Mismo respeto por
 // el límite de `Send` de arriba: lo único que cruza al hilo escritor es
 // JSON puro, nunca `Db`/`Value`.
@@ -291,8 +298,9 @@ impl CorsConfig {
 /// `http_timeout` (GRAMMAR.md §3.86): cuánto puede tardar cualquier llamada
 /// saliente (`http.get`/`post`/`getWithHeaders`/etc.) antes de abortar --
 /// `ureq` no tiene timeout de lectura/escritura por default, así que sin
-/// esto una request a un servidor lento o colgado bloqueaba el intérprete
-/// (de un solo hilo) para SIEMPRE.
+/// esto una request a un servidor lento o colgado bloqueaba para SIEMPRE
+/// (desde GRAMMAR.md §3.158/v1.114.0, solo el hilo de ESA request -- salvo
+/// dentro de un `transaction{}`, que sí sigue bloqueando a las demás).
 ///
 /// `trust_proxy` (GRAMMAR.md §3.89): si `@rate_limit` (GRAMMAR.md §3.39)
 /// puede usar `X-Forwarded-For` para identificar al cliente -- `false` por
@@ -780,7 +788,7 @@ fn handle_request(
         // Push real v0 (GRAMMAR.md §3.16): si el cuerpo matchea el
         // shape reconocido (`ast::recognize_live_subscribe`), esto NUNCA
         // llega a invocar `invoke_rpc_with_sessions` -- `Db::subscribe`
-        // (hilo principal, sincrónico) da la foto inicial + un
+        // (sincrónico, en el hilo de esta request) da la foto inicial + un
         // `Receiver` que el hilo escritor bloquea leyendo para siempre.
         // Cualquier otro stream sigue el camino de List<T> de siempre,
         // sin cambios, más abajo.
@@ -805,7 +813,7 @@ fn handle_request(
         // puede tener `@route`, el checker lo rechaza, así que la tabla
         // de rutas nunca matchea acá -- no hace falta volver a parsear.
         //
-        // invoke_rpc_with_sessions corre ACÁ, en el hilo principal --
+        // invoke_rpc_with_sessions corre ACÁ, en el hilo de esta request --
         // ver el porqué en el comentario de arriba del módulo. Lo único
         // que cruza al hilo de escritura es `elements` (ya JSON puro) y
         // `request`.
@@ -1451,8 +1459,9 @@ fn status_for(e: &super::RuntimeError) -> u16 {
 /// otras conexiones).
 ///
 /// Alcance v0 explícito (GRAMMAR.md §3.13): `elements` es una secuencia YA
-/// CALCULADA -- invoke_rpc evaluó el cuerpo COMPLETO en el hilo principal
-/// antes de spawnear esto (el checker ya exige que ese cuerpo sea `List<T>`).
+/// CALCULADA -- invoke_rpc evaluó el cuerpo COMPLETO en el hilo de la
+/// request antes de spawnear esto (el checker ya exige que ese cuerpo sea
+/// `List<T>`).
 /// Esto es lo que sigue corriendo un `stream` que NO matchea el shape de
 /// push real reconocido por `live_subscribe_collection` -- ver
 /// `write_live_stream`, más abajo, para el caso que sí anuncia eventos
@@ -1699,8 +1708,8 @@ fn cors_response_with_type(
         // abajo (valores constantes, siempre válidos), este es un `Origin`
         // que en el caso `Allowlist` viene de la request -- `headers_for`
         // ya lo filtró contra CR/LF, pero no vale la pena que una entrada
-        // rara tire el proceso entero por un `unwrap()` en el hilo principal
-        // del accept-loop.
+        // rara tire por un `unwrap()` el hilo que está atendiendo esta
+        // request.
         if let Ok(allow_origin) = tiny_http::Header::from_bytes(&b"Access-Control-Allow-Origin"[..], origin.as_bytes()) {
             response = response.with_header(allow_origin);
             let allow_methods =

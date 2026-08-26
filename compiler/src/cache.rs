@@ -46,9 +46,11 @@ const SWEEP_EVERY: u32 = 1000;
 
 /// Una entrada por (service, rpc, argumentos-serializados-como-JSON) --
 /// mismo modelo de concurrencia que `RateLimiter`/`IdempotencyStore`: un
-/// solo proceso servidor, mutado en el hilo principal, sin `Mutex`. No
-/// persiste entre reinicios (aceptado a propósito, mismo criterio que el
-/// resto de este estado de proceso).
+/// solo proceso servidor. Desde GRAMMAR.md §3.158 (v1.114.0, un hilo real
+/// por request) vive detrás de `Arc<parking_lot::Mutex<CacheStore>>` en
+/// `server.rs`, ya no mutado desde un único hilo. No persiste entre
+/// reinicios (aceptado a propósito, mismo criterio que el resto de este
+/// estado de proceso).
 pub struct CacheStore {
     entries: HashMap<(String, String, String), Entry>,
     checks_since_sweep: u32,

@@ -1712,22 +1712,42 @@ db { users: User[] }
     /// ya tiene, ANTES de decidir si invoca `invoke_rpc_with_sessions` (ver
     /// `ast::recognize_live_subscribe`).
     ///
-    /// Sacar la foto y registrarse son las dos líneas de ESTA MISMA llamada
-    /// sincrónica, sin ningún punto de suspensión entre ellas -- un
-    /// `SELECT` de `rusqlite` es una llamada de Rust sincrónica normal, sin
-    /// `.await`, que corre entera en el hilo que la llama, ni distinto de
-    /// clonar un `Vec` en ese sentido. La única otra cosa que podría
-    /// "colarse" (una mutación) solo pasa dentro de `Db::call`, en el mismo
-    /// único hilo que corre esto. El servidor entero procesa una request a
-    /// la vez en ese hilo, así que no hay forma de que una mutación se
-    /// intercale entre las dos líneas de acá: el single-threading del
-    /// servidor ES el lock, no hace falta agregar uno.
+    /// **Registrarse y sacar la foto pasan bajo el MISMO candado que
+    /// `deliver_local` usa para entregar** (`self.subscribers`) -- bug real
+    /// encontrado auditando esta sección tras shippear GRAMMAR.md §3.158
+    /// (26/08/2026, un hilo real por request): el diseño ORIGINAL sacaba la
+    /// foto primero y recién DESPUÉS se registraba, dos pasos separados sin
+    /// candado compartido con `publish`/`deliver_local` -- correcto cuando
+    /// el servidor procesaba una request a la vez (el comentario original
+    /// decía "el single-threading del servidor ES el lock"), pero con
+    /// requests concurrentes de verdad un `insert`/`applyPatch` de OTRO
+    /// hilo podía commitear y publicar ADENTRO de esa ventana: ni quedaba
+    /// en la foto (ya tomada) ni llegaba por el canal (todavía sin
+    /// registrar) -- una fila perdida en silencio para ese suscriptor,
+    /// nunca reportada como error. Con las dos cosas bajo el mismo candado,
+    /// esa fila SIEMPRE aparece -- en la foto, o como evento, o (en el peor
+    /// caso, si `publish` queda bloqueado esperando este mismo candado
+    /// mientras se toma la foto) en las DOS a la vez, nunca en NINGUNA. Un
+    /// duplicado ocasional es aceptable (el consumidor de un `stream` ya
+    /// trata cada evento como el estado ACTUAL de esa fila, no un delta);
+    /// perder una fila entera no lo es.
+    ///
+    /// **Orden de candados, a propósito:** acá siempre subscribers→conexión
+    /// (el candado de `subscribers` ya tomado cuando `select_rows` pide el
+    /// de la conexión) -- el camino de `transaction{}` (`Expr::Transaction`,
+    /// runtime/mod.rs) entrega sus eventos diferidos DESPUÉS de soltar el
+    /// candado de la conexión, precisamente para nunca pedir esos dos
+    /// candados en el orden inverso y crear un deadlock cruzado. Si algún
+    /// día algo más necesita sostener ambos candados a la vez, tiene que
+    /// respetar este MISMO orden.
     pub fn subscribe(&self, collection: &str) -> Result<(Vec<serde_json::Value>, Receiver<serde_json::Value>), RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let (tx, rx) = mpsc::sync_channel(LIVE_STREAM_BUFFER);
+        let mut subs = self.subscribers.lock();
+        subs.entry(collection.to_string()).or_default().push(tx);
         let snapshot: Vec<serde_json::Value> =
             self.select_rows(collection, columns, None)?.iter().map(|v| value_to_json(v, &self.simple_enums)).collect();
-        let (tx, rx) = mpsc::sync_channel(LIVE_STREAM_BUFFER);
-        self.subscribers.lock().entry(collection.to_string()).or_default().push(tx);
+        drop(subs);
         Ok((snapshot, rx))
     }
 
@@ -1807,22 +1827,30 @@ db { users: User[] }
         Ok(())
     }
 
-    /// `COMMIT` real -- si sale bien, entrega cada publicación que quedó en
-    /// cola durante la transacción, en el mismo orden en que se generaron,
-    /// por el mismo camino (`deliver_local`/`notify_remote`) que `publish`
-    /// usa fuera de una transacción. Si el `COMMIT` en sí falla (raro, pero
-    /// posible -- ej. una constraint diferida), la cola se descarta SIN
-    /// entregar nada -- un `COMMIT` fallido es, a todo efecto, un rollback.
-    pub(crate) fn commit_transaction(&self) -> Result<(), String> {
+    /// `COMMIT` real -- si sale bien, DEVUELVE cada publicación que quedó
+    /// en cola durante la transacción (en el mismo orden en que se
+    /// generaron) para que el caller las entregue. Si el `COMMIT` en sí
+    /// falla (raro, pero posible -- ej. una constraint diferida), la cola
+    /// se descarta SIN devolver nada -- un `COMMIT` fallido es, a todo
+    /// efecto, un rollback.
+    ///
+    /// Deliberadamente NO entrega acá adentro (bug real, encontrado
+    /// auditando esta misma sección tras shippear GRAMMAR.md §3.158,
+    /// 26/08/2026): el ÚNICO caller (`Expr::Transaction`, runtime/mod.rs)
+    /// corre este método entero DENTRO de `Db::with_exclusive_connection`,
+    /// que sostiene el candado reentrante de la CONEXIÓN -- si `deliver_local`
+    /// (que pide el candado de `subscribers`) corriera ahí adentro, quedaría
+    /// order conexión→subscribers, exactamente al revés del order que
+    /// `subscribe()` necesita (subscribers→conexión, ver su propio
+    /// comentario) para no perder un evento contra un `insert` concurrente
+    /// -- dos hilos pidiendo esos mismos dos candados en orden opuesto es
+    /// un deadlock clásico. El caller entrega DESPUÉS de que
+    /// `with_exclusive_connection` ya soltó el candado de la conexión,
+    /// evitando el problema de raíz en vez de solo evitar el deadlock
+    /// puntual.
+    pub(crate) fn commit_transaction(&self) -> Result<Vec<(String, serde_json::Value)>, String> {
         self.backend.execute_ddl("COMMIT")?;
-        let pending = self.transaction_pending_publishes.lock().take().unwrap_or_default();
-        for (collection, json) in pending {
-            self.deliver_local(&collection, &json);
-            if self.backend.is_postgres() {
-                self.notify_remote(&collection, &json);
-            }
-        }
-        Ok(())
+        Ok(self.transaction_pending_publishes.lock().take().unwrap_or_default())
     }
 
     /// `ROLLBACK` best-effort -- si el `ROLLBACK` en sí falla (ej. la
@@ -1849,22 +1877,27 @@ db { users: User[] }
         self.deliver_local(collection, &event);
     }
 
-    fn deliver_local(&self, collection: &str, json: &serde_json::Value) {
+    /// `pub(crate)`, no privado -- desde GRAMMAR.md §3.158 (v1.114.0),
+    /// `Expr::Transaction` (runtime/mod.rs) también la llama, DESPUÉS de
+    /// soltar el candado de la conexión (ver el comentario de
+    /// `commit_transaction` arriba para el porqué exacto).
+    pub(crate) fn deliver_local(&self, collection: &str, json: &serde_json::Value) {
         let mut subs = self.subscribers.lock();
         if let Some(list) = subs.get_mut(collection) {
             // `try_send` -- NUNCA bloqueante: publicar no puede colgar el
-            // único hilo que atiende todas las requests, ni siquiera si un
-            // suscriptor está lento. `Full` (suscriptor demasiado atrasado,
-            // ver LIVE_STREAM_BUFFER) o `Disconnected` (el cliente ya se
-            // fue) se podan igual -- lazy, recién en la próxima publicación
-            // a esta colección, no eager (un mecanismo eager necesitaría un
+            // hilo que atiende ESTA request, ni siquiera si un suscriptor
+            // está lento. `Full` (suscriptor demasiado atrasado, ver
+            // LIVE_STREAM_BUFFER) o `Disconnected` (el cliente ya se fue)
+            // se podan igual -- lazy, recién en la próxima publicación a
+            // esta colección, no eager (un mecanismo eager necesitaría un
             // hilo aparte tocando `Db`, reabriendo la pregunta de Send/Sync
             // que todo este diseño evita).
             list.retain(|tx| tx.try_send(json.clone()).is_ok());
         }
     }
 
-    fn notify_remote(&self, collection: &str, json: &serde_json::Value) {
+    /// `pub(crate)` por el mismo motivo que `deliver_local`, arriba.
+    pub(crate) fn notify_remote(&self, collection: &str, json: &serde_json::Value) {
         if self.try_notify_remote(collection, json) {
             return;
         }

@@ -1985,8 +1985,11 @@ fn resolve_max_body_bytes(args: &[String]) -> Result<u64, String> {
 /// 3. Ninguno de los dos: 30 segundos -- el mismo número que `ureq` (la
 ///    crate) ya usa como timeout de CONEXIÓN por default; lo que faltaba
 ///    era el de lectura/escritura, que por default es "nunca" (sin esto,
-///    una request saliente a un servidor colgado bloqueaba el intérprete de
-///    un solo hilo para siempre).
+///    una request saliente a un servidor colgado bloqueaba para siempre --
+///    antes de GRAMMAR.md §3.158/v1.114.0 eso colgaba el proceso entero de
+///    un solo hilo; hoy solo cuelga el hilo de ESA request, salvo dentro de
+///    un `transaction{}`, donde sigue bloqueando a las demás porque
+///    sostiene el candado de la conexión).
 fn resolve_http_timeout(args: &[String]) -> Result<std::time::Duration, String> {
     let raw = read_flag_or_env(args, "--http-timeout", "LINK_HTTP_TIMEOUT")?;
     let Some(raw) = raw else {

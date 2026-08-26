@@ -1,13 +1,13 @@
 //! Estado en memoria para `@idempotent` (GRAMMAR.md §3.140, PLAN.md §9.3).
 //!
 //! Mismo criterio y mismo modelo de concurrencia que `rate_limit.rs`: una
-//! sola instancia por proceso servidor, mutada request a request en el hilo
-//! principal (GRAMMAR.md §3.9 -- `linkc serve` es single-threaded a
-//! propósito) -- no hace falta `Mutex`, nunca se accede desde otro hilo, y
-//! no sobrevive un restart (mismo límite que el rate limiter: aceptable acá
-//! porque una `Idempotency-Key` reintentada DESPUÉS de un restart del
-//! servidor simplemente vuelve a ejecutar el rpc, ni peor ni mejor que sin
-//! esta feature).
+//! sola instancia por proceso servidor. Desde GRAMMAR.md §3.158 (v1.114.0,
+//! un hilo real por request) vive detrás de
+//! `Arc<parking_lot::Mutex<IdempotencyStore>>` en `server.rs`, ya no mutada
+//! desde un único hilo principal -- y no sobrevive un restart (mismo límite
+//! que el rate limiter: aceptable acá porque una `Idempotency-Key`
+//! reintentada DESPUÉS de un restart del servidor simplemente vuelve a
+//! ejecutar el rpc, ni peor ni mejor que sin esta feature).
 //!
 //! La clave es (service, rpc, idempotency_key) -- nunca solo la key, para
 //! que dos rpcs distintos nunca compartan namespace por casualidad si un

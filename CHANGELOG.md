@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.115.0] - 2026-08-26
+
+### 🐛 Arreglado
+Auditoría propia de GRAMMAR.md tras shippear v1.114.0 (un hilo real por request): varias secciones documentaban invariantes de concurrencia que dependían de "el servidor procesa una request a la vez" -- releerlas con la premisa nueva hizo aparecer 3 bugs reales, ninguno reportado externamente, los 3 arreglados y verificados el mismo día:
+- **`Db::subscribe` podía perder en silencio una fila insertada concurrentemente.** Sacaba la foto y RECIÉN DESPUÉS se registraba como suscriptor, dos pasos sin candado compartido con `publish`/`deliver_local` -- un `insert`/`applyPatch` de otro hilo podía commitear y publicar exactamente en esa ventana, sin quedar ni en la foto ni en el canal. Fix: registrar el sender y sacar la foto bajo el mismo candado que usa `deliver_local` para entregar.
+- **Ese mismo fix casi introduce un deadlock**: si `commit_transaction` entregara sus eventos diferidos con el candado de la conexión todavía tomado (como hacía antes), un `transaction{}` confirmando y un `subscribe()` concurrente a la misma colección pedirían esos dos candados en órdenes opuestos. Fix: `commit_transaction` ahora devuelve la lista de eventos pendientes en vez de entregarlos, y `Expr::Transaction` los entrega después de soltar el candado de la conexión.
+- **`upsert` podía duplicar una fila bajo el mismo `matchFn` concurrente.** Buscar la fila existente y decidir insert-o-patch eran dos pasos separados, sin candado compartido -- dos hilos podían ver "no hay match" a la vez y los dos insertar. Fix: `upsert` entero corre bajo `Db::with_exclusive_connection`, el mismo candado reentrante que ya usa `transaction{}`.
+
+Los 3 bugs tienen test de regresión nuevo con hilos de sistema operativo reales (`std::thread::spawn`/`std::sync::Barrier` forzando la carrera) -- cada uno confirmado que reproduce el fallo original revirtiendo el fix a mano antes de restaurarlo, incluido un test que literalmente se cuelga (deadlock real) con el orden de entrega viejo. Suite completa: 1216 tests, 0 fallos. Ver GRAMMAR.md §3.16, §3.75, §3.154, §3.158.
+
 ## [1.114.0] - 2026-08-26
 
 ### ✨ Nuevo
