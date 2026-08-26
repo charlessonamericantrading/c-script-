@@ -518,7 +518,18 @@ pub struct Checker {
     /// "última escritura gana" terminaría quedándose con el nodo más
     /// EXTERNO, no el más específico bajo el cursor. `probe_hover` compara
     /// anchos en vez de simplemente sobreescribir.
-    hover_result: std::cell::RefCell<Option<(usize, Type)>>,
+    /// `std::sync::Mutex`, no `RefCell` -- mismo motivo que
+    /// `in_stream_body`/`in_transaction` (Pilar 1 del roadmap de
+    /// concurrencia, 26/08/2026): `Db` necesita `Sync` para compartirse
+    /// entre hilos de request, y `RefCell` no lo es bajo ninguna
+    /// circunstancia -- aunque este campo específico solo se usa de
+    /// verdad durante `linkc lsp` (una sesión de un solo cliente, nunca la
+    /// copia de `Checker` que `Db` guarda para runtime). `std::sync`, no
+    /// `parking_lot` -- este módulo compila también a `wasm32-unknown-
+    /// unknown` sin el feature `runtime` (que es lo único detrás de lo que
+    /// vive `parking_lot`, ver Cargo.toml); `std::sync::Mutex` no necesita
+    /// ningún feature.
+    hover_result: std::sync::Mutex<Option<(usize, Type)>>,
     /// `true` mientras `check_rpc` chequea el cuerpo de un `stream` (nunca
     /// un `rpc` normal) -- mismo motivo de interior mutability que
     /// `hover_result`: el resto de `Checker` chequea con `&self`. Lo único
@@ -526,13 +537,23 @@ pub struct Checker {
     /// conexión SSE es fijo para toda su duración (GRAMMAR.md §3.46), así
     /// que llamarlo desde un `stream` pasaba desapercibido en v0 -- un
     /// no-op silencioso que un desarrollador solo descubría en producción.
-    in_stream_body: std::cell::Cell<bool>,
+    /// `AtomicBool`, no `Cell<bool>` -- Pilar 1 del roadmap de concurrencia
+    /// (26/08/2026): `Db` guarda un `Checker` propio para resolver tipos en
+    /// runtime (ver su doc), y `Db` necesita ser `Sync` para compartirse
+    /// entre hilos de request (`runtime/server.rs`) -- `Cell` no es `Sync`
+    /// bajo ninguna circunstancia. En la práctica este campo NUNCA se muta
+    /// en esa copia (solo se usa durante el CHEQUEO de tipos, una pasada
+    /// sincrónica de `linkc build`/`linkc test`, nunca durante la
+    /// interpretación); `Ordering::Relaxed` alcanza porque no hay ninguna
+    /// otra escritura con la que coordinarse -- es un flag de anidamiento
+    /// LOCAL a una sola pasada de chequeo, no un dato compartido de verdad.
+    in_stream_body: std::sync::atomic::AtomicBool,
     /// GRAMMAR.md §3.154: `true` mientras se chequea el CUERPO de un
     /// `transaction { ... }` -- mismo mecanismo que `in_stream_body`, para
     /// rechazar anidar una `transaction` dentro de otra en compilación
     /// (una sola transacción SQL por vez; savepoints/anidamiento real
     /// quedan fuera de v0).
-    in_transaction: std::cell::Cell<bool>,
+    in_transaction: std::sync::atomic::AtomicBool,
 }
 
 impl Checker {
@@ -550,9 +571,9 @@ impl Checker {
             db_collections: HashMap::new(),
             consts: HashMap::new(),
             hover_target: None,
-            hover_result: std::cell::RefCell::new(None),
-            in_stream_body: std::cell::Cell::new(false),
-            in_transaction: std::cell::Cell::new(false),
+            hover_result: std::sync::Mutex::new(None),
+            in_stream_body: std::sync::atomic::AtomicBool::new(false),
+            in_transaction: std::sync::atomic::AtomicBool::new(false),
         };
         let mut errors = Vec::new();
 
@@ -717,7 +738,7 @@ impl Checker {
             return;
         }
         let width = span.end - span.start;
-        let mut best = self.hover_result.borrow_mut();
+        let mut best = self.hover_result.lock().unwrap_or_else(|e| e.into_inner());
         let is_more_specific = match &*best {
             None => true,
             Some((best_width, _)) => width < *best_width,
@@ -984,7 +1005,7 @@ impl Checker {
             }
         }
 
-        checker.hover_result.into_inner().map(|(_, ty)| ty)
+        checker.hover_result.into_inner().unwrap_or_else(|e| e.into_inner()).map(|(_, ty)| ty)
     }
 
     // ---- resolución de TypeExpr (sintáctico) -> Type (resuelto) ----
@@ -1299,9 +1320,9 @@ impl Checker {
             }
             env.insert(p.name.clone(), immutable(pty));
         }
-        let prev_in_stream = self.in_stream_body.replace(is_stream);
+        let prev_in_stream = self.in_stream_body.swap(is_stream, std::sync::atomic::Ordering::Relaxed);
         let result = self.check_block(&r.body, &expected, &env);
-        self.in_stream_body.set(prev_in_stream);
+        self.in_stream_body.store(prev_in_stream, std::sync::atomic::Ordering::Relaxed);
         result
     }
 
@@ -2460,7 +2481,7 @@ impl Checker {
             // anidamiento se rechaza con `in_transaction`: una sola
             // transacción SQL real por vez, sin savepoints en v0.
             Expr::Transaction(block) => {
-                if self.in_transaction.get() {
+                if self.in_transaction.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(err(
                         "'transaction' no puede anidarse dentro de otra 'transaction' -- una sola transacción SQL por vez en v0 (GRAMMAR.md §3.154)",
                     ));
@@ -2471,9 +2492,9 @@ impl Checker {
                          usá una variable 'mut' declarada antes del bloque y un valor de cola después de él",
                     ));
                 }
-                self.in_transaction.set(true);
+                self.in_transaction.store(true, std::sync::atomic::Ordering::Relaxed);
                 let result = self.check_block(block, expected, env);
-                self.in_transaction.set(false);
+                self.in_transaction.store(false, std::sync::atomic::Ordering::Relaxed);
                 result
             }
             Expr::StructLit { name, variant: Some(v), fields } if name == "Result" => {
@@ -4009,7 +4030,7 @@ impl Checker {
                 let [code_arg] = args else {
                     return Err(err("'response.setStatus' toma exactamente 1 argumento (code: Int)"));
                 };
-                if self.in_stream_body.get() {
+                if self.in_stream_body.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(err(
                         "'response.setStatus' no tiene efecto dentro de un 'stream': el status de una conexión SSE es fijo para toda su duración (GRAMMAR.md §3.46) -- llamalo desde un 'rpc' normal",
                     ));
@@ -4021,7 +4042,7 @@ impl Checker {
                 let [url, permanent] = args else {
                     return Err(err("'response.redirect' toma exactamente 2 argumentos (url: String, permanent: Bool)"));
                 };
-                if self.in_stream_body.get() {
+                if self.in_stream_body.load(std::sync::atomic::Ordering::Relaxed) {
                     return Err(err(
                         "'response.redirect' no tiene efecto dentro de un 'stream': mismo motivo que 'response.setStatus' (GRAMMAR.md §3.46) -- una conexión SSE ya envió su status antes de que el cuerpo corra",
                     ));

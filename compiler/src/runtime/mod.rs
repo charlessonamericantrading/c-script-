@@ -714,9 +714,19 @@ pub(crate) fn eval_expr(
         // `ROLLBACK` si CUALQUIER `RuntimeError` se propaga desde adentro
         // -- el checker ya garantizó que no hay ningún `return` alcanzable
         // (block_has_return, checker.rs) ni ninguna otra `transaction`
-        // anidada, así que acá no hace falta ningún manejo especial más
-        // allá de propagar lo que `eval_block` devuelva.
-        Expr::Transaction(block) => {
+        // anidada SINTÁCTICA, así que acá no hace falta ningún manejo
+        // especial más allá de propagar lo que `eval_block` devuelva.
+        //
+        // Pilar 1 del roadmap de concurrencia (26/08/2026): TODO esto corre
+        // adentro de `with_exclusive_connection` -- sostiene el candado
+        // reentrante de la conexión física por la duración COMPLETA de
+        // `BEGIN` + el cuerpo + `COMMIT`/`ROLLBACK`, para que otro hilo (otra
+        // request) nunca pueda intercalar una escritura suya en la MISMA
+        // conexión a mitad de esta transacción. Sin esto, con un hilo por
+        // request, dos `transaction { }` concurrentes en la MISMA conexión
+        // podrían interlear sus escrituras entre sí -- exactamente el bug
+        // que una transacción SQL existe para impedir.
+        Expr::Transaction(block) => db.with_exclusive_connection(|| {
             db.begin_transaction().map_err(|e| err(format!("no se pudo iniciar la transacción: {e}")))?;
             match eval_block(block, env, db, fns, checker, sessions, current_token, step_budget) {
                 Ok(value) => match db.commit_transaction() {
@@ -731,7 +741,7 @@ pub(crate) fn eval_expr(
                     Err(e)
                 }
             }
-        }
+        }),
         Expr::Binary { op, left, right } => eval_binary(*op, left, right, env, db, fns, checker, sessions, current_token, step_budget),
         Expr::Unary { op, operand } => eval_unary(*op, operand, env, db, fns, checker, sessions, current_token, step_budget),
         Expr::ArrayLit(items) => {
@@ -5538,6 +5548,102 @@ mod tests {
         assert_eq!(count, json!(0), "{count:?}");
         let err2 = invoke_rpc(&program, "S", "outer", &json!({"name": "y"}), &db).unwrap_err();
         assert!(err2.message.contains("no admite anidamiento"), "{}", err2.message);
+    }
+
+    // ---- Pilar 1 del roadmap de concurrencia (26/08/2026, a partir del
+    // pedido de skynet-d3): un hilo por request en `runtime/server.rs`,
+    // `Db` ahora `Send + Sync`. Estos dos tests NO usan `linkc serve` --
+    // usan hilos de SISTEMA OPERATIVO REALES (`std::thread::spawn`) sobre
+    // un único `Arc<Db>` compartido, exactamente el mismo patrón de acceso
+    // que `server.rs` usa contra requests concurrentes de verdad, pero sin
+    // necesitar levantar un servidor HTTP real para probarlo en CI. La
+    // verificación manual (con `linkc serve` real, `curl` concurrente, y
+    // un endpoint HTTP local lento para probar que una pasarela de pago
+    // lenta ya no bloquea a las demás requests) queda documentada en
+    // GRAMMAR.md, no repetida acá.
+
+    /// 40 hilos reales insertando a la vez sobre la MISMA colección --
+    /// ninguna fila perdida, ningún id duplicado. El candado reentrante de
+    /// la conexión (`Backend::execute`, `store.rs`) es lo que hace que esto
+    /// sea correcto: cada `insert` se serializa brevemente contra los
+    /// demás, sin que ninguno pise el trabajo de otro.
+    #[test]
+    fn forty_real_threads_inserting_concurrently_never_lose_a_row_or_duplicate_an_id() {
+        let program = program_from(
+            r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                rpc create(name: String) -> Item { db.items.insert(Item { id: 0, name: name }) }
+                rpc all() -> Item[] { db.items.all() }
+            }
+        "#,
+        );
+        let db = std::sync::Arc::new(Db::new(&program, std::path::Path::new(":memory:")));
+        let program = std::sync::Arc::new(program);
+        let handles: Vec<_> = (0..40)
+            .map(|i| {
+                let db = std::sync::Arc::clone(&db);
+                let program = std::sync::Arc::clone(&program);
+                std::thread::spawn(move || {
+                    invoke_rpc(&program, "S", "create", &json!({"name": format!("item-{i}")}), &db).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let rows = invoke_rpc(&program, "S", "all", &json!({}), &db).unwrap();
+        let arr = rows.as_array().unwrap();
+        assert_eq!(arr.len(), 40, "no debe perderse ninguna fila: {arr:?}");
+        let mut ids: Vec<i64> = arr.iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 40, "ningún id puede repetirse");
+    }
+
+    /// 40 hilos reales corriendo `transaction { increment(...) }` a la vez
+    /// sobre la MISMA fila -- el resultado final tiene que ser EXACTAMENTE
+    /// 40, ni menos (update perdido) ni más (dos transacciones
+    /// entrelazadas escribiendo sobre la misma base de cálculo). Prueba
+    /// directa de que `Db::with_exclusive_connection` sostiene el candado
+    /// por TODA la transacción, no solo por cada operación suelta --
+    /// mismo caso que rompería si `begin_transaction`/el cuerpo/`commit_
+    /// transaction` lockearan por separado en vez de como una unidad.
+    #[test]
+    fn forty_real_threads_running_a_transaction_on_the_same_row_never_lose_an_update() {
+        let program = program_from(
+            r#"
+            type Counter = { id: Int, hits: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc seed() -> Counter { db.counters.insert(Counter { id: 0, hits: 0 }) }
+                rpc bump(id: Int) -> Counter {
+                    transaction { db.counters.increment(id, |c: Counter| { c.hits }, 1) }
+                }
+                rpc get(id: Int) -> Counter? { db.counters.find(id) }
+            }
+        "#,
+        );
+        let db = std::sync::Arc::new(Db::new(&program, std::path::Path::new(":memory:")));
+        let program = std::sync::Arc::new(program);
+        let seeded = invoke_rpc(&program, "S", "seed", &json!({}), &db).unwrap();
+        let id = seeded["id"].as_i64().unwrap();
+
+        let handles: Vec<_> = (0..40)
+            .map(|_| {
+                let db = std::sync::Arc::clone(&db);
+                let program = std::sync::Arc::clone(&program);
+                std::thread::spawn(move || {
+                    invoke_rpc(&program, "S", "bump", &json!({"id": id}), &db).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let result = invoke_rpc(&program, "S", "get", &json!({"id": id}), &db).unwrap();
+        assert_eq!(result["hits"], json!(40), "40 transacciones concurrentes tienen que dar exactamente 40, sin updates perdidos ni entrelazados: {result:?}");
     }
 
     // ---- `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155) ----

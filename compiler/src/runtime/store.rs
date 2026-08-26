@@ -55,15 +55,28 @@ pub(crate) enum ColumnKind {
     Json,
 }
 
+/// `ReentrantMutex`, no `std::sync::Mutex` -- GRAMMAR.md, Pilar 1 del
+/// roadmap de concurrencia (26/08/2026, a partir del pedido de skynet-d3):
+/// `linkc serve` pasa a un hilo por request, así que la conexión real
+/// necesita ser SEGURA entre hilos -- pero `transaction { }` (§3.154)
+/// sostiene el candado por TODA su duración (BEGIN + cuerpo + COMMIT/
+/// ROLLBACK), y el cuerpo llama de vuelta a `insert`/`applyPatch`/`find`/
+/// etc., que TAMBIÉN piden el candado para su propia operación -- con un
+/// `Mutex` común eso sería el mismo hilo bloqueándose a sí mismo (deadlock
+/// garantizado, no una condición de carrera rara). Reentrante: el mismo
+/// hilo puede volver a pedirlo cuantas veces haga falta sin bloquearse,
+/// otro hilo sí espera de verdad. `RefCell` adentro para Postgres porque
+/// `postgres::Client` pide `&mut self` para consultar -- `ReentrantMutex`
+/// solo da `&T` al lockear (nunca `&mut T`, sería inseguro si el mismo
+/// hilo pudiera reentrar con dos `&mut` vivos a la vez), así que la
+/// mutabilidad real todavía la da `RefCell` puertas adentro del candado ya
+/// tomado. SQLite no lo necesita: los métodos de `rusqlite::Connection`
+/// (`execute`/`query`/`prepare`) ya toman `&self`, la mutabilidad interna
+/// la maneja la propia librería C de SQLite.
 pub(crate) enum Backend {
-    Sqlite(rusqlite::Connection),
+    Sqlite(parking_lot::ReentrantMutex<rusqlite::Connection>),
     Postgres {
-        /// `RefCell` porque el cliente de `postgres` pide `&mut self` para
-        /// consultar, y `Db` se comparte como `&Db` por todo el intérprete.
-        /// Es seguro por la misma razón que ya vale para `SessionStore` y
-        /// para `Db::subscribers`: el intérprete corre entero en el hilo
-        /// principal (ver runtime/server.rs), una request a la vez.
-        client: RefCell<postgres::Client>,
+        client: parking_lot::ReentrantMutex<RefCell<postgres::Client>>,
         /// La URL de conexión original -- guardada para poder RECONECTAR
         /// (`with_reconnect`, abajo) con el mismo criterio de TLS que usó
         /// la conexión inicial (`db::connect_postgres_client`), sin
@@ -77,6 +90,27 @@ impl Backend {
         matches!(self, Backend::Postgres { .. })
     }
 
+    /// Sostiene el candado de la conexión por TODA la duración de `f` --
+    /// para `transaction { }` (GRAMMAR.md §3.154), que necesita que
+    /// `BEGIN`/el cuerpo entero/`COMMIT`-`ROLLBACK` corran como una sola
+    /// sección exclusiva, sin que OTRO hilo (otra request) intercale una
+    /// escritura suya a mitad de una transacción ajena en la MISMA
+    /// conexión física. `f` llama de vuelta a operaciones normales
+    /// (`execute`/`query`/etc.) que también piden este mismo candado --
+    /// reentrante, así que el mismo hilo no se bloquea a sí mismo.
+    pub(crate) fn with_exclusive<T>(&self, f: impl FnOnce() -> T) -> T {
+        match self {
+            Backend::Sqlite(conn) => {
+                let _guard = conn.lock();
+                f()
+            }
+            Backend::Postgres { client, .. } => {
+                let _guard = client.lock();
+                f()
+            }
+        }
+    }
+
     /// El placeholder del parámetro `n` (1-based).
     pub(crate) fn placeholder(&self, n: usize) -> String {
         match self {
@@ -88,6 +122,7 @@ impl Backend {
     pub(crate) fn execute(&self, sql: &str, params: &[Cell]) -> Result<usize, String> {
         match self {
             Backend::Sqlite(conn) => {
+                let conn = conn.lock();
                 let refs: Vec<&dyn rusqlite::ToSql> =
                     params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
                 conn.execute(sql, refs.as_slice()).map_err(|e| e.to_string())
@@ -103,7 +138,7 @@ impl Backend {
     /// Ejecuta SQL sin parámetros ni filas de vuelta (DDL).
     pub(crate) fn execute_ddl(&self, sql: &str) -> Result<(), String> {
         match self {
-            Backend::Sqlite(conn) => conn.execute_batch(sql).map_err(|e| e.to_string()),
+            Backend::Sqlite(conn) => conn.lock().execute_batch(sql).map_err(|e| e.to_string()),
             Backend::Postgres { client, url } => with_reconnect(client, url, |c| c.batch_execute(sql)),
         }
     }
@@ -119,6 +154,7 @@ impl Backend {
     ) -> Result<Vec<Vec<Cell>>, String> {
         match self {
             Backend::Sqlite(conn) => {
+                let conn = conn.lock();
                 let refs: Vec<&dyn rusqlite::ToSql> =
                     params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
                 let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
@@ -156,6 +192,7 @@ impl Backend {
     pub(crate) fn insert_returning_id(&self, sql: &str, params: &[Cell]) -> Result<i64, String> {
         match self {
             Backend::Sqlite(conn) => {
+                let conn = conn.lock();
                 let refs: Vec<&dyn rusqlite::ToSql> =
                     params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
                 conn.execute(sql, refs.as_slice()).map_err(|e| e.to_string())?;
@@ -232,15 +269,16 @@ impl Backend {
 /// como estaba -- la request siguiente vuelve a intentarlo sola, con la
 /// misma lógica, sin ningún estado especial que limpiar.
 fn with_reconnect<T>(
-    client: &RefCell<postgres::Client>,
+    client: &parking_lot::ReentrantMutex<RefCell<postgres::Client>>,
     url: &str,
     op: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error>,
 ) -> Result<T, String> {
-    let result = op(&mut client.borrow_mut());
+    let guard = client.lock();
+    let result = op(&mut guard.borrow_mut());
     if let Err(e) = &result {
         if e.is_closed() {
             if let Ok(fresh) = super::db::connect_postgres_client(url) {
-                *client.borrow_mut() = fresh;
+                *guard.borrow_mut() = fresh;
             }
         }
     }
@@ -574,4 +612,21 @@ impl postgres::types::ToSql for Cell {
     }
 
     postgres::types::to_sql_checked!();
+}
+
+/// Invariante de arquitectura para la concurrencia real por hilos (Pilar 1
+/// del roadmap propuesto a partir del pedido de skynet-d3, 26/08/2026):
+/// compartir `Db` entre hilos vía `Arc<Db>` con `Mutex` adentro depende de
+/// que estos dos tipos sean `Send` -- si una futura versión de `rusqlite`/
+/// `postgres` alguna vez dejara de serlo, este test falla en COMPILACIÓN
+/// (no en runtime), la señal más barata posible de que la arquitectura
+/// entera necesita revisarse antes de seguir.
+#[cfg(test)]
+mod send_probe {
+    fn assert_send<T: Send>() {}
+    #[test]
+    fn connection_types_are_send() {
+        assert_send::<rusqlite::Connection>();
+        assert_send::<postgres::Client>();
+    }
 }

@@ -12,7 +12,6 @@
 //! dependencia nueva: `hmac`/`sha2` ya estaban por `crypto.hmacSha256`, y
 //! `base64` ya estaba por `base64.encode`/`decode`.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -126,19 +125,21 @@ struct SessionEntry {
 
 /// Sesiones en memoria: token opaco -> `SessionEntry`.
 ///
-/// `RefCell`, no `Mutex` (a diferencia de `Db`): todo esto corre siempre en
-/// el hilo principal (mismo argumento que ya vale para `Env`/`Db` en este
-/// intérprete), y un re-lock accidental con `RefCell` panica con un mensaje
-/// claro en vez del comportamiento "unspecified" que documenta
-/// `std::sync::Mutex` para un re-lock del mismo hilo.
+/// `Mutex`, no `RefCell` -- Pilar 1 del roadmap de concurrencia (26/08/2026):
+/// con un hilo por request (`runtime/server.rs`), dos requests pueden crear/
+/// destruir/consultar sesiones AL MISMO TIEMPO de verdad. `parking_lot`, no
+/// `std::sync` -- no necesita sostenerse a través de una llamada anidada
+/// (a diferencia del candado de conexión de `Db`), así que el `Mutex` común
+/// alcanza; se usa `parking_lot` en vez de `std::sync::Mutex` por
+/// consistencia con el resto del roadmap (sin poisoning en pánico, API más
+/// simple).
 pub struct SessionStore {
-    sessions: RefCell<HashMap<String, SessionEntry>>,
+    sessions: parking_lot::Mutex<HashMap<String, SessionEntry>>,
     /// Bloqueo de cuenta (GRAMMAR.md §3.152) -- timestamps de intentos
     /// fallidos por `identifier` (email, user id como String, lo que decida
     /// quien llama), más viejo primero para que podar por ventana sea
-    /// barato (cortar del frente). `RefCell`, mismo criterio que
-    /// `sessions`.
-    failed_logins: RefCell<HashMap<String, std::collections::VecDeque<Instant>>>,
+    /// barato (cortar del frente). `Mutex`, mismo criterio que `sessions`.
+    failed_logins: parking_lot::Mutex<HashMap<String, std::collections::VecDeque<Instant>>>,
     /// Configurado UNA vez al construir el store (`--session-ttl`/
     /// `LINK_SESSION_TTL`, GRAMMAR.md §3.50) -- nunca cambia sesión a
     /// sesión, así que vivir en el store entero (no en cada `create`) es
@@ -154,7 +155,7 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn new() -> Self {
-        SessionStore { sessions: RefCell::new(HashMap::new()), failed_logins: RefCell::new(HashMap::new()), ttl: None, jwt: None }
+        SessionStore { sessions: parking_lot::Mutex::new(HashMap::new()), failed_logins: parking_lot::Mutex::new(HashMap::new()), ttl: None, jwt: None }
     }
 
     /// Como `new()`, pero cada sesión que este store cree expira `ttl`
@@ -162,7 +163,7 @@ impl SessionStore {
     /// `runtime::server::serve`, cuando `--session-ttl`/`LINK_SESSION_TTL`
     /// están configurados.
     pub fn with_ttl(ttl: Duration) -> Self {
-        SessionStore { sessions: RefCell::new(HashMap::new()), failed_logins: RefCell::new(HashMap::new()), ttl: Some(ttl), jwt: None }
+        SessionStore { sessions: parking_lot::Mutex::new(HashMap::new()), failed_logins: parking_lot::Mutex::new(HashMap::new()), ttl: Some(ttl), jwt: None }
     }
 
     /// `auth.recordFailedLogin(identifier)` (GRAMMAR.md §3.152) -- agrega
@@ -172,7 +173,7 @@ impl SessionStore {
     /// simplemente queda sin usarse hasta que algo la pode; un lockout real
     /// consulta seguido, así que esto no crece sin límite en la práctica.
     pub fn record_failed_login(&self, identifier: &str) {
-        self.failed_logins.borrow_mut().entry(identifier.to_string()).or_default().push_back(Instant::now());
+        self.failed_logins.lock().entry(identifier.to_string()).or_default().push_back(Instant::now());
     }
 
     /// `auth.failedLoginCount(identifier, windowSeconds)` -- cuántos
@@ -182,7 +183,7 @@ impl SessionStore {
     /// correcto sin recorrer toda la lista).
     pub fn failed_login_count(&self, identifier: &str, window: Duration) -> i64 {
         let now = Instant::now();
-        let mut map = self.failed_logins.borrow_mut();
+        let mut map = self.failed_logins.lock();
         let Some(times) = map.get_mut(identifier) else { return 0 };
         while let Some(&front) = times.front() {
             if now.saturating_duration_since(front) > window {
@@ -199,7 +200,7 @@ impl SessionStore {
     /// fallos previos, no los deja acumulándose contra un usuario legítimo
     /// que solo se equivocó de contraseña un par de veces.
     pub fn reset_failed_logins(&self, identifier: &str) {
-        self.failed_logins.borrow_mut().remove(identifier);
+        self.failed_logins.lock().remove(identifier);
     }
 
     /// Habilita verificar JWTs externos ADEMÁS de las sesiones propias de
@@ -221,14 +222,14 @@ impl SessionStore {
     pub fn create_with_user_id(&self, enum_name: String, variant_name: String, user_id: Option<i64>) -> String {
         let token = fresh_token();
         let expires_at = self.ttl.map(|ttl| Instant::now() + ttl);
-        self.sessions.borrow_mut().insert(token.clone(), SessionEntry { enum_name, variant_name, user_id, expires_at });
+        self.sessions.lock().insert(token.clone(), SessionEntry { enum_name, variant_name, user_id, expires_at });
         token
     }
 
     /// Idempotente -- destruir una sesión que ya no existe (o nunca existió)
     /// no es un error.
     pub fn destroy(&self, token: &str) {
-        self.sessions.borrow_mut().remove(token);
+        self.sessions.lock().remove(token);
     }
 
     /// Destruye TODAS las sesiones abiertas con ese `user_id` (GRAMMAR.md
@@ -245,7 +246,7 @@ impl SessionStore {
     /// error). Cada sesión JWT externa (GRAMMAR.md §3.64), si las hay, no
     /// pasa por acá -- este store nunca las guardó, no hay nada que borrar.
     pub fn destroy_all_for_user(&self, user_id: i64) -> usize {
-        let mut sessions = self.sessions.borrow_mut();
+        let mut sessions = self.sessions.lock();
         let before = sessions.len();
         sessions.retain(|_, entry| entry.user_id != Some(user_id));
         before - sessions.len()
@@ -276,7 +277,7 @@ impl SessionStore {
     /// por este mismo programa.
     pub fn role_for(&self, token: &str) -> Option<(String, String)> {
         {
-            let mut sessions = self.sessions.borrow_mut();
+            let mut sessions = self.sessions.lock();
             if let Some(entry) = sessions.get(token) {
                 if entry.expires_at.is_some_and(|exp| Instant::now() >= exp) {
                     sessions.remove(token);
@@ -299,7 +300,7 @@ impl SessionStore {
     /// reales -- `sub` casi siempre es string por convención de OIDC.
     pub fn user_id_for(&self, token: &str) -> Option<i64> {
         {
-            let mut sessions = self.sessions.borrow_mut();
+            let mut sessions = self.sessions.lock();
             if let Some(entry) = sessions.get(token) {
                 if entry.expires_at.is_some_and(|exp| Instant::now() >= exp) {
                     sessions.remove(token);

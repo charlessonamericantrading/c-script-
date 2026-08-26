@@ -394,33 +394,75 @@ pub fn serve(
     // así que build_route_table no puede encontrar nada inválido acá.
     let route_table = build_route_table(&program);
     // `@rate_limit` (GRAMMAR.md §3.39): un solo `RateLimiter` para todo el
-    // proceso, igual criterio que `route_table` de arriba -- se arma/muta
-    // en el hilo principal, nunca cruza a los hilos de escritura de stream.
-    let mut rate_limiter = RateLimiter::new();
+    // proceso, igual criterio que `route_table` de arriba.
+    let rate_limiter = RateLimiter::new();
     // `@idempotent` (GRAMMAR.md §3.140): mismo criterio que `rate_limiter`
-    // de arriba -- un solo store para todo el proceso, mutado en el hilo
-    // principal.
-    let mut idempotency_store = IdempotencyStore::new();
+    // de arriba -- un solo store para todo el proceso.
+    let idempotency_store = IdempotencyStore::new();
     // `@cache` (GRAMMAR.md §3.144): mismo criterio que `idempotency_store`
     // de arriba.
-    let mut cache_store = CacheStore::new();
+    let cache_store = CacheStore::new();
     // `GET /metrics` (GRAMMAR.md §3.149): mismo criterio que los tres de
     // arriba.
-    let mut metrics_store = MetricsStore::new();
+    let metrics_store = MetricsStore::new();
     println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
-    match remote_changes {
-        None => {
-            for request in server.incoming_requests() {
+    // Pilar 1 del roadmap de concurrencia (26/08/2026, a partir del pedido
+    // de skynet-d3): un hilo por request, no el loop de un solo hilo de
+    // siempre -- así que TODO lo que una request puede tocar necesita
+    // cruzar de forma segura al hilo que la va a atender. `Arc` para lo que
+    // ya es internamente seguro entre hilos (`Db`/`SessionStore`, ver sus
+    // propios candados) o inmutable después de este punto
+    // (`program`/`route_table`); `Arc<Mutex<...>>` para lo que se sigue
+    // mutando por request (los cuatro stores de arriba) -- cada uno con su
+    // PROPIO candado, así que un rate-limit check de una request nunca
+    // espera a que otra termine de escribir en el cache, por ejemplo.
+    // `db`/`sessions` en particular sostienen su candado SOLO durante la
+    // operación puntual que lo pide (o, para `transaction { }`, durante
+    // toda su duración vía `Db::with_exclusive_connection`) -- nunca
+    // durante una llamada `http.*` saliente, que no los toca en absoluto:
+    // una pasarela de pago lenta en una request ya no bloquea a las demás.
+    let program = std::sync::Arc::new(program.clone());
+    let db = std::sync::Arc::new(db);
+    let sessions = std::sync::Arc::new(sessions);
+    let route_table = std::sync::Arc::new(route_table);
+    let rate_limiter = std::sync::Arc::new(parking_lot::Mutex::new(rate_limiter));
+    let idempotency_store = std::sync::Arc::new(parking_lot::Mutex::new(idempotency_store));
+    let cache_store = std::sync::Arc::new(parking_lot::Mutex::new(cache_store));
+    let metrics_store = std::sync::Arc::new(parking_lot::Mutex::new(metrics_store));
+
+    // Un hilo por request (Pilar 1, arriba) -- cada `Arc`/`Arc<Mutex<...>>`
+    // se clona (barato: un incremento de refcount, nunca una copia real de
+    // los datos) DENTRO del loop, una vez por request, y esa copia es lo
+    // único que el hilo nuevo captura -- así el hilo no depende de que el
+    // loop principal (o el `Server` mismo) siga vivo mientras lo atiende.
+    // `cors`/`hsts`/`service_api_key` son pequeños (un enum con un
+    // `Vec<String>` a lo sumo, dos `Option<String>`) -- clonarlos por
+    // request es más simple que otro `Arc` y el costo es insignificante.
+    macro_rules! spawn_handler {
+        ($request:expr) => {{
+            let program = std::sync::Arc::clone(&program);
+            let db = std::sync::Arc::clone(&db);
+            let sessions = std::sync::Arc::clone(&sessions);
+            let route_table = std::sync::Arc::clone(&route_table);
+            let rate_limiter = std::sync::Arc::clone(&rate_limiter);
+            let idempotency_store = std::sync::Arc::clone(&idempotency_store);
+            let cache_store = std::sync::Arc::clone(&cache_store);
+            let metrics_store = std::sync::Arc::clone(&metrics_store);
+            let cors = cors.clone();
+            let hsts = hsts.clone();
+            let service_api_key = service_api_key.clone();
+            let request = $request;
+            std::thread::spawn(move || {
                 handle_request(
                     &program,
                     &db,
                     &sessions,
                     &route_table,
-                    &mut rate_limiter,
-                    &mut idempotency_store,
-                    &mut cache_store,
-                    &mut metrics_store,
+                    &rate_limiter,
+                    &idempotency_store,
+                    &cache_store,
+                    &metrics_store,
                     &cors,
                     hsts.as_deref(),
                     max_body_bytes,
@@ -429,6 +471,14 @@ pub fn serve(
                     log,
                     request,
                 );
+            });
+        }};
+    }
+
+    match remote_changes {
+        None => {
+            for request in server.incoming_requests() {
+                spawn_handler!(request);
             }
             // Inalcanzable en la práctica -- `incoming_requests()` solo
             // termina si el `Server` se apaga desde OTRO hilo (`.unblock()`),
@@ -442,7 +492,10 @@ pub fn serve(
             // `recv_timeout` en vez del `incoming_requests()` bloqueante de
             // siempre: sin esto, un cambio remoto podría quedar esperando
             // indefinidamente si no llega ninguna request HTTP nueva que
-            // "despierte" al loop.
+            // "despierte" al loop. Este loop en sí sigue siendo UN solo
+            // hilo -- lo único que cambia con el Pilar 1 es que YA NO
+            // procesa la request en línea, la delega a un hilo nuevo y
+            // sigue enseguida a la próxima vuelta.
             loop {
                 while let Ok(change) = remote_rx.try_recv() {
                     // GRAMMAR.md §3.150: latencia real de propagación --
@@ -453,7 +506,7 @@ pub fn serve(
                     // desalineados -- una latencia negativa no tiene
                     // sentido y solo ensuciaría el promedio.
                     let latency_ms = (now_ms() - change.sent_at_ms).max(0);
-                    metrics_store.record_notify_latency(std::time::Duration::from_millis(latency_ms as u64));
+                    metrics_store.lock().record_notify_latency(std::time::Duration::from_millis(latency_ms as u64));
                     db.publish_remote(&change.collection, change.event);
                 }
                 // GRAMMAR.md §3.150: reintenta cualquier NOTIFY que haya
@@ -462,23 +515,7 @@ pub fn serve(
                 // nuevo.
                 db.flush_pending_notify_retries();
                 match server.recv_timeout(REMOTE_CHANGE_POLL_INTERVAL) {
-                    Ok(Some(request)) => handle_request(
-                        &program,
-                        &db,
-                        &sessions,
-                        &route_table,
-                        &mut rate_limiter,
-                        &mut idempotency_store,
-                        &mut cache_store,
-                        &mut metrics_store,
-                        &cors,
-                        hsts.as_deref(),
-                        max_body_bytes,
-                        trust_proxy,
-                        service_api_key.as_deref(),
-                        log,
-                        request,
-                    ),
+                    Ok(Some(request)) => spawn_handler!(request),
                     Ok(None) => {}
                     Err(e) => eprintln!("error aceptando una conexión: {e}"),
                 }
@@ -506,10 +543,10 @@ fn handle_request(
     db: &Db,
     sessions: &SessionStore,
     route_table: &[RouteEntry],
-    rate_limiter: &mut RateLimiter,
-    idempotency_store: &mut IdempotencyStore,
-    cache_store: &mut CacheStore,
-    metrics_store: &mut MetricsStore,
+    rate_limiter: &parking_lot::Mutex<RateLimiter>,
+    idempotency_store: &parking_lot::Mutex<IdempotencyStore>,
+    cache_store: &parking_lot::Mutex<CacheStore>,
+    metrics_store: &parking_lot::Mutex<MetricsStore>,
     cors: &CorsConfig,
     hsts: Option<&str>,
     max_body_bytes: u64,
@@ -672,7 +709,7 @@ fn handle_request(
     // configuró esa capa, Prometheus también tiene que mandarla (soportado
     // nativamente por `scrape_configs.authorization` en `prometheus.yml`).
     if path == "/metrics" {
-        let metrics_text = metrics_store.render_prometheus_text(&db.subscriber_counts(), db.size_bytes(), &db.oversized_notify_drop_counts());
+        let metrics_text = metrics_store.lock().render_prometheus_text(&db.subscriber_counts(), db.size_bytes(), &db.oversized_notify_drop_counts());
         let _ = request.respond(cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None));
         log_done(log, req_id, Some("metrics"), 200, start, "");
         return;
@@ -717,8 +754,8 @@ fn handle_request(
             }
             None => client_ip,
         };
-        if !rate_limiter.check(&bucket_identity, service_name, rpc_name, spec) {
-            metrics_store.record_rate_limit_rejection(&method);
+        if !rate_limiter.lock().check(&bucket_identity, service_name, rpc_name, spec) {
+            metrics_store.lock().record_rate_limit_rejection(&method);
             let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
             log_done(log, req_id, Some(&method), 429, start, "");
             return;
@@ -797,7 +834,7 @@ fn handle_request(
     let idempotency_key = if required_idempotent(&program, service_name, rpc_name) { extract_idempotency_key(&request) } else { None };
     if let Some(key) = &idempotency_key {
         let request_hash = hash_request_body(&body);
-        match idempotency_store.lookup(service_name, rpc_name, key, &request_hash) {
+        match idempotency_store.lock().lookup(service_name, rpc_name, key, &request_hash) {
             Lookup::Hit { status, body: cached_body, content_type } => {
                 let _ = request.respond(cors_response_with_type(status, cached_body, &content_type, &cors_headers, None, None));
                 log_done_with_audit(log, req_id, Some(&method), status, start, "idempotent=\"replayed\"", auth_audit.as_ref());
@@ -827,7 +864,7 @@ fn handle_request(
     let cache_ttl = required_cache(&program, service_name, rpc_name);
     let cache_key = cache_ttl.map(|_| args_json.to_string());
     if let (Some(_), Some(key)) = (cache_ttl, &cache_key) {
-        if let Some((status, body, content_type)) = cache_store.get(service_name, rpc_name, key) {
+        if let Some((status, body, content_type)) = cache_store.lock().get(service_name, rpc_name, key) {
             let _ = request.respond(cors_response_with_type(status, body, &content_type, &cors_headers, None, None));
             log_done_with_audit(log, req_id, Some(&method), status, start, "cache=\"hit\"", auth_audit.as_ref());
             db.clear_request_context();
@@ -846,7 +883,7 @@ fn handle_request(
     if let Some(key) = &idempotency_key {
         if (200..300).contains(&status) {
             let request_hash = hash_request_body(&body);
-            idempotency_store.store(service_name, rpc_name, key, &request_hash, status, response_body.clone(), response_type.clone());
+            idempotency_store.lock().store(service_name, rpc_name, key, &request_hash, status, response_body.clone(), response_type.clone());
         }
     }
     // `@cache`: mismo criterio de "solo se graba un éxito" que `@idempotent`
@@ -855,7 +892,7 @@ fn handle_request(
     if let (Some(raw_ttl), Some(key)) = (cache_ttl, &cache_key) {
         if (200..300).contains(&status) {
             let ttl = crate::cache::parse_ttl(raw_ttl).expect("check_cache_annotation (checker.rs) ya validó este formato en compilación");
-            cache_store.put(service_name, rpc_name, key, status, response_body.clone(), response_type.clone(), ttl);
+            cache_store.lock().put(service_name, rpc_name, key, status, response_body.clone(), response_type.clone(), ttl);
         }
     }
     // `response_body` en una falla es `{"error": "<mensaje>"}`
@@ -886,7 +923,7 @@ fn handle_request(
     // devuelven ANTES de llegar hasta acá) y un `stream` (spawneado en su
     // propio hilo, nunca pasa por esta línea) no se cuentan -- ver la nota
     // completa en GRAMMAR.md §3.149 para el porqué de cada uno.
-    metrics_store.record(&method, start.elapsed());
+    metrics_store.lock().record(&method, start.elapsed());
     log_done_with_audit(log, req_id, Some(&method), status, start, &extra, auth_audit.as_ref());
     // Defensa en profundidad, no carga estructural: el `set_request_context`
     // de arriba ya garantiza que la PRÓXIMA request nunca ve el contexto de

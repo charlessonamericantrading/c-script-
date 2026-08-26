@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.114.0] - 2026-08-26
+
+### ✨ Nuevo
+- **`linkc serve` pasa de un solo hilo a un hilo real por request -- Pilar 1 de un roadmap de concurrencia mayor.** Propuesto por skynet-d3 a nombre del usuario, evaluado por escrito antes de escribir una línea de código (dos caminos comparados: reescritura completa a `tokio`/`async`, descartada por el "function coloring" que propagaría `async fn` por todo el intérprete; hilo-por-request con candado reentrante sobre la conexión, elegido por su riesgo mucho más acotado) y arrancado con autorización explícita del usuario sobre esa propuesta.
+- Cada request ahora corre en su propio `std::thread::spawn`, con `Db`/`Program`/`SessionStore`/route table compartidos vía `Arc` y cada store mutable (rate limiter, idempotency, cache, métricas) vía `Arc<parking_lot::Mutex<...>>`.
+- La conexión SQL usa `parking_lot::ReentrantMutex` a propósito -- `transaction{}` mantiene el candado tomado durante BEGIN+cuerpo+COMMIT/ROLLBACK, y el cuerpo vuelve a pedir el mismo candado en cada operación individual; un `Mutex` no reentrante se autobloquearía en el mismo hilo. Estado genuinamente por-request (contexto de la request actual, overrides de status/location de `response`) pasa a `thread_local!` en vez de forzarse a un `Mutex` compartido.
+- `Checker::in_stream_body`/`in_transaction`/`hover_result` (embebidos en `Db` para resolución de tipos en runtime) se convirtieron con primitivos de `std::sync`, no `parking_lot` -- `checker.rs` sigue compilando a `wasm32-unknown-unknown` sin el feature `runtime`.
+- Verificado con dos tests permanentes de concurrencia real (`std::thread::spawn`, estables en 5 corridas): 40 inserts concurrentes nunca pierden ni duplican una fila; 40 `transaction{}` concurrentes sobre la misma fila nunca pierden un update. Verificación manual contra `linkc serve` real (SQLite y Postgres) confirma la ganancia de paralelismo motivadora: 5 llamadas HTTP lentas de 2s, 11.3s en secuencial vs. 2.3s concurrentes.
+- Pilares 2 (FFI tipado a crates de Rust) y 3 (sistema de módulos/paquetes) quedan explícitamente pendientes de su propio discovery. Ver GRAMMAR.md §3.158, PLAN.md §9.2.
+
 ## [1.113.0] - 2026-08-26
 
 ### 🐛 Arreglado

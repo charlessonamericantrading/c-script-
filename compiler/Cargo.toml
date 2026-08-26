@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.113.0"
+version = "1.114.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -34,6 +34,7 @@ runtime = [
     "dep:rustls",
     "dep:tokio-postgres-rustls",
     "dep:lettre",
+    "dep:parking_lot",
 ]
 
 [dependencies]
@@ -58,6 +59,17 @@ argon2 = { version = "0.5", optional = true }
 getrandom = { version = "0.2", optional = true }
 subtle = { version = "2", optional = true }
 postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }
+# Pilar 1 del roadmap de concurrencia (propuesto a partir del pedido de
+# skynet-d3, 26/08/2026): `linkc serve` pasa de un hilo/una request a la vez
+# a un hilo por request, con la conexión real (SQLite o Postgres) detrás de
+# UN candado reentrante -- reentrante porque `transaction { }` necesita
+# sostenerlo por TODA su duración (BEGIN + cuerpo + COMMIT/ROLLBACK), y el
+# cuerpo llama de vuelta a operaciones (`insert`/`applyPatch`/etc.) que
+# también lo piden; un `std::sync::Mutex` común haría deadlock del hilo
+# consigo mismo en ese caso. Ya era dependencia transitiva (via otras
+# crates) -- agregarla como directa no suma peso real al binario. Sin
+# alternativa razonable en std: `std::sync::Mutex` no es reentrante.
+parking_lot = { version = "0.12", optional = true }
 hmac = { version = "0.12", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring", "webpki-roots"], optional = true }

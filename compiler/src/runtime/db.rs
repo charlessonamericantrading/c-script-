@@ -702,11 +702,13 @@ pub struct Db {
     /// del `Type::Struct` de esa colección al abrir la conexión.
     columns: HashMap<String, Vec<ColumnPlan>>,
     /// Suscriptores activos por colección, para push real (GRAMMAR.md
-    /// §3.16). `RefCell`, no `Mutex` -- por la MISMA razón que ya vale para
-    /// `SessionStore`: esto solo se toca desde el hilo principal
-    /// (`Db::call`/`Db::subscribe`), nunca desde ningún hilo escritor (que
-    /// solo recibe el `Receiver`, ya extraído, nunca vuelve a tocar `Db`).
-    subscribers: RefCell<HashMap<String, Vec<SyncSender<serde_json::Value>>>>,
+    /// §3.16). `Mutex`, no `RefCell` -- Pilar 1 del roadmap de concurrencia
+    /// (26/08/2026): con un hilo por request (`runtime/server.rs`), dos
+    /// requests pueden tocar esto AL MISMO TIEMPO de verdad (una
+    /// suscribiéndose, otra publicando). Nunca se toca desde ningún hilo
+    /// escritor de stream (que solo recibe el `Receiver`, ya extraído,
+    /// nunca vuelve a tocar `Db`) -- solo desde hilos de request.
+    subscribers: parking_lot::Mutex<HashMap<String, Vec<SyncSender<serde_json::Value>>>>,
     /// Cola ACOTADA de `NOTIFY` que fallaron por un motivo TRANSITORIO
     /// (conexión caída -- nunca el caso "payload de más de 8000 bytes",
     /// que jamás se arregla solo reintentando, GRAMMAR.md §3.150). Un
@@ -717,7 +719,7 @@ pub struct Db {
     /// `REMOTE_CHANGE_POLL_INTERVAL`). Acotada (`MAX_PENDING_NOTIFY_RETRIES`)
     /// -- descarta la más VIEJA al llenarse, nunca crece sin límite si la
     /// base queda caída por mucho tiempo.
-    pending_notify_retries: RefCell<std::collections::VecDeque<(String, serde_json::Value)>>,
+    pending_notify_retries: parking_lot::Mutex<std::collections::VecDeque<(String, serde_json::Value)>>,
     /// Conteo de payloads NOTIFY descartados por superar
     /// `MAX_NOTIFY_PAYLOAD_BYTES`, por colección -- landmine encontrado en
     /// un barrido de "límites honestos" (GRAMMAR.md §3.44/§3.150): antes de
@@ -728,7 +730,7 @@ pub struct Db {
     /// `/metrics` (§3.149) como `linkc_notify_oversized_dropped_total`, el
     /// mismo lugar que un operador YA está mirando para latencia/conteo de
     /// requests -- no un canal de alertas nuevo.
-    oversized_notify_drops: RefCell<HashMap<String, u64>>,
+    oversized_notify_drops: parking_lot::Mutex<HashMap<String, u64>>,
     /// `None` = no hay ninguna `transaction { ... }` abierta ahora mismo
     /// (comportamiento de siempre: `publish()` entrega de inmediato).
     /// `Some(vec)` = hay una transacción abierta -- `publish()` encola acá
@@ -736,31 +738,7 @@ pub struct Db {
     /// `rollback_transaction` la vacíen o la descarten (GRAMMAR.md §3.154).
     /// `Option` en vez de un `bool` aparte + un `Vec` siempre vivo: un solo
     /// campo no puede quedar desincronizado del otro por accidente.
-    transaction_pending_publishes: RefCell<Option<Vec<(String, serde_json::Value)>>>,
-    /// Contexto de LA request HTTP que está invocando un rpc ahora mismo --
-    /// body crudo + headers, para `request.rawBody()`/`request.header()`
-    /// (GRAMMAR.md §3.38). `server.rs` lo fija justo antes de invocar el rpc
-    /// y lo limpia apenas termina; nunca sobrevive entre requests. Vive acá
-    /// -- no como un parámetro nuevo enhebrado por las ~11 firmas que ya
-    /// cargan `db`/`sessions`/`current_token` -- por el mismo motivo que
-    /// `subscribers` vive acá: `db: &Db` ya está disponible en CUALQUIER
-    /// punto del árbol de evaluación (`call_method`, `eval_expr`, ...), así
-    /// que sumar un campo acá es aditivo puro, sin tocar ninguna firma
-    /// existente. `RefCell`, mismo criterio de siempre: un solo hilo.
-    current_request: RefCell<Option<RequestContext>>,
-    /// `response.setStatus(code)` (GRAMMAR.md §3.46) para ESTA request --
-    /// mismo criterio que `current_request` (vive acá para no enhebrar un
-    /// parámetro nuevo por todas las firmas que ya cargan `db`), pero al
-    /// revés: la escribe el CUERPO del rpc, la lee `server.rs` una sola vez
-    /// después de que `invoke_rpc` vuelve con éxito. `Cell`, no `RefCell`
-    /// -- `Option<u16>` es `Copy`, no hace falta pedir prestado nada.
-    response_status_override: std::cell::Cell<Option<u16>>,
-    /// `response.redirect(url, permanent)` (GRAMMAR.md §3.111) -- mismo
-    /// mecanismo y mismo ciclo de vida que `response_status_override`
-    /// (escrito por el cuerpo del rpc, leído UNA vez por `server.rs` tras
-    /// un éxito, limpiado en `clear_request_context`), pero `RefCell`
-    /// -- a diferencia de `Option<u16>`, `Option<String>` no es `Copy`.
-    response_location_override: RefCell<Option<String>>,
+    transaction_pending_publishes: parking_lot::Mutex<Option<Vec<(String, serde_json::Value)>>>,
     /// Id aleatorio de ESTA instancia del proceso -- solo tiene sentido con
     /// Postgres (GRAMMAR.md §3.44): va adentro de cada `NOTIFY` para que el
     /// hilo de LISTEN de esta MISMA instancia pueda reconocer y descartar
@@ -772,24 +750,31 @@ pub struct Db {
     /// sobreescribe UNA vez al arrancar, según `--argon2-memory-kib`/
     /// `--argon2-iterations` (o sus env vars). Vive acá -- no como un
     /// parámetro nuevo enhebrado por `call_method`/`eval_expr`/... -- mismo
-    /// motivo que `current_request`/`response_status_override`: `db: &Db`
-    /// ya está disponible en cualquier punto del árbol de evaluación.
+    /// motivo que `subscribers`: `db: &Db` ya está disponible en cualquier
+    /// punto del árbol de evaluación. `RwLock`, no `Mutex` -- se ESCRIBE
+    /// una sola vez al arrancar (antes de aceptar la primera request) y se
+    /// LEE en cada `crypto.hashPassword`, desde cualquier hilo de request
+    /// (Pilar 1 del roadmap de concurrencia, 26/08/2026) -- muchos
+    /// lectores concurrentes no necesitan turnarse entre sí.
     /// `verifyPassword` NO lo necesita: el formato PHC embebe sus propios
     /// `m`/`t`/`p` en el hash guardado, así que verificar un hash viejo con
     /// otros parámetros sigue funcionando sin tocar esto.
-    argon2_params: RefCell<argon2::Params>,
+    argon2_params: parking_lot::RwLock<argon2::Params>,
     /// Timeout de `http.get`/`post`/`getWithHeaders`/etc. (GRAMMAR.md
     /// §3.86): mismo criterio EXACTO que `argon2_params` de arriba (vive
     /// acá, no como parámetro enhebrado, porque `db: &Db` ya llega a
-    /// `call_method`). `ureq` (crate) NO tiene timeout de lectura/escritura
-    /// por default -- solo 30s de timeout de CONEXIÓN -- así que sin esto
-    /// una request saliente a un servidor lento o colgado bloqueaba el
-    /// intérprete (de un solo hilo, GRAMMAR.md §3.13) para SIEMPRE, sin
-    /// límite: ninguna otra request, de ningún cliente, se atendía mientras
-    /// tanto. `server.rs` lo sobreescribe UNA vez al arrancar según
+    /// `call_method`; `RwLock` por el mismo motivo -- escrito una vez,
+    /// leído desde cualquier hilo de request). `ureq` (crate) NO tiene
+    /// timeout de lectura/escritura por default -- solo 30s de timeout de
+    /// CONEXIÓN -- así que sin esto una request saliente a un servidor
+    /// lento o colgado bloqueaba TODO el intérprete cuando corría en un
+    /// solo hilo (GRAMMAR.md §3.13) -- con un hilo por request (Pilar 1),
+    /// ahora solo bloquea AL HILO de esa request puntual, pero el timeout
+    /// sigue siendo la defensa real contra un servidor externo que nunca
+    /// responde. `server.rs` lo sobreescribe UNA vez al arrancar según
     /// `--http-timeout`/`LINK_HTTP_TIMEOUT` (o su default, ver
     /// `main.rs::resolve_http_timeout`).
-    http_timeout: RefCell<Duration>,
+    http_timeout: parking_lot::RwLock<Duration>,
     /// Nombre de colección -> nombre del campo `@softDelete`, si esa
     /// colección tiene uno (GRAMMAR.md §3.78). Se calcula UNA vez al abrir
     /// la conexión (acá SÍ hay `Program`/`ast::Field` con anotaciones a
@@ -860,9 +845,32 @@ fn random_instance_id() -> String {
     }
 }
 
-/// Ver la doc de `Db::current_request`. Dos structs (no una tupla) porque
-/// `runtime/server.rs` construye esto con nombres de campo, más legible que
-/// posiciones.
+thread_local! {
+    /// Contexto de LA request HTTP que está invocando un rpc AHORA MISMO en
+    /// ESTE hilo -- body crudo + headers, para `request.rawBody()`/
+    /// `request.header()` (GRAMMAR.md §3.38). `thread_local!`, no un campo
+    /// de `Db` -- Pilar 1 del roadmap de concurrencia (26/08/2026): con un
+    /// hilo por request (`runtime/server.rs`), cada request corre en SU
+    /// PROPIO hilo de punta a punta, así que "el contexto de la request
+    /// actual" es exactamente lo que un `thread_local!` modela -- cada
+    /// hilo ve su propia copia, sin ningún candado ni riesgo de que la
+    /// request A lea el contexto que la request B (en otro hilo) está
+    /// escribiendo a la vez. `server.rs` lo fija justo antes de invocar el
+    /// rpc y lo limpia apenas termina, igual que antes.
+    static CURRENT_REQUEST: RefCell<Option<RequestContext>> = const { RefCell::new(None) };
+    /// `response.setStatus(code)` (GRAMMAR.md §3.46) para la request de
+    /// ESTE hilo -- mismo criterio que `CURRENT_REQUEST` de arriba. La
+    /// escribe el CUERPO del rpc, la lee `server.rs` una sola vez después
+    /// de que `invoke_rpc` vuelve con éxito, en el MISMO hilo.
+    static RESPONSE_STATUS_OVERRIDE: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+    /// `response.redirect(url, permanent)` (GRAMMAR.md §3.111) -- mismo
+    /// mecanismo y mismo ciclo de vida que `RESPONSE_STATUS_OVERRIDE`.
+    static RESPONSE_LOCATION_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Ver la doc de `CURRENT_REQUEST` (arriba). Dos structs (no una tupla)
+/// porque `runtime/server.rs` construye esto con nombres de campo, más
+/// legible que posiciones.
 pub(crate) struct RequestContext {
     pub raw_body: String,
     /// (nombre, valor) tal como llegaron -- la búsqueda por nombre
@@ -1096,20 +1104,17 @@ impl Db {
         let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
 
         Db {
-            backend: Backend::Sqlite(connection),
+            backend: Backend::Sqlite(parking_lot::ReentrantMutex::new(connection)),
             checker,
             simple_enums,
             columns,
-            subscribers: RefCell::new(HashMap::new()),
-            pending_notify_retries: RefCell::new(std::collections::VecDeque::new()),
-            oversized_notify_drops: RefCell::new(HashMap::new()),
-            transaction_pending_publishes: RefCell::new(None),
-            current_request: RefCell::new(None),
-            response_status_override: std::cell::Cell::new(None),
-            response_location_override: RefCell::new(None),
+            subscribers: parking_lot::Mutex::new(HashMap::new()),
+            pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+            oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
+            transaction_pending_publishes: parking_lot::Mutex::new(None),
             instance_id: random_instance_id(),
-            argon2_params: RefCell::new(argon2::Params::default()),
-            http_timeout: RefCell::new(DEFAULT_HTTP_TIMEOUT),
+            argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
+            http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
             soft_delete_fields,
         }
     }
@@ -1150,7 +1155,8 @@ impl Db {
         let simple_enums = simple_enum_names(program);
 
         let client = connect_postgres_client(url)?;
-        let backend = Backend::Postgres { client: std::cell::RefCell::new(client), url: url.to_string() };
+        let backend =
+            Backend::Postgres { client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)), url: url.to_string() };
 
         let checks_by_collection = check_fields_by_collection(program, &checker);
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
@@ -1240,16 +1246,13 @@ impl Db {
                 checker,
                 simple_enums,
                 columns,
-                subscribers: RefCell::new(HashMap::new()),
-                pending_notify_retries: RefCell::new(std::collections::VecDeque::new()),
-                oversized_notify_drops: RefCell::new(HashMap::new()),
-                transaction_pending_publishes: RefCell::new(None),
-                current_request: RefCell::new(None),
-                response_status_override: std::cell::Cell::new(None),
-                response_location_override: RefCell::new(None),
+                subscribers: parking_lot::Mutex::new(HashMap::new()),
+                pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+                oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
+                transaction_pending_publishes: parking_lot::Mutex::new(None),
                 instance_id,
-                argon2_params: RefCell::new(argon2::Params::default()),
-                http_timeout: RefCell::new(DEFAULT_HTTP_TIMEOUT),
+                argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
+                http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
                 soft_delete_fields,
             },
             remote_rx,
@@ -1274,7 +1277,7 @@ impl Db {
     /// `--argon2-memory-kib`/`--argon2-iterations` (o sus env vars). Nunca se
     /// vuelve a llamar durante la vida del servidor.
     pub(crate) fn set_argon2_params(&self, params: argon2::Params) {
-        *self.argon2_params.borrow_mut() = params;
+        *self.argon2_params.write() = params;
     }
 
     /// Los parámetros de costo configurados -- los lee `crypto.hashPassword`
@@ -1283,21 +1286,21 @@ impl Db {
     /// proyecto no usa), así que clona en vez de prestar: el costo es
     /// insignificante comparado con el propio hasheo (~15ms, §3.34).
     pub(crate) fn argon2_params(&self) -> argon2::Params {
-        self.argon2_params.borrow().clone()
+        self.argon2_params.read().clone()
     }
 
     /// Timeout de `http.*` para lo que quede de vida del proceso (GRAMMAR.md
     /// §3.86) -- mismo criterio que `set_argon2_params`: `server.rs` lo
     /// llama UNA sola vez, antes de aceptar la primera request.
     pub(crate) fn set_http_timeout(&self, timeout: Duration) {
-        *self.http_timeout.borrow_mut() = timeout;
+        *self.http_timeout.write() = timeout;
     }
 
     /// El timeout configurado -- lo lee cada llamada a `http.get`/`post`/
     /// `getWithHeaders`/etc. en `runtime/mod.rs`. `Duration` es `Copy`, así
     /// que esto no necesita clonar nada.
     pub(crate) fn http_timeout(&self) -> Duration {
-        *self.http_timeout.borrow()
+        *self.http_timeout.read()
     }
 
     /// Fixture SOLO para tests y para el demo wasm (`bin/wasm_demo.rs`) --
@@ -1432,7 +1435,7 @@ db { users: User[] }
     /// sobre-reportar temporalmente hasta esa próxima escritura; no hay
     /// forma de saber que un cliente se fue sin intentar escribirle.
     pub fn subscriber_counts(&self) -> Vec<(String, usize)> {
-        self.subscribers.borrow().iter().map(|(collection, txs)| (collection.clone(), txs.len())).collect()
+        self.subscribers.lock().iter().map(|(collection, txs)| (collection.clone(), txs.len())).collect()
     }
 
     /// GRAMMAR.md §3.44/§3.150: cuántos payloads NOTIFY se descartaron por
@@ -1440,29 +1443,36 @@ db { users: User[] }
     /// el proceso -- expuesto en `/metrics` para que este landmine deje de
     /// depender de que alguien lea stderr.
     pub fn oversized_notify_drop_counts(&self) -> Vec<(String, u64)> {
-        self.oversized_notify_drops.borrow().iter().map(|(collection, count)| (collection.clone(), *count)).collect()
+        self.oversized_notify_drops.lock().iter().map(|(collection, count)| (collection.clone(), *count)).collect()
     }
 
-    /// Ver la doc de `Db::current_request` (arriba). Llamado por
-    /// `server.rs` una vez por request, justo antes de invocar el rpc.
+    /// Ver la doc de `CURRENT_REQUEST` (`thread_local!`, arriba). Llamado
+    /// por `server.rs` una vez por request, justo antes de invocar el rpc
+    /// -- en el hilo QUE VA A MANEJAR esa request, así que queda en el
+    /// `thread_local!` correcto sin que `set_request_context` necesite
+    /// saber en qué hilo está (siempre es "el actual").
     pub(crate) fn set_request_context(&self, ctx: RequestContext) {
-        *self.current_request.borrow_mut() = Some(ctx);
+        CURRENT_REQUEST.with(|c| *c.borrow_mut() = Some(ctx));
     }
 
     /// Simétrico de `set_request_context` -- `server.rs` lo llama apenas
     /// termina de manejar la request, para que `request.rawBody()`/
     /// `request.header()` nunca puedan filtrar datos de una request anterior
-    /// hacia otra (ej. si algún día se reusa un `Db` entre requests de
-    /// formas que hoy no se dan, pero que esto deja imposibles por
-    /// construcción en vez de "porque nadie se olvidó de limpiar").
+    /// hacia otra EN EL MISMO HILO (el pool de hilos de request, GRAMMAR.md
+    /// §3.13/Pilar 1, reusa hilos entre requests -- sin este clear, el
+    /// contexto de una request vieja podría sobrevivir en el `thread_local!`
+    /// de un hilo reciclado hasta que algo lo pisara).
     pub(crate) fn clear_request_context(&self) {
-        *self.current_request.borrow_mut() = None;
+        CURRENT_REQUEST.with(|c| *c.borrow_mut() = None);
         // Defensa en profundidad simétrica a la de arriba -- si un rpc
         // llamó `response.setStatus` y DESPUÉS erró/panicó (así que
         // `handle_rpc` nunca llegó a consumirlo con `take_response_status`),
-        // esto evita que el valor sobreviva para la PRÓXIMA request.
-        self.response_status_override.set(None);
-        self.response_location_override.borrow_mut().take();
+        // esto evita que el valor sobreviva para la PRÓXIMA request en ESE
+        // hilo (mismo motivo del reciclado de hilos de arriba).
+        RESPONSE_STATUS_OVERRIDE.with(|c| c.set(None));
+        RESPONSE_LOCATION_OVERRIDE.with(|c| {
+            c.borrow_mut().take();
+        });
     }
 
     /// Llamado por `response.setStatus(code)` (GRAMMAR.md §3.46) -- guarda
@@ -1472,15 +1482,14 @@ db { users: User[] }
     /// que le corresponde a la falla, nunca con uno que el cuerpo haya
     /// pedido antes de fallar).
     pub(crate) fn set_response_status(&self, code: u16) {
-        self.response_status_override.set(Some(code));
+        RESPONSE_STATUS_OVERRIDE.with(|c| c.set(Some(code)));
     }
 
     /// Consume el override (lo deja en `None` para la próxima invocación) --
     /// `take`, no `get`, para que un valor de UNA request nunca sobreviva
-    /// por accidente a la que sigue si algún día `Db` se reusara de una
-    /// forma que hoy no pasa.
+    /// por accidente a la que sigue en el mismo hilo reciclado.
     pub(crate) fn take_response_status(&self) -> Option<u16> {
-        self.response_status_override.take()
+        RESPONSE_STATUS_OVERRIDE.with(|c| c.take())
     }
 
     /// Llamado por `response.redirect(url, permanent)` (GRAMMAR.md
@@ -1490,12 +1499,12 @@ db { users: User[] }
     /// llama a `set_response_status` con 301/302, así que las dos piezas
     /// siempre viajan juntas).
     pub(crate) fn set_response_location(&self, url: String) {
-        *self.response_location_override.borrow_mut() = Some(url);
+        RESPONSE_LOCATION_OVERRIDE.with(|c| *c.borrow_mut() = Some(url));
     }
 
     /// Simétrico de `take_response_status`.
     pub(crate) fn take_response_location(&self) -> Option<String> {
-        self.response_location_override.borrow_mut().take()
+        RESPONSE_LOCATION_OVERRIDE.with(|c| c.borrow_mut().take())
     }
 
     /// `""` -- no `None` -- fuera de una request HTTP real (ej. invocado
@@ -1507,14 +1516,15 @@ db { users: User[] }
     /// útil -- distinto de `current_request_header`, donde "el header no
     /// vino" sí es una distinción real que el caller necesita poder ver.
     pub(crate) fn current_request_body(&self) -> String {
-        self.current_request.borrow().as_ref().map(|c| c.raw_body.clone()).unwrap_or_default()
+        CURRENT_REQUEST.with(|c| c.borrow().as_ref().map(|c| c.raw_body.clone()).unwrap_or_default())
     }
 
     pub(crate) fn current_request_header(&self, name: &str) -> Option<String> {
-        self.current_request
-            .borrow()
-            .as_ref()
-            .and_then(|c| c.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone()))
+        CURRENT_REQUEST.with(|c| {
+            c.borrow()
+                .as_ref()
+                .and_then(|c| c.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone()))
+        })
     }
 
     pub fn call(&self, collection: &str, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
@@ -1717,7 +1727,7 @@ db { users: User[] }
         let snapshot: Vec<serde_json::Value> =
             self.select_rows(collection, columns, None)?.iter().map(|v| value_to_json(v, &self.simple_enums)).collect();
         let (tx, rx) = mpsc::sync_channel(LIVE_STREAM_BUFFER);
-        self.subscribers.borrow_mut().entry(collection.to_string()).or_default().push(tx);
+        self.subscribers.lock().entry(collection.to_string()).or_default().push(tx);
         Ok((snapshot, rx))
     }
 
@@ -1744,7 +1754,7 @@ db { users: User[] }
     /// orden; el rollback la descarta entera, sin publicar nada.
     fn publish(&self, collection: &str, row: &Value) {
         let json = value_to_json(row, &self.simple_enums);
-        if let Some(pending) = self.transaction_pending_publishes.borrow_mut().as_mut() {
+        if let Some(pending) = self.transaction_pending_publishes.lock().as_mut() {
             pending.push((collection.to_string(), json));
             return;
         }
@@ -1752,6 +1762,19 @@ db { users: User[] }
         if self.backend.is_postgres() {
             self.notify_remote(collection, &json);
         }
+    }
+
+    /// GRAMMAR.md §3.154, Pilar 1 del roadmap de concurrencia (26/08/2026):
+    /// sostiene el candado REENTRANTE de la conexión física por toda la
+    /// duración de `f` -- `Expr::Transaction` (`runtime/mod.rs`) envuelve
+    /// acá `begin_transaction` + el `eval_block` del cuerpo + `commit_
+    /// transaction`/`rollback_transaction`, como UNA sola sección
+    /// exclusiva, para que ningún otro hilo (otra request) pueda intercalar
+    /// una escritura suya en la MISMA conexión a mitad de esta transacción.
+    /// Las llamadas de adentro (`db.<c>.insert(...)`, etc.) piden este
+    /// mismo candado por su cuenta -- reentrante, así que no hay deadlock.
+    pub(crate) fn with_exclusive_connection<T>(&self, f: impl FnOnce() -> T) -> T {
+        self.backend.with_exclusive(f)
     }
 
     /// GRAMMAR.md §3.154: arranca la transacción SQL real detrás de un
@@ -1774,13 +1797,13 @@ db { users: User[] }
     /// que el checker ya usa para el caso sintáctico, para el caso que el
     /// checker estructuralmente no puede atrapar.
     pub(crate) fn begin_transaction(&self) -> Result<(), String> {
-        if self.transaction_pending_publishes.borrow().is_some() {
+        if self.transaction_pending_publishes.lock().is_some() {
             return Err(
                 "ya hay una transacción abierta en esta misma ejecución -- 'transaction { }' no admite anidamiento, ni siquiera a través de una función auxiliar que abre su propia transacción (GRAMMAR.md §3.154)".to_string(),
             );
         }
         self.backend.execute_ddl("BEGIN")?;
-        *self.transaction_pending_publishes.borrow_mut() = Some(Vec::new());
+        *self.transaction_pending_publishes.lock() = Some(Vec::new());
         Ok(())
     }
 
@@ -1792,7 +1815,7 @@ db { users: User[] }
     /// entregar nada -- un `COMMIT` fallido es, a todo efecto, un rollback.
     pub(crate) fn commit_transaction(&self) -> Result<(), String> {
         self.backend.execute_ddl("COMMIT")?;
-        let pending = self.transaction_pending_publishes.borrow_mut().take().unwrap_or_default();
+        let pending = self.transaction_pending_publishes.lock().take().unwrap_or_default();
         for (collection, json) in pending {
             self.deliver_local(&collection, &json);
             if self.backend.is_postgres() {
@@ -1813,7 +1836,7 @@ db { users: User[] }
         if let Err(e) = self.backend.execute_ddl("ROLLBACK") {
             eprintln!("aviso: 'ROLLBACK' de una transacción falló ({e}) -- probablemente la conexión ya se había cerrado, en cuyo caso la base ya descartó la transacción por su cuenta");
         }
-        *self.transaction_pending_publishes.borrow_mut() = None;
+        *self.transaction_pending_publishes.lock() = None;
     }
 
     /// Reinyecta LOCAL un cambio que anunció OTRA instancia (drenado del
@@ -1827,7 +1850,7 @@ db { users: User[] }
     }
 
     fn deliver_local(&self, collection: &str, json: &serde_json::Value) {
-        let mut subs = self.subscribers.borrow_mut();
+        let mut subs = self.subscribers.lock();
         if let Some(list) = subs.get_mut(collection) {
             // `try_send` -- NUNCA bloqueante: publicar no puede colgar el
             // único hilo que atiende todas las requests, ni siquiera si un
@@ -1851,7 +1874,7 @@ db { users: User[] }
         // tiempo. El payload de más de 8000 bytes NUNCA llega hasta acá --
         // `try_notify_remote` lo descarta con su propio aviso, sin encolar
         // nada (reintentarlo no lo arreglaría).
-        let mut queue = self.pending_notify_retries.borrow_mut();
+        let mut queue = self.pending_notify_retries.lock();
         if queue.len() >= MAX_PENDING_NOTIFY_RETRIES {
             queue.pop_front();
         }
@@ -1878,7 +1901,7 @@ db { users: User[] }
                  ({MAX_NOTIFY_PAYLOAD_BYTES}) -- no se propaga a otras instancias (GRAMMAR.md §3.44)",
                 payload.len()
             );
-            *self.oversized_notify_drops.borrow_mut().entry(collection.to_string()).or_insert(0) += 1;
+            *self.oversized_notify_drops.lock().entry(collection.to_string()).or_insert(0) += 1;
             return true;
         }
         match self.backend.notify(REMOTE_CHANGE_CHANNEL, &payload) {
@@ -1896,10 +1919,10 @@ db { users: User[] }
     /// timer nuevo. Los que salen bien se sacan de la cola; los que vuelven
     /// a fallar quedan para el próximo tick, en el mismo orden (FIFO).
     pub(crate) fn flush_pending_notify_retries(&self) {
-        let pending: Vec<(String, serde_json::Value)> = self.pending_notify_retries.borrow_mut().drain(..).collect();
+        let pending: Vec<(String, serde_json::Value)> = self.pending_notify_retries.lock().drain(..).collect();
         for (collection, json) in pending {
             if !self.try_notify_remote(&collection, &json) {
-                self.pending_notify_retries.borrow_mut().push_back((collection, json));
+                self.pending_notify_retries.lock().push_back((collection, json));
             }
         }
     }
@@ -2588,6 +2611,20 @@ fn scalar_cell_to_value(ty: &Type, cell: &Cell) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Invariante de arquitectura para el Pilar 1 del roadmap de
+    /// concurrencia (26/08/2026): `runtime/server.rs` comparte `Db` entre
+    /// hilos de request vía `Arc<Db>`, lo que requiere `Db: Sync` (y
+    /// `Send`, para poder construirlo en un hilo y usarlo desde otro). Si
+    /// algún cambio futuro reintroduce un campo no-`Sync` (un `RefCell`
+    /// suelto, por ejemplo) esto falla en COMPILACIÓN, no en runtime -- la
+    /// señal más barata posible de que se rompió la premisa de la que
+    /// depende todo el modelo de un-hilo-por-request.
+    #[test]
+    fn db_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Db>();
+    }
 
     #[test]
     fn parse_remote_notification_decodes_a_well_formed_payload_from_another_instance() {

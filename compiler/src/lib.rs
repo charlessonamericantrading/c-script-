@@ -48,6 +48,15 @@ pub mod runtime;
 // playground.
 #[cfg(feature = "runtime")]
 pub mod introspect;
+// Bug real preexistente, encontrado verificando el build wasm32 para el
+// Pilar 1 del roadmap de concurrencia (26/08/2026), no introducido por esa
+// ronda: `migrate` "habla PostgreSQL de verdad" (mismo motivo que
+// `runtime`/`introspect` arriba, mismo comentario que el propio módulo ya
+// se hace en su cabecera) pero nunca había quedado detrás de este feature
+// -- `cargo build --no-default-features --target wasm32-unknown-unknown`
+// nunca compiló, sencillamente porque nadie lo había probado (sin
+// verificación de CI para ese target).
+#[cfg(feature = "runtime")]
 pub mod migrate;
 pub mod scaffold;
 pub mod token;

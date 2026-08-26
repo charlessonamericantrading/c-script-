@@ -45,7 +45,7 @@ pub fn dry_run_postgres(program: &Program, url: &str) -> Result<String, String> 
         .collect();
 
     let client = connect_postgres_client(url)?;
-    let backend = Backend::Postgres { client: RefCell::new(client), url: url.to_string() };
+    let backend = Backend::Postgres { client: parking_lot::ReentrantMutex::new(RefCell::new(client)), url: url.to_string() };
     let checks_by_collection = check_fields_by_collection(program, &checker);
     let indexed_by_collection = index_fields_by_collection(program, &checker);
     let composite_unique_by_collection_map = composite_unique_by_collection(program, &checker);

@@ -654,13 +654,14 @@ dependencies = [
 
 [[package]]
 name = "linkc"
-version = "1.113.0"
+version = "1.114.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
  "getrandom 0.2.17",
  "hmac 0.12.1",
  "lettre",
+ "parking_lot",
  "postgres",
  "regex",
  "rusqlite",
