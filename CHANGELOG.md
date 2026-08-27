@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.126.0] - 2026-08-27
+
+### ✨ Nuevo
+**`countWhere`/`findWhere`/`deleteWhere` empujan comparaciones campo-vs-campo a SQL real** (`item.endDate > item.startDate`) -- cierra por completo el ítem 1 de PLAN.md §9.3 (el último hueco que §3.170/v1.125.0 había dejado explícito). Caso motivador: filtrar rangos de fecha inválidos sin traer la tabla entera a memoria.
+
+- Acotado a propósito a los cuatro operadores relacionales (`<`/`<=`/`>`/`>=`) -- `==`/`!=` entre dos campos sigue sin pushear. El checker solo tipa la forma relacional cuando ambos lados son `Int`/`Int64`/`Float`/`Timestamp` sin `Optional`, y un campo no opcional siempre es columna `NOT NULL` -- así que esta forma nunca puede toparse con NULL para una tabla que c-script creó. `==`/`!=` sí permite comparar dos `T?`, donde `NULL = NULL` en SQL no es `true` como en el camino interpretado -- replicarlo habría necesitado `(a IS NULL AND b IS NULL) OR a = b` sin ningún caso real que lo pida, así que queda deliberadamente fuera (cae al camino interpretado, correcto siempre).
+- `ast::PredicateOperand::Field`, `runtime::ConditionExpr::FieldPair` y `db.rs::field_pair_condition_sql` generan `"campoA" OP "campoB"` directo, sin ningún placeholder -- se integra al mismo recorrido recursivo de `&&`/`||` que cualquier otra hoja, sin caso especial adicional.
+
+Verificado con los cuatro operadores, el caso mezclado con una hoja normal adentro de un `&&`, `deleteWhere` empujando la selección, y repetición en vivo contra un `linkc serve` real. Suite completa sin regresiones (1 fallo de test en la corrida completa fue el flake ambiental ya conocido de binding de puerto en Windows bajo paralelismo -- pasa limpio en aislamiento, no relacionado con este cambio). Ver GRAMMAR.md §3.171, PLAN.md §9.3.
+
 ## [1.125.0] - 2026-08-27
 
 ### ✨ Nuevo

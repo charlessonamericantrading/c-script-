@@ -1012,6 +1012,12 @@ fn all_items(db: &Db, coll: &str) -> Result<Vec<Value>, RuntimeError> {
 /// hace falta para preservar la precedencia.
 pub(crate) enum ConditionExpr {
     Leaf(String, BinaryOp, Value),
+    /// `item.campoA OP item.campoB` (GRAMMAR.md §3.171) -- a diferencia de
+    /// `Leaf`, el lado derecho no es un `Value` para bindear como parámetro
+    /// sino OTRA columna de la misma fila: `db.rs` genera `"campoA" OP
+    /// "campoB"` directo, sin placeholder. Solo los cuatro operadores
+    /// relacionales llegan hasta acá -- ver `ast::recognize_predicate_tree`.
+    FieldPair(String, BinaryOp, String),
     And(Vec<ConditionExpr>),
     Or(Vec<ConditionExpr>),
 }
@@ -1030,20 +1036,23 @@ fn recognize_pushable_predicate(f: &Value) -> Option<ConditionExpr> {
 
 fn evaluate_predicate_tree(tree: crate::ast::PredicateExpr, captured_env: &Env) -> Option<ConditionExpr> {
     match tree {
-        crate::ast::PredicateExpr::Leaf(field, op, operand) => {
-            let value = match operand {
-                crate::ast::PredicateOperand::Bool(b) => Value::Bool(b),
-                crate::ast::PredicateOperand::Expr(value_expr) => match &value_expr.node {
+        crate::ast::PredicateExpr::Leaf(field, op, operand) => match operand {
+            crate::ast::PredicateOperand::Field(other_field) => {
+                Some(ConditionExpr::FieldPair(field.to_string(), op, other_field.to_string()))
+            }
+            crate::ast::PredicateOperand::Bool(b) => Some(ConditionExpr::Leaf(field.to_string(), op, Value::Bool(b))),
+            crate::ast::PredicateOperand::Expr(value_expr) => {
+                let value = match &value_expr.node {
                     Expr::Int(n) => Value::Int(*n),
                     Expr::Float(x) => Value::Float(*x),
                     Expr::Str(s) => Value::Str(s.clone()),
                     Expr::Bool(b) => Value::Bool(*b),
                     Expr::Ident(name) => captured_env.get(name.as_str())?.borrow().clone(),
                     _ => return None,
-                },
-            };
-            Some(ConditionExpr::Leaf(field.to_string(), op, value))
-        }
+                };
+                Some(ConditionExpr::Leaf(field.to_string(), op, value))
+            }
+        },
         crate::ast::PredicateExpr::And(items) => {
             Some(ConditionExpr::And(items.into_iter().map(|i| evaluate_predicate_tree(i, captured_env)).collect::<Option<Vec<_>>>()?))
         }
@@ -7592,9 +7601,13 @@ mod tests {
         assert_eq!(arr[0]["productId"], json!(2), "la fila de productId=2 tiene que sobrevivir");
     }
 
-    /// Un predicado NO pusheable (`&&` no aplica, o combina dos campos entre
-    /// sí) tiene que caer al camino interpretado de siempre -- mismo
-    /// resultado, solo más lento.
+    /// Un predicado NO pusheable (§3.171: comparar dos campos entre sí con
+    /// `==`/`!=` -- a diferencia de los cuatro relacionales, que sí se
+    /// empujan) tiene que caer al camino interpretado de siempre -- mismo
+    /// resultado, solo más lento. Este mismo ejemplo usaba `<` hasta que
+    /// §3.171 lo volvió pusheable; ver el comentario en el test hermano de
+    /// `countWhere`/`findWhere` que advierte revisar el ejemplo cada vez que
+    /// el alcance pusheable crece.
     #[test]
     fn delete_where_falls_back_correctly_for_a_non_pushable_predicate() {
         let code = r#"
@@ -7604,12 +7617,13 @@ mod tests {
           rpc add(productId: Int, rating: Int) -> Review {
             db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
           }
-          rpc removeLowRated() -> Int {
-            // Compara dos campos del propio parámetro entre sí -- no tiene
-            // la forma pusheable (`ast::recognize_predicate_expr`
-            // exige que el lado derecho NUNCA referencie al parámetro), así
-            // que cae al camino interpretado a propósito.
-            db.reviews.deleteWhere(|r: Review| { r.rating < r.productId })
+          rpc removeEqualRated() -> Int {
+            // Compara dos campos del propio parámetro entre sí con `==` --
+            // no tiene la forma pusheable (`ast::recognize_predicate_expr`
+            // solo reconoce campo-vs-campo para los cuatro relacionales,
+            // GRAMMAR.md §3.171), así que cae al camino interpretado a
+            // propósito.
+            db.reviews.deleteWhere(|r: Review| { r.rating == r.productId })
           }
           rpc all() -> Review[] { db.reviews.all() }
         }
@@ -7617,15 +7631,48 @@ mod tests {
         let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
         let db = Db::new(&program, std::path::Path::new(":memory:"));
 
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 0}), &db).unwrap(); // 0 < 1: se borra
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 5, "rating": 10}), &db).unwrap(); // 10 < 5: sobrevive
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 1}), &db).unwrap(); // 1 == 1: se borra
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 5, "rating": 10}), &db).unwrap(); // 10 != 5: sobrevive
 
-        let deleted = invoke_rpc(&program, "Reviews", "removeLowRated", &json!({}), &db).unwrap();
+        let deleted = invoke_rpc(&program, "Reviews", "removeEqualRated", &json!({}), &db).unwrap();
         assert_eq!(deleted, json!(1));
         let remaining = invoke_rpc(&program, "Reviews", "all", &json!({}), &db).unwrap();
         let arr = remaining.as_array().unwrap();
         assert_eq!(arr.len(), 1, "{arr:?}");
         assert_eq!(arr[0]["productId"], json!(5));
+    }
+
+    /// GRAMMAR.md §3.171: `deleteWhere` también empuja la SELECCIÓN (no el
+    /// DELETE en sí, que sigue fila por fila a propósito -- ver el
+    /// comentario del brazo `"deleteWhere"` en `call_method`) cuando el
+    /// predicado es una comparación campo-vs-campo.
+    #[test]
+    fn delete_where_pushes_down_the_selection_for_a_field_vs_field_comparison() {
+        let code = r#"
+        type Booking = { id: Int, startDay: Int, endDay: Int }
+        db { bookings: Booking[] }
+        service Bookings {
+          rpc add(startDay: Int, endDay: Int) -> Booking {
+            db.bookings.insert(Booking { id: 0, startDay: startDay, endDay: endDay })
+          }
+          rpc removeInvalidRanges() -> Int {
+            db.bookings.deleteWhere(|b: Booking| { b.endDay <= b.startDay })
+          }
+          rpc all() -> Booking[] { db.bookings.all() }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Bookings", "add", &json!({"startDay": 1, "endDay": 5}), &db).unwrap(); // válido, sobrevive
+        invoke_rpc(&program, "Bookings", "add", &json!({"startDay": 5, "endDay": 3}), &db).unwrap(); // inválido, se borra
+
+        let deleted = invoke_rpc(&program, "Bookings", "removeInvalidRanges", &json!({}), &db).unwrap();
+        assert_eq!(deleted, json!(1));
+        let remaining = invoke_rpc(&program, "Bookings", "all", &json!({}), &db).unwrap();
+        let arr = remaining.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{arr:?}");
+        assert_eq!(arr[0]["startDay"], json!(1));
     }
 
     /// GRAMMAR.md §3.108: `countWhere`/`findWhere` empujan a SQL los cinco
@@ -7670,15 +7717,17 @@ mod tests {
         assert_eq!(rows.as_array().unwrap().len(), 2);
     }
 
-    /// `countWhere`/`findWhere` con un predicado NO pusheable (una
-    /// comparación entre DOS campos del propio parámetro -- GRAMMAR.md
-    /// §9.3 ítem 1, sigue abierto, sin forma de expresar "columna vs.
-    /// columna" en un valor bindeado) siguen dando el resultado correcto
-    /// por el camino interpretado de siempre -- el pushdown de GRAMMAR.md
-    /// §3.95/§3.108/§3.109/§3.170 es un atajo, nunca el único camino. Ni
-    /// `r.rating > 3` solo (§3.108), ni un `&&` de varias hojas (§3.109),
-    /// ni un `||` combinándolas (§3.170) son ya buenos ejemplos de "no
-    /// pusheable" -- el que sigue quedando es comparar dos campos entre sí.
+    /// `countWhere`/`findWhere` con un predicado NO pusheable (§3.171: una
+    /// comparación `==`/`!=` -- a propósito distinta de los cuatro
+    /// relacionales, que SÍ se empujan, ver
+    /// `count_where_and_find_where_push_down_a_field_vs_field_comparison` --
+    /// entre DOS campos del propio parámetro) sigue dando el resultado
+    /// correcto por el camino interpretado de siempre -- el pushdown de
+    /// GRAMMAR.md §3.95/§3.108/§3.109/§3.170/§3.171 es un atajo, nunca el
+    /// único camino. Este mismo ejemplo YA tuvo que reescribirse dos veces
+    /// antes (§3.108, §3.109) porque el alcance pusheable creció -- ver el
+    /// comentario ahí mismo que advierte revisarlo cada vez que vuelve a
+    /// crecer.
     #[test]
     fn count_where_and_find_where_fall_back_correctly_for_a_non_pushable_predicate() {
         let code = r#"
@@ -7688,25 +7737,79 @@ mod tests {
           rpc add(productId: Int, rating: Int) -> Review {
             db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
           }
-          rpc countRatingBelowProductId() -> Int {
-            db.reviews.countWhere(|r: Review| { r.rating < r.productId })
+          rpc countRatingEqualsProductId() -> Int {
+            db.reviews.countWhere(|r: Review| { r.rating == r.productId })
           }
-          rpc listRatingBelowProductId() -> Review[] {
-            db.reviews.findWhere(|r: Review| { r.rating < r.productId })
+          rpc listRatingEqualsProductId() -> Review[] {
+            db.reviews.findWhere(|r: Review| { r.rating == r.productId })
           }
         }
         "#;
         let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
         let db = Db::new(&program, std::path::Path::new(":memory:"));
 
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 5}), &db).unwrap(); // rating(5) NO< productId(1)
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 5, "rating": 1}), &db).unwrap(); // rating(1) < productId(5)
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 2}), &db).unwrap(); // rating(2) NO< productId(2)
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 9, "rating": 3}), &db).unwrap(); // rating(3) < productId(9)
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 5}), &db).unwrap(); // rating(5) != productId(1)
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 5, "rating": 5}), &db).unwrap(); // rating(5) == productId(5)
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 2}), &db).unwrap(); // rating(2) == productId(2)
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 9, "rating": 3}), &db).unwrap(); // rating(3) != productId(9)
 
-        assert_eq!(invoke_rpc(&program, "Reviews", "countRatingBelowProductId", &json!({}), &db).unwrap(), json!(2));
-        let rows = invoke_rpc(&program, "Reviews", "listRatingBelowProductId", &json!({}), &db).unwrap();
+        assert_eq!(invoke_rpc(&program, "Reviews", "countRatingEqualsProductId", &json!({}), &db).unwrap(), json!(2));
+        let rows = invoke_rpc(&program, "Reviews", "listRatingEqualsProductId", &json!({}), &db).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 2);
+    }
+
+    /// GRAMMAR.md §3.171: `countWhere`/`findWhere` empujan a SQL una
+    /// comparación entre DOS campos del propio parámetro (`item.endDate >
+    /// item.startDate`) para los cuatro operadores relacionales -- caso real
+    /// motivador: filtrar rangos de fecha inválidos/válidos sin traer la
+    /// tabla entera. Cubre los dos órdenes (`a < b` reconocido directo,
+    /// también dentro de un `&&` con una hoja normal) y confirma que `==`
+    /// entre dos campos NO toma este camino (test de arriba).
+    #[test]
+    fn count_where_and_find_where_push_down_a_field_vs_field_comparison() {
+        let code = r#"
+        type Booking = { id: Int, room: String, startDay: Int, endDay: Int }
+        db { bookings: Booking[] }
+        service Bookings {
+          rpc add(room: String, startDay: Int, endDay: Int) -> Booking {
+            db.bookings.insert(Booking { id: 0, room: room, startDay: startDay, endDay: endDay })
+          }
+          rpc countInvalidRanges() -> Int {
+            db.bookings.countWhere(|b: Booking| { b.endDay <= b.startDay })
+          }
+          rpc listInvalidRanges() -> Booking[] {
+            db.bookings.findWhere(|b: Booking| { b.endDay <= b.startDay })
+          }
+          // El mismo campo-vs-campo adentro de una conjunción con una hoja
+          // normal -- confirma que el árbol And/Or no se rompe al mezclar
+          // una hoja `FieldPair` con una hoja `Leaf` común.
+          rpc invalidRangesInRoom(room: String) -> Int {
+            db.bookings.countWhere(|b: Booking| { b.room == room && b.endDay <= b.startDay })
+          }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Bookings", "add", &json!({"room": "A", "startDay": 1, "endDay": 5}), &db).unwrap(); // válido
+        invoke_rpc(&program, "Bookings", "add", &json!({"room": "A", "startDay": 5, "endDay": 5}), &db).unwrap(); // inválido (==)
+        invoke_rpc(&program, "Bookings", "add", &json!({"room": "B", "startDay": 9, "endDay": 3}), &db).unwrap(); // inválido (<)
+        invoke_rpc(&program, "Bookings", "add", &json!({"room": "A", "startDay": 2, "endDay": 8}), &db).unwrap(); // válido
+
+        assert_eq!(
+            invoke_rpc(&program, "Bookings", "countInvalidRanges", &json!({}), &db).unwrap(),
+            json!(2),
+            "endDay <= startDay: las reservas 2 y 3"
+        );
+        let rows = invoke_rpc(&program, "Bookings", "listInvalidRanges", &json!({}), &db).unwrap();
+        let ids: Vec<i64> = rows.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![2, 3]);
+
+        assert_eq!(
+            invoke_rpc(&program, "Bookings", "invalidRangesInRoom", &json!({"room": "A"}), &db).unwrap(),
+            json!(1),
+            "solo la reserva 2 (room A, endDay <= startDay) -- la 3 es de room B"
+        );
     }
 
     /// GRAMMAR.md §3.109: `countWhere`/`findWhere` empujan a SQL una

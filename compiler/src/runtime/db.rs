@@ -2109,6 +2109,40 @@ db { users: User[] }
         Some(clause)
     }
 
+    /// `item.campoA OP item.campoB` (GRAMMAR.md §3.171) -- comparación entre
+    /// DOS columnas de la misma fila, sin ningún valor que bindear (a
+    /// diferencia de `leaf_condition_sql`, que siempre liga un placeholder).
+    /// Solo los cuatro operadores relacionales llegan hasta acá
+    /// (`ast::recognize_predicate_tree` ya filtra `==`/`!=` antes). Sin caso
+    /// NULL-seguro que manejar: el checker (checker.rs::synth_binary, brazo
+    /// `Lt | LtEq | Gt | GtEq`) solo tipa esta forma cuando ambos lados son
+    /// Int/Int64/Float/Timestamp SIN envolver en `Optional`, y un campo no
+    /// opcional siempre es `NOT NULL` en la columna real (postgres_emit.rs)
+    /// -- para una tabla creada por c-script, ninguna de las dos columnas
+    /// puede contener NULL nunca. La única excepción teórica es
+    /// `--adopt-existing` sobre datos preexistentes que ya violaban esa
+    /// invariante antes de que c-script tocara la tabla -- fuera de alcance
+    /// acá, documentado como límite honesto en GRAMMAR.md §3.171 (el camino
+    /// interpretado tampoco está libre de sorpresas en ese escenario:
+    /// `row_to_fields` ya falla con un error limpio, no un panic, si
+    /// encuentra un NULL inesperado en una columna no opcional).
+    fn field_pair_condition_sql(&self, columns: &[ColumnPlan], left_field: &str, op: BinaryOp, right_field: &str) -> Option<String> {
+        let sql_op = match op {
+            BinaryOp::Lt => "<",
+            BinaryOp::LtEq => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::GtEq => ">=",
+            // `ast::recognize_predicate_tree` ya filtra a estos cuatro --
+            // cualquier otro operador nunca llega hasta acá.
+            _ => return None,
+        };
+        let pushable = |f: &str| f == "id" || columns.iter().any(|c| c.field.name == f && !c.json);
+        if !pushable(left_field) || !pushable(right_field) {
+            return None;
+        }
+        Some(format!("\"{left_field}\" {sql_op} \"{right_field}\""))
+    }
+
     /// Recorrido recursivo de un `ConditionExpr` (GRAMMAR.md §3.170) a una
     /// cláusula SQL -- `And`/`Or` se traducen a `AND`/`OR` reales, cada
     /// hijo compuesto que sea del tipo CONTRARIO al del padre (un `Or`
@@ -2121,6 +2155,7 @@ db { users: User[] }
     fn condition_expr_sql(&self, columns: &[ColumnPlan], expr: &ConditionExpr, cells: &mut Vec<Cell>) -> Option<String> {
         match expr {
             ConditionExpr::Leaf(field, op, value) => self.leaf_condition_sql(columns, field, *op, value, cells),
+            ConditionExpr::FieldPair(left_field, op, right_field) => self.field_pair_condition_sql(columns, left_field, *op, right_field),
             ConditionExpr::And(items) => {
                 let mut clauses = Vec::with_capacity(items.len());
                 for item in items {

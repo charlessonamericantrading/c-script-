@@ -1115,10 +1115,14 @@ pub fn recognize_group_key_selector<'a>(param_names: &[String], body: &'a Block)
 /// se reconoce como una hoja completa (`item.campo == false`) sin que exista
 /// ningún literal `false` en el código fuente al que apuntar, y lo mismo
 /// para `item.campo` solo (`item.campo == true`) -- por eso esta forma
-/// también admite un booleano SINTETIZADO, no tomado del AST.
+/// también admite un booleano SINTETIZADO, no tomado del AST. `Field` (§3.171)
+/// es el tercer caso: el otro lado no es un valor a bindear sino OTRO campo
+/// del mismo parámetro (`item.endDate > item.startDate`) -- el SQL generado
+/// compara dos columnas entre sí, sin placeholder.
 pub enum PredicateOperand<'a> {
     Expr(&'a Spanned<Expr>),
     Bool(bool),
+    Field(&'a str),
 }
 
 /// Árbol de un predicado pusheable -- GRAMMAR.md §3.95/§3.108/§3.109
@@ -1142,8 +1146,12 @@ pub enum PredicateExpr<'a> {
 /// combinándolas en cualquier profundidad (`item.a == v1 && item.b == v2 ||
 /// item.c == v3`, respetando la precedencia real del lenguaje) --
 /// GRAMMAR.md §3.95 (`==`, v1.59.0), §3.108 (los otros cinco operadores),
-/// §3.109 (conjunción de N hojas), §3.170 (`||`). Incluye `!item.campo`/
-/// `item.campo` sueltos como hojas booleanas. El ÚNICO shape de predicado
+/// §3.109 (conjunción de N hojas), §3.170 (`||`), §3.171 (`item.campoA OP
+/// item.campoB`, los cuatro relacionales solamente -- ver el comentario en
+/// el brazo `Lt | LtEq | Gt | GtEq` de este mismo reconocedor para por qué
+/// `==`/`!=` entre dos campos queda deliberadamente afuera). Incluye
+/// `!item.campo`/`item.campo` sueltos como hojas booleanas. El ÚNICO shape
+/// de predicado
 /// que `countWhere`/`findWhere`/`upsert` (su `matchFn`) empujan a SQL en
 /// vez de traer la colección entera a memoria y evaluar el predicado fila
 /// por fila. Cada hoja trae el nombre del campo, el operador (ya
@@ -1160,7 +1168,8 @@ pub enum PredicateExpr<'a> {
 /// generación de SQL.
 ///
 /// Mismo criterio conservador que `recognize_field_selector`: un campo
-/// derivado, una comparación entre DOS campos del propio parámetro, o
+/// derivado, una comparación `==`/`!=` entre DOS campos del propio
+/// parámetro (los cuatro relacionales sí se reconocen, ver §3.171 arriba), o
 /// `!(...)` negando algo que no sea una hoja de campo suelta (`!(a && b)`,
 /// De Morgan) hace fallar TODO el reconocimiento (`None`) -- el caller cae
 /// al camino interpretado de siempre, correcto en cualquier caso, más
@@ -1237,6 +1246,29 @@ fn recognize_predicate_tree<'a>(param: &str, expr: &'a Spanned<Expr>) -> Option<
         {
             let left = strip_parens(left);
             let right = strip_parens(right);
+            // `item.endDate > item.startDate` -- comparación entre DOS
+            // campos del propio parámetro, GRAMMAR.md §3.171. Acotado a los
+            // cuatro operadores relacionales a propósito: el checker
+            // (checker.rs::synth_binary, brazo `Lt | LtEq | Gt | GtEq`) solo
+            // los tipa cuando ambos lados son Int/Int64/Float/Timestamp SIN
+            // envolver en `Optional` -- y un campo no-opcional siempre es
+            // `NOT NULL` en la columna real (ver postgres_emit.rs, el test
+            // que confirma que desenvolver `Optional` no cuela un `NOT NULL`
+            // de más) -- así que esta forma nunca puede toparse con el
+            // problema de NULL-seguridad que si tiene `==`/`!=` (donde el
+            // checker sí permite comparar dos `T?`, y `NULL = NULL` en SQL
+            // no es `true` como en el camino interpretado). Por eso `==`/
+            // `!=` entre dos campos NO se reconoce acá -- cae al camino
+            // interpretado de siempre (ya lo hacía antes de este cambio,
+            // sin que hiciera falta ningún chequeo nuevo: el lado derecho
+            // queda envuelto en `PredicateOperand::Expr` de un
+            // `FieldAccess`, que `evaluate_predicate_tree` ya rechaza por no
+            // ser un literal ni un `Ident`).
+            if matches!(op, BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) {
+                if let (Some(lf), Some(rf)) = (field_of_param(param, left), field_of_param(param, right)) {
+                    return Some(PredicateExpr::Leaf(lf, *op, PredicateOperand::Field(rf)));
+                }
+            }
             if let Some(field) = field_of_param(param, left) {
                 return Some(PredicateExpr::Leaf(field, *op, PredicateOperand::Expr(right)));
             }
