@@ -77,6 +77,14 @@ impl PartialEq for DbDecl {
 
 #[derive(Debug, Clone)]
 pub struct ImportDecl {
+    /// Los nombres entre llaves de `import { A, B } from "./x.link";`.
+    /// **VACÍO** para la forma "solo por efecto" (`import "./x.link";`,
+    /// GRAMMAR.md §3.161) -- cargar el módulo por lo que APORTA al programa
+    /// (típicamente un `service`, el único ítem que no se puede nombrar en
+    /// un import) en vez de por un nombre puntual que este archivo use.
+    /// `modules.rs` valida "¿existe este nombre en ese archivo?" por cada
+    /// elemento, así que una lista vacía naturalmente no valida nada -- el
+    /// archivo igual se carga y sus ítems se fusionan, que es todo el punto.
     pub names: Vec<String>,
     pub from: String,
     pub span: Span,

@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.118.0] - 2026-08-27
+
+### ✨ Nuevo
+- **`import "./modulo.link";` — import "solo por efecto", sin llaves ni `from`.** Cierra el último hueco real para partir un programa en módulos: un módulo que solo aporta un `service` ahora se puede cargar directamente.
+- **El discovery que motivó esto corrigió el propio PLAN.md.** El plan listaba "Pilar 3, sistema de módulos" como pendiente de discovery, con dos preguntas abiertas. Auditar el código antes de diseñar nada mostró que el sistema de módulos ya existía y era mucho más completo de lo que el plan reflejaba (imports multi-archivo, `link.json`, dependencias git reales, `link.lock`, ciclos, caso diamante) y que las dos preguntas ya tenían respuesta en el código.
+- **El hueco real, medido y no supuesto**: `service` no es importable por nombre (a propósito) y no existía forma de import sin nombres, así que componer un programa a partir de módulos con servicios obligaba a declarar un tipo-fantasma en cada uno solo para tener algo que importar — y ese fantasma se filtraba al contrato público generado, como `export interface` en `contract.d.ts` Y como schema de Zod en `schemas.ts`. Confirmado inspeccionando el `gen/` real, antes y después.
+- Puramente aditivo: la forma con llaves no cambia, las dos conviven en el mismo archivo (el parser decide por el token que sigue a `import`). Resolución de `from`, detección de ciclos, errores de sintaxis por archivo: todo idéntico.
+- Límites honestos sin cambios: sigue habiendo **un solo `db {}` por programa** (varios módulos no pueden ser dueños de sus colecciones — decisión de diseño con peso propio, no atacada), sin `pub`/privado, sin re-exports.
+
+Verificado con 4 tests unitarios nuevos + verificación manual contra el binario real (proyecto multi-módulo completo generando un contrato sin ningún tipo-fantasma, comparado lado a lado contra el workaround anterior) + 4 formas malformadas de import confirmadas como errores limpios. Ver GRAMMAR.md §2.1/§3.161, PLAN.md §9.2.
+
 ## [1.117.0] - 2026-08-27
 
 ### ✨ Nuevo

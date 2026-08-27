@@ -490,6 +490,81 @@ mod tests {
         assert_eq!(errors.len(), 2, "{err}");
     }
 
+    // ---- import "solo por efecto" (GRAMMAR.md §3.161) ----
+
+    /// El caso motivador real: un módulo que SOLO aporta un `service`.
+    /// `service` no es importable por nombre (decisión de §2.1: no se
+    /// referencia por nombre en ningún lado del lenguaje), así que antes de
+    /// esta forma la única manera de componer un programa a partir de
+    /// módulos con servicios era declarar un tipo-fantasma en cada uno solo
+    /// para tener algo que importar -- y ese fantasma se filtraba al
+    /// `contract.d.ts`/`schemas.ts` generados como un tipo público real.
+    #[test]
+    fn side_effect_import_loads_a_module_that_only_contributes_a_service() {
+        let dir = TempDir::new("side_effect_service");
+        dir.write("schema.link", "type Invoice = { id: Int, amount: Int }\ndb { invoices: Invoice[] }");
+        dir.write(
+            "billing.link",
+            r#"
+            import { Invoice } from "./schema.link";
+            service Billing {
+                rpc create(amount: Int) -> Invoice { db.invoices.insert(Invoice { id: 0, amount: amount }) }
+            }
+        "#,
+        );
+        // Sin ningún nombre importado -- billing.link no declara NADA
+        // importable, solo un service.
+        dir.write("main.link", r#"import "./billing.link";"#);
+
+        let (program, touched, _item_files) = load_program(&dir.path("main.link")).unwrap();
+        assert_eq!(touched.len(), 3, "main + billing + schema, cada archivo una vez");
+        let has_service = program.items.iter().any(|i| matches!(i, Item::Service(s) if s.name == "Billing"));
+        assert!(has_service, "el service del módulo tiene que llegar al Program fusionado: {:?}", program.items.len());
+        let has_db = program.items.iter().any(|i| matches!(i, Item::Db(_)));
+        assert!(has_db, "el db {{}} transitivo (schema.link) también tiene que llegar");
+    }
+
+    /// La forma con llaves sigue funcionando exactamente igual -- la forma
+    /// nueva es puramente aditiva, no reemplaza nada.
+    #[test]
+    fn the_named_import_form_still_works_alongside_the_side_effect_form() {
+        let dir = TempDir::new("side_effect_mixed");
+        dir.write("types.link", "type Point = { x: Int, y: Int }");
+        dir.write("helpers.link", "fn double(n: Int) -> Int { n * 2 }");
+        dir.write(
+            "main.link",
+            "import { Point } from \"./types.link\";\nimport \"./helpers.link\";\nfn origin() -> Point { Point { x: 0, y: 0 } }",
+        );
+        let (program, touched, _) = load_program(&dir.path("main.link")).unwrap();
+        assert_eq!(touched.len(), 3);
+        // Point (nombrado) + double (por efecto) + origin (nativo) = 3.
+        assert_eq!(program.items.len(), 3, "las dos formas de import aportan sus ítems: {:?}", program.items.len());
+    }
+
+    /// Un import por efecto de un archivo que no existe tiene que fallar
+    /// igual de claro que la forma nombrada -- no saltearse la resolución
+    /// solo porque no hay nombres que validar.
+    #[test]
+    fn side_effect_import_of_a_missing_file_still_fails_clearly() {
+        let dir = TempDir::new("side_effect_missing");
+        dir.write("main.link", r#"import "./no_existe.link";"#);
+        let result = load_program(&dir.path("main.link"));
+        assert!(result.is_err(), "un archivo inexistente tiene que fallar aunque no haya nombres que validar");
+        assert!(result.unwrap_err().to_string().contains("no_existe"));
+    }
+
+    /// La detección de ciclos no depende de que haya nombres importados --
+    /// corre sobre la pila de archivos, no sobre los nombres.
+    #[test]
+    fn side_effect_imports_still_detect_a_cycle() {
+        let dir = TempDir::new("side_effect_cycle");
+        dir.write("a.link", "import \"./b.link\";\ntype A = { n: Int }");
+        dir.write("b.link", "import \"./a.link\";\ntype B = { n: Int }");
+        let result = load_program(&dir.path("a.link"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("ciclo"));
+    }
+
     #[test]
     fn bare_name_import_resolves_via_link_json() {
         let dir = TempDir::new("manifest");

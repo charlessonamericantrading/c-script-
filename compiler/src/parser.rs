@@ -297,6 +297,19 @@ impl Parser {
     fn parse_import_decl(&mut self) -> Result<ImportDecl, ParseError> {
         let start = self.span();
         self.eat(&TokenKind::Import)?;
+        // Forma "solo por efecto" (GRAMMAR.md §2.1/§3.161): `import
+        // "./billing.link";` -- sin llaves ni `from`, misma forma que usa
+        // TypeScript/JS para lo mismo. Existe para el ÚNICO ítem que no se
+        // puede nombrar en un import: un `service`. Antes de esto, un módulo
+        // que solo aporta un `service` obligaba a declarar un tipo-fantasma
+        // sin ningún uso real, solo para tener algo que importar -- y ese
+        // fantasma se filtraba al contrato público generado.
+        if matches!(self.peek(), TokenKind::Str(_)) {
+            let from = self.eat_string()?;
+            let span = merge(start, self.prev_span());
+            self.eat(&TokenKind::Semi)?;
+            return Ok(ImportDecl { names: Vec::new(), from, span });
+        }
         self.eat(&TokenKind::LBrace)?;
         let mut names = vec![self.eat_ident()?];
         while self.check(&TokenKind::Comma) {
