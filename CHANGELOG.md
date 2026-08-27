@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.119.0] - 2026-08-27
+
+### 🐛 Arreglado
+Segunda auditoría adversarial de la sesión, esta vez con un agente **read-only** (no puede editar código) sobre las cuatro versiones ya shippeadas (v1.114.0-v1.117.0) más el cambio en vuelo. Encontró 3 bugs REALES, los tres reproducidos a mano contra el binario real antes de tocar nada, y **dos de ellos introducidos por los propios fixes de v1.115.0/v1.116.0** -- el precio de haber tocado concurrencia:
+
+- **Deadlock que dejaba el servidor vivo pero permanentemente colgado** (introducido en v1.115.0). Los dos fixes de esa versión, combinados, crearon un orden de candados cruzado: `subscribe()` pasó a sostener el candado de suscriptores mientras pide el de la conexión (vía `select_rows`), y `upsert` pasó a sostener el de la conexión mientras publica (que pide el de suscriptores). Reproducido con `upsert` y un `stream` concurrentes sobre la misma colección: `ping` seguía respondiendo 200 pero `health`, `/metrics` y toda escritura no volvían nunca; solo se recuperaba matando el proceso. **Fix**: `subscribe()` registra al suscriptor PRIMERO, suelta el candado, y recién después saca la foto -- nunca sostiene los dos. Preserva la garantía de no perder filas que v1.115.0 buscaba (un evento duplicado es inofensivo; una fila perdida no) y es más simple que lo que hacía antes. Verificado con el mismo martillo que lo colgaba: ahora todo responde 200.
+- **`@cron` rompía el TypeScript generado** (introducido en v1.116.0). De los seis emisores de codegen, `emit_service_interface` era el único que se había quedado sin el filtro de `@cron` -- así que la interfaz declaraba un método que la clase que hace `implements` nunca define: **TS2420**, error de compilación en cualquier proyecto con una tarea `@cron`. Confirmado con el `tsc` real del propio repo. Exactamente la clase de bug que el proyecto existe para prevenir.
+- **División entera por cero era un PANIC de Rust, no un error de runtime** (preexistente, pero mucho más grave desde v1.114.0). `a / 0` y `i64::MIN / -1` panicaban; el divisor casi siempre viene de datos del usuario. Con un hilo por request el panic ya no mata el proceso, pero mata el hilo SIN pasar por ningún camino de limpieza: adentro de un `transaction { }` dejaba la transacción SQL abierta para siempre. Reproducido de punta a punta **con pérdida silenciosa de datos**: tras el panic, toda transacción futura fallaba con "ya hay una transacción abierta", escrituras posteriores se confirmaban al cliente con 200, y al reiniciar el proceso el servidor pasaba de reportar 3 filas a tener 1 -- dos escrituras ya confirmadas, descartadas en silencio. **Fix**: `/` y `%` sobre enteros usan `checked_div`/`checked_rem` y devuelven un error de runtime limpio (500, el hilo sobrevive, el `transaction{}` rollbackea normal y la base queda usable). El camino de `Float` no cambia -- IEEE-754 ya define `/0` como infinito/NaN.
+
+6 tests de regresión nuevos, todos con hilos de sistema operativo reales donde aplica. Ver GRAMMAR.md §3.162.
+
 ## [1.118.0] - 2026-08-27
 
 ### ✨ Nuevo

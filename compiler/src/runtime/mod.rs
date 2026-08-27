@@ -874,8 +874,18 @@ fn eval_binary(
         },
         Sub => numeric_op(l, r, |a, b| a - b, |a, b| a - b),
         Mul => numeric_op(l, r, |a, b| a * b, |a, b| a * b),
-        Div => numeric_op(l, r, |a, b| a / b, |a, b| a / b),
-        Rem => numeric_op(l, r, |a, b| a % b, |a, b| a % b),
+        // GRAMMAR.md §3.162: NO pasan por `numeric_op` como el resto --
+        // sobre ENTEROS, `a / 0` y `i64::MIN / -1` son panics de Rust, no
+        // valores. Un panic acá no es un error de runtime normal: mata el
+        // hilo de la request sin pasar por ningún camino de limpieza, y
+        // adentro de un `transaction { }` deja la transacción SQL abierta
+        // para siempre (bug real reproducido, con pérdida silenciosa de
+        // datos ya confirmados al cliente). El divisor casi siempre viene
+        // de datos del usuario, así que esto era trivialmente alcanzable.
+        // El camino de `Float` no necesita guarda: IEEE-754 define /0 como
+        // inf/NaN, nunca panica.
+        Div => checked_int_numeric_op(l, r, i64::checked_div, |a, b| a / b, "dividir"),
+        Rem => checked_int_numeric_op(l, r, i64::checked_rem, |a, b| a % b, "calcular el resto de"),
         Eq => Ok(Value::Bool(l == r)),
         NotEq => Ok(Value::Bool(l != r)),
         Lt => compare(l, r, |o| o == std::cmp::Ordering::Less),
@@ -972,6 +982,37 @@ fn numeric_op(
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => Ok(Value::Int(int_op(a, b))),
         (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64(int_op(a, b))),
+        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(float_op(a, b))),
+        (l, r) => Err(err(format!(
+            "operador aritmético requiere Int+Int, Int64+Int64 o Float+Float en runtime: {l:?} y {r:?}"
+        ))),
+    }
+}
+
+/// Hermana de `numeric_op` para las DOS operaciones que pueden panicar
+/// sobre enteros (`/` y `%`, GRAMMAR.md §3.162). `int_op` es la variante
+/// `checked_*` de `i64`, que devuelve `None` tanto para divisor cero como
+/// para el desborde de `i64::MIN / -1` -- los dos casos se traducen a un
+/// `RuntimeError` normal (500 limpio, el hilo de la request sobrevive) en
+/// vez de a un panic. `float_op` va sin guarda a propósito: IEEE-754 ya
+/// define `/0` como infinito/NaN.
+fn checked_int_numeric_op(
+    l: Value,
+    r: Value,
+    int_op: impl Fn(i64, i64) -> Option<i64>,
+    float_op: impl Fn(f64, f64) -> f64,
+    verb: &str,
+) -> Result<Value, RuntimeError> {
+    let bad = |a: i64, b: i64| {
+        if b == 0 {
+            err(format!("no se puede {verb} {a} por cero"))
+        } else {
+            err(format!("desborde aritmético al {verb} {a} por {b}"))
+        }
+    };
+    match (l, r) {
+        (Value::Int(a), Value::Int(b)) => int_op(a, b).map(Value::Int).ok_or_else(|| bad(a, b)),
+        (Value::Int64(a), Value::Int64(b)) => int_op(a, b).map(Value::Int64).ok_or_else(|| bad(a, b)),
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(float_op(a, b))),
         (l, r) => Err(err(format!(
             "operador aritmético requiere Int+Int, Int64+Int64 o Float+Float en runtime: {l:?} y {r:?}"
@@ -5898,6 +5939,63 @@ mod tests {
         }
     }
 
+    /// El MISMO deadlock que el test de arriba cubre para `transaction{}`,
+    /// pero por el camino de `upsert` -- que desde la misma ronda también
+    /// sostiene el candado de la conexión durante todo su cuerpo, y por lo
+    /// tanto llega a `publish`/`deliver_local` (que pide `subscribers`) con
+    /// la conexión ya tomada. Encontrado por una auditoría adversarial y
+    /// REPRODUCIDO contra un `linkc serve` real antes de arreglarlo: el
+    /// servidor quedaba vivo pero cualquier request que tocara la base
+    /// colgaba para siempre (`ping` seguía respondiendo 200, `health` y
+    /// `/metrics` no volvían nunca).
+    ///
+    /// Igual que su hermano: no verifica ningún VALOR -- si el deadlock
+    /// existiera, `.join()` no volvería nunca y el test colgaría hasta que
+    /// el runner lo mate. Que termine ES la prueba.
+    #[test]
+    fn an_upsert_publishing_concurrently_with_a_subscribe_on_the_same_collection_never_deadlocks() {
+        let program = program_from(
+            r#"
+            type Item = { id: Int, key: String, hits: Int }
+            db { items: Item[] }
+            service S {
+                rpc bump(k: String) -> Item {
+                    db.items.upsert(
+                        |x: Item| { x.key == k },
+                        Item { id: 0, key: k, hits: 1 },
+                        |x: Item| { Item { key: x.key, hits: x.hits + 1 } }
+                    )
+                }
+            }
+        "#,
+        );
+        let db = std::sync::Arc::new(Db::new(&program, std::path::Path::new(":memory:")));
+        let program = std::sync::Arc::new(program);
+
+        for _round in 0..100 {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let bump_handle = {
+                let db = std::sync::Arc::clone(&db);
+                let program = std::sync::Arc::clone(&program);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    invoke_rpc(&program, "S", "bump", &json!({"k": "k"}), &db).unwrap();
+                })
+            };
+            let subscribe_handle = {
+                let db = std::sync::Arc::clone(&db);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    db.subscribe("items").unwrap();
+                })
+            };
+            bump_handle.join().unwrap();
+            subscribe_handle.join().unwrap();
+        }
+    }
+
     /// Otro bug real de la misma auditoría: `upsert` buscaba la fila
     /// existente y decidía insert-o-patch en dos pasos SEPARADOS, sin
     /// candado compartido -- ya documentado como no-atómico ENTRE
@@ -6850,6 +6948,86 @@ mod tests {
         );
         let result = invoke_rpc(&program, "S", "f", &json!({}), &Db::seeded());
         assert!(result.is_err());
+    }
+
+    /// GRAMMAR.md §3.162: `/` y `%` por cero sobre enteros eran un PANIC de
+    /// Rust, no un error de runtime -- trivialmente alcanzable con un
+    /// divisor que viene de datos del usuario. Con un hilo por request
+    /// (§3.158) el panic ya no mata el proceso, pero mata el hilo SIN pasar
+    /// por ningún camino de limpieza: adentro de un `transaction { }` dejaba
+    /// la transacción SQL abierta para siempre, wedgeando todas las
+    /// transacciones futuras del proceso y descartando en silencio
+    /// escrituras ya confirmadas al cliente con un 200 (reproducido contra
+    /// un servidor real antes de arreglarlo).
+    #[test]
+    fn integer_division_or_remainder_by_zero_is_a_clean_runtime_error_not_a_panic() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc divZero(d: Int) -> Int { 100 / d }
+                rpc remZero(d: Int) -> Int { 100 % d }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "S", "divZero", &json!({"d": 0}), &db).unwrap_err();
+        assert!(e.message.contains("por cero"), "mensaje inesperado: {}", e.message);
+        let e = invoke_rpc(&program, "S", "remZero", &json!({"d": 0}), &db).unwrap_err();
+        assert!(e.message.contains("por cero"), "mensaje inesperado: {}", e.message);
+        // El camino feliz no cambia.
+        assert_eq!(invoke_rpc(&program, "S", "divZero", &json!({"d": 7}), &db).unwrap(), json!(14));
+        assert_eq!(invoke_rpc(&program, "S", "remZero", &json!({"d": 7}), &db).unwrap(), json!(2));
+    }
+
+    /// El otro caso que panicaba: `i64::MIN / -1` no cabe en `i64`.
+    /// `checked_div` lo cubre junto con el divisor cero, con un mensaje
+    /// distinto (desborde, no división por cero).
+    #[test]
+    fn integer_division_overflow_is_a_clean_runtime_error_too() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc f(a: Int64, b: Int64) -> Int64 { a / b }
+            }
+        "#,
+        );
+        let e = invoke_rpc(&program, "S", "f", &json!({"a": "-9223372036854775808", "b": "-1"}), &Db::seeded()).unwrap_err();
+        assert!(e.message.contains("desborde"), "mensaje inesperado: {}", e.message);
+    }
+
+    /// Un `transaction { }` cuyo cuerpo falla por división por cero tiene
+    /// que hacer ROLLBACK como cualquier otro error -- y, sobre todo, dejar
+    /// la base usable para la SIGUIENTE transacción. Antes del fix la
+    /// primera fallaba con un panic y todas las posteriores daban "ya hay
+    /// una transacción abierta" para siempre.
+    #[test]
+    fn a_transaction_whose_body_divides_by_zero_rolls_back_and_leaves_the_db_usable() {
+        let program = program_from(
+            r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                rpc boom(d: Int) -> Int {
+                    transaction {
+                        db.items.insert(Item { id: 0, name: "boom" });
+                        let x = 100 / d;
+                    }
+                    0
+                }
+                rpc ok(name: String) -> Int {
+                    transaction { db.items.insert(Item { id: 0, name: name }); }
+                    db.items.all().length()
+                }
+                rpc count() -> Int { db.items.all().length() }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let e = invoke_rpc(&program, "S", "boom", &json!({"d": 0}), &db).unwrap_err();
+        assert!(e.message.contains("por cero"), "{}", e.message);
+        assert_eq!(invoke_rpc(&program, "S", "count", &json!({}), &db).unwrap(), json!(0), "la fila del cuerpo tiene que haberse rollbackeado");
+        // Y la base sigue usable: una transacción POSTERIOR funciona.
+        assert_eq!(invoke_rpc(&program, "S", "ok", &json!({"name": "a"}), &db).unwrap(), json!(1));
     }
 
     #[test]

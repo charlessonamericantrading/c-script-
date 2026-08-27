@@ -1712,42 +1712,51 @@ db { users: User[] }
     /// ya tiene, ANTES de decidir si invoca `invoke_rpc_with_sessions` (ver
     /// `ast::recognize_live_subscribe`).
     ///
-    /// **Registrarse y sacar la foto pasan bajo el MISMO candado que
-    /// `deliver_local` usa para entregar** (`self.subscribers`) -- bug real
-    /// encontrado auditando esta sección tras shippear GRAMMAR.md §3.158
-    /// (26/08/2026, un hilo real por request): el diseño ORIGINAL sacaba la
-    /// foto primero y recién DESPUÉS se registraba, dos pasos separados sin
-    /// candado compartido con `publish`/`deliver_local` -- correcto cuando
-    /// el servidor procesaba una request a la vez (el comentario original
-    /// decía "el single-threading del servidor ES el lock"), pero con
-    /// requests concurrentes de verdad un `insert`/`applyPatch` de OTRO
-    /// hilo podía commitear y publicar ADENTRO de esa ventana: ni quedaba
-    /// en la foto (ya tomada) ni llegaba por el canal (todavía sin
-    /// registrar) -- una fila perdida en silencio para ese suscriptor,
-    /// nunca reportada como error. Con las dos cosas bajo el mismo candado,
-    /// esa fila SIEMPRE aparece -- en la foto, o como evento, o (en el peor
-    /// caso, si `publish` queda bloqueado esperando este mismo candado
-    /// mientras se toma la foto) en las DOS a la vez, nunca en NINGUNA. Un
-    /// duplicado ocasional es aceptable (el consumidor de un `stream` ya
-    /// trata cada evento como el estado ACTUAL de esa fila, no un delta);
-    /// perder una fila entera no lo es.
+    /// **REGISTRARSE PRIMERO, soltar el candado, y RECIÉN DESPUÉS sacar la
+    /// foto** -- el orden es lo único que hace correcta a esta función, y
+    /// llegar acá costó dos bugs reales seguidos (GRAMMAR.md §3.16/§3.162):
     ///
-    /// **Orden de candados, a propósito:** acá siempre subscribers→conexión
-    /// (el candado de `subscribers` ya tomado cuando `select_rows` pide el
-    /// de la conexión) -- el camino de `transaction{}` (`Expr::Transaction`,
-    /// runtime/mod.rs) entrega sus eventos diferidos DESPUÉS de soltar el
-    /// candado de la conexión, precisamente para nunca pedir esos dos
-    /// candados en el orden inverso y crear un deadlock cruzado. Si algún
-    /// día algo más necesita sostener ambos candados a la vez, tiene que
-    /// respetar este MISMO orden.
+    /// 1. El diseño ORIGINAL sacaba la foto primero y se registraba después,
+    ///    sin ningún candado compartido con `publish`/`deliver_local` --
+    ///    correcto mientras el servidor procesaba una request a la vez, roto
+    ///    apenas hubo hilos reales (§3.158): un `insert` de OTRO hilo podía
+    ///    publicar ADENTRO de esa ventana y no quedar ni en la foto (ya
+    ///    tomada) ni en el canal (todavía sin registrar) -- **fila perdida
+    ///    en silencio**.
+    /// 2. El primer fix (26/08/2026) sostuvo el candado de `subscribers`
+    ///    DURANTE `select_rows` para cerrar esa ventana. Cerró el bug 1 pero
+    ///    creó uno peor: `select_rows` pide el candado de la CONEXIÓN, así
+    ///    que este camino pasó a ser subscribers→conexión, mientras que
+    ///    `upsert` (que desde la misma ronda sostiene la conexión durante
+    ///    todo su cuerpo) llega a `publish`→`deliver_local` en el orden
+    ///    inverso, conexión→subscribers. **Deadlock ABBA reproducido**: el
+    ///    servidor queda vivo pero cualquier request que toque la base
+    ///    cuelga para siempre.
+    ///
+    /// El orden de acá resuelve los dos a la vez **sin sostener nunca los
+    /// dos candados**: si una escritura ocurre entre el registro y la foto,
+    /// el suscriptor la recibe como EVENTO (ya está registrado) y además
+    /// puede verla en la foto -- un duplicado ocasional, que es inofensivo
+    /// (el consumidor de un `stream` ya trata cada evento como el estado
+    /// ACTUAL de esa fila, nunca como un delta). Lo que NO puede pasar es
+    /// que no aparezca en ninguna de las dos, que era el bug 1.
+    ///
+    /// **Invariante de candados, a respetar por cualquier código futuro:**
+    /// nadie sostiene `subscribers` y la conexión a la vez EN ESTE ORDEN.
+    /// `publish`/`deliver_local` sí toman `subscribers` con la conexión ya
+    /// tomada (vía `upsert`/`transaction{}`), y eso está bien justamente
+    /// porque este camino ya no hace lo contrario.
     pub fn subscribe(&self, collection: &str) -> Result<(Vec<serde_json::Value>, Receiver<serde_json::Value>), RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
         let (tx, rx) = mpsc::sync_channel(LIVE_STREAM_BUFFER);
-        let mut subs = self.subscribers.lock();
-        subs.entry(collection.to_string()).or_default().push(tx);
+        // El candado se toma y se SUELTA acá mismo (statement temporal) --
+        // nunca sigue tomado durante el `select_rows` de abajo.
+        self.subscribers.lock().entry(collection.to_string()).or_default().push(tx);
+        // Si esto falla, el sender ya registrado queda huérfano en el mapa
+        // -- inofensivo: `deliver_local` poda cualquier sender desconectado
+        // de forma perezosa, en la próxima publicación a esta colección.
         let snapshot: Vec<serde_json::Value> =
             self.select_rows(collection, columns, None)?.iter().map(|v| value_to_json(v, &self.simple_enums)).collect();
-        drop(subs);
         Ok((snapshot, rx))
     }
 

@@ -183,6 +183,7 @@
   - [3.159 `@cron("Ns"/"Nm"/"Nh"/"Nd")`: tareas recurrentes nativas dentro de `linkc serve` — RESUELTO](#3159-cronnsnmnhnd-tareas-recurrentes-nativas-dentro-de-linkc-serve--resuelto)
   - [3.160 `http.postWithRetry(url, body, headers, maxAttempts)`: reintentos con backoff para webhooks salientes — RESUELTO](#3160-httppostwithretryurl-body-headers-maxattempts-reintentos-con-backoff-para-webhooks-salientes--resuelto)
   - [3.161 `import "./modulo.link";`: import "solo por efecto" — RESUELTO, cierra el último hueco real para partir un programa en módulos](#3161-importmodulolink-import-solo-por-efecto--resuelto-cierra-el-último-hueco-real-para-partir-un-programa-en-módulos)
+  - [3.162 Segunda auditoría adversarial: 3 bugs reales, dos de ellos creados por los fixes de la ronda anterior — RESUELTOS](#3162-segunda-auditoría-adversarial-3-bugs-reales-dos-de-ellos-creados-por-los-fixes-de-la-ronda-anterior--resueltos)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6227,6 +6228,40 @@ Sin llaves y sin `from` -- misma forma que TypeScript/JS usan para lo mismo, por
 - **Sin re-exports** -- sin cambios. La forma por efecto no los introduce por la puerta de atrás: no exporta nada, solo carga.
 
 **Verificado**: 4 tests unitarios nuevos en `modules.rs` -- un módulo que SOLO declara un `service` (sin nada importable) se carga y su service llega al `Program` fusionado junto con el `db {}` transitivo; las dos formas de import conviven en un mismo archivo aportando sus ítems; un archivo inexistente importado por efecto sigue fallando claro; un ciclo formado solo con imports por efecto se sigue detectando. Más verificación manual contra el binario real: el proyecto multi-módulo completo (un `schema.link` central + dos módulos de servicio) compila y genera un `contract.d.ts` con EXACTAMENTE los dos tipos de dominio y los dos clientes de servicio, **sin ningún tipo-fantasma** -- comparado lado a lado contra el mismo proyecto escrito con el workaround anterior, que sí los tenía. Cuatro formas malformadas (`import "a" "b";`, sin `;`, `import from "x";`, `import "a" from "b";`) confirmadas como errores de parser limpios.
+
+### 3.162 Segunda auditoría adversarial: 3 bugs reales, dos de ellos creados por los fixes de la ronda anterior — RESUELTOS
+
+**Origen: una segunda auditoría adversarial, pedida explícitamente por el usuario, con un agente READ-ONLY.** Detalle de proceso que importa: la ronda anterior había usado un agente `fork` para investigar y ese agente excedió su mandato (se le pidió solo investigar, implementó una feature completa). Esta vez se usó un agente `Explore`, que **estructuralmente no puede editar archivos** -- la restricción correcta para un auditor, y la lección aplicada. Los 3 hallazgos se reprodujeron a mano contra el binario real ANTES de tocar una línea; ninguno se dio por cierto por venir de un agente.
+
+**El resultado incómodo y honesto: dos de los tres bugs los introdujeron los propios fixes de §3.158/§3.162 de la ronda anterior.** Tocar concurrencia tiene ese precio, y la disciplina de auditar lo recién shippeado es lo que los encontró antes que un adoptador.
+
+**1. Deadlock: el servidor queda VIVO pero permanentemente colgado (introducido en v1.115.0).** §3.16 documentaba el orden de candados "subscribers→conexión" como invariante, y §3.154/§3.158 hacían que `transaction{}` entregara sus eventos diferidos DESPUÉS de soltar la conexión precisamente para respetarlo. Pero la MISMA ronda envolvió `upsert` entero en `Db::with_exclusive_connection` (para cerrar una carrera de fila duplicada) -- y el `insert`/`applyPatch` de adentro llega a `publish`→`deliver_local`, que pide `subscribers`, **con la conexión ya tomada**: el orden inverso. ABBA clásico.
+
+Reproducido contra un `linkc serve` real (una colección de 4000 filas, 8 clientes martillando `upsert` y 8 abriendo un `stream` sobre la misma colección, en simultáneo): tras unos segundos el proceso queda vivo, `ping` (cómputo puro, sin candados) sigue respondiendo 200, y `health`/`/metrics`/cualquier escritura **no vuelven nunca**. Solo se recupera matando el proceso.
+
+**Fix -- más simple que lo que había, no más complejo:** `subscribe()` registra al suscriptor PRIMERO, suelta el candado, y recién después saca la foto. Nunca sostiene los dos candados. Y sigue cumpliendo lo que el fix de v1.115.0 buscaba: si una escritura ocurre entre el registro y la foto, el suscriptor la recibe como EVENTO (ya está registrado) y quizá además la vea en la foto -- un duplicado ocasional, inofensivo (un consumidor de `stream` ya trata cada evento como el estado ACTUAL de esa fila, nunca como un delta). Lo que no puede pasar es que no aparezca en ninguna de las dos, que era el bug original. El fix de v1.115.0 había sobre-corregido: alcanzaba con reordenar, no hacía falta sostener el candado.
+
+**2. `@cron` rompía el TypeScript generado (introducido en v1.116.0).** De los SEIS lugares que recorren los miembros de un `service` para emitir algo, `emit_service_interface` (`ts_emit.rs`) era el único que se había quedado sin el filtro de `@cron` -- los otros cinco (`emit_client`, `emit_hooks`, `openapi_emit`, y los dos de `llms_txt_emit`) sí lo tenían. Causa concreta del olvido: la edición que agregó el filtro usó un patrón sensible a la indentación, y ese sitio tiene otra -- se aplicó a dos de tres sin aviso. Efecto: `export interface JobsClient` declaraba `sweep(...)`, pero `class JobsClientImpl implements JobsClient` nunca lo define → **TS2420: "Class 'JobsClientImpl' incorrectly implements interface 'JobsClient'"**, confirmado con el `tsc` real del propio repo. `linkc build` reportaba `OK`. Exactamente la clase de desacuerdo entre capas que §3.9 existe para prevenir, y en el artefacto que es la tesis del proyecto. **Fix**: el brazo que faltaba, más una verificación sistemática de los seis sitios (los dos del checker correctamente NO filtran -- el checker sí debe tipar un `@cron`).
+
+**3. División entera por cero era un PANIC de Rust (preexistente, pero mucho peor desde §3.158).** `a / 0` y `i64::MIN / -1` sobre `Int`/`Int64` panicaban en vez de dar un error de runtime, y el divisor casi siempre viene de datos del usuario -- trivialmente alcanzable. Antes de un hilo por request, un panic mataba el PROCESO (ruidoso, pero al menos consistente). Con hilos, mata solo ese hilo **sin pasar por ningún camino de limpieza** -- y adentro de un `transaction { }` deja el `BEGIN` abierto sobre la conexión compartida y `transaction_pending_publishes` en `Some(...)` para siempre.
+
+Reproducido de punta a punta, con **pérdida silenciosa de datos ya confirmados al cliente**:
+
+| paso | antes del fix |
+|---|---|
+| `goodTx("a")` | `1` -- commiteado |
+| `boomTx(0)` | 500 (panic) |
+| `count` | `2` -- la fila NO commiteada es visible (misma conexión, transacción abierta) |
+| `goodTx("b")` | error: *"ya hay una transacción abierta"* -- **toda transacción futura del proceso falla para siempre** |
+| `plainInsert("c")` | `{"id":3,...}` -- **200 OK devuelto al cliente** |
+| `count` | `3` |
+| reiniciar proceso, `count` | **`1`** |
+
+Dos escrituras que el servidor confirmó como exitosas se descartaron en silencio. **Fix**: `/` y `%` sobre enteros pasan por `checked_div`/`checked_rem` (que cubren divisor cero Y el desborde de `i64::MIN / -1`) y devuelven un `RuntimeError` normal. El camino de `Float` queda sin guarda a propósito: IEEE-754 ya define `/0` como infinito/NaN, nunca panica. Tras el fix, el mismo escenario da un 500 limpio, la transacción rollbackea, las siguientes funcionan, y las 3 filas sobreviven al reinicio.
+
+**Límite honesto que NO se cerró en esta ronda:** el fix 3 elimina el disparador de panic más alcanzable, pero **no** el problema de fondo -- cualquier OTRO panic dentro de un `transaction { }` (un `.expect()` de `db.rs`/`store.rs`, por ejemplo) sigue dejando el mismo estado corrupto, porque no hay ningún `catch_unwind` alrededor del cuerpo. Cerrarlo de verdad necesita esa red de seguridad y su propio diseño (qué hacer con un `Value` que no es `UnwindSafe`), no entra en una ronda de bugfix. Igual que sigue abierto que una tarea `@cron` muere para siempre en su primer panic, sin log ni métrica, contradiciendo lo que §3.159 promete.
+
+**Verificado**: 6 tests de regresión nuevos -- `an_upsert_publishing_concurrently_with_a_subscribe_on_the_same_collection_never_deadlocks` (100 vueltas con hilos reales y `Barrier`, hermano del que ya cubría `transaction{}`), los tres de división/resto por cero y desborde, y el de `transaction{}` que divide por cero (rollbackea Y deja la base usable para la siguiente transacción). Más verificación manual contra binarios reales de los tres: el martillo que colgaba el servidor ahora lo deja respondiendo 200 en todo; el `tsc` real del repo compila limpio un proyecto con `@cron`; y el escenario de pérdida de datos termina con las 3 filas intactas tras reiniciar.
 
 ---
 

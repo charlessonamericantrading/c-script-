@@ -1458,6 +1458,14 @@ fn emit_service_interface(out: &mut String, s: &ServiceDecl, checker: &Checker) 
     out.push_str(&format!("export interface {}Client {{\n", s.name));
     for m in &s.members {
         let (rpc, is_stream) = match m {
+            // `@cron` (GRAMMAR.md §3.159): nunca alcanzable vía HTTP, así
+            // que no va en la interfaz pública del cliente. Bug real
+            // (§3.162): este era el ÚNICO de los seis emisores que se había
+            // quedado sin este filtro -- `emit_client` (la CLASE que hace
+            // `implements` de esta interfaz) sí lo tenía, así que declarar
+            // un `@cron` producía una interfaz con un método que la clase
+            // nunca implementa: TS2420, el TypeScript generado no compilaba.
+            Member::Rpc(r) if r.cron().is_some() => continue,
             Member::Rpc(r) => (r, false),
             Member::Stream(r) => (r, true),
         };
