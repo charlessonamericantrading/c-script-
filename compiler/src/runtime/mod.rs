@@ -994,20 +994,6 @@ fn as_bool(v: &Value) -> Result<bool, RuntimeError> {
     }
 }
 
-/// Predicado de `countWhere`/`findWhere` (GRAMMAR.md §3.95/§3.108/§3.109)
-/// reducido a una lista de `(campo, operador, valor)`, una por cada hoja de
-/// una conjunción `&&` (una conjunción de una sola hoja es el caso de un
-/// solo operador de siempre) -- si y solo si CADA hoja tiene la forma `x.campo
-/// OP valor` (`ast::recognize_conjunction_predicate`, OP en
-/// `==`/`!=`/`<`/`<=`/`>`/`>=`, o `!x.campo`/`x.campo` sueltos como
-/// booleanos) Y su lado "valor" (cuando no es un booleano sintetizado) es
-/// lo bastante simple como para evaluarlo SIN invocar el intérprete
-/// completo: un literal, o un `Ident` que resuelve en el `Env` que el
-/// closure ya capturó al crearse (nunca el propio parámetro `x`, que no
-/// vive ahí). `None` si CUALQUIER hoja falla -- el caller cae al camino
-/// interpretado de siempre (`db.call("all")` + evaluar el predicado por
-/// fila), que sigue siendo correcto siempre, más lento solo en ese caso
-/// puntual.
 /// `db.call(&coll, "all", ...)` ya devuelve `Value::List`, siempre -- este
 /// helper solo evita repetir el `match` de desempaquetado en cada uno de los
 /// caminos de fallback de `findWhere`/`countWhere`/`deleteWhere` que caen al
@@ -1019,25 +1005,52 @@ fn all_items(db: &Db, coll: &str) -> Result<Vec<Value>, RuntimeError> {
     }
 }
 
-fn recognize_pushable_conjunction(f: &Value) -> Option<Vec<(String, BinaryOp, Value)>> {
+/// Árbol de un predicado pusheable, ya EVALUADO (`Value`, no la expresión
+/// cruda) -- espejo en runtime de `ast::PredicateExpr`, GRAMMAR.md §3.170.
+/// `db.rs` genera SQL directo desde esta forma (`Db::condition_expr_sql`),
+/// con `And`/`Or` traduciendo a `AND`/`OR` reales, parentizados solo donde
+/// hace falta para preservar la precedencia.
+pub(crate) enum ConditionExpr {
+    Leaf(String, BinaryOp, Value),
+    And(Vec<ConditionExpr>),
+    Or(Vec<ConditionExpr>),
+}
+
+/// Reconoce el `matchFn`/predicado de `findWhere`/`countWhere`/`deleteWhere`/
+/// `upsert` y, si tiene la forma pusheable (`ast::recognize_predicate_expr`),
+/// evalúa cada hoja contra el `Env` capturado por el closure -- `None` si
+/// CUALQUIER hoja no es lo bastante simple (un `Ident` que no resuelve ahí,
+/// una expresión que no es literal/`Ident`), igual que la versión anterior
+/// de un solo nivel.
+fn recognize_pushable_predicate(f: &Value) -> Option<ConditionExpr> {
     let Value::Closure(params, body, captured_env) = f else { return None };
-    let leaves = crate::ast::recognize_conjunction_predicate(params, body)?;
-    let mut out = Vec::with_capacity(leaves.len());
-    for (field, op, operand) in leaves {
-        let value = match operand {
-            crate::ast::PredicateOperand::Bool(b) => Value::Bool(b),
-            crate::ast::PredicateOperand::Expr(value_expr) => match &value_expr.node {
-                Expr::Int(n) => Value::Int(*n),
-                Expr::Float(x) => Value::Float(*x),
-                Expr::Str(s) => Value::Str(s.clone()),
-                Expr::Bool(b) => Value::Bool(*b),
-                Expr::Ident(name) => captured_env.get(name.as_str())?.borrow().clone(),
-                _ => return None,
-            },
-        };
-        out.push((field.to_string(), op, value));
+    let tree = crate::ast::recognize_predicate_expr(params, body)?;
+    evaluate_predicate_tree(tree, captured_env)
+}
+
+fn evaluate_predicate_tree(tree: crate::ast::PredicateExpr, captured_env: &Env) -> Option<ConditionExpr> {
+    match tree {
+        crate::ast::PredicateExpr::Leaf(field, op, operand) => {
+            let value = match operand {
+                crate::ast::PredicateOperand::Bool(b) => Value::Bool(b),
+                crate::ast::PredicateOperand::Expr(value_expr) => match &value_expr.node {
+                    Expr::Int(n) => Value::Int(*n),
+                    Expr::Float(x) => Value::Float(*x),
+                    Expr::Str(s) => Value::Str(s.clone()),
+                    Expr::Bool(b) => Value::Bool(*b),
+                    Expr::Ident(name) => captured_env.get(name.as_str())?.borrow().clone(),
+                    _ => return None,
+                },
+            };
+            Some(ConditionExpr::Leaf(field.to_string(), op, value))
+        }
+        crate::ast::PredicateExpr::And(items) => {
+            Some(ConditionExpr::And(items.into_iter().map(|i| evaluate_predicate_tree(i, captured_env)).collect::<Option<Vec<_>>>()?))
+        }
+        crate::ast::PredicateExpr::Or(items) => {
+            Some(ConditionExpr::Or(items.into_iter().map(|i| evaluate_predicate_tree(i, captured_env)).collect::<Option<Vec<_>>>()?))
+        }
     }
-    Some(out)
 }
 
 /// Cubre `+`/`-`/`*`/`/`/`%` -- todo operador aritmético entero de c-script
@@ -1925,7 +1938,7 @@ fn call_method(
                 // solo las filas que matchean viajan del motor al proceso.
                 // Cualquier otra forma de predicado cae al camino de
                 // siempre, dos líneas más abajo.
-                if let Some(conditions) = recognize_pushable_conjunction(&f) {
+                if let Some(conditions) = recognize_pushable_predicate(&f) {
                     if let Some(rows) = db.find_where_conjunction(&coll, &conditions)? {
                         return Ok(Value::List(rows));
                     }
@@ -1951,7 +1964,7 @@ fn call_method(
             // memoria solo para descartarla y quedarse con un número.
             "countWhere" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'countWhere' requiere 1 argumento"))?;
-                if let Some(conditions) = recognize_pushable_conjunction(&f) {
+                if let Some(conditions) = recognize_pushable_predicate(&f) {
                     if let Some(n) = db.count_where_conjunction(&coll, &conditions)? {
                         return Ok(Value::Int(n));
                     }
@@ -1984,7 +1997,7 @@ fn call_method(
             // `findWhere`/`countWhere` ya confían.
             "deleteWhere" => {
                 let f = args.into_iter().next().ok_or_else(|| err("'deleteWhere' requiere 1 argumento"))?;
-                let (items, already_filtered) = match recognize_pushable_conjunction(&f) {
+                let (items, already_filtered) = match recognize_pushable_predicate(&f) {
                     Some(conditions) => match db.find_where_conjunction(&coll, &conditions)? {
                         Some(rows) => (rows, true),
                         None => (all_items(db, &coll)?, false),
@@ -2030,7 +2043,7 @@ fn call_method(
             }
             // GRAMMAR.md §3.75: `matchFn` corre en el intérprete sobre
             // TODAS las filas -- salvo que tenga la forma pusheable
-            // reconocida (`recognize_pushable_conjunction`, la MISMA que
+            // reconocida (`recognize_pushable_predicate`, la MISMA que
             // `findWhere`/`countWhere`/`deleteWhere` ya usan), en cuyo caso
             // la SELECCIÓN se empuja a SQL igual que esos tres (26/08/2026,
             // landmine del barrido de "límites honestos": una colección que
@@ -2065,7 +2078,7 @@ fn call_method(
                 let (Some(match_fn), Some(insert_value), Some(update_fn)) = (it.next(), it.next(), it.next()) else {
                     return Err(err("'upsert' requiere 3 argumentos (matchFn, insertValue, updateFn)"));
                 };
-                let (items, already_filtered) = match recognize_pushable_conjunction(&match_fn) {
+                let (items, already_filtered) = match recognize_pushable_predicate(&match_fn) {
                     Some(conditions) => match db.find_where_conjunction(&coll, &conditions)? {
                         Some(rows) => (rows, true),
                         None => (all_items(db, &coll)?, false),
@@ -5683,7 +5696,7 @@ mod tests {
 
     /// GRAMMAR.md §3.75, landmine del barrido de "límites honestos"
     /// (26/08/2026): un `matchFn` con forma NO pusheable (acá, `||`, que
-    /// `recognize_pushable_conjunction` no reconoce) tiene que seguir
+    /// `recognize_pushable_predicate` no reconoce) tiene que seguir
     /// funcionando IGUAL que antes de esta ronda -- camino interpretado de
     /// siempre, sin ningún cambio de comportamiento observable, solo sin el
     /// atajo de SQL.
@@ -7483,7 +7496,7 @@ mod tests {
     /// GRAMMAR.md §3.95: el caso real que motiva `countWhere` -- contar
     /// cuántas reseñas tiene un producto sin traer la tabla entera a
     /// memoria. `|r: Review| { r.productId == productId }` es exactamente
-    /// el shape pusheable (`ast::recognize_conjunction_predicate`) -- este
+    /// el shape pusheable (`ast::recognize_predicate_expr`) -- este
     /// test prueba el resultado CORRECTO, no que el pushdown haya corrido
     /// (eso se verificó manualmente contra el SQL real emitido; acá lo que
     /// importa es que el número sea el que tiene que ser).
@@ -7593,7 +7606,7 @@ mod tests {
           }
           rpc removeLowRated() -> Int {
             // Compara dos campos del propio parámetro entre sí -- no tiene
-            // la forma pusheable (`ast::recognize_conjunction_predicate`
+            // la forma pusheable (`ast::recognize_predicate_expr`
             // exige que el lado derecho NUNCA referencie al parámetro), así
             // que cae al camino interpretado a propósito.
             db.reviews.deleteWhere(|r: Review| { r.rating < r.productId })
@@ -7657,14 +7670,15 @@ mod tests {
         assert_eq!(rows.as_array().unwrap().len(), 2);
     }
 
-    /// `countWhere`/`findWhere` con un predicado NO pusheable (`||`
-    /// combinando condiciones, o una comparación entre DOS campos del
-    /// propio parámetro -- GRAMMAR.md §9.3 ítem 1, siguen abiertos) siguen
-    /// dando el resultado correcto por el camino interpretado de siempre --
-    /// el pushdown de GRAMMAR.md §3.95/§3.108/§3.109 es un atajo, nunca el
-    /// único camino. Ni `r.rating > 3` solo (§3.108) ni un `&&` de varias
-    /// hojas simples (§3.109) son ya buenos ejemplos de "no pusheable" --
-    /// acá se usa un `||` a propósito, que sigue sin pushear.
+    /// `countWhere`/`findWhere` con un predicado NO pusheable (una
+    /// comparación entre DOS campos del propio parámetro -- GRAMMAR.md
+    /// §9.3 ítem 1, sigue abierto, sin forma de expresar "columna vs.
+    /// columna" en un valor bindeado) siguen dando el resultado correcto
+    /// por el camino interpretado de siempre -- el pushdown de GRAMMAR.md
+    /// §3.95/§3.108/§3.109/§3.170 es un atajo, nunca el único camino. Ni
+    /// `r.rating > 3` solo (§3.108), ni un `&&` de varias hojas (§3.109),
+    /// ni un `||` combinándolas (§3.170) son ya buenos ejemplos de "no
+    /// pusheable" -- el que sigue quedando es comparar dos campos entre sí.
     #[test]
     fn count_where_and_find_where_fall_back_correctly_for_a_non_pushable_predicate() {
         let code = r#"
@@ -7674,26 +7688,25 @@ mod tests {
           rpc add(productId: Int, rating: Int) -> Review {
             db.reviews.insert(Review { id: 0, productId: productId, rating: rating })
           }
-          rpc countHighRatedOrProductOne() -> Int {
-            db.reviews.countWhere(|r: Review| { r.rating > 3 || r.productId == 1 })
+          rpc countRatingBelowProductId() -> Int {
+            db.reviews.countWhere(|r: Review| { r.rating < r.productId })
           }
-          rpc listHighRatedOrProductOne() -> Review[] {
-            db.reviews.findWhere(|r: Review| { r.rating > 3 || r.productId == 1 })
+          rpc listRatingBelowProductId() -> Review[] {
+            db.reviews.findWhere(|r: Review| { r.rating < r.productId })
           }
         }
         "#;
         let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
         let db = Db::new(&program, std::path::Path::new(":memory:"));
 
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 5}), &db).unwrap(); // rating>3 Y productId==1
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 1}), &db).unwrap(); // solo productId==1
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 4}), &db).unwrap(); // solo rating>3
-        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 2}), &db).unwrap(); // ninguna
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 1, "rating": 5}), &db).unwrap(); // rating(5) NO< productId(1)
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 5, "rating": 1}), &db).unwrap(); // rating(1) < productId(5)
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 2, "rating": 2}), &db).unwrap(); // rating(2) NO< productId(2)
+        invoke_rpc(&program, "Reviews", "add", &json!({"productId": 9, "rating": 3}), &db).unwrap(); // rating(3) < productId(9)
 
-        // Las primeras 3 filas cumplen AL MENOS UNA de las dos condiciones.
-        assert_eq!(invoke_rpc(&program, "Reviews", "countHighRatedOrProductOne", &json!({}), &db).unwrap(), json!(3));
-        let rows = invoke_rpc(&program, "Reviews", "listHighRatedOrProductOne", &json!({}), &db).unwrap();
-        assert_eq!(rows.as_array().unwrap().len(), 3);
+        assert_eq!(invoke_rpc(&program, "Reviews", "countRatingBelowProductId", &json!({}), &db).unwrap(), json!(2));
+        let rows = invoke_rpc(&program, "Reviews", "listRatingBelowProductId", &json!({}), &db).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
     }
 
     /// GRAMMAR.md §3.109: `countWhere`/`findWhere` empujan a SQL una
@@ -7759,6 +7772,86 @@ mod tests {
             json!(2),
             "stock <= 5 && stock > 0: solo 3 y 5 -- el MISMO campo dos veces en la conjunción"
         );
+    }
+
+    /// GRAMMAR.md §3.170: `||` combinando condiciones, en tres formas --
+    /// una disyunción pura, `&&` mezclado con `||` respetando la
+    /// precedencia real del lenguaje (`&&` liga más fuerte), y un `||` de
+    /// más de dos hojas. Verifica CORRECCIÓN (el resultado tiene que ser
+    /// idéntico al que daría el camino interpretado) -- el pushdown en sí
+    /// es una optimización de rendimiento, `||` ya funcionaba antes vía el
+    /// fallback interpretado.
+    #[test]
+    fn count_where_and_find_where_push_down_a_disjunction_and_mixed_and_or() {
+        let code = r#"
+        type Ticket = { id: Int, status: String, priority: Int, assignee: String }
+        db { tickets: Ticket[] }
+        service Tickets {
+          rpc add(status: String, priority: Int, assignee: String) -> Ticket {
+            db.tickets.insert(Ticket { id: 0, status: status, priority: priority, assignee: assignee })
+          }
+          // Disyunción pura de 3 hojas.
+          rpc urgentOrCritical() -> Int {
+            db.tickets.countWhere(|t: Ticket| { t.status == "urgent" || t.status == "critical" || t.priority == 1 })
+          }
+          // && mezclado con || -- tiene que parsear como (a && b) || c, no
+          // como a && (b || c).
+          rpc mineOrCritical(who: String) -> Ticket[] {
+            db.tickets.findWhere(|t: Ticket| { t.assignee == who && t.status == "open" || t.status == "critical" })
+          }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "Tickets", "add", &json!({"status": "urgent", "priority": 3, "assignee": "ada"}), &db).unwrap();
+        invoke_rpc(&program, "Tickets", "add", &json!({"status": "open", "priority": 1, "assignee": "bob"}), &db).unwrap();
+        invoke_rpc(&program, "Tickets", "add", &json!({"status": "closed", "priority": 5, "assignee": "ada"}), &db).unwrap();
+        invoke_rpc(&program, "Tickets", "add", &json!({"status": "open", "priority": 4, "assignee": "ada"}), &db).unwrap();
+        invoke_rpc(&program, "Tickets", "add", &json!({"status": "critical", "priority": 5, "assignee": "bob"}), &db).unwrap();
+
+        assert_eq!(
+            invoke_rpc(&program, "Tickets", "urgentOrCritical", &json!({}), &db).unwrap(),
+            json!(3),
+            "urgent (1) + priority==1 (1) + critical (1) = 3"
+        );
+
+        // mineOrCritical("ada"): (assignee==ada && status==open) || status==critical
+        // -> el ticket 4 (ada/open) + el ticket 5 (bob/critical), NUNCA el
+        // ticket 1 (ada/urgent, no matchea ninguna mitad) ni el 3 (ada/closed).
+        let rows = invoke_rpc(&program, "Tickets", "mineOrCritical", &json!({"who": "ada"}), &db).unwrap();
+        let ids: Vec<i64> = rows.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![4, 5], "precedencia real: (a && b) || c, no a && (b || c)");
+    }
+
+    /// GRAMMAR.md §3.170: una hoja `campo == variable` adentro de una rama
+    /// `||` donde `variable` resulta `null` en runtime -- mismo caso NULL-
+    /// seguro que ya cubría la conjunción pura (`IS NULL`, nunca `= ?` con
+    /// un parámetro NULL, que en SQL nunca es cierto).
+    #[test]
+    fn a_null_valued_leaf_inside_an_or_branch_still_uses_is_null() {
+        let code = r#"
+        type Item = { id: Int, category: String?, archived: Bool }
+        db { items: Item[] }
+        service S {
+          rpc add(category: String?, archived: Bool) -> Item {
+            db.items.insert(Item { id: 0, category: category, archived: archived })
+          }
+          rpc uncategorizedOrArchived(cat: String?) -> Item[] {
+            db.items.findWhere(|i: Item| { i.category == cat || i.archived })
+          }
+        }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        invoke_rpc(&program, "S", "add", &json!({"category": null, "archived": false}), &db).unwrap();
+        invoke_rpc(&program, "S", "add", &json!({"category": "books", "archived": false}), &db).unwrap();
+        invoke_rpc(&program, "S", "add", &json!({"category": "tools", "archived": true}), &db).unwrap();
+
+        let rows = invoke_rpc(&program, "S", "uncategorizedOrArchived", &json!({"cat": null}), &db).unwrap();
+        let ids: Vec<i64> = rows.as_array().unwrap().iter().map(|r| r["id"].as_i64().unwrap()).collect();
+        assert_eq!(ids, vec![1, 3], "el item sin categoría (IS NULL) y el archivado -- nunca el de 'books'");
     }
 
     /// `countWhere("id" == valor)` es un caso especial (§3.95: `"id"` nunca

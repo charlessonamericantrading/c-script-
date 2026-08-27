@@ -9,7 +9,7 @@
 // mismo espíritu que contract.d.ts/client.ts/validators.ts (todos derivados
 // de la misma fuente de verdad, cero duplicación manual).
 
-use super::{as_int, json_to_typed_value, simple_enum_names, value_to_json, RuntimeError, Value};
+use super::{as_int, json_to_typed_value, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
 use crate::ast::{BinaryOp, FieldCheck, Item, Program, TimeGranularity, TypeAnnotation, TypeExpr};
 use crate::checker::Checker;
 use crate::types::{FieldType, Type};
@@ -1699,7 +1699,7 @@ db { users: User[] }
             // `List::filter`/`List::map`) -- incluido el atajo de SQL de
             // GRAMMAR.md §3.95/§3.108 (`count_where_conjunction`/`find_where_conjunction`,
             // arriba), que tampoco vive acá porque reconocer el predicado
-            // (`recognize_pushable_conjunction`) necesita el `Env` capturado
+            // (`recognize_pushable_predicate`) necesita el `Env` capturado
             // del closure, otra cosa que `Db::call` no tiene forma de
             // recibir. `call_method` es el único camino que el intérprete
             // usa para despachar un método de `Value::DbCollection`, así que
@@ -2044,84 +2044,138 @@ db { users: User[] }
     /// ambigüedad). El caller cae al camino interpretado de siempre ante
     /// `None` -- correcto en cualquier caso, más lento solo en ese caso
     /// puntual.
-    fn conjunction_condition(&self, collection: &str, columns: &[ColumnPlan], conditions: &[(String, BinaryOp, Value)]) -> Option<(String, Vec<Cell>)> {
-        if conditions.is_empty() {
-            return None;
-        }
-        let mut clauses = Vec::with_capacity(conditions.len());
-        let mut cells = Vec::with_capacity(conditions.len());
-        for (field, op, value) in conditions.iter() {
-            // Bug real, encontrado en una auditoría propia: `"campo" = ?`
-            // ligado a un parámetro NULL nunca es cierto en SQL (NULL no es
-            // igual a nada, ni siquiera a sí mismo) -- pero el camino
-            // interpretado de siempre SÍ trata `Value::Null == Value::Null`
-            // como `true` (`==`/`!=` de Rust sobre el enum `Value`). Sin este
-            // caso especial, empujar a SQL una hoja `campo == variable` donde
-            // `variable` resultó ser `null` en runtime (ej. un parámetro
-            // opcional del propio rpc) hacía que la fila con ese campo en
-            // NULL nunca matcheara -- silenciosamente distinto del camino
-            // interpretado, y en `upsert` en particular, una fila "duplicada"
-            // insertada en vez de actualizada. `IS [NOT] NULL` es la forma
-            // SQL correcta, sin ningún parámetro ligado para esa hoja.
-            if matches!(value, Value::Null) {
-                let null_op = match op {
-                    BinaryOp::Eq => "IS NULL",
-                    BinaryOp::NotEq => "IS NOT NULL",
-                    // Los cuatro operadores relacionales no tienen una forma
-                    // NULL-segura razonable de todos modos (Rust ya niega
-                    // cualquier orden con Value::Null en el camino
-                    // interpretado) -- se cae al camino interpretado.
-                    _ => return None,
-                };
-                if field != "id" && columns.iter().find(|c| &c.field.name == field).is_none_or(|c| c.json) {
-                    return None;
-                }
-                clauses.push(format!("\"{field}\" {null_op}"));
-                continue;
-            }
-            let sql_op = match op {
-                BinaryOp::Eq => "=",
-                BinaryOp::NotEq => "!=",
-                BinaryOp::Lt => "<",
-                BinaryOp::LtEq => "<=",
-                BinaryOp::Gt => ">",
-                BinaryOp::GtEq => ">=",
-                // `ast::recognize_conjunction_predicate` ya filtra a estos
-                // seis -- cualquier otro operador nunca llega hasta acá.
+    /// Una sola hoja `campo OP valor` -- misma lógica NULL-segura y de
+    /// validación de columna que antes, extraída para que `condition_expr_sql`
+    /// (el recorrido recursivo del árbol And/Or, GRAMMAR.md §3.170) la
+    /// reuse en cualquier profundidad. Empuja directo a `cells` (en vez de
+    /// devolver un Vec propio) para que la numeración de placeholders
+    /// posicionales (`$1`, `$2`, ... en Postgres) quede correcta sin
+    /// importar en qué rama del árbol cae cada hoja -- el orden de
+    /// aparición en `cells` tiene que coincidir con el orden en que cada
+    /// placeholder aparece en el SQL final, y como el recorrido es
+    /// izquierda-a-derecha en el mismo orden en que se arma el string,
+    /// `cells.len() + 1` en el momento de cada push ya da el número correcto.
+    fn leaf_condition_sql(&self, columns: &[ColumnPlan], field: &str, op: BinaryOp, value: &Value, cells: &mut Vec<Cell>) -> Option<String> {
+        // Bug real, encontrado en una auditoría propia: `"campo" = ?`
+        // ligado a un parámetro NULL nunca es cierto en SQL (NULL no es
+        // igual a nada, ni siquiera a sí mismo) -- pero el camino
+        // interpretado de siempre SÍ trata `Value::Null == Value::Null`
+        // como `true` (`==`/`!=` de Rust sobre el enum `Value`). Sin este
+        // caso especial, empujar a SQL una hoja `campo == variable` donde
+        // `variable` resultó ser `null` en runtime (ej. un parámetro
+        // opcional del propio rpc) hacía que la fila con ese campo en
+        // NULL nunca matcheara -- silenciosamente distinto del camino
+        // interpretado, y en `upsert` en particular, una fila "duplicada"
+        // insertada en vez de actualizada. `IS [NOT] NULL` es la forma
+        // SQL correcta, sin ningún parámetro ligado para esa hoja.
+        if matches!(value, Value::Null) {
+            let null_op = match op {
+                BinaryOp::Eq => "IS NULL",
+                BinaryOp::NotEq => "IS NOT NULL",
+                // Los cuatro operadores relacionales no tienen una forma
+                // NULL-segura razonable de todos modos (Rust ya niega
+                // cualquier orden con Value::Null en el camino
+                // interpretado) -- se cae al camino interpretado.
                 _ => return None,
             };
-            let cell = if field == "id" {
-                let Value::Int(id) = value else { return None };
-                Cell::Int(*id)
-            } else {
-                let col = columns.iter().find(|c| &c.field.name == field)?;
-                if col.json {
-                    return None;
-                }
-                self.write_param(col, Some(value))
-            };
-            clauses.push(format!("\"{field}\" {sql_op} {}", self.backend.placeholder(cells.len() + 1)));
-            cells.push(cell);
+            if field != "id" && columns.iter().find(|c| c.field.name == field).is_none_or(|c| c.json) {
+                return None;
+            }
+            return Some(format!("\"{field}\" {null_op}"));
         }
-        let cond = clauses.join(" AND ");
+        let sql_op = match op {
+            BinaryOp::Eq => "=",
+            BinaryOp::NotEq => "!=",
+            BinaryOp::Lt => "<",
+            BinaryOp::LtEq => "<=",
+            BinaryOp::Gt => ">",
+            BinaryOp::GtEq => ">=",
+            // `ast::recognize_predicate_expr` ya filtra a estos seis --
+            // cualquier otro operador nunca llega hasta acá.
+            _ => return None,
+        };
+        let cell = if field == "id" {
+            let Value::Int(id) = value else { return None };
+            Cell::Int(*id)
+        } else {
+            let col = columns.iter().find(|c| c.field.name == field)?;
+            if col.json {
+                return None;
+            }
+            self.write_param(col, Some(value))
+        };
+        let clause = format!("\"{field}\" {sql_op} {}", self.backend.placeholder(cells.len() + 1));
+        cells.push(cell);
+        Some(clause)
+    }
+
+    /// Recorrido recursivo de un `ConditionExpr` (GRAMMAR.md §3.170) a una
+    /// cláusula SQL -- `And`/`Or` se traducen a `AND`/`OR` reales, cada
+    /// hijo compuesto que sea del tipo CONTRARIO al del padre (un `Or`
+    /// adentro de un `And`, o viceversa) se parentiza para preservar la
+    /// precedencia real (`a AND (b OR c)` nunca puede escribirse como `a
+    /// AND b OR c`, que SQL parsearía como `(a AND b) OR c`). Un hijo del
+    /// MISMO tipo que el padre no puede aparecer -- `ast::merge_and`/
+    /// `merge_or` ya aplanan esos casos al construir el árbol, así que no
+    /// hace falta ese chequeo acá.
+    fn condition_expr_sql(&self, columns: &[ColumnPlan], expr: &ConditionExpr, cells: &mut Vec<Cell>) -> Option<String> {
+        match expr {
+            ConditionExpr::Leaf(field, op, value) => self.leaf_condition_sql(columns, field, *op, value, cells),
+            ConditionExpr::And(items) => {
+                let mut clauses = Vec::with_capacity(items.len());
+                for item in items {
+                    let clause = self.condition_expr_sql(columns, item, cells)?;
+                    clauses.push(if matches!(item, ConditionExpr::Or(_)) { format!("({clause})") } else { clause });
+                }
+                Some(clauses.join(" AND "))
+            }
+            ConditionExpr::Or(items) => {
+                let mut clauses = Vec::with_capacity(items.len());
+                for item in items {
+                    let clause = self.condition_expr_sql(columns, item, cells)?;
+                    clauses.push(if matches!(item, ConditionExpr::And(_)) { format!("({clause})") } else { clause });
+                }
+                Some(clauses.join(" OR "))
+            }
+        }
+    }
+
+    /// Cells bindeables + condición SQL completa (con soft-delete AND-eado
+    /// al final si corresponde) para el árbol que `countWhere`/`findWhere`/
+    /// `upsert` empujan a SQL (GRAMMAR.md §3.95, `==` v1.59.0; §3.108, los
+    /// otros cinco operadores relacionales; §3.109, una conjunción `&&` de
+    /// varias condiciones; §3.170, `||` combinándolas). Compartido entre
+    /// `count_where_conjunction` y `find_where_conjunction` -- la única
+    /// diferencia entre esos dos es qué `SELECT` arman con esta misma
+    /// condición.
+    fn condition_sql(&self, collection: &str, columns: &[ColumnPlan], expr: &ConditionExpr) -> Option<(String, Vec<Cell>)> {
+        let mut cells = Vec::new();
+        let cond = self.condition_expr_sql(columns, expr, &mut cells)?;
+        // El `cond` entero se parentiza acá si el árbol es un `Or` de nivel
+        // superior -- sin esto, "a OR b AND soft_delete_is_null" parsearía
+        // como "a OR (b AND soft_delete_is_null)", perdiendo el filtro de
+        // soft-delete sobre la mitad "a" de la disyunción.
         let where_clause = match self.soft_delete_where(collection) {
-            Some(sd) => format!("{cond} AND {sd}"),
+            Some(sd) => {
+                let wrapped = if matches!(expr, ConditionExpr::Or(_)) { format!("({cond})") } else { cond };
+                format!("{wrapped} AND {sd}")
+            }
             None => cond,
         };
         Some((where_clause, cells))
     }
 
-    /// `db.<c>.countWhere(|x| x.campo OP valor && ...)` (GRAMMAR.md
-    /// §3.95/§3.108/§3.109): un `SELECT COUNT(*) ... WHERE` real -- CERO
-    /// filas viajan del motor al proceso, a diferencia del `countWhere`
-    /// interpretado (traer TODO con `all`, evaluar el predicado fila por
-    /// fila en Rust, contar). `None` (nunca un error) si el predicado no
-    /// tiene esta forma exacta, o algún campo no es pusheable -- el caller
-    /// (`runtime/mod.rs`) cae al camino interpretado, que sigue siendo
-    /// correcto siempre, solo más lento en ese caso.
-    pub(crate) fn count_where_conjunction(&self, collection: &str, conditions: &[(String, BinaryOp, Value)]) -> Result<Option<i64>, RuntimeError> {
+    /// `db.<c>.countWhere(|x| ...)` (GRAMMAR.md §3.95/§3.108/§3.109/§3.170):
+    /// un `SELECT COUNT(*) ... WHERE` real -- CERO filas viajan del motor
+    /// al proceso, a diferencia del `countWhere` interpretado (traer TODO
+    /// con `all`, evaluar el predicado fila por fila en Rust, contar).
+    /// `None` (nunca un error) si el predicado no tiene esta forma exacta,
+    /// o algún campo no es pusheable -- el caller (`runtime/mod.rs`) cae al
+    /// camino interpretado, que sigue siendo correcto siempre, solo más
+    /// lento en ese caso.
+    pub(crate) fn count_where_conjunction(&self, collection: &str, conditions: &ConditionExpr) -> Result<Option<i64>, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
-        let Some((where_clause, cells)) = self.conjunction_condition(collection, columns, conditions) else {
+        let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions) else {
             return Ok(None);
         };
         let sql = format!("SELECT COUNT(*) FROM \"{collection}\" WHERE {where_clause}");
@@ -2135,14 +2189,14 @@ db { users: User[] }
         }
     }
 
-    /// Como `count_where_conjunction`, para `db.<c>.findWhere(|x| x.campo
-    /// OP valor && ...)` -- un `SELECT ... WHERE` real, solo las filas que
-    /// matchean viajan del motor al proceso (a diferencia del camino
-    /// interpretado, que trae TODA la colección y filtra en Rust). Mismo
-    /// criterio de `None` que `count_where_conjunction`.
-    pub(crate) fn find_where_conjunction(&self, collection: &str, conditions: &[(String, BinaryOp, Value)]) -> Result<Option<Vec<Value>>, RuntimeError> {
+    /// Como `count_where_conjunction`, para `db.<c>.findWhere(|x| ...)` --
+    /// un `SELECT ... WHERE` real, solo las filas que matchean viajan del
+    /// motor al proceso (a diferencia del camino interpretado, que trae
+    /// TODA la colección y filtra en Rust). Mismo criterio de `None` que
+    /// `count_where_conjunction`.
+    pub(crate) fn find_where_conjunction(&self, collection: &str, conditions: &ConditionExpr) -> Result<Option<Vec<Value>>, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
-        let Some((where_clause, cells)) = self.conjunction_condition(collection, columns, conditions) else {
+        let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions) else {
             return Ok(None);
         };
         let mut col_list = vec!["\"id\"".to_string()];

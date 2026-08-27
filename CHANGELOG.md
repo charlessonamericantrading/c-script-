@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.125.0] - 2026-08-27
+
+### ✨ Nuevo
+**`countWhere`/`findWhere`/`deleteWhere`/`upsert` empujan `||` combinando condiciones a SQL real**, en cualquier profundidad de anidamiento con `&&` -- el hueco que §3.109 (v1.72.0) había dejado explícitamente documentado como pendiente. `a && b || c` respeta la precedencia real del lenguaje (`&&` liga más fuerte), reconociendo exactamente `(a && b) || c`.
+
+- `ast::PredicateExpr` (árbol `Leaf`/`And`/`Or`) reemplaza la lista plana de hojas que solo sabía `&&` -- una cadena `a && b && c` sigue reconociéndose como un solo `And` de 3 hojas (sin paréntesis de más en el SQL generado), y un `||` en cualquier posición ahora también se reconoce, en vez de hacer fallar el reconocimiento entero y caer al camino interpretado (que sigue siendo correcto siempre, solo más lento).
+- El `WHERE` generado parentiza cada hijo compuesto solo cuando es del tipo CONTRARIO al de su padre (`(b OR c)` adentro de un `AND`, o viceversa) -- nunca de más. El filtro de `@softDelete` se AND-ea correctamente incluso cuando el predicado de nivel superior es un `Or` (parentizando la disyunción entera primero).
+- Mismo comportamiento NULL-seguro que la conjunción pura (`campo == variable` con `variable` resultando `null` en runtime se traduce a `IS NULL`, nunca a un `= ?` que en SQL nunca es cierto) ahora también dentro de una rama `||`.
+
+Verificado con una disyunción pura, `&&` mezclado con `||` confirmando la precedencia exacta, una hoja NULL dentro de un `Or`, y repetición en vivo contra un `linkc serve` real (`countWhere`/`findWhere`/`deleteWhere` con predicados mixtos). Sigue sin cubrir: comparar dos campos del propio parámetro entre sí. Ver GRAMMAR.md §3.170, PLAN.md §9.3.
+
 ## [1.124.0] - 2026-08-27
 
 ### 🐛 Arreglado

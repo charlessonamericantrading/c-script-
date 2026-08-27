@@ -1109,7 +1109,7 @@ pub fn recognize_group_key_selector<'a>(param_names: &[String], body: &'a Block)
     matches!(&base.node, Expr::Ident(n) if n == param).then(|| (field.as_str(), Some(granularity)))
 }
 
-/// El lado "valor" de una hoja de conjunción (ver `recognize_conjunction_predicate`
+/// El lado "valor" de una hoja de predicado (ver `recognize_predicate_expr`
 /// abajo). Normalmente una expresión del código fuente sin evaluar todavía
 /// (mismo criterio que la versión de un solo operador) -- pero `!item.campo`
 /// se reconoce como una hoja completa (`item.campo == false`) sin que exista
@@ -1121,21 +1121,37 @@ pub enum PredicateOperand<'a> {
     Bool(bool),
 }
 
+/// Árbol de un predicado pusheable -- GRAMMAR.md §3.95/§3.108/§3.109
+/// (una hoja, luego una conjunción `&&` de varias) y ahora también §3.170
+/// (`||` combinando condiciones, en cualquier profundidad de anidamiento
+/// con `&&`, respetando la precedencia real del lenguaje -- `&&` liga más
+/// fuerte que `||`, mismo criterio que `parser.rs::parse_or_expr`/
+/// `parse_and_expr`). `And`/`Or` nunca anidan el MISMO tipo directamente
+/// (`recognize_predicate_expr` los aplana) -- una cadena `a && b && c`
+/// sigue siendo un solo `And` de 3 hojas, no `And(And(a,b),c)`, así que el
+/// SQL generado para el caso puro de siempre no cambia de forma.
+pub enum PredicateExpr<'a> {
+    Leaf(&'a str, BinaryOp, PredicateOperand<'a>),
+    And(Vec<PredicateExpr<'a>>),
+    Or(Vec<PredicateExpr<'a>>),
+}
+
 /// Reconoce `|item: T| item.campo OP valor` (en cualquier orden -- `valor
-/// OP item.campo` también) para `OP` en `==`/`!=`/`<`/`<=`/`>`/`>=`, Y
-/// AHORA TAMBIÉN una conjunción de varias hojas así unidas con `&&`
-/// (`item.a OP1 v1 && item.b OP2 v2 && ...`), incluyendo `!item.campo`/
-/// `item.campo` sueltos como hojas booleanas -- GRAMMAR.md §3.95 (`==`,
-/// v1.59.0), §3.108 (los otros cinco operadores, un solo operador por
-/// predicado), §3.109 (conjunción de N hojas). El ÚNICO shape de predicado
-/// que `countWhere`/`findWhere` empujan a SQL en vez de traer la colección
-/// entera a memoria y evaluar el predicado fila por fila. Devuelve, por
-/// cada hoja, el nombre del campo, el operador (ya "enderezado" -- ver
-/// abajo) y el lado "valor" sin evaluar -- el caller (`runtime/mod.rs`, que
-/// sí tiene acceso al `Env` capturado del closure) decide si cada uno es lo
-/// bastante simple como para confiar en el resultado (un literal, o un
-/// `Ident` que resuelve en ese `Env`) sin tener que reimplementar un
-/// evaluador de expresiones acá.
+/// OP item.campo` también) para `OP` en `==`/`!=`/`<`/`<=`/`>`/`>=`, una
+/// conjunción de varias hojas así unidas con `&&`, y AHORA TAMBIÉN `||`
+/// combinándolas en cualquier profundidad (`item.a == v1 && item.b == v2 ||
+/// item.c == v3`, respetando la precedencia real del lenguaje) --
+/// GRAMMAR.md §3.95 (`==`, v1.59.0), §3.108 (los otros cinco operadores),
+/// §3.109 (conjunción de N hojas), §3.170 (`||`). Incluye `!item.campo`/
+/// `item.campo` sueltos como hojas booleanas. El ÚNICO shape de predicado
+/// que `countWhere`/`findWhere`/`upsert` (su `matchFn`) empujan a SQL en
+/// vez de traer la colección entera a memoria y evaluar el predicado fila
+/// por fila. Cada hoja trae el nombre del campo, el operador (ya
+/// "enderezado" -- ver abajo) y el lado "valor" sin evaluar -- el caller
+/// (`runtime/mod.rs`, que sí tiene acceso al `Env` capturado del closure)
+/// decide si cada uno es lo bastante simple como para confiar en el
+/// resultado (un literal, o un `Ident` que resuelve en ese `Env`) sin
+/// tener que reimplementar un evaluador de expresiones acá.
 ///
 /// Cuando el campo de una hoja de comparación aparece del lado DERECHO (`5
 /// < item.campo`), el operador se invierte (`Lt` -> `Gt`) para que el
@@ -1143,26 +1159,20 @@ pub enum PredicateOperand<'a> {
 /// tener que manejar los dos órdenes por separado en el sitio de
 /// generación de SQL.
 ///
-/// Mismo criterio conservador que `recognize_field_selector`: `||` en
-/// CUALQUIER posición, un campo derivado, o una comparación entre DOS
-/// campos del propio parámetro hace fallar TODO el reconocimiento (`None`)
-/// -- el caller cae al camino interpretado de siempre, correcto en
-/// cualquier caso, más lento solo en ese caso puntual. Alcance deliberado
-/// de esta ronda: solo `&&` (los casos reales de CRM que lo motivaron --
-/// `n.userId == uid && !n.read`, `p.stock <= 5 && p.stock > 0` -- son los
-/// dos conjunciones puras) -- `||` necesitaría una cláusula `OR` separada
-/// en el SQL generado, sin evidencia real de demanda todavía; queda para
-/// una ronda dedicada si aparece. `deleteWhere` tampoco gana este atajo
+/// Mismo criterio conservador que `recognize_field_selector`: un campo
+/// derivado, una comparación entre DOS campos del propio parámetro, o
+/// `!(...)` negando algo que no sea una hoja de campo suelta (`!(a && b)`,
+/// De Morgan) hace fallar TODO el reconocimiento (`None`) -- el caller cae
+/// al camino interpretado de siempre, correcto en cualquier caso, más
+/// lento solo en ese caso puntual. `deleteWhere` tampoco gana este atajo
 /// (mismo motivo que la versión de un solo operador: publicar cada fila
 /// borrada a `stream` complica un `DELETE ... WHERE` de una sola sentencia).
-pub fn recognize_conjunction_predicate<'a>(param_names: &[String], body: &'a Block) -> Option<Vec<(&'a str, BinaryOp, PredicateOperand<'a>)>> {
+pub fn recognize_predicate_expr<'a>(param_names: &[String], body: &'a Block) -> Option<PredicateExpr<'a>> {
     let [param] = param_names else { return None };
     if !body.stmts.is_empty() {
         return None;
     }
-    let mut leaves = Vec::new();
-    collect_conjunction_leaves(param, body.tail.as_ref()?, &mut leaves)?;
-    Some(leaves)
+    recognize_predicate_tree(param, body.tail.as_ref()?)
 }
 
 fn strip_parens(mut e: &Spanned<Expr>) -> &Spanned<Expr> {
@@ -1177,17 +1187,50 @@ fn field_of_param<'a>(param: &str, e: &'a Spanned<Expr>) -> Option<&'a str> {
     matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
 }
 
-fn collect_conjunction_leaves<'a>(
-    param: &str,
-    expr: &'a Spanned<Expr>,
-    out: &mut Vec<(&'a str, BinaryOp, PredicateOperand<'a>)>,
-) -> Option<()> {
+/// `a && b` combinados: si CUALQUIERA de los dos ya es un `And`, sus hojas
+/// se aplanan adentro del nuevo -- así `a && b && c` (que el parser arma
+/// como `And(And(a,b), c)`, asociatividad izquierda) sigue devolviendo un
+/// único `And` de 3 elementos, no un árbol anidado -- el SQL generado para
+/// el caso puro de siempre no gana paréntesis de más.
+fn merge_and<'a>(l: PredicateExpr<'a>, r: PredicateExpr<'a>) -> PredicateExpr<'a> {
+    let mut items = Vec::new();
+    match l {
+        PredicateExpr::And(v) => items.extend(v),
+        other => items.push(other),
+    }
+    match r {
+        PredicateExpr::And(v) => items.extend(v),
+        other => items.push(other),
+    }
+    PredicateExpr::And(items)
+}
+
+/// Como `merge_and`, para `||`.
+fn merge_or<'a>(l: PredicateExpr<'a>, r: PredicateExpr<'a>) -> PredicateExpr<'a> {
+    let mut items = Vec::new();
+    match l {
+        PredicateExpr::Or(v) => items.extend(v),
+        other => items.push(other),
+    }
+    match r {
+        PredicateExpr::Or(v) => items.extend(v),
+        other => items.push(other),
+    }
+    PredicateExpr::Or(items)
+}
+
+fn recognize_predicate_tree<'a>(param: &str, expr: &'a Spanned<Expr>) -> Option<PredicateExpr<'a>> {
     let expr = strip_parens(expr);
     match &expr.node {
         Expr::Binary { op: BinaryOp::And, left, right } => {
-            collect_conjunction_leaves(param, left, out)?;
-            collect_conjunction_leaves(param, right, out)?;
-            Some(())
+            let l = recognize_predicate_tree(param, left)?;
+            let r = recognize_predicate_tree(param, right)?;
+            Some(merge_and(l, r))
+        }
+        Expr::Binary { op: BinaryOp::Or, left, right } => {
+            let l = recognize_predicate_tree(param, left)?;
+            let r = recognize_predicate_tree(param, right)?;
+            Some(merge_or(l, r))
         }
         Expr::Binary { op, left, right }
             if matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) =>
@@ -1195,24 +1238,20 @@ fn collect_conjunction_leaves<'a>(
             let left = strip_parens(left);
             let right = strip_parens(right);
             if let Some(field) = field_of_param(param, left) {
-                out.push((field, *op, PredicateOperand::Expr(right)));
-                return Some(());
+                return Some(PredicateExpr::Leaf(field, *op, PredicateOperand::Expr(right)));
             }
             if let Some(field) = field_of_param(param, right) {
-                out.push((field, flip_comparison_operator(*op), PredicateOperand::Expr(left)));
-                return Some(());
+                return Some(PredicateExpr::Leaf(field, flip_comparison_operator(*op), PredicateOperand::Expr(left)));
             }
             None
         }
         Expr::Unary { op: UnaryOp::Not, operand } => {
             let field = field_of_param(param, strip_parens(operand))?;
-            out.push((field, BinaryOp::Eq, PredicateOperand::Bool(false)));
-            Some(())
+            Some(PredicateExpr::Leaf(field, BinaryOp::Eq, PredicateOperand::Bool(false)))
         }
         _ => {
             let field = field_of_param(param, expr)?;
-            out.push((field, BinaryOp::Eq, PredicateOperand::Bool(true)));
-            Some(())
+            Some(PredicateExpr::Leaf(field, BinaryOp::Eq, PredicateOperand::Bool(true)))
         }
     }
 }

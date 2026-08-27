@@ -191,6 +191,7 @@
   - [3.167 `@idempotent`: la carrera de doble ejecución concurrente — RESUELTO, cierra el hallazgo #4 de AUDIT-2026-08-27.md](#3167-idempotent-la-carrera-de-doble-ejecución-concurrente--resuelto-cierra-el-hallazgo-4-de-audit-2026-08-27md)
   - [3.168 Ronda 3 de AUDIT-FIX-PLAN-2026-08-27.md: 6 bugs de severidad media — RESUELTOS](#3168-ronda-3-de-audit-fix-plan-2026-08-27md-6-bugs-de-severidad-media--resueltos)
   - [3.169 Ronda 4 de AUDIT-FIX-PLAN-2026-08-27.md: los 6 hallazgos restantes — CERRADA (3 código, 3 documentación deliberada)](#3169-ronda-4-de-audit-fix-plan-2026-08-27md-los-6-hallazgos-restantes--cerrada-3-código-3-documentación-deliberada)
+  - [3.170 `countWhere`/`findWhere`/`deleteWhere`/`upsert` empujan `||` combinando condiciones — RESUELTO, cierra PLAN.md §9.3 ítem 1](#3170-countwherefindwheredeletewhereupsert-empujan--combinando-condiciones--resuelto-cierra-planmd-93-ítem-1)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6390,6 +6391,28 @@ Cierra los hallazgos #5-#10 de `AUDIT-2026-08-27.md` (severidad media), el paque
 - **#15 (composición check-then-act de `recordFailedLogin`/`failedLoginCount`)**: consecuencia inherente de exponer tres primitivas para componer en vez de un builtin atómico -- documentado como límite honesto, no atacado sin evidencia real de que importe. Ver §3.152.
 
 **Verificado**: `an_empty_string_flag_value_behaves_like_the_flag_was_never_passed` (`cli_service_api_key.rs`) + `an_empty_string_jwt_secret_flag_behaves_like_it_was_never_configured` (`server_http.rs`), los dos contra un `linkc serve` real. `adopting_a_table_whose_physical_type_does_not_match_the_declared_one_gives_a_clean_error_not_a_panic` + `adopting_a_table_whose_stored_json_no_longer_matches_the_current_nested_type_gives_a_clean_error` (`db.rs`, los dos manipulando SQLite crudo para forzar el desacuerdo, mismo patrón que los tests de adopción existentes). `integer_add_sub_mul_and_unary_neg_overflow_are_clean_runtime_errors_too` + `list_int_sum_overflow_is_a_clean_runtime_error` (`runtime/mod.rs`) + repetición en vivo contra un `linkc serve` real (`add`/`neg` con valores en el borde de `i64`, confirmando 500 limpio y el proceso sigue vivo).
+
+### 3.170 `countWhere`/`findWhere`/`deleteWhere`/`upsert` empujan `||` combinando condiciones — RESUELTO, cierra PLAN.md §9.3 ítem 1
+
+§3.109 había dejado esto explícitamente como "alcance deliberado, queda para una ronda dedicada si aparece evidencia real" -- sin ningún reporte de adopción pidiéndolo puntualmente, pero con el hueco documentado desde el principio ("`||` necesitaría una cláusula `OR` separada en el SQL generado... una forma bastante más rica que agregar hojas a una lista plana"). Con la auditoría de `AUDIT-FIX-PLAN-2026-08-27.md` cerrada, este quedaba como el ítem "sin bloqueos" de mayor valor del backlog restante.
+
+```
+type Ticket = { id: Int, status: String, priority: Int, assignee: String }
+
+rpc mineOrCritical(who: String) -> Ticket[] {
+  db.tickets.findWhere(|t: Ticket| { t.assignee == who && t.status == "open" || t.status == "critical" })
+}
+```
+
+**`ast::PredicateExpr` reemplaza la lista plana de hojas por un árbol `Leaf`/`And`/`Or`.** `recognize_predicate_expr` (reemplaza a `recognize_conjunction_predicate`, eliminada por no quedar ningún caller) recorre `&&`/`||` recursivamente respetando la precedencia REAL del lenguaje (`&&` liga más fuerte que `||`, igual que `parser.rs::parse_or_expr`/`parse_and_expr`) -- `a && b || c` reconoce exactamente `(a && b) || c`, nunca `a && (b || c)`. Dos funciones chicas (`merge_and`/`merge_or`) aplanan una cadena del MISMO tipo (`a && b && c` sigue siendo un `And` de 3 hojas, no `And(And(a,b),c)`) sin tocar el caso mixto (`a && (b || c)` sí anida un `Or` adentro de un `And`) -- así el SQL generado para el caso puro de `&&` de siempre no gana paréntesis de más.
+
+**`runtime/mod.rs::ConditionExpr` es el espejo evaluado** (mismo árbol, con `Value` en vez de la expresión cruda sin evaluar) -- `recognize_pushable_predicate` reemplaza a `recognize_pushable_conjunction`. **`db.rs::condition_expr_sql` recorre el árbol generando `AND`/`OR` reales**, parentizando SOLO un hijo compuesto del tipo CONTRARIO al de su padre (`(b OR c)` adentro de un `AND`, o `(a AND b)` adentro de un `OR`) -- nunca un hijo del mismo tipo, que ya viene aplanado. El `WHERE` completo se parentiza entero antes de AND-ear el filtro de `@softDelete` si el árbol de nivel superior es un `Or` (sin esto, `a OR b AND soft_delete_is_null` perdería el filtro sobre la mitad "a" de la disyunción -- SQL evalúa `AND` antes que `OR`). Los placeholders posicionales (`$1`, `$2`, ... en Postgres) se numeran empujando cada `Cell` a un `Vec` COMPARTIDO durante todo el recorrido recursivo, en el mismo orden izquierda-a-derecha en que aparecen en el string final -- la numeración queda correcta sin importar en qué rama del árbol cae cada hoja, sin necesitar ningún caso especial por profundidad.
+
+**Mismo comportamiento NULL-seguro que la conjunción pura (§3.109), ahora también dentro de una rama `||`**: una hoja `campo == variable` donde `variable` resultó `null` en runtime se traduce a `IS NULL` (nunca `= ?` con un parámetro NULL, que en SQL nunca es cierto) sin importar si esa hoja está en un `And` o un `Or`.
+
+**Alcance sin cambios respecto a §3.109**: una comparación entre DOS campos del propio parámetro (`endDate > startDate`) sigue sin pushear (sin forma de expresar "columna vs. columna" en un valor bindeado) -- cae al camino interpretado, correcto siempre, más lento solo en ese caso. `!(...)` negando algo que no sea una hoja de campo suelta (`!(a && b)`, expansión De Morgan) tampoco se reconoce -- alcance deliberado, no hay evidencia de demanda para esa forma.
+
+**Verificado**: `count_where_and_find_where_push_down_a_disjunction_and_mixed_and_or` (`runtime/mod.rs`) -- una disyunción pura de 3 hojas, y `&&` mezclado con `||` confirmando la precedencia exacta (`(assignee==who && status=="open") || status=="critical"`, nunca la lectura alternativa). `a_null_valued_leaf_inside_an_or_branch_still_uses_is_null` -- una hoja NULL adentro de una rama `Or`. Los tests preexistentes de `&&` puro (§3.109) siguen pasando sin cambios, confirmando que el SQL para ese caso no ganó paréntesis de más. Más repetición en vivo contra un `linkc serve` real: `countWhere`/`findWhere` con la disyunción mixta del ejemplo de arriba, y `deleteWhere` con un `||` de dos hojas (`status == "done" || status == "cancelled"`), confirmando el conteo exacto de filas borradas. El ejemplo de "predicado NO pusheable" en los tests (§3.108/§3.109 ya habían tenido que corregirlo una vez cada uno, por el mismo motivo) se corrigió de nuevo -- de un `||` (ahora pusheable) a una comparación entre dos campos del propio parámetro, el único caso que sigue quedando.
 
 ---
 
