@@ -3,6 +3,20 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.123.0] - 2026-08-27
+
+### 🐛 Arreglado
+Ronda 3 de `AUDIT-FIX-PLAN-2026-08-27.md` (severidad media) -- los 6 hallazgos restantes de esa franja, en un solo paquete (mismo criterio que v1.119.0):
+
+- **`insert()` panicaba en vez de dar `RuntimeError`** si la fila se borraba entre el INSERT y el SELECT de confirmación -- asimetría con `applyPatch`, que ya manejaba la carrera idéntica limpio. Mismo `.ok_or_else(...)`.
+- **Agregaciones (`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`) panicaban sobre una columna `NULL`** heredada de agregar un campo requerido a una colección Postgres con filas viejas (la migración nunca agrega `NOT NULL`, sin importar la opcionalidad declarada). Mismo `RuntimeError` limpio que la lectura normal ya usaba.
+- **El checker aceptaba un rpc `@cron` como blanco de `@invalidates`** -- invalidación de caché muerta en silencio (`hooks.ts` con una llamada que ningún hook escribe jamás). Excluido explícitamente.
+- **`linkc doc` no mostraba badges de auth/rate-limit/deprecated en un `stream`** -- documentación generada que desinformaba sobre qué está protegido. Unificado en una función compartida con el brazo `rpc`.
+- **`GET /metrics` sostenía el candado de métricas mientras esperaba la conexión a la base** -- latencia/contención innecesaria bajo tráfico real combinado con transacciones largas. Reordenado.
+- **`lint`: `mixed-service-auth` daba falso positivo** con un `@cron` al lado de rpcs protegidos, justo el patrón que `@cron` fue diseñado para soportar. Excluido del cálculo.
+
+Un test unitario nuevo por hallazgo (6 en total) + repetición en vivo contra el binario real para los 3 que tienen repro directo (`@invalidates`+`@cron`, badges de `linkc doc`, falso positivo del lint). Suite completa sin regresiones (1257 tests, +6 sobre v1.122.0). Ver GRAMMAR.md §3.168, `AUDIT-FIX-PLAN-2026-08-27.md`.
+
 ## [1.122.0] - 2026-08-27
 
 ### 🔒 Seguridad / 🐛 Arreglado

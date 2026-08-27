@@ -816,7 +816,27 @@ fn handle_request(
     // configuró esa capa, Prometheus también tiene que mandarla (soportado
     // nativamente por `scrape_configs.authorization` en `prometheus.yml`).
     if path == "/metrics" {
-        let metrics_text = metrics_store.lock().render_prometheus_text(&db.subscriber_counts(), db.size_bytes(), &db.oversized_notify_drop_counts());
+        // AUDIT-2026-08-27.md #9: por orden de evaluación de Rust, el
+        // receptor de una llamada a método se evalúa ANTES que sus
+        // argumentos, y el `MutexGuard` temporal que devuelve `.lock()`
+        // sigue vivo hasta el final de la sentencia completa -- así que
+        // llamar a `render_prometheus_text` directo sobre `.lock()` sostenía
+        // `metrics_store` durante TODA la evaluación de sus argumentos,
+        // incluyendo `db.size_bytes()` (un `PRAGMA` real en SQLite, o un
+        // round-trip de red `SELECT pg_database_size(...)` en Postgres),
+        // que a su vez pide el mismo candado de conexión que `transaction{}`/
+        // `upsert` sostienen por toda su duración (§3.158). Un `GET
+        // /metrics` que cae en medio de una transacción larga quedaba
+        // bloqueado sosteniendo `metrics_store` -- y cualquier OTRO hilo que
+        // necesitara ese candado (el registro de un rechazo de
+        // `@rate_limit`, el registro final de cada request normal) quedaba
+        // en cola detrás, sin relación ninguna con `/metrics` en sí. Fix:
+        // calcular los tres valores ANTES de tomar el candado, sostenerlo
+        // solo para el formateo (puro cómputo en memoria).
+        let subscriber_counts = db.subscriber_counts();
+        let size_bytes = db.size_bytes();
+        let oversized_notify_drop_counts = db.oversized_notify_drop_counts();
+        let metrics_text = metrics_store.lock().render_prometheus_text(&subscriber_counts, size_bytes, &oversized_notify_drop_counts);
         let _ = request.respond(cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None));
         log_done(log, req_id, Some("metrics"), 200, start, "");
         return;

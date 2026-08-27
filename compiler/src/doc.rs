@@ -308,6 +308,66 @@ fn render_enum_decl(e: &EnumDecl) -> String {
     )
 }
 
+/// Badges de anotaciones -- compartido entre `Member::Rpc` y `Member::Stream`
+/// (los dos envuelven el mismo `RpcDecl`, GRAMMAR.md §3.14: auth/rate-limit/
+/// deprecated/cors aplican igual a un `stream` que a un `rpc` normal).
+/// AUDIT-2026-08-27.md #8: antes de esto había DOS implementaciones
+/// independientes -- la del brazo `Rpc` (esta) calculaba los seis badges de
+/// abajo, la del brazo `Stream` solo mostraba "📡 Realtime" y nunca miraba
+/// `auth()`/`rate_limit()`/`deprecated()`/`cors()` -- un `stream` protegido,
+/// con rate limit o deprecado se documentaba como público sin restricciones.
+/// Una sola función evita que la próxima anotación se agregue a un brazo y
+/// se olvide del otro.
+fn annotation_badges(r: &RpcDecl) -> String {
+    let auth_badge = match r.auth() {
+        Some(Annotation::Requires { enum_name, variant_names }) => {
+            let roles = variant_names.iter().map(|v| format!("{enum_name}.{v}")).collect::<Vec<_>>().join(" | ");
+            format!(r#"<span class="badge auth-badge">🔒 @requires({roles})</span>"#)
+        }
+        Some(Annotation::Authenticated) => r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string(),
+        // `auth()` nunca devuelve ContentType, Route, RateLimit,
+        // Deprecated, CacheControl, Example, Invalidates,
+        // Infinite ni Idempotent; el brazo existe para que
+        // agregar una anotación nueva rompa acá y no pase de
+        // largo mostrando "Público" por descarte.
+        Some(Annotation::ContentType(_))
+        | Some(Annotation::Route(_))
+        | Some(Annotation::RateLimit { .. })
+        | Some(Annotation::Deprecated(_))
+        | Some(Annotation::CacheControl(_))
+        | Some(Annotation::Example { .. })
+        | Some(Annotation::Invalidates(_))
+        | Some(Annotation::Infinite { .. })
+        | Some(Annotation::Idempotent)
+        | Some(Annotation::Cache(_))
+        | Some(Annotation::Cors(_))
+        | Some(Annotation::Cron(_))
+        | None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
+    };
+    let rate_limit_badge = match r.rate_limit() {
+        Some((spec, Some(key_param))) => format!(r#"<span class="badge">⏱️ @rate_limit("{spec}", key: {key_param})</span>"#),
+        Some((spec, None)) => format!(r#"<span class="badge">⏱️ @rate_limit("{spec}")</span>"#),
+        None => String::new(),
+    };
+    let content_type_badge = match r.content_type() {
+        Some(ct) => format!(r#"<span class="badge">📄 {ct}</span>"#),
+        None => String::new(),
+    };
+    let route_badge = match r.route() {
+        Some(pattern) => format!(r#"<span class="badge">🔗 {pattern}</span>"#),
+        None => String::new(),
+    };
+    let deprecated_badge = match r.deprecated() {
+        Some(reason) => format!(r#"<span class="badge" style="background:#7a1f1f;">⚠️ deprecated: {reason}</span>"#),
+        None => String::new(),
+    };
+    let cron_badge = match r.cron() {
+        Some(interval) => format!(r#"<span class="badge">⏰ @cron("{interval}") -- nunca alcanzable vía HTTP</span>"#),
+        None => String::new(),
+    };
+    format!("{auth_badge}{content_type_badge}{route_badge}{rate_limit_badge}{deprecated_badge}{cron_badge}")
+}
+
 fn render_service(s: &ServiceDecl) -> String {
     let name = &s.name;
     let mut rpcs_html = String::new();
@@ -315,55 +375,7 @@ fn render_service(s: &ServiceDecl) -> String {
         match member {
             Member::Rpc(r) => {
                 let rpc_name = &r.name;
-                let auth_badge = match r.auth() {
-                    Some(Annotation::Requires { enum_name, variant_names }) => {
-                        let roles = variant_names.iter().map(|v| format!("{enum_name}.{v}")).collect::<Vec<_>>().join(" | ");
-                        format!(r#"<span class="badge auth-badge">🔒 @requires({roles})</span>"#)
-                    }
-                    Some(Annotation::Authenticated) => {
-                        r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string()
-                    }
-                    // `auth()` nunca devuelve ContentType, Route, RateLimit,
-                    // Deprecated, CacheControl, Example, Invalidates,
-                    // Infinite ni Idempotent; el brazo existe para que
-                    // agregar una anotación nueva rompa acá y no pase de
-                    // largo mostrando "Público" por descarte.
-                    Some(Annotation::ContentType(_))
-                    | Some(Annotation::Route(_))
-                    | Some(Annotation::RateLimit { .. })
-                    | Some(Annotation::Deprecated(_))
-                    | Some(Annotation::CacheControl(_))
-                    | Some(Annotation::Example { .. })
-                    | Some(Annotation::Invalidates(_))
-                    | Some(Annotation::Infinite { .. })
-                    | Some(Annotation::Idempotent)
-                    | Some(Annotation::Cache(_))
-                    | Some(Annotation::Cors(_))
-                    | Some(Annotation::Cron(_))
-                    | None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
-                };
-                let rate_limit_badge = match r.rate_limit() {
-                    Some((spec, Some(key_param))) => format!(r#"<span class="badge">⏱️ @rate_limit("{spec}", key: {key_param})</span>"#),
-                    Some((spec, None)) => format!(r#"<span class="badge">⏱️ @rate_limit("{spec}")</span>"#),
-                    None => String::new(),
-                };
-                let content_type_badge = match r.content_type() {
-                    Some(ct) => format!(r#"<span class="badge">📄 {ct}</span>"#),
-                    None => String::new(),
-                };
-                let route_badge = match r.route() {
-                    Some(pattern) => format!(r#"<span class="badge">🔗 {pattern}</span>"#),
-                    None => String::new(),
-                };
-                let deprecated_badge = match r.deprecated() {
-                    Some(reason) => format!(r#"<span class="badge" style="background:#7a1f1f;">⚠️ deprecated: {reason}</span>"#),
-                    None => String::new(),
-                };
-                let cron_badge = match r.cron() {
-                    Some(interval) => format!(r#"<span class="badge">⏰ @cron("{interval}") -- nunca alcanzable vía HTTP</span>"#),
-                    None => String::new(),
-                };
-                let auth_badge = format!("{auth_badge}{content_type_badge}{route_badge}{rate_limit_badge}{deprecated_badge}{cron_badge}");
+                let auth_badge = annotation_badges(r);
 
                 let mut params_str = Vec::new();
                 let mut params_table = String::new();
@@ -396,11 +408,12 @@ fn render_service(s: &ServiceDecl) -> String {
             Member::Stream(st) => {
                 let stream_name = &st.name;
                 let signature = format!("stream {stream_name}() -> {:?}", st.return_type);
+                let badges = annotation_badges(st);
                 rpcs_html.push_str(&format!(
                     r#"<div style="margin-top: 1.5rem; border-top: 1px solid var(--border); padding-top: 1rem;">
   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
     <h4 style="font-family:var(--font-mono); color:var(--heading);">{name}.{stream_name} (SSE Stream)</h4>
-    <span class="badge">📡 Realtime</span>
+    <span class="badge">📡 Realtime</span>{badges}
   </div>
   <pre class="code-block">{signature}</pre>
 </div>"#
@@ -444,4 +457,65 @@ fn render_const(c: &ConstDecl) -> String {
 </div>"#,
         c.ty
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+
+    fn html_for(src: &str) -> String {
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        generate_html(&program, "test.link")
+    }
+
+    /// AUDIT-2026-08-27.md #8: antes de esta ronda, un `stream` con
+    /// `@requires`/`@rate_limit`/`@deprecated` mostraba SOLO el badge
+    /// "📡 Realtime" -- la documentación generada no decía nada sobre lo
+    /// que en runtime SÍ está protegido/limitado/deprecado (GRAMMAR.md
+    /// §3.14: esas anotaciones aplican igual a un `stream` que a un `rpc`).
+    /// `annotation_badges` compartido entre los dos brazos cierra ese hueco.
+    #[test]
+    fn a_protected_rate_limited_deprecated_stream_shows_all_three_badges() {
+        let html = html_for(
+            r#"
+            enum Role { Admin }
+            type Item = { id: Int }
+            db { items: Item[] }
+            service Feed {
+                @requires(Role.Admin)
+                @rate_limit("5/1m")
+                @deprecated("usa Feed.watchV2")
+                stream watchItems() -> Item {
+                    while true { db.items.subscribe() }
+                }
+            }
+        "#,
+        );
+        assert!(html.contains("@requires(Role.Admin)"), "falta el badge de auth en el stream:\n{html}");
+        assert!(html.contains("@rate_limit(&quot;5/1m&quot;)") || html.contains(r#"@rate_limit("5/1m")"#), "falta el badge de rate limit en el stream:\n{html}");
+        assert!(html.contains("deprecated: usa Feed.watchV2"), "falta el badge de deprecated en el stream:\n{html}");
+        assert!(html.contains("📡 Realtime"), "el badge de Realtime no debería desaparecer:\n{html}");
+    }
+
+    /// Un `stream` sin ninguna anotación de auth sigue mostrando "Público"
+    /// -- mismo criterio que ya aplica a un `rpc` sin auth, ahora también
+    /// visible en un `stream` (antes no decía nada al respecto).
+    #[test]
+    fn an_unprotected_stream_shows_publico() {
+        let html = html_for(
+            r#"
+            type Item = { id: Int }
+            db { items: Item[] }
+            service Feed {
+                stream watchItems() -> Item {
+                    while true { db.items.subscribe() }
+                }
+            }
+        "#,
+        );
+        assert!(html.contains("🌐 Público"), "un stream sin auth debería mostrar Público:\n{html}");
+    }
 }

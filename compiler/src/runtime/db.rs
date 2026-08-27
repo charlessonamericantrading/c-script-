@@ -1579,11 +1579,23 @@ db { users: User[] }
                     format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "))
                 };
                 let new_id = self.backend.insert_returning_id(&sql, &params).map_err(|e| write_error("insert", e))?;
+                // AUDIT-2026-08-27.md #5: el INSERT y este SELECT de
+                // confirmación son dos llamadas independientes al backend
+                // (cada una toma y suelta su propio candado, salvo que este
+                // `insert` corra dentro de `with_exclusive_connection` --
+                // `transaction{}`/`upsert`) -- hay una ventana real donde
+                // otro hilo (un `deleteWhere` concurrente cuyo predicado
+                // matchea la fila recién insertada, por ejemplo por un valor
+                // de campo por defecto) puede borrarla antes de este SELECT.
+                // `.expect(...)` panicaba acá en vez de dar el mismo
+                // `RuntimeError` que `applyPatch` (unas líneas más abajo) ya
+                // usa para la carrera IDÉNTICA -- asimetría sin motivo entre
+                // dos funciones que reconsultan por id después de escribir.
                 let inserted = self
                     .select_rows(collection, columns, Some(new_id))?
                     .into_iter()
                     .next()
-                    .expect("la fila recién insertada tiene que existir");
+                    .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con id {new_id} en '{collection}'")))?;
                 self.publish(collection, &inserted);
                 Ok(inserted)
             }
@@ -2313,15 +2325,14 @@ db { users: User[] }
             .backend
             .query(&sql, &[], &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
-        Ok(rows
-            .iter()
+        rows.iter()
             .map(|cells| {
-                Value::Struct(vec![
-                    ("key".to_string(), scalar_cell_to_value(&key_ty, &cells[0])),
-                    ("value".to_string(), scalar_cell_to_value(&value_ty, &cells[1])),
-                ])
+                Ok(Value::Struct(vec![
+                    ("key".to_string(), scalar_cell_to_value(collection, &key_ty, &cells[0])?),
+                    ("value".to_string(), scalar_cell_to_value(collection, &value_ty, &cells[1])?),
+                ]))
             })
-            .collect())
+            .collect()
     }
 
     /// `db.<c>.maxRow(selector)` / `db.<c>.minRow(selector)` (GRAMMAR.md
@@ -2622,8 +2633,18 @@ fn truncate_timestamp_sql(field: &str, granularity: TimeGranularity, is_postgres
 /// mismo camino que ya usa `row_to_fields` para una columna enum normal
 /// -- si no, el checker y el runtime terminarían en desacuerdo sobre qué
 /// forma tiene el mismo valor (GRAMMAR.md §3.9).
-fn scalar_cell_to_value(ty: &Type, cell: &Cell) -> Value {
-    match (ty, cell) {
+/// AUDIT-2026-08-27.md #6: sin brazo para `Cell::Null`, una fila vieja con
+/// `NULL` físico en la columna de agrupación/valor (típico tras agregar un
+/// campo REQUERIDO a una colección con filas existentes -- Postgres agrega
+/// la columna nueva sin `NOT NULL` sin importar la opcionalidad declarada en
+/// el `.link`, `codegen/postgres_emit.rs::alter_table_add_column_postgres`,
+/// confirmado leyendo esa función) caía al `panic!` genérico de abajo.
+/// `row_to_fields` (lectura normal, `find`/`all`/etc.) ya tenía este mismo
+/// caso cubierto con un `RuntimeError` limpio (`null_but_required`) -- ese
+/// fix nunca se había aplicado acá, el camino de agregación (`sumBy`/
+/// `countBy`/`avgBy`/`maxBy`/`minBy`).
+fn scalar_cell_to_value(collection: &str, ty: &Type, cell: &Cell) -> Result<Value, RuntimeError> {
+    Ok(match (ty, cell) {
         (Type::Enum(name), Cell::Text(variant)) => {
             Value::Variant { enum_name: name.clone(), variant: variant.clone(), fields: Vec::new() }
         }
@@ -2646,8 +2667,13 @@ fn scalar_cell_to_value(ty: &Type, cell: &Cell) -> Value {
         (_, Cell::Float(f)) => Value::Float(*f),
         (_, Cell::Text(t)) => Value::Str(t.clone()),
         (_, Cell::Bool(b)) => Value::Bool(*b),
+        (ty, Cell::Null) => {
+            return Err(RuntimeError::new(format!(
+                "la colección '{collection}' tiene una fila con NULL en una columna declarada {ty} usada como clave/valor de agregación -- típico tras agregar un campo REQUERIDO a una colección con filas existentes (ver GRAMMAR.md §9.1.1): Postgres agrega la columna nueva sin NOT NULL sin importar la opcionalidad declarada. Backfilleá esa columna a mano o volvé el campo a opcional."
+            )))
+        }
         (ty, cell) => panic!("una agregación devolvió {cell:?} para una columna declarada {ty}"),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -2666,6 +2692,23 @@ mod tests {
     fn db_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Db>();
+    }
+
+    /// AUDIT-2026-08-27.md #6: `scalar_cell_to_value` (el decodificador de
+    /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`) panicaba sobre
+    /// `Cell::Null` en vez de dar el mismo `RuntimeError` limpio que
+    /// `row_to_fields` ya usa para "fila con NULL en un campo requerido" --
+    /// alcanzable con un campo REQUERIDO agregado a una colección Postgres
+    /// con filas viejas (la migración no destructiva agrega la columna
+    /// nueva sin `NOT NULL` sin importar la opcionalidad declarada).
+    #[test]
+    fn scalar_cell_to_value_rejects_null_with_a_clean_error_instead_of_panicking() {
+        let e = scalar_cell_to_value("sales", &Type::Int, &Cell::Null).unwrap_err();
+        assert!(e.message.contains("sales"), "{}", e.message);
+        assert!(e.message.contains("NULL"), "{}", e.message);
+        // El camino feliz no cambia.
+        assert!(matches!(scalar_cell_to_value("sales", &Type::Int, &Cell::Int(5)), Ok(Value::Int(5))));
+        assert!(matches!(scalar_cell_to_value("sales", &Type::Int64, &Cell::Int(5)), Ok(Value::Int64(5))));
     }
 
     #[test]

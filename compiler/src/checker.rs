@@ -1841,7 +1841,19 @@ impl Checker {
                     r.name, service.name
                 )));
             };
-            if target_is_stream || !target_rpc.looks_like_a_query() {
+            // AUDIT-2026-08-27.md #7: `looks_like_a_query()` (ast.rs) dice
+            // "sí" para CUALQUIER rpc con cero parámetros -- y un rpc
+            // `@cron` siempre tiene cero parámetros (el checker se lo exige
+            // más abajo), así que sin este chequeo explícito, `@invalidates`
+            // sobre un rpc `@cron` compilaba `OK`. `emit_hooks` (ts_emit.rs,
+            // el emisor real de hooks de Query) SÍ excluye `@cron` -- así
+            // que ese target nunca generaba un hook, y `@invalidates`
+            // apuntaba a una entrada de caché que jamás existió: una
+            // llamada muerta para siempre en `hooks.ts` (confirmado en vivo,
+            // `linkc build` daba `OK`), exactamente la clase de "artefacto
+            // generado que miente en silencio" que este proyecto rechaza en
+            // otros lados (`@example`, GRAMMAR.md).
+            if target_is_stream || target_rpc.cron().is_some() || !target_rpc.looks_like_a_query() {
                 return Err(err(format!(
                     "`@invalidates({name})` en '{}': '{name}' no genera un hook de Query -- no hay ninguna entrada de cache que invalidar",
                     r.name
@@ -6239,6 +6251,26 @@ type T = { id: Int, s: Status }")
                 rpc create(title: String) -> Int { 1 }
                 @invalidates(create)
                 rpc update(id: Int, title: String) -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("no genera un hook de Query")), "mensaje inesperado: {err:?}");
+    }
+
+    /// AUDIT-2026-08-27.md #7: un rpc `@cron` siempre tiene cero
+    /// parámetros, así que `looks_like_a_query()` decía "sí" -- sin este
+    /// chequeo explícito, `@invalidates` apuntando a un `@cron` compilaba
+    /// `OK` aunque `emit_hooks` (el emisor real) nunca genera un hook de
+    /// Query para un rpc `@cron`, dejando una llamada de invalidación
+    /// muerta para siempre en `hooks.ts`.
+    #[test]
+    fn invalidates_rejects_a_cron_target() {
+        let src = r#"
+            service Jobs {
+                @cron("5m")
+                rpc sweep() -> Void { }
+                @invalidates(sweep)
+                rpc create(name: String) -> Int { 1 }
             }
         "#;
         let err = check_source(src).unwrap_err();

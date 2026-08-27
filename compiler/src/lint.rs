@@ -20,11 +20,22 @@ pub fn lint_program(program: &Program) -> Vec<LintWarning> {
                 lint_block(&f.body, &mut warnings);
             }
             Item::Service(s) => {
+                // AUDIT-2026-08-27.md #10: un rpc `@cron` nunca puede llevar
+                // `@authenticated`/`@requires` (el checker lo prohíbe -- es
+                // la ÚNICA anotación que admite, GRAMMAR.md §3.159) y nunca
+                // es alcanzable vía HTTP, así que su falta de auth no dice
+                // NADA sobre la superficie HTTP real del servicio. Sin
+                // excluirlo acá, cualquier servicio con al menos un job
+                // `@cron` y al menos un rpc protegido disparaba este lint
+                // aunque TODOS los endpoints HTTP reales estuvieran
+                // protegidos de manera uniforme -- exactamente el patrón que
+                // `@cron` fue diseñado para soportar (una API protegida con
+                // un job de limpieza al lado).
                 let has_auth = s.members.iter().any(|m| match m {
-                    Member::Rpc(r) | Member::Stream(r) => r.auth().is_some(),
+                    Member::Rpc(r) | Member::Stream(r) => r.cron().is_none() && r.auth().is_some(),
                 });
                 let has_unauth = s.members.iter().any(|m| match m {
-                    Member::Rpc(r) | Member::Stream(r) => r.auth().is_none(),
+                    Member::Rpc(r) | Member::Stream(r) => r.cron().is_none() && r.auth().is_none(),
                 });
 
                 if has_auth && has_unauth {
@@ -544,6 +555,40 @@ mod tests {
         let tokens = lexer::tokenize(code).unwrap_or_else(|e| panic!("{e}"));
         let program = parser::parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
         lint_program(&program)
+    }
+
+    #[test]
+    fn mixed_service_auth_still_fires_for_a_genuinely_public_rpc_next_to_a_protected_one() {
+        let code = r#"
+            service Jobs {
+                @authenticated
+                rpc me() -> Void { }
+                rpc ping() -> Void { }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(warnings.iter().any(|w| w.rule == "mixed-service-auth"), "{warnings:?}");
+    }
+
+    /// AUDIT-2026-08-27.md #10: un rpc `@cron` nunca puede llevar
+    /// `@authenticated`/`@requires` y nunca es alcanzable vía HTTP -- antes
+    /// de este fix, un servicio con SOLO rpcs protegidos más un job `@cron`
+    /// disparaba `mixed-service-auth` igual, aunque ningún endpoint HTTP
+    /// real quedara sin protección.
+    #[test]
+    fn mixed_service_auth_does_not_fire_for_a_cron_job_next_to_protected_rpcs() {
+        let code = r#"
+            service Jobs {
+                @authenticated rpc me() -> Void { }
+                @authenticated rpc me2() -> Void { }
+                @cron("5m") rpc sweep() -> Void { }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "mixed-service-auth"),
+            "un @cron no debería contar como rpc 'público' para este lint: {warnings:?}"
+        );
     }
 
     #[test]

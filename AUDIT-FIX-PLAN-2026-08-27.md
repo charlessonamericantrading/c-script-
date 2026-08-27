@@ -49,37 +49,37 @@ test de regresión + verificación manual contra el binario real (nunca solo "co
 
 ## Ronda 3 — Medio (paquete de bugfix, estilo v1.119.0/v1.120.0)
 
-- [ ] **5. `insert()` panica si la fila se borra entre el INSERT y el SELECT de confirmación**
+- [x] **5. `insert()` panica si la fila se borra entre el INSERT y el SELECT de confirmación** -- v1.123.0, GRAMMAR.md §3.168
   - Dónde: `compiler/src/runtime/db.rs:1581-1588`
   - Qué: cambiar el `.expect("la fila recién insertada tiene que existir")` por un `.ok_or_else(...)` que devuelva `RuntimeError`, igual que ya hace `applyPatch` unas líneas más abajo.
   - Verificar: no hay repro trivial por timing — alcanza con el test unitario.
   - Test de regresión: simular la carrera a nivel de test (insertar y borrar entre medio con acceso directo a `Db`, sin depender de timing real de hilos).
 
-- [ ] **6. Agregaciones panican sobre una columna `NULL` heredada de una migración**
+- [x] **6. Agregaciones panican sobre una columna `NULL` heredada de una migración** -- v1.123.0, GRAMMAR.md §3.168
   - Dónde: `compiler/src/runtime/db.rs:2625-2650` (`scalar_cell_to_value`)
   - Qué: agregar un brazo para `Cell::Null` que devuelva `RuntimeError`, mismo mensaje/criterio que `row_to_fields` ya usa para "null_but_required".
   - Verificar: si hay Postgres disponible, repetir el repro de punta a punta (agregar campo requerido a colección con filas viejas, migrar, llamar `sumBy` agrupando por ese campo). Si no hay Postgres a mano, alcanza con un test unitario que llame `scalar_cell_to_value` directo con `Cell::Null`.
   - Test de regresión: unitario mínimo, + uno contra Postgres real si el entorno de CI lo permite.
 
-- [ ] **7. El checker acepta un rpc `@cron` como blanco de `@invalidates`**
+- [x] **7. El checker acepta un rpc `@cron` como blanco de `@invalidates`** -- v1.123.0, GRAMMAR.md §3.168
   - Dónde: `compiler/src/checker.rs:1818-1852` (`check_invalidates_annotation`)
   - Qué: excluir explícitamente un blanco con `.cron().is_some()`, mismo criterio que los 6 sitios de codegen.
   - Verificar: repetir el repro del audit — `@invalidates(unRpcConCron)` debe ser un error de compilación, no un `OK` silencioso.
   - Test de regresión: unitario de checker (`invalidates_rejects_a_cron_target` o similar).
 
-- [ ] **8. `linkc doc` no muestra badges de auth/rate-limit/deprecated en un `stream`**
+- [x] **8. `linkc doc` no muestra badges de auth/rate-limit/deprecated en un `stream`** -- v1.123.0, GRAMMAR.md §3.168
   - Dónde: `compiler/src/doc.rs`, brazo `Member::Stream(st)` de `render_service`
   - Qué: extraer el cálculo de badges a una función compartida entre los brazos `Rpc` y `Stream`, en vez de dos implementaciones independientes (la raíz del bug es duplicación, no solo el síntoma).
   - Verificar: repetir el repro del audit — un `stream` con `@requires`+`@rate_limit`+`@deprecated` debe mostrar los tres badges en el HTML generado.
   - Test de regresión: si `doc.rs` tiene tests existentes, sumar uno ahí; si no, al menos una verificación manual documentada en el commit/CHANGELOG.
 
-- [ ] **9. `GET /metrics` sostiene el candado de métricas mientras contiende por la conexión**
+- [x] **9. `GET /metrics` sostiene el candado de métricas mientras contiende por la conexión** -- v1.123.0, GRAMMAR.md §3.168
   - Dónde: `compiler/src/runtime/server.rs:819`
   - Qué: recolectar `db.subscriber_counts()`/`db.size_bytes()`/`db.oversized_notify_drop_counts()` ANTES de tomar `metrics_store.lock()`, sostenerlo solo para el formateo.
   - Verificar: no hay un repro de un solo request — es un cambio de orden de evaluación, revisar que `render_prometheus_text` siga recibiendo los mismos argumentos ya calculados.
   - Test de regresión: los tests de `/metrics` existentes (`cli_metrics.rs`) no deberían cambiar de comportamiento — correrlos como regresión, no hace falta un test nuevo salvo que se quiera medir contención directamente (opcional, bajo prioridad).
 
-- [ ] **10. `lint`: `mixed-service-auth` da falso positivo con `@cron` + rpcs protegidos**
+- [x] **10. `lint`: `mixed-service-auth` da falso positivo con `@cron` + rpcs protegidos** -- v1.123.0, GRAMMAR.md §3.168
   - Dónde: `compiler/src/lint.rs:23-28`
   - Qué: excluir `.cron().is_some()` del cálculo de `has_unauth`, mismo criterio que codegen.
   - Verificar: repetir el repro del audit — el programa con 2 rpcs `@authenticated` + 1 `@cron` no debe disparar el lint.
