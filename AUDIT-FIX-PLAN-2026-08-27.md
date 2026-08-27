@@ -89,19 +89,26 @@ test de regresión + verificación manual contra el binario real (nunca solo "co
 
 ## Ronda 4 — Bajo / opcional (evaluar caso a caso, no urgente)
 
-- [ ] **11. `@cache` con la misma carrera que `@idempotent`** — cubrir en el mismo commit que el #4 si el fix ahí es genérico; si no, evaluar aparte (menor severidad, "cache stampede" no es una escritura duplicada).
-- [ ] **12. `@unique`/`@index` no son índices parciales respecto a `@softDelete`** — requiere índices parciales en los dos backends (`CREATE UNIQUE INDEX ... WHERE "campo" IS NULL`), cambio de arquitectura, no un one-liner. Como mínimo: documentar el límite en GRAMMAR.md si no se ataca esta ronda.
-- [ ] **13. `--jwt-secret ""` / `--service-api-key ""` (string vacío por flag) activa la feature con secreto vacío** — aplicar el mismo `.filter(|v| !v.trim().is_empty())` al valor que viene de flag en `read_flag_or_env` (`main.rs:2122-2131`), igual que ya se aplica al de env var. Fix de una línea.
-- [ ] **14. Panics de tipo-incompatible decodificando filas de tablas `--adopt-existing` con datos legado** — necesita su propio discovery (no verificado independientemente en el audit); revisar `row_to_fields`/`write_param` en `db.rs` y convertir los `panic!`/`.expect()` reachable a `RuntimeError`, mismo criterio que el resto del archivo.
-- [ ] **15. Carrera check-then-act en la composición de `recordFailedLogin`/`failedLoginCount`** — probablemente aceptado por diseño (GRAMMAR.md §3.152 ya documenta que son piezas para componer a mano). Acción mínima: confirmar que el límite está explícitamente documentado en GRAMMAR.md; si no, agregar la nota. No priorizar un fix de runtime sin evidencia real de que importa a un adoptador.
-- [ ] **16. `+`/`-`/`*` sobre `Int`/`Int64` sin `checked_*`** — ya conocido y aceptado fuera de `transaction{}`/`@cron` (GRAMMAR.md §3.163). En perfil `release` wrappea en silencio (bug de corrección, no de estabilidad). Evaluar si vale la pena cerrarlo del todo (`checked_add`/`checked_sub`/`checked_mul`, mismo patrón que `/` y `%` en v1.119.0) en una ronda futura — no es urgente, no es nuevo.
+- [x] **11. `@cache` con la misma carrera que `@idempotent`** — evaluado y NO atacado a propósito: la semántica correcta sería "esperar al primero" (no rechazar con 409, que rompería el contrato de `@cache`), y esperar sincrónico acopla la latencia de requests no relacionados sin evidencia real de que importe. Documentado en GRAMMAR.md §3.144.
+- [x] **12. `@unique`/`@index` no son índices parciales respecto a `@softDelete`** — evaluado y NO atacado a propósito: requiere índices parciales en los dos backends MÁS una migración segura para bases ya desplegadas (`DROP`+`CREATE` del índice viejo, riesgo real sobre datos de producción). Discovery hecho, documentado como límite honesto en GRAMMAR.md §3.80, diseño/implementación quedan para una ronda propia.
+- [x] **13. `--jwt-secret ""` / `--service-api-key ""` (string vacío por flag) activa la feature con secreto vacío** -- v1.124.0, GRAMMAR.md §3.169. Fix puntual en `resolve_service_api_key`/`resolve_jwt_config`, no en `read_flag_or_env` (otros flags como `--host` tienen el contrato inverso, deliberado).
+- [x] **14. Panics de tipo-incompatible decodificando filas de tablas `--adopt-existing` con datos legado** -- v1.124.0, GRAMMAR.md §3.169. Los 3 sitios reales de `row_to_fields` (JSON legado que no calza, `Cell` inesperada en columna JSON, tipo nativo no coincide) convertidos a `RuntimeError` limpio.
+- [x] **15. Carrera check-then-act en la composición de `recordFailedLogin`/`failedLoginCount`** — documentado como límite honesto en GRAMMAR.md §3.152, no atacado con un mecanismo nuevo sin evidencia real de que importe.
+- [x] **16. `+`/`-`/`*` sobre `Int`/`Int64` sin `checked_*`** -- v1.124.0, GRAMMAR.md §3.169. `checked_int_numeric_op` generalizada para cubrir los tres operadores (y el `-` unario, y `List<Int>.sum()`) -- ya no queda ningún operador aritmético entero sin `checked_*`. Efecto colateral: dos tests de §3.163/§3.164 que usaban desborde de `+` como disparador de panic se actualizaron (ese disparador específico ya no panica, ahora es un `RuntimeError` limpio).
 
 ---
 
-## Cómo seguir
+## Estado: plan completo
 
-Recomendación: atacar Ronda 1 completa en una sola sesión de trabajo (los dos hallazgos
-críticos), shippear como versión propia con su propio ciclo completo (tests + docs +
-verificación manual + CI verde) antes de tocar la Ronda 2. Rondas 2 y 3 pueden
-empaquetarse juntas si el volumen de cambio por versión se mantiene razonable — mismo
-criterio que ya se usó para v1.119.0 (3 bugs en un solo paquete).
+Los 16 hallazgos de `AUDIT-2026-08-27.md` quedaron todos resueltos o documentados
+explícitamente como límites conocidos, ninguno silenciado:
+
+- **10 hallazgos cerrados con código real** (#1-10, #13, #14, #16 -- 13 en total),
+  verificados con test unitario propio + repetición en vivo contra el binario real
+  donde había repro directo.
+- **3 hallazgos evaluados y documentados a propósito, sin cambio de código** (#11, #12,
+  #15) -- cada uno con su razonamiento explícito en GRAMMAR.md sobre por qué no se
+  atacó, no un olvido.
+
+Shippeado en 4 versiones (v1.122.0 Ronda 1+2, v1.123.0 Ronda 3, v1.124.0 Ronda 4),
+cada una con su propio ciclo completo (tests + docs + verificación manual + CI verde).

@@ -148,6 +148,20 @@ fn without_the_flag_no_key_is_required_at_all() {
     assert_eq!(body, "\"pong\"");
 }
 
+/// AUDIT-2026-08-27.md #13: `--service-api-key ""` (valor vacío explícito
+/// por flag) activaba la capa entera con un secreto vacío -- ahora se
+/// filtra igual que un valor de env var vacío, comportándose IDÉNTICO a no
+/// pasar el flag en absoluto.
+#[test]
+fn an_empty_string_flag_value_behaves_like_the_flag_was_never_passed() {
+    let temp = TempDir::new("empty-flag");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--service-api-key", ""]);
+    let (status, body) = server.request("/Sys/ping", &[]);
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body, "\"pong\"");
+}
+
 #[test]
 fn a_request_without_the_header_is_rejected_before_it_reaches_the_rpc() {
     let temp = TempDir::new("missing-header");

@@ -703,6 +703,23 @@ fn without_jwt_secret_configured_a_jwt_shaped_token_is_just_unauthenticated() {
     server.shutdown();
 }
 
+/// AUDIT-2026-08-27.md #13: `--jwt-secret ""` (valor vacío explícito por
+/// flag) activaba la verificación de JWT con un secreto vacío en vez de
+/// comportarse como "no configurado" -- mismo filtro que ya aplicaba del
+/// lado de la env var, ahora también del lado del flag.
+#[test]
+fn an_empty_string_jwt_secret_flag_behaves_like_it_was_never_configured() {
+    let server = ServeProcess::start_with_program_and_args("jwt-empty-flag", JWT_PROGRAM, &["--jwt-secret", ""]);
+
+    // Un JWT firmado con la clave vacía -- si el flag vacío se hubiera
+    // tomado en serio, esto verificaría.
+    let jwt = make_jwt("", "HS256", r#"{"role":"Admin","sub":1}"#);
+    let (status, _) = server.post("/Secured/adminOnly", &json!({}), Some(&jwt));
+    assert_eq!(status, 401, "un --jwt-secret vacío no debería activar la verificación de JWT");
+
+    server.shutdown();
+}
+
 /// `@idempotent` (GRAMMAR.md §3.140): `create` inserta una fila real -- el
 /// contador (`count`) es lo que prueba que un reintento con la MISMA clave
 /// nunca corre el cuerpo dos veces, no solo que devuelve un valor parecido.

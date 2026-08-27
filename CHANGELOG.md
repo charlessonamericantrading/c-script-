@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.124.0] - 2026-08-27
+
+### 🐛 Arreglado
+Ronda 4 (última) de `AUDIT-FIX-PLAN-2026-08-27.md` -- cierra los 16 hallazgos de la tercera auditoría adversarial. 3 con código, 3 evaluados y documentados a propósito sin cambio de código:
+
+- **`--jwt-secret ""` / `--service-api-key ""` (string vacío por flag) activaba la feature con secreto vacío.** El mismo filtro que ya aplicaba del lado de la env var no se aplicaba al valor de flag. Fix puntual en los dos `resolve_*`, sin tocar `read_flag_or_env` en sí (otros flags como `--host` tienen el contrato inverso deliberado: un valor vacío ahí es un error explícito).
+- **Panics de tipo-incompatible decodificando filas de una tabla `--adopt-existing` con datos legado.** Tres sitios en `row_to_fields` asumían "esta fila la escribimos nosotros, con esta forma" -- un JSON guardado por una versión anterior del `.link` que ya no calza con el tipo actual, una columna JSON con una `Cell` física inesperada, o un tipo nativo declarado que no coincide con lo que la base tiene guardado (alcanzable de verdad: SQLite tiene afinidad de tipo, no enforcement). Los tres dan ahora el mismo `RuntimeError` limpio que el resto de la función.
+- **`+`/`-`/`*` sobre `Int`/`Int64` (y el `-` unario, y `List<Int>.sum()`) seguían con aritmética cruda.** v1.119.0 solo había cerrado `/`/`%` -- en perfil `release` (los binarios publicados) un desborde de `+`/`-`/`*` wrappea EN SILENCIO, un bug de corrección, no solo de estabilidad. Generalizada la función que ya cubría `/`/`%` -- ya no queda ningún operador aritmético entero del lenguaje sin `checked_*`. Efecto colateral honesto: dos tests de rondas anteriores usaban desborde de `+` como disparador de un panic real para probar `catch_unwind` -- con `+` ahora protegido, ese disparador específico ya no panica, así que esos tests se actualizaron para reflejar la nueva realidad (siguen siendo regresiones válidas, ya no ejercitan el camino de panic).
+- **`@cache` con la misma carrera que `@idempotent`**, **`@unique`/`@softDelete` sin índices parciales**, y **la composición check-then-act del lockout de login** se evaluaron y quedaron documentados como límites honestos en GRAMMAR.md, no atacados con apuro -- cada uno con su razonamiento explícito de por qué.
+
+Con esto, `AUDIT-FIX-PLAN-2026-08-27.md` queda completo. Verificado con test unitario por hallazgo con código + repetición en vivo contra el binario real para los tres. Ver GRAMMAR.md §3.169.
+
 ## [1.123.0] - 2026-08-27
 
 ### 🐛 Arreglado

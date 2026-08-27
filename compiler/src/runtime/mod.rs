@@ -915,24 +915,40 @@ fn eval_binary(
     match op {
         // '+' concatena si ambos lados son String (checker.rs ya garantizó
         // que no llega acá un String mezclado con Int/Float).
+        // AUDIT-2026-08-27.md #16: `+`/`-`/`*` sobre `Int`/`Int64` pasaban
+        // por `numeric_op` con `a+b`/`a-b`/`a*b` crudo -- el mismo riesgo de
+        // panic (perfil `dev`) o wrap silencioso (perfil `release`) que
+        // `/`/`%` ya tenían antes de GRAMMAR.md §3.162, solo que el
+        // disparador es más raro (un valor cerca de `i64::MAX`/`MIN`, no
+        // "cualquier cero") -- pero igual de real con datos de usuario
+        // (IDs tipo snowflake, montos grandes, un contador que crece sin
+        // límite declarado). Mismo mecanismo que Div/Rem: `checked_*` +
+        // `RuntimeError` limpio en vez de panic/wrap.
         Add => match (l, r) {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
-            (l, r) => numeric_op(l, r, |a, b| a + b, |a, b| a + b),
+            (l, r) => checked_int_numeric_op(l, r, i64::checked_add, |a, b| a + b, |a, b| {
+                err(format!("desborde aritmético al sumar {a} y {b}"))
+            }),
         },
-        Sub => numeric_op(l, r, |a, b| a - b, |a, b| a - b),
-        Mul => numeric_op(l, r, |a, b| a * b, |a, b| a * b),
-        // GRAMMAR.md §3.162: NO pasan por `numeric_op` como el resto --
-        // sobre ENTEROS, `a / 0` y `i64::MIN / -1` son panics de Rust, no
-        // valores. Un panic acá no es un error de runtime normal: mata el
-        // hilo de la request sin pasar por ningún camino de limpieza, y
-        // adentro de un `transaction { }` deja la transacción SQL abierta
-        // para siempre (bug real reproducido, con pérdida silenciosa de
-        // datos ya confirmados al cliente). El divisor casi siempre viene
-        // de datos del usuario, así que esto era trivialmente alcanzable.
-        // El camino de `Float` no necesita guarda: IEEE-754 define /0 como
-        // inf/NaN, nunca panica.
-        Div => checked_int_numeric_op(l, r, i64::checked_div, |a, b| a / b, "dividir"),
-        Rem => checked_int_numeric_op(l, r, i64::checked_rem, |a, b| a % b, "calcular el resto de"),
+        Sub => checked_int_numeric_op(l, r, i64::checked_sub, |a, b| a - b, |a, b| {
+            err(format!("desborde aritmético al restar {b} de {a}"))
+        }),
+        Mul => checked_int_numeric_op(l, r, i64::checked_mul, |a, b| a * b, |a, b| {
+            err(format!("desborde aritmético al multiplicar {a} por {b}"))
+        }),
+        // GRAMMAR.md §3.162: sobre ENTEROS, `a / 0` y `i64::MIN / -1` son
+        // panics de Rust, no valores. Un panic acá no es un error de
+        // runtime normal: mata el hilo de la request sin pasar por ningún
+        // camino de limpieza, y adentro de un `transaction { }` deja la
+        // transacción SQL abierta para siempre (bug real reproducido, con
+        // pérdida silenciosa de datos ya confirmados al cliente). El
+        // divisor casi siempre viene de datos del usuario, así que esto era
+        // trivialmente alcanzable. El camino de `Float` no necesita guarda:
+        // IEEE-754 define /0 como inf/NaN, nunca panica.
+        Div => checked_int_numeric_op(l, r, i64::checked_div, |a, b| a / b, |a, b| div_or_rem_overflow_message("dividir", a, b)),
+        Rem => {
+            checked_int_numeric_op(l, r, i64::checked_rem, |a, b| a % b, |a, b| div_or_rem_overflow_message("calcular el resto de", a, b))
+        }
         Eq => Ok(Value::Bool(l == r)),
         NotEq => Ok(Value::Bool(l != r)),
         Lt => compare(l, r, |o| o == std::cmp::Ordering::Less),
@@ -957,9 +973,13 @@ fn eval_unary(
 ) -> Result<Value, RuntimeError> {
     let v = eval_expr(operand, env, db, fns, checker, sessions, current_token, step_budget)?;
     match op {
+        // AUDIT-2026-08-27.md #16: `i64::MIN` es el único valor cuyo
+        // negativo no representa -- `-i64::MIN` desborda (mismo motivo que
+        // `i64::MIN / -1` en Div, §3.162). `checked_neg()` en vez de `-n`
+        // crudo, mismo criterio que el resto de esta ronda.
         UnaryOp::Neg => match v {
-            Value::Int(n) => Ok(Value::Int(-n)),
-            Value::Int64(n) => Ok(Value::Int64(-n)),
+            Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| err(format!("desborde aritmético al negar {n}"))),
+            Value::Int64(n) => n.checked_neg().map(Value::Int64).ok_or_else(|| err(format!("desborde aritmético al negar {n}"))),
             Value::Float(n) => Ok(Value::Float(-n)),
             other => Err(err(format!("'-' unario requiere Int, Int64 o Float en runtime: {other:?}"))),
         },
@@ -1020,43 +1040,28 @@ fn recognize_pushable_conjunction(f: &Value) -> Option<Vec<(String, BinaryOp, Va
     Some(out)
 }
 
-fn numeric_op(
-    l: Value,
-    r: Value,
-    int_op: impl Fn(i64, i64) -> i64,
-    float_op: impl Fn(f64, f64) -> f64,
-) -> Result<Value, RuntimeError> {
-    match (l, r) {
-        (Value::Int(a), Value::Int(b)) => Ok(Value::Int(int_op(a, b))),
-        (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64(int_op(a, b))),
-        (Value::Float(a), Value::Float(b)) => Ok(Value::Float(float_op(a, b))),
-        (l, r) => Err(err(format!(
-            "operador aritmético requiere Int+Int, Int64+Int64 o Float+Float en runtime: {l:?} y {r:?}"
-        ))),
-    }
-}
-
-/// Hermana de `numeric_op` para las DOS operaciones que pueden panicar
-/// sobre enteros (`/` y `%`, GRAMMAR.md §3.162). `int_op` es la variante
-/// `checked_*` de `i64`, que devuelve `None` tanto para divisor cero como
-/// para el desborde de `i64::MIN / -1` -- los dos casos se traducen a un
+/// Cubre `+`/`-`/`*`/`/`/`%` -- todo operador aritmético entero de c-script
+/// pasa por acá, ninguno queda con aritmética cruda sin `checked_*`
+/// (originalmente solo `/`/`%`, GRAMMAR.md §3.162; extendida a `+`/`-`/`*`
+/// en AUDIT-2026-08-27.md #16 -- mismo riesgo real: `a + b` crudo sobre
+/// `i64` panica en desborde bajo `overflow-checks`, el perfil `dev` que
+/// corre `cargo test`/CI, y en `release` wrappea en silencio, un bug de
+/// CORRECCIÓN en vez de estabilidad, pero igual de real con datos de
+/// usuario). `int_op` es la variante `checked_*` de `i64` correspondiente,
+/// que devuelve `None` en cualquier desborde -- se traduce a un
 /// `RuntimeError` normal (500 limpio, el hilo de la request sobrevive) en
-/// vez de a un panic. `float_op` va sin guarda a propósito: IEEE-754 ya
-/// define `/0` como infinito/NaN.
+/// vez de a un panic o un wrap silencioso. `float_op` va sin guarda a
+/// propósito: IEEE-754 ya define overflow/`/0` como infinito/NaN, nunca
+/// panica. `bad` arma el mensaje -- cada operador tiene su propia forma
+/// natural (`/`/`%` distinguen divisor cero de desborde real; `+`/`-`/`*`
+/// solo pueden desbordar, nunca hay un caso "por cero" que mencionar).
 fn checked_int_numeric_op(
     l: Value,
     r: Value,
     int_op: impl Fn(i64, i64) -> Option<i64>,
     float_op: impl Fn(f64, f64) -> f64,
-    verb: &str,
+    bad: impl Fn(i64, i64) -> RuntimeError,
 ) -> Result<Value, RuntimeError> {
-    let bad = |a: i64, b: i64| {
-        if b == 0 {
-            err(format!("no se puede {verb} {a} por cero"))
-        } else {
-            err(format!("desborde aritmético al {verb} {a} por {b}"))
-        }
-    };
     match (l, r) {
         (Value::Int(a), Value::Int(b)) => int_op(a, b).map(Value::Int).ok_or_else(|| bad(a, b)),
         (Value::Int64(a), Value::Int64(b)) => int_op(a, b).map(Value::Int64).ok_or_else(|| bad(a, b)),
@@ -1064,6 +1069,16 @@ fn checked_int_numeric_op(
         (l, r) => Err(err(format!(
             "operador aritmético requiere Int+Int, Int64+Int64 o Float+Float en runtime: {l:?} y {r:?}"
         ))),
+    }
+}
+
+/// Mensaje para `/`/`%`: distingue divisor cero (el caso casi siempre
+/// alcanzado con datos de usuario) del desborde real (`i64::MIN / -1`).
+fn div_or_rem_overflow_message(verb: &str, a: i64, b: i64) -> RuntimeError {
+    if b == 0 {
+        err(format!("no se puede {verb} {a} por cero"))
+    } else {
+        err(format!("desborde aritmético al {verb} {a} por {b}"))
     }
 }
 
@@ -2100,9 +2115,17 @@ fn call_method(
             // ronda, ver la doc ahí para el motivo (una lista vacía no lleva
             // ningún tag de tipo de elemento en runtime).
             "sum" => {
+                // AUDIT-2026-08-27.md #16: mismo riesgo que `+` binario --
+                // `total += as_int(item)?` es una suma cruda de `i64`, así
+                // que una lista cuyos elementos sumados superan `i64::MAX`
+                // panicaba (perfil `dev`) o wrappeaba en silencio
+                // (`release`) en vez de dar un `RuntimeError` limpio.
                 let mut total: i64 = 0;
                 for item in &items {
-                    total += as_int(item)?;
+                    let n = as_int(item)?;
+                    total = total
+                        .checked_add(n)
+                        .ok_or_else(|| err(format!("desborde aritmético: la suma de List<Int>.sum() supera el rango de Int ({total} + {n})")))?;
                 }
                 Ok(Value::Int(total))
             }
@@ -7137,6 +7160,54 @@ mod tests {
         assert!(e.message.contains("desborde"), "mensaje inesperado: {}", e.message);
     }
 
+    /// AUDIT-2026-08-27.md #16: `/`/`%` ya tenían `checked_*` desde
+    /// §3.162 -- `+`/`-`/`*` (y el `-` unario) seguían con aritmética
+    /// cruda, mismo riesgo de panic/wrap silencioso con un valor cerca de
+    /// `i64::MAX`/`MIN`.
+    #[test]
+    fn integer_add_sub_mul_and_unary_neg_overflow_are_clean_runtime_errors_too() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc add(a: Int64, b: Int64) -> Int64 { a + b }
+                rpc sub(a: Int64, b: Int64) -> Int64 { a - b }
+                rpc mul(a: Int64, b: Int64) -> Int64 { a * b }
+                rpc neg(a: Int64) -> Int64 { -a }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "S", "add", &json!({"a": "9223372036854775807", "b": "1"}), &db).unwrap_err();
+        assert!(e.message.contains("desborde"), "add: {}", e.message);
+        let e = invoke_rpc(&program, "S", "sub", &json!({"a": "-9223372036854775808", "b": "1"}), &db).unwrap_err();
+        assert!(e.message.contains("desborde"), "sub: {}", e.message);
+        let e = invoke_rpc(&program, "S", "mul", &json!({"a": "9223372036854775807", "b": "2"}), &db).unwrap_err();
+        assert!(e.message.contains("desborde"), "mul: {}", e.message);
+        let e = invoke_rpc(&program, "S", "neg", &json!({"a": "-9223372036854775808"}), &db).unwrap_err();
+        assert!(e.message.contains("desborde"), "neg: {}", e.message);
+        // El camino feliz no cambia.
+        assert_eq!(invoke_rpc(&program, "S", "add", &json!({"a": "2", "b": "3"}), &db).unwrap(), json!("5"));
+        assert_eq!(invoke_rpc(&program, "S", "sub", &json!({"a": "5", "b": "3"}), &db).unwrap(), json!("2"));
+        assert_eq!(invoke_rpc(&program, "S", "mul", &json!({"a": "2", "b": "3"}), &db).unwrap(), json!("6"));
+        assert_eq!(invoke_rpc(&program, "S", "neg", &json!({"a": "5"}), &db).unwrap(), json!("-5"));
+    }
+
+    /// `List<Int>.sum()` sobre valores cuya suma real supera `i64::MAX`
+    /// (AUDIT-2026-08-27.md #16) -- mismo criterio, `checked_add` en vez de
+    /// `+=` crudo.
+    #[test]
+    fn list_int_sum_overflow_is_a_clean_runtime_error() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc total(xs: Int[]) -> Int { xs.sum() }
+            }
+        "#,
+        );
+        let e = invoke_rpc(&program, "S", "total", &json!({"xs": [9223372036854775807i64, 1]}), &Db::seeded()).unwrap_err();
+        assert!(e.message.contains("desborde"), "{}", e.message);
+    }
+
     /// Un `transaction { }` cuyo cuerpo falla por división por cero tiene
     /// que hacer ROLLBACK como cualquier otro error -- y, sobre todo, dejar
     /// la base usable para la SIGUIENTE transacción. Antes del fix la
@@ -7172,26 +7243,22 @@ mod tests {
         assert_eq!(invoke_rpc(&program, "S", "ok", &json!({"name": "a"}), &db).unwrap(), json!(1));
     }
 
-    /// GRAMMAR.md §3.163: el fix de §3.162 solo cubría `/` y `%` -- CUALQUIER
-    /// otro panic real (no un `RuntimeError`) adentro de un `transaction { }`
-    /// seguía dejando el `BEGIN` abierto para siempre. El disparador acá es
-    /// distinto a propósito (desborde de `+` sobre `i64`, código de
-    /// producción sin arreglar -- ver `numeric_op`, que sigue usando `a + b`
-    /// crudo) para probar que el `catch_unwind` nuevo protege contra un
-    /// panic GENÉRICO, no solo contra el caso puntual que ya tenía su propio
-    /// `RuntimeError` limpio.
-    ///
-    /// `#[cfg(debug_assertions)]`: el desborde de `+` sobre `i64` solo panica
-    /// con `overflow-checks` activo, que Cargo prende por defecto en el
-    /// perfil `dev` (`cargo test` normal, lo que corre CI) y apaga en
-    /// `release` (donde `a + b` simplemente wrappea, sin nada que atrapar --
-    /// confirmado corriendo este mismo test con `cargo test --release`: no
-    /// panicó, la RPC devolvió éxito). Gatearlo así evita un test que
-    /// flaquea según el perfil de build en vez de fallar limpio o pasar
-    /// limpio.
+    /// GRAMMAR.md §3.163 originalmente usaba un desborde de `+` sobre `i64`
+    /// como disparador -- código de producción sin arreglar EN ESE MOMENTO,
+    /// a propósito, para probar que el `catch_unwind` de `Expr::Transaction`
+    /// protege contra un panic GENÉRICO, no solo contra el caso puntual de
+    /// división por cero que ya tenía su propio `RuntimeError` limpio.
+    /// AUDIT-2026-08-27.md #16 cerró ESE disparador también (`+` ahora usa
+    /// `checked_add`) -- así que hoy este mismo escenario ya no panica: da
+    /// un `RuntimeError` limpio por el camino normal, sin necesitar
+    /// `catch_unwind` para nada. Este test quedó como regresión de esa
+    /// composición (desborde dentro de `transaction{}` sigue rollbackeando
+    /// y dejando la base usable), no como prueba del mecanismo de panic --
+    /// para ESO, `a_transaction_whose_body_divides_by_zero_...` (arriba)
+    /// alcanza igual de bien ahora que los dos disparadores dan el mismo
+    /// tipo de error limpio.
     #[test]
-    #[cfg(debug_assertions)]
-    fn a_transaction_whose_body_panics_from_something_other_than_division_by_zero_also_rolls_back_and_leaves_the_db_usable() {
+    fn a_transaction_whose_body_overflows_still_rolls_back_and_leaves_the_db_usable() {
         let program = program_from(
             r#"
             type Item = { id: Int, name: String }
@@ -7213,19 +7280,10 @@ mod tests {
         "#,
         );
         let db = Db::new(&program, std::path::Path::new(":memory:"));
-        // Silenciar el panic hook default mientras el panic es intencional
-        // (dispara el `catch_unwind` que este test prueba) -- no ensuciar
-        // stderr de `cargo test` (mismo criterio que lsp.rs,
-        // `test_catch_unwind_around_a_document_recheck_does_not_crash_the_server`).
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = invoke_rpc(&program, "S", "boom", &json!({"a": i64::MAX}), &db);
-        std::panic::set_hook(prev_hook);
-        let e = result.unwrap_err();
-        assert!(e.message.contains("error interno inesperado"), "{}", e.message);
+        let e = invoke_rpc(&program, "S", "boom", &json!({"a": i64::MAX}), &db).unwrap_err();
+        assert!(e.message.contains("desborde"), "{}", e.message);
         assert_eq!(invoke_rpc(&program, "S", "count", &json!({}), &db).unwrap(), json!(0), "la fila del cuerpo tiene que haberse rollbackeado");
-        // Y la base sigue usable: una transacción POSTERIOR funciona -- antes
-        // del fix se hubiera quedado con el 'BEGIN' abierto para siempre.
+        // Y la base sigue usable: una transacción POSTERIOR funciona.
         assert_eq!(invoke_rpc(&program, "S", "ok", &json!({"name": "a"}), &db).unwrap(), json!(1));
     }
 

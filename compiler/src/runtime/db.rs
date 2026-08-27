@@ -2461,11 +2461,38 @@ db { users: User[] }
                         }
                     }
                     Cell::Json(parsed) => {
-                        let decoded = json_to_typed_value(parsed, &col.field.ty, &self.checker, &col.field.name)
-                            .unwrap_or_else(|e| panic!("un valor que nosotros escribimos tiene que decodificar contra su propio tipo: {e}"));
+                        // AUDIT-2026-08-27.md #14: el comentario original
+                        // ("un valor que nosotros escribimos") asume que
+                        // TODA fila fue escrita por este mismo programa --
+                        // falso bajo `--adopt-existing`/evolución de
+                        // esquema: un blob JSON legado, escrito por una
+                        // versión ANTERIOR del `.link` (un campo anidado que
+                        // ahora es requerido y antes no existía, por
+                        // ejemplo), puede no calzar con el tipo ACTUAL.
+                        // `panic!` mataba el hilo de esa request en vez de
+                        // dar el mismo `RuntimeError` limpio que el resto de
+                        // esta función ya usa para "el schema declarado no
+                        // coincide con lo que hay guardado".
+                        let decoded = json_to_typed_value(parsed, &col.field.ty, &self.checker, &col.field.name).map_err(|e| {
+                            RuntimeError::new(format!(
+                                "la colección '{collection}' tiene una fila (id={id}) con un JSON guardado en '{}' que no coincide con el tipo declarado actual: {e} -- típico tras evolucionar el tipo de un campo anidado (`--adopt-existing` o una migración de esquema); esa fila se guardó con una forma anterior",
+                                col.field.name
+                            ))
+                        })?;
                         out.push((col.field.name.clone(), decoded));
                     }
-                    other => panic!("la columna JSON '{}' devolvió {other:?}", col.field.name),
+                    // Mismo motivo: bajo `--adopt-existing`, una columna que
+                    // el `.link` declara como JSON (struct/lista/map/
+                    // genérico) podría, en la tabla física real, no ser
+                    // JSON en absoluto (un `INTEGER`/`TEXT` plano de un
+                    // programa completamente distinto que casualmente
+                    // adoptó la misma tabla, por ejemplo).
+                    other => {
+                        return Err(RuntimeError::new(format!(
+                            "la colección '{collection}' tiene una fila (id={id}) cuya columna '{}' debería contener JSON (tipo declarado {:?}) pero la base devolvió {other:?} -- la tabla física no coincide con lo que el programa espera ahí",
+                            col.field.name, col.field.ty
+                        )))
+                    }
                 }
                 continue;
             }
@@ -2491,13 +2518,22 @@ db { users: User[] }
                 // Un desajuste acá significa que el plan de columnas y lo que
                 // la base devolvió no coinciden: schema escrito por otra
                 // versión del programa, o un backend nuevo mapeando mal un
-                // tipo. Fallar fuerte con los dos lados a la vista es lo único
-                // útil -- devolver un valor "parecido" escondería el problema
-                // adentro de la respuesta de un rpc.
-                (ty, cell) => panic!(
-                    "la columna '{}' declara {ty} pero la base devolvió {cell:?}",
-                    col.field.name
-                ),
+                // tipo -- alcanzable de verdad bajo `--adopt-existing`
+                // (AUDIT-2026-08-27.md #14): `check_schema_for_adoption`
+                // valida existencia y tipo DECLARADO de cada columna, pero
+                // SQLite tiene afinidad de tipo, no enforcement -- una
+                // columna declarada `INTEGER` puede seguir teniendo filas
+                // con `TEXT` físico adentro si algo la escribió así antes.
+                // Fallar limpio con los dos lados a la vista (antes: panic,
+                // mataba el hilo) es lo único útil -- devolver un valor
+                // "parecido" escondería el problema adentro de la respuesta
+                // de un rpc.
+                (ty, cell) => {
+                    return Err(RuntimeError::new(format!(
+                        "la colección '{collection}' tiene una fila (id={id}) cuya columna '{}' declara {ty} pero la base devolvió {cell:?} -- la tabla física no coincide con lo que el programa espera ahí (típico bajo --adopt-existing con datos que no calzan)",
+                        col.field.name
+                    )))
+                }
             };
             match value {
                 Some(v) => out.push((col.field.name.clone(), v)),
@@ -3040,6 +3076,65 @@ mod tests {
             !fields.iter().any(|(n, _)| n == "legacy_note"),
             "una columna física no declarada en el .link se ignora, nunca se filtra al Value"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// AUDIT-2026-08-27.md #14: `check_schema_for_adoption` valida el tipo
+    /// DECLARADO de cada columna, pero SQLite tiene afinidad de tipo, no
+    /// enforcement real -- una columna declarada `INTEGER` puede seguir
+    /// aceptando (y guardando tal cual) un valor `TEXT` si algo la escribió
+    /// así por fuera de c-script. Antes de este fix, leer esa fila panicaba
+    /// (`row_to_fields`) en vez de dar un `RuntimeError` limpio.
+    #[test]
+    fn adopting_a_table_whose_physical_type_does_not_match_the_declared_one_gives_a_clean_error_not_a_panic() {
+        let path = std::env::temp_dir().join("c_script_test_adopt_type_mismatch.db");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute("CREATE TABLE \"items\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"qty\" INTEGER NOT NULL)", []).unwrap();
+            // SQLite tiene afinidad de tipo, no enforcement -- esto SÍ
+            // guarda un TEXT en una columna declarada INTEGER.
+            raw.execute("INSERT INTO \"items\" (\"qty\") VALUES ('no-es-un-numero')", []).unwrap();
+        }
+
+        let program = program_from("type Item = { id: Int, qty: Int } db { items: Item[] }");
+        let db = Db::new_with_options(&program, &path, true);
+        let e = db.call("items", "all", vec![]).unwrap_err();
+        assert!(e.message.contains("items"), "{}", e.message);
+        assert!(e.message.contains("qty"), "{}", e.message);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Mismo hallazgo (#14), el otro sitio: una columna JSON-serializada
+    /// (struct anidado) cuya forma GUARDADA (de una versión anterior del
+    /// `.link`) ya no calza con el tipo DECLARADO actual -- ej. un campo
+    /// nuevo requerido que el JSON legado nunca tuvo. `json_to_typed_value`
+    /// da `Err` legítimamente ahí (falta un campo requerido), pero el
+    /// comentario original asumía "esto lo escribimos nosotros mismos,
+    /// nunca puede fallar" y panicaba en vez de propagar ese error.
+    #[test]
+    fn adopting_a_table_whose_stored_json_no_longer_matches_the_current_nested_type_gives_a_clean_error() {
+        let path = std::env::temp_dir().join("c_script_test_adopt_json_shape_mismatch.db");
+        let _ = std::fs::remove_file(&path);
+
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute("CREATE TABLE \"orders\" (\"id\" INTEGER PRIMARY KEY AUTOINCREMENT, \"meta\" TEXT NOT NULL)", []).unwrap();
+            // Forma legada: nunca tuvo 'trackingCode', que la versión
+            // actual del .link declara como campo requerido.
+            raw.execute("INSERT INTO \"orders\" (\"meta\") VALUES ('{\"carrier\":\"DHL\"}')", []).unwrap();
+        }
+
+        let program = program_from(
+            "type Meta = { carrier: String, trackingCode: String } type Order = { id: Int, meta: Meta } db { orders: Order[] }",
+        );
+        let db = Db::new_with_options(&program, &path, true);
+        let e = db.call("orders", "all", vec![]).unwrap_err();
+        assert!(e.message.contains("orders"), "{}", e.message);
+        assert!(e.message.contains("meta"), "{}", e.message);
 
         let _ = std::fs::remove_file(&path);
     }

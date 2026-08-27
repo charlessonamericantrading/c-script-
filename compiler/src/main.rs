@@ -1483,7 +1483,16 @@ fn resolve_restart_backoff(args: &[String]) -> Result<Option<Duration>, String> 
 /// de red). Sin el flag/env var: `None`, sin este chequeo -- comportamiento
 /// IDÉNTICO al de siempre.
 fn resolve_service_api_key(args: &[String]) -> Result<Option<String>, String> {
-    read_flag_or_env(args, "--service-api-key", "LINK_SERVICE_API_KEY")
+    // AUDIT-2026-08-27.md #13: `read_flag_or_env` ya filtra un valor de ENV
+    // VAR vacío (así queda `None`, "sin esta capa"), pero un valor vacío que
+    // llega por FLAG pasaba tal cual -- `--service-api-key ""` activaba la
+    // capa entera con un secreto vacío (`constant_time_eq` contra `""` es
+    // válido, así que un caller mandando un header `X-Service-Api-Key: `
+    // vacío pasaría). No se toca `read_flag_or_env` en sí: otros flags
+    // (`--host`, por ejemplo) SÍ tienen un contrato deliberado de "un valor
+    // vacío es un error explícito", no "tratalo como ausente" -- el filtro
+    // va acá, puntual, para este secreto.
+    Ok(read_flag_or_env(args, "--service-api-key", "LINK_SERVICE_API_KEY")?.filter(|v| !v.trim().is_empty()))
 }
 
 /// `--hsts <valor>`/`LINK_HSTS` (GRAMMAR.md §3.143): el valor LITERAL del
@@ -2139,7 +2148,13 @@ fn read_flag_or_env(args: &[String], flag: &str, env: &str) -> Result<Option<Str
 /// sentido si `--jwt-secret` está, y tienen default (`"role"`/`"sub"`, este
 /// último por convención de OIDC) para el caso común.
 fn resolve_jwt_config(args: &[String]) -> Result<Option<(String, String, String)>, String> {
-    let Some(secret) = read_flag_or_env(args, "--jwt-secret", "LINK_JWT_SECRET")? else {
+    // AUDIT-2026-08-27.md #13: mismo motivo que `resolve_service_api_key` --
+    // `--jwt-secret ""` (flag con valor vacío explícito) activaba la
+    // verificación de JWT con un secreto vacío (`Hmac::<Sha256>::new_from_
+    // slice(b"")` es una clave válida, aunque degenerada), cuando la
+    // intención de "flag vacío" es casi seguro "no configuré nada" -- mismo
+    // criterio que ya aplica del lado de la env var.
+    let Some(secret) = read_flag_or_env(args, "--jwt-secret", "LINK_JWT_SECRET")?.filter(|v| !v.trim().is_empty()) else {
         return Ok(None);
     };
     let role_claim = read_flag_or_env(args, "--jwt-role-claim", "LINK_JWT_ROLE_CLAIM")?.unwrap_or_else(|| "role".to_string());
