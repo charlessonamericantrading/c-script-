@@ -51,6 +51,10 @@ service Sys {
   rpc postStatus(url: String, body: String) -> Resp {
     http.postWithStatus(url, body, [])
   }
+
+  rpc postRetry(url: String, body: String, maxAttempts: Int) -> String {
+    http.postWithRetry(url, body, [], maxAttempts)
+  }
 }
 "#;
 
@@ -101,6 +105,34 @@ impl FakeHttp {
 
     fn recv(&self, timeout: Duration) -> Option<ReceivedRequest> {
         self.rx.recv_timeout(timeout).ok()
+    }
+
+    /// GRAMMAR.md §3.160 (`http.postWithRetry`): las primeras `fail_count`
+    /// conexiones reciben 500, la siguiente en adelante 200 -- un contador
+    /// compartido entre conexiones (`AtomicUsize`, no un `Mutex` porque solo
+    /// hace falta incrementar-y-leer atómico) simula un endpoint real que
+    /// falla de forma transitoria y se recupera solo.
+    fn start_failing_then_succeeding(fail_count: usize) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bindear puerto efímero");
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = channel();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let tx = tx.clone();
+                let seen = std::sync::Arc::clone(&seen);
+                std::thread::spawn(move || {
+                    let n = seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n < fail_count {
+                        handle_one_connection(stream, tx, 500, "Internal Server Error", b"falla transitoria", &[]);
+                    } else {
+                        handle_one_connection(stream, tx, 200, "OK", br#"{"ok":true}"#, &[]);
+                    }
+                });
+            }
+        });
+        FakeHttp { port, rx }
     }
 }
 
@@ -548,6 +580,50 @@ fn oauth2_client_credentials_flow_works_end_to_end_with_only_existing_builtins()
         "el token extraído de la respuesta del primer servidor tiene que llegar EXACTO al segundo: {:?}",
         api_req.headers
     );
+}
+
+// ---- `http.postWithRetry` (GRAMMAR.md §3.160) ----
+
+#[test]
+fn post_with_retry_succeeds_after_transient_failures_within_its_budget() {
+    let upstream = FakeHttp::start_failing_then_succeeding(2);
+    let temp = TempDir::new("retry-succeeds");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+
+    let url = format!("http://127.0.0.1:{}/webhook", upstream.port);
+    let (status, body) = server.post("/Sys/postRetry", &serde_json::json!({"url": url, "body": "evento", "maxAttempts": 3}).to_string());
+    assert_eq!(status, 200, "2 fallas transitorias con presupuesto de 3 intentos tienen que terminar en éxito: body: {body}");
+    assert_eq!(body, "\"{\\\"ok\\\":true}\"");
+}
+
+#[test]
+fn post_with_retry_gives_up_after_exhausting_max_attempts() {
+    // Un 500 persistente (nunca se recupera) -- con solo 2 intentos de
+    // presupuesto, el tercer intento que arreglaría todo nunca llega a
+    // pasar. Prueba que esto falla LIMPIO (un runtime error real, no un
+    // loop infinito ni un panic) en vez de reintentar para siempre.
+    let upstream = FakeHttp::start_with_response(500, "Internal Server Error", b"caido de verdad", &[]);
+    let temp = TempDir::new("retry-exhausted");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+
+    let url = format!("http://127.0.0.1:{}/webhook", upstream.port);
+    let (status, body) = server.post("/Sys/postRetry", &serde_json::json!({"url": url, "body": "evento", "maxAttempts": 2}).to_string());
+    assert_eq!(status, 500, "agotar los 2 intentos contra un 500 persistente tiene que fallar limpio: body: {body}");
+}
+
+#[test]
+fn post_with_retry_rejects_a_non_positive_max_attempts() {
+    let upstream = FakeHttp::start();
+    let temp = TempDir::new("retry-bad-max-attempts");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+
+    let url = format!("http://127.0.0.1:{}/webhook", upstream.port);
+    let (status, body) = server.post("/Sys/postRetry", &serde_json::json!({"url": url, "body": "evento", "maxAttempts": 0}).to_string());
+    assert_eq!(status, 500, "maxAttempts=0 tiene que ser un error de runtime claro, no un no-op ni un panic: body: {body}");
+    assert!(upstream.recv(Duration::from_millis(200)).is_none(), "con maxAttempts inválido no debería haberse mandado ninguna request real");
 }
 
 #[test]

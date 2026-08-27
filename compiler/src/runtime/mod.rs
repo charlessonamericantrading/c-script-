@@ -1492,6 +1492,25 @@ fn strings_from_value_list(method: &str, field: &str, items: &[Value]) -> Result
         .collect()
 }
 
+/// Backoff exponencial de `http.postWithRetry` (GRAMMAR.md §3.160) --
+/// FIJO, no configurable, mismo espíritu que `MAX_WHILE_ITERATIONS`
+/// (§3.15): un backstop razonable, no un sistema fino de política de
+/// reintentos por llamada. `attempt` es 1-based (el intento 0 nunca
+/// espera, es el primero); dobla cada fallo consecutivo, techo de 5s --
+/// deliberadamente mucho más corto que `MAX_RESTART_BACKOFF` (30s,
+/// main.rs), porque esto bloquea el hilo de UNA request (§3.158), no
+/// reintenta un proceso servidor entero.
+fn http_retry_backoff(attempt: i64) -> std::time::Duration {
+    const BASE: std::time::Duration = std::time::Duration::from_millis(200);
+    const CAP: std::time::Duration = std::time::Duration::from_secs(5);
+    // `attempt` es 1-based: intento 1 espera BASE (200ms), intento 2 espera
+    // 2*BASE, etc. -- el shift se acota a 8 (256x BASE, ya muy por encima
+    // del CAP de 5s) para nunca desbordar el shift aunque `maxAttempts` sea
+    // un número enorme.
+    let shift = (attempt - 1).clamp(0, 8) as u32;
+    BASE.saturating_mul(1u32 << shift).min(CAP)
+}
+
 fn http_headers_from_value(items: &[Value]) -> Result<Vec<(String, String)>, RuntimeError> {
     items
         .iter()
@@ -2671,6 +2690,46 @@ fn call_method(
                     Err(e) => Err(err(format!("error HTTP al hacer POST a {url}: {e}"))),
                 }
             }
+            "postWithRetry" => {
+                let url = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.postWithRetry requiere un argumento URL String")),
+                };
+                let body = match args.get(1) {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.postWithRetry requiere un argumento Body String")),
+                };
+                let headers = match args.get(2) {
+                    Some(Value::List(items)) => http_headers_from_value(items)?,
+                    _ => return Err(err("http.postWithRetry requiere una lista de headers como tercer argumento")),
+                };
+                let max_attempts = match args.get(3) {
+                    Some(v) => as_int(v)?,
+                    _ => return Err(err("http.postWithRetry requiere maxAttempts: Int como cuarto argumento")),
+                };
+                if max_attempts <= 0 {
+                    return Err(err(format!(
+                        "http.postWithRetry: 'maxAttempts' tiene que ser mayor a 0, se recibió {max_attempts}"
+                    )));
+                }
+                let mut last_error = String::new();
+                for attempt in 0..max_attempts {
+                    if attempt > 0 {
+                        std::thread::sleep(http_retry_backoff(attempt));
+                    }
+                    let mut req = ureq::post(url).timeout(db.http_timeout());
+                    for (name, value) in &headers {
+                        req = req.set(name, value);
+                    }
+                    match req.send_string(body) {
+                        Ok(resp) => return Ok(Value::Str(resp.into_string().unwrap_or_default())),
+                        Err(e) => last_error = e.to_string(),
+                    }
+                }
+                Err(err(format!(
+                    "error HTTP al hacer POST a {url} tras {max_attempts} intento(s): {last_error}"
+                )))
+            }
             other => Err(err(format!("método desconocido sobre http: '{other}'"))),
         },
         // Auth v0 (GRAMMAR.md §3.14). `createSession` extrae (enum_name,
@@ -3772,6 +3831,17 @@ mod tests {
     fn program_from(src: &str) -> Program {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         parse(tokens).unwrap_or_else(|e| panic!("{e:?}"))
+    }
+
+    #[test]
+    fn http_retry_backoff_doubles_from_200ms_and_caps_at_5s() {
+        assert_eq!(http_retry_backoff(1), std::time::Duration::from_millis(200));
+        assert_eq!(http_retry_backoff(2), std::time::Duration::from_millis(400));
+        assert_eq!(http_retry_backoff(3), std::time::Duration::from_millis(800));
+        assert_eq!(http_retry_backoff(4), std::time::Duration::from_millis(1600));
+        assert_eq!(http_retry_backoff(5), std::time::Duration::from_millis(3200));
+        assert_eq!(http_retry_backoff(6), std::time::Duration::from_secs(5), "el 6to intento ya superaría el techo sin acotar (6.4s)");
+        assert_eq!(http_retry_backoff(100), std::time::Duration::from_secs(5), "un maxAttempts enorme nunca desborda el shift ni supera el techo");
     }
 
     fn users_demo() -> Program {

@@ -4000,6 +4000,27 @@ impl Checker {
                 self.check_expr(headers, &Type::List(Box::new(http_header_type())), env)?;
                 Some(Type::String)
             }
+            // GRAMMAR.md §3.160: reintenta con backoff exponencial FIJO (no
+            // configurable, mismo criterio que MAX_WHILE_ITERATIONS §3.15 --
+            // un backstop generoso, no un sistema fino de política de
+            // reintentos) ante CUALQUIER falla -- red o un status no-2xx,
+            // mismo criterio de "falla" que `post`/`postWithHeaders` ya
+            // usan. `maxAttempts` es el único knob real: cuánto tolera cada
+            // caller puntual antes de rendirse, algo que sí varía caso a
+            // caso (un webhook de cobro vs. una notificación de baja
+            // prioridad).
+            (Type::Http, "postWithRetry") => {
+                let [url, body, headers, max_attempts] = args else {
+                    return Err(err(
+                        "'http.postWithRetry' toma exactamente 4 argumentos (url: String, body: String, headers: {name: String, value: String}[], maxAttempts: Int)",
+                    ));
+                };
+                self.check_expr(url, &Type::String, env)?;
+                self.check_expr(body, &Type::String, env)?;
+                self.check_expr(headers, &Type::List(Box::new(http_header_type())), env)?;
+                self.check_expr(max_attempts, &Type::Int, env)?;
+                Some(Type::String)
+            }
             (Type::Json, "parse") => {
                 let [str_arg] = args else {
                     return Err(err("'json.parse' toma exactamente 1 argumento (text: String)"));

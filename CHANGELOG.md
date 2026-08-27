@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.117.0] - 2026-08-27
+
+### ✨ Nuevo
+- **`http.postWithRetry(url, body, headers, maxAttempts)`: reintentos con backoff para webhooks salientes.** PLAN.md §9.4 ítem 2 -- firmar un webhook saliente ya funcionaba sin ningún primitivo nuevo (`crypto.hmacSha256` + `http.postWithHeaders`); el gap real (ya documentado como pendiente en GRAMMAR.md §3.86) era que ninguna llamada `http.*` reintentaba sola ante una falla transitoria.
+- Nuevo método en el namespace `http` ya existente -- `maxAttempts: Int` es el único parámetro nuevo. Backoff exponencial FIJO (200ms doblando, techo de 5s, no configurable, mismo criterio que `MAX_WHILE_ITERATIONS`) -- mucho más corto que el techo de 30s de `--restart-backoff`, porque esto bloquea el hilo de UNA request, no un proceso servidor entero.
+- Reintenta ante cualquier falla (red o status no-2xx, mismo criterio que `post`/`postWithHeaders`) -- sin distinguir 4xx de 5xx todavía, alcance v0. `maxAttempts <= 0` es un error de runtime limpio antes de mandar ninguna request real.
+
+Verificado con 3 tests de integración contra un servidor de mentira real + 1 test unitario de la progresión del backoff. Suite completa sin regresiones. Ver GRAMMAR.md §3.160, PLAN.md §9.4.
+
 ## [1.116.0] - 2026-08-27
 
 ### ✨ Nuevo
