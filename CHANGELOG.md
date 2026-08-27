@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.121.0] - 2026-08-27
+
+### 🔧 Proceso
+Sin cambios de código sobre v1.120.0 -- ese tag quedó con CI en rojo por un error de proceso propio: el comando usado para regenerar `examples/users.link.snap` (`linkc test examples/users.link --update`) omitió el segundo argumento posicional del snapshot, así que no lo tocó de verdad -- el paso de CI que compara SIN `--update` ("Contrato del demo insignia sin deriva sin querer", GRAMMAR.md §3.29) lo agarró. El release/tag v1.120.0 ya estaba publicado con binarios reales (0 descargas) cuando se encontró -- borrarlo/re-taggearlo requería una acción bloqueada por el clasificador de auto mode por ser demasiado destructiva/visible sin confirmación explícita del usuario, que eligió avanzar en vez de forzarla. v1.120.0 queda en el historial con CI rojo mencionado acá para que quede claro por qué; su código es idéntico al de v1.121.0. Ver v1.120.0 para el changelog real de esta ronda (`catch_unwind` en `transaction { }` y `@cron`).
+
 ## [1.120.0] - 2026-08-27
 
 ### 🐛 Arreglado
