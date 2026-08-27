@@ -321,6 +321,75 @@ fn metrics_reports_real_cron_runs_and_failures() {
     assert!(!body.contains("linkc_cron_failures_total{method=\"Jobs.tick\"}"), "ninguna corrida falló, no debería haber contador de fallas: {body}");
 }
 
+/// GRAMMAR.md §3.164: antes de esta ronda, un PANIC real (no un
+/// `RuntimeError`) adentro del cuerpo de un `@cron` mataba el hilo entero
+/// del scheduler sin loguear nada -- la tarea dejaba de correr para
+/// siempre, indistinguible de "todavía no le tocaba el turno". El disparador
+/// acá es un desborde real de `i64` (`a + b` en el borde de `Int64`) --
+/// código de producción sin arreglar a propósito, para probar el
+/// `catch_unwind` contra un panic genuino, no uno inventado para el test.
+/// `linkc_cron_runs_total` solo cuenta corridas OK (ver `record_cron_run`),
+/// así que con un cuerpo que SIEMPRE panica la señal de "el loop sigue
+/// vivo" es que `linkc_cron_failures_total` siga creciendo con el tiempo,
+/// no que deje de aparecer tras la primera corrida.
+///
+/// `#[cfg(debug_assertions)]`: mismo motivo que el test hermano en
+/// `runtime/mod.rs` (`a_transaction_whose_body_panics_from_...`) -- el
+/// desborde de `i64` solo panica con `overflow-checks` activo (perfil
+/// `dev`, lo que corre `cargo test` normal/CI); en `release` el `linkc`
+/// real que este test lanza como subproceso (`CARGO_BIN_EXE_linkc`, mismo
+/// perfil que el harness) simplemente wrappea sin panicar, y este test
+/// dejaría de tener nada que probar.
+#[test]
+#[cfg(debug_assertions)]
+fn metrics_reports_a_cron_run_that_panics_as_a_failure_and_the_task_keeps_running() {
+    let temp = TempDir::new("cron-panics");
+    let out = build(
+        &temp,
+        r#"
+            service Jobs {
+                @cron("1s")
+                rpc tick() -> Void {
+                    let a: Int64 = 9223372036854775807.toInt64();
+                    let b: Int64 = 1.toInt64();
+                    let x: Int64 = a + b;
+                }
+            }
+        "#,
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let server = Serve::start(&temp.0.join("app.link"), &[]);
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let (_, body_early) = server.request("GET", "/metrics", "", &[]);
+    let failures_early = cron_failures_count(&body_early, "Jobs.tick");
+    assert!(failures_early >= 1, "la primera corrida (que panica) tiene que contar como falla: {body_early}");
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let (_, body_later) = server.request("GET", "/metrics", "", &[]);
+    let failures_later = cron_failures_count(&body_later, "Jobs.tick");
+    assert!(
+        failures_later > failures_early,
+        "el loop tiene que seguir corriendo (y panicando) después de la primera corrida, no morir en silencio: antes={failures_early} después={failures_later}"
+    );
+
+    // Ningún panic pudo terminar en éxito -- `runs_total` (que solo cuenta
+    // corridas OK, ver el comentario de arriba) tiene que quedarse en 0.
+    let runs_line = body_later
+        .lines()
+        .find(|l| l.starts_with("linkc_cron_runs_total{method=\"Jobs.tick\"}"))
+        .unwrap_or_else(|| panic!("body: {body_later}"));
+    assert!(runs_line.ends_with(" 0"), "cada corrida panicó, ninguna debería contar como OK: {runs_line}");
+}
+
+fn cron_failures_count(body: &str, method: &str) -> u64 {
+    let prefix = format!("linkc_cron_failures_total{{method=\"{method}\"}}");
+    body.lines()
+        .find(|l| l.starts_with(&prefix))
+        .map(|line| line.rsplit(' ').next().unwrap().parse().expect("conteo numérico"))
+        .unwrap_or(0)
+}
+
 #[test]
 fn metrics_is_not_exempt_from_the_service_api_key_unlike_health() {
     let temp = TempDir::new("api-key");

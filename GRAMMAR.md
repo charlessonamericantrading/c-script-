@@ -184,6 +184,8 @@
   - [3.160 `http.postWithRetry(url, body, headers, maxAttempts)`: reintentos con backoff para webhooks salientes — RESUELTO](#3160-httppostwithretryurl-body-headers-maxattempts-reintentos-con-backoff-para-webhooks-salientes--resuelto)
   - [3.161 `import "./modulo.link";`: import "solo por efecto" — RESUELTO, cierra el último hueco real para partir un programa en módulos](#3161-importmodulolink-import-solo-por-efecto--resuelto-cierra-el-último-hueco-real-para-partir-un-programa-en-módulos)
   - [3.162 Segunda auditoría adversarial: 3 bugs reales, dos de ellos creados por los fixes de la ronda anterior — RESUELTOS](#3162-segunda-auditoría-adversarial-3-bugs-reales-dos-de-ellos-creados-por-los-fixes-de-la-ronda-anterior--resueltos)
+  - [3.163 `catch_unwind` alrededor del cuerpo de `transaction { }` — RESUELTO, cierra el primer límite honesto de §3.162](#3163-catch_unwind-alrededor-del-cuerpo-de-transaction----resuelto-cierra-el-primer-límite-honesto-de-§3162)
+  - [3.164 `catch_unwind` alrededor de cada corrida de `@cron` — RESUELTO, cierra el segundo límite honesto de §3.162](#3164-catch_unwind-alrededor-de-cada-corrida-de-cron--resuelto-cierra-el-segundo-límite-honesto-de-§3162)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6262,6 +6264,45 @@ Dos escrituras que el servidor confirmó como exitosas se descartaron en silenci
 **Límite honesto que NO se cerró en esta ronda:** el fix 3 elimina el disparador de panic más alcanzable, pero **no** el problema de fondo -- cualquier OTRO panic dentro de un `transaction { }` (un `.expect()` de `db.rs`/`store.rs`, por ejemplo) sigue dejando el mismo estado corrupto, porque no hay ningún `catch_unwind` alrededor del cuerpo. Cerrarlo de verdad necesita esa red de seguridad y su propio diseño (qué hacer con un `Value` que no es `UnwindSafe`), no entra en una ronda de bugfix. Igual que sigue abierto que una tarea `@cron` muere para siempre en su primer panic, sin log ni métrica, contradiciendo lo que §3.159 promete.
 
 **Verificado**: 6 tests de regresión nuevos -- `an_upsert_publishing_concurrently_with_a_subscribe_on_the_same_collection_never_deadlocks` (100 vueltas con hilos reales y `Barrier`, hermano del que ya cubría `transaction{}`), los tres de división/resto por cero y desborde, y el de `transaction{}` que divide por cero (rollbackea Y deja la base usable para la siguiente transacción). Más verificación manual contra binarios reales de los tres: el martillo que colgaba el servidor ahora lo deja respondiendo 200 en todo; el `tsc` real del repo compila limpio un proyecto con `@cron`; y el escenario de pérdida de datos termina con las 3 filas intactas tras reiniciar.
+
+### 3.163 `catch_unwind` alrededor del cuerpo de `transaction { }` — RESUELTO, cierra el primer límite honesto de §3.162
+
+§3.162 dejó dicho, explícitamente, que su fix (3) solo tapaba el disparador de panic más alcanzable (`/`/`%` por cero) -- **cualquier OTRO panic** dentro de un `transaction { }` (un `.expect()` en `db.rs`/`store.rs`, un desborde de `+`/`-`/`*`, lo que sea) seguía dejando exactamente el mismo estado corrupto: el hilo de la request muere en el unwind sin pasar por `rollback_transaction`, así que `transaction_pending_publishes` se queda en `Some(...)` para siempre y la conexión SQL compartida se queda con un `BEGIN` sin `COMMIT` ni `ROLLBACK`. Consecuencia idéntica a la de §3.162: toda `transaction { }` POSTERIOR en el proceso falla para siempre con "ya hay una transacción abierta", y toda escritura no transaccional posterior corre sobre esa conexión corrupta y se pierde en silencio al reiniciar.
+
+**Fix: `eval_block` del cuerpo va envuelto en `std::panic::catch_unwind`, adentro de `Expr::Transaction` (`runtime/mod.rs`).** Un panic atrapado se traduce a un `RuntimeError` normal ("la transacción abortó por un error interno inesperado: {mensaje}") y toma el mismo camino que cualquier otro error del cuerpo: `rollback_transaction()`, que limpia `transaction_pending_publishes` y emite el `ROLLBACK` real. El mensaje del panic se extrae con un helper chico (`panic_payload_message`, compartido con el fix de §3.164) que sabe leer los dos payloads que casi siempre trae un panic de Rust (`&str` de un `panic!("...")` literal, `String` de uno formateado) y cae a un texto genérico para cualquier otro tipo.
+
+<!-- linkc:fragment -->
+```link
+type Item = { id: Int, name: String }
+db { items: Item[] }
+service S {
+    rpc riesgoso(a: Int64, b: Int64) -> Void {
+        transaction {
+            db.items.insert(Item { id: 0, name: "en vuelo" });
+            // si esto panicara -- overflow, un bug en una fn nativa, lo
+            // que sea -- ya no deja el BEGIN abierto para siempre: hace
+            // ROLLBACK como cualquier otro error del cuerpo.
+            let x = a + b;
+        }
+    }
+}
+```
+
+**Por qué `AssertUnwindSafe` es seguro acá y no un escape hatch descuidado.** El compilador no puede probar `UnwindSafe` para el closure -- `env` es un `HashMap<String, Rc<RefCell<Value>>>` (§3.10) y ni `Rc` ni `RefCell` lo son en general, porque en el caso genérico un panic a mitad de mutación puede dejar datos a medio escribir visibles después. Lo que hace esto seguro específicamente ACÁ no es una promesa del type system: es que el ÚNICO estado que le importa a la ejecución SIGUIENTE (`transaction_pending_publishes`, el `BEGIN` de la conexión) se limpia explícitamente en el brazo `Err` con el mismo `rollback_transaction()` que ya corría para un `RuntimeError` normal. El `env`/las filas a medio insertar de ESTA transacción abortada no importan -- nunca se confirman (`ROLLBACK` real), y la petición entera ya terminó en error.
+
+**Límite que se mantiene, a propósito: un panic en un `rpc` que NO usa `transaction { }` sigue matando solo ese hilo, sin ninguna limpieza especial más allá de lo que `parking_lot` ya hace al soltar sus candados en el unwind.** Fuera de una transacción no hay ningún `BEGIN`/estado pendiente que limpiar -- el caller HTTP recibe una conexión cortada (§3.158 documenta ese caso), no una respuesta, y el servidor sigue vivo para la próxima request. Trazar ESE panic con una línea de log propia (en vez de depender de lo que imprima el hook default de Rust a stderr) queda fuera de esta ronda -- es el "panics 500 no trazables" que ya estaba anotado como hallazgo menor de la auditoría de §3.162, deliberadamente no perseguido acá.
+
+**Verificado**: `a_transaction_whose_body_panics_from_something_other_than_division_by_zero_also_rolls_back_and_leaves_the_db_usable` (`runtime/mod.rs`) -- dispara un desborde real de `+` sobre `i64` (código de producción sin arreglar a propósito, para probar el `catch_unwind` contra un panic GENÉRICO en vez de reproducir el caso puntual que §3.162 ya había cerrado con su propio `RuntimeError`), confirma que la fila del cuerpo se rollbackea y que una transacción POSTERIOR sigue funcionando. Gateado con `#[cfg(debug_assertions)]`: el desborde de `+` solo panica con `overflow-checks` activo, que Cargo prende por defecto en `dev` (lo que corre `cargo test`/CI) y apaga en `release` (donde `a + b` wrappea sin panicar) -- confirmado corriendo el mismo test bajo `cargo test --release`: no panicó, así que no había nada que atrapar y el test quedaría sin señal real.
+
+### 3.164 `catch_unwind` alrededor de cada corrida de `@cron` — RESUELTO, cierra el segundo límite honesto de §3.162
+
+El comentario que introduce el scheduler de `@cron` en `runtime/server.rs` (desde §3.159) siempre dijo "un error del cuerpo (panic, `@check`/`@unique`, lo que sea) se loguea y el loop SIGUE" -- pero eso era falso para el caso panic específicamente. `invoke_rpc_with_sessions` corre dentro de un `match Ok/Err` normal, y un panic real NO es un `Err`: atraviesa el `match` sin tocarlo y sigue desenrollando. `std::thread::spawn` no trae ningún `catch_unwind` propio, así que el unwind se lleva puesto TODO el hilo del scheduler -- el `loop` nunca vuelve a `std::thread::sleep`, y la tarea deja de correr **para siempre**, sin ninguna línea de log ni entrada de métrica que lo marque. Indistinguible, desde afuera, de "todavía no le tocaba el turno" -- el peor tipo de falla silenciosa para algo que por definición nadie está mirando activamente.
+
+**Fix: la llamada a `invoke_rpc_with_sessions` va envuelta en `catch_unwind`, mismo `AssertUnwindSafe` y mismo `panic_payload_message` que §3.163.** El resultado se matchea a tres casos en vez de dos -- `Ok(Ok(_))` (corrida exitosa), `Ok(Err(e))` (un `RuntimeError` normal, como siempre), y el caso nuevo `Err(payload)` (panic real): los tres registran `metrics_store.record_cron_run` y loguean vía `log_cron_tick` -- el panic cuenta como falla, con el mensaje extraído en vez de perderse. El `loop` externo nunca se entera de que hubo un panic adentro; sigue durmiendo y reintentando en el próximo tick, exactamente la garantía que el comentario original prometía.
+
+**Verificado con el binario real, no solo con el runtime en aislamiento** (`metrics_reports_a_cron_run_that_panics_as_a_failure_and_the_task_keeps_running`, `tests/cli_metrics.rs`): un `@cron("1s")` cuyo cuerpo SIEMPRE desborda `+` sobre `i64` (mismo disparador que §3.163, mismo gateo `#[cfg(debug_assertions)]` y mismo motivo -- en `release` el binario `linkc` real que este test lanza como subproceso tampoco panicaría). Se mide `linkc_cron_failures_total{method="Jobs.tick"}` en dos instantes separados por 1.5s y se confirma que **sigue creciendo** -- la señal de que el hilo del scheduler sobrevivió al primer panic y siguió despertando. Antes del fix, ese contador se hubiera quedado clavado en su primer valor (o en cero, si el panic pegó antes de la primera corrida completa) para siempre. `linkc_cron_runs_total` (que solo cuenta corridas OK, §3.149) se confirma en `0` -- ningún panic pudo colarse como éxito.
+
+**Con esto se cierran los dos límites que §3.162 había dejado explícitamente abiertos** ("Límite honesto que NO se cerró en esta ronda", más arriba) -- ningún panic dentro de `transaction { }` ni dentro de `@cron` queda ya sin un camino de limpieza.
 
 ---
 

@@ -250,6 +250,23 @@ fn bad_req(msg: impl Into<String>) -> RuntimeError {
     RuntimeError::bad_request(msg)
 }
 
+/// Extrae un mensaje legible del payload de un panic atrapado con
+/// `catch_unwind` -- usado tanto por `Expr::Transaction` (GRAMMAR.md
+/// §3.163) como por el loop de `@cron` (server.rs, GRAMMAR.md §3.164). El
+/// payload es `Box<dyn Any + Send>`: casi siempre un `&str` (`panic!("...")`
+/// literal) o un `String` (`panic!("{}", x)`/`.expect(fmt)`) -- cualquier
+/// otro tipo (raro; alguien hizo `panic_any` con un valor propio) cae al
+/// mensaje genérico en vez de fallar a su vez tratando de formatearlo.
+pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "panic sin mensaje de texto".to_string()
+    }
+}
+
 /// Cada variable es su propia celda compartida, no un `Value` directo. Es lo
 /// que hace que la mutación (`x = ...`, GRAMMAR.md §2.3) atraviese bloques
 /// anidados de verdad: `eval_block` clona el mapa `Env` al entrar a un bloque
@@ -740,10 +757,40 @@ pub(crate) fn eval_expr(
         // de candados cruzado, no una carrera rara: se hubiera disparado la
         // primera vez que un `transaction{}` confirmando y un `stream`
         // suscribiéndose a la misma colección coincidieran en el tiempo.
+        //
+        // GRAMMAR.md §3.163: `eval_block` del cuerpo va envuelto en
+        // `catch_unwind` -- antes de esta ronda, CUALQUIER panic ahí adentro
+        // (no solo la división/módulo por cero que ya se volvió
+        // `RuntimeError` limpio en §3.162) se llevaba puesto el `BEGIN` real:
+        // el hilo de la request muere en el unwind, pero `transaction_
+        // pending_publishes` se queda en `Some(...)` para siempre (nadie
+        // corre el `*...lock() = None` de `rollback_transaction`) y la
+        // conexión SQL compartida se queda con una transacción abierta que
+        // nunca ve `COMMIT` ni `ROLLBACK`. Encontrado auditando esta misma
+        // sección: todo intento de `transaction{}` POSTERIOR en el proceso
+        // falla para siempre con "ya hay una transacción abierta", y toda
+        // escritura no transaccional posterior corre sobre esa conexión
+        // corrupta y se pierde en silencio al reiniciar (confirmado a mano:
+        // 3 filas insertadas, 1 sola sobrevivió el restart). `AssertUnwindSafe`
+        // es necesario porque `env`/`db` cargan `Rc<RefCell<_>>`/`Mutex` que
+        // el compilador no puede probar `UnwindSafe` en abstracto -- lo que
+        // de verdad garantiza que esto es seguro es el `rollback_transaction()`
+        // explícito del brazo `Err` de más abajo, que deja el estado de la
+        // transacción limpio pase lo que pase adentro.
         Expr::Transaction(block) => {
             let outcome = db.with_exclusive_connection(|| {
                 db.begin_transaction().map_err(|e| err(format!("no se pudo iniciar la transacción: {e}")))?;
-                match eval_block(block, env, db, fns, checker, sessions, current_token, step_budget) {
+                let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    eval_block(block, env, db, fns, checker, sessions, current_token, step_budget)
+                }));
+                let block_result = match unwind_result {
+                    Ok(r) => r,
+                    Err(payload) => {
+                        let msg = panic_payload_message(&*payload);
+                        Err(err(format!("la transacción abortó por un error interno inesperado: {msg}")))
+                    }
+                };
+                match block_result {
                     Ok(value) => match db.commit_transaction() {
                         Ok(pending) => Ok((value, pending)),
                         Err(e) => {
@@ -7027,6 +7074,63 @@ mod tests {
         assert!(e.message.contains("por cero"), "{}", e.message);
         assert_eq!(invoke_rpc(&program, "S", "count", &json!({}), &db).unwrap(), json!(0), "la fila del cuerpo tiene que haberse rollbackeado");
         // Y la base sigue usable: una transacción POSTERIOR funciona.
+        assert_eq!(invoke_rpc(&program, "S", "ok", &json!({"name": "a"}), &db).unwrap(), json!(1));
+    }
+
+    /// GRAMMAR.md §3.163: el fix de §3.162 solo cubría `/` y `%` -- CUALQUIER
+    /// otro panic real (no un `RuntimeError`) adentro de un `transaction { }`
+    /// seguía dejando el `BEGIN` abierto para siempre. El disparador acá es
+    /// distinto a propósito (desborde de `+` sobre `i64`, código de
+    /// producción sin arreglar -- ver `numeric_op`, que sigue usando `a + b`
+    /// crudo) para probar que el `catch_unwind` nuevo protege contra un
+    /// panic GENÉRICO, no solo contra el caso puntual que ya tenía su propio
+    /// `RuntimeError` limpio.
+    ///
+    /// `#[cfg(debug_assertions)]`: el desborde de `+` sobre `i64` solo panica
+    /// con `overflow-checks` activo, que Cargo prende por defecto en el
+    /// perfil `dev` (`cargo test` normal, lo que corre CI) y apaga en
+    /// `release` (donde `a + b` simplemente wrappea, sin nada que atrapar --
+    /// confirmado corriendo este mismo test con `cargo test --release`: no
+    /// panicó, la RPC devolvió éxito). Gatearlo así evita un test que
+    /// flaquea según el perfil de build en vez de fallar limpio o pasar
+    /// limpio.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_transaction_whose_body_panics_from_something_other_than_division_by_zero_also_rolls_back_and_leaves_the_db_usable() {
+        let program = program_from(
+            r#"
+            type Item = { id: Int, name: String }
+            db { items: Item[] }
+            service S {
+                rpc boom(a: Int) -> Int {
+                    transaction {
+                        db.items.insert(Item { id: 0, name: "boom" });
+                        let x = a + 1;
+                    }
+                    0
+                }
+                rpc ok(name: String) -> Int {
+                    transaction { db.items.insert(Item { id: 0, name: name }); }
+                    db.items.all().length()
+                }
+                rpc count() -> Int { db.items.all().length() }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        // Silenciar el panic hook default mientras el panic es intencional
+        // (dispara el `catch_unwind` que este test prueba) -- no ensuciar
+        // stderr de `cargo test` (mismo criterio que lsp.rs,
+        // `test_catch_unwind_around_a_document_recheck_does_not_crash_the_server`).
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = invoke_rpc(&program, "S", "boom", &json!({"a": i64::MAX}), &db);
+        std::panic::set_hook(prev_hook);
+        let e = result.unwrap_err();
+        assert!(e.message.contains("error interno inesperado"), "{}", e.message);
+        assert_eq!(invoke_rpc(&program, "S", "count", &json!({}), &db).unwrap(), json!(0), "la fila del cuerpo tiene que haberse rollbackeado");
+        // Y la base sigue usable: una transacción POSTERIOR funciona -- antes
+        // del fix se hubiera quedado con el 'BEGIN' abierto para siempre.
         assert_eq!(invoke_rpc(&program, "S", "ok", &json!({"name": "a"}), &db).unwrap(), json!(1));
     }
 

@@ -476,9 +476,28 @@ pub fn serve(
     // COMPLETO antes de la primera corrida (mismo criterio que
     // `setInterval` de JS) -- así arrancar `serve`/`serve-all` con varias
     // tareas no las dispara todas a la vez contra la base en el instante
-    // 0. Un error del cuerpo (panic, `@check`/`@unique`, lo que sea) se
-    // loguea y el loop SIGUE -- una corrida fallida nunca apaga la tarea
+    // 0. Un error del cuerpo (`RuntimeError`, `@check`/`@unique`, un panic)
+    // se loguea y el loop SIGUE -- una corrida fallida nunca apaga la tarea
     // entera ni el servidor.
+    //
+    // GRAMMAR.md §3.164: `invoke_rpc_with_sessions` va envuelto en
+    // `catch_unwind` -- el comentario de arriba prometía esto desde
+    // GRAMMAR.md §3.159, pero antes de esta ronda era falso para el caso
+    // panic: un panic real (no un `RuntimeError`) atraviesa el `match Ok/Err`
+    // sin tocarlo y sigue desenrollando -- `std::thread::spawn` no tiene
+    // ningún `catch_unwind` propio, así que el unwind se lleva puesto TODO
+    // el hilo: el `loop` nunca vuelve a `std::thread::sleep`, la tarea
+    // simplemente deja de correr para siempre, sin ninguna línea de log ni
+    // métrica que lo marque -- silencio total, indistinguible de "todavía no
+    // le tocaba el turno". Encontrado auditando esta misma sección.
+    // `AssertUnwindSafe` acá es seguro por la misma razón que en
+    // `Expr::Transaction` (runtime/mod.rs, GRAMMAR.md §3.163): lo que
+    // garantiza la limpieza no es que el compilador pueda probar
+    // `UnwindSafe`, es que el brazo `Err` de abajo loguea+registra la
+    // métrica de fallo exactamente igual que un `RuntimeError` normal, y el
+    // `loop` sigue -- no queda ningún candado sostenido ni estado a medio
+    // mutar que le importe a la corrida SIGUIENTE (cada corrida arranca su
+    // propia transacción/conexión desde cero vía `invoke_rpc_with_sessions`).
     for item in program.items.iter() {
         let Item::Service(service) = item else { continue };
         for member in &service.members {
@@ -497,14 +516,22 @@ pub fn serve(
                 std::thread::sleep(interval);
                 let start = std::time::Instant::now();
                 let no_args = serde_json::Value::Object(serde_json::Map::new());
-                match invoke_rpc_with_sessions(&program, &service_name, &rpc_name, &no_args, &db, &sessions, None) {
-                    Ok(_) => {
+                let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    invoke_rpc_with_sessions(&program, &service_name, &rpc_name, &no_args, &db, &sessions, None)
+                }));
+                match unwind_result {
+                    Ok(Ok(_)) => {
                         metrics_store.lock().record_cron_run(&method, true);
                         log_cron_tick(log, &method, true, start.elapsed(), "");
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         metrics_store.lock().record_cron_run(&method, false);
                         log_cron_tick(log, &method, false, start.elapsed(), &format!("error={:?}", e.message));
+                    }
+                    Err(payload) => {
+                        let msg = super::panic_payload_message(&*payload);
+                        metrics_store.lock().record_cron_run(&method, false);
+                        log_cron_tick(log, &method, false, start.elapsed(), &format!("panic={msg:?}"));
                     }
                 }
             });

@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.120.0] - 2026-08-27
+
+### 🐛 Arreglado
+Cierra los dos límites que la auditoría de v1.119.0 había dejado explícitamente abiertos (GRAMMAR.md §3.162): ningún panic real (no un `RuntimeError`) dentro de `transaction { }` ni dentro de una corrida de `@cron` tenía un camino de limpieza -- el fix de v1.119.0 solo tapaba el disparador de panic más alcanzable (división/resto entero por cero).
+
+- **`catch_unwind` alrededor del cuerpo de `transaction { }`.** Antes: cualquier otro panic (un `.expect()` en `db.rs`/`store.rs`, un desborde de `+`/`-`/`*`, lo que sea) dejaba el hilo de la request morir en el unwind sin pasar por `rollback_transaction` -- el `BEGIN` se quedaba abierto sobre la conexión compartida para siempre, toda transacción futura del proceso fallaba con "ya hay una transacción abierta", y escrituras posteriores confirmadas al cliente se perdían en silencio al reiniciar (el mismo escenario de pérdida de datos de v1.119.0, con cualquier otro disparador). Ahora un panic atrapado se traduce a un `RuntimeError` normal y toma el mismo camino de `rollback_transaction()` que cualquier otro error del cuerpo.
+- **`catch_unwind` alrededor de cada corrida de `@cron`.** El comentario del scheduler siempre prometió "una corrida fallida nunca apaga la tarea entera", pero eso era falso para un panic real: atraviesa el `match Ok/Err` sin tocarlo y se lleva puesto TODO el hilo del scheduler -- la tarea dejaba de correr para siempre, sin ninguna línea de log ni entrada de métrica, indistinguible desde afuera de "todavía no le tocaba el turno". Ahora un panic cuenta como falla en `/metrics` (`linkc_cron_failures_total`) igual que un `RuntimeError`, y el `loop` sigue durmiendo y reintentando en el próximo intervalo.
+
+Ambos comparten el mismo helper para extraer un mensaje legible del payload del panic. Verificado con un desborde real de `+` sobre `i64` como disparador (código de producción sin arreglar a propósito, para probar el `catch_unwind` contra un panic genérico en vez de repetir el caso de división por cero ya cerrado) -- incluyendo, para `@cron`, contra un `linkc serve` real: `linkc_cron_failures_total` sigue creciendo con el tiempo en vez de quedarse clavado tras la primera corrida. Los dos tests nuevos están gateados con `#[cfg(debug_assertions)]`: el desborde solo panica con `overflow-checks` activo (perfil `dev`, lo que corre `cargo test`/CI); en `release` simplemente wrappea, sin nada que atrapar. Ver GRAMMAR.md §3.163/§3.164, PLAN.md §9.2.
+
 ## [1.119.0] - 2026-08-27
 
 ### 🐛 Arreglado
