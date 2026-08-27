@@ -2328,9 +2328,36 @@ fn call_method(
             }
             "randomToken" => {
                 let length = match args.first() {
-                    Some(Value::Int(n)) => *n as usize,
+                    Some(Value::Int(n)) => *n,
                     _ => return Err(err("crypto.randomToken requiere un argumento Int")),
                 };
+                // Auditoría adversarial (27/08/2026, AUDIT-2026-08-27.md #1):
+                // antes de este chequeo, `length` pasaba directo de `i64` a
+                // `usize` con `as` -- un valor negativo (ej. -1) reinterpreta
+                // sus bits como un `usize` gigante (~1.8*10^19), y un valor
+                // grande pero positivo (ej. i64::MAX) igual. `os_random_bytes`
+                // hace `vec![0u8; n]` con eso -- para el primer caso, el
+                // propio macro `vec!` detecta que el pedido excede
+                // `isize::MAX` y panica con "capacity overflow" (panic
+                // normal, mata solo el hilo); para el segundo, el pedido SÍ
+                // llega al allocator real del sistema operativo, que no
+                // tiene esa memoria -- Rust llama a `handle_alloc_error`, que
+                // hace `std::process::abort()` **sin poder atraparse con
+                // `catch_unwind`, tire el hilo que tire**. Confirmado contra
+                // un `linkc serve` real: una sola request con
+                // `{"length": 9223372036854775807}` mataba el proceso
+                // ENTERO (bajo `serve-all`, todos los servicios coexistiendo
+                // ahí). Mismo criterio que `crypto.randomInt`/`dateFromParts`
+                // ya usan para sus propios rangos: rechazar ANTES de tocar
+                // memoria, con un `RuntimeError` limpio. El tope de 1024 es
+                // generoso a propósito -- ningún token real (sesiones, OTPs,
+                // claves de idempotencia) necesita ni una fracción de eso.
+                if !(1..=1024).contains(&length) {
+                    return Err(err(format!(
+                        "crypto.randomToken: 'length' tiene que estar entre 1 y 1024, se recibió {length}"
+                    )));
+                }
+                let length = length as usize;
                 // El token sale del CSPRNG del sistema. La versión anterior era
                 // SHA-256 del reloj (SystemTime::now().as_nanos()), lo que hacía
                 // que un token fuese adivinable para quien pudiera acotar el
@@ -3339,7 +3366,7 @@ pub(crate) fn json_to_typed_value(
         Type::Enum(name) => variant_from_json(j, ty, name, checker, path, &mismatch),
         Type::ResultOf(..) => variant_from_json(j, ty, "Result", checker, path, &mismatch),
         Type::PatchOf(inner) => {
-            let Type::Struct { fields, .. } = &**inner else {
+            let Type::Struct { fields, name } = &**inner else {
                 return Err(bad_req(format!("'{path}': Patch<T> requiere que T sea un struct")));
             };
             let obj = j.as_object().ok_or_else(mismatch)?;
@@ -3352,7 +3379,24 @@ pub(crate) fn json_to_typed_value(
                     out.push((k.clone(), json_to_typed_value(v, &f.ty, checker, &format!("{path}.{k}"))?));
                 }
             }
-            Ok(Value::Struct(out))
+            let v = Value::Struct(out);
+            // AUDIT-2026-08-27.md #3: este era el ÚNICO lugar que construye
+            // un struct a partir del wire SIN pasar por
+            // `apply_field_validators` -- el brazo `Type::Struct` de acá
+            // arriba sí lo hace. Consecuencia real, confirmada en vivo: un
+            // `@validate(email)` que `create` rechazaba con 400 pasaba
+            // derecho por `applyPatch`/`Patch<T>` y quedaba persistido tal
+            // cual. `apply_field_validators` ya tolera un valor PARCIAL (un
+            // patch nunca trae todos los campos) -- por diseño, solo valida
+            // las claves que de verdad están presentes en `entries`, así que
+            // no hace falta ningún cambio ahí, alcanza con dejar de saltarse
+            // la llamada.
+            if let Some(n) = name {
+                if let Some(ast_fields) = field_annotations_for(checker, n, None) {
+                    apply_field_validators(ast_fields, &v, path)?;
+                }
+            }
+            Ok(v)
         }
         // Una unión acepta el primer miembro que encaje. El checker ya
         // rechaza las uniones cuyos miembros no se puedan distinguir
@@ -5255,6 +5299,57 @@ mod tests {
         let db = Db::new(&program, std::path::Path::new(":memory:"));
         let result = invoke_rpc(&program, "S", "register", &json!({"email": "not-an-email"}), &db);
         assert!(result.is_ok(), "documenta el límite: sin @validate en NewSignup, no hay nada que lo rechace");
+    }
+
+    /// AUDIT-2026-08-27.md #3: `Type::PatchOf` (el decodificador de
+    /// `Patch<T>`, usado por `applyPatch`) era el ÚNICO lugar que construye
+    /// un struct a partir del wire sin llamar a `apply_field_validators` --
+    /// un `@validate(email)` que `create` (que sí pasa por `Type::Struct`)
+    /// rechazaba con 400 pasaba derecho por `update`/`applyPatch` y quedaba
+    /// persistido tal cual. Confirmado en vivo contra un `linkc serve` real
+    /// antes de este fix.
+    #[test]
+    fn validate_fires_on_applypatch_via_patch_of_t_not_just_on_the_full_struct() {
+        let program = program_from(
+            r#"
+            type User = { id: Int, @validate(email) email: String, name: String }
+            db { users: User[] }
+            service S {
+                rpc create(email: String, name: String) -> User {
+                    db.users.insert(User { id: 0, email: email, name: name })
+                }
+                rpc update(id: Int, patch: Patch<User>) -> User {
+                    db.users.applyPatch(id, patch)
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "create", &json!({"email": "a@b.com", "name": "Ada"}), &db).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // `create` (Type::Struct) ya rechazaba esto -- confirma que el
+        // camino de siempre sigue andando.
+        let e = invoke_rpc(&program, "S", "create", &json!({"email": "not-an-email", "name": "Bad"}), &db).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::BadRequest, "{e}");
+
+        // El bug real: antes de este fix, esto daba 200 y persistía el
+        // email inválido.
+        let e = invoke_rpc(&program, "S", "update", &json!({"id": id, "patch": {"email": "not-an-email"}}), &db)
+            .expect_err("un email inválido en el patch debe rechazarse igual que en create");
+        assert_eq!(e.kind, ErrorKind::BadRequest, "{e}");
+        assert!(e.message.contains("email"), "{e}");
+
+        // Un patch que NO toca el campo con @validate sigue funcionando
+        // normal -- apply_field_validators no vuelve requerido un campo
+        // ausente del patch.
+        let ok = invoke_rpc(&program, "S", "update", &json!({"id": id, "patch": {"name": "Ada Lovelace"}}), &db).unwrap();
+        assert_eq!(ok["name"], json!("Ada Lovelace"));
+        assert_eq!(ok["email"], json!("a@b.com"), "el email original no se tocó");
+
+        // Y un patch CON un email válido sigue aplicando normal.
+        let ok = invoke_rpc(&program, "S", "update", &json!({"id": id, "patch": {"email": "c@d.com"}}), &db).unwrap();
+        assert_eq!(ok["email"], json!("c@d.com"));
     }
 
     // ---- `@check(...)` sobre un campo (GRAMMAR.md §3.96) ----
@@ -8393,6 +8488,37 @@ mod tests {
         let program = crate::parser::parse(crate::lexer::tokenize(code).unwrap()).unwrap();
         let summary = run_program_tests(&program).expect("ejecucion de tests de randomInt/timingSafeEqual");
         assert_eq!(summary.passed, 1, "fallaron asserts: {summary:?}");
+    }
+
+    /// AUDIT-2026-08-27.md #1: `crypto.randomToken(length)` con `length`
+    /// negativo o absurdamente grande pasaba directo de `i64` a `usize` con
+    /// `as`, terminando en un pedido de memoria gigante -- para un valor
+    /// negativo, el propio macro `vec!` panica ("capacity overflow", mata
+    /// solo el hilo); para uno grande pero positivo (`i64::MAX`), el pedido
+    /// llegaba al allocator real del sistema y `handle_alloc_error` hacía
+    /// `std::process::abort()` -- tumbaba el PROCESO ENTERO, sin que
+    /// `catch_unwind` pudiera hacer nada, confirmado contra un `linkc serve`
+    /// real antes de este fix. Ahora los dos casos dan un `RuntimeError`
+    /// limpio antes de tocar memoria.
+    #[test]
+    fn random_token_rejects_a_negative_or_absurdly_large_length_instead_of_crashing() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc gen(length: Int) -> String { crypto.randomToken(length) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "S", "gen", &json!({"length": -1}), &db).unwrap_err();
+        assert!(e.message.contains("length"), "{}", e.message);
+        let e = invoke_rpc(&program, "S", "gen", &json!({"length": 9223372036854775807i64}), &db).unwrap_err();
+        assert!(e.message.contains("length"), "{}", e.message);
+        let e = invoke_rpc(&program, "S", "gen", &json!({"length": 0}), &db).unwrap_err();
+        assert!(e.message.contains("length"), "{}", e.message);
+        // El camino feliz no cambia.
+        let ok = invoke_rpc(&program, "S", "gen", &json!({"length": 32}), &db).unwrap();
+        assert_eq!(ok.as_str().unwrap().chars().count(), 32);
     }
 
 }

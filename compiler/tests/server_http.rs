@@ -759,6 +759,36 @@ fn idempotent_rejects_the_same_key_reused_with_a_different_body_over_a_real_subp
     server.shutdown();
 }
 
+/// AUDIT-2026-08-27.md #4/GRAMMAR.md §3.166: antes del fix, `lookup`+`store`
+/// eran dos candados separados con el cuerpo del rpc corriendo sin ninguno
+/// sostenido entre medio -- requests concurrentes con la MISMA clave veían
+/// todas un `Miss` y todas corrían el cuerpo. Acá se lanzan 30 requests
+/// reales, con hilos del sistema operativo reales, contra un `linkc serve`
+/// real -- exactamente el escenario que reprodujo el bug (30 concurrentes
+/// insertaron 2 filas antes del fix). Con el fix, como mucho UNA gana la
+/// reserva y corre el cuerpo; el resto recibe 200 (con la respuesta
+/// repetida, si llegaron después de que la primera terminara) o 409
+/// (`in-flight`, si llegaron mientras la primera todavía corría) -- nunca
+/// una segunda inserción.
+#[test]
+fn idempotent_never_runs_the_body_twice_under_real_concurrent_requests_with_the_same_key() {
+    let server = ServeProcess::start_with_program("idempotent-concurrent", IDEMPOTENT_PROGRAM);
+
+    std::thread::scope(|scope| {
+        for _ in 0..30 {
+            scope.spawn(|| {
+                let (status, _) = server.post_with_idempotency_key("/Orders/create", &json!({"total": 10}), "race-key");
+                assert!(status == 200 || status == 409, "status inesperado: {status}");
+            });
+        }
+    });
+
+    let (_, count) = server.post("/Orders/count", &json!({}), None);
+    assert_eq!(count, json!(1), "30 requests concurrentes con la misma clave tienen que insertar UNA sola fila, no más");
+
+    server.shutdown();
+}
+
 /// `@cache("60s")` (GRAMMAR.md §3.144): `summary` inserta una fila real cada
 /// vez que CORRE de verdad -- `rowCount` (sin `@cache`) es lo que prueba que
 /// un segundo POST dentro del TTL nunca ejecutó el cuerpo de nuevo, no solo

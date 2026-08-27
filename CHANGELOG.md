@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.122.0] - 2026-08-27
+
+### 🔒 Seguridad / 🐛 Arreglado
+Tercera auditoría adversarial de la sesión (5 agentes `Explore` read-only en paralelo, uno por capa: concurrencia/panics, consistencia de codegen, auth/secretos, superficie de `.unwrap()`/panic, capa SQL/DB). 16 hallazgos documentados en `AUDIT-2026-08-27.md`, priorizados en `AUDIT-FIX-PLAN-2026-08-27.md`. Rondas 1 y 2 del plan (severidad crítica y alta) se cierran acá:
+
+- **`crypto.randomToken(length)` con `length` negativo o gigante mataba el proceso `linkc serve` ENTERO.** `*n as usize` sobre un negativo reinterpreta los bits como un `usize` gigante; sin ningún techo, el pedido de memoria resultante hacía que Rust llamara a `handle_alloc_error` → `std::process::abort()` -- ni siquiera `catch_unwind` puede evitarlo. Reproducido en vivo: una sola request `{"length": 9223372036854775807}` a un rpc que expone `crypto.randomToken(length)` tumbaba el proceso entero (todos los servicios coexistiendo bajo `serve-all` incluidos), sin necesitar autenticación si el rpc no la exigía. **Fix**: `length` se valida contra `1..=1024` antes de tocar memoria.
+- **`@cache` + `@authenticated`/`@requires` filtraba datos de un usuario autenticado hacia otro.** La clave de caché (`(service, rpc, argumentos)`) nunca incluyó la sesión del caller. Reproducido en vivo: Bob, con su propio token de sesión válido, recibía el perfil completo de Alice (un `myProfile()` cacheado que lee `auth.currentUserId()`) en vez del suyo. **Fix**: rechazado en compilación -- combinar `@cache` con `@authenticated`/`@requires` en el mismo rpc es ahora un error del checker, hasta que exista un diseño real de scoping por sesión.
+- **`Patch<T>`/`applyPatch` nunca aplicaba `@validate`/`@check`.** `json_to_typed_value` tiene dos caminos que construyen un struct desde el wire; solo el de un struct COMPLETO llamaba a `apply_field_validators`, el de `Patch<T>` (la forma canónica de actualización parcial) se lo saltaba entero -- y `@validate` no tiene ningún respaldo de DDL, así que era el único punto de enforcement en todo el sistema. Reproducido en vivo: `create` con un email inválido daba 400, `update` con el mismo valor daba 200 y lo persistía. **Fix**: `Type::PatchOf` ahora también corre `apply_field_validators` -- la función ya toleraba valores parciales, ningún cambio de semántica.
+- **`@idempotent` tenía una carrera TOCTOU real -- doble ejecución con la misma `Idempotency-Key`.** `lookup`+`store` eran dos candados separados con el cuerpo del rpc corriendo sin ninguno sostenido entre medio. Reproducido en vivo: 30 requests concurrentes con la misma clave insertaron 2 filas para un solo cargo. **Fix**: `reserve` (revisar + marcar en vuelo, atómico bajo un único candado) reemplaza a `lookup` -- un segundo `reserve` sobre una clave todavía en vuelo da `409` sin correr el cuerpo, mismo criterio que la API real de Stripe. Una marca huérfana (el hilo que la reservó murió sin liberarla) se autolibera después de 120s.
+
+Verificado con hilos de sistema operativo reales en los dos últimos casos (no solo tests unitarios) + repetición en vivo de los 4 repros exactos del audit contra un `linkc serve` real. Los 12 hallazgos restantes (media/baja severidad) quedan documentados y priorizados para rondas siguientes -- no todos entran en un solo paquete de bugfix. Ver GRAMMAR.md §3.165/§3.166/§3.167, PLAN.md §9.5, `AUDIT-FIX-PLAN-2026-08-27.md`.
+
 ## [1.121.0] - 2026-08-27
 
 ### 🔧 Proceso

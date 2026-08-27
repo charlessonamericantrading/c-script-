@@ -952,7 +952,14 @@ fn handle_request(
     let idempotency_key = if required_idempotent(&program, service_name, rpc_name) { extract_idempotency_key(&request) } else { None };
     if let Some(key) = &idempotency_key {
         let request_hash = hash_request_body(&body);
-        match idempotency_store.lock().lookup(service_name, rpc_name, key, &request_hash) {
+        // AUDIT-2026-08-27.md #4/GRAMMAR.md §3.166: `reserve` es una única
+        // operación atómica (revisar + marcar en vuelo bajo el MISMO
+        // candado) -- antes, `lookup`+`store` eran dos adquisiciones
+        // separadas con el cuerpo entero corriendo sin ningún candado entre
+        // medio, así que dos requests concurrentes con la misma clave veían
+        // las dos un `Miss` y las dos corrían el cuerpo (confirmado en vivo:
+        // 30 requests concurrentes insertaron 2 filas para un solo cargo).
+        match idempotency_store.lock().reserve(service_name, rpc_name, key, &request_hash) {
             Lookup::Hit { status, body: cached_body, content_type } => {
                 let _ = request.respond(cors_response_with_type(status, cached_body, &content_type, &cors_headers, None, None));
                 log_done_with_audit(log, req_id, Some(&method), status, start, "idempotent=\"replayed\"", auth_audit.as_ref());
@@ -968,7 +975,16 @@ fn handle_request(
                 db.clear_request_context();
                 return;
             }
-            Lookup::Miss => {}
+            Lookup::InFlight => {
+                let msg = format!(
+                    "'Idempotency-Key: {key}' ya tiene una request en vuelo para '{method}' -- esperá a que termine antes de reintentar"
+                );
+                let _ = request.respond(cors_response(409, error_json(&msg), &cors_headers));
+                log_done_with_audit(log, req_id, Some(&method), 409, start, "idempotent=\"in-flight\"", auth_audit.as_ref());
+                db.clear_request_context();
+                return;
+            }
+            Lookup::Reserved => {}
         }
     }
 
@@ -1001,7 +1017,16 @@ fn handle_request(
     if let Some(key) = &idempotency_key {
         if (200..300).contains(&status) {
             let request_hash = hash_request_body(&body);
-            idempotency_store.lock().store(service_name, rpc_name, key, &request_hash, status, response_body.clone(), response_type.clone());
+            idempotency_store.lock().complete(service_name, rpc_name, key, &request_hash, status, response_body.clone(), response_type.clone());
+        } else {
+            // `reserve()` (arriba) siempre deja la clave marcada EN VUELO --
+            // si el cuerpo terminó en error, hay que liberarla acá, no solo
+            // "no grabar nada": sin este `release`, la clave se queda
+            // `InFlight` hasta `IN_FLIGHT_STALE_AFTER` (120s) aunque el
+            // intento ya haya terminado, y un reintento inmediato con la
+            // misma clave (el caso de uso central de `@idempotent`: corregí
+            // y reintentá) recibiría 409 en vez de poder correr de nuevo.
+            idempotency_store.lock().release(service_name, rpc_name, key);
         }
     }
     // `@cache`: mismo criterio de "solo se graba un éxito" que `@idempotent`

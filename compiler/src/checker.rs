@@ -1957,6 +1957,26 @@ impl Checker {
                 r.name
             )));
         }
+        // Auditoría adversarial (27/08/2026, AUDIT-2026-08-27.md #2): la
+        // clave de caché es (service, rpc, argumentos) -- NUNCA incluye la
+        // sesión/token del caller. Un rpc `@cache` que además es
+        // `@authenticated`/`@requires` y cuya respuesta depende de LA
+        // IDENTIDAD del caller (`auth.currentUserId()`, el patrón que
+        // GRAMMAR.md §3.53 documenta y promueve para "mis notas"/"mi
+        // dashboard") sirve, dentro del TTL, la respuesta de OTRO usuario
+        // autenticado a cualquiera que llegue con los mismos argumentos
+        // (casi siempre ninguno) -- confirmado en vivo: Alice llama, queda
+        // cacheado; Bob, con su PROPIO token válido, recibe el perfil de
+        // Alice completo. Rechazado acá hasta que exista un diseño real de
+        // scoping por sesión (incluir el userId/token en la clave) -- mismo
+        // criterio que el proyecto ya usa para otras combinaciones sin
+        // sentido (`@cron` + cualquier otra anotación, más abajo).
+        if r.auth().is_some() {
+            return Err(err(format!(
+                "'{}' combina `@cache` con `@authenticated`/`@requires`: la clave de caché no distingue quién llama, así que dentro del TTL cualquier caller autenticado recibiría la respuesta cacheada de OTRO -- sacá `@cache` de este rpc, o dejá de depender de la identidad del caller dentro del cuerpo (GRAMMAR.md §3.144)",
+                r.name
+            )));
+        }
         crate::cache::parse_ttl(raw).map_err(|e| err(format!("`@cache(\"{raw}\")` en '{}': {e}", r.name)))?;
         Ok(())
     }
@@ -6466,6 +6486,46 @@ type T = { id: Int, s: Status }")
         let err = check_source(src).unwrap_err();
         assert!(
             err.iter().any(|e| e.message.contains("cache") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    /// AUDIT-2026-08-27.md #2: la clave de caché es (service, rpc,
+    /// argumentos), nunca la sesión del caller -- `@cache` sobre un rpc
+    /// `@authenticated`/`@requires` sirve la respuesta de UN usuario a
+    /// cualquier OTRO usuario autenticado que llegue con los mismos
+    /// argumentos dentro del TTL (confirmado en vivo antes de este fix).
+    /// Rechazado en compilación hasta que exista un diseño real de scoping
+    /// por sesión.
+    #[test]
+    fn cache_annotation_is_rejected_when_combined_with_authenticated() {
+        let src = r#"
+            service Account {
+                @authenticated
+                @cache("30s")
+                rpc myProfile() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("@cache") && e.message.contains("@authenticated")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn cache_annotation_is_rejected_when_combined_with_requires() {
+        let src = r#"
+            enum Role { Admin }
+            service Account {
+                @requires(Role.Admin)
+                @cache("30s")
+                rpc adminStats() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("@cache") && e.message.contains("@authenticated")),
             "mensaje inesperado: {err:?}"
         );
     }
