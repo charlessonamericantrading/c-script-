@@ -524,6 +524,48 @@ mod tests {
         assert!(has_db, "el db {{}} transitivo (schema.link) también tiene que llegar");
     }
 
+    /// GRAMMAR.md §3.172: el caso real que motivó permitir varios `db {{ ... }}`
+    /// -- cada módulo de servicio dueño de sus PROPIAS colecciones, en vez
+    /// del `schema.link` central que era el único patrón que funcionaba
+    /// antes. Dos módulos, cada uno con su `db {{ ... }}` y su `service`,
+    /// cargados por efecto desde `main.link` -- el `Program` fusionado tiene
+    /// que pasar el checker completo, con las dos colecciones usables desde
+    /// cualquiera de los dos services.
+    #[test]
+    fn two_modules_each_owning_their_own_db_block_merge_and_type_check() {
+        let dir = TempDir::new("two_modules_own_db");
+        dir.write(
+            "billing.link",
+            r#"
+            type Invoice = { id: Int, amount: Int }
+            db { invoices: Invoice[] }
+            service Billing {
+                rpc create(amount: Int) -> Invoice { db.invoices.insert(Invoice { id: 0, amount: amount }) }
+            }
+        "#,
+        );
+        dir.write(
+            "crm.link",
+            r#"
+            type Customer = { id: Int, name: String }
+            db { customers: Customer[] }
+            service Crm {
+                rpc create(name: String) -> Customer { db.customers.insert(Customer { id: 0, name: name }) }
+                rpc totalAcrossModules() -> Int { db.customers.count() + db.invoices.count() }
+            }
+        "#,
+        );
+        dir.write("main.link", "import \"./billing.link\";\nimport \"./crm.link\";\n");
+
+        let (program, touched, _item_files) = load_program(&dir.path("main.link")).unwrap();
+        assert_eq!(touched.len(), 3, "main + billing + crm, cada archivo una vez");
+        let db_block_count = program.items.iter().filter(|i| matches!(i, Item::Db(_))).count();
+        assert_eq!(db_block_count, 2, "los dos 'db {{ ... }}' nativos, uno por módulo, llegan intactos al Program fusionado");
+
+        let result = crate::checker::Checker::check_program(&program);
+        assert!(result.is_ok(), "dos módulos con su propio 'db {{ ... }}' tienen que tipar limpio, fusionados: {result:?}");
+    }
+
     /// La forma con llaves sigue funcionando exactamente igual -- la forma
     /// nueva es puramente aditiva, no reemplaza nada.
     #[test]

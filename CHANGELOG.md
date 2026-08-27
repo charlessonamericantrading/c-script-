@@ -3,6 +3,30 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.127.0] - 2026-08-27
+
+### ✨ Nuevo
+**Varios `db { ... }`, uno por módulo, se fusionan en un solo namespace de colecciones** -- cierra el último hueco genuinamente abierto del Pilar 3 (sistema de módulos) del roadmap de tres pilares que skynet-d3 relayó a nombre del usuario. Antes de esta ronda, un SEGUNDO `db { ... }` en el cierre transitivo de imports era un error duro sin importar sus nombres -- el único patrón que funcionaba era un `schema.link` central con el `db {}` que los módulos de servicio importaban.
+
+```
+// billing.link
+db { invoices: Invoice[] }
+service Billing { ... }
+
+// crm.link
+db { customers: Customer[] }
+service Crm { ... }
+
+// main.link
+import "./billing.link";
+import "./crm.link";
+```
+
+- Discovery primero: auditando quién consume un `Item::Db` apareció que, salvo el loop del checker que construye el mapa fusionado `db_collections`, TODO lo demás (codegen de Postgres, `linkc migrate`, el runtime) ya consumía exclusivamente ese mapa -- el cambio real quedó contenido en un solo lugar.
+- Regla nueva: cualquier cantidad de `db {}` se fusiona; el único error duro que queda es un nombre de colección repetido (mismo criterio que `type`/`enum`/`fn`/`const` duplicados entre archivos), sin importar si las dos apariciones caen en el mismo bloque o en dos distintos. De paso se cerró un gap preexistente (un nombre repetido DENTRO de un solo bloque se perdía en silencio) y el gotcha de UX de la cascada de errores ya documentado.
+
+Verificado con 3 tests nuevos en `checker.rs` + 1 en `modules.rs`, más repetición en vivo contra el binario real: `linkc build`/`linkc serve` con dos módulos reales generan el contrato y las dos tablas correctamente, cada `service` opera sobre la suya, y el caso de colisión da un solo error limpio sin cascada. Sigue abierto del Pilar 3: visibilidad `pub`/privado, sin evidencia de demanda propia. Ver GRAMMAR.md §3.172, PLAN.md §9.2.
+
 ## [1.126.0] - 2026-08-27
 
 ### ✨ Nuevo

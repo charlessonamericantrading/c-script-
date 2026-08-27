@@ -650,22 +650,45 @@ impl Checker {
         }
 
         // Item::Db -- DESPUÉS de types/enums (resolver "User[]" necesita
-        // poder encontrar "User" ya insertado). A lo sumo un `db { ... }`
-        // en todo el Program ya fusionado (imports lo aplanan todo a un
-        // solo Program, modules.rs, así que no hay "por archivo" acá).
-        let mut db_decl_seen = false;
+        // poder encontrar "User" ya insertado). CUALQUIER cantidad de
+        // `db { ... }` en el Program ya fusionado (imports lo aplanan todo a
+        // un solo Program, modules.rs) se fusiona en un solo namespace de
+        // colecciones -- GRAMMAR.md §3.172, cierra el "qué queda REALMENTE
+        // abierto del Pilar 3" que §3.161 había dejado explícito ("permitir
+        // varios `db {}` es una decisión de diseño con su propio peso").
+        // Antes de esto, un SEGUNDO `db { ... }` en el cierre transitivo era
+        // un error duro sin importar sus nombres -- el patrón real que
+        // dependía de esto (`schema.link` central con el `db {}`, importado
+        // por módulos de servicio) sigue funcionando exactamente igual;
+        // ahora TAMBIÉN funciona que cada módulo sea dueño de sus propias
+        // colecciones. Lo único que sigue siendo un error duro es un nombre
+        // de colección REPETIDO -- sin importar si las dos apariciones caen
+        // en el mismo `db { ... }` o en dos de archivos distintos, mismo
+        // criterio que ya aplica a `type`/`enum`/`fn`/`const` duplicados
+        // (`build_symbols`, arriba). Antes de esta ronda, un nombre repetido
+        // DENTRO de un solo bloque se perdía en silencio (el `insert` de más
+        // abajo simplemente pisaba la primera aparición sin ningún aviso) --
+        // un gap preexistente cerrado de paso, no solo el caso nuevo.
+        let mut collection_span: HashMap<String, Span> = HashMap::new();
         for item in &program.items {
             if let Item::Db(db) = item {
-                if db_decl_seen {
-                    errors.push(err("ya hay un 'db { ... }' declarado en este programa (duplicado)").with_span(db.span));
-                    continue;
-                }
-                db_decl_seen = true;
                 for coll in &db.collections {
                     // `coll` es un `Field` -- fuera de alcance para tener su
                     // propio span (ver ast.rs) -- así que el mejor span
                     // disponible es el de todo el `db { ... }` que lo
                     // contiene.
+                    if collection_span.contains_key(&coll.name) {
+                        errors.push(
+                            err(format!(
+                                "la colección '{}' ya está declarada -- un nombre de colección no puede repetirse, \
+                                 ni dentro del mismo 'db {{ ... }}' ni en otro distinto",
+                                coll.name
+                            ))
+                            .with_span(db.span),
+                        );
+                        continue;
+                    }
+                    collection_span.insert(coll.name.clone(), db.span);
                     match checker.resolve_type(&coll.ty) {
                         Ok(Type::List(element_ty)) => match checker.validate_db_element_type(&element_ty) {
                             Ok(()) => {
@@ -5883,15 +5906,61 @@ type T = { id: Int, s: Status }")
         assert!(result.is_err(), "una colección de db tiene que ser T[], no un tipo suelto");
     }
 
+    /// GRAMMAR.md §3.172: desde esta ronda, un SEGUNDO `db {{ ... }}` ya no
+    /// es un error por sí solo (ver el test de abajo que confirma que se
+    /// fusionan) -- lo que sigue siendo un error duro es el NOMBRE DE
+    /// COLECCIÓN repetido, sin importar si las dos apariciones caen en el
+    /// mismo bloque o en dos distintos. Este test antes se llamaba
+    /// `duplicate_db_declaration_is_rejected`; sigue fallando, pero por el
+    /// motivo real ahora (no por tener dos `db {{ ... }}`, sino por
+    /// repetir 'posts').
     #[test]
-    fn duplicate_db_declaration_is_rejected() {
+    fn duplicate_collection_name_across_two_db_blocks_is_rejected() {
         let src = r#"
             type Post = { id: Int }
             db { posts: Post[] }
             db { posts: Post[] }
         "#;
         let result = check_source(src);
-        assert!(result.is_err(), "no puede haber dos 'db {{ ... }}' en el mismo programa");
+        assert!(result.is_err(), "el mismo nombre de colección ('posts') repetido en dos 'db {{ ... }}' tiene que fallar");
+    }
+
+    /// Gap preexistente cerrado de paso en la misma ronda: un nombre de
+    /// colección repetido DENTRO de un único bloque se perdía en silencio
+    /// antes (el `insert` de turno pisaba la primera aparición sin ningún
+    /// aviso, ver la única `db.<c>` que sobrevivía). Ahora es el MISMO
+    /// error que el caso entre dos bloques.
+    #[test]
+    fn duplicate_collection_name_within_a_single_db_block_is_rejected() {
+        let src = r#"
+            type Post = { id: Int }
+            type OldPost = { id: Int }
+            db { posts: Post[], posts: OldPost[] }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "el mismo nombre de colección repetido en el MISMO bloque tiene que fallar, no perderse en silencio");
+    }
+
+    /// El caso nuevo que motivó todo esto: dos `db {{ ... }}` con nombres de
+    /// colección DISTINTOS -- cada módulo dueño de las suyas -- se fusionan
+    /// en un solo namespace, en vez del error duro de antes. Ambas
+    /// colecciones quedan usables desde el mismo `rpc`, como si hubieran
+    /// vivido siempre en un único bloque.
+    #[test]
+    fn two_db_blocks_with_disjoint_collection_names_merge_into_one_namespace() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            type Order = { id: Int, total: Int }
+            db { users: User[] }
+            db { orders: Order[] }
+            service S {
+                rpc bothCounts() -> Int {
+                    db.users.count() + db.orders.count()
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_ok(), "dos 'db {{ ... }}' con nombres de colección distintos tienen que fusionarse: {result:?}");
     }
 
     #[test]

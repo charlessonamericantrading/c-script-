@@ -193,6 +193,7 @@
   - [3.169 Ronda 4 de AUDIT-FIX-PLAN-2026-08-27.md: los 6 hallazgos restantes — CERRADA (3 código, 3 documentación deliberada)](#3169-ronda-4-de-audit-fix-plan-2026-08-27md-los-6-hallazgos-restantes--cerrada-3-código-3-documentación-deliberada)
   - [3.170 `countWhere`/`findWhere`/`deleteWhere`/`upsert` empujan `||` combinando condiciones — RESUELTO, cierra PLAN.md §9.3 ítem 1](#3170-countwherefindwheredeletewhereupsert-empujan--combinando-condiciones--resuelto-cierra-planmd-93-ítem-1)
   - [3.171 `countWhere`/`findWhere`/`deleteWhere` empujan comparaciones campo-vs-campo (`item.endDate > item.startDate`) — RESUELTO, cierra el resto de PLAN.md §9.3 ítem 1](#3171-countwherefindwheredeletewhere-empujan-comparaciones-campo-vs-campo-itemenddate--itemstartdate--resuelto-cierra-el-resto-de-planmd-93-ítem-1)
+  - [3.172 Varios `db { ... }`, uno por módulo, se fusionan en un solo namespace de colecciones — RESUELTO, cierra el último hueco de §3.161 (Pilar 3 del roadmap de skynet-d3)](#3172-varios-db--uno-por-módulo-se-fusionan-en-un-solo-namespace-de-colecciones--resuelto-cierra-el-último-hueco-de-3161-pilar-3-del-roadmap-de-skynet-d3)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6237,7 +6238,7 @@ Sin llaves y sin `from` -- misma forma que TypeScript/JS usan para lo mismo, por
 **Todo lo demás del sistema de módulos aplica igual, sin excepciones**: la resolución de `from` (relativo `./`/`../`, nombre pelado vía `link.json`, o `git+<url>#<rev>`) es la MISMA función; los ciclos se siguen detectando (la detección corre sobre la pila de ARCHIVOS, nunca sobre los nombres importados); un archivo inexistente falla igual de claro; un error de sintaxis en el módulo importado sigue nombrando el archivo y la línea. Lo único que una lista de nombres vacía saltea es, por construcción, la validación "¿existe este nombre ahí?" -- no hay ningún nombre que validar.
 
 **Límites honestos, y qué queda REALMENTE abierto del Pilar 3:**
-- **Un solo `db { ... }` por programa, sigue siendo un error duro.** Cada módulo NO puede ser dueño de sus propias colecciones: declarar un `db {}` en dos archivos del mismo cierre da `ya hay un 'db { ... }' declarado en este programa (duplicado)`. El patrón que sí funciona es un `schema.link` con el `db {}` central que los módulos de servicio importan. **Gotcha real de UX, verificado**: además del error correcto, se dispara un segundo error en CASCADA (`'db' no tiene ninguna colección llamada 'customers'`, apuntando al archivo del segundo `db {}`) que es una CONSECUENCIA, no la causa -- confuso si se lee de arriba hacia abajo. Ninguno de los dos se arregló acá: permitir varios `db {}` es una decisión de diseño con su propio peso (¿se fusionan las colecciones? ¿qué pasa con dos colecciones del mismo nombre en módulos distintos?), no un fix chico.
+- ~~**Un solo `db { ... }` por programa, sigue siendo un error duro.**~~ **RESUELTO (27/08/2026), ver §3.172.** Cada módulo ya puede ser dueño de sus propias colecciones -- se fusionan en un solo namespace, con el único error duro que queda siendo un nombre de colección repetido (de paso, el gotcha de UX de la cascada de abajo también desapareció para el caso legítimo).
 - **Sin visibilidad `pub`/privado** -- sin cambios respecto de §2.1: el `Program` fusionado sigue siendo la unión plana de todos los ítems nativos alcanzados, y un import no oculta nada de los demás archivos del cierre.
 - **Sin re-exports** -- sin cambios. La forma por efecto no los introduce por la puerta de atrás: no exporta nada, solo carga.
 
@@ -6436,6 +6437,42 @@ rpc invalidRanges() -> Booking[] {
 **Límite honesto, `--adopt-existing` solamente**: la invariante "campo no opcional = columna `NOT NULL`" la garantiza el `CREATE TABLE` que emite c-script -- para una tabla adoptada de datos preexistentes que ya violaban esa invariante ANTES de que c-script la tocara, `check_schema_for_adoption` (ver AUDIT-2026-08-27.md #7) valida el TIPO declarado de cada columna pero no su nulabilidad. En ese escenario puntual, un NULL inesperado en una de las dos columnas haría que esa fila silenciosamente no matchee ninguna comparación (`NULL OP x` es `NULL`/falso en SQL) -- el camino interpretado, en cambio, ya falla con un `RuntimeError` limpio ANTES de llegar a evaluar el predicado (`row_to_fields` revienta primero al decodificar esa fila). Sin evidencia de un caso real que dependa de esto -- documentado, no bloqueante.
 
 **Verificado**: `count_where_and_find_where_push_down_a_field_vs_field_comparison` (`runtime/mod.rs`) -- los cuatro operadores relacionales entre dos campos, y el mismo campo-vs-campo adentro de un `&&` junto a una hoja normal (`room == room && endDay <= startDay`), confirmando que el árbol mixto no se rompe. `delete_where_pushes_down_the_selection_for_a_field_vs_field_comparison` -- mismo caso para la SELECCIÓN de `deleteWhere` (el DELETE en sí sigue fila por fila, sin cambios). El ejemplo de "predicado NO pusheable" (§3.108/§3.109/§3.170 ya habían tenido que corregirlo, siempre por el mismo motivo: el alcance pusheable creció) se corrigió una vez más -- de un relacional campo-vs-campo (ahora pusheable) a un `==` campo-vs-campo, el único caso que sigue quedando. Suite completa sin regresiones. Repetición en vivo contra un `linkc serve` real (`findWhere`/`countWhere` con `endDay <= startDay` sobre 4 filas, conteo y filas exactas).
+
+---
+
+### 3.172 Varios `db { ... }`, uno por módulo, se fusionan en un solo namespace de colecciones — RESUELTO, cierra el último hueco de §3.161 (Pilar 3 del roadmap de skynet-d3)
+
+§3.161 había dejado esto explícito como lo único que quedaba REALMENTE abierto del Pilar 3 (sistema de módulos) del roadmap de tres pilares que skynet-d3 relayó a nombre de Carlos: "un solo `db { ... }` por programa, sigue siendo un error duro... permitir varios `db {}` es una decisión de diseño con su propio peso (¿se fusionan las colecciones? ¿qué pasa con dos colecciones del mismo nombre en módulos distintos?)". Antes de esta ronda, el ÚNICO patrón que funcionaba era un `schema.link` central con el `db { ... }` que los módulos de servicio importaban -- cada módulo NO podía ser dueño de sus propias colecciones.
+
+```
+// billing.link
+type Invoice = { id: Int, amount: Int }
+db { invoices: Invoice[] }
+service Billing {
+  rpc create(amount: Int) -> Invoice { db.invoices.insert(Invoice { id: 0, amount: amount }) }
+}
+
+// crm.link
+type Customer = { id: Int, name: String }
+db { customers: Customer[] }
+service Crm {
+  rpc create(name: String) -> Customer { db.customers.insert(Customer { id: 0, name: name }) }
+}
+
+// main.link
+import "./billing.link";
+import "./crm.link";
+```
+
+**Discovery antes de tocar código, mismo criterio que §3.161: el blast radius real era mucho más chico de lo que parecía.** Auditando quién consume un `Item::Db` apareció que, salvo `checker.rs` (la única validación que construía `checker.db_collections`, el `HashMap<String, Type>` ya evaluado), TODO lo demás (`postgres_emit.rs`, `migrate.rs`, `runtime/db.rs`, `runtime/mod.rs`) ya consumía exclusivamente ese mapa fusionado, nunca el AST crudo -- ni siquiera las funciones que además cruzan con `program.items` para leer anotaciones (`@softDelete`/`@index`/`@check`/`@unique` compuesto) lo hacen buscando `Item::Db`, sino `Item::Type` por nombre de tipo, algo que el sistema de módulos YA fusiona correctamente desde §2.1. El cambio real quedó contenido en un solo lugar: el loop de `Checker::new` que antes rechazaba un SEGUNDO `Item::Db` sin mirar sus nombres.
+
+**La regla nueva: cualquier cantidad de `db { ... }` se fusiona; lo único que sigue siendo un error duro es un NOMBRE DE COLECCIÓN repetido**, sin importar si las dos apariciones caen en el mismo bloque o en dos archivos distintos -- mismo criterio que ya aplica a `type`/`enum`/`fn`/`const` duplicados entre archivos (§2.1, `build_symbols`). **Gap preexistente cerrado de paso, no solo el caso nuevo**: antes de esta ronda, un nombre de colección repetido DENTRO de un único bloque (`db { posts: Post[], posts: OldPost[] }`) se perdía en silencio -- el `insert` sobre el `HashMap` pisaba la primera aparición sin ningún aviso, nunca ejercitado porque nadie escribiría eso a mano, pero un gap real de todos modos. Ahora es exactamente el mismo error que el caso entre dos archivos.
+
+**De paso se cierra el gotcha de UX que §3.161 había documentado**: el error en cascada (`ya hay un 'db { ... }' declarado` seguido de `'db' no tiene ninguna colección llamada '<x>'`, apuntando al segundo bloque) desaparece para el caso legítimo -- ya no hay ningún "segundo bloque" que rechazar por sí solo. Para el caso de colisión real, un solo error nombra la colección repetida, sin ningún error derivado en cascada.
+
+**Alcance sin cambios**: sigue sin haber visibilidad `pub`/privado (§2.1/§3.161) -- las colecciones fusionadas, igual que el resto del `Program`, son visibles desde cualquier `service` del cierre transitivo, tenga o no una relación de import directa con el módulo que las declaró.
+
+**Verificado**: 3 tests nuevos en `checker.rs` -- dos `db { ... }` con nombres de colección DISTINTOS tipan limpio y las dos colecciones son usables desde el mismo `rpc` (`db.users.count() + db.orders.count()`); el nombre repetido entre dos bloques falla; el nombre repetido DENTRO de un solo bloque también falla (antes se perdía en silencio). 1 test nuevo en `modules.rs` -- dos módulos reales, cada uno con su propio `db { ... }` y su propio `service`, cargados por import de efecto (§3.161) desde un `main.link`, confirman que los dos `Item::Db` nativos llegan intactos al `Program` fusionado y que el checker completo los acepta. Más repetición en vivo contra el binario real: `linkc build` con dos módulos reales (arriba) genera el contrato limpio con los dos tipos de dominio; `linkc serve` real crea las dos tablas de verdad, cada `service` opera sobre la suya sin interferencia (`Billing.create`/`Billing.count` y `Crm.create`/`Crm.count` contra el mismo proceso, conteos exactos); y el caso de colisión (dos módulos declarando `db { things: ... }` con el mismo nombre) confirmado con un solo error limpio, sin cascada, vía `linkc build` real.
 
 ---
 
