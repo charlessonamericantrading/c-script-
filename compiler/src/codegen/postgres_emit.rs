@@ -4,7 +4,7 @@
 
 use crate::ast::{FieldCheck, Program};
 use crate::checker::Checker;
-use crate::runtime::db::{check_clause_sql, check_fields_by_collection, composite_unique_index_name};
+use crate::runtime::db::{check_clause_sql, check_fields_by_collection, composite_unique_index_name, type_checks_by_collection};
 use crate::types::{FieldType, Type};
 use std::collections::HashSet;
 
@@ -51,10 +51,22 @@ fn postgres_column_type(field: &FieldType, simple_enums: &HashSet<String>) -> &'
 }
 
 /// Genera la sentencia DDL `CREATE TABLE IF NOT EXISTS` para una colección en PostgreSQL.
-/// `checks` (GRAMMAR.md §3.96, `@check`): pares `(campo, FieldCheck)`, mismo
-/// formato que `runtime::db::check_fields_by_collection` produce -- sin
-/// entrada para el `.link` mayoría que no usa `@check` en absoluto.
-pub fn create_postgres_table_sql(collection: &str, fields: &[FieldType], simple_enums: &HashSet<String>, checks: &[(String, FieldCheck)]) -> String {
+/// `checks` (GRAMMAR.md §3.96, `@check` de un solo campo): pares `(campo,
+/// FieldCheck)`, mismo formato que `runtime::db::check_fields_by_collection`
+/// produce -- sin entrada para el `.link` mayoría que no usa `@check` en
+/// absoluto. `type_checks` (GRAMMAR.md §3.173, `@check(<expr>)` de nivel
+/// `type`): expresiones SQL YA TRADUCIDAS (`runtime::db::type_check_expr_sql`),
+/// una por cada `@check(...)` a nivel `type` -- se agregan como constraint
+/// de TABLA (no de columna, a diferencia de `checks`), mismo lugar en el
+/// `CREATE TABLE` que ocuparía cualquier otro `CHECK` de más de una
+/// columna.
+pub fn create_postgres_table_sql(
+    collection: &str,
+    fields: &[FieldType],
+    simple_enums: &HashSet<String>,
+    checks: &[(String, FieldCheck)],
+    type_checks: &[String],
+) -> String {
     let mut cols = vec!["\"id\" BIGSERIAL PRIMARY KEY".to_string()];
 
     for f in fields {
@@ -69,6 +81,9 @@ pub fn create_postgres_table_sql(collection: &str, fields: &[FieldType], simple_
             None => String::new(),
         };
         cols.push(format!("\"{}\" {}{}{}", f.name, pg_type, not_null, check_clause));
+    }
+    for sql in type_checks {
+        cols.push(format!("CHECK {sql}"));
     }
 
     format!("CREATE TABLE IF NOT EXISTS \"{collection}\" (\n  {}\n);", cols.join(",\n  "))
@@ -100,13 +115,16 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
     // borrarla.
     let mut statements = vec!["-- Schema generado automáticamente por Link (PostgreSQL Enterprise Backend)".to_string()];
     let checks_by_collection = check_fields_by_collection(program, &checker);
+    let type_checks_by_collection = type_checks_by_collection(program, &checker);
     let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
+    let empty_type_checks: Vec<String> = Vec::new();
 
     for (coll_name, elem_ty) in checker.db_collections() {
         if let Type::Struct { fields, .. } = elem_ty {
             let non_id_fields: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
             let checks = checks_by_collection.get(coll_name).unwrap_or(&empty_checks);
-            let sql = create_postgres_table_sql(coll_name, &non_id_fields, &simple_enums, checks);
+            let type_checks = type_checks_by_collection.get(coll_name).unwrap_or(&empty_type_checks);
+            let sql = create_postgres_table_sql(coll_name, &non_id_fields, &simple_enums, checks, type_checks);
             statements.push(sql);
         }
     }
@@ -148,7 +166,8 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
             if &t.name != type_name {
                 continue;
             }
-            for crate::ast::TypeAnnotation::Unique(fields) in &t.annotations {
+            for ann in &t.annotations {
+                let crate::ast::TypeAnnotation::Unique(fields) = ann else { continue };
                 let idx_name = composite_unique_index_name(coll_name, fields);
                 let cols = fields.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
                 statements.push(format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{coll_name}\"({cols});"));
@@ -213,6 +232,23 @@ mod tests {
         assert!(ddl.contains("\"rating\" BIGINT NOT NULL CHECK (\"rating\" >= 1 AND \"rating\" <= 5)"), "{ddl}");
         assert!(ddl.contains("\"helpfulVotes\" BIGINT NOT NULL CHECK (\"helpfulVotes\" >= 0)"), "{ddl}");
         assert!(ddl.contains("\"discountPercent\" DOUBLE PRECISION NOT NULL CHECK (\"discountPercent\" <= 100)"), "{ddl}");
+    }
+
+    /// GRAMMAR.md §3.173: `@check(<expr>)` de nivel type genera un `CHECK`
+    /// de TABLA de verdad en el DDL estático -- constraint de tabla, no de
+    /// columna (a diferencia del `@check` de un solo campo del test de
+    /// arriba), así que aparece como su propia entrada en la lista de
+    /// columnas del `CREATE TABLE`, no pegado al final de una columna.
+    #[test]
+    fn type_level_check_annotation_emits_a_real_sql_table_check_constraint() {
+        let code = r#"
+        @check(endDay > startDay)
+        type Booking = { id: Int, startDay: Int, endDay: Int }
+        db { bookings: Booking[] }
+        "#;
+        let program = parser::parse(lexer::tokenize(code).unwrap()).unwrap();
+        let ddl = generate_postgres_ddl(&program).unwrap();
+        assert!(ddl.contains("CHECK (\"endDay\" > \"startDay\")"), "{ddl}");
     }
 
     /// PLAN.md §9.1: auditando si `CREATE EXTENSION "pgcrypto"` necesita

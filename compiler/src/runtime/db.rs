@@ -241,14 +241,129 @@ pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checke
             if &t.name != type_name {
                 continue;
             }
-            let sets: Vec<Vec<String>> =
-                t.annotations.iter().map(|TypeAnnotation::Unique(fields)| fields.clone()).collect();
+            let sets: Vec<Vec<String>> = t
+                .annotations
+                .iter()
+                .filter_map(|a| match a {
+                    TypeAnnotation::Unique(fields) => Some(fields.clone()),
+                    TypeAnnotation::Check(_) => None,
+                })
+                .collect();
             if !sets.is_empty() {
                 result.insert(coll_name.clone(), sets);
             }
         }
     }
     result
+}
+
+/// Nombre de colección -> lista de expresiones SQL ya traducidas, una por
+/// cada `@check(<expr>)` de nivel `type` (GRAMMAR.md §3.173) -- mismo cruce
+/// `checker.db_collections()` + `program.items` que `composite_unique_by_collection`
+/// arriba. La traducción (`type_check_expr_sql`) asume que el checker
+/// (`Checker::check_type_level_check_expr`) ya validó la forma Y el tipo de
+/// la expresión -- acá no se repite ninguna de esas dos validaciones.
+pub(crate) fn type_checks_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<String>> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let clauses: Vec<String> = t
+                .annotations
+                .iter()
+                .filter_map(|a| match a {
+                    TypeAnnotation::Check(expr) => Some(type_check_expr_sql(&expr.node)),
+                    TypeAnnotation::Unique(_) => None,
+                })
+                .collect();
+            if !clauses.is_empty() {
+                result.insert(coll_name.clone(), clauses);
+            }
+        }
+    }
+    result
+}
+
+/// Traduce la expresión de un `@check(<expr>)` de nivel `type` (GRAMMAR.md
+/// §3.173) a un booleano SQL real -- comparte sintaxis entre SQLite y
+/// PostgreSQL (los mismos operadores, sin ninguna función específica de
+/// motor), así que esta única función alimenta tanto `create_table_sql`
+/// (acá abajo) como `codegen::postgres_emit::create_postgres_table_sql`,
+/// igual que `check_clause_sql` para el `@check` de un solo campo.
+///
+/// Solo recibe formas que `Checker::check_type_level_check_expr` ya validó
+/// como pusheables (identificadores que son campos declarados de ESTE
+/// struct, literales, y los operadores de la lista de abajo) -- cualquier
+/// otra forma (llamada, acceso a `db`, closure, campo de otro struct) ya
+/// se rechazó en el checker, mucho antes de que el programa llegue a
+/// generar SQL. `panic!` en el caso `_` de abajo documenta esa garantía en
+/// vez de devolver `Option`/`Result` sin ningún caller real que pueda
+/// fallar de verdad.
+pub(crate) fn type_check_expr_sql(expr: &crate::ast::Expr) -> String {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Ident(name) => format!("\"{name}\""),
+        Expr::Null => "NULL".to_string(),
+        Expr::Int(n) => n.to_string(),
+        Expr::Float(x) => x.to_string(),
+        // `TRUE`/`FALSE`, no `1`/`0`: SQLite acepta las dos formas (desde
+        // 3.23), pero Postgres NO convierte un entero a booleano en
+        // silencio (`CHECK(activo AND 1)` falla ahí con un error de tipos)
+        // -- las palabras clave son la única forma que funciona igual en
+        // los dos motores, mismo criterio de "sin rama por backend" que el
+        // resto de este archivo.
+        Expr::Bool(b) => (if *b { "TRUE" } else { "FALSE" }).to_string(),
+        Expr::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        Expr::Paren(inner) => format!("({})", type_check_expr_sql(&inner.node)),
+        Expr::Unary { op: crate::ast::UnaryOp::Not, operand } => format!("NOT ({})", type_check_expr_sql(&operand.node)),
+        Expr::Unary { op: crate::ast::UnaryOp::Neg, operand } => format!("-({})", type_check_expr_sql(&operand.node)),
+        // `x = NULL`/`x != NULL` en SQL nunca es `true` (NULL no es igual a
+        // nada, ni siquiera a sí mismo) -- mismo footgun que
+        // `leaf_condition_sql` (§3.170) ya cerró para el pushdown de
+        // predicados. `IS [NOT] NULL` es la forma SQL correcta para
+        // expresar `campo == null`/`campo != null` acá.
+        Expr::Binary { op: BinaryOp::Eq, left, right } if matches!(&left.node, Expr::Null) => {
+            format!("({} IS NULL)", type_check_expr_sql(&right.node))
+        }
+        Expr::Binary { op: BinaryOp::Eq, left, right } if matches!(&right.node, Expr::Null) => {
+            format!("({} IS NULL)", type_check_expr_sql(&left.node))
+        }
+        Expr::Binary { op: BinaryOp::NotEq, left, right } if matches!(&left.node, Expr::Null) => {
+            format!("({} IS NOT NULL)", type_check_expr_sql(&right.node))
+        }
+        Expr::Binary { op: BinaryOp::NotEq, left, right } if matches!(&right.node, Expr::Null) => {
+            format!("({} IS NOT NULL)", type_check_expr_sql(&left.node))
+        }
+        Expr::Binary { op, left, right } => {
+            let l = type_check_expr_sql(&left.node);
+            let r = type_check_expr_sql(&right.node);
+            let sql_op = match op {
+                BinaryOp::Eq => "=",
+                BinaryOp::NotEq => "!=",
+                BinaryOp::Lt => "<",
+                BinaryOp::LtEq => "<=",
+                BinaryOp::Gt => ">",
+                BinaryOp::GtEq => ">=",
+                BinaryOp::And => "AND",
+                BinaryOp::Or => "OR",
+                BinaryOp::Add => "+",
+                BinaryOp::Sub => "-",
+                BinaryOp::Mul => "*",
+                BinaryOp::Div => "/",
+                BinaryOp::Rem => "%",
+                // `check_type_level_check_expr` ya filtra a estos doce --
+                // cualquier otro operador (`&&`/`||` de cortocircuito con
+                // efectos, `??`) nunca llega hasta acá.
+                other => unreachable!("operador no pusheable en @check de nivel type: {other:?}"),
+            };
+            format!("({l} {sql_op} {r})")
+        }
+        other => unreachable!("forma no pusheable en @check de nivel type: {other:?}"),
+    }
 }
 
 /// `CREATE UNIQUE INDEX IF NOT EXISTS ...` de VARIAS columnas a la vez, uno
@@ -357,7 +472,7 @@ pub(crate) fn check_clause_sql(field: &str, check: &FieldCheck) -> String {
     }
 }
 
-fn create_table_sql(collection: &str, columns: &[ColumnPlan], checks: &[(String, FieldCheck)]) -> String {
+fn create_table_sql(collection: &str, columns: &[ColumnPlan], checks: &[(String, FieldCheck)], type_checks: &[String]) -> String {
     let mut defs = vec!["\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
 
     for col in columns {
@@ -367,6 +482,12 @@ fn create_table_sql(collection: &str, columns: &[ColumnPlan], checks: &[(String,
             None => String::new(),
         };
         defs.push(format!("\"{}\" {}{}{}", col.field.name, col.sql_type, not_null, check_clause));
+    }
+    // `@check(<expr>)` de nivel `type` (GRAMMAR.md §3.173) -- constraint de
+    // TABLA, no de columna (a diferencia del loop de arriba), mismo lugar
+    // que ocuparía cualquier `CHECK` de más de una columna.
+    for sql in type_checks {
+        defs.push(format!("CHECK {sql}"));
     }
     // STRICT (SQLite >= 3.37, muy por debajo de la versión bundleada de
     // rusqlite 0.40): que SQLite rechace un tipo incompatible en vez de
@@ -1058,7 +1179,9 @@ impl Db {
         let _ = connection.pragma_update(None, "journal_mode", "WAL");
 
         let checks_by_collection = check_fields_by_collection(program, &checker);
+        let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
+        let empty_type_checks: Vec<String> = Vec::new();
         let mut columns = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
@@ -1078,8 +1201,9 @@ impl Db {
                 check_schema_for_adoption(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             } else {
                 let checks = checks_by_collection.get(name).unwrap_or(&empty_checks);
+                let type_checks = type_checks_by_collection_map.get(name).unwrap_or(&empty_type_checks);
                 connection
-                    .execute(&create_table_sql(name, &cols, checks), [])
+                    .execute(&create_table_sql(name, &cols, checks, type_checks), [])
                     .unwrap_or_else(|e| panic!("no se pudo crear la tabla '{name}' en '{db_path_display}': {e}"));
                 check_schema_matches(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             }
@@ -1159,7 +1283,9 @@ impl Db {
             Backend::Postgres { client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)), url: url.to_string() };
 
         let checks_by_collection = check_fields_by_collection(program, &checker);
+        let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
+        let empty_type_checks: Vec<String> = Vec::new();
         let mut columns = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
@@ -1176,8 +1302,15 @@ impl Db {
                 // realmente tiene podrían divergir -- que es la clase de bug que
                 // este repo ya encontró varias veces (GRAMMAR.md §3.9).
                 let checks = checks_by_collection.get(name).unwrap_or(&empty_checks);
+                let type_checks = type_checks_by_collection_map.get(name).unwrap_or(&empty_type_checks);
                 backend
-                    .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(name, &non_id, &simple_enums, checks))
+                    .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(
+                        name,
+                        &non_id,
+                        &simple_enums,
+                        checks,
+                        type_checks,
+                    ))
                     .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
             }
 

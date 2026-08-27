@@ -2315,12 +2315,14 @@ impl Checker {
         errors
     }
 
-    /// `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155)
-    /// -- constraint compuesto, complementa al `@unique` de un solo campo
-    /// ya existente (`FieldAnnotation::Index`, §3.80). Vive en un método
-    /// aparte de `check_field_checks` (arriba) porque opera sobre el
-    /// `TypeDecl` entero, no field por field -- necesita la lista COMPLETA
-    /// de nombres declarados para validar que cada uno exista.
+    /// `@unique(campo1, campo2, ...)`/`@check(<expr>)` a nivel de `type`
+    /// (GRAMMAR.md §3.155/§3.173) -- dos anotaciones que complementan, sin
+    /// reemplazar, sus formas de un solo campo ya existentes
+    /// (`FieldAnnotation::Index`/`FieldAnnotation::Check`, §3.80/§3.96).
+    /// Viven en un método aparte de `check_field_checks` porque operan
+    /// sobre el `TypeDecl` entero, no field por field -- las dos necesitan
+    /// la lista COMPLETA de campos declarados (`@unique` para validar que
+    /// cada nombre exista, `@check` para tipar la expresión contra ella).
     fn check_type_annotations(&self, t: &TypeDecl) -> Vec<CheckError> {
         let mut errors = Vec::new();
         if t.annotations.is_empty() {
@@ -2328,7 +2330,7 @@ impl Checker {
         }
         let TypeExpr::Struct(fields) = &t.ty else {
             errors.push(err(format!(
-                "'{}': '@unique(...)' solo aplica sobre un `type` con forma de struct (`{{ campo: Tipo, ... }}`), no sobre un alias/unión",
+                "'{}': una '@anotación' de nivel type ('@unique(...)'/'@check(...)') solo aplica sobre un `type` con forma de struct (`{{ campo: Tipo, ... }}`), no sobre un alias/unión",
                 t.name
             )));
             return errors;
@@ -2336,36 +2338,100 @@ impl Checker {
         let field_names: std::collections::HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
         let mut seen_sets: Vec<std::collections::BTreeSet<String>> = Vec::new();
         for ann in &t.annotations {
-            let TypeAnnotation::Unique(names) = ann;
-            if names.len() < 2 {
-                errors.push(err(format!(
-                    "'{}': '@unique(...)' a nivel de type necesita al menos 2 campos -- para uno solo, poné '@unique' directamente sobre ESE campo (GRAMMAR.md §3.80)",
-                    t.name
-                )));
-                continue;
-            }
-            let set: std::collections::BTreeSet<String> = names.iter().cloned().collect();
-            if set.len() != names.len() {
-                errors.push(err(format!("'{}': '@unique({})' repite el mismo campo más de una vez", t.name, names.join(", "))));
-                continue;
-            }
-            for name in names {
-                if !field_names.contains(name.as_str()) {
-                    errors.push(err(format!(
-                        "'{}': '@unique(...)' nombra '{name}', que no es un campo declarado de este type",
-                        t.name
-                    )));
+            match ann {
+                TypeAnnotation::Unique(names) => {
+                    if names.len() < 2 {
+                        errors.push(err(format!(
+                            "'{}': '@unique(...)' a nivel de type necesita al menos 2 campos -- para uno solo, poné '@unique' directamente sobre ESE campo (GRAMMAR.md §3.80)",
+                            t.name
+                        )));
+                        continue;
+                    }
+                    let set: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+                    if set.len() != names.len() {
+                        errors.push(err(format!("'{}': '@unique({})' repite el mismo campo más de una vez", t.name, names.join(", "))));
+                        continue;
+                    }
+                    for name in names {
+                        if !field_names.contains(name.as_str()) {
+                            errors.push(err(format!(
+                                "'{}': '@unique(...)' nombra '{name}', que no es un campo declarado de este type",
+                                t.name
+                            )));
+                        }
+                    }
+                    if seen_sets.contains(&set) {
+                        errors.push(err(format!(
+                            "'{}': '@unique({})' ya está declarado -- dos '@unique' con exactamente el mismo conjunto de campos son redundantes",
+                            t.name,
+                            names.join(", ")
+                        )));
+                    } else {
+                        seen_sets.push(set);
+                    }
+                }
+                TypeAnnotation::Check(expr) => {
+                    errors.extend(self.check_type_level_check_expr(t, fields, expr));
                 }
             }
-            if seen_sets.contains(&set) {
-                errors.push(err(format!(
-                    "'{}': '@unique({})' ya está declarado -- dos '@unique' con exactamente el mismo conjunto de campos son redundantes",
-                    t.name,
-                    names.join(", ")
-                )));
-            } else {
-                seen_sets.push(set);
+        }
+        errors
+    }
+
+    /// `@check(<expr>)` a nivel de `type` (GRAMMAR.md §3.173) -- una
+    /// expresión booleana referenciando campos del propio struct por
+    /// nombre PELADO (`endDate > startDate`, sin `self.`/prefijo: no hay
+    /// ningún parámetro que bindear, a diferencia de un closure de
+    /// `findWhere`/etc.), traducida a un `CHECK (...)` real de la base
+    /// (`runtime::db::type_check_expr_sql`) Y aplicada del lado de la
+    /// aplicación reusando el evaluador de expresiones normal
+    /// (`runtime/mod.rs::eval_expr`) sobre un `Env` armado con los valores
+    /// de esa fila -- mismo enforcement DOBLE que el resto de `@check`.
+    ///
+    /// Alcance deliberadamente acotado a lo que un `CHECK` de SQL puede
+    /// expresar sin reimplementar un evaluador de expresiones acá:
+    /// identificadores (que tienen que ser un campo declarado de ESTE
+    /// struct), literales, y los operadores `==`/`!=`/`<`/`<=`/`>`/`>=`/
+    /// `&&`/`||`/`!`/`-` (unario)/`+`/`-`/`*`/`/`/`%`. `validate_check_expr_shape`
+    /// (ast.rs) rechaza CUALQUIER otra forma (llamada, acceso a `db`,
+    /// closure, índice, literal de struct) ANTES de intentar tipar --
+    /// ninguna de esas formas puede evaluarse dentro de un `CHECK` de SQL,
+    /// así que dejarlas pasar solo para fallar después (en runtime, o
+    /// nunca, silenciosamente mal) sería peor que rechazarlas acá con un
+    /// mensaje claro.
+    fn check_type_level_check_expr(&self, t: &TypeDecl, fields: &[Field], expr: &Spanned<Expr>) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        if let Err(bad_span) = crate::ast::validate_check_expr_shape(expr) {
+            errors.push(
+                err(format!(
+                    "'{}': '@check(...)' a nivel de type solo admite nombres de campo, literales y los operadores \
+                     ==, !=, <, <=, >, >=, &&, ||, !, +, -, *, /, % -- no llamadas, acceso a 'db', closures, índices \
+                     ni literales de struct/enum",
+                    t.name
+                ))
+                .with_span(bad_span),
+            );
+            return errors;
+        }
+        let mut env: Env = HashMap::new();
+        for f in fields {
+            let ty =
+                if t.type_params.is_empty() { self.resolve_type(&f.ty) } else { self.resolve_type_abstract(&f.ty, &t.type_params) };
+            match ty {
+                Ok(ty) => {
+                    env.insert(f.name.clone(), immutable(ty));
+                }
+                Err(e) => {
+                    errors.push(e.with_span(f.name_span));
+                    return errors;
+                }
             }
+        }
+        // Un `Ident` referenciado que no sea un campo de este struct ya lo
+        // rechaza `check_expr`/`synth_expr` con su error normal de "no
+        // declarado" -- no hace falta duplicar esa validación acá.
+        if let Err(e) = self.check_expr(expr, &Type::Bool, &env) {
+            errors.push(e.with_span(t.span));
         }
         errors
     }
@@ -9208,6 +9274,98 @@ type T = { id: Int, s: Status }")
             @unique(a, b)
             @unique(a, c)
             type T = { id: Int, a: Int, b: Int, c: Int }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    // ---- `@check(<expr>)` a nivel de `type` (GRAMMAR.md §3.173) ----
+
+    #[test]
+    fn type_level_check_comparing_two_fields_typechecks() {
+        let src = r#"
+            @check(endDate > startDate)
+            type Booking = { id: Int, startDate: Timestamp, endDate: Timestamp }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn type_level_check_with_and_or_and_arithmetic_typechecks() {
+        let src = r#"
+            @check(discountPrice <= price && (bonus + price) > 0)
+            type Product = { id: Int, price: Int, discountPrice: Int, bonus: Int }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn type_level_check_referencing_an_unknown_field_is_rejected() {
+        let src = r#"
+            @check(endDate > doesNotExist)
+            type Booking = { id: Int, startDate: Timestamp, endDate: Timestamp }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("doesNotExist"), "{msg}");
+    }
+
+    #[test]
+    fn type_level_check_with_mismatched_types_is_rejected() {
+        let src = r#"
+            @check(name > age)
+            type Person = { id: Int, name: String, age: Int }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "comparar String con Int tiene que fallar, mismo criterio que cualquier otro '<'/'>'");
+    }
+
+    #[test]
+    fn type_level_check_that_does_not_typecheck_to_bool_is_rejected() {
+        let src = r#"
+            @check(price + bonus)
+            type Product = { id: Int, price: Int, bonus: Int }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "'@check(...)' de tipo tiene que tipar a Bool, no a Int");
+    }
+
+    #[test]
+    fn type_level_check_calling_a_function_is_rejected() {
+        let src = r#"
+            fn isValid(x: Int) -> Bool { x > 0 }
+            @check(isValid(price))
+            type Product = { id: Int, price: Int }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "una llamada dentro de '@check(...)' de tipo no puede traducirse a un CHECK de SQL -- tiene que rechazarse");
+    }
+
+    #[test]
+    fn type_level_check_accessing_db_is_rejected() {
+        let src = r#"
+            type Order = { id: Int }
+            db { orders: Order[] }
+            @check(db.orders.count() > 0)
+            type Product = { id: Int }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "acceso a 'db' dentro de '@check(...)' de tipo tiene que rechazarse -- no puede evaluarse dentro de un CHECK de SQL");
+    }
+
+    #[test]
+    fn type_level_check_on_a_non_struct_type_is_rejected() {
+        let src = "@check(true) type NotAStruct = Int[];";
+        let result = check_source(src);
+        assert!(result.is_err(), "'@check(...)' sobre un alias que no es struct debe rechazarse");
+    }
+
+    #[test]
+    fn type_level_check_coexists_with_composite_unique_on_the_same_type() {
+        let src = r#"
+            @unique(startDate, room)
+            @check(endDate > startDate)
+            type Booking = { id: Int, room: String, startDate: Timestamp, endDate: Timestamp }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }

@@ -3,6 +3,22 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.128.0] - 2026-08-28
+
+### ✨ Nuevo
+**`@check(<expr>)` a nivel de `type`** -- cierra la mitad "expresión booleana arbitraria" que §3.96 (v1.60.0) había dejado pendiente: una comparación entre DOS campos del propio struct, no solo un rango numérico simple sobre un campo suelto. Complementa, sin reemplazar, el `@check(min/max/range/minLength/maxLength, ...)` de un solo campo ya existente.
+
+```
+@check(endDay > startDay)
+type Booking = { id: Int, room: String, startDay: Int, endDay: Int }
+```
+
+- Acotado a lo que un `CHECK` de SQL puede expresar, no a "cualquier expresión de c-script": `ast::validate_check_expr_shape` rechaza en el checker -- antes de tipar nada -- cualquier forma que no sea identificador/literal/`!`/`-` unario/paréntesis/los operadores `==`/`!=`/`<`/`<=`/`>`/`>=`/`&&`/`||`/`+`/`-`/`*`/`/`/`%`. Ninguna llamada, acceso a `db`, closure, índice ni literal de struct/enum.
+- Enforcement DOBLE, mismo criterio que el resto de `@check`: un `CHECK` real de TABLA (no de columna) en el `CREATE TABLE`, en los dos backends -- Y del lado de la aplicación, en los mismos dos puntos de entrada que el resto de las validaciones (wire y `StructLit` construido en el cuerpo de un rpc). El evaluador de aplicación es chico y autocontenido, pero reusa la misma aritmética/comparación (`checked_*`, NULL-segura) que el resto del intérprete.
+- Un `applyPatch`/`Patch<T>` parcial saltea la expresión completa si le falta cualquier campo que referencia -- generaliza el mismo criterio de "ausente: nada que validar" que `@check` de un solo campo ya aplicaba.
+
+Verificado con 9 tests de checker, 4 de runtime, 1 de DDL estático, 1 contra un Postgres real (acepta/rechaza con 400/rechaza un `INSERT` SQL crudo sin pasar por c-script), y repetición en vivo contra SQLite (`.schema` confirma el `CHECK` real, `sqlite3` rechaza un `INSERT` crudo). Suite completa sin regresiones (1285 tests, +15 sobre v1.127.0). Ver GRAMMAR.md §3.173, PLAN.md §9.3.
+
 ## [1.127.0] - 2026-08-27
 
 ### ✨ Nuevo

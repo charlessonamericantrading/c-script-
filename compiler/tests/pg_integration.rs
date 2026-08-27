@@ -2535,6 +2535,57 @@ service Posts {{ rpc add(title: String) -> Post {{ db.{COLLECTION}.insert(Post {
     assert!(detail.contains("check"), "detalle real del error: {detail:?} (err: {err})");
 }
 
+/// GRAMMAR.md §3.173: `@check(<expr>)` de nivel `type` -- una expresión
+/// booleana comparando DOS campos entre sí, traducida a un `CHECK` real de
+/// tabla en Postgres. Confirma tres cosas a la vez: el servidor real acepta
+/// una fila válida, el servidor real rechaza una inválida con 400 (mismo
+/// fix de clasificación por SQLSTATE que el resto de `@check`/`@unique`), y
+/// -- lo que confirma que el CHECK vive de verdad en la base, no solo en la
+/// aplicación -- un `INSERT` SQL crudo que viola el mismo constraint se
+/// rechaza sin pasar por c-script en absoluto.
+#[test]
+fn a_type_level_check_constraint_is_enforced_for_real_against_postgres() {
+    const COLLECTION: &str = "bookings_type_level_check";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("type-level-check-constraint");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+@check(endDay > startDay)
+type Booking = {{ id: Int, startDay: Int, endDay: Int }}
+db {{ {COLLECTION}: Booking[] }}
+service Bookings {{
+  rpc add(startDay: Int, endDay: Int) -> Booking {{
+    db.{COLLECTION}.insert(Booking {{ id: 0, startDay: startDay, endDay: endDay }})
+  }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    let ok = server.rpc("Bookings/add", r#"{"startDay":1,"endDay":5}"#);
+    assert_eq!(ok["startDay"], 1);
+
+    let failed = server.try_rpc("Bookings/add", r#"{"startDay":5,"endDay":1}"#);
+    let msg = failed.expect_err("endDay <= startDay tiene que rechazarse");
+    assert!(msg.contains("devolvió 400"), "el status real tiene que ser 400, no 500: {msg}");
+    drop(server);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let raw_insert =
+        client.execute(&format!("INSERT INTO \"{COLLECTION}\" (\"startDay\", \"endDay\") VALUES (9, 3)"), &[]);
+    let err = raw_insert.expect_err("un INSERT crudo que viola @check(endDay > startDay) debe rechazarse a nivel de Postgres, sin pasar por Rust");
+    let detail = err.as_db_error().map(|db| db.message().to_lowercase()).unwrap_or_default();
+    assert!(detail.contains("check"), "detalle real del error: {detail:?} (err: {err})");
+}
+
 /// Bug real, encontrado verificando a mano `@unique` COMPUESTO (GRAMMAR.md
 /// §3.155) contra Postgres real -- pero preexistente, afecta también al
 /// `@unique` de un solo campo (§3.80) que ya estaba shippeado: una

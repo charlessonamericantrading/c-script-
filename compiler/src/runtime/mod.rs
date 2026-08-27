@@ -684,6 +684,16 @@ pub(crate) fn eval_expr(
             if let Some(fs) = ast_fields {
                 apply_field_validators(fs, &Value::Struct(evaluated.clone()), name)?;
             }
+            // GRAMMAR.md §3.173: `@check(<expr>)` de nivel type -- solo
+            // aplica cuando ESTE literal es un struct puro (`variant:
+            // None`); `checker.types` (adentro de `apply_type_level_checks`)
+            // no tiene entradas para un enum de todos modos, así que llamar
+            // siempre acá sería un no-op inofensivo para `Some(v)`, pero
+            // ser explícito documenta la intención sin depender de ese
+            // detalle.
+            if variant.is_none() {
+                apply_type_level_checks(checker, name, &Value::Struct(evaluated.clone()), name)?;
+            }
             match variant {
                 Some(v) => {
                     Ok(Value::Variant { enum_name: name.clone(), variant: v.clone(), fields: evaluated })
@@ -3399,6 +3409,7 @@ pub(crate) fn json_to_typed_value(
                 if let Some(ast_fields) = field_annotations_for(checker, n, None) {
                     apply_field_validators(ast_fields, &v, path)?;
                 }
+                apply_type_level_checks(checker, n, &v, path)?;
             }
             Ok(v)
         }
@@ -3440,6 +3451,7 @@ pub(crate) fn json_to_typed_value(
                 if let Some(ast_fields) = field_annotations_for(checker, n, None) {
                     apply_field_validators(ast_fields, &v, path)?;
                 }
+                apply_type_level_checks(checker, n, &v, path)?;
             }
             Ok(v)
         }
@@ -3584,6 +3596,115 @@ fn apply_field_validators(ast_fields: &[Field], value: &Value, path: &str) -> Re
         }
     }
     Ok(())
+}
+
+/// `@check(<expr>)` de nivel `type` (GRAMMAR.md §3.173) -- mismos DOS
+/// puntos de entrada que `apply_field_validators` arriba (wire y
+/// `StructLit` construido en el cuerpo de un rpc/`applyPatch`), pero
+/// operando sobre TODOS los campos que la expresión referencia a la vez,
+/// no campo por campo. Un valor PARCIAL (un patch nunca trae todos los
+/// campos) simplemente SALTEA una expresión completa si le falta CUALQUIER
+/// campo que referencia -- generaliza el mismo criterio de "ausente: nada
+/// que validar" que `apply_field_validators` ya aplica campo por campo.
+fn apply_type_level_checks(checker: &Checker, type_name: &str, value: &Value, path: &str) -> Result<(), RuntimeError> {
+    let Value::Struct(entries) = value else { return Ok(()) };
+    let Some(decl) = checker.types.get(type_name) else { return Ok(()) };
+    for ann in &decl.annotations {
+        let TypeAnnotation::Check(expr) = ann else { continue };
+        if !check_expr_fields_present(&expr.node, entries) {
+            continue;
+        }
+        match eval_check_expr(&expr.node, entries)? {
+            Value::Bool(true) => {}
+            Value::Bool(false) => {
+                return Err(bad_req(format!("'{path}': no cumple una restricción '@check(...)' de tipo (GRAMMAR.md §3.173)")))
+            }
+            other => unreachable!("el checker ya garantizó que '@check(...)' de tipo tipa a Bool, no {other:?}"),
+        }
+    }
+    Ok(())
+}
+
+/// ¿Están presentes en `entries` TODOS los campos que `expr` referencia?
+/// (Ver `apply_type_level_checks` -- un valor parcial no alcanza para
+/// evaluar una expresión que necesita un campo ausente.)
+fn check_expr_fields_present(expr: &Expr, entries: &[(String, Value)]) -> bool {
+    match expr {
+        Expr::Ident(name) => entries.iter().any(|(n, _)| n == name),
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
+        Expr::Paren(inner) => check_expr_fields_present(&inner.node, entries),
+        Expr::Unary { operand, .. } => check_expr_fields_present(&operand.node, entries),
+        Expr::Binary { left, right, .. } => {
+            check_expr_fields_present(&left.node, entries) && check_expr_fields_present(&right.node, entries)
+        }
+        // `ast::validate_check_expr_shape` ya garantizó que ninguna otra
+        // forma llegue hasta acá.
+        _ => false,
+    }
+}
+
+/// Evalúa la expresión de un `@check(<expr>)` de nivel `type` (GRAMMAR.md
+/// §3.173) contra los valores YA PRESENTES de una fila -- evaluador chico y
+/// autocontenido (sin `db`/`fns`/`sessions`/`step_budget`: el shape que
+/// `ast::validate_check_expr_shape` restringió en compilación nunca puede
+/// necesitar ninguno de esos -- ni una llamada, ni acceso a `db`, ni un
+/// closure) que de todos modos REUSA la MISMA aritmética/comparación que
+/// el intérprete general (`checked_int_numeric_op`/`compare`/`as_bool`/
+/// `div_or_rem_overflow_message`), para no mantener una segunda copia de
+/// esas reglas (desborde, NULL-seguridad de `==`, etc.) por separado.
+fn eval_check_expr(expr: &Expr, entries: &[(String, Value)]) -> Result<Value, RuntimeError> {
+    match expr {
+        Expr::Ident(name) => entries.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone()).ok_or_else(|| {
+            err(format!("'@check(...)' de tipo: campo '{name}' no encontrado -- bug interno, ya debería haberse salteado"))
+        }),
+        Expr::Int(n) => Ok(Value::Int(*n)),
+        Expr::Float(x) => Ok(Value::Float(*x)),
+        Expr::Str(s) => Ok(Value::Str(s.clone())),
+        Expr::Bool(b) => Ok(Value::Bool(*b)),
+        Expr::Null => Ok(Value::Null),
+        Expr::Paren(inner) => eval_check_expr(&inner.node, entries),
+        Expr::Unary { op: UnaryOp::Not, operand } => Ok(Value::Bool(!as_bool(&eval_check_expr(&operand.node, entries)?)?)),
+        Expr::Unary { op: UnaryOp::Neg, operand } => match eval_check_expr(&operand.node, entries)? {
+            Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| err(format!("desborde aritmético al negar {n}"))),
+            Value::Int64(n) => n.checked_neg().map(Value::Int64).ok_or_else(|| err(format!("desborde aritmético al negar {n}"))),
+            Value::Float(n) => Ok(Value::Float(-n)),
+            other => Err(err(format!("'-' unario requiere Int, Int64 o Float en '@check(...)' de tipo: {other:?}"))),
+        },
+        Expr::Binary { op, left, right } => {
+            let l = eval_check_expr(&left.node, entries)?;
+            let r = eval_check_expr(&right.node, entries)?;
+            match op {
+                BinaryOp::And => Ok(Value::Bool(as_bool(&l)? && as_bool(&r)?)),
+                BinaryOp::Or => Ok(Value::Bool(as_bool(&l)? || as_bool(&r)?)),
+                BinaryOp::Eq => Ok(Value::Bool(l == r)),
+                BinaryOp::NotEq => Ok(Value::Bool(l != r)),
+                BinaryOp::Lt => compare(l, r, |o| o == std::cmp::Ordering::Less),
+                BinaryOp::LtEq => compare(l, r, |o| o != std::cmp::Ordering::Greater),
+                BinaryOp::Gt => compare(l, r, |o| o == std::cmp::Ordering::Greater),
+                BinaryOp::GtEq => compare(l, r, |o| o != std::cmp::Ordering::Less),
+                BinaryOp::Add => match (l, r) {
+                    (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
+                    (l, r) => checked_int_numeric_op(l, r, i64::checked_add, |a, b| a + b, |a, b| {
+                        err(format!("desborde aritmético al sumar {a} y {b}"))
+                    }),
+                },
+                BinaryOp::Sub => checked_int_numeric_op(l, r, i64::checked_sub, |a, b| a - b, |a, b| {
+                    err(format!("desborde aritmético al restar {b} de {a}"))
+                }),
+                BinaryOp::Mul => checked_int_numeric_op(l, r, i64::checked_mul, |a, b| a * b, |a, b| {
+                    err(format!("desborde aritmético al multiplicar {a} por {b}"))
+                }),
+                BinaryOp::Div => checked_int_numeric_op(l, r, i64::checked_div, |a, b| a / b, |a, b| div_or_rem_overflow_message("dividir", a, b)),
+                BinaryOp::Rem => {
+                    checked_int_numeric_op(l, r, i64::checked_rem, |a, b| a % b, |a, b| div_or_rem_overflow_message("calcular el resto de", a, b))
+                }
+                // `ast::validate_check_expr_shape` ya filtra a estos trece --
+                // cualquier otro operador (`??`) nunca llega hasta acá.
+                other => unreachable!("operador no pusheable en @check de tipo: {other:?}"),
+            }
+        }
+        other => unreachable!("forma no pusheable en @check de tipo: {other:?}"),
+    }
 }
 
 /// Forma general de un email (GRAMMAR.md §3.73 "Límites honestos") -- NO
@@ -5426,6 +5547,131 @@ mod tests {
 
         let too_low = invoke_rpc(&program, "S", "add", &json!({"rating": 0}), &db).expect_err("0 está fuera de [1,5]");
         assert_eq!(too_low.kind, ErrorKind::BadRequest, "{too_low}");
+    }
+
+    /// GRAMMAR.md §3.173: `@check(<expr>)` de nivel type -- una comparación
+    /// entre DOS campos rechazada del lado de la aplicación, mismo camino
+    /// (`Expr::StructLit`) que ejercita `check_range_rejects_a_value_outside_the_declared_bounds`
+    /// arriba, pero para el `@check` de tipo en vez del de un solo campo.
+    #[test]
+    fn type_level_check_comparing_two_fields_rejects_an_invalid_row() {
+        let program = program_from(
+            r#"
+            @check(endDay > startDay)
+            type Booking = { id: Int, startDay: Int, endDay: Int }
+            db { bookings: Booking[] }
+            service S {
+                rpc add(startDay: Int, endDay: Int) -> Booking {
+                    db.bookings.insert(Booking { id: 0, startDay: startDay, endDay: endDay })
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        let ok = invoke_rpc(&program, "S", "add", &json!({"startDay": 1, "endDay": 5}), &db).unwrap();
+        assert_eq!(ok["startDay"], json!(1));
+
+        let bad = invoke_rpc(&program, "S", "add", &json!({"startDay": 5, "endDay": 5}), &db).expect_err("endDay == startDay no es > ");
+        assert_eq!(bad.kind, ErrorKind::BadRequest, "{bad}");
+        assert!(bad.message.contains("@check"), "{bad}");
+
+        let bad2 = invoke_rpc(&program, "S", "add", &json!({"startDay": 9, "endDay": 3}), &db).expect_err("endDay < startDay");
+        assert_eq!(bad2.kind, ErrorKind::BadRequest, "{bad2}");
+    }
+
+    /// GRAMMAR.md §3.173: lo mismo que el test de arriba, pero recibiendo
+    /// el struct COMPLETO por el wire (`json_to_typed_value`, el otro punto
+    /// de entrada de `apply_type_level_checks` -- un rpc que toma el tipo
+    /// entero como parámetro, no uno que lo arma campo por campo adentro
+    /// del cuerpo).
+    #[test]
+    fn type_level_check_rejects_an_invalid_row_received_whole_over_the_wire() {
+        let program = program_from(
+            r#"
+            @check(endDay > startDay)
+            type Booking = { id: Int, startDay: Int, endDay: Int }
+            service S {
+                rpc validate(b: Booking) -> Booking { b }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        let ok = invoke_rpc(&program, "S", "validate", &json!({"b": {"id": 1, "startDay": 1, "endDay": 5}}), &db).unwrap();
+        assert_eq!(ok["startDay"], json!(1));
+
+        let bad = invoke_rpc(&program, "S", "validate", &json!({"b": {"id": 1, "startDay": 5, "endDay": 1}}), &db)
+            .expect_err("endDay < startDay recibido por el wire tiene que rechazarse igual que construido en el cuerpo");
+        assert_eq!(bad.kind, ErrorKind::BadRequest, "{bad}");
+    }
+
+    /// GRAMMAR.md §3.173: un `applyPatch` PARCIAL que no toca NINGUNO de
+    /// los dos campos que `@check(...)` referencia tiene que pasar sin
+    /// evaluar la expresión (mismo criterio de "ausente: nada que validar"
+    /// que ya usa `@check` de un solo campo) -- ni falso rechazo, ni
+    /// evaluarla contra un campo que no está.
+    #[test]
+    fn type_level_check_is_skipped_for_a_patch_that_does_not_touch_either_referenced_field() {
+        let program = program_from(
+            r#"
+            @check(endDay > startDay)
+            type Booking = { id: Int, room: String, startDay: Int, endDay: Int }
+            type NewBooking = { room: String, startDay: Int, endDay: Int }
+            db { bookings: Booking[] }
+            service S {
+                rpc add(room: String, startDay: Int, endDay: Int) -> Booking {
+                    db.bookings.insert(NewBooking { room: room, startDay: startDay, endDay: endDay })
+                }
+                rpc renameRoom(id: Int, patch: Patch<Booking>) -> Booking {
+                    db.bookings.applyPatch(id, patch)
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "add", &json!({"room": "A", "startDay": 1, "endDay": 5}), &db).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        // Renombra la sala sin tocar startDay/endDay -- el patch parcial
+        // (recibido por el wire, `Type::PatchOf`) no trae ninguno de los dos
+        // campos que la expresión necesita, así que tiene que pasar sin
+        // evaluarla, no rechazarse ni reventar.
+        let patched = invoke_rpc(&program, "S", "renameRoom", &json!({"id": id, "patch": {"room": "B"}}), &db).unwrap();
+        assert_eq!(patched["room"], json!("B"));
+        assert_eq!(patched["startDay"], json!(1));
+        assert_eq!(patched["endDay"], json!(5));
+    }
+
+    /// Complementa el test de arriba: un `applyPatch` que sí trae LOS DOS
+    /// campos referenciados (aunque no traiga `room`) tiene que evaluarse de
+    /// verdad -- confirma que "salteado si falta un campo" no se volvió
+    /// "salteado siempre" por accidente.
+    #[test]
+    fn type_level_check_still_applies_to_a_patch_that_touches_both_referenced_fields() {
+        let program = program_from(
+            r#"
+            @check(endDay > startDay)
+            type Booking = { id: Int, room: String, startDay: Int, endDay: Int }
+            type NewBooking = { room: String, startDay: Int, endDay: Int }
+            db { bookings: Booking[] }
+            service S {
+                rpc add(room: String, startDay: Int, endDay: Int) -> Booking {
+                    db.bookings.insert(NewBooking { room: room, startDay: startDay, endDay: endDay })
+                }
+                rpc reschedule(id: Int, patch: Patch<Booking>) -> Booking {
+                    db.bookings.applyPatch(id, patch)
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "add", &json!({"room": "A", "startDay": 1, "endDay": 5}), &db).unwrap();
+        let id = created["id"].as_i64().unwrap();
+
+        let bad = invoke_rpc(&program, "S", "reschedule", &json!({"id": id, "patch": {"startDay": 9, "endDay": 3}}), &db)
+            .expect_err("el patch trae los dos campos -- tiene que evaluarse y rechazarse");
+        assert_eq!(bad.kind, ErrorKind::BadRequest, "{bad}");
     }
 
     #[test]

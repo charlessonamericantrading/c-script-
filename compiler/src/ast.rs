@@ -133,6 +133,61 @@ pub enum TypeAnnotation {
     /// arriba (el checker rechaza menos de 2). Identificadores sueltos,
     /// mismo criterio sintáctico que `Annotation::Invalidates`.
     Unique(Vec<String>),
+    /// `@check(<expr>)` (GRAMMAR.md §3.173): la mitad "expresión booleana
+    /// arbitraria" de `@check` que §3.96 había dejado pendiente --
+    /// complementa, nunca reemplaza, el `@check(min/max/range/minLength/
+    /// maxLength, ...)` de un solo campo ya existente
+    /// (`FieldAnnotation::Check`). `<expr>` referencia campos del propio
+    /// struct por nombre PELADO (`endDate > startDate`, sin `self.`/prefijo
+    /// -- no hay ningún parámetro que bindear, a diferencia de un closure
+    /// de `findWhere`/etc.), sin evaluar todavía: el checker
+    /// (`check_type_level_check_expr`) la tipa contra `Bool` y valida que
+    /// solo use el subconjunto de la gramática que un `CHECK` de SQL puede
+    /// expresar (identificadores/literales/aritmética/comparación/lógica --
+    /// nunca una llamada, acceso a `db`, closure ni campo de otro struct).
+    Check(Spanned<Expr>),
+}
+
+/// Valida que un `@check(<expr>)` de nivel `type` (GRAMMAR.md §3.173) use
+/// SOLO el subconjunto de la gramática que un `CHECK` de SQL puede
+/// expresar -- identificadores, literales (incluido `null`), `!`/`-`
+/// unario, agrupación con paréntesis, y los operadores binarios
+/// `==`/`!=`/`<`/`<=`/`>`/`>=`/`&&`/`||`/`+`/`-`/`*`/`/`/`%`. `Err(span)`
+/// con el span del primer nodo NO permitido (una llamada, un acceso a
+/// `db.<c>`, un closure, un índice, un literal de struct/enum, `match`/
+/// `if`/`transaction`, `??`) -- ninguna de esas formas puede evaluarse
+/// dentro de un `CHECK` de SQL (`runtime::db::type_check_expr_sql` solo
+/// sabe traducir lo que esta función ya validó), así que dejarlas pasar
+/// haría que el checker aceptara una anotación que después no tiene forma
+/// de generar SQL para ella.
+pub fn validate_check_expr_shape(expr: &Spanned<Expr>) -> Result<(), Span> {
+    match &expr.node {
+        Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Ident(_) => Ok(()),
+        Expr::Paren(inner) => validate_check_expr_shape(inner),
+        Expr::Unary { op: UnaryOp::Not | UnaryOp::Neg, operand } => validate_check_expr_shape(operand),
+        Expr::Binary { op, left, right }
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+                    | BinaryOp::And
+                    | BinaryOp::Or
+                    | BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem
+            ) =>
+        {
+            validate_check_expr_shape(left)?;
+            validate_check_expr_shape(right)
+        }
+        _ => Err(expr.span),
+    }
 }
 
 #[derive(Debug, Clone)]

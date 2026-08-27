@@ -353,10 +353,11 @@ impl Parser {
         Ok(TypeDecl { name, type_params, ty, annotations, span })
     }
 
-    /// `@unique(campo1, campo2, ...)` antes de `type` (GRAMMAR.md §3.155) --
-    /// mismo loop de coma que `@invalidates` (`parse_optional_annotation`),
-    /// pero en un punto de entrada APARTE porque vive antes de un ítem de
-    /// nivel superior, no antes de `rpc`/`stream` dentro de un `service`.
+    /// `@unique(campo1, campo2, ...)`/`@check(<expr>)` antes de `type`
+    /// (GRAMMAR.md §3.155/§3.173) -- mismo loop de coma que `@invalidates`
+    /// (`parse_optional_annotation`) para `@unique`, pero en un punto de
+    /// entrada APARTE porque vive antes de un ítem de nivel superior, no
+    /// antes de `rpc`/`stream` dentro de un `service`.
     fn parse_type_annotations(&mut self) -> Result<Vec<TypeAnnotation>, ParseError> {
         let mut annotations = Vec::new();
         while self.check(&TokenKind::At) {
@@ -373,9 +374,22 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     TypeAnnotation::Unique(fields)
                 }
+                // `@check(<expr>)` (GRAMMAR.md §3.173) -- `parse_or_expr`
+                // directo, no `parse_expr`: excluye a propósito `match`/
+                // `if`/`transaction`/`??`, ninguno de los cuales tiene
+                // sentido como restricción estática traducible a un `CHECK`
+                // de SQL. `no_struct_lit: false` porque estar adentro de
+                // `(...)` ya resuelve la ambigüedad de struct-lit (mismo
+                // criterio que cualquier lista de argumentos).
+                "check" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let expr = self.parse_or_expr(false)?;
+                    self.eat(&TokenKind::RParen)?;
+                    TypeAnnotation::Check(expr)
+                }
                 other => {
                     return Err(self.error(format!(
-                        "'@{other}' no es una anotación válida antes de 'type' -- la única disponible hoy es '@unique(campo1, campo2, ...)'"
+                        "'@{other}' no es una anotación válida antes de 'type' -- las disponibles hoy son '@unique(campo1, campo2, ...)' y '@check(<expr>)'"
                     )))
                 }
             };
