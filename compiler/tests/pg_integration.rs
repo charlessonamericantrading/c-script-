@@ -2687,6 +2687,20 @@ service Products {{
 /// reales insertadas por un `linkc serve` real, `@softDelete` no filtrado
 /// (mismo criterio que `db.tableStats()`), y una colección declarada que
 /// nunca llegó a tener tabla física reportada como "no existe todavía".
+///
+/// Bug real en el DISEÑO de este mismo test, encontrado por CI (no en
+/// desarrollo local, sin Postgres a mano en ese momento): la primera
+/// versión declaraba las DOS colecciones en el MISMO `.link` que
+/// `Serve::start` corría -- pero `linkc serve` crea la tabla física de
+/// TODA colección declarada al conectar (`new_with_options`/
+/// `connect_postgres_with_options`, GRAMMAR.md §3.17), sin importar si
+/// algún `rpc` la usa. "Nunca la toca ningún rpc" NO es lo mismo que "la
+/// tabla no existe" -- para lograr esto último de verdad hacen falta DOS
+/// `.link` DISTINTOS contra la MISMA base: uno más chico que `Serve::start`
+/// sirve de verdad (solo crea SU tabla), y uno más grande (con una
+/// colección de más) que `linkc db inspect` -- que nunca ejecuta DDL --
+/// usa para leer. Documentado acá para que nadie repita el mismo error de
+/// diseño de test.
 #[test]
 fn db_inspect_reports_real_row_counts_against_postgres() {
     const COLLECTION: &str = "items_db_inspect";
@@ -2699,13 +2713,14 @@ fn db_inspect_reports_real_row_counts_against_postgres() {
     reset_schema(&url, "orders_db_inspect_never_created");
 
     let temp = TempDir::new("db-inspect");
-    let link = temp.write(
-        "app.link",
+    // Solo declara "items" -- lo único que `Serve::start` va a crear de
+    // verdad al conectar.
+    let served_link = temp.write(
+        "served.link",
         &format!(
             r#"
 type Item = {{ id: Int, name: String, @softDelete deletedAt: Timestamp? = null }}
-type NeverCreated = {{ id: Int, x: Int }}
-db {{ {COLLECTION}: Item[], orders_db_inspect_never_created: NeverCreated[] }}
+db {{ {COLLECTION}: Item[] }}
 service Items {{
   rpc add(name: String) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, name: name }}) }}
   rpc remove(id: Int) -> Bool {{ db.{COLLECTION}.delete(id) }}
@@ -2713,16 +2728,33 @@ service Items {{
 "#
         ),
     );
-    // Arranca el servicio real para que la tabla de "items" exista de
-    // verdad -- la de "NeverCreated" nunca se toca, así que su tabla nunca
-    // se crea (mismo caso "no existe todavía" que el test de SQLite).
-    let server = Serve::start(&link, &url);
+    let server = Serve::start(&served_link, &url);
     server.rpc("Items/add", r#"{"name":"a"}"#);
     let created = server.rpc("Items/add", r#"{"name":"b"}"#);
     server.rpc("Items/remove", &format!(r#"{{"id":{}}}"#, created["id"]));
     drop(server);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("db").arg("inspect").arg(&link).env("LINK_DATABASE_URL", &url).output().expect("ejecutar linkc db inspect");
+    // Este SEGUNDO .link declara una colección de más -- `linkc db
+    // inspect`, a diferencia de `linkc serve`, nunca ejecuta DDL, así que
+    // inspeccionar CON este archivo contra la MISMA base no crea la tabla
+    // que le falta; solo la reporta como ausente.
+    let inspect_link = temp.write(
+        "inspect.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String, @softDelete deletedAt: Timestamp? = null }}
+type NeverCreated = {{ id: Int, x: Int }}
+db {{ {COLLECTION}: Item[], orders_db_inspect_never_created: NeverCreated[] }}
+"#
+        ),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("db")
+        .arg("inspect")
+        .arg(&inspect_link)
+        .env("LINK_DATABASE_URL", &url)
+        .output()
+        .expect("ejecutar linkc db inspect");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout.contains(COLLECTION) && stdout.contains("2 fila(s)"), "{stdout}");
