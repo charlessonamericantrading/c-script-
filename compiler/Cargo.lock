@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "linkc"
-version = "1.130.0"
+version = "1.131.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",

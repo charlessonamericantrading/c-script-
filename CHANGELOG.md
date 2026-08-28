@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.131.0] - 2026-08-28
+
+### 🔧 Proceso
+Sin cambios de código de producción sobre v1.130.0 -- ese tag quedó con CI en rojo por un bug real en el DISEÑO de un test, no en el binario. `db_inspect_reports_real_row_counts_against_postgres` (`pg_integration.rs`) declaraba dos colecciones en el MISMO `.link` que `Serve::start` corría, asumiendo que una colección que ningún `rpc` toca no tendría tabla física -- pero `linkc serve` crea la tabla de TODA colección declarada al conectar (`new_with_options`/`connect_postgres_with_options`, GRAMMAR.md §3.17), sin importar si algún `rpc` la usa. Fix: dos `.link` distintos contra la misma base -- uno más chico que `Serve::start` sirve de verdad, y uno más grande (con una colección de más) que `linkc db inspect` -- que nunca ejecuta DDL -- usa para leer. Confirmado en vivo contra Postgres real antes de este commit. v1.130.0 queda en el historial con CI rojo mencionado acá para que quede claro por qué; su código de producción es idéntico al de v1.131.0. Ver v1.130.0 para el changelog real de esta ronda (`linkc db inspect`).
+
 ## [1.130.0] - 2026-08-28
 
 ### ✨ Nuevo
