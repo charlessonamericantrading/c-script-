@@ -196,6 +196,7 @@
   - [3.172 Varios `db { ... }`, uno por módulo, se fusionan en un solo namespace de colecciones — RESUELTO, cierra el último hueco de §3.161 (Pilar 3 del roadmap de skynet-d3)](#3172-varios-db--uno-por-módulo-se-fusionan-en-un-solo-namespace-de-colecciones--resuelto-cierra-el-último-hueco-de-3161-pilar-3-del-roadmap-de-skynet-d3)
   - [3.173 `@check(<expr>)` a nivel de `type` — RESUELTO, cierra la mitad "expresión booleana arbitraria" que §3.96 había dejado pendiente](#3173-checkexpr-a-nivel-de-type--resuelto-cierra-la-mitad-expresión-booleana-arbitraria-que-396-había-dejado-pendiente)
   - [3.174 `@unique(...) where <expr>`: la mitad CONDICIONAL de §3.155 — RESUELTO](#3174-uniquewhereexpr-la-mitad-condicional-de-3155--resuelto)
+  - [3.175 `linkc db inspect`: primera pieza de la suite de administración de datos — RESUELTO PARCIAL](#3175-linkc-db-inspect-primera-pieza-de-la-suite-de-administración-de-datos--resuelto-parcial)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6525,6 +6526,40 @@ type Appointment = { id: Int, userId: Int, appointmentDate: String, startTime: S
 **El dedup de redundancia ahora es por `(conjunto de campos, condición)`, no solo por conjunto de campos.** Dos `@unique` con los MISMOS campos pero condiciones DISTINTAS (o uno con condición y otro sin) son dos constraints PARCIALES legítimos y distintos -- ya NO se rechazan como redundantes (antes de esta ronda, esa combinación ni siquiera podía expresarse). El mismo conjunto Y la misma condición sí siguen siendo redundantes, igual que antes.
 
 **Verificado**: 7 tests de checker (`checker.rs`) -- el caso real de Glowapp tipa limpio; la condición referenciando un campo inexistente rechazada; una llamada dentro de la condición rechazada; la condición que no tipa a `Bool` rechazada; dos `@unique` con los mismos campos pero condiciones DISTINTAS conviven; el MISMO conjunto Y la MISMA condición sí se rechazan por redundante; un `@unique` condicional y uno sin condición sobre el mismo conjunto conviven. 1 test contra SQLite real (`runtime/mod.rs`) reproduciendo el caso exacto de Glowapp: el mismo horario "confirmed" repetido se rechaza, el mismo horario "cancelled" se acepta (la fila existente queda afuera del índice parcial). 1 test de DDL estático (`postgres_emit.rs`) confirmando el `CREATE UNIQUE INDEX` parcial exacto en el SQL que `linkc build` emite. 1 test contra un Postgres real (`pg_integration.rs`) reproduciendo el mismo caso de Glowapp de punta a punta por HTTP real. Más repetición en vivo contra un `linkc serve` real con SQLite: `.schema` confirma el índice único parcial real (`... WHERE ("status" != 'cancelled')`), y las tres llamadas HTTP reales (booking inicial, choque con 400, reuso tras cancelar con 200) confirman el comportamiento de punta a punta. Suite completa sin regresiones (1295 tests, +10 sobre v1.128.0).
+
+---
+
+### 3.175 `linkc db inspect`: primera pieza de la suite de administración de datos — RESUELTO PARCIAL
+
+PLAN.md §9.7 ítem 2 pedía una suite completa (`inspect`/`shell`/`export`/`import`/`seed`) -- esta ronda ataca solo la primera pieza, la más chica y de mayor valor inmediato: un diagnóstico de solo lectura de qué colecciones existen FÍSICAMENTE y cuántas filas tienen, sin ejecutar ningún DDL. `shell`/`export`/`import`/`seed` quedan explícitamente para rondas futuras.
+
+<!-- linkc:check -->
+```rust
+type Item = { id: Int, name: String }
+db { items: Item[] }
+service Items { rpc add(name: String) -> Item { db.items.insert(Item { id: 0, name: name }) } }
+```
+
+```
+$ linkc db inspect app.link --db app.db
+linkc db inspect -- 'app.link' contra SQLite embebido en 'app.db'
+
+  items       2 columna(s) declaradas  1 fila(s)
+
+1 colección(es) declaradas, 0 sin crear todavía, 1 fila(s) en total
+```
+
+**Mismo espíritu de solo lectura que `linkc doctor`/`linkc migrate --dry-run`, y reusa el mismo `resolve_db_source` (`--db`/`LINK_DATABASE_URL`) que esos dos y `linkc serve`.** `src/inspect.rs`, módulo nuevo detrás del feature `runtime` (mismo motivo que `migrate`/`introspect`: habla SQLite/PostgreSQL de verdad, no puede vivir en el build wasm32 del playground). Reusa DOS funciones ya existentes en vez de duplicar introspección: `sqlite_table_exists` (`runtime/db.rs`, antes privada de ese módulo) y `existing_columns` (`migrate.rs`, antes privada) -- las dos solo necesitaron subir de visibilidad a `pub(crate)`, sin ningún cambio de comportamiento.
+
+**"Existe" vs. "no existe" nunca es ambiguo con "existe pero está vacía".** `exists: false` implica `row_count: None`, nunca `Some(0)` -- un checkout fresco antes del primer `linkc serve` reporta cada colección declarada como "no existe todavía", no como "0 filas" (que sugeriría que la tabla ya está ahí, solo sin datos).
+
+**El conteo es FÍSICO, sin filtrar `@softDelete` -- mismo criterio que `db.tableStats()` (§3.151), a propósito distinto de `count()`.** Una fila soft-deleteada sigue contando: el punto de `inspect` es ver qué hay de verdad en el disco, no lo que un `rpc` normal vería a través del filtro de aplicación.
+
+**SQLite: `Connection::open_with_flags(..., SQLITE_OPEN_READ_ONLY)`** -- la intención de solo-lectura queda expresada en el flag de apertura, no solo en qué SQL se manda. Un archivo `.db` inexistente NUNCA es un error -- es exactamente el caso "ninguna colección creada todavía", el mismo que un checkout fresco antes de arrancar `linkc serve` por primera vez.
+
+**Verificado**: 5 tests de CLI contra el binario real (`cli_db_inspect.rs`) -- una base SQLite inexistente reporta cada colección como no creada; una base REAL poblada por un `linkc serve` real (no un archivo armado a mano) reporta las filas reales, confirmando que una fila soft-deleteada sigue contando; sin argumentos da un error de uso limpio; un sub-subcomando desconocido (`db shell`, todavía no implementado) también; una URL de Postgres inalcanzable falla limpio y rápido, sin colgarse ni entrar en pánico. 1 test contra un Postgres real (`pg_integration.rs`) -- filas reales insertadas por un `linkc serve` real contra Postgres, una colección declarada pero nunca creada reportada como "no existe todavía" en vez de "0 filas".
+
+**Sigue pendiente, PLAN.md §9.7 ítem 2**: `linkc db shell` (REPL de solo lectura), `linkc db export`/`import` (entre entornos o motores), `linkc db seed` (poblar una base nueva desde un fichero) -- cada uno queda para su propia ronda.
 
 ---
 

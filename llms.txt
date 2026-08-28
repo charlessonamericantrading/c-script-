@@ -324,6 +324,7 @@ linkc dev backend.link src/gen 8787  # rebuild and restart on change
 linkc introspect postgres://... > main.link  # generate a starting .link from an existing PostgreSQL schema
 linkc migrate backend.link --db postgres://... --dry-run  # show the exact DDL 'linkc serve' would run, without running it
 linkc doctor backend.link --db postgres://...  # environment diagnostics before a deployment: version, parse/typecheck, write permission, read-only DB connectivity
+linkc db inspect backend.link --db postgres://...  # read-only: which declared collections physically exist, and their real row counts -- no DDL
 linkc serve backend.link 8787 --adopt-existing  # never touch DDL; assume every table already exists
 linkc serve backend.link 8787 --host 127.0.0.1  # bind loopback only, not 0.0.0.0
 linkc serve backend.link 8787 --max-body-bytes 1000000  # cap request bodies at 1 MB (default 10 MiB)
@@ -335,7 +336,7 @@ linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json
 linkc serve-all ./services --port-base 3000 --port-registry ./services/ports.json  # same shape, but read back first -- a name keeps its port forever
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
 linkc serve-all ./services --port-base 3000 --service-api-key s3cr3t --service-api-key-exempt webhooks  # every service but "webhooks" requires the header
-linkc --version                      # linkc 1.129.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.130.0 -- same version stamped in every generated file
 ```
 
 ## Verified example

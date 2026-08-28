@@ -599,7 +599,7 @@ fn check_schema_matches(connection: &Connection, collection: &str, columns: &[Co
 /// eso para decir "recién la creó el `CREATE TABLE IF NOT EXISTS` de arriba
 /// en esta misma llamada", que en modo adopción es justo el caso que NO
 /// puede pasar: acá nunca se ejecuta ese `CREATE TABLE`).
-fn sqlite_table_exists(connection: &Connection, collection: &str) -> bool {
+pub(crate) fn sqlite_table_exists(connection: &Connection, collection: &str) -> bool {
     connection
         .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1", [collection], |_| Ok(()))
         .is_ok()

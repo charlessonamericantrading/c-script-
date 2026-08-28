@@ -3,6 +3,27 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.130.0] - 2026-08-28
+
+### ✨ Nuevo
+**`linkc db inspect <archivo.link> [--db <url|archivo>]`** -- primera pieza de la suite de administración de datos (PLAN.md §9.7 ítem 2): un diagnóstico de SOLO LECTURA de qué colecciones declaradas existen físicamente y cuántas filas tienen, sin ejecutar ningún DDL.
+
+```
+$ linkc db inspect app.link --db app.db
+linkc db inspect -- 'app.link' contra SQLite embebido en 'app.db'
+
+  items       2 columna(s) declaradas  1 fila(s)
+
+1 colección(es) declaradas, 0 sin crear todavía, 1 fila(s) en total
+```
+
+- Mismo espíritu de solo lectura que `linkc doctor`/`linkc migrate --dry-run` -- reusa el mismo `resolve_db_source` (`--db`/`LINK_DATABASE_URL`) que esos dos y `linkc serve`.
+- `exists: false` implica `row_count: None`, nunca `Some(0)` -- "no existe todavía" nunca se confunde con "existe pero está vacía".
+- El conteo es FÍSICO, sin filtrar `@softDelete` -- mismo criterio que `db.tableStats()`, a propósito distinto de `count()`.
+- SQLite abre de solo lectura (`SQLITE_OPEN_READ_ONLY`); un archivo `.db` inexistente nunca es un error, es exactamente el caso "ninguna colección creada todavía".
+
+Verificado con 5 tests de CLI contra el binario real (incluida una base REAL poblada por un `linkc serve` real) + 1 contra un Postgres real. Suite completa sin regresiones (1301 tests, +6 sobre v1.129.0). `db shell`/`export`/`import`/`seed` quedan para rondas futuras. Ver GRAMMAR.md §3.175, PLAN.md §9.7.
+
 ## [1.129.0] - 2026-08-28
 
 ### ✨ Nuevo

@@ -2683,6 +2683,56 @@ service Products {{
     assert_eq!(other_slug["slug"], serde_json::json!("bar"), "{other_slug:?}");
 }
 
+/// GRAMMAR.md §3.175: `linkc db inspect` contra un Postgres real -- filas
+/// reales insertadas por un `linkc serve` real, `@softDelete` no filtrado
+/// (mismo criterio que `db.tableStats()`), y una colección declarada que
+/// nunca llegó a tener tabla física reportada como "no existe todavía".
+#[test]
+fn db_inspect_reports_real_row_counts_against_postgres() {
+    const COLLECTION: &str = "items_db_inspect";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    reset_schema(&url, "orders_db_inspect_never_created");
+
+    let temp = TempDir::new("db-inspect");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String, @softDelete deletedAt: Timestamp? = null }}
+type NeverCreated = {{ id: Int, x: Int }}
+db {{ {COLLECTION}: Item[], orders_db_inspect_never_created: NeverCreated[] }}
+service Items {{
+  rpc add(name: String) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, name: name }}) }}
+  rpc remove(id: Int) -> Bool {{ db.{COLLECTION}.delete(id) }}
+}}
+"#
+        ),
+    );
+    // Arranca el servicio real para que la tabla de "items" exista de
+    // verdad -- la de "NeverCreated" nunca se toca, así que su tabla nunca
+    // se crea (mismo caso "no existe todavía" que el test de SQLite).
+    let server = Serve::start(&link, &url);
+    server.rpc("Items/add", r#"{"name":"a"}"#);
+    let created = server.rpc("Items/add", r#"{"name":"b"}"#);
+    server.rpc("Items/remove", &format!(r#"{{"id":{}}}"#, created["id"]));
+    drop(server);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("db").arg("inspect").arg(&link).env("LINK_DATABASE_URL", &url).output().expect("ejecutar linkc db inspect");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains(COLLECTION) && stdout.contains("2 fila(s)"), "{stdout}");
+    assert!(
+        stdout.contains("orders_db_inspect_never_created") && stdout.contains("no existe todavía"),
+        "una colección declarada pero nunca creada tiene que reportarse así, no como 0 filas: {stdout}"
+    );
+    assert!(stdout.contains("2 colección(es) declaradas, 1 sin crear todavía, 2 fila(s) en total"), "{stdout}");
+}
+
 /// GRAMMAR.md §3.174: `@unique(...) where <expr>` -- índice único compuesto
 /// PARCIAL real contra Postgres. Caso motivador citado desde el schema
 /// Drizzle de Glowapp: dos turnos con el mismo horario chocan SOLO si

@@ -59,6 +59,11 @@ pub mod introspect;
 // verificación de CI para ese target).
 #[cfg(feature = "runtime")]
 pub mod migrate;
+// Mismo motivo que `migrate` arriba: `linkc db inspect` conecta de verdad
+// contra SQLite (`rusqlite`) o PostgreSQL (`postgres`), así que tampoco
+// puede vivir en el build wasm32 del playground.
+#[cfg(feature = "runtime")]
+pub mod inspect;
 pub mod scaffold;
 pub mod token;
 pub mod types;

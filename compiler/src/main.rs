@@ -81,6 +81,7 @@ fn main() -> ExitCode {
         Some("serve") => cmd_serve(&args[2..]),
         Some("serve-all") => cmd_serve_all(&args[2..]),
         Some("migrate") => cmd_migrate(&args[2..]),
+        Some("db") => cmd_db(&args[2..]),
         Some("doctor") => cmd_doctor(&args[2..]),
         Some("new") => cmd_new(&args[2..]),
         Some("dev") => cmd_dev(&args[2..]),
@@ -141,6 +142,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
     out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve')"));
+    out(&format!("     linkc db inspect <archivo.link> [--db <url|archivo>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor')"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
     out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)"));
     out(&format!("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {{\"nombre_archivo\": puerto, ...}} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)"));
@@ -524,6 +526,82 @@ fn cmd_doctor(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `linkc db <sub-subcomando>` (GRAMMAR.md §3.175, PLAN.md §9.7 ítem 2) --
+/// solo `inspect` existe por ahora; `shell`/`export`/`import`/`seed` quedan
+/// para rondas futuras, así que el mensaje de uso solo anuncia lo que de
+/// verdad está implementado.
+fn cmd_db(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("inspect") => cmd_db_inspect(&args[1..]),
+        _ => {
+            eprintln!("uso: linkc db inspect <archivo.link> [--db <url|archivo>]");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `linkc db inspect <archivo.link> [--db <url|archivo>]` -- lista cada
+/// colección declarada con su estado FÍSICO real (existe o no, filas),
+/// SIN ejecutar ningún DDL -- a diferencia de `linkc serve`, que crea/migra
+/// tablas al conectar. Mismo espíritu de solo-lectura que `linkc doctor`/
+/// `linkc migrate --dry-run` (de hecho reusa `resolve_db_source`, el mismo
+/// resolvedor de `--db`/`LINK_DATABASE_URL` que esos dos y que `serve`).
+fn cmd_db_inspect(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("uso: linkc db inspect <archivo.link> [--db <url|archivo>]");
+        return ExitCode::FAILURE;
+    };
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let source = match resolve_db_source(path, args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("configuración de base de datos inválida: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (label, result) = match &source {
+        runtime::server::DbSource::SqliteFile(db_path) => {
+            (format!("SQLite embebido en '{}'", display_path(db_path)), linkc::inspect::inspect_sqlite(&program, db_path))
+        }
+        runtime::server::DbSource::Postgres(url) => {
+            (format!("PostgreSQL ({})", redact_url_credentials(url)), linkc::inspect::inspect_postgres(&program, url))
+        }
+    };
+    let statuses = match result {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("no se pudo inspeccionar la base: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("linkc db inspect -- '{path}' contra {label}\n");
+    if statuses.is_empty() {
+        println!("(este programa no declara ninguna colección en 'db {{ ... }}')");
+        return ExitCode::SUCCESS;
+    }
+    let name_width = statuses.iter().map(|s| s.name.len()).max().unwrap_or(0).max(10);
+    let mut total_rows: i64 = 0;
+    let mut missing = 0usize;
+    for s in &statuses {
+        let status = match s.row_count {
+            Some(n) => {
+                total_rows += n;
+                format!("{n} fila(s)")
+            }
+            None => {
+                missing += 1;
+                "no existe todavía".to_string()
+            }
+        };
+        println!("  {:<name_width$}  {} columna(s) declaradas  {}", s.name, s.declared_columns, status);
+    }
+    println!("\n{} colección(es) declaradas, {} sin crear todavía, {total_rows} fila(s) en total", statuses.len(), missing);
+    ExitCode::SUCCESS
 }
 
 fn cmd_wasm(args: &[String]) -> ExitCode {
