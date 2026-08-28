@@ -125,14 +125,20 @@ impl PartialEq for TypeDecl {
 /// `TypeDecl::annotations`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypeAnnotation {
-    /// `@unique(campo1, campo2, ...)` (GRAMMAR.md §3.155): constraint
-    /// UNIQUE COMPUESTO sobre varios campos a la vez -- complementa, nunca
-    /// reemplaza, el `@unique` de un solo campo ya existente
-    /// (`FieldAnnotation::Index { unique: true }`, §3.80). Al menos 2
-    /// nombres -- un solo campo ya tiene su propia forma, más simple,
-    /// arriba (el checker rechaza menos de 2). Identificadores sueltos,
-    /// mismo criterio sintáctico que `Annotation::Invalidates`.
-    Unique(Vec<String>),
+    /// `@unique(campo1, campo2, ...)` opcionalmente seguido de `where <expr>`
+    /// (GRAMMAR.md §3.155/§3.174): constraint UNIQUE COMPUESTO sobre varios
+    /// campos a la vez -- complementa, nunca reemplaza, el `@unique` de un
+    /// solo campo ya existente (`FieldAnnotation::Index { unique: true }`,
+    /// §3.80). Al menos 2 nombres -- un solo campo ya tiene su propia forma,
+    /// más simple, arriba (el checker rechaza menos de 2). Identificadores
+    /// sueltos, mismo criterio sintáctico que `Annotation::Invalidates`.
+    /// `where <expr>` (la mitad "condicional" que §3.155 había dejado
+    /// pendiente) vuelve el índice PARCIAL -- mismo subconjunto de gramática
+    /// validado que `Check` (abajo), y puede referenciar CUALQUIER campo del
+    /// struct, no solo los que integran el conjunto único (el caso real
+    /// motivador: `@unique(userId, appointmentDate, startTime) where status
+    /// != "cancelled"`, sin que `status` participe del conjunto).
+    Unique(Vec<String>, Option<Spanned<Expr>>),
     /// `@check(<expr>)` (GRAMMAR.md §3.173): la mitad "expresión booleana
     /// arbitraria" de `@check` que §3.96 había dejado pendiente --
     /// complementa, nunca reemplaza, el `@check(min/max/range/minLength/

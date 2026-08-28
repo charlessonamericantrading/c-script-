@@ -372,7 +372,20 @@ impl Parser {
                         fields.push(self.eat_ident()?);
                     }
                     self.eat(&TokenKind::RParen)?;
-                    TypeAnnotation::Unique(fields)
+                    // `where <expr>` (GRAMMAR.md §3.174) -- "where" NO es
+                    // palabra reservada (mismo criterio que "db", §2.1): se
+                    // reconoce por texto solo ACÁ, inmediatamente después
+                    // del `)` de un `@unique(...)`, así que sigue siendo un
+                    // identificador común y corriente en cualquier otro
+                    // contexto. `parse_or_expr`, misma gramática acotada que
+                    // `@check(<expr>)` arriba.
+                    let condition = if matches!(self.peek(), TokenKind::Ident(n) if n == "where") {
+                        self.advance();
+                        Some(self.parse_or_expr(false)?)
+                    } else {
+                        None
+                    };
+                    TypeAnnotation::Unique(fields, condition)
                 }
                 // `@check(<expr>)` (GRAMMAR.md §3.173) -- `parse_or_expr`
                 // directo, no `parse_expr`: excluye a propósito `match`/

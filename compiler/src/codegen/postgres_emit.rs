@@ -4,7 +4,10 @@
 
 use crate::ast::{FieldCheck, Program};
 use crate::checker::Checker;
-use crate::runtime::db::{check_clause_sql, check_fields_by_collection, composite_unique_index_name, type_checks_by_collection};
+use crate::runtime::db::{
+    check_clause_sql, check_fields_by_collection, composite_unique_by_collection, create_composite_unique_statements,
+    type_checks_by_collection,
+};
 use crate::types::{FieldType, Type};
 use std::collections::HashSet;
 
@@ -156,22 +159,20 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
         }
     }
 
-    // `@unique(campo1, campo2, ...)` a nivel de `type` (GRAMMAR.md §3.155)
-    // -- mismo criterio que el bloque de arriba (duplicado acá por el mismo
-    // motivo: DDL estático, sin `Db` real).
-    for (coll_name, elem_ty) in checker.db_collections() {
-        let Type::Struct { name: Some(type_name), .. } = elem_ty else { continue };
-        for item in &program.items {
-            let crate::ast::Item::Type(t) = item else { continue };
-            if &t.name != type_name {
-                continue;
-            }
-            for ann in &t.annotations {
-                let crate::ast::TypeAnnotation::Unique(fields) = ann else { continue };
-                let idx_name = composite_unique_index_name(coll_name, fields);
-                let cols = fields.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
-                statements.push(format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{coll_name}\"({cols});"));
-            }
+    // `@unique(campo1, campo2, ...)` opcionalmente `where <expr>` a nivel de
+    // `type` (GRAMMAR.md §3.155/§3.174) -- reusa DIRECTO las mismas dos
+    // funciones puras que arma el `Db` real (`composite_unique_by_collection`/
+    // `create_composite_unique_statements`, `runtime/db.rs`) en vez de
+    // volver a derivar el `CREATE UNIQUE INDEX` a mano acá: ninguna de las
+    // dos necesita un `Db` real (los dos toman `program`/`checker` puros),
+    // así que la duplicación que este comentario justificaba antes de
+    // §3.174 ya no hacía falta -- reusarlas de una es lo que evita que este
+    // generador estático y el runtime real puedan divergir en la condición
+    // `where` (el mismo riesgo que motivó reusar el generador para el resto
+    // del DDL, GRAMMAR.md §3.9).
+    for (coll_name, sets) in composite_unique_by_collection(program, &checker) {
+        for stmt in create_composite_unique_statements(&coll_name, &sets) {
+            statements.push(format!("{stmt};"));
         }
     }
 
@@ -391,6 +392,24 @@ mod tests {
             ddl.contains("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_products_uniq_9$profileId4$slug\" ON \"products\"(\"profileId\", \"slug\");"),
             "{ddl}"
         );
+    }
+
+    /// GRAMMAR.md §3.174: `@unique(...) where <expr>` genera un `CREATE
+    /// UNIQUE INDEX` PARCIAL de verdad en el DDL estático -- con la
+    /// cláusula `WHERE` traducida, no solo las columnas.
+    #[test]
+    fn conditional_composite_unique_annotation_emits_a_partial_create_unique_index() {
+        let code = r#"
+        @unique(userId, appointmentDate, startTime) where status != "cancelled"
+        type Appointment = { id: Int, userId: Int, appointmentDate: String, startTime: String, status: String }
+        db { appointments: Appointment[] }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let ddl = generate_postgres_ddl(&program).unwrap();
+
+        assert!(ddl.contains("(\"userId\", \"appointmentDate\", \"startTime\")"), "{ddl}");
+        assert!(ddl.contains("WHERE (\"status\" != 'cancelled')"), "{ddl}");
     }
 
     /// Bug real, encontrado por una auditoría multi-agente adversarial

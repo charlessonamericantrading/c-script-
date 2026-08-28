@@ -2336,10 +2336,15 @@ impl Checker {
             return errors;
         };
         let field_names: std::collections::HashSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
-        let mut seen_sets: Vec<std::collections::BTreeSet<String>> = Vec::new();
+        // La clave de redundancia incluye la CONDICIÓN (§3.174, `where
+        // <expr>`), no solo el conjunto de campos -- dos `@unique` con el
+        // mismo conjunto pero condiciones DISTINTAS son dos constraints
+        // PARCIALES distintos, no un duplicado (`composite_unique_index_name`,
+        // runtime/db.rs, ya asume esto para no colisionar de nombre).
+        let mut seen_sets: Vec<(std::collections::BTreeSet<String>, Option<Expr>)> = Vec::new();
         for ann in &t.annotations {
             match ann {
-                TypeAnnotation::Unique(names) => {
+                TypeAnnotation::Unique(names, condition) => {
                     if names.len() < 2 {
                         errors.push(err(format!(
                             "'{}': '@unique(...)' a nivel de type necesita al menos 2 campos -- para uno solo, poné '@unique' directamente sobre ESE campo (GRAMMAR.md §3.80)",
@@ -2360,14 +2365,24 @@ impl Checker {
                             )));
                         }
                     }
-                    if seen_sets.contains(&set) {
+                    // `where <expr>` (GRAMMAR.md §3.174) -- MISMA validación
+                    // de forma y tipo que `@check(<expr>)`: la condición
+                    // puede referenciar CUALQUIER campo del struct, no solo
+                    // los que integran el conjunto único (el caso real
+                    // motivador cita justo eso: `status`, ajeno al
+                    // conjunto `(userId, appointmentDate, startTime)`).
+                    if let Some(cond) = condition {
+                        errors.extend(self.check_type_level_check_expr(t, fields, cond));
+                    }
+                    let key = (set.clone(), condition.as_ref().map(|c| c.node.clone()));
+                    if seen_sets.contains(&key) {
                         errors.push(err(format!(
-                            "'{}': '@unique({})' ya está declarado -- dos '@unique' con exactamente el mismo conjunto de campos son redundantes",
+                            "'{}': '@unique({})' ya está declarado con la misma condición -- dos '@unique' con exactamente el mismo conjunto de campos Y la misma 'where <expr>' son redundantes",
                             t.name,
                             names.join(", ")
                         )));
                     } else {
-                        seen_sets.push(set);
+                        seen_sets.push(key);
                     }
                 }
                 TypeAnnotation::Check(expr) => {
@@ -9366,6 +9381,93 @@ type T = { id: Int, s: Status }")
             @unique(startDate, room)
             @check(endDate > startDate)
             type Booking = { id: Int, room: String, startDate: Timestamp, endDate: Timestamp }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    // ---- `@unique(...) where <expr>` a nivel de `type` (GRAMMAR.md §3.174) ----
+
+    /// Caso real motivador (GRAMMAR.md §3.174, citado desde el schema Drizzle
+    /// de Glowapp): la condición referencia `status`, un campo que NO
+    /// integra el conjunto único (`userId`/`appointmentDate`/`startTime`).
+    #[test]
+    fn conditional_composite_unique_with_real_fields_typechecks() {
+        let src = r#"
+            @unique(userId, appointmentDate, startTime) where status != "cancelled"
+            type Appointment = { id: Int, userId: Int, appointmentDate: String, startTime: String, status: String }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn conditional_composite_unique_referencing_an_unknown_field_in_the_condition_is_rejected() {
+        let src = r#"
+            @unique(a, b) where doesNotExist != "x"
+            type T = { id: Int, a: Int, b: Int }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("doesNotExist"), "{msg}");
+    }
+
+    #[test]
+    fn conditional_composite_unique_whose_condition_calls_a_function_is_rejected() {
+        let src = r#"
+            fn isActive(s: String) -> Bool { s != "cancelled" }
+            @unique(a, b) where isActive(status)
+            type T = { id: Int, a: Int, b: Int, status: String }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "una llamada dentro de 'where <expr>' no puede traducirse a un CHECK de SQL -- tiene que rechazarse");
+    }
+
+    #[test]
+    fn conditional_composite_unique_whose_condition_does_not_typecheck_to_bool_is_rejected() {
+        let src = r#"
+            @unique(a, b) where a + b
+            type T = { id: Int, a: Int, b: Int }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "'where <expr>' tiene que tipar a Bool, no a Int");
+    }
+
+    /// Dos `@unique` con el MISMO conjunto de campos pero condiciones
+    /// DISTINTAS son dos constraints parciales distintos -- no un
+    /// duplicado, a diferencia de dos `@unique` sin condición sobre el
+    /// mismo conjunto (`declaring_the_exact_same_composite_unique_twice_is_rejected`).
+    #[test]
+    fn two_conditional_composite_uniques_with_the_same_fields_but_different_conditions_both_typecheck() {
+        let src = r#"
+            @unique(a, b) where status == "x"
+            @unique(a, b) where status == "y"
+            type T = { id: Int, a: Int, b: Int, status: String }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    /// A diferencia del test de arriba, el MISMO conjunto de campos con la
+    /// MISMA condición sí es redundante.
+    #[test]
+    fn two_conditional_composite_uniques_with_the_same_fields_and_the_same_condition_are_rejected_as_redundant() {
+        let src = r#"
+            @unique(a, b) where status == "x"
+            @unique(a, b) where status == "x"
+            type T = { id: Int, a: Int, b: Int, status: String }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "mismo conjunto de campos Y misma condición -- tiene que rechazarse por redundante");
+    }
+
+    /// Y un `@unique` CON condición no puede confundirse con uno SIN
+    /// condición sobre el mismo conjunto de campos -- son dos constraints
+    /// distintos (uno total, uno parcial), ninguno redundante con el otro.
+    #[test]
+    fn a_conditional_and_an_unconditional_composite_unique_over_the_same_fields_both_typecheck() {
+        let src = r#"
+            @unique(a, b)
+            @unique(a, b) where status == "x"
+            type T = { id: Int, a: Int, b: Int, status: String }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }

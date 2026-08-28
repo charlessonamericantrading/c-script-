@@ -6514,6 +6514,59 @@ mod tests {
         assert_eq!(other_slug["slug"], json!("bar"), "mismo profileId, distinto slug: también tiene que aceptarse");
     }
 
+    /// GRAMMAR.md §3.174: `@unique(...) where <expr>` -- el índice único
+    /// compuesto se vuelve PARCIAL. Caso real motivador (citado desde el
+    /// schema Drizzle de Glowapp): dos turnos con el mismo
+    /// `(userId, appointmentDate, startTime)` chocan SOLO si ninguno está
+    /// cancelado -- una vez cancelado, ese horario puede reusarse sin
+    /// acumular filas basura.
+    #[test]
+    fn a_conditional_composite_unique_constraint_is_enforced_for_real_against_sqlite() {
+        let program = program_from(
+            r#"
+            @unique(userId, appointmentDate, startTime) where status != "cancelled"
+            type Appointment = { id: Int, userId: Int, appointmentDate: String, startTime: String, status: String }
+            db { appointments: Appointment[] }
+            service Appointments {
+                rpc book(userId: Int, appointmentDate: String, startTime: String, status: String) -> Appointment {
+                    db.appointments.insert(Appointment { id: 0, userId: userId, appointmentDate: appointmentDate, startTime: startTime, status: status })
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(
+            &program,
+            "Appointments",
+            "book",
+            &json!({"userId": 1, "appointmentDate": "2026-09-01", "startTime": "10:00", "status": "confirmed"}),
+            &db,
+        )
+        .unwrap();
+
+        // Mismo horario, todavía "confirmed" -- tiene que chocar.
+        let clash = invoke_rpc(
+            &program,
+            "Appointments",
+            "book",
+            &json!({"userId": 1, "appointmentDate": "2026-09-01", "startTime": "10:00", "status": "confirmed"}),
+            &db,
+        );
+        assert!(clash.is_err(), "el mismo horario, sin cancelar, tiene que rechazarse (400)");
+
+        // Mismo horario, pero "cancelled" -- la fila existente NO participa
+        // del índice parcial (la condición 'where' la excluye), así que
+        // reusar el horario tiene que aceptarse.
+        let reused = invoke_rpc(
+            &program,
+            "Appointments",
+            "book",
+            &json!({"userId": 1, "appointmentDate": "2026-09-01", "startTime": "10:00", "status": "cancelled"}),
+            &db,
+        );
+        assert!(reused.is_ok(), "reusar un horario ya cancelado tiene que aceptarse -- el índice es parcial: {reused:?}");
+    }
+
     /// Bug real, encontrado por una auditoría multi-agente adversarial
     /// (26/08/2026): el nombre de índice compuesto se armaba con
     /// `fields.join("_")`, ambiguo cuando un nombre de campo ya tenía un

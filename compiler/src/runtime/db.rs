@@ -227,12 +227,15 @@ pub(crate) fn create_index_statements(collection: &str, indexed: &[(String, bool
         .collect()
 }
 
-/// Nombre de colección -> lista de conjuntos de campos con `@unique(...)`
-/// COMPUESTO de su tipo de elemento (GRAMMAR.md §3.155) -- mismo cruce
-/// `checker.db_collections()` + `program.items` que `index_fields_by_collection`
-/// arriba, mismo motivo (la anotación vive en `ast::TypeDecl`, no en el
-/// `Type` ya resuelto).
-pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<Vec<String>>> {
+/// Nombre de colección -> lista de `(campos, condición SQL opcional)` por
+/// cada `@unique(...)` COMPUESTO de su tipo de elemento (GRAMMAR.md §3.155/
+/// §3.174) -- mismo cruce `checker.db_collections()` + `program.items` que
+/// `index_fields_by_collection` arriba, mismo motivo (la anotación vive en
+/// `ast::TypeDecl`, no en el `Type` ya resuelto). La condición (`where
+/// <expr>`, §3.174) ya viene TRADUCIDA a SQL (`type_check_expr_sql`, misma
+/// función que usa `@check` de tipo) -- el checker
+/// (`Checker::check_type_annotations`) ya validó su forma y su tipo.
+pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<(Vec<String>, Option<String>)>> {
     let mut result = HashMap::new();
     for (coll_name, element_ty) in checker.db_collections() {
         let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
@@ -241,11 +244,13 @@ pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checke
             if &t.name != type_name {
                 continue;
             }
-            let sets: Vec<Vec<String>> = t
+            let sets: Vec<(Vec<String>, Option<String>)> = t
                 .annotations
                 .iter()
                 .filter_map(|a| match a {
-                    TypeAnnotation::Unique(fields) => Some(fields.clone()),
+                    TypeAnnotation::Unique(fields, condition) => {
+                        Some((fields.clone(), condition.as_ref().map(|c| type_check_expr_sql(&c.node))))
+                    }
                     TypeAnnotation::Check(_) => None,
                 })
                 .collect();
@@ -277,7 +282,7 @@ pub(crate) fn type_checks_by_collection(program: &Program, checker: &Checker) ->
                 .iter()
                 .filter_map(|a| match a {
                     TypeAnnotation::Check(expr) => Some(type_check_expr_sql(&expr.node)),
-                    TypeAnnotation::Unique(_) => None,
+                    TypeAnnotation::Unique(..) => None,
                 })
                 .collect();
             if !clauses.is_empty() {
@@ -367,17 +372,22 @@ pub(crate) fn type_check_expr_sql(expr: &crate::ast::Expr) -> String {
 }
 
 /// `CREATE UNIQUE INDEX IF NOT EXISTS ...` de VARIAS columnas a la vez, uno
-/// por cada `@unique(...)` de nivel `type` (GRAMMAR.md §3.155) -- mismo
+/// por cada `@unique(...)` de nivel `type` (GRAMMAR.md §3.155), opcionalmente
+/// PARCIAL (`WHERE <condición>`, GRAMMAR.md §3.174, `where <expr>`) -- mismo
 /// criterio de idempotencia y nombre determinístico que `create_index_statements`
-/// (arriba), con el nombre de TODOS los campos codificados sin ambigüedad
-/// (`composite_unique_index_name` abajo) para que dos constraints
-/// compuestos sobre la misma tabla nunca colisionen de nombre.
-pub(crate) fn create_composite_unique_statements(collection: &str, sets: &[Vec<String>]) -> Vec<String> {
+/// (arriba), con el nombre de TODOS los campos (Y la condición, si hay)
+/// codificados sin ambigüedad (`composite_unique_index_name` abajo) para
+/// que dos constraints compuestos sobre la misma tabla nunca colisionen de
+/// nombre -- incluido el caso de dos `@unique` con EL MISMO conjunto de
+/// campos pero condiciones DISTINTAS, que sin esto generarían el mismo
+/// nombre de índice y la segunda sentencia sería un no-op silencioso.
+pub(crate) fn create_composite_unique_statements(collection: &str, sets: &[(Vec<String>, Option<String>)]) -> Vec<String> {
     sets.iter()
-        .map(|fields| {
-            let idx_name = composite_unique_index_name(collection, fields);
+        .map(|(fields, condition)| {
+            let idx_name = composite_unique_index_name(collection, fields, condition.as_deref());
             let cols = fields.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
-            format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{collection}\"({cols})")
+            let where_clause = condition.as_ref().map(|c| format!(" WHERE {c}")).unwrap_or_default();
+            format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{collection}\"({cols}){where_clause}")
         })
         .collect()
 }
@@ -404,9 +414,30 @@ pub(crate) fn create_composite_unique_statements(collection: &str, sets: &[Vec<S
 /// caracter esté ausente del nombre del campo (a diferencia de un `join`
 /// con separador, que solo es seguro si el separador nunca puede aparecer
 /// DENTRO de un campo -- exactamente la garantía que `_` no daba).
-pub(crate) fn composite_unique_index_name(collection: &str, fields: &[String]) -> String {
+/// `condition` (GRAMMAR.md §3.174, `where <expr>`) NO se concatena tal
+/// cual -- a diferencia de un nombre de campo (identificador simple), el
+/// SQL ya traducido de una condición trae comillas/paréntesis/espacios
+/// (`("status" != 'cancelled')`), que romperían el identificador entre
+/// comillas dobles que envuelve a este nombre completo (`"idx_..."`) si se
+/// pegaran directo -- confirmado en vivo: un intento anterior sin hashear
+/// producía `CREATE UNIQUE INDEX IF NOT EXISTS "idx_..._("status" != ...` y
+/// SQLite lo rechazaba con un error de sintaxis a mitad del nombre. En vez
+/// de escapar comillas a mano, se hashea con el MISMO SHA-256 que
+/// `lockfile::hash_source` ya usa para otra cosa (detección de deriva) --
+/// determinista, sin caracteres problemáticos, y sin sumar una segunda
+/// implementación de hashing al proyecto. Dos `@unique` con el mismo
+/// conjunto de campos pero condiciones DISTINTAS (o una con condición y
+/// otra sin) igual generan nombres distintos -- lo único que importa acá
+/// es que la MISMA condición siempre hashee igual (para que `CREATE UNIQUE
+/// INDEX IF NOT EXISTS` reconozca el índice ya creado en el próximo
+/// arranque) y una DISTINTA casi seguro hashee distinto.
+pub(crate) fn composite_unique_index_name(collection: &str, fields: &[String], condition: Option<&str>) -> String {
     let encoded: String = fields.iter().map(|f| format!("{}${f}", f.len())).collect();
-    format!("idx_{collection}_uniq_{encoded}")
+    let where_suffix = match condition {
+        Some(c) => format!("_where_{}", &crate::lockfile::hash_source(c)[..16]),
+        None => String::new(),
+    };
+    format!("idx_{collection}_uniq_{encoded}{where_suffix}")
 }
 
 /// ¿Es este el texto con el que SQLite o Postgres reportan una violación de

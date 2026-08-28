@@ -2683,6 +2683,56 @@ service Products {{
     assert_eq!(other_slug["slug"], serde_json::json!("bar"), "{other_slug:?}");
 }
 
+/// GRAMMAR.md §3.174: `@unique(...) where <expr>` -- índice único compuesto
+/// PARCIAL real contra Postgres. Caso motivador citado desde el schema
+/// Drizzle de Glowapp: dos turnos con el mismo horario chocan SOLO si
+/// ninguno está cancelado.
+#[test]
+fn a_conditional_composite_unique_constraint_is_enforced_for_real_against_postgres() {
+    const COLLECTION: &str = "appointments_conditional_unique";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("conditional-composite-unique-postgres");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+@unique(userId, appointmentDate, startTime) where status != "cancelled"
+type Appointment = {{ id: Int, userId: Int, appointmentDate: String, startTime: String, status: String }}
+db {{ {COLLECTION}: Appointment[] }}
+service Appointments {{
+  rpc book(userId: Int, appointmentDate: String, startTime: String, status: String) -> Appointment {{
+    db.{COLLECTION}.insert(Appointment {{ id: 0, userId: userId, appointmentDate: appointmentDate, startTime: startTime, status: status }})
+  }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Appointments/book", r#"{"userId":1,"appointmentDate":"2026-09-01","startTime":"10:00","status":"confirmed"}"#);
+
+    // Mismo horario, todavía confirmado: rechazado con 400 real.
+    let clash = server.try_rpc(
+        "Appointments/book",
+        r#"{"userId":1,"appointmentDate":"2026-09-01","startTime":"10:00","status":"confirmed"}"#,
+    );
+    let msg = clash.expect_err("el mismo horario, sin cancelar, debe rechazarse");
+    assert!(msg.contains("devolvió 400"), "{msg}");
+
+    // Mismo horario, pero cancelado: la fila existente queda AFUERA del
+    // índice parcial -- reusar el horario tiene que aceptarse.
+    let reused = server.rpc(
+        "Appointments/book",
+        r#"{"userId":1,"appointmentDate":"2026-09-01","startTime":"10:00","status":"cancelled"}"#,
+    );
+    assert_eq!(reused["status"], serde_json::json!("cancelled"), "{reused:?}");
+}
+
 /// GRAMMAR.md §3.149: `GET /metrics` sobre Postgres usa `pg_database_size`
 /// (una función SQL distinta a la de SQLite, `PRAGMA page_count/page_size`)
 /// -- este test es la contraparte real de

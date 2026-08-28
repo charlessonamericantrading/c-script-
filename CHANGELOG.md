@@ -3,6 +3,23 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.129.0] - 2026-08-28
+
+### ✨ Nuevo
+**`@unique(...) where <expr>`** -- cierra la mitad CONDICIONAL que §3.155 (v1.45.0) había dejado explícitamente afuera: el caso real citado ahí, el schema Drizzle de Glowapp (`UNIQUE(userId, appointmentDate, startTime) WHERE status != 'cancelled'`, permite reusar un horario una vez cancelado sin acumular filas basura).
+
+```
+@unique(userId, appointmentDate, startTime) where status != "cancelled"
+type Appointment = { id: Int, userId: Int, appointmentDate: String, startTime: String, status: String }
+```
+
+- Reusa DIRECTO la infraestructura que `@check(<expr>)` de tipo (v1.128.0, esta misma sesión) acababa de construir -- misma validación de forma, mismo tipado contra `Bool`, misma traducción a SQL. Cero evaluador de aplicación nuevo: a diferencia de `@check`, `@unique` nunca tuvo enforcement de aplicación -- siempre fue puramente un constraint de base, y acá el índice simplemente se vuelve PARCIAL (`CREATE UNIQUE INDEX ... WHERE <condición>`, sintaxis idéntica en los dos backends).
+- La condición puede referenciar cualquier campo del struct, no solo los del conjunto único.
+- Bug encontrado y arreglado en el camino: el nombre determinístico del índice no podía concatenar la condición SQL tal cual (comillas/paréntesis rompían el identificador que lo envuelve) -- se hashea con el mismo SHA-256 que el sistema de módulos ya usaba para otra cosa, sin sumar una segunda implementación de hashing.
+- El dedup de redundancia ahora es por `(campos, condición)`, no solo por campos -- dos `@unique` con los mismos campos pero condiciones distintas son dos constraints parciales legítimos.
+
+Verificado con 7 tests de checker, 1 contra SQLite real (reproduce el caso exacto de Glowapp), 1 de DDL estático, 1 contra un Postgres real, y repetición en vivo contra SQLite (`.schema` + tres llamadas HTTP reales). Suite completa sin regresiones (1295 tests, +10 sobre v1.128.0). Ver GRAMMAR.md §3.174, PLAN.md §9.3.
+
 ## [1.128.0] - 2026-08-28
 
 ### ✨ Nuevo
