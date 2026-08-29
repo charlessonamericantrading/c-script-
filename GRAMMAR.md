@@ -203,6 +203,7 @@
   - [3.179 `String` contra `uuid`/`inet`/`cidr` NATIVOS de Postgres — RESUELTO](#3179-string-contra-uuidinetcidr-nativos-de-postgres--resuelto)
   - [3.180 Compresión GZIP de la respuesta HTTP — RESUELTO](#3180-compresión-gzip-de-la-respuesta-http--resuelto)
   - [3.181 Camino de despliegue recomendado (git+CI) — RESUELTO, alcance acotado](#3181-camino-de-despliegue-recomendado-gitci--resuelto-alcance-acotado)
+  - [3.182 Escritura de `Timestamp` contra `date`/`timestamp`/`timestamptz` NATIVOS de Postgres — RESUELTO](#3182-escritura-de-timestamp-contra-datetimestamptimestamptz-nativos-de-postgres--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6701,6 +6702,20 @@ Segundo ítem de la ronda de "límites y fricciones" (junto con §3.178 rate lim
 **Límite honesto, deliberado**: el paso de despliegue en sí (`scp`/`ssh systemctl restart`) es UNA variante concreta, no una abstracción de "despliegue genérico" -- reemplazarla por Docker/Kubernetes/lo que sea es cosa del operador, el resto del workflow (tests, contrato, `doctor` antes/después) no cambia. Sin rollback automático -- si `doctor --target-url` muestra algo raro después de desplegar, el job simplemente termina; revertir sigue siendo manual, igual que cualquier despliegue por SSH simple. Ninguna herramienta nueva del lado de `linkc serve`/runtime -- alcance puramente de scaffolding + documentación, la pieza que faltaba no era código de servidor.
 
 **Verificado**: 4 tests unitarios de `scaffold.rs` (incluido uno nuevo que confirma que los TRES templates scaffoldean el workflow, que referencia `main.link` de verdad, y que el job `deploy` queda apagado por default) más una corrida real de `linkc new` cuyo `.github/workflows/deploy.yml` resultante se validó con un parser YAML real (`yaml.safe_load`, no solo "compila el Rust que lo genera"). Suite completa sin regresiones.
+
+---
+
+### 3.182 Escritura de `Timestamp` contra `date`/`timestamp`/`timestamptz` NATIVOS de Postgres — RESUELTO
+
+**Bug real de producción, severidad alta, reportado por skynet-43 (iaacademy) el mismo día que §3.181** -- silencioso, no un error: `insert`/`applyPatch` contra una columna `created_at timestamp with time zone` NATIVA (adoptada, no generada por `linkc build`) guardaba una fecha completamente distinta a la enviada, sin ningún error. Repro reportado: mandar `"2026-08-29T12:34:56.789Z"` terminaba guardado como `2000-01-21 16:40:06.896896` -- un salto de 26 años, sin ningún mensaje que lo señalara.
+
+**Causa raíz, confirmada con aritmética antes de tocar código (no solo el síntoma):** `Cell::to_sql` (`runtime/store.rs`) nunca tuvo un caso para `ty == TIMESTAMP`/`TIMESTAMPTZ` -- un `Cell::Int(millis)` (la representación interna de `Type::Timestamp`, milisegundos desde 1970) caía al brazo genérico `_ => n.to_sql(ty, out)`, que serializa el i64 tal cual como `int8` (8 bytes crudos). Postgres interpreta esos MISMOS 8 bytes, para una columna `timestamp`/`timestamptz`, como microsegundos desde el epoch PROPIO de Postgres (2000-01-01) -- un formato binario del MISMO ANCHO, así que el servidor los acepta sin protestar, solo que con la semántica equivocada. Es el motivo exacto por el que este bug es más peligroso que el mismatch ya documentado de `numeric` (§3.103, "solo lectura"): `numeric` tiene un formato binario de ancho/forma DISTINTA, así que Postgres lo hubiera rechazado con un error claro -- acá, en cambio, el ancho coincide por pura coincidencia (los dos son enteros de 8 bytes), así que la escritura "funciona" y corrompe en silencio.
+
+**La corrección** agrega dos casos nuevos a `Cell::to_sql`, simétricos a la lectura que §3.91 ya resolvía (`PgTimestampMicros`/`PgDateDays`, mismo módulo `timestamp.rs`): `pg_timestamp_micros_from_millis` (inversa EXACTA de `millis_from_pg_timestamp_micros`, para `TIMESTAMP`/`TIMESTAMPTZ`) y `pg_date_days_from_millis` (inversa de `millis_from_pg_date_days`, para `DATE` -- trunca cualquier componente de hora, mismo criterio que `timestamp::date` del propio Postgres). Mismo espíritu que el resto de este proyecto: un formato binario chico y documentado (8 y 4 bytes respectivamente, protocolo fijo) no amerita ninguna dependencia nueva.
+
+**Límite honesto, deliberado**: el mismatch simétrico de `Float`/`numeric` (§3.103) sigue sin arreglar -- esta ronda solo cerró `Timestamp`, el reportado como bug real. La diferencia de riesgo justifica la diferencia de urgencia: `numeric` falla RUIDOSO (Postgres rechaza el formato), así que sigue siendo "no funciona todavía" en vez de "corrompe en silencio" -- documentado como tal desde §3.103, sin cambios acá.
+
+**Verificado contra Postgres real** (`pg_integration.rs`): una tabla adoptada con columnas `date`/`timestamptz`/`timestamp` nativas, un `insert` real vía `linkc serve --adopt-existing`, y la prueba que de verdad importa -- leer la fila guardada con el cliente `postgres` CRUDO (`SELECT ...::text`, sin pasar por ningún decodificador propio de c-script) para confirmar que el AÑO real guardado es el correcto, no un artefacto de que lectura y escritura compartan el mismo bug compensándose entre sí. Más 5 tests unitarios locales sobre la aritmética de conversión (ida y vuelta exacta contra la lectura ya existente, el ancla pública conocida del epoch, y un test que documenta explícitamente el cálculo del bug -- "sin este fix, esto resolvería a enero de 2000").
 
 ---
 

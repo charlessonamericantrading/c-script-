@@ -123,10 +123,44 @@ pub(crate) fn millis_from_pg_timestamp_micros(micros: i64) -> i64 {
     micros.div_euclid(1000) + PG_EPOCH_DAYS_SINCE_UNIX_EPOCH * MS_PER_DAY
 }
 
-/// Como `millis_from_pg_timestamp_micros`, para la forma binaria de un
-/// `date` nativo de Postgres -- días (no microsegundos) desde 2000-01-01.
+/// Como `millis_from_pg_date_days`, para la forma binaria de un `date`
+/// nativo de Postgres -- días (no microsegundos) desde 2000-01-01.
 pub(crate) fn millis_from_pg_date_days(days: i32) -> i64 {
     (i64::from(days) + PG_EPOCH_DAYS_SINCE_UNIX_EPOCH) * MS_PER_DAY
+}
+
+/// Inversa EXACTA de `millis_from_pg_timestamp_micros` -- milisegundos
+/// desde 1970 (la representación interna de `Timestamp`) a microsegundos
+/// desde 2000-01-01 (la forma binaria que Postgres espera al ESCRIBIR
+/// contra una columna `timestamp`/`timestamptz` nativa).
+///
+/// Bug real de adopción (iaacademy, vía skynet-43, 2026-08-29): antes de
+/// esto, `Cell::to_sql` no tenía ningún caso para `ty == TIMESTAMP(TZ)` --
+/// un `Cell::Int(millis)` caía al `_ => n.to_sql(ty, out)` genérico
+/// (`i64::to_sql`, los mismos 8 bytes crudos que usa una columna `BIGINT`
+/// normal). A diferencia del mismatch de `numeric` (§3.103, que Postgres
+/// SÍ rechaza -- formato binario de ancho/forma distinta), acá los 8 bytes
+/// de un `int8` y los de un `timestamptz` binario tienen el MISMO ancho --
+/// el servidor los acepta sin quejarse, solo que interpretándolos como
+/// microsegundos-desde-2000 en vez de milisegundos-desde-1970: silencioso,
+/// nunca un error, la fecha guardada queda corrompida sin ningún aviso.
+/// Confirmado con aritmética antes de escribir el fix (no solo el repro):
+/// escribir el `Timestamp` crudo de 2026 contra una columna `timestamptz`
+/// da como resultado una fecha de enero del año 2000 -- exactamente lo que
+/// da interpretar esos milisegundos como si fueran microsegundos.
+pub(crate) fn pg_timestamp_micros_from_millis(millis: i64) -> i64 {
+    (millis - PG_EPOCH_DAYS_SINCE_UNIX_EPOCH * MS_PER_DAY) * 1000
+}
+
+/// Como `pg_timestamp_micros_from_millis`, para la forma binaria de un
+/// `date` nativo -- trunca cualquier componente de hora (mismo criterio que
+/// el propio Postgres al hacer `timestamp::date`: un `Timestamp` que no cae
+/// exacto a medianoche UTC pierde esa parte al guardarse en una columna
+/// `date`, no es un error). `div_euclid`, no `/` cruda, por el mismo motivo
+/// de siempre: una fecha anterior a 2000 tiene que redondear hacia el día
+/// de calendario correcto, no truncar hacia 0.
+pub(crate) fn pg_date_days_from_millis(millis: i64) -> i32 {
+    (millis.div_euclid(MS_PER_DAY) - PG_EPOCH_DAYS_SINCE_UNIX_EPOCH) as i32
 }
 
 /// Milisegundos desde epoch -> `(dateStamp, amzDate)` en las dos formas
@@ -310,6 +344,63 @@ mod tests {
         // se está probando).
         let days_since_pg_epoch = (days_from_civil(2026, 8, 24) - PG_EPOCH_DAYS_SINCE_UNIX_EPOCH) as i32;
         assert_eq!(format_iso8601_millis(millis_from_pg_date_days(days_since_pg_epoch)), "2026-08-24T00:00:00.000Z");
+    }
+
+    // ---- escritura contra `timestamp`/`timestamptz`/`date` nativos de
+    // Postgres (GRAMMAR.md §3.182 -- inversa de las conversiones de arriba) ----
+
+    #[test]
+    fn pg_timestamp_micros_from_millis_is_the_exact_inverse_of_the_read_side_conversion() {
+        // Repro real de skynet-43/iaacademy antes de este fix: escribir el
+        // Timestamp crudo de 2026 contra `timestamptz` daba una fecha de
+        // enero de 2000 -- exactamente lo que da interpretar milisegundos
+        // como si fueran microsegundos. La ida y vuelta millis -> micros ->
+        // millis tiene que ser EXACTA (sin pérdida) para cualquier
+        // milisegundo real, no solo para el epoch.
+        for iso in ["2000-01-01T00:00:00.000Z", "2026-08-29T12:34:56.789Z", "1999-12-31T23:59:59.999Z", "1969-01-01T00:00:00.000Z"] {
+            let millis = parse_iso8601_millis(iso).unwrap();
+            let micros = pg_timestamp_micros_from_millis(millis);
+            assert_eq!(millis_from_pg_timestamp_micros(micros), millis, "ida y vuelta debe ser exacta para {iso}");
+        }
+    }
+
+    #[test]
+    fn pg_timestamp_micros_from_millis_matches_the_known_pg_epoch_anchor() {
+        // Mismo ancla pública que `pg_timestamp_micros_at_its_own_epoch_matches_the_known_unix_millis`,
+        // en la dirección inversa: 2000-01-01T00:00:00Z en millis-desde-1970
+        // (946684800000, valor conocido) tiene que dar micros=0 exacto.
+        assert_eq!(pg_timestamp_micros_from_millis(946_684_800_000), 0);
+    }
+
+    #[test]
+    fn pg_timestamp_micros_from_millis_reproduces_the_exact_corruption_bug_when_absent() {
+        // Documenta el bug real, no solo el fix: SIN esta conversión, el
+        // wire binario tal cual (el i64 de millis mandado como si fueran
+        // micros) resuelve a una fecha de enero de 2000 -- confirmado con
+        // el mismo cálculo que motivó el fix, para que quede claro qué
+        // exactamente estaba mal si alguien revierte esto sin querer.
+        let millis_2026 = parse_iso8601_millis("2026-08-29T12:34:56.789Z").unwrap();
+        let corrupted_if_sent_raw = format_iso8601_millis(millis_from_pg_timestamp_micros(millis_2026));
+        assert!(corrupted_if_sent_raw.starts_with("2000-01-"), "confirma el bug documentado: {corrupted_if_sent_raw}");
+    }
+
+    #[test]
+    fn pg_date_days_from_millis_is_the_exact_inverse_of_the_read_side_conversion_at_midnight() {
+        for iso in ["2000-01-01T00:00:00.000Z", "2026-08-24T00:00:00.000Z", "1999-12-31T00:00:00.000Z"] {
+            let millis = parse_iso8601_millis(iso).unwrap();
+            let days = pg_date_days_from_millis(millis);
+            assert_eq!(millis_from_pg_date_days(days), millis, "ida y vuelta debe ser exacta a medianoche para {iso}");
+        }
+    }
+
+    #[test]
+    fn pg_date_days_from_millis_truncates_a_time_of_day_component() {
+        // Un Timestamp con hora distinta de medianoche pierde esa parte al
+        // guardarse en una columna `date` -- mismo criterio que
+        // `timestamp::date` del propio Postgres, no un error.
+        let midnight = parse_iso8601_millis("2026-08-24T00:00:00.000Z").unwrap();
+        let with_time = parse_iso8601_millis("2026-08-24T15:30:00.000Z").unwrap();
+        assert_eq!(pg_date_days_from_millis(with_time), pg_date_days_from_millis(midnight));
     }
 
     // ---- `dateFromParts` (GRAMMAR.md §3.90) ----

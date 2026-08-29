@@ -776,6 +776,27 @@ impl postgres::types::ToSql for Cell {
                     let n32: i32 = (*n).try_into().map_err(|_| format!("{n} no entra en un entero de 32 bits (columna '{ty}')"))?;
                     n32.to_sql(ty, out)
                 }
+                // GRAMMAR.md §3.91/§3.182: un `Timestamp` es milisegundos
+                // desde 1970 (la MISMA representación interna que un `Int`
+                // normal, `Cell::Int`) -- contra una columna `BIGINT`
+                // generada por c-script eso es correcto tal cual (el brazo
+                // `_` de abajo). Contra una columna `timestamp`/`timestamptz`
+                // NATIVA adoptada, el servidor espera microsegundos desde
+                // 2000-01-01, un formato binario del MISMO ancho (8 bytes)
+                // pero semántica distinta -- sin este caso, Postgres
+                // aceptaba los bytes crudos sin quejarse (mismo ancho) y
+                // guardaba una fecha corrompida en silencio, nunca un
+                // error. Bug real de adopción (iaacademy, vía skynet-43).
+                postgres::types::Type::TIMESTAMP | postgres::types::Type::TIMESTAMPTZ => {
+                    super::timestamp::pg_timestamp_micros_from_millis(*n).to_sql(ty, out)
+                }
+                // Mismo problema, para una columna `date` nativa -- 4 bytes,
+                // días desde 2000-01-01 en vez de milisegundos desde 1970.
+                // Cualquier componente de hora se trunca (mismo criterio que
+                // `timestamp::date` del propio Postgres).
+                postgres::types::Type::DATE => {
+                    super::timestamp::pg_date_days_from_millis(*n).to_sql(ty, out)
+                }
                 _ => n.to_sql(ty, out),
             },
             Cell::Float(f) => f.to_sql(ty, out),

@@ -2556,6 +2556,87 @@ service Facturas {{ rpc list() -> Factura[] {{ db.{COLLECTION}.all() }} }}
     assert_eq!(rows[0]["updated_at"], "2026-08-24T14:30:00.000Z", "timestamp (sin tz) nativo: {rows:?}");
 }
 
+// GRAMMAR.md §3.182: la mitad de ESCRITURA del mismo problema que el test de
+// arriba (solo lectura) -- bug real reportado por skynet-43/iaacademy en
+// producción: `Cell::to_sql` no tenía ningún caso para una columna
+// `timestamp`/`timestamptz`/`date` NATIVA, así que un `Cell::Int(millis)`
+// caía al `i64::to_sql` genérico -- el MISMO ancho de 8 bytes que un
+// `BIGINT` normal, así que Postgres lo aceptaba sin quejarse, pero
+// interpretándolo como microsegundos-desde-2000 en vez de
+// milisegundos-desde-1970: la fecha quedaba corrompida en SILENCIO (nunca
+// un error), resolviendo siempre a enero del año 2000.
+#[test]
+fn a_timestamp_field_writes_correctly_against_a_native_postgres_date_and_timestamptz_column() {
+    const COLLECTION: &str = "facturas_fecha_nativa_escritura";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"fecha_emision\" date NOT NULL, \
+                \"created_at\" timestamptz NOT NULL, \
+                \"updated_at\" timestamp NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla legacy a mano, con columnas de fecha NATIVAS de Postgres");
+
+    let temp = TempDir::new("native-timestamp-write");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Factura = {{ id: Int, fecha_emision: Timestamp, created_at: Timestamp, updated_at: Timestamp }}
+type NewFactura = {{ fecha_emision: Timestamp, created_at: Timestamp, updated_at: Timestamp }}
+db {{ {COLLECTION}: Factura[] }}
+service Facturas {{
+  rpc create(fecha_emision: Timestamp, created_at: Timestamp, updated_at: Timestamp) -> Factura {{
+    db.{COLLECTION}.insert(NewFactura {{ fecha_emision: fecha_emision, created_at: created_at, updated_at: updated_at }})
+  }}
+}}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+    let created = server.rpc(
+        "Facturas/create",
+        r#"{"fecha_emision":"2026-08-24T00:00:00.000Z","created_at":"2026-08-24T14:30:00.000Z","updated_at":"2026-08-24T14:30:00.000Z"}"#,
+    );
+    // Primero, el propio c-script tiene que devolver de vuelta lo que
+    // acaba de escribir -- necesario pero NO suficiente (si escritura y
+    // lectura compartieran el mismo bug simétrico, esto pasaría igual con
+    // la fecha corrompida en los dos sentidos, ver el chequeo con SQL
+    // crudo más abajo, que es el que de verdad prueba algo).
+    assert_eq!(created["fecha_emision"], "2026-08-24T00:00:00.000Z", "{created:?}");
+    assert_eq!(created["created_at"], "2026-08-24T14:30:00.000Z", "{created:?}");
+    assert_eq!(created["updated_at"], "2026-08-24T14:30:00.000Z", "{created:?}");
+
+    // La prueba real: leer los bytes guardados con el cliente `postgres`
+    // CRUDO, sin pasar por el `Cell`/decodificador propio de c-script en
+    // absoluto -- si el bug estuviera presente, esto mostraría el año 2000,
+    // no 2026, confirmando que la corrupción es real y no un artefacto de
+    // que lectura y escritura compartan el mismo error compensándose entre sí.
+    let row = client
+        .query_one(
+            &format!("SELECT fecha_emision::text, created_at::text, updated_at::text FROM \"{COLLECTION}\" WHERE id = 1"),
+            &[],
+        )
+        .expect("leer la fila con SQL crudo");
+    let fecha_emision: String = row.get(0);
+    let created_at: String = row.get(1);
+    let updated_at: String = row.get(2);
+    assert_eq!(fecha_emision, "2026-08-24", "SQL crudo -- date: {fecha_emision}");
+    assert!(created_at.starts_with("2026-08-24"), "SQL crudo -- timestamptz: {created_at}");
+    assert!(updated_at.starts_with("2026-08-24"), "SQL crudo -- timestamp: {updated_at}");
+}
+
 // GRAMMAR.md §3.103: un campo `Float` decodifica correctamente contra una
 // columna `numeric`/`decimal` NATIVA de Postgres, no solo contra
 // `float4`/`float8` -- segundo bug real encontrado por MyFinance verificando

@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.138.0] - 2026-08-29
+
+### 🐛 Arreglado
+**Escritura de `Timestamp` corrompía en silencio una columna `date`/`timestamp`/`timestamptz` NATIVA de Postgres adoptada.** Bug real de producción, severidad alta, reportado por skynet-43 (iaacademy): `insert`/`applyPatch` contra una columna `created_at timestamp with time zone` guardaba una fecha completamente distinta a la enviada -- un salto de 26 años en el repro reportado (`2026-08-29T12:34:56.789Z` guardado como `2000-01-21 16:40:06.896896`), sin ningún error.
+
+- Causa: `Cell::to_sql` nunca tuvo un caso para `TIMESTAMP`/`TIMESTAMPTZ` -- un `Cell::Int(millis)` caía al `i64::to_sql` genérico, que serializa 8 bytes crudos como `int8`. Postgres interpreta esos MISMOS 8 bytes, para una columna temporal, como microsegundos desde SU epoch (2000-01-01) -- mismo ancho binario, semántica distinta, así que el servidor los acepta sin protestar. Más peligroso que el mismatch ya documentado de `numeric` (§3.103, formato de ancho DISTINTO, falla ruidoso) precisamente porque acá el ancho coincide por casualidad.
+- Arreglado con dos casos nuevos en `Cell::to_sql` (`TIMESTAMP`/`TIMESTAMPTZ` y `DATE`), simétricos a la lectura que §3.91 ya resolvía -- sin ninguna dependencia nueva.
+- Límite honesto sin cambios: el mismatch simétrico de `Float`/`numeric` (§3.103) sigue sin arreglar en esta ronda -- solo se cerró `Timestamp`, el reportado como bug real y el más peligroso (falla en silencio, no ruidoso).
+
+**Verificado contra Postgres real**: una tabla adoptada con columnas nativas, un `insert` real vía `--adopt-existing`, y la fila leída de vuelta con el cliente `postgres` CRUDO (no el decodificador propio de c-script) para confirmar el año real guardado. Más 5 tests unitarios sobre la aritmética de conversión. Suite completa (1346 tests) sin regresiones. Ver GRAMMAR.md §3.182.
+
 ## [1.137.0] - 2026-08-29
 
 ### ✨ Nuevo
