@@ -1,0 +1,103 @@
+name: Deploy
+
+# Camino de despliegue recomendado (git+CI) para un proyecto c-script --
+# GRAMMAR.md §3.181 en el repo de c-script si querés el porqué completo.
+#
+# El job `test-and-build` corre en TODO push a main y no necesita ningún
+# secret -- da señal real de inmediato, sin que tengas que configurar nada
+# primero. El job `deploy` está APAGADO por default (solo corre por disparo
+# manual, botón "Run workflow" en la pestaña Actions de GitHub) hasta que
+# configures los secrets de abajo y cambies su `if:` -- así un proyecto
+# recién scaffoldeado con `linkc new` no arranca con el badge de CI en rojo
+# por un despliegue que todavía no armaste.
+#
+# Secrets que necesita el job `deploy` (Settings -> Secrets and variables ->
+# Actions, en tu repo de GitHub):
+#   DATABASE_URL    postgres://usuario:password@host/db  (la misma que le
+#                   pasarías a 'linkc serve --db')
+#   DEPLOY_HOST     IP o dominio del servidor donde corre 'linkc serve'
+#   DEPLOY_USER     usuario SSH con permiso de reiniciar el servicio
+#   DEPLOY_SSH_KEY  clave privada SSH (par con una clave pública ya
+#                   agregada a ~/.ssh/authorized_keys de DEPLOY_USER)
+#   DEPLOY_URL      https://tu-dominio.com (o http://host:puerto) -- la URL
+#                   pública donde queda escuchando 'linkc serve' ya
+#                   desplegado, para el chequeo final de abajo
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar linkc
+        run: curl -fsSL https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/install.sh | sh
+
+      - name: Tests de comportamiento (bloques test "..." { } dentro de main.link)
+        run: linkc test main.link
+
+      - name: Regenerar el contrato TypeScript/OpenAPI
+        run: linkc build main.link gen
+
+      - name: Contrato sin deriva sin querer
+        # main.link.snap no existe todavía en un proyecto recién
+        # scaffoldeado -- generalo una vez con:
+        #   linkc test main.link main.link.snap --update
+        # y commiteálo para activar este chequeo (el mismo mecanismo que usa
+        # c-script consigo mismo contra su propio demo insignia): un cambio
+        # accidental al contrato público (un campo movido, un tipo
+        # cambiado) rompe este paso ANTES de llegar a producción, no
+        # después de que un cliente ya lo notó.
+        run: |
+          if [ -f main.link.snap ]; then
+            linkc test main.link main.link.snap
+          else
+            echo "sin main.link.snap todavía -- este chequeo queda inactivo hasta que lo generes y commitees (ver el comentario de arriba)"
+          fi
+
+  deploy:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    # Apagado por default -- ver el comentario del principio del archivo.
+    # Una vez que tengas los 5 secrets configurados, cambiá esta línea a:
+    #   if: github.ref == 'refs/heads/main'
+    # para que despliegue de verdad en cada push a main.
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar linkc
+        run: curl -fsSL https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master/install.sh | sh
+
+      - name: Diagnóstico de entorno contra la base real (linkc doctor -- solo lectura, nunca ejecuta DDL)
+        run: linkc doctor main.link --db "${{ secrets.DATABASE_URL }}"
+
+      - name: Cargar la clave SSH de despliegue
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      # Esta variante asume systemd del lado del servidor -- generá la
+      # unidad UNA vez con 'linkc systemd main.link <puerto>' y copiala a
+      # /etc/systemd/system/ a mano. Para docker o pm2 en vez de systemd,
+      # ver docs/multi-service-deployment.md (mismo patrón, un paso
+      # distinto acá) en el repo de c-script.
+      - name: Copiar main.link al servidor y reiniciar el servicio
+        run: |
+          scp -o StrictHostKeyChecking=no main.link "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/main/main.link"
+          ssh -o StrictHostKeyChecking=no "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" "sudo systemctl restart main"
+
+      - name: Confirmar que el servidor en vivo ya corre esta versión
+        # linkc doctor --target-url compara la versión LOCAL (la que acaba
+        # de correr en este runner) contra la que reporta /health del
+        # servidor real -- un desfasaje queda como [INFO], no como error
+        # (un servidor recién reiniciado puede tardar unos segundos en
+        # responder), así que esto es una señal para leer en el log del
+        # job, no un gate que bloquee el deploy si no coinciden todavía.
+        run: |
+          sleep 3
+          linkc doctor main.link --db "${{ secrets.DATABASE_URL }}" --target-url "${{ secrets.DEPLOY_URL }}"

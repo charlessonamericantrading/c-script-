@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-1333-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.136.1-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-1334-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.137.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -98,6 +98,7 @@ this section wins. Verified on 2026-08-24 by running the compiler, not by readin
 - Sending email: `smtp.send(to, subject, body)` — connection (`LINK_SMTP_URL`) and sender (`LINK_SMTP_FROM`) come from the process environment, never from rpc arguments. TLS via pure-rustls, same stack as the PostgreSQL driver. `smtp.sendToMany(to: String[], subject, body)` sends one message with one `RCPT TO` per recipient; `smtp.sendHtml(to: String[], subject, html)` sends an HTML body (`Content-Type: text/html`) to one or many recipients — `send` itself is unchanged
 - Configurable CORS and fixed security headers: `--cors-origin <origin>` (repeatable, or `LINK_CORS_ORIGINS`) switches from open `*` to a real allowlist (exact match, echoed literal + `Vary: Origin`); every response — including errors and `stream` SSE — carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. `--hsts <value>`/`LINK_HSTS` (e.g. `"max-age=63072000; includeSubDomains"`) adds `Strict-Transport-Security` to every response too — opt-in, since `linkc serve` never terminates TLS itself and can't claim that guarantee by default; only turn it on behind a trusted proxy that does
 - Transparent GZIP response compression: a response over 1KB is sent with `Content-Encoding: gzip` whenever the request declares `Accept-Encoding: gzip` — no annotation, no flag, no client change (`fetch` decompresses on its own). A `stream` (SSE) is never compressed — that path writes chunked transfer encoding by hand and never goes through the response builder this hooks into. GZIP only, no brotli/deflate, fixed compression level
+- Recommended git+CI deployment path: `linkc new` now scaffolds `.github/workflows/deploy.yml` — a `test-and-build` job that runs on every push with zero secrets required (behavior tests, contract regeneration, contract-drift check once you commit a `.snap`), and a `deploy` job that stays off by default (manual dispatch only) until you configure 5 secrets and flip one `if:` line. The deploy steps chain existing tools, nothing new: `linkc doctor` (read-only pre-flight) → copy the `.link` + restart the service → `linkc doctor --target-url` (confirms the live server picked up the new version). See [docs/deploying-from-git.md](docs/deploying-from-git.md)
 - `linkc fmt`, `linkc --help`, and the TypeScript client emitter for multi-service files all work correctly now
 - Real password hashing: `crypto.hashPassword` is Argon2id (RFC 9106) with a random per-password salt, in PHC format; `verifyPassword` compares in constant time and still accepts hashes written by the previous version so existing users are not locked out
 - Numeric randomness and constant-time comparison for user code: `crypto.randomInt(min, max)` gives a uniform `Int` in that inclusive range from the OS CSPRNG (rejection-sampled against modulo bias) — enough for a real OTP, unlike `randomToken`'s hex alphabet; `crypto.timingSafeEqual(a, b)` exposes the same constant-time comparison `verifyPassword` already used internally, for comparing a webhook secret or API key without a timing side-channel
@@ -196,6 +197,11 @@ cd my-app
 linkc build main.link gen    # Generates typed contracts, client & OpenAPI
 linkc serve main.link 3000   # Starts HTTP server with auto-migrating database
 ```
+
+Every new project also ships `.github/workflows/deploy.yml` — a recommended
+git+CI pipeline (tests, contract-drift check, then an opt-in deploy job you
+switch on once your server/secrets are ready). See
+[docs/deploying-from-git.md](docs/deploying-from-git.md).
 
 ---
 

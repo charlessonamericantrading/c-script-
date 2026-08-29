@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.137.0] - 2026-08-29
+
+### ✨ Nuevo
+**Camino de despliegue recomendado (git+CI)** -- último ítem de "mejoremos estos límites y las fricciones". Auditando qué faltaba apareció que `linkc docker`/`systemd`/`pm2-config`/`doctor`/`migrate --dry-run` ya existían todos, maduros -- el gap real era que nada los conectaba en un pipeline recomendado, y que `docs/multi-service-deployment.md` describía como "no existe todavía" tres cosas que ya habían enviado (`--host`, los generadores de systemd/pm2, `--restart-backoff`), más una premisa central (que no había modo de un solo proceso para varios `.link`) que tampoco era cierta desde que `linkc serve-all` se agregó.
+
+- `linkc new <nombre>` ahora scaffoldea `.github/workflows/deploy.yml` en los tres templates. Job `test-and-build` en todo push, sin secrets; job `deploy` apagado por default (disparo manual) hasta configurar 5 secrets y cambiar una línea `if:` -- un proyecto recién creado no arranca con CI en rojo por un despliegue sin configurar.
+- El job `deploy`, activo, encadena piezas que ya existían: `linkc doctor` (pre-flight de solo lectura) → copiar el `.link` + reiniciar el servicio → `linkc doctor --target-url` (confirma que el servidor en vivo corre la versión nueva).
+- `docs/multi-service-deployment.md` corregido (no solo extendido): las tres afirmaciones desactualizadas arregladas, y reescrito para presentar `linkc serve-all` (un proceso para todos los servicios) como alternativa real, no solo "N procesos separados" como si fuera la única opción.
+- `docs/deploying-from-git.md` (nuevo): qué hace cada paso del workflow scaffoldeado, cómo activar el deploy, tabla de los 5 secrets.
+
+**Verificado**: 4 tests unitarios de scaffold (incluido uno nuevo que confirma los tres templates + que el job deploy queda apagado por default) más una corrida real de `linkc new` con el `deploy.yml` resultante validado contra un parser YAML real. Suite completa sin regresiones. Ver GRAMMAR.md §3.181.
+
 ## [1.136.1] - 2026-08-29
 
 ### 🔧 Proceso

@@ -4,18 +4,29 @@ Escrito para el caso real: una migración de un monolito a N servicios
 `c-script` (una migración real reportó 17), todos corriendo en el mismo
 servidor. El README cubre bien UN servicio suelto; esta guía cubre el resto.
 
-**Límite honesto por adelantado**: hoy no existe ningún modo "workspace" que
-sirva varios `.link` bajo un mismo proceso o puerto (PLAN.md §9.7) -- cada
-`linkc serve` es un proceso y un puerto, uno por servicio. Esta guía es sobre
-cómo operar bien ESE modelo con las herramientas que ya existen, no una
-promesa de que el modelo vaya a cambiar.
+**Dos caminos, según cuánto aislamiento querés entre servicios**: `linkc
+serve-all <directorio> --port-base N` (GRAMMAR.md §3.92) sirve TODOS los
+`.link` de un directorio bajo un ÚNICO proceso -- cada uno en su propio
+hilo, puerto `N`/`N+1`/`N+2`/... en orden alfabético, cada uno con su propio
+archivo SQLite. Un solo proceso para supervisar, un solo binario que
+actualizar -- la opción más simple si tus servicios no necesitan estar
+completamente aislados entre sí (un panic o una fuga de memoria en un hilo
+no debería tumbar el proceso entero en el uso normal, pero comparten
+recursos del sistema operativo de todas formas). El resto de esta guía
+también aplica sirviendo cada `.link` con su propio `linkc serve` --
+procesos separados, más aislamiento (un `systemctl restart` de un servicio
+nunca toca a los demás), a costa de un proceso/unidad por servicio en vez
+de uno solo. **Límite honesto**: no hay hoy un puerto ÚNICO compartido por
+varios servicios (ni con `serve-all` ni sin él) -- cada `.link` sigue
+necesitando su propio puerto, el proxy de la sección 1 es lo que da una
+sola cara pública hacia afuera.
 
 ## 1. Un puerto por servicio, un proxy adelante
 
 ```bash
-linkc serve auth.link      8781 --db postgres://...
-linkc serve billing.link   8782 --db postgres://...
-linkc serve notifications.link 8783 --db postgres://...
+linkc serve auth.link      8781 --db postgres://... --host 127.0.0.1
+linkc serve billing.link   8782 --db postgres://... --host 127.0.0.1
+linkc serve notifications.link 8783 --db postgres://... --host 127.0.0.1
 # ...uno por servicio
 ```
 
@@ -42,58 +53,59 @@ server {
 }
 ```
 
-**Por qué no exponer cada puerto directo a Internet**: hoy `linkc serve`
-siempre escucha en `0.0.0.0` -- no hay un flag `--host`/`--bind` todavía
-(PLAN.md §9.7) para limitarlo a `127.0.0.1`. Un firewall a nivel de sistema
-operativo (`ufw`/`iptables`, deny-by-default, solo el puerto del proxy
-abierto hacia afuera) es hoy la capa real que evita que cada servicio quede
-expuesto directo -- no algo opcional, es la única defensa hasta que ese flag
-exista.
+**Por qué no exponer cada puerto directo a Internet**: `--host 127.0.0.1`
+(o `LINK_HOST`, GRAMMAR.md §3.81) limita cada `linkc serve` a aceptar solo
+conexiones locales -- el proxy corre en la misma máquina y les habla por
+`127.0.0.1:puerto`, así que nada externo puede llegar a un servicio salteando
+el proxy. Sumale un firewall a nivel de sistema operativo (`ufw`/`iptables`,
+deny-by-default, solo el puerto del proxy abierto hacia afuera) como
+defensa en profundidad -- `--host 127.0.0.1` ya cierra el gap del lado de la
+aplicación, pero un firewall cubre cualquier otro proceso/puerto que termine
+corriendo en el mismo host más adelante.
 
-## 2. Un proceso supervisor por servicio
+## 2. Supervisión de proceso
+
+Con `linkc serve-all`, esto es UNA unidad/config, no una por servicio -- un
+solo `systemctl restart miapp` (o una sola entrada de PM2) reinicia el
+proceso que sirve TODOS los `.link` del directorio a la vez. El resto de
+esta sección asume el otro camino (aislamiento por proceso, la sección 1
+de arriba lo explica).
 
 `linkc docker` ya genera un `Dockerfile` por servicio (`linkc docker
 <archivo> -o Dockerfile`) -- la ruta más simple si ya usás contenedores: un
 contenedor por servicio, orquestado con `docker compose` o lo que ya uses.
 
-Sin contenedores, `pm2` o `systemd` funcionan igual de bien -- no hay
-todavía un generador oficial de ninguno de los dos (`linkc systemd`/`linkc
-pm2-config`, PLAN.md §9.7), así que la unidad se escribe a mano, una por
-servicio:
+Sin contenedores, `linkc systemd <archivo> <puerto> [outdir]` y `linkc
+pm2-config <archivo> <puerto> [-o <archivo>]` generan la unidad/config REAL
+por servicio -- una por servicio, sin escribirla a mano:
 
-```ini
-# /etc/systemd/system/miapp-auth.service
-[Unit]
-Description=miapp auth service
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/linkc serve /opt/miapp/auth.link 8781
-Environment=LINK_DATABASE_URL=postgres://...
-Restart=on-failure
-RestartSec=2
-
-[Install]
-WantedBy=multi-user.target
+```bash
+linkc systemd auth.link 8781      # -> auth.service, listo para /etc/systemd/system/
+linkc systemd billing.link 8782   # -> billing.service
+linkc pm2-config auth.link 8781 -o ecosystem.auth.json
+linkc pm2-config billing.link 8782 -o ecosystem.billing.json
 ```
 
-```json
-// ecosystem.config.json, para pm2
-{
-  "apps": [
-    { "name": "auth", "script": "linkc", "args": "serve auth.link 8781", "env": { "LINK_DATABASE_URL": "postgres://..." } },
-    { "name": "billing", "script": "linkc", "args": "serve billing.link 8782", "env": { "LINK_DATABASE_URL": "postgres://..." } }
-  ]
-}
-```
+Cada `.service` generado ya trae `ExecStart`, `WorkingDirectory`,
+`Restart=on-failure`+`RestartSec`, la variable `LINK_DATABASE_URL` comentada
+como referencia (nunca un valor real -- eso queda para el operador, no para
+un archivo generado), y hardening mínimo (`NoNewPrivileges`,
+`ProtectSystem=strict`, `ReadWritePaths`, `PrivateTmp`). Cada
+`ecosystem.json` de PM2 trae `--restart-backoff 30s` ya incluido en `args`
+y `autorestart: true` del lado de PM2 -- las dos capas son complementarias,
+no redundantes: una reinicia el PROCESO (PM2/systemd), la otra espera antes
+de reintentar la CONEXIÓN (ver el párrafo siguiente).
 
 **Arranque en frío de muchos procesos a la vez**: si los N servicios
 arrancan simultáneamente (ej. un reinicio del host), un bind de puerto que
 falla momentáneamente (`Address already in use` durante un reinicio previo
 todavía liberando el puerto) puede producir una ráfaga de reintentos --
-hoy no hay backoff exponencial nativo (`--restart-backoff`, PLAN.md §9.7),
-así que `RestartSec`/`--restart-delay` del supervisor (arriba, ya puesto en
-los dos ejemplos) es la mitigación real mientras tanto.
+`--restart-backoff <duración>`/`LINK_RESTART_BACKOFF` (GRAMMAR.md §3.92,
+funciona en `linkc serve` y en `linkc serve-all`) agrega backoff
+exponencial NATIVO ante ese fallo (dobla en cada intento consecutivo, techo
+30s, se resetea tras 60s estable) -- ya viene incluido en el `ecosystem.json`
+que genera `linkc pm2-config`; para una unidad systemd escrita por
+`linkc systemd`, agregalo a mano al `ExecStart` si tu caso lo necesita.
 
 ## 3. Si varios servicios comparten una base de datos: cuidado con las colisiones de nombre
 
@@ -138,7 +150,9 @@ compartido entre servicios todavía.
 | Necesidad | Solución hoy |
 |---|---|
 | Ruteo público | Reverse proxy (nginx/Caddy) por path o subdominio |
-| No exponer cada puerto directo | Firewall de sistema operativo -- no hay `--host`/`--bind` todavía |
-| Supervisión de proceso | `linkc docker` (con contenedores) o una unidad systemd/pm2 escrita a mano (sin contenedores) |
+| No exponer cada puerto directo | `--host 127.0.0.1` (GRAMMAR.md §3.81) + firewall de sistema operativo como defensa en profundidad |
+| Un solo proceso para varios `.link` | `linkc serve-all <directorio> --port-base N` (GRAMMAR.md §3.92) |
+| Supervisión de proceso | `linkc docker` (contenedores), o `linkc systemd`/`linkc pm2-config` (unidad/config generada, sin contenedores) |
 | Muchos servicios, una sola base | Revisar colisiones de nombre a mano, o una base por servicio, o `--adopt-existing` |
 | Política compartida (CORS/rate-limit/TTL) | Repetir el flag por servicio -- no hay configuración global todavía |
+| Desplegar desde git (CI/CD) | [docs/deploying-from-git.md](deploying-from-git.md) -- el workflow que `linkc new` ya scaffoldea, un servicio a la vez |

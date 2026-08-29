@@ -10,6 +10,7 @@ const FRONTEND_PACKAGE_JSON: &str = include_str!("../templates/frontend/package.
 const FRONTEND_TSCONFIG: &str = include_str!("../templates/frontend/tsconfig.json");
 const FRONTEND_MAIN_TS: &str = include_str!("../templates/frontend/src/main.ts");
 const PROJECT_README: &str = include_str!("../templates/PROJECT_README.md");
+const DEPLOY_WORKFLOW: &str = include_str!("../templates/deploy.yml");
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Template {
@@ -33,6 +34,11 @@ pub fn project_files(name: &str, template: Template) -> Vec<(String, String)> {
     let mut files = vec![
         ("main.link".to_string(), MAIN_LINK.to_string()),
         ("README.md".to_string(), PROJECT_README.replace("__PROJECT_NAME__", name)),
+        // GRAMMAR.md §3.181: camino de despliegue recomendado (git+CI) --
+        // apagado por default (solo corre por disparo manual) hasta que se
+        // configuren los secrets que documenta el propio archivo, así un
+        // proyecto recién scaffoldeado no arranca con el badge en rojo.
+        (".github/workflows/deploy.yml".to_string(), DEPLOY_WORKFLOW.to_string()),
     ];
 
     match template {
@@ -219,6 +225,27 @@ mod tests {
         let files = project_files("acme", Template::Nextjs);
         assert!(files.iter().any(|(r, _)| r == "web/app/page.tsx"));
         assert!(files.iter().any(|(r, _)| r == "web/package.json"));
+    }
+
+    #[test]
+    fn every_template_scaffolds_a_deploy_workflow_disabled_by_default() {
+        for template in [Template::Minimal, Template::Nextjs, Template::Vite] {
+            let files = project_files("acme", template);
+            let workflow = &files
+                .iter()
+                .find(|(rel, _)| rel == ".github/workflows/deploy.yml")
+                .unwrap_or_else(|| panic!("falta .github/workflows/deploy.yml para {template:?}"))
+                .1;
+            assert!(workflow.contains("main.link"), "el workflow tiene que referenciar el main.link que este mismo scaffold generó");
+            // El job `deploy` queda apagado hasta que el usuario lo prenda a
+            // mano (ver el comentario del propio archivo) -- un proyecto
+            // recién scaffoldeado no debe arrancar con CI en rojo por un
+            // despliegue sin secrets configurados todavía.
+            assert!(
+                workflow.contains("if: github.event_name == 'workflow_dispatch'"),
+                "el job deploy tiene que quedar apagado por default en un proyecto recién scaffoldeado"
+            );
+        }
     }
 
     #[test]

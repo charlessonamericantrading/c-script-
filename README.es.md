@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-1333-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.136.1-blue.svg" alt="Versión" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-1334-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/versión-1.137.0-blue.svg" alt="Versión" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-purple.svg" alt="Licencia" /></a>
   </p>
 </div>
@@ -98,6 +98,7 @@ gana esta. Verificado el 24/08/2026 corriendo el compilador, no leyéndolo.
 - Mandar email: `smtp.send(to, subject, body)` — la conexión (`LINK_SMTP_URL`) y el remitente (`LINK_SMTP_FROM`) salen del entorno del proceso, nunca de argumentos del rpc. TLS con rustls puro, mismo stack que el driver de PostgreSQL. `smtp.sendToMany(to: String[], subject, body)` manda un solo mensaje con un `RCPT TO` por destinatario; `smtp.sendHtml(to: String[], subject, html)` manda un body HTML (`Content-Type: text/html`) a uno o varios destinatarios -- `send` en sí queda sin cambios
 - CORS configurable y headers de seguridad fijos: `--cors-origin <origen>` (repetible, o `LINK_CORS_ORIGINS`) pasa del `*` abierto a un allowlist real (match exacto, ecoado literal + `Vary: Origin`); toda respuesta -- incluidos errores y un `stream` SSE -- lleva `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`. `--hsts <valor>`/`LINK_HSTS` (ej. `"max-age=63072000; includeSubDomains"`) agrega `Strict-Transport-Security` a toda respuesta también -- opt-in, porque `linkc serve` nunca termina TLS por sí mismo y no puede prometer esa garantía por default; solo activarlo detrás de un proxy de confianza que sí la termine
 - Compresión GZIP transparente de la respuesta: una respuesta de más de 1KB viaja con `Content-Encoding: gzip` cuando la request declara `Accept-Encoding: gzip` -- sin anotación, sin flag, sin cambio en el cliente (`fetch` descomprime solo). Un `stream` (SSE) nunca se comprime -- ese camino escribe chunked transfer encoding a mano y nunca pasa por el constructor de respuesta del que esto depende. Solo GZIP, sin brotli/deflate, nivel de compresión fijo
+- Camino de despliegue recomendado (git+CI): `linkc new` ahora scaffoldea `.github/workflows/deploy.yml` -- un job `test-and-build` que corre en todo push sin necesitar ningún secret (tests de comportamiento, regeneración del contrato, chequeo de deriva una vez que commiteás un `.snap`), y un job `deploy` que queda apagado por default (solo disparo manual) hasta que configurés 5 secrets y cambies una línea `if:`. Los pasos de despliegue encadenan herramientas que ya existían, nada nuevo: `linkc doctor` (diagnóstico de solo lectura) → copiar el `.link` + reiniciar el servicio → `linkc doctor --target-url` (confirma que el servidor en vivo ya corre la versión nueva). Ver [docs/deploying-from-git.md](docs/deploying-from-git.md)
 - `linkc fmt`, `linkc --help`, y el emisor de cliente TypeScript para archivos multi-service funcionan correctamente ahora
 - Hashing de contraseñas real: `crypto.hashPassword` es Argon2id (RFC 9106) con sal aleatoria por contraseña, en formato PHC; `verifyPassword` compara en tiempo constante y sigue aceptando los hashes de la versión anterior para no dejar afuera a los usuarios ya registrados
 - Aleatoriedad numérica y comparación en tiempo constante para código de usuario: `crypto.randomInt(min, max)` da un `Int` uniforme en ese rango inclusive desde el CSPRNG del sistema (con rechazo de muestreo contra el sesgo de módulo) — alcanza para un OTP de verdad, a diferencia del alfabeto hex de `randomToken`; `crypto.timingSafeEqual(a, b)` expone la misma comparación en tiempo constante que `verifyPassword` ya usaba internamente, para comparar un secreto de webhook o una API key sin filtrar nada por el tiempo de respuesta
@@ -193,6 +194,11 @@ cd my-app
 linkc build main.link gen    # Genera contratos tipados, cliente y OpenAPI
 linkc serve main.link 3000   # Inicia servidor HTTP con SQLite embebido y auto-migraciones
 ```
+
+Todo proyecto nuevo también trae `.github/workflows/deploy.yml` -- un pipeline
+git+CI recomendado (tests, chequeo de deriva del contrato, y un job de
+despliegue apagado por default que activás cuando tu servidor/secrets estén
+listos). Ver [docs/deploying-from-git.md](docs/deploying-from-git.md).
 
 ---
 
