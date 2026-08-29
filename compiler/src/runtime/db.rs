@@ -1752,15 +1752,28 @@ db { users: User[] }
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
+        // GRAMMAR.md §3.178, bug real encontrado en CI: `$2 - 1` con el
+        // literal entero `1` sin tipo hacía que Postgres infiriera `$2`
+        // como `integer`, no `double precision` -- la PRIMERA aparición
+        // de un parámetro es la que fija su tipo para TODA la sentencia,
+        // y encontrarlo después en un contexto `DOUBLE PRECISION` (la
+        // columna `capacity`) no lo corrige, solo inserta un cast
+        // implícito ahí -- el propio driver seguía mandando 8 bytes de
+        // `Cell::Float` (formato binario de `float8`) contra un
+        // parámetro que el servidor esperaba como 4 bytes de `int4`:
+        // "incorrect binary data format in bind parameter 2". El cast
+        // explícito (`$N::double precision`/`$N::bigint`) en CADA
+        // aparición fija el tipo sin ambigüedad, sin depender de en qué
+        // orden Postgres visite las distintas apariciones.
         let sql = format!(
             "INSERT INTO \"{RATE_LIMIT_TABLE}\" (\"bucket_key\", \"tokens\", \"capacity\", \"refill_per_sec\", \"last_seen_ms\") \
-             VALUES ($1, $2 - 1, $2, $3, $4) \
+             VALUES ($1, $2::double precision - 1, $2::double precision, $3::double precision, $4::bigint) \
              ON CONFLICT (\"bucket_key\") DO UPDATE SET \
-                \"tokens\" = LEAST($2, \"{RATE_LIMIT_TABLE}\".\"tokens\" + GREATEST(0, $4 - \"{RATE_LIMIT_TABLE}\".\"last_seen_ms\")::double precision / 1000.0 * \"{RATE_LIMIT_TABLE}\".\"refill_per_sec\") - 1, \
-                \"capacity\" = $2, \
-                \"refill_per_sec\" = $3, \
-                \"last_seen_ms\" = $4 \
-             WHERE LEAST($2, \"{RATE_LIMIT_TABLE}\".\"tokens\" + GREATEST(0, $4 - \"{RATE_LIMIT_TABLE}\".\"last_seen_ms\")::double precision / 1000.0 * \"{RATE_LIMIT_TABLE}\".\"refill_per_sec\") >= 1.0 \
+                \"tokens\" = LEAST($2::double precision, \"{RATE_LIMIT_TABLE}\".\"tokens\" + GREATEST(0, $4::bigint - \"{RATE_LIMIT_TABLE}\".\"last_seen_ms\")::double precision / 1000.0 * \"{RATE_LIMIT_TABLE}\".\"refill_per_sec\") - 1, \
+                \"capacity\" = $2::double precision, \
+                \"refill_per_sec\" = $3::double precision, \
+                \"last_seen_ms\" = $4::bigint \
+             WHERE LEAST($2::double precision, \"{RATE_LIMIT_TABLE}\".\"tokens\" + GREATEST(0, $4::bigint - \"{RATE_LIMIT_TABLE}\".\"last_seen_ms\")::double precision / 1000.0 * \"{RATE_LIMIT_TABLE}\".\"refill_per_sec\") >= 1.0 \
              RETURNING \"tokens\""
         );
         let params = vec![Cell::Text(bucket_key), Cell::Float(capacity), Cell::Float(refill_per_sec), Cell::Int(now_ms)];
