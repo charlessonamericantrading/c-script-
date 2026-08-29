@@ -336,7 +336,7 @@ linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json
 linkc serve-all ./services --port-base 3000 --port-registry ./services/ports.json  # same shape, but read back first -- a name keeps its port forever
 linkc serve backend.link 8787 --service-api-key s3cr3t  # require X-Service-Api-Key on every non-health request
 linkc serve-all ./services --port-base 3000 --service-api-key s3cr3t --service-api-key-exempt webhooks  # every service but "webhooks" requires the header
-linkc --version                      # linkc 1.134.0 -- same version stamped in every generated file
+linkc --version                      # linkc 1.134.1 -- same version stamped in every generated file
 ```
 
 ## Verified example

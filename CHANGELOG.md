@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.134.1] - 2026-08-29
+
+### 🔧 Proceso
+**v1.134.0 quedó con CI en rojo** -- el UPSERT distribuido del rate limiter fallaba en cada request (`incorrect binary data format in bind parameter 2`), tragado en silencio por la degradación a memoria. Causa: `$2 - 1` con el literal entero `1` sin tipo hacía que Postgres infiriera `$2` como `integer`, no `double precision` -- la primera aparición de un parámetro fija su tipo para toda la sentencia. Arreglado con un cast explícito (`$2::double precision`/`$3::double precision`/`$4::bigint`) en cada aparición. De paso, la degradación silenciosa se volvió un `eprintln!` real -- útil para el diagnóstico esta vez, y para cualquier operador futuro que la vea en producción.
+
+**Verificado en CI contra Postgres real** -- el test de dos instancias que v1.134.0 no llegó a pasar (exactamente 5 admitidas compartidas, no 10) ahora sí. Suite completa sin regresiones.
+
 ## [1.134.0] - 2026-08-29
 
 ### ✨ Nuevo
