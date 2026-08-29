@@ -3625,6 +3625,171 @@ db {{ {COLLECTION}: Item[], orders_db_inspect_never_created: NeverCreated[] }}
     assert!(stdout.contains("2 colección(es) declaradas, 1 sin crear todavía, 2 fila(s) en total"), "{stdout}");
 }
 
+// GRAMMAR.md §3.185: `linkc db export`/`linkc db import` -- siguiente pieza
+// de la suite de administración de datos después de `db inspect`.
+
+/// Round-trip completo contra Postgres real: exporta filas reales
+/// (sembradas por un `linkc serve` real), resetea el esquema (simula un
+/// target fresco reusando la misma base compartida de test) e importa de
+/// vuelta -- confirma vía RPC real que el id y el Decimal sobreviven
+/// exactos.
+#[test]
+fn db_export_and_import_round_trip_against_real_postgres() {
+    const COLLECTION: &str = "items_export_import_pg";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("db-export-import-pg");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String, price: Decimal }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{
+  rpc add(name: String, price: Decimal) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, name: name, price: price }}) }}
+  rpc get(id: Int) -> Item? {{ db.{COLLECTION}.find(id) }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&link, &url);
+    server.rpc("Items/add", r#"{"name":"Widget","price":"19.9900"}"#);
+    server.rpc("Items/add", r#"{"name":"Gadget","price":"5.5000"}"#);
+    drop(server);
+
+    let export_path = temp.write("export.json", "");
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("db")
+        .arg("export")
+        .arg(&link)
+        .arg(&export_path)
+        .arg("--db")
+        .arg(&url)
+        .output()
+        .expect("ejecutar linkc db export");
+    assert!(out.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    // "Target fresco" -- reusa la misma base compartida de test, pero la
+    // tabla se dropea y recrea antes de importar, simulando un entorno
+    // nuevo sin necesitar una segunda base Postgres real.
+    reset_schema(&url, COLLECTION);
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("db")
+        .arg("import")
+        .arg(&link)
+        .arg(&export_path)
+        .arg("--db")
+        .arg(&url)
+        .output()
+        .expect("ejecutar linkc db import");
+    assert!(out.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&link, &url);
+    let fetched = server.rpc("Items/get", r#"{"id":1}"#);
+    assert_eq!(fetched["name"], serde_json::json!("Widget"), "id ORIGINAL preservado: {fetched}");
+    assert_eq!(fetched["price"], serde_json::json!("19.9900"), "Decimal exacto tras el round-trip: {fetched}");
+}
+
+/// La propiedad de resync de secuencia SOLO se puede verificar contra una
+/// secuencia Postgres real (`pg_get_serial_sequence`/`setval`) -- la
+/// emulación `sqlite_sequence` de SQLite es un mecanismo DISTINTO,
+/// verificado aparte contra SQLite real en `cli_db_import.rs`. Importa
+/// filas con ids explícitos ALTOS, después crea una fila normal vía RPC
+/// real (el camino de autoincremento real de `Db::call`) y confirma que
+/// el id nuevo no choca con ninguno importado.
+#[test]
+fn db_import_resyncs_the_postgres_sequence_so_a_normal_insert_never_collides_with_an_imported_id() {
+    const COLLECTION: &str = "items_import_resync_pg";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("db-import-resync-pg");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String }}
+db {{ {COLLECTION}: Item[] }}
+service Items {{ rpc add(name: String) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, name: name }}) }} }}
+"#
+        ),
+    );
+    let export_path = temp.write(
+        "export.json",
+        &format!(r#"{{"linkc_version":"0","exported_at":"","collections":{{"{COLLECTION}":[{{"id":500,"name":"a"}},{{"id":510,"name":"b"}}]}}}}"#),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("db")
+        .arg("import")
+        .arg(&link)
+        .arg(&export_path)
+        .arg("--db")
+        .arg(&url)
+        .output()
+        .expect("ejecutar linkc db import");
+    assert!(out.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&link, &url);
+    let created = server.rpc("Items/add", r#"{"name":"c"}"#);
+    let new_id = created["id"].as_i64().expect("id");
+    assert!(new_id > 510, "la secuencia resincronizada no debe chocar con ningún id importado: {created}");
+}
+
+/// Una colección con PK `Uuid` (GRAMMAR.md §3.177) no tiene ningún
+/// concepto de secuencia -- confirma que el import funciona igual y que
+/// `resync_id_sequence` se saltea sin error.
+#[test]
+fn db_import_a_uuid_pk_collection_against_real_postgres_needs_no_sequence_resync() {
+    const COLLECTION: &str = "leads_import_uuid_pg";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("db-import-uuid-pg");
+    let link = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Lead = {{ id: Uuid, email: String }}
+db {{ {COLLECTION}: Lead[] }}
+service Leads {{ rpc get(id: Uuid) -> Lead? {{ db.{COLLECTION}.find(id) }} }}
+"#
+        ),
+    );
+    let export_path = temp.write(
+        "export.json",
+        &format!(
+            r#"{{"linkc_version":"0","exported_at":"","collections":{{"{COLLECTION}":[{{"id":"6fe55062-2751-4ed0-b902-0820b15be183","email":"a@example.com"}}]}}}}"#
+        ),
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("db")
+        .arg("import")
+        .arg(&link)
+        .arg(&export_path)
+        .arg("--db")
+        .arg(&url)
+        .output()
+        .expect("ejecutar linkc db import");
+    assert!(out.status.success(), "stdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+    let server = Serve::start(&link, &url);
+    let fetched = server.rpc("Leads/get", r#"{"id":"6fe55062-2751-4ed0-b902-0820b15be183"}"#);
+    assert_eq!(fetched["email"], serde_json::json!("a@example.com"), "{fetched}");
+}
+
 /// GRAMMAR.md §3.174: `@unique(...) where <expr>` -- índice único compuesto
 /// PARCIAL real contra Postgres. Caso motivador citado desde el schema
 /// Drizzle de Glowapp: dos turnos con el mismo horario chocan SOLO si

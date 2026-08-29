@@ -43,8 +43,8 @@ const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Cómo se representa UN campo (que no sea `id`) de una colección en SQL --
 /// derivado una sola vez por colección, al abrir la conexión, y reusado por
 /// cada `insert`/`applyPatch`/lectura (GRAMMAR.md §3.17).
-struct ColumnPlan {
-    field: FieldType,
+pub(crate) struct ColumnPlan {
+    pub(crate) field: FieldType,
     /// Tipo de columna DDL: `"INTEGER"`, `"REAL"` o `"TEXT"`. Cuando
     /// `json` es `true` siempre es `"TEXT"`.
     sql_type: &'static str,
@@ -53,7 +53,7 @@ struct ColumnPlan {
     /// Result/Patch, o el caso `x?: T?` -- ver `for_field`). `false` => la
     /// columna guarda el valor nativo tal cual (Int/Float/String/Bool/enum
     /// simple).
-    json: bool,
+    pub(crate) json: bool,
 }
 
 impl ColumnPlan {
@@ -65,7 +65,7 @@ impl ColumnPlan {
     /// tercer estado sale gratis de `value_to_json`/`json_to_typed_value`
     /// sin ningún caso especial en el resto de este archivo -- ver
     /// `write_param`/`row_to_fields`.
-    fn for_field(field: FieldType, simple_enums: &HashSet<String>) -> Self {
+    pub(crate) fn for_field(field: FieldType, simple_enums: &HashSet<String>) -> Self {
         let double_optional = field.optional && matches!(field.ty, Type::Optional(_));
         let effective_ty: &Type = match &field.ty {
             Type::Optional(inner) => inner.as_ref(),
@@ -83,7 +83,7 @@ impl ColumnPlan {
 
     /// Qué se lee de esta columna. Se deriva del MISMO plan que decide cómo se
     /// escribe, así que lectura y escritura no pueden divergir.
-    fn kind(&self) -> ColumnKind {
+    pub(crate) fn kind(&self) -> ColumnKind {
         if self.json {
             return ColumnKind::Json;
         }
@@ -132,6 +132,28 @@ impl IdKind {
             Type::Uuid => IdKind::Uuid,
             _ => IdKind::Int,
         }
+    }
+}
+
+/// El `ColumnKind` con el que hay que decodificar/bindear la columna `"id"`
+/// -- `Int` o `Uuid` (GRAMMAR.md §3.177), según `id_kind`. Función libre
+/// (GRAMMAR.md §3.185) para que `db_admin.rs` (`linkc db export`) pueda
+/// armar el `SELECT` de la columna `"id"` sin necesitar un `Db` completo --
+/// `Db::id_column_kind` es ahora un wrapper de una línea sobre esto mismo.
+pub(crate) fn id_column_kind_for(id_kind: IdKind) -> ColumnKind {
+    match id_kind {
+        // GRAMMAR.md §3.177: `ColumnKind::Uuid`, no `Text` -- distinto de
+        // cualquier otro campo `Uuid` normal (que sí es `Text`, sin
+        // cambios). SQLite decodifica los dos exactamente igual (no tiene
+        // un tipo separado del texto), pero Postgres SÍ: la PK usa el tipo
+        // NATIVO `uuid`, cuyo formato binario de verdad (16 bytes crudos)
+        // no es el mismo que el de un `TEXT` común (los bytes UTF-8 de los
+        // 36 caracteres) -- `postgres_cell` necesita saber la diferencia
+        // para leer la columna sin reventar contra una tabla adoptada con
+        // `id` nativamente `uuid`. Ver `store.rs::Cell::to_sql` para el
+        // lado de ESCRITURA del mismo problema.
+        IdKind::Int => ColumnKind::Int,
+        IdKind::Uuid => ColumnKind::Uuid,
     }
 }
 
@@ -2459,21 +2481,7 @@ db { users: User[] }
     /// leerla -- `Int` o `Text`, según `id_kind`. Mismo `ColumnKind::Text`
     /// que ya usa cualquier otro campo `Uuid` (`ColumnPlan::kind`).
     fn id_column_kind(&self, collection: &str) -> ColumnKind {
-        match self.id_kind(collection) {
-            // GRAMMAR.md §3.177: `ColumnKind::Uuid`, no `Text` -- distinto
-            // de cualquier otro campo `Uuid` normal (que sí es `Text`, sin
-            // cambios). SQLite decodifica los dos exactamente igual (no
-            // tiene un tipo separado del texto), pero Postgres SÍ: la PK
-            // usa el tipo NATIVO `uuid`, cuyo formato binario de verdad
-            // (16 bytes crudos) no es el mismo que el de un `TEXT` común
-            // (los bytes UTF-8 de los 36 caracteres) -- `postgres_cell`
-            // necesita saber la diferencia para leer la columna sin
-            // reventar contra una tabla adoptada con `id` nativamente
-            // `uuid`. Ver `store.rs::Cell::to_sql` para el lado de
-            // ESCRITURA del mismo problema.
-            IdKind::Int => ColumnKind::Int,
-            IdKind::Uuid => ColumnKind::Uuid,
-        }
+        id_column_kind_for(self.id_kind(collection))
     }
 
     /// El `Cell` para bindear/comparar en SQL, más su representación en
@@ -2487,6 +2495,118 @@ db { users: User[] }
             Value::Uuid(s) => Ok((Cell::Text(s.clone()), s.clone())),
             other => Err(RuntimeError::new(format!("id inválido: se esperaba Int o Uuid, se encontró {other:?}"))),
         }
+    }
+
+    /// Inserta una fila con un id EXPLÍCITO -- nunca alcanzable desde el
+    /// lenguaje `.link` ni desde el intérprete (GRAMMAR.md §3.185): la
+    /// rama `"insert"` de `Db::call`, arriba, SIEMPRE autogenera (Int por
+    /// autoincremento del motor, Uuid del lado de la app) -- `omit_id_field`
+    /// (checker.rs) garantiza que ningún caller de `.link` pueda siquiera
+    /// intentar mandar un `id`. Solo `linkc db import` llama a esto,
+    /// directo desde Rust. Mismo armado de `col_names`/`params` que la rama
+    /// `"insert"` (reusa `write_param`/`Cell`/`placeholder` tal cual), con
+    /// dos diferencias: el id SIEMPRE viene del caller (nunca generado), y
+    /// no hay `RETURNING`/`last_insert_rowid()` que pedir -- ya se sabe.
+    /// A propósito SIN re-SELECT de confirmación (un import mueve miles de
+    /// filas, no una -- duplicar cada INSERT con un SELECT no tiene
+    /// beneficio acá) ni `publish` a suscriptores (un proceso `linkc db
+    /// import` de una sola corrida nunca tiene ningún `stream` conectado).
+    pub(crate) fn import_row(&self, collection: &str, id: &Value, fields: &[(String, Value)]) -> Result<(), RuntimeError> {
+        let columns = self
+            .columns
+            .get(collection)
+            .ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let (id_cell, id_display) = self.id_cell_and_display(id)?;
+        let mut col_names = vec!["\"id\"".to_string()];
+        let mut params: Vec<Cell> = vec![id_cell];
+        for col in columns {
+            let slot = fields.iter().find(|(n, _)| n == &col.field.name).map(|(_, v)| v);
+            col_names.push(format!("\"{}\"", col.field.name));
+            params.push(self.write_param(col, slot));
+        }
+        let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
+        let sql = format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "));
+        self.backend
+            .execute(&sql, &params)
+            .map_err(|e| RuntimeError::new(format!("import: '{collection}' id={id_display}: {e}")))?;
+        Ok(())
+    }
+
+    /// Resincroniza la secuencia de autoincremento de `collection` DESPUÉS
+    /// de un `import_row` con ids explícitos -- sin esto, un `insert()`
+    /// normal posterior podría chocar con un id importado (GRAMMAR.md
+    /// §3.185: ni SQLite ni Postgres avanzan su generador de ids solos
+    /// ante un INSERT que trae el id a mano). Autocorrectivo: lee el
+    /// `MAX("id")` FÍSICO de la tabla, nunca confía en lo que el caller
+    /// cree haber importado -- así que es seguro llamarlo aunque algunas
+    /// filas del import hayan fallado antes de llegar acá (nunca pasa hoy,
+    /// `run_import` aborta todo el proceso ante el primer error, pero esta
+    /// función queda correcta igual si el caller cambiara ese criterio).
+    pub(crate) fn resync_id_sequence(&self, collection: &str) -> Result<(), RuntimeError> {
+        if self.id_kind(collection) != IdKind::Int {
+            return Ok(()); // una PK Uuid no tiene ningún concepto de secuencia
+        }
+        let rows = self
+            .backend
+            .query(&format!("SELECT MAX(\"id\") FROM \"{collection}\""), &[], &[ColumnKind::Int])
+            .map_err(|e| RuntimeError::new(format!("resync de secuencia de '{collection}' falló: {e}")))?;
+        let Some(Cell::Int(max_id)) = rows.first().and_then(|r| r.first()) else {
+            return Ok(()); // tabla vacía -- MAX(id) es NULL, nada que resincronizar
+        };
+        match &self.backend {
+            Backend::Sqlite(_) => {
+                // `sqlite_sequence` solo existe para columnas `INTEGER
+                // PRIMARY KEY AUTOINCREMENT` (exactamente lo que
+                // `create_table_sql` genera para `IdKind::Int`) -- guarda
+                // el ÚLTIMO valor autoincremental usado, y SQLite lo
+                // respeta incluso tras un DELETE (a diferencia de
+                // `INTEGER PRIMARY KEY` sin `AUTOINCREMENT`, que reusaría
+                // ids libremente). `UPDATE` si ya hay fila para esta tabla
+                // (nunca la BAJA -- `seq < max_id` como guarda), `INSERT`
+                // si no hay fila todavía (el caso común: una tabla recién
+                // creada por `import` nunca hizo un insert autoincremental
+                // antes, así que `sqlite_sequence` no la conoce todavía).
+                let existing = self
+                    .backend
+                    .query("SELECT seq FROM sqlite_sequence WHERE name = ?", &[Cell::Text(collection.to_string())], &[
+                        ColumnKind::Int,
+                    ])
+                    .map_err(|e| RuntimeError::new(format!("resync de secuencia de '{collection}' falló: {e}")))?;
+                match existing.first().and_then(|r| r.first()) {
+                    Some(Cell::Int(seq)) if *seq >= *max_id => {}
+                    Some(_) => {
+                        self.backend
+                            .execute("UPDATE sqlite_sequence SET seq = ? WHERE name = ?", &[
+                                Cell::Int(*max_id),
+                                Cell::Text(collection.to_string()),
+                            ])
+                            .map_err(|e| RuntimeError::new(format!("resync de secuencia de '{collection}' falló: {e}")))?;
+                    }
+                    None => {
+                        self.backend
+                            .execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", &[
+                                Cell::Text(collection.to_string()),
+                                Cell::Int(*max_id),
+                            ])
+                            .map_err(|e| RuntimeError::new(format!("resync de secuencia de '{collection}' falló: {e}")))?;
+                    }
+                }
+            }
+            Backend::Postgres { .. } => {
+                // `pg_get_serial_sequence` en vez de hardcodear
+                // `"<tabla>_id_seq"` (el nombre por default de una columna
+                // `BIGSERIAL`, `postgres_emit.rs`) -- la forma oficial y a
+                // prueba de quoting de resolver la secuencia real de una
+                // columna serial.
+                self.backend
+                    .execute("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)", &[
+                        Cell::Text(format!("\"{collection}\"")),
+                        Cell::Int(*max_id),
+                    ])
+                    .map_err(|e| RuntimeError::new(format!("resync de secuencia de '{collection}' falló: {e}")))?;
+            }
+        }
+        Ok(())
     }
 
     /// `all` (`id: None`, ordenado por "id" para output determinístico,
@@ -3033,24 +3153,38 @@ db { users: User[] }
     /// principal del accept-loop, server.rs) que nombra la colección y el
     /// campo.
     fn row_to_fields(&self, collection: &str, cells: &[Cell], columns: &[ColumnPlan]) -> Result<Vec<(String, Value)>, RuntimeError> {
-        let mut out = Vec::with_capacity(columns.len() + 1);
-        // GRAMMAR.md §3.177: `id` es `Cell::Int` para una PK autoincremento
-        // o `Cell::Text` para una PK `Uuid` -- `id_column_kind` ya le pidió
-        // al SELECT que decodifique esta columna acorde (`select_rows`), así
-        // que la forma que llega acá siempre coincide con `id_kind`.
-        let (id_field, id_display) = match (self.id_kind(collection), cells.first()) {
-            (IdKind::Int, Some(Cell::Int(n))) => (Value::Int(*n), n.to_string()),
-            (IdKind::Uuid, Some(Cell::Text(s))) => (Value::Uuid(s.clone()), s.clone()),
-            _ => panic!(
-                "la columna 'id' de '{collection}' no matchea su IdKind ({:?}): llegó {:?}",
-                self.id_kind(collection),
-                cells.first()
-            ),
-        };
-        out.push(("id".to_string(), id_field));
-        let id = &id_display;
+        decode_row(collection, cells, columns, self.id_kind(collection), &self.checker)
+    }
+}
 
-        let null_but_required = |field_name: &str| {
+/// Cuerpo real de `Db::row_to_fields`, extraído a función libre (GRAMMAR.md
+/// §3.185) para que `db_admin.rs` (`linkc db export`) pueda decodificar filas
+/// leídas con su PROPIO `Backend` de solo lectura, sin necesitar un `Db`
+/// completo (que siempre corre DDL al construirse -- ver `db_admin.rs` para
+/// el porqué de fondo). Único punto de verdad para "cómo se convierte una
+/// fila cruda de vuelta a `Value`" -- `Db::row_to_fields` es ahora un
+/// wrapper de una línea sobre esto mismo.
+pub(crate) fn decode_row(
+    collection: &str,
+    cells: &[Cell],
+    columns: &[ColumnPlan],
+    id_kind: IdKind,
+    checker: &Checker,
+) -> Result<Vec<(String, Value)>, RuntimeError> {
+    let mut out = Vec::with_capacity(columns.len() + 1);
+    // GRAMMAR.md §3.177: `id` es `Cell::Int` para una PK autoincremento
+    // o `Cell::Text` para una PK `Uuid` -- `id_column_kind` ya le pidió
+    // al SELECT que decodifique esta columna acorde (`select_rows`), así
+    // que la forma que llega acá siempre coincide con `id_kind`.
+    let (id_field, id_display) = match (id_kind, cells.first()) {
+        (IdKind::Int, Some(Cell::Int(n))) => (Value::Int(*n), n.to_string()),
+        (IdKind::Uuid, Some(Cell::Text(s))) => (Value::Uuid(s.clone()), s.clone()),
+        _ => panic!("la columna 'id' de '{collection}' no matchea su IdKind ({id_kind:?}): llegó {:?}", cells.first()),
+    };
+    out.push(("id".to_string(), id_field));
+    let id = &id_display;
+
+    let null_but_required = |field_name: &str| {
             RuntimeError::new(format!(
                 "la colección '{collection}' tiene una fila (id={id}) con NULL en '{field_name}', pero el programa actual \
                  declara ese campo requerido (no `T?` ni `x?: T`) -- típico tras una migración de PostgreSQL, que siempre \
@@ -3087,7 +3221,7 @@ db { users: User[] }
                         // dar el mismo `RuntimeError` limpio que el resto de
                         // esta función ya usa para "el schema declarado no
                         // coincide con lo que hay guardado".
-                        let decoded = json_to_typed_value(parsed, &col.field.ty, &self.checker, &col.field.name).map_err(|e| {
+                        let decoded = json_to_typed_value(parsed, &col.field.ty, checker, &col.field.name).map_err(|e| {
                             RuntimeError::new(format!(
                                 "la colección '{collection}' tiene una fila (id={id}) con un JSON guardado en '{}' que no coincide con el tipo declarado actual: {e} -- típico tras evolucionar el tipo de un campo anidado (`--adopt-existing` o una migración de esquema); esa fila se guardó con una forma anterior",
                                 col.field.name
@@ -3165,8 +3299,9 @@ db { users: User[] }
             }
         }
         Ok(out)
-    }
+}
 
+impl Db {
     /// Valor a bindear para `col`, dado el valor del `Value::Struct` de entrada
     /// en esa clave (`None` si la clave está ausente -- solo alcanzable si
     /// `col.field.optional`, ver `ColumnPlan`). Inversa de `row_to_fields`.

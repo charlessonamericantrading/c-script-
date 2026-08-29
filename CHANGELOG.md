@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.141.0] - 2026-08-30
+
+### ✨ Nuevo
+**`linkc db export`/`linkc db import`** -- siguiente pieza de la suite de administración de datos (PLAN.md §9.7 ítem 2), después de `linkc db inspect` (§3.175). `export` vuelca cada colección declarada a un solo archivo JSON, byte-idéntico al wire real (mismo `value_to_json` que `db.<c>.all()` ya usa por HTTP); `import` lo lee de vuelta contra un target SQLite o PostgreSQL, PRESERVANDO el id original de cada fila. `seed` no necesitó su propia pieza -- importar contra un target vacío YA ES ese caso, mismo mecanismo. Solo `linkc db shell` (un REPL interactivo, mucho más difícil de verificar de forma no interactiva) queda pendiente.
+
+- `export` nunca ejecuta DDL ni construye un `Db` completo (que siempre migra el esquema al conectar) -- lector propio, mismo espíritu que `db inspect`: una tabla faltante es "0 filas", nunca un error. Nunca filtra `@softDelete` -- mueve TODA fila física, mismo criterio que `db inspect`/`db.tableStats()`.
+- `import` conecta con el camino NORMAL de conexión (`CREATE TABLE IF NOT EXISTS` idempotente) -- cubre "target vacío" (el caso `seed`) y "target ya servido antes" (cruce de entornos) con un solo código. Un mecanismo nuevo, solo Rust y nunca alcanzable desde `.link`, escribe cada fila con su id EXPLÍCITO preservado, y resincroniza la secuencia de autoincremento de cada backend después (SQLite: `sqlite_sequence`; Postgres: `setval`/`pg_get_serial_sequence`) para que un `insert()` normal posterior nunca choque con un id importado.
+- `@validate`/`@check` de nivel tipo se saltean a propósito en `import` (las restricciones de base -- `CHECK`/`UNIQUE` -- siguen activas siempre): una restauración cruda de datos que ya eran válidos no debería bloquearse por un validador de flujo de trabajo específico de la app. Un choque de id cancela y revierte TODO el import, sin dejar nada a medias -- sin modo overwrite/skip en v0.
+
+**Verificado**: 14 tests nuevos (6 de CLI contra el binario real para `export`, 5 para `import` -- incluye el caso seed con secuencia resincronizada confirmada vía un insert normal posterior, cruce de entornos idempotente, y choque de id revirtiendo todo -- más 3 contra Postgres real, incluido el resync de secuencia real). Suite completa (1392 tests) sin regresiones. Ver GRAMMAR.md §3.185.
+
 ## [1.140.2] - 2026-08-29
 
 ### 🐛 Arreglado

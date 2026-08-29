@@ -206,6 +206,7 @@
   - [3.182 Escritura de `Timestamp` contra `date`/`timestamp`/`timestamptz` NATIVOS de Postgres — RESUELTO](#3182-escritura-de-timestamp-contra-datetimestamptimestamptz-nativos-de-postgres--resuelto)
   - [3.183 `link.lock` como pin real de dependencias git + locking entre procesos — RESUELTO](#3183-linklock-como-pin-real-de-dependencias-git--locking-entre-procesos--resuelto)
   - [3.184 `Decimal`: tipo numérico de precisión exacta (punto fijo, 4 decimales) — RESUELTO](#3184-decimal-tipo-numérico-de-precisión-exacta-punto-fijo-4-decimales--resuelto)
+  - [3.185 `linkc db export`/`linkc db import` — RESUELTO PARCIAL](#3185-linkc-db-exportlinkc-db-import--resuelto-parcial)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6796,6 +6797,60 @@ service Products {
 **Verificado**: 6 tests nuevos en `checker.rs` (conversión ida y vuelta, receptor/argumentos inválidos en `.toDecimal()`, sin mezcla implícita con `Float`/`Int` en aritmética ni comparaciones, aritmética y comparaciones entre dos `Decimal`, `%` rechazado con mensaje claro, `@check(min/max/range)` sobre un campo `Decimal`). 13 tests nuevos en `runtime/mod.rs` (formateo/parseo del wire string, `div_round` con empates -- incluidos negativos -- y no-empates, aritmética checked de las 4 operaciones con overflow y división por cero limpios, construcción desde `Int`/`Float` con NaN/Infinity rechazados, más un test de integración de punta a punta contra SQLite real: insert/find/round-trip exacto/multiplicación calculada/`applyPatch`/`sumBy`). 8 tests nuevos en `runtime/store.rs` (ida y vuelta del codec binario `NUMERIC` de Postgres: un valor típico, cero con la convención de Postgres de cero dígitos, negativo, solo fracción, un entero que omite el dígito fraccionario cero, un entero grande multi-chunk, redondeo correcto al decodificar más de 4 decimales, NaN/Infinity rechazados limpio). 2 tests nuevos en `pg_integration.rs` contra Postgres real (columna `numeric(12,2)` ADOPTADA -- lectura y escritura confirmadas con SQL crudo `::text`, el caso real de MyFinance; una tabla GENERADA por c-script de punta a punta con `sumBy`/`maxRow`/`minRow` reales y el DDL confirmado como `NUMERIC(38,4)` real vía `information_schema`). Suite completa (1066 tests de biblioteca + toda la matriz de integración) sin regresiones.
 
 ---
+
+### 3.185 `linkc db export`/`linkc db import` — RESUELTO PARCIAL
+
+PLAN.md §9.7 ítem 2 pedía una suite completa (`inspect`/`shell`/`export`/`import`/`seed`) -- §3.175 ya había resuelto `inspect`; esta ronda cierra `export`/`import`, elegidos explícitamente por el usuario sobre `shell` (un REPL interactivo, mucho más difícil de verificar de forma no interactiva con la disciplina de este proyecto de correr el binario real). `seed` no necesita su propia pieza: importar contra un target vacío YA ES ese caso, mismo mecanismo -- así que esta ronda cierra 3 de los 4 ítems que quedaban. `shell` sigue pendiente, para una ronda aparte.
+
+<!-- linkc:check -->
+```link
+type Item = { id: Int, name: String, price: Decimal }
+type NewItem = { name: String, price: Decimal }
+db { items: Item[] }
+service Items {
+  rpc add(name: String, price: Decimal) -> Item { db.items.insert(NewItem { name: name, price: price }) }
+}
+```
+
+```
+$ linkc db export app.link export.json --db app.db
+linkc db export -- 'app.link' contra SQLite embebido en 'app.db' -> 'export.json'
+
+  items  2 fila(s)
+
+1 colección(es), 2 fila(s) en total exportadas
+
+$ linkc db import app.link export.json --db staging.db
+linkc db import -- 'export.json' contra SQLite embebido en 'staging.db'
+
+  items  2 fila(s) importadas
+
+1 colección(es), 2 fila(s) en total importadas
+```
+
+**`export`: lector propio, sin DDL, nunca `Db` completo.** `Db::new_with_options(..., adopt_existing=true)` -- la alternativa obvia para "conectar sin migrar" -- panickea apenas UNA colección declarada no tiene tabla física todavía (`check_schema_for_adoption`), exactamente el caso normal que §3.175 existe para tratar como estado normal, no error. Por eso `export` usa su propio lector (`src/db_admin.rs`, mismo espíritu que `inspect.rs`): SQLite abre `SQLITE_OPEN_READ_ONLY`, Postgres arma un `Backend` a mano (sin `Db`, sin hilo LISTEN/NOTIFY, sin tabla de rate-limit), y una tabla faltante es "0 filas", nunca un error. `select_rows` (el camino de `all()`) NO se reusa tal cual -- filtra `@softDelete`, correcto para un rpc normal, incorrecto para un backup/migración, que tiene que mover TODA fila física (mismo criterio que `db.tableStats()`/`db inspect`: verdad física, a propósito distinto de `count()`/`all()`).
+
+**Decodificación de fila reusada, no duplicada.** El cuerpo de `Db::row_to_fields` se extrajo a una función libre, `pub(crate) fn decode_row(collection, cells, columns, id_kind, checker)` (`runtime/db.rs`) -- `Db::row_to_fields` quedó como wrapper de una línea sobre esto mismo. `export` la llama directo, sin necesitar un `Db`. Mismo movimiento para `id_column_kind` -> `id_column_kind_for(id_kind)`. `ColumnPlan`/`ColumnPlan::for_field`/`ColumnPlan::kind` pasaron de privado a `pub(crate)` -- mismo criterio ya usado para `sqlite_table_exists`/`existing_columns` al construir `inspect.rs`.
+
+**Formato**: un solo JSON con TODAS las colecciones declaradas (arrays vacíos incluidos para las que no tienen tabla física todavía -- el archivo es una foto completa del `.link` actual, no solo lo que tenía datos). Cada fila = `value_to_json(&Value::Struct(decode_row(...)), &simple_enums)` -- la MISMA función que `db.<c>.all()` ya usa para responder por HTTP, byte-idéntica al wire real (Decimal como string de 4 decimales, Uuid canónico, Timestamp ISO-8601, todo gratis, sin encoding paralelo que pueda divergir). `linkc_version` es puramente informativo, nunca se compara contra el binario corriendo.
+
+**`import`: conecta con `Db::new`/`connect_postgres_for_testing` NORMAL, nunca `adopt_existing` -- esto cubre "target vacío" (el caso `seed`) y "target ya servido antes" (cruce de entornos) con un solo camino.** `create_table_sql`/`create_postgres_table_sql` son `CREATE TABLE IF NOT EXISTS`; `check_schema_matches`/`alter_table_add_column_postgres` son no-ops reales contra un esquema que ya coincide. Un target vacío recibe su esquema y sigue derecho a los datos -- sin código separado para "seed".
+
+**Escritura con id EXPLÍCITO -- mecanismo nuevo, solo Rust, nunca alcanzable desde `.link`.** `Db::import_row` (nuevo, `runtime/db.rs`) reusa `write_param`/`Cell`/`placeholder` de la rama `"insert"` existente, con dos diferencias: el id siempre lo trae el caller (nunca se genera) y no hay `RETURNING`/`last_insert_rowid()` que pedir. Decodificación CAMPO POR CAMPO, nunca vía `Type::Struct{name: Some(...)}` -- esto es lo que evita `@validate`/`@check` de nivel tipo a propósito (esa rama de `json_to_typed_value` solo dispara esos validadores cuando decodifica el struct NOMBRADO completo, el camino de borde para input de cliente no confiable). Exactamente equivalente, por construcción, a lo que `insertMany` ya prueba seguro (`Db::call(&coll, "insert", vec![Value::Struct(fields)])` con un struct ya armado). Las restricciones de BASE (`CHECK`/`UNIQUE` de la DDL) siguen aplicando siempre -- las impone el propio `INSERT`.
+
+**Resincronización de secuencia post-import -- el gap real que un id explícito abre.** `Db::resync_id_sequence` (nuevo), corrido una vez por colección después de que todas sus filas aterrizaron, autocorrectivo (lee el `MAX("id")` físico). SQLite usa `INTEGER PRIMARY KEY AUTOINCREMENT`, que respeta `sqlite_sequence` incluso tras un DELETE -- sin resync, un `insert()` normal posterior podía chocar con un id importado; `UPDATE`/`INSERT` sobre `sqlite_sequence` según si ya había fila para esa tabla. Postgres usa `BIGSERIAL` -- `setval(pg_get_serial_sequence(...), max_id)`, resolviendo el nombre real de la secuencia en vez de hardcodear `"<tabla>_id_seq"`. Se salta para `IdKind::Uuid` (sin concepto de secuencia) y para una colección sin filas importadas. Corre DENTRO de la misma transacción que los inserts (`with_exclusive_connection`/`begin_transaction`/`commit_transaction`/`rollback_transaction`, mismas piezas que `transaction { }` usa).
+
+**Choque de id -- falla todo y deshace, sin overwrite/skip en v0.** Un `INSERT` con un id que ya existe dispara la violación de PK del motor; todo el import se cancela y revierte -- mismo criterio de "fallar limpio y ruidoso" que `check_schema_for_adoption` ya establece. Una colección desconocida en el archivo (una key que el `.link` actual no declara) se valida ANTES de conectar siquiera con el target (no solo antes de escribir una fila) -- si el error saliera después de conectar, "nada se escribió" sería impreciso: `Db::new`/`connect_postgres_for_testing` ya corren su DDL idempotente al conectar.
+
+**Límites honestos, deliberados**:
+- Sin FK/referencias entre colecciones en el lenguaje -> `import` procesa cada colección de forma independiente, sin ningún orden de dependencia -- es responsabilidad del operador si su propio modelo de datos asume cierto orden.
+- `@validate`/`@check` de nivel tipo del CUERPO de una colección se saltean a propósito en `import` (las restricciones de base -- `CHECK`/`UNIQUE` -- siguen activas siempre). Una restauración cruda de datos que ya eran válidos cuando se escribieron no debería bloquearse por un validador de flujo de trabajo específico de la app.
+- Sin modo overwrite/skip ante un choque de id -- todo o nada. Un futuro `--overwrite`/`--skip-existing` queda aditivo, sin diseñar todavía.
+- Una transacción para la corrida entera -- todo-o-nada por diseño, a costa de un candado exclusivo sostenido por toda la duración del import. Aceptable para una herramienta de CLI en lote; un límite real para un dataset gigantesco, sin commit por chunks.
+- `linkc_version` en el archivo es puramente informativo, nunca se compara contra el binario corriendo.
+- **`linkc db shell` sigue pendiente** -- PLAN.md §9.7 ítem 2, para una ronda aparte.
+
+**Verificado**: 6 tests de CLI contra el binario real (`cli_db_export.rs` -- una `.db` inexistente exporta arrays vacíos, una base real poblada por `linkc serve` exporta filas físicas incluida una soft-deleted, una colección declarada pero nunca creada exporta vacío, el export calza byte a byte contra la respuesta RPC real de `all()`, casos de uso limpios) + 5 (`cli_db_import.rs` -- caso seed contra un target vacío con id original preservado y secuencia resincronizada confirmada vía un insert normal posterior, cruce de entornos idempotente sin perder filas previas, choque de id revierte TODO sin dejar nada a medias, colección desconocida no toca ni el archivo `.db`, caso de uso limpio) + 3 contra Postgres real en `pg_integration.rs` (round-trip completo con Decimal exacto, resync de secuencia real confirmado con un insert normal tras importar ids altos, colección con PK `Uuid` sin necesitar resync). Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

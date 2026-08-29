@@ -143,6 +143,8 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
     out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'; con --target-url/LINK_DOCTOR_TARGET_URL, además compara la versión local contra la de un 'linkc serve' real corriendo ahí, vía /health)"));
     out(&format!("     linkc db inspect <archivo.link> [--db <url|archivo>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor')"));
+    out(&format!("     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>] (vuelca cada colección declarada a un archivo JSON, byte-idéntico al wire real -- sin ejecutar ningún DDL)"));
+    out(&format!("     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] (escribe las filas de un archivo de 'db export' contra un target, preservando el id original de cada fila -- un target vacío ES el caso 'seed')"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
     out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)"));
     out(&format!("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {{\"nombre_archivo\": puerto, ...}} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)"));
@@ -581,15 +583,19 @@ fn cmd_doctor(args: &[String]) -> ExitCode {
     }
 }
 
-/// `linkc db <sub-subcomando>` (GRAMMAR.md §3.175, PLAN.md §9.7 ítem 2) --
-/// solo `inspect` existe por ahora; `shell`/`export`/`import`/`seed` quedan
-/// para rondas futuras, así que el mensaje de uso solo anuncia lo que de
-/// verdad está implementado.
+/// `linkc db <sub-subcomando>` (GRAMMAR.md §3.175/§3.185, PLAN.md §9.7 ítem
+/// 2) -- `inspect`/`export`/`import` existen; `shell`/`seed` quedan para
+/// rondas futuras (`seed` en rigor no necesita su propia pieza: importar
+/// contra un target vacío YA ES ese caso, mismo mecanismo).
 fn cmd_db(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("inspect") => cmd_db_inspect(&args[1..]),
+        Some("export") => cmd_db_export(&args[1..]),
+        Some("import") => cmd_db_import(&args[1..]),
         _ => {
-            eprintln!("uso: linkc db inspect <archivo.link> [--db <url|archivo>]");
+            eprintln!(
+                "uso: linkc db inspect <archivo.link> [--db <url|archivo>]\n     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>]\n     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>]"
+            );
             ExitCode::FAILURE
         }
     }
@@ -654,6 +660,123 @@ fn cmd_db_inspect(args: &[String]) -> ExitCode {
         println!("  {:<name_width$}  {} columna(s) declaradas  {}", s.name, s.declared_columns, status);
     }
     println!("\n{} colección(es) declaradas, {} sin crear todavía, {total_rows} fila(s) en total", statuses.len(), missing);
+    ExitCode::SUCCESS
+}
+
+/// `linkc db export <archivo.link> <archivo.json> [--db <url|archivo>]` --
+/// vuelca cada colección declarada a un solo archivo JSON, byte-idéntico
+/// al wire real (GRAMMAR.md §3.185). Nunca ejecuta DDL, mismo espíritu de
+/// solo lectura que `db inspect`.
+fn cmd_db_export(args: &[String]) -> ExitCode {
+    let (Some(path), Some(out_path)) = (args.first(), args.get(1)) else {
+        eprintln!("uso: linkc db export <archivo.link> <archivo.json> [--db <url|archivo>]");
+        return ExitCode::FAILURE;
+    };
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let source = match resolve_db_source(path, args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("configuración de base de datos inválida: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (label, result) = match &source {
+        runtime::server::DbSource::SqliteFile(db_path) => {
+            (format!("SQLite embebido en '{}'", display_path(db_path)), linkc::db_admin::export_sqlite(&program, db_path))
+        }
+        runtime::server::DbSource::Postgres(url) => {
+            (format!("PostgreSQL ({})", redact_url_credentials(url)), linkc::db_admin::export_postgres(&program, url))
+        }
+    };
+    let file = match result {
+        Ok(f) => f,
+        Err(msg) => {
+            eprintln!("no se pudo exportar la base: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let json = match serde_json::to_string_pretty(&file) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("no se pudo serializar el export: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = std::fs::write(out_path, json) {
+        eprintln!("no se pudo escribir '{out_path}': {e}");
+        return ExitCode::FAILURE;
+    }
+    let mut names: Vec<&String> = file.collections.keys().collect();
+    names.sort();
+    let total_rows: usize = file.collections.values().map(|rows| rows.len()).sum();
+    println!("linkc db export -- '{path}' contra {label} -> '{out_path}'\n");
+    for name in &names {
+        println!("  {name}  {} fila(s)", file.collections[*name].len());
+    }
+    println!("\n{} colección(es), {total_rows} fila(s) en total exportadas", names.len());
+    ExitCode::SUCCESS
+}
+
+/// `linkc db import <archivo.link> <archivo.json> [--db <url|archivo>]` --
+/// lee un archivo generado por `db export` y escribe sus filas contra un
+/// target SQLite o PostgreSQL, PRESERVANDO el id original de cada fila
+/// (GRAMMAR.md §3.185). Un target vacío ES el caso "seed" -- mismo camino,
+/// sin flag aparte. Un choque de id (o cualquier otro error) cancela y
+/// revierte TODO el import, nunca deja datos a medias.
+fn cmd_db_import(args: &[String]) -> ExitCode {
+    let (Some(path), Some(in_path)) = (args.first(), args.get(1)) else {
+        eprintln!("uso: linkc db import <archivo.link> <archivo.json> [--db <url|archivo>]");
+        return ExitCode::FAILURE;
+    };
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let raw = match std::fs::read_to_string(in_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("no se pudo leer '{in_path}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let file: linkc::db_admin::ExportFile = match serde_json::from_str(&raw) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("'{in_path}' no es un archivo de export válido: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let source = match resolve_db_source(path, args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("configuración de base de datos inválida: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (label, result) = match &source {
+        runtime::server::DbSource::SqliteFile(db_path) => {
+            (format!("SQLite embebido en '{}'", display_path(db_path)), linkc::db_admin::import_sqlite(&program, db_path, &file))
+        }
+        runtime::server::DbSource::Postgres(url) => {
+            (format!("PostgreSQL ({})", redact_url_credentials(url)), linkc::db_admin::import_postgres(&program, url, &file))
+        }
+    };
+    let report = match result {
+        Ok(r) => r,
+        Err(msg) => {
+            eprintln!("no se pudo importar: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let total_rows: usize = report.iter().map(|(_, n)| n).sum();
+    println!("linkc db import -- '{in_path}' contra {label}\n");
+    for (name, n) in &report {
+        println!("  {name}  {n} fila(s) importadas");
+    }
+    println!("\n{} colección(es), {total_rows} fila(s) en total importadas", report.len());
     ExitCode::SUCCESS
 }
 

@@ -7,7 +7,7 @@ pub mod db;
 pub mod server;
 pub mod session;
 pub(crate) mod store;
-mod timestamp;
+pub(crate) mod timestamp;
 
 use crate::ast::*;
 use db::Db;

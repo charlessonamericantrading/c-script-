@@ -64,6 +64,10 @@ pub mod migrate;
 // puede vivir en el build wasm32 del playground.
 #[cfg(feature = "runtime")]
 pub mod inspect;
+// Mismo motivo que `inspect` arriba: `linkc db export`/`linkc db import`
+// (GRAMMAR.md §3.185) hablan SQLite/PostgreSQL de verdad.
+#[cfg(feature = "runtime")]
+pub mod db_admin;
 pub mod scaffold;
 pub mod token;
 pub mod types;
