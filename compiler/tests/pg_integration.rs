@@ -1408,6 +1408,21 @@ service Sys {
 }
 "#;
 
+/// Ventana larga a propósito -- para el test de concurrencia real (16
+/// requests repartidas entre dos procesos, cada una compitiendo por el
+/// LOCK de fila del mismo bucket): con una ventana corta, el tiempo real
+/// que tarda una ráfaga serializada por lock contention en CI podría
+/// acumular refill suficiente para admitir de más, un falso negativo que
+/// no tiene nada que ver con si el bucket está de verdad compartido. Con
+/// `5/60s` (refill ~0.083/s), ni varios segundos de ejecución real
+/// alcanzan para sumar un token entero de más.
+const RATE_LIMIT_PROGRAM_LONG_WINDOW: &str = r#"
+service Sys {
+  @rate_limit("5/60s")
+  rpc ping() -> String { "pong" }
+}
+"#;
+
 /// `POST <url>` -- devuelve el status HTTP real (200/429/...), sin
 /// panickear ante un no-2xx (a diferencia de `Serve::rpc`, que sí lo hace
 /// -- acá el punto es justamente poder ver un 429 real sin abortar el test).
@@ -1421,8 +1436,8 @@ fn post_status(url: &str, body: &str) -> u16 {
 
 #[test]
 fn distributed_rate_limit_shares_one_bucket_across_two_real_server_instances() {
-    // El punto entero de GRAMMAR.md §3.178: `@rate_limit("5/2s")` tiene que
-    // limitar a 5 requests cada 2s TOTAL entre las dos instancias, no 5 por
+    // El punto entero de GRAMMAR.md §3.178: `@rate_limit("5/60s")` tiene
+    // que limitar a 5 requests TOTAL entre las dos instancias, no 5 por
     // instancia (10 en total) -- que es exactamente lo que pasaría con el
     // `RateLimiter` en memoria de siempre, cada uno con su propio HashMap.
     let Some(url) = pg_url() else {
@@ -1440,8 +1455,8 @@ fn distributed_rate_limit_shares_one_bucket_across_two_real_server_instances() {
 
     let temp_a = TempDir::new("rate-limit-distributed-a");
     let temp_b = TempDir::new("rate-limit-distributed-b");
-    let link_a = temp_a.write("app.link", RATE_LIMIT_PROGRAM);
-    let link_b = temp_b.write("app.link", RATE_LIMIT_PROGRAM);
+    let link_a = temp_a.write("app.link", RATE_LIMIT_PROGRAM_LONG_WINDOW);
+    let link_b = temp_b.write("app.link", RATE_LIMIT_PROGRAM_LONG_WINDOW);
     // Arrancan una atrás de otra: la primera crea la tabla interna (sin
     // --adopt-existing), la segunda la encuentra ya creada -- las dos
     // terminan con `distributed_rate_limit = true` de todos modos
@@ -1465,7 +1480,12 @@ fn distributed_rate_limit_shares_one_bucket_across_two_real_server_instances() {
 
     let admitted = statuses.iter().filter(|&&s| s == 200).count();
     let rejected = statuses.iter().filter(|&&s| s == 429).count();
-    assert_eq!(admitted, 5, "capacidad compartida entre las dos instancias: exactamente 5 admitidas, no 5 por instancia. statuses={statuses:?}");
+    assert_eq!(
+        admitted, 5,
+        "capacidad compartida entre las dos instancias: exactamente 5 admitidas, no 5 por instancia. statuses={statuses:?}\n\
+         stderr A: {}\nstderr B: {}",
+        server_a.stderr(), server_b.stderr()
+    );
     assert_eq!(rejected, REQUESTS_PER_SERVER * 2 - 5, "el resto tiene que ser 429, nunca otro status: statuses={statuses:?}");
 }
 

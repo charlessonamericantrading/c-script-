@@ -1771,7 +1771,15 @@ db { users: User[] }
         // llegar hasta acá.
         match self.backend.query(&sql, &params, &[ColumnKind::Float]) {
             Ok(rows) => Some(!rows.is_empty()),
-            Err(_) => None,
+            Err(e) => {
+                // Visible, no silenciosa -- degradarse al limitador en
+                // memoria sin ningún rastro sería exactamente el tipo de
+                // landmine que GRAMMAR.md ya viene documentando (§3.153):
+                // un límite MÁS DÉBIL de lo prometido, sin ningún error
+                // que lo señale hasta que alguien lo note en producción.
+                eprintln!("advertencia: rate limit distribuido falló ({e}) -- esta request usó el limitador en memoria de este proceso");
+                None
+            }
         }
     }
 
