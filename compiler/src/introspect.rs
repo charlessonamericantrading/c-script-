@@ -9,14 +9,14 @@
 //! suelto). El resultado es un PUNTO DE PARTIDA para revisar a mano, no un
 //! `.link` listo para producción sin mirarlo: cualquier columna que este
 //! módulo no pueda mapear con confianza (JSONB de forma desconocida, un
-//! `uuid`, un `time` sin fecha) se emite igual, como `String`, con un
-//! comentario `/* TODO */` al lado que dice exactamente qué hace falta
-//! revisar -- nunca se omite una columna en silencio. `date`/`timestamp`/
-//! `timestamptz` NATIVOS de Postgres SÍ mapean con confianza a `Timestamp`
-//! (sin advertencia) desde GRAMMAR.md §3.91 -- antes de esa ronda mapeaban a
-//! `String` con advertencia, un mapeo que en los hechos estaba ROTO (ni
-//! `String` ni `Timestamp` decodificaban una columna así contra una fila
-//! real).
+//! `time` sin fecha) se emite igual, como `String`, con un comentario
+//! `/* TODO */` al lado que dice exactamente qué hace falta revisar -- nunca
+//! se omite una columna en silencio. `date`/`timestamp`/`timestamptz`
+//! (GRAMMAR.md §3.91) y `uuid`/`inet`/`cidr` (§3.179) NATIVOS de Postgres SÍ
+//! mapean con confianza (sin advertencia) -- los tres empezaron como "String
+//! con advertencia" y resultaron ROTOS en los hechos (ni `String` ni el tipo
+//! "obvio" decodificaban esa columna contra una fila real) hasta que una
+//! ronda dedicada verificó el binario real y lo arregló.
 //!
 //! Los nombres de campo son los nombres REALES de columna SQL, `snake_case`
 //! incluido -- c-script no tiene ningún mecanismo de alias campo->columna
@@ -52,19 +52,23 @@ fn map_pg_type(pg_type: &str, column_name: &str) -> (&'static str, Option<String
         "boolean" => ("Bool", None),
         "double precision" | "real" | "numeric" => ("Float", None),
         "text" | "character varying" | "character" | "citext" => ("String", None),
-        // NO se mapea a `Uuid` (GRAMMAR.md §3.70) a propósito -- ese tipo sí
-        // existe, pero decodificar un `uuid` NATIVO de Postgres contra un
-        // campo `Uuid`/`String` no está verificado (mismo tipo de mapeo
-        // "parece obvio, nunca se probó contra una fila real" que resultó
-        // roto para `date`/`timestamp`, GRAMMAR.md §3.91) -- queda como
-        // `String` con advertencia hasta auditarlo aparte.
-        "uuid" => (
-            "String",
-            Some(format!(
-                "'{column_name}' es uuid -- se mapea a String; el tipo 'Uuid' nativo de c-script (GRAMMAR.md §3.70) \
-                 existe, pero decodificarlo contra un uuid NATIVO de Postgres no está verificado todavía, revisar a mano"
-            )),
-        ),
+        // GRAMMAR.md §3.179: hasta antes de esa ronda, un `uuid` NATIVO de
+        // Postgres contra un campo `Uuid`/`String` no estaba verificado
+        // (mismo tipo de mapeo "parece obvio, nunca se probó contra una
+        // fila real" que resultó roto para `date`/`timestamp`, §3.91).
+        // Reporte de adopción real (iaacademy, vía skynet-43) confirmó el
+        // gap Y motivó el fix -- `postgres_string_cell`/`Cell::to_sql`
+        // (runtime/store.rs) ahora decodifican/codifican el binario real
+        // de `uuid`. Mapeo EXACTO, sin advertencia -- mismo criterio que
+        // `timestamp`/`date` de acá abajo.
+        "uuid" => ("Uuid", None),
+        // GRAMMAR.md §3.179: mismo fix, mismo criterio -- `inet`/`cidr`
+        // ahora decodifican/codifican de verdad contra un campo `String`
+        // (`PgInetText`/`inet_string_to_binary`, runtime/store.rs). Sin
+        // sufijo "/N" para una IP sin máscara real (el caso normal, una
+        // IP de cliente guardada tal cual), con él si la columna de
+        // verdad tiene una máscara distinta del ancho completo.
+        "inet" | "cidr" => ("String", None),
         "jsonb" | "json" => (
             "String",
             Some(format!(
@@ -257,12 +261,31 @@ mod tests {
     }
 
     #[test]
-    fn map_pg_type_flags_jsonb_and_uuid_with_a_warning() {
+    fn map_pg_type_flags_jsonb_with_a_warning() {
         assert!(map_pg_type("jsonb", "meta").1.is_some());
-        assert!(map_pg_type("uuid", "external_id").1.is_some());
-        // Los dos siguen dando un tipo VÁLIDO (String) -- nunca se omite la
-        // columna del .link generado, aunque necesite revisión.
+        // Sigue dando un tipo VÁLIDO (String) -- nunca se omite la columna
+        // del .link generado, aunque necesite revisión.
         assert_eq!(map_pg_type("jsonb", "meta").0, "String");
+    }
+
+    /// GRAMMAR.md §3.179: `uuid`/`inet`/`cidr` NATIVOS de Postgres
+    /// decodifican/codifican de verdad (`postgres_string_cell`/
+    /// `Cell::to_sql`, runtime/store.rs) desde esta ronda -- mapeo EXACTO,
+    /// sin advertencia, mismo criterio que `timestamp`/`date` arriba.
+    /// Antes de esta ronda `uuid` mapeaba a `String` con advertencia
+    /// ("no está verificado todavía"), e `inet`/`cidr` caían en el
+    /// catch-all genérico -- reporte de adopción real (iaacademy, vía
+    /// skynet-43) confirmó el gap y motivó el fix.
+    #[test]
+    fn map_pg_type_maps_native_uuid_inet_and_cidr_without_a_warning() {
+        let (mapped, warning) = map_pg_type("uuid", "external_id");
+        assert_eq!(mapped, "Uuid");
+        assert!(warning.is_none(), "{warning:?}");
+        for ty in ["inet", "cidr"] {
+            let (mapped, warning) = map_pg_type(ty, "source_ip");
+            assert_eq!(mapped, "String", "'{ty}'");
+            assert!(warning.is_none(), "'{ty}' no debería generar advertencia: {warning:?}");
+        }
     }
 
     /// GRAMMAR.md §3.91: `date`/`timestamp`/`timestamptz` NATIVOS de
@@ -292,7 +315,11 @@ mod tests {
 
     #[test]
     fn map_pg_type_falls_back_to_string_with_a_warning_for_anything_unknown() {
-        let (ty, warning) = map_pg_type("inet", "ip_address");
+        // GRAMMAR.md §3.179: "inet" ya no sirve de ejemplo acá -- pasó a
+        // ser un mapeo exacto sin advertencia (ver
+        // map_pg_type_maps_native_uuid_inet_and_cidr_without_a_warning).
+        // "macaddr" sigue sin ningún mapeo dedicado.
+        let (ty, warning) = map_pg_type("macaddr", "mac_address");
         assert_eq!(ty, "String");
         assert!(warning.is_some());
     }

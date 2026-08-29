@@ -2350,6 +2350,138 @@ service Leads {{
     assert_eq!(created["email"], "c@example.com", "insert también tiene que funcionar después del DROP COLUMN: {created:?}");
 }
 
+// ---- `String` contra `inet`/`uuid` NATIVOS de Postgres (GRAMMAR.md §3.179) ----
+
+#[test]
+fn adopt_existing_reads_and_writes_a_native_inet_column_mapped_to_string() {
+    // La causa REAL del reporte de skynet-43 (iaacademy) -- no el DROP
+    // COLUMN (ver test de arriba, que no reprodujo nada): una columna
+    // `inet` NATIVA (`source_ip`, típica en una tabla de captación de
+    // leads) mapeada a `String?` en el `.link`, tal como `linkc
+    // introspect` ya recomienda ("revisado como String a mano") -- el
+    // wire binario de `inet` no es texto UTF-8, así que leerla como
+    // `String` rompía con un error de decodificación en runtime, aunque
+    // compilara limpio.
+    const COLLECTION: &str = "leads_inet_column";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"email\" TEXT NOT NULL, \
+                \"source_ip\" INET, \
+                \"user_agent\" TEXT\
+            )"
+        ))
+        .expect("crear la tabla con una columna inet nativa, como la real de iaacademy");
+    client
+        .execute(
+            &format!("INSERT INTO \"{COLLECTION}\" (email, source_ip, user_agent) VALUES ($1, $2, $3)"),
+            &[&"a@example.com", &"203.0.113.7", &"Mozilla/5.0"],
+        )
+        .expect("sembrar una fila con source_ip real (SQL crudo, cast de texto a inet del lado del servidor)");
+    client
+        .execute(&format!("INSERT INTO \"{COLLECTION}\" (email, source_ip, user_agent) VALUES ($1, NULL, $2)"), &[
+            &"b@example.com",
+            &"curl/8.0",
+        ])
+        .expect("sembrar una fila con source_ip NULL -- el caso 'sin IP registrada'");
+
+    let temp = TempDir::new("adopt-inet-column");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Lead = {{ id: Int, email: String, source_ip: String?, user_agent: String? }}
+type NewLead = {{ email: String, source_ip: String?, user_agent: String? }}
+db {{ {COLLECTION}: Lead[] }}
+service Leads {{
+  rpc list() -> Lead[] {{ db.{COLLECTION}.all() }}
+  rpc create(email: String, source_ip: String?) -> Lead {{ db.{COLLECTION}.insert(NewLead {{ email: email, source_ip: source_ip, user_agent: null }}) }}
+}}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+    let listed = server.rpc("Leads/list", "{}");
+    let rows = listed.as_array().unwrap_or_else(|| panic!("se esperaba una lista, llegó: {listed:?}"));
+    assert_eq!(rows.len(), 2, "{listed:?}");
+    let with_ip = rows.iter().find(|r| r["email"] == "a@example.com").expect("la fila con IP");
+    assert_eq!(with_ip["source_ip"], "203.0.113.7", "la IP tiene que decodificarse a su forma de texto real: {with_ip:?}");
+    let without_ip = rows.iter().find(|r| r["email"] == "b@example.com").expect("la fila sin IP");
+    assert_eq!(without_ip["source_ip"], serde_json::Value::Null, "NULL en inet sigue siendo NULL: {without_ip:?}");
+
+    // Escritura: c-script tiene que poder ESCRIBIR un valor nuevo contra
+    // la misma columna inet nativa, no solo leerla.
+    let created = server.rpc("Leads/create", r#"{"email":"c@example.com","source_ip":"198.51.100.42"}"#);
+    assert_eq!(created["source_ip"], "198.51.100.42", "{created:?}");
+    // Confirma con SQL crudo que quedó guardada como inet real, no como texto.
+    let raw_type: String = client
+        .query_one("SELECT pg_typeof(source_ip)::text FROM \"leads_inet_column\" WHERE email = 'c@example.com'", &[])
+        .map(|row| row.get(0))
+        .expect("leer el tipo real de la columna con SQL crudo");
+    assert_eq!(raw_type, "inet", "el insert tiene que haber escrito un valor inet real, no forzado el tipo de la columna");
+}
+
+#[test]
+fn adopt_existing_reads_and_writes_a_native_uuid_column_mapped_to_plain_string() {
+    // La SEGUNDA mitad del mismo reporte: un campo declarado `String` (NO
+    // `Uuid`, GRAMMAR.md §3.70/§3.177) mapeado contra una columna Postgres
+    // NATIVA `uuid` -- el caso real de `posts`/`seo_pages` de iaacademy,
+    // que conservaron una columna `uuid` legada como `String` en vez de
+    // `Uuid` en su `.link`. Mismo problema de fondo que el `inet` de
+    // arriba, mismo arreglo (`postgres_string_cell` prueba `PgUuidText`
+    // antes de `PgInetText`).
+    const COLLECTION: &str = "posts_uuid_string_column";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"title\" TEXT NOT NULL, \
+                \"legacy_uuid\" UUID NOT NULL DEFAULT gen_random_uuid()\
+            )"
+        ))
+        .expect("crear la tabla con una columna uuid nativa legada");
+    client
+        .execute(&format!("INSERT INTO \"{COLLECTION}\" (title) VALUES ($1)"), &[&"primer post"])
+        .expect("sembrar una fila -- legacy_uuid se autogenera vía DEFAULT");
+
+    let temp = TempDir::new("adopt-uuid-as-string");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Post = {{ id: Int, title: String, legacy_uuid: String }}
+db {{ {COLLECTION}: Post[] }}
+service Posts {{ rpc list() -> Post[] {{ db.{COLLECTION}.all() }} }}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+    let listed = server.rpc("Posts/list", "{}");
+    let rows = listed.as_array().unwrap_or_else(|| panic!("se esperaba una lista, llegó: {listed:?}"));
+    assert_eq!(rows.len(), 1, "{listed:?}");
+    let legacy_uuid = rows[0]["legacy_uuid"].as_str().unwrap_or_else(|| panic!("legacy_uuid tiene que ser un string: {listed:?}"));
+    assert_eq!(legacy_uuid.len(), 36, "tiene que decodificar a la forma canónica de un uuid real: {legacy_uuid}");
+}
+
 // GRAMMAR.md §3.91: un campo `Timestamp` decodifica correctamente contra
 // una columna `date`/`timestamp`/`timestamptz` NATIVA de Postgres, no solo
 // contra el `BIGINT` propio de c-script -- encontrado auditando un reporte

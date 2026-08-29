@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.135.0] - 2026-08-29
+
+### 🐛 Arreglado
+**`String` (y campos `Uuid` fuera de la PK) contra columnas `uuid`/`inet`/`cidr` NATIVAS de Postgres.** Segundo reporte real de adopción de iaacademy (vía skynet-43), mismo día: `find`/`findWhere`/`all` rompían con `"error deserializing column N"` contra datos reales, aunque `linkc doctor`/`migrate --dry-run` pasaran limpios. Descartadas dos hipótesis en el camino (un hueco de `pg_attribute.attnum` tras un `DROP COLUMN` real, reproducido a mano sin éxito; el orden de campos del `.link`) antes de que skynet-43 aislara la causa real con el DDL exacto: una columna `source_ip inet` (mapeada a `String?`, como recomienda `linkc introspect`) y una columna `uuid` legada mapeada a `String` en vez de `Uuid`.
+
+- Mismo problema que la PK `id: Uuid` (§3.177), generalizado: `uuid`/`inet`/`cidr` tienen formato binario propio, no texto UTF-8. `postgres_string_cell` prueba `String` primero, después `PgUuidText` (reusa el decodificador de la PK), y por último `PgInetText` (nuevo, usa `std::net::{Ipv4Addr,Ipv6Addr}` para el formateo de texto correcto). La escritura gana los mismos dos casos, simétricamente.
+- `linkc introspect` sube `uuid` de `String` con advertencia a `Uuid` sin advertencia, e `inet`/`cidr` a `String` sin advertencia -- mapeos exactos ahora, mismo criterio que `date`/`timestamp` (§3.91).
+
+**Verificado contra Postgres real**: una tabla adoptada con `source_ip inet` (lectura con valor y con NULL, escritura confirmada con SQL crudo `pg_typeof`), una tabla adoptada con una columna `uuid` nativa mapeada a `String`. Más 8 tests unitarios locales (sin Postgres) sobre la codificación/decodificación binaria en sí. Suite completa sin regresiones. Ver GRAMMAR.md §3.179.
+
 ## [1.134.1] - 2026-08-29
 
 ### 🔧 Proceso

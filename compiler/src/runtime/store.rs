@@ -533,6 +533,115 @@ fn uuid_string_to_binary(s: &str) -> Option<[u8; 16]> {
     Some(bytes)
 }
 
+/// GRAMMAR.md §3.179: reporte de adopción real de iaacademy (vía
+/// skynet-43) -- una columna `inet`/`cidr` NATIVA de Postgres (ej.
+/// `source_ip inet`, común en tablas de captación de leads) mapeada a
+/// `String` (`linkc introspect` ya avisa: "es 'inet', un tipo sin mapeo
+/// conocido -- revisado como String a mano", §3.66) rompía al leer la
+/// primera fila real: el wire binario de `inet` (family/bits/is_cidr/
+/// longitud/bytes de dirección, protocolo fijo y documentado por
+/// Postgres) no es texto UTF-8. Reusa `std::net::{Ipv4Addr,Ipv6Addr}`
+/// para el FORMATEO de texto (RFC 5952 correcto para IPv6 -- compresión
+/// de ceros incluida -- gratis, sin reimplementarlo a mano) -- lo único
+/// que hace falta escribir es el parseo del formato binario en sí, que
+/// la librería estándar no conoce (es un formato de PROTOCOLO de
+/// Postgres, no de Rust).
+struct PgInetText(String);
+
+/// Postgres define sus PROPIAS constantes de familia para el wire de
+/// inet/cidr -- 2 para IPv4, 3 para IPv6 -- deliberadamente independientes
+/// de los valores reales de `AF_INET`/`AF_INET6` del sistema operativo
+/// (que varían entre plataformas), para que el formato de red sea
+/// portable. No confundir con las constantes de socket del SO.
+const PGSQL_AF_INET: u8 = 2;
+const PGSQL_AF_INET6: u8 = 3;
+
+impl<'a> postgres::types::FromSql<'a> for PgInetText {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 4 {
+            return Err(format!("'{ty}': inet/cidr truncado, se esperaban al menos 4 bytes de cabecera, llegaron {}", raw.len()).into());
+        }
+        let family = raw[0];
+        let bits = raw[1];
+        // raw[2] es `is_cidr` -- irrelevante para el TEXTO: "inet" y
+        // "cidr" se renderizan igual, la diferencia es de constraint
+        // (cidr exige que los bits fuera de la máscara sean cero), no de
+        // representación.
+        let addr_len = raw[3] as usize;
+        let addr_bytes = raw
+            .get(4..4 + addr_len)
+            .ok_or_else(|| format!("'{ty}': inet/cidr truncado, se esperaban {addr_len} bytes de dirección"))?;
+        let (addr, full_width): (std::net::IpAddr, u8) = match (family, addr_len) {
+            (PGSQL_AF_INET, 4) => {
+                (std::net::Ipv4Addr::new(addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]).into(), 32)
+            }
+            (PGSQL_AF_INET6, 16) => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(addr_bytes);
+                (std::net::Ipv6Addr::from(octets).into(), 128)
+            }
+            _ => return Err(format!("'{ty}': familia de dirección desconocida ({family}) o largo inconsistente ({addr_len} bytes)").into()),
+        };
+        // Sin sufijo "/N" cuando la máscara es el ancho COMPLETO de la
+        // familia -- "sin máscara real", mismo criterio que el cast
+        // `::text` nativo de Postgres usa para un `inet` sin subred
+        // explícita (el caso normal: una IP de cliente guardada tal
+        // cual, `'203.0.113.7'::inet`, no `'203.0.113.0/24'::inet`).
+        let text = if bits == full_width { addr.to_string() } else { format!("{addr}/{bits}") };
+        Ok(PgInetText(text))
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        matches!(*ty, postgres::types::Type::INET | postgres::types::Type::CIDR)
+    }
+}
+
+/// Inversa de `PgInetText::from_sql` -- forma de texto ("203.0.113.7",
+/// "203.0.113.0/24", "::1", ...) a los bytes binarios que el wire de
+/// Postgres espera. `is_cidr` siempre `0`: c-script no distingue `inet`
+/// de `cidr` como tipos separados (ninguna evidencia de demanda propia
+/// más allá de `inet`, el caso real reportado), así que nunca escribe
+/// un valor marcado como `cidr` de verdad.
+fn inet_string_to_binary(s: &str) -> Option<Vec<u8>> {
+    let (addr_part, explicit_bits) = match s.split_once('/') {
+        Some((addr, mask)) => (addr, Some(mask.parse::<u8>().ok()?)),
+        None => (s, None),
+    };
+    let addr: std::net::IpAddr = addr_part.parse().ok()?;
+    let (family, addr_bytes): (u8, Vec<u8>) = match addr {
+        std::net::IpAddr::V4(v4) => (PGSQL_AF_INET, v4.octets().to_vec()),
+        std::net::IpAddr::V6(v6) => (PGSQL_AF_INET6, v6.octets().to_vec()),
+    };
+    let full_width = if family == PGSQL_AF_INET { 32 } else { 128 };
+    let bits = explicit_bits.unwrap_or(full_width);
+    if bits > full_width {
+        return None;
+    }
+    let mut out = vec![family, bits, 0, addr_bytes.len() as u8];
+    out.extend_from_slice(&addr_bytes);
+    Some(out)
+}
+
+/// Una columna `String` (GRAMMAR.md §2.1) contra Postgres puede ser
+/// físicamente TEXT/VARCHAR (la convención normal) o -- una tabla YA
+/// EXISTENTE, adoptada -- `uuid`/`inet`/`cidr` NATIVOS, con formato
+/// binario propio que no es texto UTF-8. Mismo criterio de "probar en
+/// orden" que `postgres_int_cell`/`postgres_timestamp_cell`/
+/// `postgres_float_cell`: `String` primero (el caso normal, sin costo
+/// extra), `PgUuidText` después (reusa el mismo decodificador que la PK
+/// `id: Uuid`, GRAMMAR.md §3.177 -- un campo `String` normal mapeado a
+/// una columna `uuid` nativa es el mismo problema, solo que no es la
+/// PK), y `PgInetText` al final (GRAMMAR.md §3.179).
+fn postgres_string_cell(row: &postgres::Row, i: usize) -> Result<Option<String>, String> {
+    if let Ok(v) = row.try_get::<_, Option<String>>(i) {
+        return Ok(v);
+    }
+    if let Ok(v) = row.try_get::<_, Option<PgUuidText>>(i) {
+        return Ok(v.map(|PgUuidText(s)| s));
+    }
+    row.try_get::<_, Option<PgInetText>>(i).map(|v| v.map(|PgInetText(s)| s)).map_err(|e| e.to_string())
+}
+
 /// Una columna `Timestamp` (GRAMMAR.md §3.31/§3.91) contra Postgres puede
 /// ser físicamente UNA de dos cosas MUY distintas -- se prueban en orden,
 /// mismo criterio que `postgres_int_cell` con los tres anchos de entero:
@@ -595,7 +704,7 @@ fn postgres_cell(row: &postgres::Row, i: usize, kind: ColumnKind) -> Result<Cell
             Some(f) => Cell::Float(f),
             None => Cell::Null,
         },
-        ColumnKind::Text => match row.try_get::<_, Option<String>>(i).map_err(|e| e.to_string())? {
+        ColumnKind::Text => match postgres_string_cell(row, i)? {
             Some(s) => Cell::Text(s),
             None => Cell::Null,
         },
@@ -696,6 +805,17 @@ impl postgres::types::ToSql for Cell {
                 out.extend_from_slice(&bytes);
                 Ok(postgres::types::IsNull::No)
             }
+            // GRAMMAR.md §3.179: mismo problema, mismo arreglo que `UUID`
+            // arriba -- un campo `String` que guarda una IP mapeado contra
+            // una columna `inet`/`cidr` NATIVA necesita el formato binario
+            // real (`inet_string_to_binary`), no los bytes UTF-8 del texto.
+            Cell::Text(s) if *ty == postgres::types::Type::INET || *ty == postgres::types::Type::CIDR => {
+                let bytes = inet_string_to_binary(s).ok_or_else(|| {
+                    format!("'{s}' no es una dirección IP/red válida (ej. '203.0.113.7' o '203.0.113.0/24') -- no se puede bindear contra una columna 'inet'/'cidr' nativa")
+                })?;
+                out.extend_from_slice(&bytes);
+                Ok(postgres::types::IsNull::No)
+            }
             Cell::Text(s) => s.to_sql(ty, out),
             Cell::Bool(b) => b.to_sql(ty, out),
             Cell::Json(v) => v.to_sql(ty, out),
@@ -728,5 +848,73 @@ mod send_probe {
     fn connection_types_are_send() {
         assert_send::<rusqlite::Connection>();
         assert_send::<postgres::Client>();
+    }
+}
+
+/// GRAMMAR.md §3.179: la codificación/decodificación binaria de `inet` en
+/// sí (`inet_string_to_binary`/`PgInetText::from_sql`) es lógica PURA, sin
+/// Postgres real de por medio -- se puede probar acá, localmente, a
+/// diferencia de si el SERVIDOR acepta esos bytes de vuelta (eso sí
+/// necesita `pg_integration.rs` contra Postgres real). Encontrar un error
+/// de layout ACÁ, antes de pushear, es mucho más barato que encontrarlo en
+/// CI -- lección de esta misma ronda con el rate limiter distribuido
+/// (§3.178), donde la falta de Postgres local retrasó dos vueltas de CI.
+#[cfg(test)]
+mod inet_tests {
+    use super::*;
+
+    fn decode(bytes: &[u8]) -> String {
+        let PgInetText(s) =
+            <PgInetText as postgres::types::FromSql>::from_sql(&postgres::types::Type::INET, bytes).expect("decodificar");
+        s
+    }
+
+    #[test]
+    fn ipv4_without_an_explicit_mask_round_trips_without_a_slash_suffix() {
+        let bytes = inet_string_to_binary("203.0.113.7").unwrap();
+        assert_eq!(decode(&bytes), "203.0.113.7");
+    }
+
+    #[test]
+    fn ipv4_with_an_explicit_mask_keeps_the_slash_suffix() {
+        let bytes = inet_string_to_binary("203.0.113.0/24").unwrap();
+        assert_eq!(decode(&bytes), "203.0.113.0/24");
+    }
+
+    #[test]
+    fn ipv6_round_trips_with_zero_compression() {
+        // `std::net::Ipv6Addr::to_string()` ya implementa la compresión de
+        // ceros de RFC 5952 -- "2001:db8::1", no la forma expandida.
+        let bytes = inet_string_to_binary("2001:db8::1").unwrap();
+        assert_eq!(decode(&bytes), "2001:db8::1");
+    }
+
+    #[test]
+    fn ipv6_loopback_round_trips() {
+        let bytes = inet_string_to_binary("::1").unwrap();
+        assert_eq!(decode(&bytes), "::1");
+    }
+
+    #[test]
+    fn ipv6_with_an_explicit_mask_keeps_the_slash_suffix() {
+        let bytes = inet_string_to_binary("2001:db8::/32").unwrap();
+        assert_eq!(decode(&bytes), "2001:db8::/32");
+    }
+
+    #[test]
+    fn garbage_and_out_of_range_masks_are_rejected_not_panicking() {
+        assert!(inet_string_to_binary("no es una ip").is_none());
+        assert!(inet_string_to_binary("203.0.113.7/999").is_none());
+        assert!(inet_string_to_binary("203.0.113.7/33").is_none(), "33 excede el ancho completo de IPv4 (32)");
+        assert!(inet_string_to_binary("").is_none());
+    }
+
+    #[test]
+    fn wire_layout_matches_postgres_documented_format() {
+        // family=2 (IPv4), bits=32 (sin máscara real), is_cidr=0,
+        // longitud=4, después los 4 bytes de la dirección -- el layout
+        // exacto que Postgres documenta para el protocolo binario de inet.
+        let bytes = inet_string_to_binary("192.168.1.1").unwrap();
+        assert_eq!(bytes, vec![2, 32, 0, 4, 192, 168, 1, 1]);
     }
 }
