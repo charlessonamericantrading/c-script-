@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.140.2] - 2026-08-29
+
+### 🐛 Arreglado
+**CI en rojo tras v1.140.1, por segunda vez seguida -- pero esta vez el bug era del test, no del compilador.** El nuevo test de `sumBy` contra Postgres real (`pg_integration.rs`) afirmaba `"24.5100"` para el total de `WIDGET` -- ese número venía de copiar el escenario del test equivalente contra SQLite (`runtime/mod.rs`), que incluye un `reprice` de por medio; este test nuevo no lo tiene, así que el total real y correcto es `19.9900 + 0.0100 = "20.0000"`. Corregida la aserción, sin tocar el compilador -- el `sumBy` real ya sumaba bien.
+
 ## [1.140.1] - 2026-08-29
 
 ### 🐛 Arreglado

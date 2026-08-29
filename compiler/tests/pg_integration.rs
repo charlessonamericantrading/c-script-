@@ -2824,7 +2824,7 @@ service Items {{
     for row in sums.as_array().unwrap() {
         by_key.insert(row["key"].as_str().unwrap().to_string(), row["value"].as_str().unwrap().to_string());
     }
-    assert_eq!(by_key.get("WIDGET").map(String::as_str), Some("24.5100"), "sumBy real contra Postgres: {by_key:?}");
+    assert_eq!(by_key.get("WIDGET").map(String::as_str), Some("20.0000"), "sumBy real contra Postgres: {by_key:?}");
     assert_eq!(by_key.get("GADGET").map(String::as_str), Some("5.5000"), "{by_key:?}");
 
     let priciest = server.rpc("Items/priciest", "{}");
