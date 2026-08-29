@@ -7,8 +7,11 @@
 // propio, GRAMMAR.md §3.17).
 
 use crate::lockfile::{hash_source, GitLockEntry};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 /// `git+<url>#<rev>` -- AMBOS obligatorios en v0. Sin un rev explícito,
 /// "la última versión" no tiene un significado bien definido sin un
@@ -60,49 +63,197 @@ fn cache_dir_for(project_root: &Path, url: &str) -> PathBuf {
     project_root.join(".linkc").join("cache").join(hash_source(url))
 }
 
-/// Clona (si hace falta), actualiza (si el rev pedido no está localmente
-/// todavía) y hace checkout de `spec` (`git+<url>#<rev>`) dentro del
-/// caché de `project_root`. Devuelve el directorio ya en el commit
-/// correcto -- el punto de entrada dentro de él es convención de quien
-/// llama (`modules.rs` asume `main.link` en la raíz, mismo nombre que
-/// `linkc new` ya scaffoldea) -- más el `GitLockEntry` para grabar en
-/// `link.lock`.
+/// Exclusión mutua ENTRE PROCESOS sobre el directorio de caché de una
+/// dependencia puntual (GRAMMAR.md §2.1) -- dos `linkc build`/`serve`
+/// corriendo a la vez sobre el mismo proyecto podían pisarse el mismo
+/// clon (un `fetch` de uno interrumpido por el `checkout --force` del
+/// otro, por ejemplo). Advisory, basado en un archivo (`<hash>.lock`
+/// junto al directorio de caché) -- no un lock real de sistema operativo
+/// (`flock`/`LockFileEx`, que pediría FFI a mano en dos plataformas
+/// distintas o una dependencia nueva) para un caso que en la práctica es
+/// raro; proporcional al riesgo real, no al máximo rigor posible.
+const CACHE_LOCK_STALE_AFTER: Duration = Duration::from_secs(120);
+const CACHE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CACHE_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug)]
+struct CacheLock {
+    path: PathBuf,
+}
+
+impl CacheLock {
+    /// Bloquea hasta tomar el lock (creando `<cache_dir>.lock` de forma
+    /// atómica, `create_new`) o hasta `CACHE_LOCK_WAIT_TIMEOUT` -- lo que
+    /// pase primero. Un lock más viejo que `CACHE_LOCK_STALE_AFTER` se
+    /// considera abandonado (el proceso que lo tomó murió sin soltarlo --
+    /// un panic, un `kill -9`) y se borra para reintentar, en vez de
+    /// bloquear para siempre.
+    fn acquire(cache_dir: &Path) -> Result<Self, String> {
+        let lock_path = cache_dir.with_extension("lock");
+        // El propio directorio de caché puede no existir todavía (primera
+        // vez que se resuelve esta URL) -- el lock vive junto a él
+        // (sibling, no adentro), pero su PADRE (`.linkc/cache/`) sí tiene
+        // que existir para poder crear el archivo del lock.
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("no se pudo crear '{}': {e}", parent.display()))?;
+        }
+        let start = Instant::now();
+        loop {
+            match OpenOptions::new().write(true).create_new(true).open(&lock_path) {
+                Ok(mut f) => {
+                    let _ = write!(f, "{}", std::process::id());
+                    return Ok(CacheLock { path: lock_path });
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if let Ok(meta) = fs::metadata(&lock_path) {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(age) = modified.elapsed() {
+                                if age > CACHE_LOCK_STALE_AFTER {
+                                    let _ = fs::remove_file(&lock_path);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if start.elapsed() > CACHE_LOCK_WAIT_TIMEOUT {
+                        return Err(format!(
+                            "no se pudo tomar el lock de caché '{}' tras {}s -- otro 'linkc' parece estar resolviendo \
+                             la misma dependencia; si no hay ningún otro proceso corriendo, borrá ese archivo a mano",
+                            lock_path.display(),
+                            CACHE_LOCK_WAIT_TIMEOUT.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(CACHE_LOCK_POLL_INTERVAL);
+                }
+                Err(e) => return Err(format!("no se pudo crear el lock de caché '{}': {e}", lock_path.display())),
+            }
+        }
+    }
+}
+
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// `true` si `rev` ya es un commit SHA completo (40 hex) -- inmutable por
+/// definición, a diferencia de un tag (movible en teoría, aunque mala
+/// práctica moverlo) o una rama (movible por diseño). Usado para decidir
+/// cuándo un fetch es realmente necesario, ver `resolve`.
+fn is_full_commit_sha(rev: &str) -> bool {
+    rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Clona (si hace falta), actualiza (si hace falta) y hace checkout de
+/// `spec` (`git+<url>#<rev>`) dentro del caché de `project_root`. Devuelve
+/// el directorio ya en el commit correcto -- el punto de entrada dentro de
+/// él es convención de quien llama (`modules.rs` asume `main.link` en la
+/// raíz, mismo nombre que `linkc new` ya scaffoldea) -- más el
+/// `GitLockEntry` para grabar en `link.lock`.
 ///
-/// Sin locking entre procesos concurrentes (dos `linkc build` corriendo
-/// a la vez sobre el mismo proyecto podrían pisarse el mismo clon) --
-/// límite de v0 conocido, no manejado.
+/// Resolución FRESCA -- siempre le pregunta al remoto qué es lo más
+/// reciente para `rev` (salvo que `rev` ya sea un commit SHA completo, o
+/// un tag que ya resuelve en el caché local -- ninguno de los dos puede
+/// haber cambiado). Este es el camino que corre la PRIMERA vez que se ve
+/// una dependencia, o cuando `link.json` cambió su `rev`, o bajo
+/// `--update-deps` -- para builds repetidos que ya tienen un pin en
+/// `link.lock`, `modules.rs` llama a `resolve_pinned` en cambio, que NUNCA
+/// vuelve a preguntarle nada al remoto sobre qué es "lo último".
 pub fn resolve(spec: &str, project_root: &Path) -> Result<(PathBuf, GitLockEntry), String> {
     let (url, rev) = parse_spec(spec)?;
     let checkout_dir = cache_dir_for(project_root, url);
+    let _lock = CacheLock::acquire(&checkout_dir)?;
 
     if !checkout_dir.exists() {
-        let parent = checkout_dir.parent().expect("cache_dir_for siempre da un directorio con padre");
-        std::fs::create_dir_all(parent).map_err(|e| format!("no se pudo crear '{}': {e}", parent.display()))?;
-        // `display_path` (modules.rs) le pela el prefijo `\\?\` que
-        // `fs::canonicalize` antepone en Windows -- ahí existe para
-        // texto que un humano lee, pero acá hace falta por una razón
-        // distinta y más dura: git (vía su capa MSYS/Cygwin) directamente
-        // NO ENTIENDE ese prefijo como argumento de línea de comandos --
-        // "fatal: could not create work tree dir ... Invalid argument"
-        // en vez de un simple problema estético. Mismo string, dos
-        // motivos.
-        let checkout_str = crate::modules::display_path(&checkout_dir);
-        run_git(parent, &["clone", url, &checkout_str])?;
+        clone_into(url, &checkout_dir)?;
     }
 
-    // ¿el rev pedido ya resuelve localmente (un commit ya presente, o un
-    // tag/rama ya conocidos de un fetch anterior)? Si no, un fetch
-    // actualiza el clon existente antes de reintentar -- evita un fetch
-    // de red en el caso común (mismo rev que la corrida anterior, ya
-    // cacheado).
-    if run_git(&checkout_dir, &["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")]).is_err() {
+    // Bug real encontrado corriendo esto, no leyéndolo (GRAMMAR.md §2.1):
+    // antes de este fix, `rev-parse --verify rev^{commit}` ya resolvía
+    // localmente para una RAMA apenas clonada (el clone deja
+    // `refs/heads/<rama>` local, apuntando al commit de ESE momento) --
+    // así que una dependencia por rama quedaba congelada en el commit del
+    // PRIMER clone para siempre, sin importar cuánto avanzara el remoto,
+    // aunque la documentación afirmara "se re-resuelve contra su HEAD real
+    // en cada build". Un commit SHA completo es inmutable por definición
+    // (nunca hace falta red si ya está local); un TAG que ya resuelve
+    // contra `refs/tags/<rev>` específicamente se trata igual (moverlo ya
+    // publicado es mala práctica, no algo que este resolver defienda
+    // activamente) -- CUALQUIER OTRA COSA (una rama, o un rev que ni
+    // siquiera se conoce localmente todavía) SIEMPRE fetchea: es la única
+    // forma real de saber si el remoto avanzó.
+    let trust_local_cache = is_full_commit_sha(rev)
+        || run_git(&checkout_dir, &["rev-parse", "--verify", "--quiet", &format!("refs/tags/{rev}")]).is_ok();
+    let already_resolves = run_git(&checkout_dir, &["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")]).is_ok();
+    if !(trust_local_cache && already_resolves) {
         run_git(&checkout_dir, &["fetch", "--all", "--tags", "--force"])?;
     }
 
-    run_git(&checkout_dir, &["checkout", "--detach", "--force", rev])?;
+    // Segunda mitad del mismo bug: `git fetch` por sí solo NUNCA mueve una
+    // rama LOCAL (`refs/heads/<rama>`, la que `checkout <rev>` resuelve
+    // primero por las reglas de `gitrevisions(7)`) -- solo actualiza el
+    // ref de SEGUIMIENTO remoto (`refs/remotes/origin/<rama>`). Sin este
+    // paso, el fetch de arriba traía el commit nuevo al caché, pero el
+    // checkout de abajo seguía resolviendo a la rama local vieja de todas
+    // formas -- confirmado a mano contra un repo real antes de este fix.
+    // Si existe un ref de seguimiento remoto para `rev`, ESE es el que
+    // manda (recién actualizado); si no (un tag, un SHA), `rev` tal cual
+    // sigue siendo correcto -- los tags fetcheados van directo a
+    // `refs/tags/`, sin este problema de dos copias.
+    let checkout_target = if run_git(&checkout_dir, &["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{rev}")]).is_ok() {
+        format!("refs/remotes/origin/{rev}")
+    } else {
+        rev.to_string()
+    };
+    run_git(&checkout_dir, &["checkout", "--detach", "--force", &checkout_target])?;
     let resolved = run_git(&checkout_dir, &["rev-parse", "HEAD"])?;
 
     Ok((checkout_dir, GitLockEntry { url: url.to_string(), rev: rev.to_string(), resolved }))
+}
+
+/// Resuelve una dependencia ya FIJADA por un `link.lock` existente (mismo
+/// `url`/`rev` que la última vez, GRAMMAR.md §2.1) -- en vez de volver a
+/// preguntarle al remoto "¿a qué resuelve `rev` AHORA?", hace checkout
+/// DIRECTO al commit exacto ya resuelto antes (`pinned_commit`). Un
+/// `linkc build` repetido sobre el mismo `link.json` (sin `--update-deps`)
+/// es reproducible byte a byte -- una rama que avanzó en el remoto NO se
+/// sigue hasta que alguien lo pide explícitamente, el mismo contrato que
+/// cualquier lockfile real promete (`Cargo.lock`/`package-lock.json`).
+///
+/// Solo toca la red si el commit fijado no está YA en el caché local (ej.
+/// un `.linkc/cache` recién clonado en otra máquina que nunca lo vio) --
+/// como mucho un fetch, y nunca vuelve a intentar RESOLVER `rev` contra el
+/// remoto: el pin YA ES el commit exacto, no hay ninguna ambigüedad de
+/// rama/tag que resolver, así que el bug de `resolve` que el comentario de
+/// arriba describe ni siquiera puede aplicar acá.
+pub fn resolve_pinned(url: &str, pinned_commit: &str, project_root: &Path) -> Result<PathBuf, String> {
+    let checkout_dir = cache_dir_for(project_root, url);
+    let _lock = CacheLock::acquire(&checkout_dir)?;
+
+    if !checkout_dir.exists() {
+        clone_into(url, &checkout_dir)?;
+    }
+    if run_git(&checkout_dir, &["rev-parse", "--verify", "--quiet", &format!("{pinned_commit}^{{commit}}")]).is_err() {
+        run_git(&checkout_dir, &["fetch", "--all", "--tags", "--force"])?;
+    }
+    run_git(&checkout_dir, &["checkout", "--detach", "--force", pinned_commit])?;
+    Ok(checkout_dir)
+}
+
+fn clone_into(url: &str, checkout_dir: &Path) -> Result<(), String> {
+    let parent = checkout_dir.parent().expect("cache_dir_for siempre da un directorio con padre");
+    fs::create_dir_all(parent).map_err(|e| format!("no se pudo crear '{}': {e}", parent.display()))?;
+    // `display_path` (modules.rs) le pela el prefijo `\\?\` que
+    // `fs::canonicalize` antepone en Windows -- ahí existe para texto que
+    // un humano lee, pero acá hace falta por una razón distinta y más
+    // dura: git (vía su capa MSYS/Cygwin) directamente NO ENTIENDE ese
+    // prefijo como argumento de línea de comandos -- "fatal: could not
+    // create work tree dir ... Invalid argument" en vez de un simple
+    // problema estético. Mismo string, dos motivos.
+    let checkout_str = crate::modules::display_path(checkout_dir);
+    run_git(parent, &["clone", url, &checkout_str])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -288,5 +439,158 @@ mod tests {
 
         let err = result.expect_err("un remoto inalcanzable debe fallar el clone, no resolver como si nada");
         assert!(!err.is_empty(), "el error debe traer un mensaje real, no una cadena vacía");
+    }
+
+    /// El bug real que motivó el fix de `resolve` (GRAMMAR.md §2.1): antes,
+    /// una dependencia por RAMA quedaba congelada en el commit del primer
+    /// clone para siempre, porque `refs/heads/<rama>` ya resolvía
+    /// localmente después de clonar y el chequeo viejo nunca fetcheaba de
+    /// nuevo. Repro exacto: clonar con `rev = "main"`, avanzar el remoto,
+    /// resolver "main" DE NUEVO -- debe traer el commit nuevo, no el viejo.
+    #[test]
+    fn resolve_follows_a_branch_that_advanced_on_the_remote_after_the_first_clone() {
+        let remote = FixtureRemote::new("branch-advances");
+        remote.commit_file("main.link", "type Point = { x: Int }", "v1");
+
+        let project = TempProject::new("branch-advances");
+        let spec = format!("git+{}#main", remote.url());
+        let (_, lock1) = resolve(&spec, &project.0).expect("debe clonar y resolver 'main'");
+
+        let v2_sha = remote.commit_file("main.link", "type Point = { x: Int, y: Int }", "v2 -- el remoto avanzó");
+
+        let (checkout_dir, lock2) = resolve(&spec, &project.0).expect("debe volver a resolver 'main'");
+        assert_eq!(
+            lock2.resolved, v2_sha,
+            "una dependencia por rama tiene que seguir al remoto que avanzó, no quedarse congelada en el commit del primer clone \
+             (bug real: lock1={:?} era el commit viejo)",
+            lock1.resolved
+        );
+        let content = fs::read_to_string(checkout_dir.join("main.link")).unwrap();
+        assert!(content.contains("y: Int"), "el checkout tiene que reflejar el contenido del commit nuevo: {content}");
+    }
+
+    /// Contraparte del test de arriba: un TAG ya conocido localmente, o un
+    /// commit SHA completo, NO deben disparar un fetch -- son inmutables
+    /// (o tratados como tales), así que `resolve` puede confiar en el
+    /// caché sin tocar la red. Verificado indirectamente por
+    /// `resolve_reuses_the_cache_on_a_second_call_without_reaching_the_network`
+    /// (con un tag, borra el remoto entero) y
+    /// `resolve_can_check_out_a_specific_commit_sha_directly` (con un SHA) --
+    /// ambos siguen pasando después de este fix, lo que confirma que el
+    /// fetch-siempre nuevo quedó acotado a ramas/revs desconocidos, no a
+    /// TODO rev.
+    #[test]
+    fn resolve_does_not_refetch_for_an_already_known_tag_or_full_sha() {
+        assert!(is_full_commit_sha("a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"), "40 hex chars debe contar como SHA completo");
+        assert!(!is_full_commit_sha("v1.0.0"), "un tag no es un SHA completo");
+        assert!(!is_full_commit_sha("a1b2c3d"), "un SHA corto (abreviado) no cuenta -- podría ser ambiguo");
+    }
+
+    /// `resolve_pinned` (el camino que toma un build repetido con
+    /// `link.lock` ya escrito, GRAMMAR.md §2.1): hace checkout DIRECTO al
+    /// commit fijado, sin resolver `rev` de nuevo -- así que aunque el
+    /// remoto avance, el pin se queda exactamente donde estaba hasta que
+    /// alguien pida `--update-deps` explícitamente.
+    #[test]
+    fn resolve_pinned_stays_on_the_locked_commit_even_after_the_remote_advances() {
+        let remote = FixtureRemote::new("pinned-stays");
+        let v1_sha = remote.commit_file("main.link", "type Point = { x: Int }", "v1");
+
+        let project = TempProject::new("pinned-stays");
+        let (_, lock) = resolve(&format!("git+{}#main", remote.url()), &project.0).expect("debe resolver 'main' la primera vez");
+        assert_eq!(lock.resolved, v1_sha);
+
+        remote.commit_file("main.link", "type Point = { x: Int, y: Int }", "v2 -- el remoto avanzó");
+
+        let checkout_dir = resolve_pinned(&remote.url(), &lock.resolved, &project.0).expect("debe resolver el pin sin tocar el remoto para 'rev'");
+        let content = fs::read_to_string(checkout_dir.join("main.link")).unwrap();
+        assert!(!content.contains("y: Int"), "el pin tiene que quedarse en v1 aunque el remoto ya tenga v2: {content}");
+    }
+
+    /// `resolve_pinned` contra un commit que el caché local NO tiene
+    /// todavía (ej. un `.linkc/cache` recién clonado en otra máquina) --
+    /// tiene que fetchear UNA vez para materializarlo, no fallar
+    /// asumiendo que ya está.
+    #[test]
+    fn resolve_pinned_fetches_once_when_the_pinned_commit_is_not_in_the_local_cache_yet() {
+        let remote = FixtureRemote::new("pinned-fetch-once");
+        let v1_sha = remote.commit_file("main.link", "type Point = { x: Int }", "v1");
+        let v2_sha = remote.commit_file("main.link", "type Point = { x: Int, y: Int }", "v2");
+
+        let project = TempProject::new("pinned-fetch-once");
+        // Clona y se queda en v1 -- v2 existe en el remoto pero el caché
+        // local todavía no lo vio.
+        resolve(&format!("git+{}#{v1_sha}", remote.url()), &project.0).expect("debe clonar y resolver v1");
+
+        let checkout_dir = resolve_pinned(&remote.url(), &v2_sha, &project.0).expect("debe fetchear una vez para traer v2 al caché local");
+        let content = fs::read_to_string(checkout_dir.join("main.link")).unwrap();
+        assert!(content.contains("y: Int"), "debe haber materializado v2: {content}");
+    }
+
+    /// El lock de caché (`CacheLock`) serializa dos resoluciones
+    /// CONCURRENTES de la MISMA dependencia -- sin él, dos hilos podrían
+    /// pisarse el mismo `git clone`/`checkout` a la vez. No prueba que el
+    /// resultado final sea correcto bajo carrera (`resolve` en sí ya lo es,
+    /// una vez serializado) -- prueba que el lock REALMENTE excluye, con
+    /// un contador compartido que solo puede incrementarse de a uno bajo
+    /// el lock si la exclusión funciona.
+    #[test]
+    fn cache_lock_serializes_concurrent_acquisitions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!("cscript-gitdep-lock-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cache_dir = dir.join("fake-cache-dir");
+
+        let concurrent_holders = Arc::new(AtomicUsize::new(0));
+        let max_concurrent_holders = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let cache_dir = cache_dir.clone();
+                let concurrent_holders = Arc::clone(&concurrent_holders);
+                let max_concurrent_holders = Arc::clone(&max_concurrent_holders);
+                scope.spawn(move || {
+                    let _lock = CacheLock::acquire(&cache_dir).expect("debe poder tomar el lock, eventualmente");
+                    let now = concurrent_holders.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_concurrent_holders.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    concurrent_holders.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        assert_eq!(max_concurrent_holders.load(Ordering::SeqCst), 1, "nunca debería haber más de UN hilo sosteniendo el lock a la vez");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Un lock más viejo que `CACHE_LOCK_STALE_AFTER` se trata como
+    /// abandonado (el proceso que lo tomó murió sin soltarlo) -- se borra y
+    /// se reintenta, en vez de bloquear para siempre.
+    #[test]
+    fn cache_lock_steals_a_stale_lock_instead_of_blocking_forever() {
+        let dir = std::env::temp_dir().join(format!("cscript-gitdep-stale-lock-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let cache_dir = dir.join("fake-cache-dir");
+        let lock_path = cache_dir.with_extension("lock");
+
+        fs::write(&lock_path, "99999999").unwrap();
+        // Retrocede el mtime del lock más allá del umbral de "abandonado"
+        // -- sin esto, el test dependería de esperar CACHE_LOCK_STALE_AFTER
+        // de verdad (120s), demasiado lento para un test.
+        let stale_time = std::time::SystemTime::now() - CACHE_LOCK_STALE_AFTER - Duration::from_secs(1);
+        // `File::open` (solo lectura) no alcanza para `set_modified` en
+        // Windows ("Acceso denegado") -- necesita el handle abierto con
+        // permiso de escritura, aunque no se escriba ningún byte acá.
+        let file = OpenOptions::new().write(true).open(&lock_path).unwrap();
+        file.set_modified(stale_time).unwrap();
+
+        let acquired = CacheLock::acquire(&cache_dir);
+        assert!(acquired.is_ok(), "un lock viejo abandonado tiene que poder robarse, no bloquear para siempre: {acquired:?}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

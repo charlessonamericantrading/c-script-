@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.139.0] - 2026-08-29
+
+### ✨ Nuevo
+**`link.lock` como pin real de dependencias git + locking entre procesos concurrentes** -- cierra los dos huecos reales que quedaban en el package manager `git+<url>#<rev>` (GRAMMAR.md §2.1), reforzando el modelo "git-as-registry" ya elegido en vez de construir un registro centralizado (decisión ya tomada y documentada en PLAN.md, no revertida acá).
+
+- **Bug real encontrado antes de diseñar el fix, corriendo el código no leyéndolo**: una dependencia por RAMA quedaba congelada en el commit del primer clone para siempre -- `git fetch` nunca mueve una rama LOCAL, solo su ref de seguimiento remoto, y el checkout seguía resolviendo a la copia local vieja. Arreglado: un commit SHA completo o un tag ya conocido confían en el caché sin red; cualquier otra cosa siempre fetchea, y el checkout prefiere el ref de seguimiento remoto recién actualizado.
+- `link.lock` ahora se LEE para decidir qué commit usar (antes solo se escribía, informativo) -- mismo contrato que `Cargo.lock`/`package-lock.json`. `linkc build --update-deps` es el único comando que ignora el pin y re-resuelve fresco, avanzándolo.
+- Un lock advisory basado en archivo serializa dos `linkc build`/`serve` concurrentes que resuelven la misma dependencia -- se autorepara si un proceso muere a mitad de un clone.
+
+**Verificado**: 9 tests nuevos (gitdep.rs + modules.rs) más una corrida manual de punta a punta contra un repo git local real (resuelve y pinnea, se queda pinneado con el remoto avanzado, `--update-deps` re-resuelve y el checker atrapa el tipo nuevo). Suite completa sin regresiones. Ver GRAMMAR.md §3.183.
+
 ## [1.138.0] - 2026-08-29
 
 ### 🐛 Arreglado

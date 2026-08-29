@@ -128,9 +128,12 @@ pub fn load_program(entry: &Path) -> Result<(Program, Vec<PathBuf>, Vec<PathBuf>
 /// Descarta el cuarto elemento de `load_program_full` (`git_dependencies`
 /// resueltas, GRAMMAR.md §2.1) -- ningún caller existente (LSP, tests)
 /// necesita esa información; solo `main.rs` la usa para escribir
-/// `link.lock`, vía `load_program_full` directo.
+/// `link.lock`, vía `load_program_full` directo. `update_deps` siempre
+/// `false` acá -- este camino (usado por `serve`/`test`/`lsp`/`check`,
+/// GRAMMAR.md §3.183) respeta un `link.lock` existente si lo hay, nunca lo
+/// ignora a propósito; solo `linkc build --update-deps` puede pedir eso.
 pub fn load_program_with_overlay(entry: &Path, overlay: &HashMap<PathBuf, String>) -> Result<(Program, Vec<PathBuf>, Vec<PathBuf>), LoadError> {
-    let (program, touched, item_files, _git_dependencies) = load_program_full(entry, overlay)?;
+    let (program, touched, item_files, _git_dependencies) = load_program_full(entry, overlay, false)?;
     Ok((program, touched, item_files))
 }
 
@@ -142,9 +145,15 @@ pub fn load_program_with_overlay(entry: &Path, overlay: &HashMap<PathBuf, String
 /// (GRAMMAR.md §2.1). Separada de `load_program_with_overlay` (en vez de
 /// agregarle un cuarto elemento a SU tupla) para no tener que tocar los
 /// ~10 call sites existentes (lsp.rs, tests) que no les importa esto.
+///
+/// `update_deps` (GRAMMAR.md §3.183, `linkc build --update-deps`): `true`
+/// fuerza una resolución FRESCA de cada dependencia git, ignorando
+/// cualquier pin que ya exista en `link.lock` -- el único camino que
+/// avanza el pin a un commit más nuevo.
 pub fn load_program_full(
     entry: &Path,
     overlay: &HashMap<PathBuf, String>,
+    update_deps: bool,
 ) -> Result<(Program, Vec<PathBuf>, Vec<PathBuf>, BTreeMap<String, crate::lockfile::GitLockEntry>), LoadError> {
     let canon_entry = canonicalize(entry)?;
     let project_root = canon_entry.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
@@ -155,6 +164,8 @@ pub fn load_program_full(
         manifest: None,
         overlay,
         git_dependencies: BTreeMap::new(),
+        existing_lock: None,
+        update_deps,
     };
     let mut on_stack = HashSet::new();
     let mut done = HashSet::new();
@@ -185,9 +196,38 @@ struct Loader<'a> {
     /// (GRAMMAR.md §2.1) -- poblado por `resolve_import_target` a medida
     /// que resuelve cada `git+<url>#<rev>`, expuesto por `load_program_full`.
     git_dependencies: BTreeMap<String, crate::lockfile::GitLockEntry>,
+    /// `git_dependencies` de un `link.lock` YA EXISTENTE en `project_root`,
+    /// leído una sola vez y cacheado (mismo patrón perezoso que `manifest`)
+    /// -- GRAMMAR.md §2.1/§3.183: la fuente del PIN real. `None` = todavía
+    /// no se intentó leer; `Some(vacío)` = no hay `link.lock` o no declara
+    /// dependencias git (primer build de este proyecto, o uno sin
+    /// dependencias git todavía).
+    existing_lock: Option<BTreeMap<String, crate::lockfile::GitLockEntry>>,
+    /// `--update-deps` (solo `linkc build`, GRAMMAR.md §3.183): ignora
+    /// cualquier pin existente y fuerza una resolución FRESCA de cada
+    /// dependencia git, como si `link.lock` no existiera -- el único camino
+    /// que reescribe el pin a un commit más nuevo. `false` para todo el
+    /// resto de los callers (`serve`/`test`/`lsp`/`check`), que siempre
+    /// respetan el pin si existe.
+    update_deps: bool,
 }
 
 impl Loader<'_> {
+    /// Lee `link.lock` (si existe) UNA sola vez y cachea su
+    /// `git_dependencies` -- devuelve el pin para `from` si ese `link.lock`
+    /// lo tiene. Un `link.lock` inexistente, ilegible o corrupto se trata
+    /// igual que "sin pin todavía" (`None`), nunca un error duro: perder el
+    /// pin degrada a la resolución fresca de siempre, mismo criterio de
+    /// "nunca romper el build por algo que un pin es libre de no tener".
+    fn existing_lock_entry(&mut self, from: &str) -> Option<crate::lockfile::GitLockEntry> {
+        if self.existing_lock.is_none() {
+            let lock_path = self.project_root.join("link.lock");
+            let git_deps = crate::lockfile::read_lockfile(&lock_path).map(|l| l.git_dependencies).unwrap_or_default();
+            self.existing_lock = Some(git_deps);
+        }
+        self.existing_lock.as_ref().and_then(|m| m.get(from)).cloned()
+    }
+
     fn load_native(&mut self, canon: &Path) -> Result<Vec<Item>, LoadError> {
         if let Some(items) = self.native_items.get(canon) {
             return Ok(items.clone());
@@ -219,9 +259,14 @@ impl Loader<'_> {
             self.manifest = Some(deps);
         }
         let deps = self.manifest.as_ref().expect("se acaba de asignar arriba");
-        let dep_spec = deps.get(from).ok_or_else(|| {
-            err(format!("'{from}' no es una ruta relativa ('./' o '../') ni una dependencia en link.json"))
-        })?;
+        // Clonado a `String` (no `&str` prestado de `self.manifest`) --
+        // el chequeo del pin de abajo necesita `&mut self`
+        // (`existing_lock_entry`), así que este préstamo de `self.manifest`
+        // tiene que soltarse antes de llegar ahí.
+        let dep_spec = deps
+            .get(from)
+            .ok_or_else(|| err(format!("'{from}' no es una ruta relativa ('./' o '../') ni una dependencia en link.json")))?
+            .clone();
 
         // Dependencia git real (GRAMMAR.md §2.1, package manager):
         // `git+<url>#<rev>` clona/actualiza un caché local vía `git`
@@ -231,8 +276,24 @@ impl Loader<'_> {
         // para un proyecto nuevo (ver `scaffold.rs`), no una ruta
         // configurable en esta v0.
         if dep_spec.starts_with("git+") {
-            let (checkout_dir, lock_entry) =
-                crate::gitdep::resolve(dep_spec, &self.project_root).map_err(|e| err(format!("'{from}': {e}")))?;
+            // GRAMMAR.md §3.183: si `link.lock` ya tiene un pin para ESTA
+            // dependencia (mismo `from`) Y ese pin coincide con el
+            // `url`/`rev` ACTUAL de `link.json` (si `link.json` cambió el
+            // rev desde que se grabó el lock, el pin quedó obsoleto --
+            // re-resolver fresco es lo correcto, mismo criterio que Cargo
+            // ante un `Cargo.toml` editado) Y no se pidió `--update-deps`,
+            // usar el commit YA FIJADO en vez de volver a preguntarle al
+            // remoto qué es "lo último" -- reproducible entre builds.
+            let pinned = self.existing_lock_entry(from).filter(|entry| {
+                !self.update_deps && crate::gitdep::parse_spec(&dep_spec).is_ok_and(|(url, rev)| entry.url == url && entry.rev == rev)
+            });
+            let (checkout_dir, lock_entry) = if let Some(pinned) = pinned {
+                let dir = crate::gitdep::resolve_pinned(&pinned.url, &pinned.resolved, &self.project_root)
+                    .map_err(|e| err(format!("'{from}': {e}")))?;
+                (dir, pinned)
+            } else {
+                crate::gitdep::resolve(&dep_spec, &self.project_root).map_err(|e| err(format!("'{from}': {e}")))?
+            };
             self.git_dependencies.insert(from.to_string(), lock_entry);
             return canonicalize(&checkout_dir.join("main.link"));
         }
@@ -661,12 +722,126 @@ mod tests {
             fn unit_circle() -> Circle { Circle { r: 1 } }
         "#,
         );
-        let (program, _touched, _item_files, git_deps) = load_program_full(&dir.path("a.link"), &HashMap::new()).unwrap();
+        let (program, _touched, _item_files, git_deps) = load_program_full(&dir.path("a.link"), &HashMap::new(), false).unwrap();
         assert_eq!(program.items.len(), 2, "Circle (del repo git) + unit_circle");
         assert_eq!(git_deps.len(), 1);
         let entry = git_deps.get("shapes").expect("debe registrar la resolución de 'shapes' en git_dependencies");
         assert_eq!(entry.rev, "v1.0.0");
         assert_eq!(entry.resolved.len(), 40, "un commit SHA completo de git: {}", entry.resolved);
+
+        let _ = fs::remove_dir_all(&remote_dir);
+    }
+
+    // ---- pin real vía link.lock (GRAMMAR.md §3.183) ----
+
+    fn commit_to_fixture_remote(dir: &Path, contents: &str, message: &str) -> String {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git").args(args).current_dir(dir).status().unwrap();
+            assert!(status.success(), "git {args:?} falló");
+        };
+        fs::write(dir.join("main.link"), contents).unwrap();
+        run(&["commit", "--quiet", "-am", message]);
+        String::from_utf8(std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(dir).output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    fn write_link_lock_with_pin(dir: &TempDir, name: &str, url: &str, rev: &str, resolved: &str) {
+        dir.write(
+            "link.lock",
+            &format!(
+                r#"{{"version":1,"entries":{{}},"git_dependencies":{{"{name}":{{"url":"{url}","rev":"{rev}","resolved":"{resolved}"}}}}}}"#
+            ),
+        );
+    }
+
+    #[test]
+    fn a_git_dependency_pinned_in_link_lock_stays_on_that_commit_even_after_the_remote_branch_advances() {
+        let remote_dir = std::env::temp_dir().join(format!("cscript-modules-pin-remote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&remote_dir);
+        let remote_url = init_fixture_remote(&remote_dir);
+        // `init_fixture_remote` deja el remoto en `main` con "v1.0.0" ya
+        // taggeado -- acá se usa la RAMA (`main`), no el tag, porque es el
+        // caso donde el bug de staleness (§3.183) y el valor de un pin real
+        // se notan de verdad: un tag no cambia solo, una rama sí.
+        let v1_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&remote_dir)
+            .output()
+            .map(|o| String::from_utf8(o.stdout).unwrap().trim().to_string())
+            .unwrap();
+
+        let dir = TempDir::new("pin-stays");
+        dir.write("link.json", &format!(r#"{{ "dependencies": {{ "shapes": "git+{remote_url}#main" }} }}"#));
+        dir.write("a.link", r#"import { Circle } from "shapes"; fn f() -> Circle { Circle { r: 1 } }"#);
+        write_link_lock_with_pin(&dir, "shapes", &remote_url, "main", &v1_sha);
+
+        // El remoto avanza DESPUÉS de que el pin ya quedó grabado.
+        commit_to_fixture_remote(&remote_dir, "type Circle = { r: Int, extra: Int }", "v2 -- el remoto avanzó");
+
+        let (_, _, _, git_deps) = load_program_full(&dir.path("a.link"), &HashMap::new(), false).unwrap();
+        let entry = git_deps.get("shapes").unwrap();
+        assert_eq!(
+            entry.resolved, v1_sha,
+            "con un pin existente en link.lock y sin --update-deps, el build tiene que quedarse en el commit fijado, no seguir a la rama"
+        );
+
+        let _ = fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn update_deps_ignores_the_existing_pin_and_re_resolves_the_branch_fresh() {
+        let remote_dir = std::env::temp_dir().join(format!("cscript-modules-update-deps-remote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&remote_dir);
+        let remote_url = init_fixture_remote(&remote_dir);
+        let v1_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&remote_dir)
+            .output()
+            .map(|o| String::from_utf8(o.stdout).unwrap().trim().to_string())
+            .unwrap();
+
+        let dir = TempDir::new("update-deps");
+        dir.write("link.json", &format!(r#"{{ "dependencies": {{ "shapes": "git+{remote_url}#main" }} }}"#));
+        dir.write("a.link", r#"import { Circle } from "shapes"; fn f() -> Circle { Circle { r: 1 } }"#);
+        write_link_lock_with_pin(&dir, "shapes", &remote_url, "main", &v1_sha);
+
+        let v2_sha = commit_to_fixture_remote(&remote_dir, "type Circle = { r: Int, extra: Int }", "v2 -- el remoto avanzó");
+
+        let (_, _, _, git_deps) = load_program_full(&dir.path("a.link"), &HashMap::new(), true).unwrap();
+        let entry = git_deps.get("shapes").unwrap();
+        assert_eq!(entry.resolved, v2_sha, "con --update-deps, el pin existente se ignora y la rama se re-resuelve fresca contra el remoto");
+
+        let _ = fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn a_pin_for_a_rev_that_link_json_no_longer_declares_is_ignored_and_re_resolved_fresh() {
+        // Si `link.json` cambió el rev de "shapes" desde que se grabó el
+        // pin (ej. de una rama a un tag específico), el pin viejo queda
+        // OBSOLETO -- re-resolver fresco es lo correcto, mismo criterio que
+        // Cargo ante un Cargo.toml editado a mano.
+        let remote_dir = std::env::temp_dir().join(format!("cscript-modules-stale-pin-remote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&remote_dir);
+        let remote_url = init_fixture_remote(&remote_dir);
+        let v1_sha = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&remote_dir)
+            .output()
+            .map(|o| String::from_utf8(o.stdout).unwrap().trim().to_string())
+            .unwrap();
+
+        let dir = TempDir::new("stale-pin");
+        // link.json pide el TAG "v1.0.0" -- pero el pin grabado dice "main".
+        dir.write("link.json", &format!(r#"{{ "dependencies": {{ "shapes": "git+{remote_url}#v1.0.0" }} }}"#));
+        dir.write("a.link", r#"import { Circle } from "shapes"; fn f() -> Circle { Circle { r: 1 } }"#);
+        write_link_lock_with_pin(&dir, "shapes", &remote_url, "main", &v1_sha);
+
+        let (_, _, _, git_deps) = load_program_full(&dir.path("a.link"), &HashMap::new(), false).unwrap();
+        let entry = git_deps.get("shapes").unwrap();
+        assert_eq!(entry.rev, "v1.0.0", "el pin (grabado para 'main') no coincide con el rev actual de link.json ('v1.0.0') -- se ignora");
+        assert_eq!(entry.resolved, v1_sha, "'v1.0.0' apunta al mismo commit en este fixture, pero resuelto FRESCO, no reusando el pin obsoleto");
 
         let _ = fs::remove_dir_all(&remote_dir);
     }

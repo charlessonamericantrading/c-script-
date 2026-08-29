@@ -130,7 +130,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("uso: linkc <subcomando> [opciones]"));
     out(&format!("subcomandos conocidos:"));
     out(&format!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)"));
-    out(&format!("     linkc build <archivo.link> <outdir> [--diff <anterior>]    (genera contratos TS, cliente, hooks, schemas Zod, OpenAPI, llms.txt y llms-full.txt; --diff compara el contract.d.ts nuevo contra uno guardado antes)"));
+    out(&format!("     linkc build <archivo.link> <outdir> [--diff <anterior>] [--update-deps]    (genera contratos TS, cliente, hooks, schemas Zod, OpenAPI, llms.txt y llms-full.txt; --diff compara el contract.d.ts nuevo contra uno guardado antes; --update-deps ignora el pin de link.lock y re-resuelve cada dependencia git contra su remoto real)"));
     out(&format!("     linkc test <archivo.link> [--filter <nombre>] [--db <url-postgres>]  (ejecuta pruebas de comportamiento integradas; --filter acota a las que CONTIENEN ese substring en el nombre; --db/LINK_TEST_DB corre contra PostgreSQL real en vez de SQLite :memory:, sin aislamiento entre tests -- solo contra una base de test dedicada, nunca producción)"));
     out(&format!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)"));
     out(&format!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)"));
@@ -757,14 +757,18 @@ struct BuildResult {
     touched: Vec<PathBuf>,
 }
 
-fn build_once(path: &str, outdir: &str) -> BuildResult {
+fn build_once(path: &str, outdir: &str, update_deps: bool) -> BuildResult {
     // `load_program_full`, no `load_program`: además del trío de
     // siempre, necesita `git_dependencies` (GRAMMAR.md §2.1, package
     // manager real) para grabar en `link.lock` más abajo -- `linkc
     // check`/`serve`/`wasm` (que sí usan `load_program` vía
     // `load_and_check`) no escriben ningún lockfile, así que no
-    // necesitan este cuarto valor.
-    let (program, touched, item_files, git_dependencies) = match modules::load_program_full(Path::new(path), &HashMap::new()) {
+    // necesitan este cuarto valor. `update_deps` (GRAMMAR.md §3.183):
+    // `linkc dev` siempre pasa `false` -- un rebuild automático por watch
+    // respeta el pin existente, igual que un `linkc build` normal; solo
+    // `linkc build --update-deps` explícito puede pedir una resolución
+    // fresca.
+    let (program, touched, item_files, git_dependencies) = match modules::load_program_full(Path::new(path), &HashMap::new(), update_deps) {
         Ok(quad) => quad,
         Err(e) => {
             report_load_error(&e);
@@ -929,28 +933,34 @@ fn build_once(path: &str, outdir: &str) -> BuildResult {
 /// `--update` de `linkc test`), así que hay que consumir los dos tokens
 /// juntos antes de tratar el resto como posicional (`path`/`outdir`), mismo
 /// criterio de filtrado que `cmd_test` ya usa para `snap_path`/`--update`.
+/// `--update-deps` (GRAMMAR.md §3.183) es un flag suelto, sin valor -- mismo
+/// criterio que `--update` de `cmd_test`, filtrado sin consumir un token extra.
 fn cmd_build(args: &[String]) -> ExitCode {
     let mut positional = Vec::new();
     let mut diff_against: Option<&str> = None;
+    let mut update_deps = false;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--diff" {
             let Some(value) = args.get(i + 1) else {
-                eprintln!("uso: linkc build <archivo.link> <outdir> [--diff <contract.d.ts anterior>]");
+                eprintln!("uso: linkc build <archivo.link> <outdir> [--diff <contract.d.ts anterior>] [--update-deps]");
                 return ExitCode::FAILURE;
             };
             diff_against = Some(value);
             i += 2;
+        } else if args[i] == "--update-deps" {
+            update_deps = true;
+            i += 1;
         } else {
             positional.push(args[i].as_str());
             i += 1;
         }
     }
     let (Some(path), Some(outdir)) = (positional.first(), positional.get(1)) else {
-        eprintln!("uso: linkc build <archivo.link> <outdir> [--diff <contract.d.ts anterior>]");
+        eprintln!("uso: linkc build <archivo.link> <outdir> [--diff <contract.d.ts anterior>] [--update-deps]");
         return ExitCode::FAILURE;
     };
-    let result = build_once(path, outdir);
+    let result = build_once(path, outdir, update_deps);
     if !result.ok {
         return ExitCode::FAILURE;
     }
@@ -1352,11 +1362,9 @@ fn cmd_dev(args: &[String]) -> ExitCode {
     // TAMBIÉN al hijo (ese es el camino verificado manualmente). Un kill
     // programático dirigido SOLO al PID de este proceso padre (no un
     // Ctrl+C real) es el caso que sí puede dejar al hijo huérfano
-    // sirviendo el puerto -- límite de v0 conocido, no manejado (mismo
-    // tipo de limitación que `gitdep::resolve` ya documenta para el
-    // locking entre procesos).
+    // sirviendo el puerto -- límite de v0 conocido, no manejado.
     println!("linkc dev: observando '{path}' y sus imports (Ctrl+C para detener)");
-    let mut result = build_once(path, outdir);
+    let mut result = build_once(path, outdir, false);
     let mut mtimes = snapshot_mtimes(&result.touched);
     let mut server_child = match (&exe, serve_port) {
         (Some(exe), Some(port)) if result.ok => spawn_serve_child(exe, path, port),
@@ -1368,7 +1376,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
         let current = snapshot_mtimes(&result.touched);
         if current != mtimes {
             println!("cambio detectado, reconstruyendo...");
-            result = build_once(path, outdir);
+            result = build_once(path, outdir, false);
             mtimes = snapshot_mtimes(&result.touched);
             if !result.ok {
                 if server_child.is_some() {

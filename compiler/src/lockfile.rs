@@ -10,15 +10,17 @@ pub struct LockEntry {
 }
 
 /// Dependencia `git+<url>#<rev>` de `link.json` ya resuelta (GRAMMAR.md
-/// §2.1, package manager real) -- `rev` es lo que el usuario pidió (un
-/// tag, una rama, o ya un commit), `resolved` es el commit SHA exacto al
-/// que resolvió esa vez. A diferencia de `LockEntry` (que SÍ se usa para
-/// detectar deriva -- `verify_lockfile` compara contra el hash actual),
-/// esta entrada es puramente informativa en v0: `modules::gitdep`
-/// siempre re-resuelve `rev` fresco en cada build (si es una rama/tag que
-/// se movió, el build lo sigue) en vez de forzar `resolved` como un pin
-/// que anule lo que dice `link.json` -- ver `gitdep.rs` para el porqué y
-/// qué haría falta para que sea un pin real.
+/// §2.1/§3.183, package manager real) -- `rev` es lo que el usuario pidió
+/// (un tag, una rama, o ya un commit), `resolved` es el commit SHA exacto
+/// al que resolvió esa vez. PIN REAL: si `link.lock` ya trae una entrada
+/// para una dependencia cuyo `url`/`rev` siguen coincidiendo con
+/// `link.json`, `modules::Loader` usa `resolved` DIRECTO (vía
+/// `gitdep::resolve_pinned`) en vez de volver a preguntarle al remoto qué
+/// es "lo último" -- reproducible entre builds, igual que
+/// `Cargo.lock`/`package-lock.json`. Solo `linkc build --update-deps`
+/// fuerza una resolución fresca que reescribe este campo; sin ese flag, y
+/// mientras `link.json` no cambie el `url`/`rev` de la dependencia, el pin
+/// se mantiene indefinidamente. Ver `gitdep.rs`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct GitLockEntry {
     pub url: String,
