@@ -2251,6 +2251,105 @@ service Items {{ rpc list() -> Item[] {{ db.{COLLECTION}.all() }} }}
     assert!(rows[0].get("legacy_note").is_none(), "una columna no declarada no debe filtrarse a la respuesta");
 }
 
+#[test]
+fn adopt_existing_reads_correctly_after_a_real_drop_column_migration() {
+    // Reporte real de skynet-43 (iaacademy, 29/08/2026): después de migrar
+    // `id uuid` -> `id BIGSERIAL` a mano (ADD COLUMN id_seq + backfill +
+    // RENAME de las dos columnas + ADD PRIMARY KEY) y por último DROP
+    // COLUMN de la columna uuid vestigial, TODA query real contra la tabla
+    // rompía con "error deserializing column N" -- `find`/`findWhere` por
+    // igual, siempre, en la MISMA posición numérica sin importar el orden
+    // de los campos en el `.link`. Hipótesis del reporte (sin confirmar
+    // contra el código): un DROP COLUMN deja un hueco permanente en
+    // `pg_attribute.attnum` (`attisdropped=true`, attnum nunca se
+    // renumera) que en algún punto de `--adopt-existing` desalinearía
+    // lecturas posteriores.
+    //
+    // Este test reproduce la MISMA secuencia real de migración (no solo
+    // "una tabla con una columna de más", que ya cubre el test de arriba)
+    // contra una tabla real, y confirma que `--adopt-existing` sigue
+    // pudiendo leer/escribir después.
+    const COLLECTION: &str = "leads_post_drop_column";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                \"email\" TEXT NOT NULL, \
+                \"status\" TEXT NOT NULL, \
+                \"score\" BIGINT NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla legacy con id uuid, como la real de iaacademy antes de migrar");
+    client
+        .execute(
+            &format!("INSERT INTO \"{COLLECTION}\" (email, status, score) VALUES ($1, $2, $3)"),
+            &[&"a@example.com", &"new", &7i64],
+        )
+        .expect("sembrar una fila con la PK uuid original");
+
+    // La MISMA secuencia que describe el reporte, paso a paso.
+    client
+        .batch_execute(&format!(
+            "ALTER TABLE \"{COLLECTION}\" ADD COLUMN \"id_seq\" BIGSERIAL; \
+             UPDATE \"{COLLECTION}\" SET \"id_seq\" = DEFAULT; \
+             ALTER TABLE \"{COLLECTION}\" DROP CONSTRAINT \"{COLLECTION}_pkey\"; \
+             ALTER TABLE \"{COLLECTION}\" RENAME COLUMN \"id\" TO \"id_uuid_legacy\"; \
+             ALTER TABLE \"{COLLECTION}\" RENAME COLUMN \"id_seq\" TO \"id\"; \
+             ALTER TABLE \"{COLLECTION}\" ADD PRIMARY KEY (\"id\"); \
+             ALTER TABLE \"{COLLECTION}\" DROP COLUMN \"id_uuid_legacy\""
+        ))
+        .expect("correr la migracion real completa -- ADD/backfill/RENAME/ADD PK/DROP COLUMN");
+
+    // Sembrar una SEGUNDA fila después de la migración, con la nueva PK
+    // entera -- confirma que la tabla post-migración es usable en SQL
+    // crudo antes de meter a c-script en la ecuación.
+    let second_id: i64 = client
+        .query_one(&format!("INSERT INTO \"{COLLECTION}\" (email, status, score) VALUES ($1, $2, $3) RETURNING id"), &[
+            &"b@example.com",
+            &"contacted",
+            &9i64,
+        ])
+        .map(|row| row.get(0))
+        .expect("insertar una segunda fila con SQL crudo tras la migración");
+
+    let temp = TempDir::new("adopt-drop-column");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Lead = {{ id: Int, email: String, status: String, score: Int }}
+type NewLead = {{ email: String, status: String, score: Int }}
+db {{ {COLLECTION}: Lead[] }}
+service Leads {{
+  rpc list() -> Lead[] {{ db.{COLLECTION}.all() }}
+  rpc get(id: Int) -> Lead? {{ db.{COLLECTION}.find(id) }}
+  rpc create(email: String, status: String, score: Int) -> Lead {{ db.{COLLECTION}.insert(NewLead {{ email: email, status: status, score: score }}) }}
+}}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+
+    let listed = server.rpc("Leads/list", "{}");
+    let rows = listed.as_array().unwrap_or_else(|| panic!("se esperaba una lista, llegó: {listed:?}"));
+    assert_eq!(rows.len(), 2, "las dos filas (antes y después de migrar) tienen que leerse limpio: {listed:?}");
+
+    let fetched = server.rpc("Leads/get", &format!(r#"{{"id":{second_id}}}"#));
+    assert_eq!(fetched["email"], "b@example.com", "find por id tiene que funcionar después del DROP COLUMN: {fetched:?}");
+
+    let created = server.rpc("Leads/create", r#"{"email":"c@example.com","status":"new","score":1}"#);
+    assert_eq!(created["email"], "c@example.com", "insert también tiene que funcionar después del DROP COLUMN: {created:?}");
+}
+
 // GRAMMAR.md §3.91: un campo `Timestamp` decodifica correctamente contra
 // una columna `date`/`timestamp`/`timestamptz` NATIVA de Postgres, no solo
 // contra el `BIGINT` propio de c-script -- encontrado auditando un reporte
