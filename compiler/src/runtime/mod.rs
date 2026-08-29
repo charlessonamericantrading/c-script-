@@ -1387,6 +1387,7 @@ fn value_matches_type(v: &Value, ty: &crate::types::Type, checker: &Checker) -> 
     match ty {
         Type::Int => matches!(v, Value::Int(_)),
         Type::Int64 => matches!(v, Value::Int64(_)),
+        Type::Decimal => matches!(v, Value::Decimal(_)),
         Type::Timestamp => matches!(v, Value::Timestamp(_)),
         Type::Float => matches!(v, Value::Float(_)),
         Type::String => matches!(v, Value::Str(_)),
@@ -5273,9 +5274,11 @@ mod tests {
                 rpc reprice(id: Int, p: Patch<LineItem>) -> LineItem {
                     db.items.applyPatch(id, p)
                 }
-                rpc lineTotal(id: Int) -> Decimal {
-                    let item = db.items.find(id) ?? panic("no existe");
-                    item.unitPrice * item.qty.toDecimal()
+                rpc lineTotal(id: Int) -> Decimal? {
+                    match db.items.find(id) {
+                        item: LineItem => item.unitPrice * item.qty.toDecimal(),
+                        null => null,
+                    }
                 }
                 rpc totalValue() -> Decimal[] {
                     db.items.sumBy(|i: LineItem| { i.description }, |i: LineItem| { i.unitPrice })

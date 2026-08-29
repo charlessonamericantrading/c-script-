@@ -2791,9 +2791,11 @@ service Items {{
     db.{COLLECTION}.insert(NewLineItem {{ sku: sku, unitPrice: unitPrice, qty: qty }})
   }}
   rpc get(id: Int) -> LineItem? {{ db.{COLLECTION}.find(id) }}
-  rpc lineTotal(id: Int) -> Decimal {{
-    let item = db.{COLLECTION}.find(id) ?? panic("no existe")
-    item.unitPrice * item.qty.toDecimal()
+  rpc lineTotal(id: Int) -> Decimal? {{
+    match db.{COLLECTION}.find(id) {{
+      item: LineItem => item.unitPrice * item.qty.toDecimal(),
+      null => null,
+    }}
   }}
   rpc totalBySku() -> {{key: String, value: Decimal}}[] {{ db.{COLLECTION}.sumBy(|i: LineItem| {{ i.sku }}, |i: LineItem| {{ i.unitPrice }}) }}
   rpc priciest() -> LineItem? {{ db.{COLLECTION}.maxRow(|i: LineItem| {{ i.unitPrice }}) }}

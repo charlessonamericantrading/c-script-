@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.140.1] - 2026-08-29
+
+### 🐛 Arreglado
+**CI en rojo tras v1.140.0**: `match`/narrowing de un `Optional`/`Union` (`match db.<c>.find(id) { fila: T => ..., null => ... }`) nunca matcheaba ningún arm cuando `T` tenía un campo `Decimal` -- `value_matches_type` (`runtime/mod.rs`) es un `match` sobre `Type` sin brazo para `Type::Decimal`, cayendo al fallback `_ => false`. Expuesto por el propio test nuevo contra Postgres real en CI (el test local equivalente contra SQLite usa un harness que se salta el checker, así que compiló pero nunca ejercitó este camino). Arreglado con un brazo explícito, mismo criterio que el resto de la ronda. Ver GRAMMAR.md §3.184.
+
+**Verificado**: los 2 tests de `pg_integration.rs` de v1.140.0 ahora corren de punta a punta contra Postgres real en CI. Suite completa (1378 tests) sin regresiones.
+
 ## [1.140.0] - 2026-08-29
 
 ### ✨ Nuevo
