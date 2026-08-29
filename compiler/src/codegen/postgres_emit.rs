@@ -24,6 +24,12 @@ pub fn link_to_postgres_type(ty: &Type, simple_enums: &HashSet<String>) -> &'sta
     match ty {
         Type::Optional(inner) => link_to_postgres_type(inner.as_ref(), simple_enums),
         Type::Int | Type::Int64 | Type::Timestamp => "BIGINT",
+        // GRAMMAR.md §3.184: NUMERIC nativo, no BIGINT -- a diferencia de
+        // Int64 (mismo ancho físico que Int, sin necesidad de un tipo
+        // Postgres propio), Decimal necesita el tipo real de precisión
+        // exacta -- 38 dígitos totales, 4 decimales fijos, más que
+        // suficiente para el i128 interno.
+        Type::Decimal => "NUMERIC(38,4)",
         Type::Float => "DOUBLE PRECISION",
         Type::String => "TEXT",
         // TEXT, no el tipo nativo UUID de Postgres -- mismo criterio de

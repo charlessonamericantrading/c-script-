@@ -1519,6 +1519,12 @@ pub(crate) fn render_type(ty: &Type) -> String {
         // y las llamadas salientes usan un `JSON.stringify` con replacer que
         // vuelve a pasar cualquier `bigint` a texto antes de mandarlo.
         Type::Int64 => "bigint".to_string(),
+        // `string`, NO `bigint` -- a diferencia de Int64, no hay un tipo
+        // decimal nativo en JS/TS al que "revivir" (GRAMMAR.md §3.184).
+        // Inventar una clase cliente propia queda fuera de alcance en v0;
+        // el wire ya manda un string con exactamente 4 decimales, así que
+        // este tipo TS ya es la forma final, sin ningún walker de revivido.
+        Type::Decimal => "string".to_string(),
         // String ISO-8601 plano, no branded -- GRAMMAR.md §3.31: el mismo
         // criterio minimalista que el resto del proyecto, revisar branding
         // si aparece un caso real que lo pida.
@@ -1655,7 +1661,7 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
                 collect_type_names(m, names);
             }
         }
-        Type::Int | Type::Int64 | Type::Timestamp | Type::Float | Type::String | Type::Uuid | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
+        Type::Int | Type::Int64 | Type::Decimal | Type::Timestamp | Type::Float | Type::String | Type::Uuid | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
         Type::Db | Type::DbCollection(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Env | Type::Request | Type::Smtp | Type::Response => {
             unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64 nunca aparece en un TypeExpr real")
         }

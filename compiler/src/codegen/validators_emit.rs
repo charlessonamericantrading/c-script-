@@ -222,6 +222,7 @@ fn type_key(ty: &Type) -> String {
     match ty {
         Type::Int => "Int".into(),
         Type::Int64 => "Int64".into(),
+        Type::Decimal => "Decimal".into(),
         Type::Timestamp => "Timestamp".into(),
         Type::Float => "Float".into(),
         Type::String => "String".into(),
@@ -280,6 +281,11 @@ fn render_check(ty: &Type, expr: &str, worklist: &mut Vec<Type>, seen: &mut Vec<
             "(typeof {expr} === \"string\" && /^\\d{{4}}-\\d{{2}}-\\d{{2}}T\\d{{2}}:\\d{{2}}:\\d{{2}}\\.\\d{{3}}Z$/.test({expr}) && !isNaN(Date.parse({expr})))"
         ),
         Type::Float => format!("typeof {expr} === \"number\""),
+        // Forma fija (GRAMMAR.md §3.184): signo opcional, uno o más
+        // dígitos, punto, EXACTAMENTE 4 decimales -- nunca ceros finales
+        // omitidos (el servidor siempre los manda, sin ambigüedad al
+        // parsear de vuelta).
+        Type::Decimal => format!("(typeof {expr} === \"string\" && /^-?\\d+\\.\\d{{4}}$/.test({expr}))"),
         Type::String => format!("typeof {expr} === \"string\""),
         // Forma canónica 8-4-4-4-12 en hex (GRAMMAR.md §3.70) -- sin
         // restringir el nibble de versión/variante: acepta UUIDs de

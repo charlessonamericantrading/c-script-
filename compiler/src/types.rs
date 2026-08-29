@@ -12,6 +12,18 @@ pub enum Type {
     /// preservarla (GRAMMAR.md §3.30). Sin mezcla implícita con `Int` en
     /// aritmética -- `.toInt64()`/`.toInt()` son la única conversión.
     Int64,
+    /// Punto fijo, 4 decimales, escala GLOBAL (no configurable por campo en
+    /// v0) -- internamente `i128` escalado ×10.000 (GRAMMAR.md §3.184).
+    /// Resuelve el error de redondeo binario de `Float` sobre columnas de
+    /// dinero (reportado por dos adoptadores financieros reales) con
+    /// aritmética entera EXACTA para `+`/`-`, y redondeo half-up (empate se
+    /// aleja de cero) en el único punto donde hace falta re-escalar:
+    /// `*`/`/`. Sin sintaxis de literal propia -- mismo criterio que
+    /// `Int64`: se construye vía `.toDecimal()` desde `Int`/`Float`. `%` NO
+    /// está soportado (sin semántica bien definida para un decimal
+    /// escalado). Wire y TS: `string` con exactamente 4 decimales, nunca
+    /// `number` (perdería exactitud en cualquier cliente JS).
+    Decimal,
     /// Milisegundos desde epoch UTC internamente; string ISO-8601
     /// (`YYYY-MM-DDTHH:mm:ss.sssZ`) en el wire y en TS (GRAMMAR.md §3.31).
     /// Solo comparable (`< <= > >= == !=`) -- sin aritmética (no hay tipo
@@ -152,6 +164,7 @@ impl std::fmt::Display for Type {
         match self {
             Type::Int => write!(f, "Int"),
             Type::Int64 => write!(f, "Int64"),
+            Type::Decimal => write!(f, "Decimal"),
             Type::Timestamp => write!(f, "Timestamp"),
             Type::Float => write!(f, "Float"),
             Type::String => write!(f, "String"),

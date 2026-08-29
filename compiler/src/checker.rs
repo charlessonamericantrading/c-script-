@@ -1135,6 +1135,7 @@ impl Checker {
         match name {
             "Int" => Ok(Type::Int),
             "Int64" => Ok(Type::Int64),
+            "Decimal" => Ok(Type::Decimal),
             "Timestamp" => Ok(Type::Timestamp),
             "Float" => Ok(Type::Float),
             "String" => Ok(Type::String),
@@ -1231,7 +1232,7 @@ impl Checker {
                         Ok(Type::Generic(name.to_string(), resolved_args))
                     }
                 } else {
-                    let mut candidates: Vec<&str> = vec!["Int", "Int64", "Timestamp", "Float", "String", "Uuid", "Bool", "Void", "Result", "Patch", "Map"];
+                    let mut candidates: Vec<&str> = vec!["Int", "Int64", "Decimal", "Timestamp", "Float", "String", "Uuid", "Bool", "Void", "Result", "Patch", "Map"];
                     candidates.extend(self.types.keys().map(String::as_str));
                     candidates.extend(self.enums.keys().map(String::as_str));
                     if let Some(sug) = find_best_suggestion(name, candidates) {
@@ -2298,10 +2299,10 @@ impl Checker {
                     );
                     continue;
                 }
-            } else if !matches!(inner, Type::Int | Type::Int64 | Type::Float) {
+            } else if !matches!(inner, Type::Int | Type::Int64 | Type::Decimal | Type::Float) {
                 errors.push(
                     err(format!(
-                        "'@check(min/max/range, ...)' en el campo '{}': solo aplica sobre `Int`/`Int64`/`Float` (u opcional de esos) -- es `{ty}`",
+                        "'@check(min/max/range, ...)' en el campo '{}': solo aplica sobre `Int`/`Int64`/`Decimal`/`Float` (u opcional de esos) -- es `{ty}`",
                         f.name
                     ))
                     .with_span(f.name_span),
@@ -3708,15 +3709,22 @@ impl Checker {
                 match (&l, &r) {
                     (Type::Int, Type::Int) => Ok(Type::Int),
                     (Type::Int64, Type::Int64) => Ok(Type::Int64),
+                    (Type::Decimal, Type::Decimal) => Ok(Type::Decimal),
                     (Type::Float, Type::Float) => Ok(Type::Float),
                     (Type::String, Type::String) => Ok(Type::String),
                     (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Dynamic),
                     _ => Err(err(format!(
-                        "'+' requiere Int+Int, Int64+Int64, Float+Float o String+String sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
+                        "'+' requiere Int+Int, Int64+Int64, Decimal+Decimal, Float+Float o String+String sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
                     ))),
                 }
             }
-            Sub | Mul | Div | Rem => {
+            // GRAMMAR.md §3.184: Decimal entra en Sub/Mul/Div (aritmética
+            // exacta con redondeo half-up al re-escalar, ver runtime/mod.rs)
+            // pero NO en Rem -- un resto sobre un decimal escalado no tiene
+            // una semántica bien definida todavía, y aceptarlo acá sin
+            // implementarlo en runtime sería el mismo tipo de desacuerdo
+            // checker/runtime que este proyecto siempre trata como bug.
+            Rem => {
                 let l = self.synth_expr(left, env)?;
                 let r = self.synth_expr(right, env)?;
                 match (&l, &r) {
@@ -3725,7 +3733,21 @@ impl Checker {
                     (Type::Float, Type::Float) => Ok(Type::Float),
                     (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Dynamic),
                     _ => Err(err(format!(
-                        "operador aritmético requiere Int+Int, Int64+Int64 o Float+Float sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
+                        "'%' requiere Int+Int, Int64+Int64 o Float+Float sin mezclar -- Decimal no soporta '%' (GRAMMAR.md §3.184); se encontró {l:?} y {r:?}"
+                    ))),
+                }
+            }
+            Sub | Mul | Div => {
+                let l = self.synth_expr(left, env)?;
+                let r = self.synth_expr(right, env)?;
+                match (&l, &r) {
+                    (Type::Int, Type::Int) => Ok(Type::Int),
+                    (Type::Int64, Type::Int64) => Ok(Type::Int64),
+                    (Type::Decimal, Type::Decimal) => Ok(Type::Decimal),
+                    (Type::Float, Type::Float) => Ok(Type::Float),
+                    (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Dynamic),
+                    _ => Err(err(format!(
+                        "operador aritmético requiere Int+Int, Int64+Int64, Decimal+Decimal o Float+Float sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
                     ))),
                 }
             }
@@ -3755,6 +3777,7 @@ impl Checker {
                 match (&l, &r) {
                     (Type::Int, Type::Int)
                     | (Type::Int64, Type::Int64)
+                    | (Type::Decimal, Type::Decimal)
                     | (Type::Float, Type::Float)
                     // Timestamp SOLO entra acá (comparación/orden) -- sin
                     // aritmética, sin Neg (GRAMMAR.md §3.31): no hay
@@ -3762,7 +3785,7 @@ impl Checker {
                     | (Type::Timestamp, Type::Timestamp) => Ok(Type::Bool),
                     (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Bool),
                     _ => Err(err(format!(
-                        "operador relacional requiere Int+Int, Int64+Int64, Float+Float o Timestamp+Timestamp; se encontró {l:?} y {r:?}"
+                        "operador relacional requiere Int+Int, Int64+Int64, Decimal+Decimal, Float+Float o Timestamp+Timestamp; se encontró {l:?} y {r:?}"
                     ))),
                 }
             }
@@ -3819,8 +3842,8 @@ impl Checker {
             UnaryOp::Neg => {
                 let t = self.synth_expr(operand, env)?;
                 match t {
-                    Type::Int | Type::Int64 | Type::Float | Type::Dynamic => Ok(t),
-                    other => Err(err(format!("'-' unario requiere Int, Int64 o Float, se encontró {other}"))),
+                    Type::Int | Type::Int64 | Type::Decimal | Type::Float | Type::Dynamic => Ok(t),
+                    other => Err(err(format!("'-' unario requiere Int, Int64, Decimal o Float, se encontró {other}"))),
                 }
             }
             UnaryOp::Not => {
@@ -3888,8 +3911,25 @@ impl Checker {
                 self.expect_no_args(args, "toInt")?;
                 Some(Type::Int)
             }
+            // GRAMMAR.md §3.184: sin sintaxis de literal Decimal propia --
+            // mismo criterio que Int64 (§3.30), `.toDecimal()` es la ÚNICA
+            // forma de obtenerlo desde código fuente. `Int.toDecimal()` es
+            // exacto (escala ×10.000 sin pérdida); `Float.toDecimal()`
+            // redondea el f64 ya parseado al 4to decimal -- seguro en la
+            // práctica para cualquier magnitud financiera real (la
+            // precisión de f64 excede por muchísimo la resolución de 4
+            // decimales), documentado como límite honesto en GRAMMAR.md.
+            (Type::Int, "toDecimal") | (Type::Float, "toDecimal") => {
+                self.expect_no_args(args, "toDecimal")?;
+                Some(Type::Decimal)
+            }
+            (Type::Decimal, "toFloat") => {
+                self.expect_no_args(args, "toFloat")?;
+                Some(Type::Float)
+            }
             (Type::Int, "toString")
             | (Type::Int64, "toString")
+            | (Type::Decimal, "toString")
             | (Type::Float, "toString")
             | (Type::Bool, "toString")
             // `Uuid` -> `String`: la salida "downgrade" explícita para
@@ -4834,9 +4874,25 @@ impl Checker {
 
         let value_ty = if needs_value {
             let (value_field, field_ty) = self.field_selector(element_ty, &args[1], method, "de valor")?;
-            if !matches!(field_ty, Type::Int | Type::Int64 | Type::Float) {
+            // GRAMMAR.md §3.184: `Decimal` entra en sumBy/maxBy/minBy (SQL
+            // pushdown exacto en los dos backends -- SUM/MAX/MIN sobre una
+            // columna Decimal se decodifica con el mismo `ColumnKind::Decimal`
+            // de siempre) pero NO en `avgBy`, a propósito -- Postgres guarda
+            // Decimal como NUMERIC nativo (valor real, sin escalar) pero
+            // SQLite lo guarda como INTEGER YA escalado ×10.000 (sin tipo
+            // decimal nativo); `AVG()` sobre esas dos representaciones
+            // FÍSICAS distintas no da resultados comparables sin una
+            // decodificación específica por backend que esta ronda no
+            // construyó -- límite honesto, no atacado en v0.
+            let field_ty_ok = if method == "avgBy" {
+                matches!(field_ty, Type::Int | Type::Int64 | Type::Float)
+            } else {
+                matches!(field_ty, Type::Int | Type::Int64 | Type::Decimal | Type::Float)
+            };
+            if !field_ty_ok {
+                let allowed = if method == "avgBy" { "Int, Int64 o Float" } else { "Int, Int64, Decimal o Float" };
                 return Err(err(format!(
-                    "'{method}': el campo de valor '{value_field}' es {field_ty} -- tiene que ser Int, Int64 o Float (GRAMMAR.md §3.65)"
+                    "'{method}': el campo de valor '{value_field}' es {field_ty} -- tiene que ser {allowed} (GRAMMAR.md §3.65/§3.184)"
                 )));
             }
             Some(field_ty)
@@ -4871,9 +4927,15 @@ impl Checker {
             return Err(err(format!("'{method}' toma exactamente 1 argumento (selector: |item: T| item.campo)")));
         };
         let (field_name, field_ty) = self.field_selector(element_ty, selector_arg, method, "de orden")?;
-        if !matches!(field_ty, Type::Int | Type::Int64 | Type::Float) {
+        // GRAMMAR.md §3.184: Decimal entra acá sin el límite que avgBy tiene
+        // en check_aggregate_by -- maxRow/minRow es un ORDER BY ... LIMIT 1
+        // puro (runtime/db.rs::top_row), nunca un CAST de agregación, así
+        // que la representación física distinta entre backends (NUMERIC vs
+        // INTEGER escalado) no importa: ordenar por cualquiera de las dos da
+        // el mismo orden relativo.
+        if !matches!(field_ty, Type::Int | Type::Int64 | Type::Decimal | Type::Float) {
             return Err(err(format!(
-                "'{method}': el campo de orden '{field_name}' es {field_ty} -- tiene que ser Int, Int64 o Float (mismo criterio que el campo de valor de sumBy/maxBy/minBy, GRAMMAR.md §3.52)"
+                "'{method}': el campo de orden '{field_name}' es {field_ty} -- tiene que ser Int, Int64, Decimal o Float (mismo criterio que el campo de valor de sumBy/maxBy/minBy, GRAMMAR.md §3.52/§3.184)"
             )));
         }
         Ok(Type::Optional(Box::new(element_ty.clone())))
@@ -5518,6 +5580,66 @@ type T = { id: Int, s: Status }")
         // Sin arm final que capture el resto: no exhaustivo, mismo criterio
         // que Int/String (GRAMMAR.md §3.3).
         assert!(check_source("fn f(n: Int64) -> String { match n { 0 => \"zero\" } }").is_err());
+    }
+
+    // ---- Decimal (GRAMMAR.md §3.184) ----
+
+    #[test]
+    fn decimal_round_trips_through_conversion_methods() {
+        assert!(check_source("fn f(n: Int) -> Decimal { n.toDecimal() }").is_ok());
+        assert!(check_source("fn f(n: Float) -> Decimal { n.toDecimal() }").is_ok());
+        assert!(check_source("fn f(n: Decimal) -> Float { n.toFloat() }").is_ok());
+        assert!(check_source("fn f(n: Decimal) -> String { n.toString() }").is_ok());
+    }
+
+    #[test]
+    fn decimal_conversion_rejects_wrong_receiver_or_args() {
+        assert!(check_source("fn f(n: Decimal) -> Decimal { n.toDecimal() }").is_err(), "toDecimal es de Int/Float, no de Decimal");
+        assert!(check_source("fn f(n: Int) -> Decimal { n.toDecimal(1) }").is_err(), "no toma argumentos");
+        // Deliberado: sin .toInt() -- perdería la parte fraccionaria en
+        // silencio (a diferencia de Int64, mismo ancho que Int).
+        assert!(check_source("fn f(n: Decimal) -> Int { n.toInt() }").is_err());
+    }
+
+    #[test]
+    fn decimal_does_not_mix_implicitly_with_float_or_int_in_arithmetic_or_comparisons() {
+        assert!(check_source("fn f(a: Decimal, b: Float) -> Decimal { a + b }").is_err());
+        assert!(check_source("fn f(a: Decimal, b: Int) -> Bool { a < b }").is_err());
+    }
+
+    #[test]
+    fn decimal_supports_arithmetic_and_comparisons_between_two_decimals() {
+        assert!(check_source("fn f(a: Decimal, b: Decimal) -> Decimal { a + b }").is_ok());
+        assert!(check_source("fn f(a: Decimal, b: Decimal) -> Decimal { a - b }").is_ok());
+        assert!(check_source("fn f(a: Decimal, b: Decimal) -> Decimal { a * b }").is_ok());
+        assert!(check_source("fn f(a: Decimal, b: Decimal) -> Decimal { a / b }").is_ok());
+        assert!(check_source("fn f(a: Decimal, b: Decimal) -> Bool { a < b }").is_ok());
+        assert!(check_source("fn f(a: Decimal, b: Decimal) -> Bool { a == b }").is_ok());
+        assert!(check_source("fn f(a: Decimal) -> Decimal { -a }").is_ok());
+    }
+
+    #[test]
+    fn decimal_rejects_the_modulo_operator_with_a_clear_message() {
+        let errors = check_source("fn f(a: Decimal, b: Decimal) -> Decimal { a % b }")
+            .expect_err("'%' sobre Decimal no tiene semántica bien definida (GRAMMAR.md §3.184)");
+        assert!(
+            errors[0].to_string().contains("Decimal no soporta"),
+            "el mensaje debe explicar por qué, no solo 'tipo equivocado': {:?}",
+            errors[0]
+        );
+    }
+
+    #[test]
+    fn check_min_max_range_applies_to_a_decimal_field() {
+        let src = r#"
+            type Invoice = {
+                id: Int,
+                @check(min, 0) subtotal: Decimal,
+                @check(range, 0, 100) taxRate: Decimal?
+            }
+            db { invoices: Invoice[] }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 
     // ---- Timestamp (GRAMMAR.md §3.31) ----
@@ -8574,7 +8696,7 @@ type T = { id: Int, s: Status }")
             }
         "#;
         let msg = format!("{:?}", check_source(src).unwrap_err());
-        assert!(msg.contains("tiene que ser Int, Int64 o Float"), "{msg}");
+        assert!(msg.contains("tiene que ser Int, Int64, Decimal o Float"), "{msg}");
     }
 
     // GRAMMAR.md §3.102: `maxRow`/`minRow` -- la fila COMPLETA, a
@@ -8614,7 +8736,7 @@ type T = { id: Int, s: Status }")
             }
         "#;
         let msg = format!("{:?}", check_source(src).unwrap_err());
-        assert!(msg.contains("tiene que ser Int, Int64 o Float"), "{msg}");
+        assert!(msg.contains("tiene que ser Int, Int64, Decimal o Float"), "{msg}");
     }
 
     #[test]

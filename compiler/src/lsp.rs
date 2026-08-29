@@ -772,6 +772,7 @@ fn get_hover_for_word(word: &str, source: &str, full_program: Option<&Program>) 
         "pub" => Some("Keyword `pub`\n\nExposes a module item."),
         "Int" => Some("Builtin Type `Int`\n\n64-bit signed integer."),
         "Int64" => Some("Builtin Type `Int64`\n\nSame 64-bit range as `Int`, but serialized as a string on the wire (and typed as `string` in TS) to avoid precision loss above 2^53. Convert with `.toInt64()`/`.toInt()`."),
+        "Decimal" => Some("Builtin Type `Decimal`\n\nFixed-point, exactly 4 decimal places, backed internally by a 128-bit scaled integer -- exact `+`/`-`/comparisons, half-up rounding on `*`/`/` (no `%`). Serialized as a string with exactly 4 decimals on the wire and typed as `string` in TS (no native JS decimal type to revive to). No literal syntax -- construct with `.toDecimal()` from `Int` (exact) or `Float` (rounds to 4 decimals)."),
         "Timestamp" => Some("Builtin Type `Timestamp`\n\nUTC instant, serialized as a fixed-shape ISO-8601 string (`YYYY-MM-DDTHH:mm:ss.sssZ`) on the wire and typed as `string` in TS. Comparable (`< <= > >= == !=`) but no arithmetic; not constructible from source in v0 (arrives as an rpc param or from `db`)."),
         "Float" => Some("Builtin Type `Float`\n\n64-bit floating point number."),
         "String" => Some("Builtin Type `String`\n\nUTF-8 string."),
@@ -1464,13 +1465,20 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
         Type::Int => Some(vec![
             method("toFloat()", "Convert this Int to Float"),
             method("toInt64()", "Convert this Int to Int64"),
+            method("toDecimal()", "Convert this Int to Decimal (exact)"),
         ]),
         Type::Int64 => Some(vec![method("toInt()", "Convert this Int64 to Int")]),
+        // GRAMMAR.md §3.184: sin `.toInt()` -- ver la nota en runtime/mod.rs
+        // sobre por qué (perdería la parte fraccionaria en silencio).
+        Type::Decimal => Some(vec![method("toFloat()", "Convert this Decimal to Float (lossy for extreme magnitudes)")]),
         // Lista vacía EXPLÍCITA, no `None` -- v0 no tiene ningún método
         // sobre Timestamp (GRAMMAR.md §3.31); caer al fallback genérico
         // ofrecería métodos de otros tipos que acá no aplican.
         Type::Timestamp => Some(vec![]),
-        Type::Float => Some(vec![method("toInt()", "Convert this Float to Int")]),
+        Type::Float => Some(vec![
+            method("toInt()", "Convert this Float to Int"),
+            method("toDecimal()", "Convert this Float to Decimal (rounds to 4 decimals)"),
+        ]),
         Type::Auth => Some(vec![
             method("createSession(role)", "Create an opaque session token for the given Role"),
             method("createSessionWithId(role, userId)", "Create an opaque session token for the given Role and userId"),

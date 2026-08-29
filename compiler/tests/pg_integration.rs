@@ -2702,6 +2702,150 @@ service Facturas {{ rpc list() -> Factura[] {{ db.{COLLECTION}.all() }} }}
     assert_eq!(rows[0]["total"], serde_json::json!(1000.0), "numeric entero exacto, sin escala declarada: {rows:?}");
 }
 
+// GRAMMAR.md §3.184: caso real que motiva `Decimal` -- MyFinance tiene
+// columnas `numeric(12,2)` (`subtotal`, `descuento`, `total`, etc.) YA
+// EXISTENTES en producción. Este test adopta una tabla así (no generada por
+// c-script) y confirma lectura Y escritura exactas -- la escritura se
+// verifica con SQL crudo (`::text`), no con el propio decodificador de
+// c-script, porque el punto es que la fila FÍSICA cambie bien, no solo que
+// el programa "crea" que cambió.
+#[test]
+fn adopt_existing_reads_and_writes_a_native_postgres_numeric_column_as_decimal() {
+    const COLLECTION: &str = "facturas_decimal_nativo";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"subtotal\" numeric(12,2) NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla legacy a mano, columna numeric(12,2) NATIVA -- el caso real de MyFinance");
+    client
+        .execute(&format!("INSERT INTO \"{COLLECTION}\" (subtotal) VALUES (1234.56), (-78.90)"), &[])
+        .expect("sembrar filas con SQL crudo");
+
+    let temp = TempDir::new("native-numeric-decimal");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Factura = {{ id: Int, subtotal: Decimal }}
+db {{ {COLLECTION}: Factura[] }}
+service Facturas {{
+  rpc list() -> Factura[] {{ db.{COLLECTION}.all() }}
+  rpc reprice(id: Int, p: Patch<Factura>) -> Factura {{ db.{COLLECTION}.applyPatch(id, p) }}
+}}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+    let listed = server.rpc("Facturas/list", "{}");
+    let rows = listed.as_array().expect("se esperaba una lista");
+    assert_eq!(rows.len(), 2, "body: {listed:?}");
+    let by_id: std::collections::HashMap<i64, String> =
+        rows.iter().map(|r| (r["id"].as_i64().unwrap(), r["subtotal"].as_str().unwrap().to_string())).collect();
+    assert_eq!(by_id.get(&1).map(String::as_str), Some("1234.5600"), "escalado a 4 decimales: {by_id:?}");
+    assert_eq!(by_id.get(&2).map(String::as_str), Some("-78.9000"), "negativo: {by_id:?}");
+
+    server.rpc("Facturas/reprice", r#"{"id":1,"p":{"subtotal":"999.9900"}}"#);
+    let raw: String = client
+        .query_one(&format!("SELECT subtotal::text FROM \"{COLLECTION}\" WHERE id = 1"), &[])
+        .expect("leer con SQL crudo")
+        .get(0);
+    assert_eq!(raw, "999.99", "el valor físico en la columna numeric(12,2) adoptada, confirmado sin pasar por c-script: {raw}");
+}
+
+// GRAMMAR.md §3.184: la otra mitad -- una columna GENERADA por c-script
+// mismo (no adoptada) tiene que salir como `NUMERIC(38,4)` real en el DDL,
+// y el ciclo completo (create/find/multiplicación/sumBy/maxBy/minBy) tiene
+// que dar el mismo resultado exacto que el test equivalente contra SQLite
+// real (`runtime/mod.rs`).
+#[test]
+fn a_decimal_field_supports_the_full_crud_cycle_and_aggregation_against_a_freshly_generated_postgres_column() {
+    const COLLECTION: &str = "line_items_decimal_generated";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("decimal-generated");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type LineItem = {{ id: Int, sku: String, unitPrice: Decimal, qty: Int }}
+type NewLineItem = {{ sku: String, unitPrice: Decimal, qty: Int }}
+db {{ {COLLECTION}: LineItem[] }}
+service Items {{
+  rpc create(sku: String, unitPrice: Decimal, qty: Int) -> LineItem {{
+    db.{COLLECTION}.insert(NewLineItem {{ sku: sku, unitPrice: unitPrice, qty: qty }})
+  }}
+  rpc get(id: Int) -> LineItem? {{ db.{COLLECTION}.find(id) }}
+  rpc lineTotal(id: Int) -> Decimal {{
+    let item = db.{COLLECTION}.find(id) ?? panic("no existe")
+    item.unitPrice * item.qty.toDecimal()
+  }}
+  rpc totalBySku() -> {{key: String, value: Decimal}}[] {{ db.{COLLECTION}.sumBy(|i: LineItem| {{ i.sku }}, |i: LineItem| {{ i.unitPrice }}) }}
+  rpc priciest() -> LineItem? {{ db.{COLLECTION}.maxRow(|i: LineItem| {{ i.unitPrice }}) }}
+  rpc cheapest() -> LineItem? {{ db.{COLLECTION}.minRow(|i: LineItem| {{ i.unitPrice }}) }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&src, &url);
+
+    let created = server.rpc("Items/create", r#"{"sku":"WIDGET","unitPrice":"19.9900","qty":3}"#);
+    assert_eq!(created["unitPrice"], serde_json::json!("19.9900"), "{created}");
+    let id = created["id"].as_i64().unwrap();
+
+    let fetched = server.rpc("Items/get", &format!(r#"{{"id":{id}}}"#));
+    assert_eq!(fetched["unitPrice"], serde_json::json!("19.9900"), "round-trip exacto por Postgres real: {fetched}");
+
+    let total = server.rpc("Items/lineTotal", &format!(r#"{{"id":{id}}}"#));
+    assert_eq!(total, serde_json::json!("59.9700"), "19.99 * 3 = 59.97 exacto: {total}");
+
+    server.rpc("Items/create", r#"{"sku":"WIDGET","unitPrice":"0.0100","qty":1}"#);
+    server.rpc("Items/create", r#"{"sku":"GADGET","unitPrice":"5.5000","qty":1}"#);
+
+    let sums = server.rpc("Items/totalBySku", "{}");
+    let mut by_key: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for row in sums.as_array().unwrap() {
+        by_key.insert(row["key"].as_str().unwrap().to_string(), row["value"].as_str().unwrap().to_string());
+    }
+    assert_eq!(by_key.get("WIDGET").map(String::as_str), Some("24.5100"), "sumBy real contra Postgres: {by_key:?}");
+    assert_eq!(by_key.get("GADGET").map(String::as_str), Some("5.5000"), "{by_key:?}");
+
+    let priciest = server.rpc("Items/priciest", "{}");
+    assert_eq!(priciest["sku"], serde_json::json!("WIDGET"), "maxRow real contra Postgres: {priciest}");
+    assert_eq!(priciest["unitPrice"], serde_json::json!("19.9900"), "{priciest}");
+
+    let cheapest = server.rpc("Items/cheapest", "{}");
+    assert_eq!(cheapest["unitPrice"], serde_json::json!("0.0100"), "minRow real contra Postgres: {cheapest}");
+
+    // Confirmar el DDL generado: `NUMERIC(38,4)` real, no un genérico.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let row = client
+        .query_one(
+            "SELECT numeric_precision, numeric_scale FROM information_schema.columns \
+             WHERE table_name = $1 AND column_name = 'unitPrice'",
+            &[&COLLECTION],
+        )
+        .expect("leer information_schema");
+    let precision: i32 = row.get(0);
+    let scale: i32 = row.get(1);
+    assert_eq!((precision, scale), (38, 4), "DDL generado tiene que ser NUMERIC(38,4) real");
+}
+
 #[test]
 fn adopt_existing_fails_fast_against_real_postgres_when_a_declared_column_is_missing() {
     const COLLECTION: &str = "legacy_items_missing_col";

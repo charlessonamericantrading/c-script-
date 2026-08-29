@@ -49,6 +49,9 @@ pub enum Value {
     /// serializa cada uno distinto, y `value_to_json` no tiene contexto de
     /// `Type` para decidirlo de otra forma).
     Int64(i64),
+    /// Escalado ×`DECIMAL_SCALE` (10.000, 4 decimales) -- ver la doc de
+    /// `Type::Decimal` (types.rs, GRAMMAR.md §3.184).
+    Decimal(i128),
     /// Milisegundos desde epoch UTC -- ver la doc de `Type::Timestamp`
     /// (types.rs) para el resto del diseño (GRAMMAR.md §3.31).
     Timestamp(i64),
@@ -166,6 +169,7 @@ impl std::fmt::Debug for Value {
         match self {
             Value::Int(n) => f.debug_tuple("Int").field(n).finish(),
             Value::Int64(n) => f.debug_tuple("Int64").field(n).finish(),
+            Value::Decimal(n) => f.debug_tuple("Decimal").field(&format_decimal(*n)).finish(),
             Value::Timestamp(n) => f.debug_tuple("Timestamp").field(n).finish(),
             Value::Float(n) => f.debug_tuple("Float").field(n).finish(),
             Value::Str(s) => f.debug_tuple("Str").field(s).finish(),
@@ -936,16 +940,28 @@ fn eval_binary(
         // `RuntimeError` limpio en vez de panic/wrap.
         Add => match (l, r) {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
+            (Value::Decimal(a), Value::Decimal(b)) => decimal_add(a, b),
             (l, r) => checked_int_numeric_op(l, r, i64::checked_add, |a, b| a + b, |a, b| {
                 err(format!("desborde aritmético al sumar {a} y {b}"))
             }),
         },
-        Sub => checked_int_numeric_op(l, r, i64::checked_sub, |a, b| a - b, |a, b| {
-            err(format!("desborde aritmético al restar {b} de {a}"))
-        }),
-        Mul => checked_int_numeric_op(l, r, i64::checked_mul, |a, b| a * b, |a, b| {
-            err(format!("desborde aritmético al multiplicar {a} por {b}"))
-        }),
+        Sub => match (l, r) {
+            (Value::Decimal(a), Value::Decimal(b)) => decimal_sub(a, b),
+            (l, r) => checked_int_numeric_op(l, r, i64::checked_sub, |a, b| a - b, |a, b| {
+                err(format!("desborde aritmético al restar {b} de {a}"))
+            }),
+        },
+        // GRAMMAR.md §3.184: `*`/`/` sobre Decimal necesitan re-escalar
+        // (redondeo half-up, ver `decimal_mul`/`decimal_div`) -- una
+        // operación distinta de "la misma cuenta en un ancho más grande"
+        // que `checked_int_numeric_op` asume para Int/Int64/Float, así que
+        // Decimal se intercepta ANTES de llegar ahí.
+        Mul => match (l, r) {
+            (Value::Decimal(a), Value::Decimal(b)) => decimal_mul(a, b),
+            (l, r) => checked_int_numeric_op(l, r, i64::checked_mul, |a, b| a * b, |a, b| {
+                err(format!("desborde aritmético al multiplicar {a} por {b}"))
+            }),
+        },
         // GRAMMAR.md §3.162: sobre ENTEROS, `a / 0` y `i64::MIN / -1` son
         // panics de Rust, no valores. Un panic acá no es un error de
         // runtime normal: mata el hilo de la request sin pasar por ningún
@@ -955,7 +971,12 @@ fn eval_binary(
         // divisor casi siempre viene de datos del usuario, así que esto era
         // trivialmente alcanzable. El camino de `Float` no necesita guarda:
         // IEEE-754 define /0 como inf/NaN, nunca panica.
-        Div => checked_int_numeric_op(l, r, i64::checked_div, |a, b| a / b, |a, b| div_or_rem_overflow_message("dividir", a, b)),
+        Div => match (l, r) {
+            (Value::Decimal(a), Value::Decimal(b)) => decimal_div(a, b),
+            (l, r) => checked_int_numeric_op(l, r, i64::checked_div, |a, b| a / b, |a, b| div_or_rem_overflow_message("dividir", a, b)),
+        },
+        // `%` sobre Decimal ya queda rechazado por el checker (GRAMMAR.md
+        // §3.184) -- nunca alcanzable acá con un Value::Decimal real.
         Rem => {
             checked_int_numeric_op(l, r, i64::checked_rem, |a, b| a % b, |a, b| div_or_rem_overflow_message("calcular el resto de", a, b))
         }
@@ -990,8 +1011,11 @@ fn eval_unary(
         UnaryOp::Neg => match v {
             Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| err(format!("desborde aritmético al negar {n}"))),
             Value::Int64(n) => n.checked_neg().map(Value::Int64).ok_or_else(|| err(format!("desborde aritmético al negar {n}"))),
+            Value::Decimal(n) => {
+                n.checked_neg().map(Value::Decimal).ok_or_else(|| err(format!("desborde aritmético al negar {}", format_decimal(n))))
+            }
             Value::Float(n) => Ok(Value::Float(-n)),
-            other => Err(err(format!("'-' unario requiere Int, Int64 o Float en runtime: {other:?}"))),
+            other => Err(err(format!("'-' unario requiere Int, Int64, Decimal o Float en runtime: {other:?}"))),
         },
         UnaryOp::Not => Ok(Value::Bool(!as_bool(&v)?)),
     }
@@ -1118,13 +1142,137 @@ fn compare(l: Value, r: Value, accept: impl Fn(std::cmp::Ordering) -> bool) -> R
     let ordering = match (&l, &r) {
         (Value::Int(a), Value::Int(b)) => a.cmp(b),
         (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
+        (Value::Decimal(a), Value::Decimal(b)) => a.cmp(b),
         (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
         (Value::Float(a), Value::Float(b)) => {
             a.partial_cmp(b).ok_or_else(|| err("comparación con NaN"))?
         }
-        _ => return Err(err(format!("operador relacional requiere Int+Int, Int64+Int64, Float+Float o Timestamp+Timestamp: {l:?} y {r:?}"))),
+        _ => return Err(err(format!("operador relacional requiere Int+Int, Int64+Int64, Decimal+Decimal, Float+Float o Timestamp+Timestamp: {l:?} y {r:?}"))),
     };
     Ok(Value::Bool(accept(ordering)))
+}
+
+/// GRAMMAR.md §3.184: 4 decimales fijos, global -- `Value::Decimal(raw)`
+/// representa el valor lógico `raw as f64 / DECIMAL_SCALE as f64`, siempre
+/// exacto (aritmética entera, nunca de punto flotante en el camino normal).
+pub(crate) const DECIMAL_SCALE: i128 = 10_000;
+
+/// `raw` escalado -> string con EXACTAMENTE 4 decimales (ej. `"1234.5600"`,
+/// nunca `"1234.56"`) -- formateado a mano desde el i128, sin tocar `f64` en
+/// ningún punto. Usado tanto para el wire (`value_to_json`) como para
+/// mensajes de error legibles (nunca se muestra el i128 crudo a un humano).
+pub(crate) fn format_decimal(raw: i128) -> String {
+    let negative = raw < 0;
+    let abs = raw.unsigned_abs();
+    let int_part = abs / (DECIMAL_SCALE as u128);
+    let frac_part = abs % (DECIMAL_SCALE as u128);
+    format!("{}{int_part}.{frac_part:04}", if negative { "-" } else { "" })
+}
+
+/// Inversa de `format_decimal` -- exige la forma EXACTA (signo opcional,
+/// uno o más dígitos, punto, EXACTAMENTE 4 decimales); cualquier otra forma
+/// (`"19.9"`, `"19.99900"`, notación científica) es `None`, nunca una
+/// reinterpretación laxa -- mismo criterio de "wire sin ambigüedad" que el
+/// resto del formato.
+pub(crate) fn parse_decimal(s: &str) -> Option<i128> {
+    let (negative, s) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let (int_part, frac_part) = s.split_once('.')?;
+    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if frac_part.len() != 4 || !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let int_val: i128 = int_part.parse().ok()?;
+    let frac_val: i128 = frac_part.parse().ok()?;
+    let raw = int_val.checked_mul(DECIMAL_SCALE)?.checked_add(frac_val)?;
+    Some(if negative { -raw } else { raw })
+}
+
+/// División entera con redondeo al más cercano, EMPATE SE ALEJA DE CERO
+/// (GRAMMAR.md §3.184 -- mismo criterio que la mayoría del software
+/// financiero/comercial: `-2.5` redondea a `-3`, no a `-2`). General sobre
+/// el signo de `denominator` (necesario para `/`, donde el divisor es un
+/// valor de usuario que puede ser negativo -- no solo para el re-escalado
+/// de `*`, donde el denominador siempre es `DECIMAL_SCALE`, positivo).
+/// `None` en cualquier desborde/división por cero (vía los `checked_*`).
+pub(crate) fn div_round(numerator: i128, denominator: i128) -> Option<i128> {
+    let q = numerator.checked_div(denominator)?;
+    let r = numerator.checked_rem(denominator)?;
+    if r == 0 {
+        return Some(q);
+    }
+    let double_r_abs = r.checked_abs()?.checked_mul(2)?;
+    let denom_abs = denominator.checked_abs()?;
+    if double_r_abs < denom_abs {
+        return Some(q);
+    }
+    // Empate o más -- el signo del cociente REAL (antes de truncar) es
+    // positivo cuando numerator/denominator tienen el mismo signo.
+    let same_sign = (numerator < 0) == (denominator < 0);
+    if same_sign { q.checked_add(1) } else { q.checked_sub(1) }
+}
+
+fn decimal_add(a: i128, b: i128) -> Result<Value, RuntimeError> {
+    a.checked_add(b).map(Value::Decimal).ok_or_else(|| {
+        err(format!("desborde aritmético al sumar {} y {}", format_decimal(a), format_decimal(b)))
+    })
+}
+
+fn decimal_sub(a: i128, b: i128) -> Result<Value, RuntimeError> {
+    a.checked_sub(b).map(Value::Decimal).ok_or_else(|| {
+        err(format!("desborde aritmético al restar {} de {}", format_decimal(b), format_decimal(a)))
+    })
+}
+
+/// `(a × b) / DECIMAL_SCALE`, redondeado -- el producto crudo de dos
+/// valores ya escalados ×10.000 tiene 8 decimales lógicos (`10.000²`), hay
+/// que volver a escalar a 4. Un solo redondeo, no iterativo.
+fn decimal_mul(a: i128, b: i128) -> Result<Value, RuntimeError> {
+    let bad = || err(format!("desborde aritmético al multiplicar {} por {}", format_decimal(a), format_decimal(b)));
+    let raw = a.checked_mul(b).ok_or_else(bad)?;
+    div_round(raw, DECIMAL_SCALE).map(Value::Decimal).ok_or_else(bad)
+}
+
+/// `(a × DECIMAL_SCALE) / b`, redondeado -- reescala el numerador ANTES de
+/// dividir (en vez de dividir crudo y perder los 4 decimales de precisión
+/// del resultado). Mismo redondeo que `decimal_mul`, un solo paso.
+fn decimal_div(a: i128, b: i128) -> Result<Value, RuntimeError> {
+    if b == 0 {
+        return Err(err(format!("no se puede dividir {} por cero", format_decimal(a))));
+    }
+    let bad = || err(format!("desborde aritmético al dividir {} por {}", format_decimal(a), format_decimal(b)));
+    let scaled_numerator = a.checked_mul(DECIMAL_SCALE).ok_or_else(bad)?;
+    div_round(scaled_numerator, b).map(Value::Decimal).ok_or_else(bad)
+}
+
+/// `Int.toDecimal()` -- exacto, nunca lossy (i128 tiene rango de sobra
+/// sobre i64×10.000).
+fn decimal_from_int(n: i64) -> Result<Value, RuntimeError> {
+    (n as i128)
+        .checked_mul(DECIMAL_SCALE)
+        .map(Value::Decimal)
+        .ok_or_else(|| err(format!("{n} no entra en el rango de Decimal al escalar a 4 decimales")))
+}
+
+/// `Float.toDecimal()` -- redondea el f64 YA PARSEADO al 4to decimal
+/// (mismo criterio de redondeo que el resto de Decimal: `f64::round()` ya
+/// redondea empate-se-aleja-de-cero). Seguro en la práctica para cualquier
+/// magnitud financiera real -- la precisión de f64 (~15-17 dígitos
+/// significativos) excede por muchísimo la resolución de 4 decimales;
+/// límite honesto documentado en GRAMMAR.md §3.184 para el caso patológico.
+fn decimal_from_float(f: f64) -> Result<Value, RuntimeError> {
+    if !f.is_finite() {
+        return Err(err(format!("no se puede convertir {f} a Decimal -- no es un número finito")));
+    }
+    let scaled = (f * DECIMAL_SCALE as f64).round();
+    if scaled < i128::MIN as f64 || scaled > i128::MAX as f64 {
+        return Err(err(format!("{f} no entra en el rango de Decimal al escalar a 4 decimales")));
+    }
+    Ok(Value::Decimal(scaled as i128))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2228,6 +2376,7 @@ fn call_method(
         Value::Int(n) => match method {
             "toFloat" => Ok(Value::Float(n as f64)),
             "toInt64" => Ok(Value::Int64(n)),
+            "toDecimal" => decimal_from_int(n),
             "toString" => Ok(Value::Str(n.to_string())),
             other => Err(err(format!("método desconocido sobre Int: '{other}'"))),
         },
@@ -2236,8 +2385,19 @@ fn call_method(
             "toString" => Ok(Value::Str(n.to_string())),
             other => Err(err(format!("método desconocido sobre Int64: '{other}'"))),
         },
+        // GRAMMAR.md §3.184: sin `.toInt()` -- a diferencia de Int64 (mismo
+        // ancho que Int, ida y vuelta exacta), un Decimal con parte
+        // fraccionaria distinta de cero perdería información silenciosa al
+        // truncar a Int; sin caso real que lo justifique todavía, `.toFloat()`
+        // (que ya declara su propia pérdida de precisión) cubre el mismo hueco.
+        Value::Decimal(n) => match method {
+            "toFloat" => Ok(Value::Float(n as f64 / DECIMAL_SCALE as f64)),
+            "toString" => Ok(Value::Str(format_decimal(n))),
+            other => Err(err(format!("método desconocido sobre Decimal: '{other}'"))),
+        },
         Value::Float(n) => match method {
             "toInt" => Ok(Value::Int(n as i64)), // trunca hacia cero, no redondea (GRAMMAR.md §3.8)
+            "toDecimal" => decimal_from_float(n),
             "toString" => Ok(Value::Str(n.to_string())),
             other => Err(err(format!("método desconocido sobre Float: '{other}'"))),
         },
@@ -3337,6 +3497,10 @@ pub(crate) fn json_to_typed_value(
             .and_then(|s| s.parse::<i64>().ok())
             .map(Value::Int64)
             .ok_or_else(mismatch),
+        // Siempre string, forma fija de EXACTAMENTE 4 decimales (GRAMMAR.md
+        // §3.184) -- mismo motivo que Int64: un `number` JSON perdería
+        // exactitud del lado del cliente.
+        Type::Decimal => j.as_str().and_then(parse_decimal).map(Value::Decimal).ok_or_else(mismatch),
         // String ISO-8601 de forma fija (GRAMMAR.md §3.31) -- rechaza
         // cualquier otra variante (offset de timezone, sin milisegundos,
         // fecha de calendario inexistente) en vez de aceptarla a medias.
@@ -3678,8 +3842,11 @@ fn eval_check_expr(expr: &Expr, entries: &[(String, Value)]) -> Result<Value, Ru
         Expr::Unary { op: UnaryOp::Neg, operand } => match eval_check_expr(&operand.node, entries)? {
             Value::Int(n) => n.checked_neg().map(Value::Int).ok_or_else(|| err(format!("desborde aritmético al negar {n}"))),
             Value::Int64(n) => n.checked_neg().map(Value::Int64).ok_or_else(|| err(format!("desborde aritmético al negar {n}"))),
+            Value::Decimal(n) => {
+                n.checked_neg().map(Value::Decimal).ok_or_else(|| err(format!("desborde aritmético al negar {}", format_decimal(n))))
+            }
             Value::Float(n) => Ok(Value::Float(-n)),
-            other => Err(err(format!("'-' unario requiere Int, Int64 o Float en '@check(...)' de tipo: {other:?}"))),
+            other => Err(err(format!("'-' unario requiere Int, Int64, Decimal o Float en '@check(...)' de tipo: {other:?}"))),
         },
         Expr::Binary { op, left, right } => {
             let l = eval_check_expr(&left.node, entries)?;
@@ -3695,17 +3862,29 @@ fn eval_check_expr(expr: &Expr, entries: &[(String, Value)]) -> Result<Value, Ru
                 BinaryOp::GtEq => compare(l, r, |o| o != std::cmp::Ordering::Less),
                 BinaryOp::Add => match (l, r) {
                     (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
+                    (Value::Decimal(a), Value::Decimal(b)) => decimal_add(a, b),
                     (l, r) => checked_int_numeric_op(l, r, i64::checked_add, |a, b| a + b, |a, b| {
                         err(format!("desborde aritmético al sumar {a} y {b}"))
                     }),
                 },
-                BinaryOp::Sub => checked_int_numeric_op(l, r, i64::checked_sub, |a, b| a - b, |a, b| {
-                    err(format!("desborde aritmético al restar {b} de {a}"))
-                }),
-                BinaryOp::Mul => checked_int_numeric_op(l, r, i64::checked_mul, |a, b| a * b, |a, b| {
-                    err(format!("desborde aritmético al multiplicar {a} por {b}"))
-                }),
-                BinaryOp::Div => checked_int_numeric_op(l, r, i64::checked_div, |a, b| a / b, |a, b| div_or_rem_overflow_message("dividir", a, b)),
+                BinaryOp::Sub => match (l, r) {
+                    (Value::Decimal(a), Value::Decimal(b)) => decimal_sub(a, b),
+                    (l, r) => checked_int_numeric_op(l, r, i64::checked_sub, |a, b| a - b, |a, b| {
+                        err(format!("desborde aritmético al restar {b} de {a}"))
+                    }),
+                },
+                BinaryOp::Mul => match (l, r) {
+                    (Value::Decimal(a), Value::Decimal(b)) => decimal_mul(a, b),
+                    (l, r) => checked_int_numeric_op(l, r, i64::checked_mul, |a, b| a * b, |a, b| {
+                        err(format!("desborde aritmético al multiplicar {a} por {b}"))
+                    }),
+                },
+                BinaryOp::Div => match (l, r) {
+                    (Value::Decimal(a), Value::Decimal(b)) => decimal_div(a, b),
+                    (l, r) => checked_int_numeric_op(l, r, i64::checked_div, |a, b| a / b, |a, b| div_or_rem_overflow_message("dividir", a, b)),
+                },
+                // `%` sobre Decimal ya queda rechazado por el checker --
+                // nunca alcanzable acá con un Value::Decimal real.
                 BinaryOp::Rem => {
                     checked_int_numeric_op(l, r, i64::checked_rem, |a, b| a % b, |a, b| div_or_rem_overflow_message("calcular el resto de", a, b))
                 }
@@ -3743,6 +3922,7 @@ fn as_check_number(v: &Value) -> Option<f64> {
     match v {
         Value::Int(n) => Some(*n as f64),
         Value::Int64(n) => Some(*n as f64),
+        Value::Decimal(n) => Some(*n as f64 / DECIMAL_SCALE as f64),
         Value::Float(f) => Some(*f),
         _ => None,
     }
@@ -4067,6 +4247,9 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         Value::Int(n) => json!(n),
         // String, no número -- ver la nota simétrica en json_to_typed_value.
         Value::Int64(n) => json!(n.to_string()),
+        // String con exactamente 4 decimales -- ver la nota simétrica en
+        // json_to_typed_value (GRAMMAR.md §3.184).
+        Value::Decimal(n) => json!(format_decimal(*n)),
         Value::Timestamp(n) => json!(timestamp::format_iso8601_millis(*n)),
         Value::Float(n) => json!(n),
         Value::Str(s) => json!(s),
@@ -4140,6 +4323,113 @@ mod tests {
     fn program_from(src: &str) -> Program {
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         parse(tokens).unwrap_or_else(|e| panic!("{e:?}"))
+    }
+
+    // ---- `Decimal` (GRAMMAR.md §3.184): aritmética, formateo, redondeo ----
+
+    #[test]
+    fn format_decimal_and_parse_decimal_round_trip() {
+        for (raw, text) in [(1234500, "123.4500"), (-1234500, "-123.4500"), (0, "0.0000"), (1, "0.0001"), (-1, "-0.0001")] {
+            assert_eq!(format_decimal(raw), text);
+            assert_eq!(parse_decimal(text), Some(raw));
+        }
+    }
+
+    #[test]
+    fn parse_decimal_rejects_anything_without_exactly_four_fraction_digits() {
+        assert_eq!(parse_decimal("19.9"), None, "menos de 4 decimales");
+        assert_eq!(parse_decimal("19.99900"), None, "más de 4 decimales");
+        assert_eq!(parse_decimal("19"), None, "sin punto decimal");
+        assert_eq!(parse_decimal("abc.1234"), None, "parte entera no numérica");
+        assert_eq!(parse_decimal(".1234"), None, "parte entera vacía");
+        assert_eq!(parse_decimal("19.12ab"), None, "parte fraccionaria no numérica");
+    }
+
+    #[test]
+    fn div_round_rounds_half_away_from_zero_including_negative_ties() {
+        // Empates exactos -- el caso que una fórmula ingenua (truncar en
+        // vez de redondear) rompe para negativos.
+        assert_eq!(div_round(5, 2), Some(3), "2.5 -> 3 (arriba)");
+        assert_eq!(div_round(-5, 2), Some(-3), "-2.5 -> -3 (lejos de cero, NO -2)");
+        assert_eq!(div_round(5, -2), Some(-3), "mismo empate, denominador negativo");
+        assert_eq!(div_round(-5, -2), Some(3), "los dos negativos -- cociente real positivo");
+    }
+
+    #[test]
+    fn div_round_rounds_non_ties_to_the_nearest_integer() {
+        assert_eq!(div_round(7, 4), Some(2), "1.75 -> 2");
+        assert_eq!(div_round(-7, 4), Some(-2), "-1.75 -> -2");
+        assert_eq!(div_round(-7, 3), Some(-2), "-2.333 -> -2 (el más cercano, no un empate)");
+        assert_eq!(div_round(10, 5), Some(2), "división exacta, sin resto");
+        assert_eq!(div_round(0, 5), Some(0));
+    }
+
+    #[test]
+    fn decimal_add_and_sub_are_exact_integer_arithmetic() {
+        let a = parse_decimal("19.9900").unwrap();
+        let b = parse_decimal("0.0100").unwrap();
+        let Ok(Value::Decimal(sum)) = decimal_add(a, b) else { panic!("se esperaba Decimal") };
+        assert_eq!(format_decimal(sum), "20.0000", "19.99 + 0.01 exacto, sin el típico error binario de Float");
+        let Ok(Value::Decimal(diff)) = decimal_sub(sum, b) else { panic!("se esperaba Decimal") };
+        assert_eq!(diff, a);
+    }
+
+    #[test]
+    fn decimal_mul_rescales_and_rounds_once() {
+        // 19.99 * 0.21 = 4.1979 -- redondeado a 4 decimales, 4.1979 ya
+        // entra exacto (sin redondeo real necesario acá).
+        let price = parse_decimal("19.9900").unwrap();
+        let rate = parse_decimal("0.2100").unwrap();
+        let Ok(Value::Decimal(product)) = decimal_mul(price, rate) else { panic!("se esperaba Decimal") };
+        assert_eq!(format_decimal(product), "4.1979");
+    }
+
+    #[test]
+    fn decimal_mul_rounds_a_result_that_does_not_land_exactly_on_four_decimals() {
+        let a = parse_decimal("0.3333").unwrap();
+        let b = parse_decimal("0.3333").unwrap();
+        // 0.3333 * 0.3333 = 0.11108889 -- el 5to decimal (8) redondea el
+        // 4to hacia arriba: 0.1110|8889 -> 0.1111 (verificado a mano con
+        // la división entera exacta: 11108889 / 10000 = 1110 resto 8889,
+        // 2*8889=17778 >= 10000 -> empate/excede, redondea arriba).
+        let Ok(Value::Decimal(product)) = decimal_mul(a, b) else { panic!("se esperaba Decimal") };
+        assert_eq!(format_decimal(product), "0.1111");
+    }
+
+    #[test]
+    fn decimal_div_rescales_the_numerator_before_dividing_and_rounds() {
+        // 10 / 3 = 3.3333... -- redondea a 3.3333 (repetitivo, nunca
+        // termina, el caso central que motiva el redondeo explícito).
+        let ten = parse_decimal("10.0000").unwrap();
+        let three = parse_decimal("3.0000").unwrap();
+        let Ok(Value::Decimal(q)) = decimal_div(ten, three) else { panic!("se esperaba Decimal") };
+        assert_eq!(format_decimal(q), "3.3333");
+    }
+
+    #[test]
+    fn decimal_div_by_zero_is_a_clean_error_not_a_panic() {
+        let a = parse_decimal("1.0000").unwrap();
+        assert!(decimal_div(a, 0).is_err());
+    }
+
+    #[test]
+    fn decimal_from_int_and_from_float_construct_the_expected_scaled_value() {
+        let Ok(Value::Decimal(from_int)) = decimal_from_int(19) else { panic!("se esperaba Decimal") };
+        assert_eq!(format_decimal(from_int), "19.0000");
+        let Ok(Value::Decimal(from_float)) = decimal_from_float(19.99) else { panic!("se esperaba Decimal") };
+        assert_eq!(format_decimal(from_float), "19.9900", "f64 tiene precisión de sobra para redondear exacto a 4 decimales");
+    }
+
+    #[test]
+    fn decimal_from_float_rejects_nan_and_infinity() {
+        assert!(decimal_from_float(f64::NAN).is_err());
+        assert!(decimal_from_float(f64::INFINITY).is_err());
+        assert!(decimal_from_float(f64::NEG_INFINITY).is_err());
+    }
+
+    #[test]
+    fn decimal_add_reports_a_clean_overflow_error_not_a_panic() {
+        assert!(decimal_add(i128::MAX, 1).is_err());
     }
 
     #[test]
@@ -4961,6 +5251,58 @@ mod tests {
     }
 
     // ---- `id: Uuid` como PK alternativa (GRAMMAR.md §3.177) ----
+
+    /// El ciclo completo -- insert/find/applyPatch/aritmética/sumBy -- sobre
+    /// un campo `Decimal` real, contra SQLite real (GRAMMAR.md §3.184).
+    /// Confirma de punta a punta: el wire manda/recibe el string de 4
+    /// decimales exacto (nunca un número JSON), `+`/`*` dan resultados
+    /// EXACTOS (sin el error de redondeo binario que motivó todo el tipo),
+    /// y `sumBy` empuja a SQL real sin perder precisión.
+    #[test]
+    fn decimal_field_supports_the_full_crud_cycle_and_sum_by_against_real_sqlite() {
+        let program = program_from(
+            r#"
+            type LineItem = { id: Int, description: String, unitPrice: Decimal, qty: Int }
+            type NewLineItem = { description: String, unitPrice: Decimal, qty: Int }
+            db { items: LineItem[] }
+            service Items {
+                rpc create(description: String, unitPrice: Decimal, qty: Int) -> LineItem {
+                    db.items.insert(NewLineItem { description: description, unitPrice: unitPrice, qty: qty })
+                }
+                rpc get(id: Int) -> LineItem? { db.items.find(id) }
+                rpc reprice(id: Int, p: Patch<LineItem>) -> LineItem {
+                    db.items.applyPatch(id, p)
+                }
+                rpc lineTotal(id: Int) -> Decimal {
+                    let item = db.items.find(id) ?? panic("no existe");
+                    item.unitPrice * item.qty.toDecimal()
+                }
+                rpc totalValue() -> Decimal[] {
+                    db.items.sumBy(|i: LineItem| { i.description }, |i: LineItem| { i.unitPrice })
+                        .map(|g: {key: String, value: Decimal}| { g.value })
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        let created = invoke_rpc(&program, "Items", "create", &json!({"description": "Widget", "unitPrice": "19.9900", "qty": 3}), &db).unwrap();
+        assert_eq!(created["unitPrice"], json!("19.9900"), "el wire manda el string de 4 decimales exacto, nunca un number");
+        let id = created["id"].as_i64().unwrap();
+
+        let fetched = invoke_rpc(&program, "Items", "get", &json!({"id": id}), &db).unwrap();
+        assert_eq!(fetched["unitPrice"], json!("19.9900"), "round-trip exacto por SQLite real, sin deriva binaria");
+
+        let total = invoke_rpc(&program, "Items", "lineTotal", &json!({"id": id}), &db).unwrap();
+        assert_eq!(total, json!("59.9700"), "19.99 * 3 = 59.97 exacto -- Float haría 59.96999999999999...");
+
+        let repriced = invoke_rpc(&program, "Items", "reprice", &json!({"id": id, "p": {"unitPrice": "24.5000"}}), &db).unwrap();
+        assert_eq!(repriced["unitPrice"], json!("24.5000"));
+
+        invoke_rpc(&program, "Items", "create", &json!({"description": "Widget", "unitPrice": "0.0100", "qty": 1}), &db).unwrap();
+        let sums = invoke_rpc(&program, "Items", "totalValue", &json!({}), &db).unwrap();
+        assert_eq!(sums, json!(["24.5100"]), "sumBy real contra SQLite, exacto: 24.50 + 0.01 = 24.51");
+    }
 
     /// El ciclo completo -- insert/find/applyPatch/increment/delete -- sobre
     /// una colección cuya PK es `Uuid`, no `Int`. `insert` nunca recibe un

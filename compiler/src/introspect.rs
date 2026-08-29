@@ -50,7 +50,15 @@ fn map_pg_type(pg_type: &str, column_name: &str) -> (&'static str, Option<String
     match pg_type {
         "bigint" | "integer" | "smallint" => ("Int", None),
         "boolean" => ("Bool", None),
-        "double precision" | "real" | "numeric" => ("Float", None),
+        "double precision" | "real" => ("Float", None),
+        // GRAMMAR.md §3.184: `Decimal`, no `Float` -- `numeric`/`decimal`
+        // (sinónimos, `information_schema` siempre normaliza a "numeric")
+        // es EXACTAMENTE el tipo que casi toda columna de dinero real usa
+        // (nunca `float8`, por el error de redondeo binario que `numeric`
+        // evita) -- mapeo EXACTO ahora que `Decimal` decodifica/codifica
+        // el binario real sin pasar por `f64` en ningún punto, mismo
+        // criterio que `uuid`/`inet`/`date`/`timestamp` arriba/abajo.
+        "numeric" => ("Decimal", None),
         "text" | "character varying" | "character" | "citext" => ("String", None),
         // GRAMMAR.md §3.179: hasta antes de esa ronda, un `uuid` NATIVO de
         // Postgres contra un campo `Uuid`/`String` no estaba verificado
@@ -252,7 +260,7 @@ mod tests {
         assert_eq!(map_pg_type("smallint", "x").0, "Int");
         assert_eq!(map_pg_type("boolean", "x").0, "Bool");
         assert_eq!(map_pg_type("double precision", "x").0, "Float");
-        assert_eq!(map_pg_type("numeric", "x").0, "Float");
+        assert_eq!(map_pg_type("numeric", "x").0, "Decimal");
         assert_eq!(map_pg_type("text", "x").0, "String");
         assert_eq!(map_pg_type("character varying", "x").0, "String");
         for ty in ["bigint", "integer", "smallint", "boolean", "double precision", "numeric", "text", "character varying"] {

@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.140.0] - 2026-08-29
+
+### ✨ Nuevo
+**`Decimal`: tipo numérico de precisión exacta (punto fijo, 4 decimales).** PLAN.md §9.2 ítem 1 -- `Float` es una fuente de error de redondeo confirmada por adoptadores financieros reales en columnas de dinero (`19.99 * 3` da `59.96999999999999...` con `Float`, exacto `59.9700` con `Decimal`). Representación `i128` interna escalada ×10.000, decisión tomada explícitamente por el usuario tras ver el trade-off frente a precisión variable estilo `numeric` nativo.
+
+- Sin sintaxis de literal nueva -- se construye vía `.toDecimal()` desde `Int` (exacto) o `Float` (redondea al 4to decimal), mismo patrón que `Int64`. `+`/`-` exactos; `*`/`/` con redondeo half-up (empate se aleja de cero); `%` rechazado a propósito con mensaje claro.
+- Wire format: string JSON con exactamente 4 decimales siempre (`"1234.5600"`), nunca un `number` nativo -- evita pérdida de exactitud en cualquier cliente JS/TS.
+- Almacenamiento: `INTEGER` escalado en SQLite (con chequeo de rango), `NUMERIC(38,4)` nativo en Postgres -- incluye lectura y escritura contra una columna `numeric`/`decimal` YA EXISTENTE (`--adopt-existing`, el caso real de MyFinance), con un codificador/decodificador binario nuevo que nunca toca `f64`.
+- `sumBy`/`maxBy`/`minBy`/`maxRow`/`minRow` y `@check(min/max/range)` soportan `Decimal`. `avgBy` queda excluido a propósito en v0 -- asimetría real de almacenamiento entre backends, documentada como límite honesto, no atacada esta ronda.
+
+**Verificado**: 29 tests nuevos (checker.rs, runtime/mod.rs -- incluye un CRUD completo contra SQLite real --, runtime/store.rs -- ida y vuelta del codec binario de Postgres -- y 2 contra Postgres real en pg_integration.rs, columna adoptada y generada). Suite completa (1066 tests de biblioteca + toda la matriz de integración) sin regresiones. Ver GRAMMAR.md §3.184.
+
 ## [1.139.0] - 2026-08-29
 
 ### ✨ Nuevo

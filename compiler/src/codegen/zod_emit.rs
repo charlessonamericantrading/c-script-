@@ -9,6 +9,9 @@ fn render_zod_type(ty: &Type) -> String {
     match ty {
         Type::Int => "z.number().int()".to_string(),
         Type::Int64 => "z.union([z.number().int(), z.string(), z.bigint()])".to_string(),
+        // Misma forma fija que validators.ts (GRAMMAR.md §3.184): signo
+        // opcional, uno o más dígitos, punto, EXACTAMENTE 4 decimales.
+        Type::Decimal => "z.string().regex(/^-?\\d+\\.\\d{4}$/)".to_string(),
         Type::Float => "z.number()".to_string(),
         Type::String => "z.string()".to_string(),
         // Misma regex canónica que validators.ts (GRAMMAR.md §3.70) --

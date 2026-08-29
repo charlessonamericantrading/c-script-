@@ -205,6 +205,7 @@
   - [3.181 Camino de despliegue recomendado (git+CI) — RESUELTO, alcance acotado](#3181-camino-de-despliegue-recomendado-gitci--resuelto-alcance-acotado)
   - [3.182 Escritura de `Timestamp` contra `date`/`timestamp`/`timestamptz` NATIVOS de Postgres — RESUELTO](#3182-escritura-de-timestamp-contra-datetimestamptimestamptz-nativos-de-postgres--resuelto)
   - [3.183 `link.lock` como pin real de dependencias git + locking entre procesos — RESUELTO](#3183-linklock-como-pin-real-de-dependencias-git--locking-entre-procesos--resuelto)
+  - [3.184 `Decimal`: tipo numérico de precisión exacta (punto fijo, 4 decimales) — RESUELTO](#3184-decimal-tipo-numérico-de-precisión-exacta-punto-fijo-4-decimales--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6739,6 +6740,58 @@ Los dos confirmados con un repro real (clonar un repo git local, avanzar su rama
 **Límite honesto, deliberado**: el registro centralizado en red (`npm`/`crates.io`-style) sigue explícitamente DESCARTADO -- esta ronda refuerza el modelo "git-as-registry" ya elegido (PLAN.md), no lo reemplaza. Sin auto-detección de si el pin quedó desactualizado respecto al remoto (ningún warning tipo "hay una versión nueva disponible") -- hay que correr `--update-deps` a mano para enterarse, mismo comportamiento que Cargo sin `cargo outdated` instalado.
 
 **Verificado**: 6 tests nuevos en `gitdep.rs` (el repro exacto del bug de staleness antes/después del fix, `resolve_pinned` quedándose en el commit fijado aunque el remoto avance, fetch único cuando el commit fijado no está en caché local, y dos tests de `CacheLock` -- serializa acceso concurrente real con 8 hilos del sistema operativo, roba un lock abandonado en vez de bloquear para siempre) + 3 tests nuevos en `modules.rs` (el pin se mantiene tras un `load_program_full` repetido con la rama avanzada, `--update-deps` lo ignora y re-resuelve, un pin obsoleto -- `link.json` cambió el rev -- se ignora solo). Más una verificación manual de punta a punta contra el binario real (`linkc build` tres veces seguidas contra un repo git local: resuelve y pinnea, se queda pinneado con el remoto avanzado, `--update-deps` re-resuelve y el checker atrapa correctamente el tipo nuevo que el código local todavía no soporta). Suite completa sin regresiones.
+
+### 3.184 `Decimal`: tipo numérico de precisión exacta (punto fijo, 4 decimales) — RESUELTO
+
+PLAN.md §9.2 ítem 1: `Float` es una fuente de error de redondeo confirmada por adoptadores financieros reales -- columnas de dinero (`subtotal`/`descuento`/`total`/etc.) sufren la imprecisión binaria de IEEE754 tarde o temprano (`19.99 * 3` da `59.96999999999999...`, no `59.97`). Decisión de representación tomada explícitamente por el usuario tras ver el trade-off: **punto fijo, `i128` interno escalado ×10.000 (4 decimales fijos)**, no precisión variable estilo `numeric` nativo de Postgres.
+
+**Construcción, sin sintaxis de literal nueva** -- mismo patrón que `Int64` (§3.28): un literal `19.99` sigue lexeando a `f64` sin cambios; `Decimal` se construye vía `.toDecimal()`, nunca un sufijo o prefijo de literal propio. `Int.toDecimal()` es exacto (`n * 10_000`); `Float.toDecimal()` redondea el f64 ya parseado al 4to decimal -- seguro en la práctica, porque la resolución de 4 decimales es mucho más gruesa que la precisión de f64 (~15-17 dígitos significativos) para cualquier magnitud financiera real. `Decimal.toFloat()`/`Decimal.toString()` para volver, siempre explícito. Deliberadamente SIN `.toInt()` -- truncaría en silencio.
+
+**Aritmética**: `+`/`-` son suma/resta entera exacta sobre el valor escalado, `checked` (overflow da un `RuntimeError` limpio, nunca panic). `*`/`/` rescalan el resultado a 4 decimales con **redondeo half-up -- empate se aleja de cero** (`-2.5` redondea a `-3`, no a `-2`; mismo criterio que la mayoría del software financiero/comercial). `%` (`Rem`) queda **excluido a propósito**: el checker lo rechaza con un mensaje claro (`"Decimal no soporta '%'"`) en vez de dejarlo type-checkear sin semántica real en runtime. Comparaciones (`==`/`!=`/`<`/`<=`/`>`/`>=`) son comparación entera directa, exacta. `-` unario es `checked_neg`.
+
+**Wire format**: string JSON con EXACTAMENTE 4 decimales siempre (`"1234.5600"`, nunca `"1234.56"` ni un `number` nativo -- un `number` de JS perdería exactitud en cualquier cliente). `contract.d.ts` tipa el campo como `string`, sin una clase `Decimal` de cliente propia (alcance mayor, fuera de v0). `openapi.json` emite `{"type":"string","format":"decimal"}` -- deliberadamente consistente con el wire real, a diferencia de `Int64` (que emite `format:"int64"` pese a viajar como string -- inconsistencia preexistente, no tocada esta ronda). Zod valida la forma exacta con un regex (signo opcional, dígitos, punto, exactamente 4 decimales).
+
+**Almacenamiento SQLite**: `ColumnKind::Decimal` nueva, columna `INTEGER` con el valor ya escalado. Rango real ±~922.337.203.685.477,5807 (el de un i64 tras escalar ×10.000) -- de sobra para cualquier magnitud financiera real; un valor fuera de rango da un error claro al escribir, nunca un wrap silencioso.
+
+**Almacenamiento Postgres**: `NUMERIC(38,4)` para una columna GENERADA por c-script. Una columna `numeric`/`decimal` YA EXISTENTE (adoptada vía `--adopt-existing`, el caso real de MyFinance) funciona igual -- un decodificador/codificador binario nuevo (`PgDecimal`/`decimal_scaled_to_pg_numeric_binary`, `runtime/store.rs`) extiende el formato que `PgNumeric` ya mapea para `Float` (§3.103: ndigits/weight/sign/dscale + dígitos base-10000), pero acumulando en `i128` en las dos direcciones, nunca tocando `f64`. Una columna adoptada con más de 4 decimales se redondea a 4 al leer, mismo criterio half-up.
+
+**Agregaciones**: `sumBy`/`maxBy`/`minBy` soportados sobre un campo `Decimal`, con pushdown real a SQL (`SUM`/`MAX`/`MIN` nativos, exactos en los dos backends -- tanto sobre el `INTEGER` de SQLite como sobre el `NUMERIC` de Postgres). `maxRow`/`minRow` también aceptan `Decimal` como campo de orden (pura `ORDER BY`, sin cast ni agregación de por medio). `avgBy` queda EXCLUIDO a propósito -- ver límite honesto abajo.
+
+**`@check(min/max/range, ...)`**: extendido a `Decimal`, mismo mecanismo que `Int`/`Int64`/`Float` ya tenían (§3.5).
+
+<!-- linkc:check -->
+```link
+type Product = { id: Int, name: String, price: Decimal }
+type NewProduct = { name: String, price: Decimal }
+db { products: Product[] }
+
+service Products {
+  rpc create(name: String, price: Decimal) -> Product {
+    db.products.insert(NewProduct { name: name, price: price })
+  }
+  rpc get(id: Int) -> Product? { db.products.find(id) }
+  // 19.99 * 1.19 con Float arrastraría error binario -- acá es exacto.
+  rpc priceWithTax(id: Int) -> Decimal? {
+    match db.products.find(id) {
+      p: Product => p.price * 1.19.toDecimal(),
+      null => null,
+    }
+  }
+  rpc totalCatalogValue() -> Decimal[] {
+    db.products.sumBy(|p: Product| { p.name }, |p: Product| { p.price })
+      .map(|g: {key: String, value: Decimal}| { g.value })
+  }
+}
+```
+
+**Límites honestos, deliberados**:
+- Escala fija de 4 decimales, global -- no configurable por campo. Sin evidencia de demanda de otra escala todavía.
+- **`avgBy` excluido sobre `Decimal` en v0.** Motivo: asimetría real de almacenamiento entre backends -- Postgres guarda el `NUMERIC` verdadero (`AVG` nativo, exacto), SQLite guarda el valor YA escalado ×10.000 como `INTEGER` (un `AVG()` de SQLite sobre esos enteros da un resultado de punto flotante que habría que reescalar y redondear sin acumular error -- ingeniería propia, no construida esta ronda). El checker rechaza `avgBy` sobre un campo `Decimal` con un mensaje claro, nunca un resultado silenciosamente incorrecto.
+- `Float.toDecimal()` redondea el f64 ya parseado -- no es "el texto fuente exacto" para una magnitud patológicamente grande (mismo límite que `Int64` ya tiene por no tener sintaxis de literal dedicada).
+- Rango real limitado por SQLite (±~922 billones tras escalar) -- Postgres `NUMERIC` no tiene ese límite, pero el límite del lenguaje es el más chico de los dos backends a propósito, mismo comportamiento en los dos motores.
+- Escribir contra una columna `numeric(N,M)` adoptada con `M < 4` depende de la coerción de escala implícita del propio Postgres al guardar -- sin redondeo/validación propia de c-script en esa dirección (el redondeo propio solo cubre LEER una columna con más decimales que 4). Sin caso real reportado que lo justifique todavía.
+
+**Verificado**: 6 tests nuevos en `checker.rs` (conversión ida y vuelta, receptor/argumentos inválidos en `.toDecimal()`, sin mezcla implícita con `Float`/`Int` en aritmética ni comparaciones, aritmética y comparaciones entre dos `Decimal`, `%` rechazado con mensaje claro, `@check(min/max/range)` sobre un campo `Decimal`). 13 tests nuevos en `runtime/mod.rs` (formateo/parseo del wire string, `div_round` con empates -- incluidos negativos -- y no-empates, aritmética checked de las 4 operaciones con overflow y división por cero limpios, construcción desde `Int`/`Float` con NaN/Infinity rechazados, más un test de integración de punta a punta contra SQLite real: insert/find/round-trip exacto/multiplicación calculada/`applyPatch`/`sumBy`). 8 tests nuevos en `runtime/store.rs` (ida y vuelta del codec binario `NUMERIC` de Postgres: un valor típico, cero con la convención de Postgres de cero dígitos, negativo, solo fracción, un entero que omite el dígito fraccionario cero, un entero grande multi-chunk, redondeo correcto al decodificar más de 4 decimales, NaN/Infinity rechazados limpio). 2 tests nuevos en `pg_integration.rs` contra Postgres real (columna `numeric(12,2)` ADOPTADA -- lectura y escritura confirmadas con SQL crudo `::text`, el caso real de MyFinance; una tabla GENERADA por c-script de punta a punta con `sumBy`/`maxRow`/`minRow` reales y el DDL confirmado como `NUMERIC(38,4)` real vía `information_schema`). Suite completa (1066 tests de biblioteca + toda la matriz de integración) sin regresiones.
 
 ---
 

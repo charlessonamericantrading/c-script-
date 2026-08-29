@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.139.0 — no editar a mano.
+// Generado automáticamente por linkc v1.140.0 — no editar a mano.
 
 import type { BoardStats, ColumnId, NewTask, Patch, Result, Task, TasksClient } from "./contract";
 import { isBoardStats, isTask } from "./validators.ts";

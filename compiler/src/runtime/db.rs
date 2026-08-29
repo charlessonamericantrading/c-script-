@@ -98,6 +98,10 @@ impl ColumnPlan {
             // `timestamp`/`timestamptz` nativo de una tabla adoptada, ver
             // `ColumnKind::Timestamp`.
             Type::Timestamp => ColumnKind::Timestamp,
+            // GRAMMAR.md §3.184: a diferencia de Int64, NO reusa
+            // `ColumnKind::Int` -- el rango de i128 no cabe en el i64 que
+            // ese kind asume en todos lados (SQLite/Postgres INT2-INT8).
+            Type::Decimal => ColumnKind::Decimal,
             Type::Float => ColumnKind::Float,
             Type::Bool => ColumnKind::Bool,
             Type::String | Type::Uuid | Type::Enum(_) => ColumnKind::Text,
@@ -149,6 +153,11 @@ fn native_sql_type(ty: &Type, simple_enums: &HashSet<String>) -> Option<&'static
         // conversión a/desde el string ISO-8601 solo pasa en el borde JSON
         // (json_to_typed_value/value_to_json, runtime/mod.rs), nunca acá.
         Type::Timestamp => Some("INTEGER"),
+        // GRAMMAR.md §3.184: SQLite no tiene un tipo decimal nativo -- el
+        // valor YA escalado ×10.000 se guarda como INTEGER (exacto, cabe
+        // sobrado en 64 bits para cualquier magnitud financiera real; ver
+        // `Cell::to_sql` para el chequeo de rango al escribir).
+        Type::Decimal => Some("INTEGER"),
         Type::Float => Some("REAL"),
         Type::String => Some("TEXT"),
         // Misma columna TEXT que String -- la validación de forma
@@ -2877,6 +2886,16 @@ db { users: User[] }
             let cast_as = match kind {
                 ColumnKind::Int => "BIGINT",
                 ColumnKind::Float => "DOUBLE PRECISION",
+                // GRAMMAR.md §3.184: SUM/MAX/MIN sobre una columna Decimal
+                // -- `avgBy` nunca llega acá (checker.rs ya lo rechaza para
+                // Decimal, ver check_aggregate_by). NUMERIC es un no-op
+                // real en los dos backends para este caso: Postgres ya
+                // devuelve `numeric` de por sí (SUM/MAX/MIN sobre numeric
+                // no promociona a otro tipo, a diferencia de Int→numeric);
+                // SQLite conserva la afinidad INTEGER del valor YA escalado
+                // que la columna guarda (mismo mecanismo que
+                // `ColumnKind::Decimal` en `Cell::to_sql`/`sqlite_cell`).
+                ColumnKind::Decimal => "NUMERIC",
                 other => panic!("select_grouped: un selector de valor numérico no debería resolver a {other:?}"),
             };
             // AVG siempre da Float, sin importar el tipo de la columna de
@@ -3100,6 +3119,7 @@ db { users: User[] }
                 (_, Cell::Null) => None,
                 (Type::Int, Cell::Int(n)) => Some(Value::Int(*n)),
                 (Type::Int64, Cell::Int(n)) => Some(Value::Int64(*n)),
+                (Type::Decimal, Cell::Decimal(n)) => Some(Value::Decimal(*n)),
                 (Type::Timestamp, Cell::Int(n)) => Some(Value::Timestamp(*n)),
                 (Type::Float, Cell::Float(f)) => Some(Value::Float(*f)),
                 (Type::String, Cell::Text(t)) => Some(Value::Str(t.clone())),
@@ -3164,6 +3184,9 @@ db { users: User[] }
             Value::Null => Cell::Null,
             Value::Int(n) => Cell::Int(*n),
             Value::Int64(n) => Cell::Int(*n),
+            // GRAMMAR.md §3.184: `Cell::Decimal`, no `Cell::Int` -- a
+            // diferencia de Int64, el rango de i128 no cabe ahí.
+            Value::Decimal(n) => Cell::Decimal(*n),
             Value::Timestamp(n) => Cell::Int(*n),
             Value::Float(f) => Cell::Float(*f),
             Value::Str(s) => Cell::Text(s.clone()),
@@ -3295,6 +3318,10 @@ fn scalar_cell_to_value(collection: &str, ty: &Type, cell: &Cell) -> Result<Valu
         // para Int64, ahora con Timestamp en vez de descubrirlo tarde.
         (Type::Timestamp, Cell::Int(n)) => Value::Timestamp(*n),
         (_, Cell::Int(n)) => Value::Int(*n),
+        // GRAMMAR.md §3.184: `Cell::Decimal` es una variante PROPIA (no
+        // comparte `Cell::Int` como Int64) -- sin ambigüedad de storage que
+        // resolver mirando `Type`, a diferencia del brazo de Int64 arriba.
+        (_, Cell::Decimal(n)) => Value::Decimal(*n),
         (_, Cell::Float(f)) => Value::Float(*f),
         (_, Cell::Text(t)) => Value::Str(t.clone()),
         (_, Cell::Bool(b)) => Value::Bool(*b),

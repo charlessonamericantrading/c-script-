@@ -26,6 +26,12 @@ use std::cell::RefCell;
 pub(crate) enum Cell {
     Null,
     Int(i64),
+    /// `Type::Decimal` (GRAMMAR.md §3.184) -- escalado ×`DECIMAL_SCALE`
+    /// (10.000). Variante propia, no `Cell::Int`: el rango de `i128` no
+    /// cabe en el `i64` que SQLite/`postgres_int_cell` asumen en todos
+    /// lados (a diferencia de `Int64`, que SÍ reusa `Cell::Int` porque
+    /// sigue siendo un `i64` físico real).
+    Decimal(i128),
     Float(f64),
     Text(String),
     Bool(bool),
@@ -62,6 +68,11 @@ pub(crate) enum ColumnKind {
     Uuid,
     Bool,
     Json,
+    /// `Type::Decimal` (GRAMMAR.md §3.184) -- `INTEGER` (el valor escalado,
+    /// checkeado a rango i64) en SQLite; `NUMERIC` NATIVO en Postgres, tanto
+    /// para schema generado como adoptado -- ver `postgres_decimal_cell`/
+    /// `Cell::to_sql`.
+    Decimal,
 }
 
 /// `ReentrantMutex`, no `std::sync::Mutex` -- GRAMMAR.md, Pilar 1 del
@@ -348,6 +359,14 @@ fn sqlite_cell(row: &rusqlite::Row, i: usize, kind: ColumnKind) -> rusqlite::Res
             Some(f) => Cell::Float(f),
             None => Cell::Null,
         },
+        // GRAMMAR.md §3.184: SQLite no tiene un tipo decimal nativo -- se
+        // guarda como INTEGER, el valor YA escalado ×10.000 (`Cell::to_sql`
+        // lo checkea a rango i64 al escribir). Leer de vuelta a `i128` es
+        // siempre exacto -- ensanchar nunca pierde nada.
+        ColumnKind::Decimal => match row.get::<_, Option<i64>>(i)? {
+            Some(n) => Cell::Decimal(n as i128),
+            None => Cell::Null,
+        },
         // `ColumnKind::Uuid` (GRAMMAR.md §3.177) es una PK `id: Uuid` --
         // en SQLite es una columna TEXT común, se decodifica exactamente
         // igual que `Text` (la distinción binaria/uuid nativo solo existe
@@ -478,6 +497,133 @@ impl<'a> postgres::types::FromSql<'a> for PgNumeric {
     fn accepts(ty: &postgres::types::Type) -> bool {
         matches!(*ty, postgres::types::Type::NUMERIC)
     }
+}
+
+/// Como `PgNumeric` arriba (mismo formato: ndigits/weight/sign/dscale +
+/// dígitos base-10000), pero acumula en `i128` ESCALADO ×`DECIMAL_SCALE`
+/// (10.000), NUNCA en `f64` -- GRAMMAR.md §3.184. Acumular en punto
+/// flotante acá reintroduciría exactamente el error de redondeo binario
+/// que `Type::Decimal` existe para evitar, así que `PgNumeric` sirve de
+/// referencia de FORMATO, no de decodificador reusable tal cual.
+///
+/// Algoritmo: junta los `ndigits` dígitos base-10000 en un solo entero
+/// `big` (más significativo primero, mismo orden en que vienen), después
+/// reescala `big` a la potencia de 10 que corresponde según `weight` y
+/// `ndigits` -- derivado a mano y verificado con casos concretos
+/// (`123.45` con 2 dígitos da exactamente 1234500; `123.456789` con 3
+/// dígitos, más precisión que los 4 decimales de Decimal, redondea a
+/// 1234568 con el mismo `div_round` que el resto del tipo usa) antes de
+/// escribirlo acá.
+struct PgDecimal(i128);
+
+impl<'a> postgres::types::FromSql<'a> for PgDecimal {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 8 {
+            return Err(format!("'{ty}': numeric truncado, se esperaban al menos 8 bytes de cabecera, llegaron {}", raw.len()).into());
+        }
+        let ndigits = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+        let weight = i16::from_be_bytes([raw[2], raw[3]]) as i32;
+        let sign = u16::from_be_bytes([raw[4], raw[5]]);
+        let expected_len = 8 + ndigits * 2;
+        if raw.len() < expected_len {
+            return Err(format!("'{ty}': numeric truncado, se esperaban {expected_len} bytes, llegaron {}", raw.len()).into());
+        }
+        if sign != 0x0000 && sign != 0x4000 {
+            return Err(format!("'{ty}': numeric con signo 0x{sign:04x} (NaN/Infinity) no se puede representar como Decimal").into());
+        }
+        let mut big: i128 = 0;
+        for i in 0..ndigits {
+            let offset = 8 + i * 2;
+            let digit = i16::from_be_bytes([raw[offset], raw[offset + 1]]) as i128;
+            big = match big.checked_mul(10_000).and_then(|b| b.checked_add(digit)) {
+                Some(b) => b,
+                None => return Err(format!("'{ty}': numeric demasiado grande para Decimal (i128)").into()),
+            };
+        }
+        // raw_escalado = big * 10^pow10, donde pow10 = 4*(weight - ndigits + 2)
+        // -- ver el comentario de arriba del struct para la derivación.
+        let pow10 = 4 * (weight - ndigits as i32 + 2);
+        let scaled = if pow10 >= 0 {
+            let Some(factor) = 10i128.checked_pow(pow10 as u32) else {
+                return Err(format!("'{ty}': numeric demasiado grande para Decimal (i128)").into());
+            };
+            match big.checked_mul(factor) {
+                Some(s) => s,
+                None => return Err(format!("'{ty}': numeric demasiado grande para Decimal (i128)").into()),
+            }
+        } else {
+            let Some(factor) = 10i128.checked_pow((-pow10) as u32) else {
+                return Err(format!("'{ty}': numeric demasiado grande para Decimal (i128)").into());
+            };
+            match super::div_round(big, factor) {
+                Some(s) => s,
+                None => return Err(format!("'{ty}': error al redondear numeric a Decimal").into()),
+            }
+        };
+        Ok(PgDecimal(if sign == 0x4000 { -scaled } else { scaled }))
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        matches!(*ty, postgres::types::Type::NUMERIC)
+    }
+}
+
+/// `n` -> sus dígitos base-10000, más significativo primero -- vacío si
+/// `n == 0` (mismo convenio que el propio `numeric_send` de Postgres: cero
+/// se representa con `ndigits = 0`, no un dígito `0` explícito).
+fn to_base10000_digits(mut n: u128) -> Vec<u16> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut digits = Vec::new();
+    while n > 0 {
+        digits.push((n % 10_000) as u16);
+        n /= 10_000;
+    }
+    digits.reverse();
+    digits
+}
+
+/// Inversa de `PgDecimal::from_sql` -- un i128 escalado ×`DECIMAL_SCALE`
+/// (GRAMMAR.md §3.184) a la forma binaria NUMERIC real de Postgres. Nuestra
+/// escala fija (4 decimales) cabe SIEMPRE en un solo dígito fraccionario
+/// base-10000 (`abs % 10000`), así que la parte entera y la fraccionaria se
+/// arman por separado y se concatenan -- sin la ambigüedad de trimming que
+/// tendría un decodificador de precisión arbitraria. El dígito fraccionario
+/// se OMITE si es exactamente cero (mismo convenio de Postgres: sin ceros
+/// finales en el array de dígitos, `dscale` es lo que controla cuántos
+/// decimales se muestran, no `ndigits`). `weight`/`ndigits` de un i128 real
+/// caben sobrado en i16/u16 (el rango de i128 en base 10000 son ~10
+/// dígitos como mucho) -- sin necesidad de aritmética checked acá, a
+/// diferencia del decodificador (que procesa un NUMERIC de Postgres real,
+/// de precisión arbitraria y potencialmente mucho más ancho).
+fn decimal_scaled_to_pg_numeric_binary(raw: i128) -> Vec<u8> {
+    let sign: u16 = if raw < 0 { 0x4000 } else { 0x0000 };
+    let abs = raw.unsigned_abs();
+    let int_part = abs / (super::DECIMAL_SCALE as u128);
+    let frac_chunk = (abs % (super::DECIMAL_SCALE as u128)) as u16;
+    let mut int_digits = to_base10000_digits(int_part);
+
+    let (digits, weight): (Vec<u16>, i32) = if int_digits.is_empty() && frac_chunk == 0 {
+        (Vec::new(), 0)
+    } else if frac_chunk == 0 {
+        let w = int_digits.len() as i32 - 1;
+        (int_digits, w)
+    } else {
+        let w = if int_digits.is_empty() { -1 } else { int_digits.len() as i32 - 1 };
+        int_digits.push(frac_chunk);
+        (int_digits, w)
+    };
+
+    let mut out = Vec::with_capacity(8 + digits.len() * 2);
+    out.extend_from_slice(&(digits.len() as u16).to_be_bytes());
+    out.extend_from_slice(&(weight as i16).to_be_bytes());
+    out.extend_from_slice(&sign.to_be_bytes());
+    out.extend_from_slice(&4u16.to_be_bytes()); // dscale: siempre 4 decimales de display
+    for d in &digits {
+        out.extend_from_slice(&d.to_be_bytes());
+    }
+    out
 }
 
 /// GRAMMAR.md §3.177: los 16 bytes CRUDOS de un `uuid` nativo de Postgres
@@ -704,6 +850,15 @@ fn postgres_cell(row: &postgres::Row, i: usize, kind: ColumnKind) -> Result<Cell
             Some(f) => Cell::Float(f),
             None => Cell::Null,
         },
+        // GRAMMAR.md §3.184: siempre `NUMERIC` nativo del lado Postgres,
+        // generado o adoptado -- a diferencia de `Float` (que puede ser
+        // `float4`/`float8` O `numeric`), Decimal no tiene una convención
+        // propia de c-script que no sea ya NUMERIC, así que no hace falta
+        // "probar en orden".
+        ColumnKind::Decimal => match row.try_get::<_, Option<PgDecimal>>(i).map_err(|e| e.to_string())? {
+            Some(PgDecimal(n)) => Cell::Decimal(n),
+            None => Cell::Null,
+        },
         ColumnKind::Text => match postgres_string_cell(row, i)? {
             Some(s) => Cell::Text(s),
             None => Cell::Null,
@@ -735,6 +890,20 @@ impl rusqlite::ToSql for Cell {
         Ok(match self {
             Cell::Null => ToSqlOutput::Owned(SqlValue::Null),
             Cell::Int(n) => ToSqlOutput::Owned(SqlValue::Integer(*n)),
+            // GRAMMAR.md §3.184: SQLite no tiene un tipo decimal nativo --
+            // se guarda como INTEGER, el valor YA escalado ×10.000. Cabe
+            // siempre que la magnitud real esté dentro de
+            // ±~922.337.203.685.477,5807 (rango de i64 tras escalar) -- más
+            // que suficiente para cualquier caso financiero real; un valor
+            // que no entre es un error claro acá, nunca un wrap silencioso.
+            Cell::Decimal(n) => {
+                let n64 = i64::try_from(*n).map_err(|_| {
+                    rusqlite::Error::ToSqlConversionFailure(
+                        format!("{} no entra en el rango de Decimal soportado por SQLite (±~922 billones)", super::format_decimal(*n)).into(),
+                    )
+                })?;
+                ToSqlOutput::Owned(SqlValue::Integer(n64))
+            }
             Cell::Float(f) => ToSqlOutput::Owned(SqlValue::Real(*f)),
             Cell::Text(s) => ToSqlOutput::Owned(SqlValue::Text(s.clone())),
             Cell::Bool(b) => ToSqlOutput::Owned(SqlValue::Integer(i64::from(*b))),
@@ -800,6 +969,14 @@ impl postgres::types::ToSql for Cell {
                 _ => n.to_sql(ty, out),
             },
             Cell::Float(f) => f.to_sql(ty, out),
+            // GRAMMAR.md §3.184: siempre columna NUMERIC nativa del lado
+            // Postgres -- `decimal_scaled_to_pg_numeric_binary` arma el
+            // wire binario real (ndigits/weight/sign/dscale + dígitos
+            // base-10000), inversa exacta de `PgDecimal::from_sql` arriba.
+            Cell::Decimal(n) => {
+                out.extend_from_slice(&decimal_scaled_to_pg_numeric_binary(*n));
+                Ok(postgres::types::IsNull::No)
+            }
             // GRAMMAR.md §3.177: `id: Uuid` -- una PK Uuid usa el tipo
             // NATIVO `UUID` de Postgres (a diferencia de cualquier otro
             // campo `Uuid`, que sigue siendo TEXT), para poder adoptar una
@@ -937,5 +1114,102 @@ mod inet_tests {
         // exacto que Postgres documenta para el protocolo binario de inet.
         let bytes = inet_string_to_binary("192.168.1.1").unwrap();
         assert_eq!(bytes, vec![2, 32, 0, 4, 192, 168, 1, 1]);
+    }
+}
+
+/// GRAMMAR.md §3.184: como `inet_tests` arriba -- la codificación/
+/// decodificación binaria de `numeric` en sí (`decimal_scaled_to_pg_numeric_binary`/
+/// `PgDecimal::from_sql`) es lógica PURA, sin Postgres real de por medio.
+/// Encontrar un error de layout acá es mucho más barato que en CI.
+#[cfg(test)]
+mod decimal_tests {
+    use super::*;
+
+    fn decode(bytes: &[u8]) -> i128 {
+        let PgDecimal(n) =
+            <PgDecimal as postgres::types::FromSql>::from_sql(&postgres::types::Type::NUMERIC, bytes).expect("decodificar");
+        n
+    }
+
+    #[test]
+    fn a_typical_money_value_round_trips() {
+        let raw = super::super::parse_decimal("123.4500").unwrap();
+        let bytes = decimal_scaled_to_pg_numeric_binary(raw);
+        assert_eq!(decode(&bytes), raw);
+    }
+
+    #[test]
+    fn zero_round_trips_with_the_postgres_convention_of_zero_digits() {
+        let raw = 0i128;
+        let bytes = decimal_scaled_to_pg_numeric_binary(raw);
+        // ndigits=0, weight=0, sign=0x0000, dscale=4 -- el "cero" real de
+        // Postgres, sin ningún dígito explícito.
+        assert_eq!(bytes, vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04]);
+        assert_eq!(decode(&bytes), 0);
+    }
+
+    #[test]
+    fn a_negative_value_round_trips_with_the_correct_sign() {
+        let raw = super::super::parse_decimal("-987.6543").unwrap();
+        let bytes = decimal_scaled_to_pg_numeric_binary(raw);
+        assert_eq!(decode(&bytes), raw);
+    }
+
+    #[test]
+    fn a_value_with_only_a_fractional_part_round_trips() {
+        // 0.5000 -- sin dígitos enteros, weight negativo (-1).
+        let raw = super::super::parse_decimal("0.5000").unwrap();
+        let bytes = decimal_scaled_to_pg_numeric_binary(raw);
+        assert_eq!(decode(&bytes), raw);
+    }
+
+    #[test]
+    fn a_whole_number_omits_the_zero_fractional_digit() {
+        // 100.0000 -- el dígito fraccionario (0) se omite, mismo convenio
+        // que el propio numeric_send() de Postgres (sin ceros finales).
+        let raw = super::super::parse_decimal("100.0000").unwrap();
+        let bytes = decimal_scaled_to_pg_numeric_binary(raw);
+        let ndigits = u16::from_be_bytes([bytes[0], bytes[1]]);
+        assert_eq!(ndigits, 1, "solo el dígito entero, sin el fraccionario en cero: {bytes:?}");
+        assert_eq!(decode(&bytes), raw);
+    }
+
+    #[test]
+    fn a_large_integer_part_spanning_multiple_base10000_digits_round_trips() {
+        // 123456789.0000 -- la parte entera sola ya necesita 3 dígitos
+        // base-10000 (123456789 = 1*10000² + 2345*10000 + 6789).
+        let raw = super::super::parse_decimal("123456789.0000").unwrap();
+        let bytes = decimal_scaled_to_pg_numeric_binary(raw);
+        assert_eq!(decode(&bytes), raw);
+    }
+
+    #[test]
+    fn decoding_more_precision_than_four_decimals_rounds_correctly() {
+        // Simula una columna numeric(12,6) real con MÁS precisión que la
+        // escala fija de Decimal -- construido a mano según el formato
+        // documentado (no vía el encoder, que nunca produce más de 4
+        // decimales él mismo): "123.456789", ndigits=3, weight=0,
+        // dígitos=[123, 4567, 8900] (89 rellenado con ceros a la derecha
+        // para completar el chunk base-10000). Verificado a mano en el
+        // comentario de PgDecimal antes de escribir el decodificador:
+        // redondea a 123.4568 (el 5to decimal, 8, redondea el 4to hacia
+        // arriba).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3u16.to_be_bytes()); // ndigits
+        bytes.extend_from_slice(&0i16.to_be_bytes()); // weight
+        bytes.extend_from_slice(&0x0000u16.to_be_bytes()); // sign: positivo
+        bytes.extend_from_slice(&6u16.to_be_bytes()); // dscale (informativo, no afecta el valor)
+        for d in [123u16, 4567, 8900] {
+            bytes.extend_from_slice(&d.to_be_bytes());
+        }
+        assert_eq!(decode(&bytes), super::super::parse_decimal("123.4568").unwrap());
+    }
+
+    #[test]
+    fn nan_and_infinity_are_rejected_with_a_clean_error() {
+        let mut bytes = vec![0u8, 0, 0, 0, 0, 0, 0, 4]; // ndigits=0, weight=0, dscale=4
+        bytes[4..6].copy_from_slice(&0xC000u16.to_be_bytes()); // sign = NaN
+        let result = <PgDecimal as postgres::types::FromSql>::from_sql(&postgres::types::Type::NUMERIC, &bytes);
+        assert!(result.is_err(), "NaN no se puede representar como Decimal -- tiene que fallar, no adivinar 0");
     }
 }

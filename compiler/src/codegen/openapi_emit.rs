@@ -60,6 +60,12 @@ fn type_to_json_schema(ty: &Type) -> Value {
     match ty {
         Type::Int => json!({ "type": "integer", "format": "int32" }),
         Type::Int64 => json!({ "type": "integer", "format": "int64" }),
+        // GRAMMAR.md §3.184: `"type": "string"`, NO `"number"` -- a
+        // diferencia de la inconsistencia ya existente de Int64 (arriba,
+        // wire real de string pero OpenAPI dice "integer"), acá el schema
+        // SÍ coincide con el wire real: Decimal siempre viaja como string
+        // de 4 decimales exactos, nunca como número JSON nativo.
+        Type::Decimal => json!({ "type": "string", "format": "decimal" }),
         Type::Float => json!({ "type": "number", "format": "double" }),
         Type::String => json!({ "type": "string" }),
         // "format": "uuid" es el idiom estándar de JSON Schema/OpenAPI para
