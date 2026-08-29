@@ -20,7 +20,7 @@ use crate::checker::Checker;
 use crate::codegen::postgres_emit::{alter_table_add_column_postgres, create_postgres_table_sql};
 use crate::runtime::db::{
     check_fields_by_collection, composite_unique_by_collection, connect_postgres_client, create_composite_unique_statements,
-    create_index_statements, index_fields_by_collection, type_checks_by_collection, validate_existing_id_column,
+    create_index_statements, index_fields_by_collection, type_checks_by_collection, validate_existing_id_column, IdKind,
 };
 use crate::runtime::store::{Backend, Cell, ColumnKind};
 use crate::types::{FieldType, Type};
@@ -59,8 +59,10 @@ pub fn dry_run_postgres(program: &Program, url: &str) -> Result<String, String> 
     for (coll_name, elem_ty) in checker.db_collections() {
         let Type::Struct { fields, .. } = elem_ty else { continue };
         let non_id: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
+        let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
+        let id_kind = IdKind::from_field_type(id_field_ty);
 
-        if let Err(e) = validate_existing_id_column(&backend, coll_name) {
+        if let Err(e) = validate_existing_id_column(&backend, coll_name, id_kind) {
             out.push_str(&format!("-- '{coll_name}': ¡ESTO FALLARÍA AL CONECTAR DE VERDAD! {e}\n\n"));
             any_change = true;
             continue;
@@ -73,7 +75,7 @@ pub fn dry_run_postgres(program: &Program, url: &str) -> Result<String, String> 
             let checks = checks_by_collection.get(coll_name).cloned().unwrap_or_default();
             let type_checks = type_checks_by_collection_map.get(coll_name).cloned().unwrap_or_default();
             out.push_str(&format!("-- '{coll_name}': tabla nueva\n"));
-            out.push_str(&create_postgres_table_sql(coll_name, &non_id, &simple_enums, &checks, &type_checks));
+            out.push_str(&create_postgres_table_sql(coll_name, id_field_ty, &non_id, &simple_enums, &checks, &type_checks));
             out.push_str("\n\n");
         } else {
             let declared_names: Vec<&str> = non_id.iter().map(|f| f.name.as_str()).collect();

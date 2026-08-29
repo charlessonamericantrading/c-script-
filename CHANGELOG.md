@@ -3,6 +3,30 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.133.0] - 2026-08-29
+
+### ✨ Nuevo
+**`id: Uuid` como clave primaria alternativa a `id: Int`** -- cierra el bloqueo real de adopción de iaacademy que v1.132.0 (GRAMMAR.md §3.176) había dejado explícitamente pendiente: tablas de producción con `id uuid DEFAULT gen_random_uuid()` ahora se pueden modelar y adoptar de punta a punta, sin migrar ningún esquema.
+
+```
+type Lead = { id: Uuid, email: String }
+type NewLead = { email: String }
+db { leads: Lead[] }
+service Leads {
+  rpc create(email: String) -> Lead { db.leads.insert(NewLead { email: email }) }
+  rpc get(id: Uuid) -> Lead? { db.leads.find(id) }
+}
+```
+
+- La PK se genera SIEMPRE del lado de la aplicación (mismo generador que `crypto.uuid()`), nunca depende de `DEFAULT`/`RETURNING`/`last_insert_rowid()` -- es lo que hace posible adoptar una tabla existente sin tocarla.
+- SQLite: `TEXT PRIMARY KEY NOT NULL`. Postgres: tipo nativo `UUID PRIMARY KEY`, con un cast `::uuid` explícito en cada bind (sin sumar la dependencia `with-uuid-1` a la crate `postgres`) -- verificado contra una tabla adoptada de verdad con columna `uuid` nativa.
+- `find`/`applyPatch`/`delete`/`increment`/`insert`/`upsert`/`page`/`maxRow`/`minRow` funcionan igual que con `id: Int`. `pageAfter` queda RECHAZADO a propósito sobre una PK Uuid -- su garantía de no saltear filas concurrentes depende de que el id crezca en el mismo orden que la inserción, falso para un UUID aleatorio.
+- `linkc introspect` ahora emite `id: Uuid` directo (sin advertencia) para una PK `uuid` nativa; `linkc migrate --dry-run`/`--adopt-existing` la reconocen como compatible.
+
+**Bug real encontrado en el camino** (atrapado por el test de `upsert`, vía su pushdown de predicado): `find_where_conjunction`/`select_rows_page`/`top_row` (`runtime/db.rs`) tenían el mismo `ColumnKind::Int` hardcodeado para decodificar la columna `"id"` que `select_rows` ya tenía -- sin el fix, `findWhere`/`page`/`maxRow`/`minRow` sobre una colección Uuid rompían con un error de decodificación.
+
+**Verificado**: 6 tests de checker + 5 contra SQLite real + 3 contra un PostgreSQL real (fresco, `--adopt-existing` contra una tabla armada a mano igual a la de iaacademy, y `migrate --dry-run`). Suite completa sin regresiones (1316 tests locales, +14 sobre v1.132.0). Ver GRAMMAR.md §3.177.
+
 ## [1.132.0] - 2026-08-29
 
 ### ✨ Nuevo

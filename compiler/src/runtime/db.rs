@@ -9,7 +9,7 @@
 // mismo espíritu que contract.d.ts/client.ts/validators.ts (todos derivados
 // de la misma fuente de verdad, cero duplicación manual).
 
-use super::{as_int, json_to_typed_value, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
+use super::{as_int, generate_uuid_v4, json_to_typed_value, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
 use crate::ast::{BinaryOp, FieldCheck, Item, Program, TimeGranularity, TypeAnnotation, TypeExpr};
 use crate::checker::Checker;
 use crate::types::{FieldType, Type};
@@ -101,6 +101,30 @@ impl ColumnPlan {
             Type::Bool => ColumnKind::Bool,
             Type::String | Type::Uuid | Type::Enum(_) => ColumnKind::Text,
             other => unreachable!("tipo nativo inesperado en una columna no-JSON: {other:?}"),
+        }
+    }
+}
+
+/// GRAMMAR.md §3.177: qué tipo es la PK de una colección -- deriva todo
+/// lo demás que cambia entre las dos formas (columna DDL INTEGER
+/// AUTOINCREMENT/BIGSERIAL vs TEXT/UUID, generación por autoincremento
+/// del motor vs generada del lado de la app antes del INSERT, y el cast
+/// `::uuid` explícito que Postgres necesita para bindear un valor de
+/// texto contra una columna `uuid` nativa -- ver `Db::id_placeholder`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdKind {
+    Int,
+    Uuid,
+}
+
+impl IdKind {
+    /// `Checker::validate_db_element_type` ya garantizó que el campo
+    /// `id` de toda colección es `Int` o `Uuid` -- cualquier otro tipo
+    /// nunca llega hasta acá.
+    pub(crate) fn from_field_type(ty: &Type) -> Self {
+        match ty {
+            Type::Uuid => IdKind::Uuid,
+            _ => IdKind::Int,
         }
     }
 }
@@ -503,8 +527,30 @@ pub(crate) fn check_clause_sql(field: &str, check: &FieldCheck) -> String {
     }
 }
 
-fn create_table_sql(collection: &str, columns: &[ColumnPlan], checks: &[(String, FieldCheck)], type_checks: &[String]) -> String {
-    let mut defs = vec!["\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
+fn create_table_sql(
+    collection: &str,
+    id_kind: IdKind,
+    columns: &[ColumnPlan],
+    checks: &[(String, FieldCheck)],
+    type_checks: &[String],
+) -> String {
+    // GRAMMAR.md §3.177: una PK `Uuid` se genera del lado de la
+    // aplicación (`crypto.uuid()`, `Db::call` "insert") ANTES de cada
+    // INSERT, nunca por el motor -- así que la columna es TEXT sin
+    // AUTOINCREMENT, no INTEGER. Mismo tipo SQL que cualquier otro campo
+    // `Uuid` ya usa (`ColumnPlan::kind`), consistente con esa columna.
+    // `NOT NULL` explícito en la rama Uuid: a diferencia de un `INTEGER
+    // PRIMARY KEY` (el alias de `rowid`, que SQLite nunca deja en NULL
+    // por construcción), un `PRIMARY KEY` sobre cualquier OTRO tipo --
+    // incluido `TEXT` -- NO implica `NOT NULL` en SQLite (quirk
+    // documentado del motor, distinto del estándar SQL); sin esto, un
+    // `id` NULL pasaría el `CREATE TABLE ... STRICT` de arriba sin
+    // ninguna queja.
+    let id_def = match id_kind {
+        IdKind::Int => "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string(),
+        IdKind::Uuid => "\"id\" TEXT PRIMARY KEY NOT NULL".to_string(),
+    };
+    let mut defs = vec![id_def];
 
     for col in columns {
         let not_null = if col.not_null() { " NOT NULL" } else { "" };
@@ -535,7 +581,13 @@ fn create_table_sql(collection: &str, columns: &[ColumnPlan], checks: &[(String,
 /// `CREATE TABLE IF NOT EXISTS` acaba de crear en esta misma llamada
 /// siempre matchea por construcción, así que esto solo puede fallar contra
 /// un archivo de una corrida ANTERIOR con un schema distinto.
-fn check_schema_matches(connection: &Connection, collection: &str, columns: &[ColumnPlan], db_path: &str) -> Result<(), RuntimeError> {
+fn check_schema_matches(
+    connection: &Connection,
+    collection: &str,
+    id_kind: IdKind,
+    columns: &[ColumnPlan],
+    db_path: &str,
+) -> Result<(), RuntimeError> {
     let mut stmt = connection
         .prepare(&format!("PRAGMA table_info(\"{collection}\")"))
         .map_err(|e| RuntimeError::new(format!("no se pudo leer el schema de '{collection}' en '{db_path}': {e}")))?;
@@ -554,8 +606,14 @@ fn check_schema_matches(connection: &Connection, collection: &str, columns: &[Co
     // `id INTEGER PRIMARY KEY` reporta notnull=0 en PRAGMA table_info aunque
     // nunca pueda terminar siendo NULL de verdad (SQLite autoasigna en vez
     // de aceptar NULL) -- si acá se esperara notnull=1, CUALQUIER reinicio
-    // detectaría un mismatch falso desde el primer arranque.
-    expected.insert("id".to_string(), ("INTEGER".to_string(), false));
+    // detectaría un mismatch falso desde el primer arranque. `id TEXT
+    // PRIMARY KEY` (GRAMMAR.md §3.177) SÍ declara `NOT NULL` de verdad
+    // (ver `create_table_sql`), así que ahí notnull=1 es lo esperado.
+    let id_expected = match id_kind {
+        IdKind::Int => ("INTEGER".to_string(), false),
+        IdKind::Uuid => ("TEXT".to_string(), true),
+    };
+    expected.insert("id".to_string(), id_expected);
     for col in columns {
         expected.insert(col.field.name.clone(), (col.sql_type.to_string(), col.not_null()));
     }
@@ -690,7 +748,7 @@ fn check_schema_for_adoption(connection: &Connection, collection: &str, columns:
 /// devuelve un error limpio, NO un panic (el panic era específico de la
 /// variante `Row::get` sin chequear que usaba justo el fetch del id nuevo).
 /// "id" es el único caso donde ese error limpio no alcanzaba a tiempo.
-pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str) -> Result<(), String> {
+pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str, expected: IdKind) -> Result<(), String> {
     let sql = format!(
         "SELECT data_type FROM information_schema.columns WHERE table_name = {} AND column_name = 'id'",
         backend.placeholder(1)
@@ -699,21 +757,45 @@ pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str) -
         .query(&sql, &[Cell::Text(collection.to_string())], &[ColumnKind::Text])
         .map_err(|e| format!("no se pudo verificar el esquema de '{collection}' en PostgreSQL: {e}"))?;
 
-    // Sin fila: o la tabla se acaba de crear (su "id" siempre es BIGSERIAL,
-    // por construcción -- nada que validar) o por algún motivo no tiene
-    // columna "id" en absoluto, en cuyo caso cualquier find/insert/delete
-    // sobre esta colección va a fallar de todos modos con su propio mensaje.
-    // Ninguno de los dos casos es este el lugar para inventar uno mejor.
+    // Sin fila: o la tabla se acaba de crear (su "id" siempre es BIGSERIAL/
+    // UUID según `expected`, por construcción -- nada que validar) o por
+    // algún motivo no tiene columna "id" en absoluto, en cuyo caso
+    // cualquier find/insert/delete sobre esta colección va a fallar de
+    // todos modos con su propio mensaje. Ninguno de los dos casos es este
+    // el lugar para inventar uno mejor.
     let Some(Cell::Text(data_type)) = rows.first().and_then(|row| row.first()) else {
         return Ok(());
     };
-    if matches!(data_type.as_str(), "bigint" | "integer" | "smallint") {
+    // GRAMMAR.md §3.177: `id: Uuid` solo acepta una columna Postgres
+    // NATIVA `uuid` -- no `text`/`varchar`, aunque guarden un UUID con
+    // forma válida. Es un scope deliberado, no un descuido: el bind de
+    // un parámetro contra esta columna (`Db::id_placeholder`) siempre
+    // agrega un cast `::uuid` explícito, que solo hace falta -- y solo
+    // es correcto -- cuando la columna real es `uuid` nativo. Aceptar
+    // también `text` acá abriría la puerta a un cast innecesario contra
+    // una columna que nunca lo necesitó, sin ningún caso real verificado
+    // que lo pida todavía (el motivador, iaacademy, tiene columnas
+    // genuinamente `uuid`).
+    let ok = match expected {
+        IdKind::Int => matches!(data_type.as_str(), "bigint" | "integer" | "smallint"),
+        IdKind::Uuid => data_type == "uuid",
+    };
+    if ok {
         return Ok(());
     }
+    let (required, hint) = match expected {
+        IdKind::Int => (
+            "una clave primaria entera autoincremental (BIGSERIAL)".to_string(),
+            "agregá una columna \"id\" BIGSERIAL nueva".to_string(),
+        ),
+        IdKind::Uuid => (
+            "una clave primaria 'uuid' nativa de PostgreSQL".to_string(),
+            "agregá una columna \"id\" UUID nueva, o cambiá el tipo del campo 'id' del .link a Int si esta tabla ya usa un entero/otro formato".to_string(),
+        ),
+    };
     Err(format!(
-        "la tabla '{collection}' ya existe en PostgreSQL con \"id\" de tipo '{data_type}', pero c-script requiere una \
-         clave primaria entera autoincremental (BIGSERIAL) -- típico al migrar desde un backend que usaba UUID como id. \
-         No se puede usar esta tabla sin migrarla a mano: agregá una columna \"id\" BIGSERIAL nueva, o apuntá esta \
+        "la tabla '{collection}' ya existe en PostgreSQL con \"id\" de tipo '{data_type}', pero c-script requiere {required} \
+         -- típico al migrar desde otro backend. No se puede usar esta tabla sin migrarla a mano: {hint}, o apuntá esta \
          colección a otro nombre de tabla."
     ))
 }
@@ -853,6 +935,12 @@ pub struct Db {
     /// Nombre de colección -> plan de columnas (todo menos `id`), derivado
     /// del `Type::Struct` de esa colección al abrir la conexión.
     columns: HashMap<String, Vec<ColumnPlan>>,
+    /// Nombre de colección -> tipo de su PK (GRAMMAR.md §3.177). Ausente
+    /// de este mapa == `IdKind::Int` (`id_kind` de abajo defaultea así) --
+    /// nunca puede pasar en la práctica (`Checker::validate_db_element_type`
+    /// garantiza `id` en toda colección), pero el default barato evita un
+    /// `unwrap`/panic en cualquier código que consulte esto.
+    id_kinds: HashMap<String, IdKind>,
     /// Suscriptores activos por colección, para push real (GRAMMAR.md
     /// §3.16). `Mutex`, no `RefCell` -- Pilar 1 del roadmap de concurrencia
     /// (26/08/2026): con un hilo por request (`runtime/server.rs`), dos
@@ -1214,10 +1302,14 @@ impl Db {
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let empty_type_checks: Vec<String> = Vec::new();
         let mut columns = HashMap::new();
+        let mut id_kinds = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
                 unreachable!("Checker::validate_db_element_type ya garantizó que el elemento sea un struct");
             };
+            let id_kind = IdKind::from_field_type(
+                &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty,
+            );
             let cols: Vec<ColumnPlan> =
                 fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
             if adopt_existing {
@@ -1234,11 +1326,12 @@ impl Db {
                 let checks = checks_by_collection.get(name).unwrap_or(&empty_checks);
                 let type_checks = type_checks_by_collection_map.get(name).unwrap_or(&empty_type_checks);
                 connection
-                    .execute(&create_table_sql(name, &cols, checks, type_checks), [])
+                    .execute(&create_table_sql(name, id_kind, &cols, checks, type_checks), [])
                     .unwrap_or_else(|e| panic!("no se pudo crear la tabla '{name}' en '{db_path_display}': {e}"));
-                check_schema_matches(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
+                check_schema_matches(&connection, name, id_kind, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             }
             columns.insert(name.clone(), cols);
+            id_kinds.insert(name.clone(), id_kind);
         }
         if !adopt_existing {
             for (name, indexed) in index_fields_by_collection(program, &checker) {
@@ -1263,6 +1356,7 @@ impl Db {
             checker,
             simple_enums,
             columns,
+            id_kinds,
             subscribers: parking_lot::Mutex::new(HashMap::new()),
             pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
@@ -1318,10 +1412,13 @@ impl Db {
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let empty_type_checks: Vec<String> = Vec::new();
         let mut columns = HashMap::new();
+        let mut id_kinds = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
                 unreachable!("Checker::validate_db_element_type ya garantizó que el elemento sea un struct");
             };
+            let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
+            let id_kind = IdKind::from_field_type(id_field_ty);
             let cols: Vec<ColumnPlan> =
                 fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
             let non_id: Vec<FieldType> = cols.iter().map(|c| c.field.clone()).collect();
@@ -1337,6 +1434,7 @@ impl Db {
                 backend
                     .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(
                         name,
+                        id_field_ty,
                         &non_id,
                         &simple_enums,
                         checks,
@@ -1355,7 +1453,7 @@ impl Db {
             // mismo momento y mismo criterio que `check_schema_matches` ya
             // aplica para SQLite, adaptado a que Postgres no recrea tablas.
             // Es un SELECT, no DDL, así que corre en los dos modos.
-            validate_existing_id_column(&backend, name)?;
+            validate_existing_id_column(&backend, name, id_kind)?;
 
             if adopt_existing {
                 validate_columns_exist_for_adoption(&backend, name, &cols)?;
@@ -1382,6 +1480,7 @@ impl Db {
                 }
             }
             columns.insert(name.clone(), cols);
+            id_kinds.insert(name.clone(), id_kind);
         }
         if !adopt_existing {
             // Mismo criterio que el lado SQLite: `--adopt-existing` nunca
@@ -1410,6 +1509,7 @@ impl Db {
                 checker,
                 simple_enums,
                 columns,
+                id_kinds,
                 subscribers: parking_lot::Mutex::new(HashMap::new()),
                 pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
                 oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
@@ -1721,16 +1821,33 @@ db { users: User[] }
             "maxRow" | "minRow" => self.top_row(collection, columns, method, &args),
             "increment" => self.increment(collection, columns, args),
             "find" => {
-                let id = as_int(args.first().ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?)?;
-                Ok(self.select_rows(collection, columns, Some(id))?.into_iter().next().unwrap_or(Value::Null))
+                let id_value = args.into_iter().next().ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?;
+                let (id_cell, _) = self.id_cell_and_display(&id_value)?;
+                Ok(self.select_rows(collection, columns, Some(id_cell))?.into_iter().next().unwrap_or(Value::Null))
             }
             "insert" => {
                 let v = args.into_iter().next().ok_or_else(|| RuntimeError::new("insert requiere 1 argumento"))?;
                 let Value::Struct(fields) = &v else {
                     return Err(RuntimeError::new("insert: el valor debe ser un struct"));
                 };
-                let mut col_names = Vec::with_capacity(columns.len());
-                let mut params: Vec<Cell> = Vec::with_capacity(columns.len());
+                let mut col_names = Vec::with_capacity(columns.len() + 1);
+                let mut params: Vec<Cell> = Vec::with_capacity(columns.len() + 1);
+                // GRAMMAR.md §3.177: una PK `Uuid` se genera del lado de la
+                // APLICACIÓN, ANTES del INSERT -- mismo generador que
+                // `crypto.uuid()` (`generate_uuid_v4`, runtime/mod.rs) --
+                // y se manda como valor EXPLÍCITO, nunca por DEFAULT ni
+                // RETURNING. El caller nunca trae "id" en `fields`
+                // (`Omit<T,"id">`, checker.rs::omit_id_field), así que no
+                // hay riesgo de pisar un valor que el usuario haya
+                // intentado fijar.
+                let generated_uuid = match self.id_kind(collection) {
+                    IdKind::Int => None,
+                    IdKind::Uuid => Some(generate_uuid_v4()?),
+                };
+                if let Some(uuid) = &generated_uuid {
+                    col_names.push("\"id\"".to_string());
+                    params.push(Cell::Text(uuid.clone()));
+                }
                 for col in columns {
                     let slot = fields.iter().find(|(n, _)| n == &col.field.name).map(|(_, v)| v);
                     col_names.push(format!("\"{}\"", col.field.name));
@@ -1739,10 +1856,32 @@ db { users: User[] }
                 let sql = if col_names.is_empty() {
                     format!("INSERT INTO \"{collection}\" DEFAULT VALUES")
                 } else {
-                    let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
+                    // El placeholder de "id" (siempre el primero cuando
+                    // está presente, empujado arriba antes que cualquier
+                    // otra columna) es el único que puede necesitar el
+                    // cast `::uuid` de Postgres -- el resto de las
+                    // columnas nunca son la PK.
+                    let placeholders: Vec<String> = (1..=col_names.len())
+                        .map(|n| {
+                            if generated_uuid.is_some() && n == 1 {
+                                self.id_placeholder(collection, n)
+                            } else {
+                                self.backend.placeholder(n)
+                            }
+                        })
+                        .collect();
                     format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "))
                 };
-                let new_id = self.backend.insert_returning_id(&sql, &params).map_err(|e| write_error("insert", e))?;
+                let (id_cell, id_display) = match generated_uuid {
+                    Some(uuid) => {
+                        self.backend.execute(&sql, &params).map_err(|e| write_error("insert", e))?;
+                        (Cell::Text(uuid.clone()), uuid)
+                    }
+                    None => {
+                        let new_id = self.backend.insert_returning_id(&sql, &params).map_err(|e| write_error("insert", e))?;
+                        (Cell::Int(new_id), new_id.to_string())
+                    }
+                };
                 // AUDIT-2026-08-27.md #5: el INSERT y este SELECT de
                 // confirmación son dos llamadas independientes al backend
                 // (cada una toma y suelta su propio candado, salvo que este
@@ -1756,16 +1895,17 @@ db { users: User[] }
                 // usa para la carrera IDÉNTICA -- asimetría sin motivo entre
                 // dos funciones que reconsultan por id después de escribir.
                 let inserted = self
-                    .select_rows(collection, columns, Some(new_id))?
+                    .select_rows(collection, columns, Some(id_cell))?
                     .into_iter()
                     .next()
-                    .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con id {new_id} en '{collection}'")))?;
+                    .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con id {id_display} en '{collection}'")))?;
                 self.publish(collection, &inserted);
                 Ok(inserted)
             }
             "applyPatch" => {
                 let mut it = args.into_iter();
-                let id = as_int(&it.next().ok_or_else(|| RuntimeError::new("applyPatch requiere 2 argumentos"))?)?;
+                let id_value = it.next().ok_or_else(|| RuntimeError::new("applyPatch requiere 2 argumentos"))?;
+                let (id_cell, id_display) = self.id_cell_and_display(&id_value)?;
                 let patch = it.next().ok_or_else(|| RuntimeError::new("applyPatch requiere 2 argumentos"))?;
                 let Value::Struct(patch_fields) = patch else {
                     return Err(RuntimeError::new("applyPatch: el patch debe ser un objeto"));
@@ -1780,8 +1920,8 @@ db { users: User[] }
                     params.push(self.write_param(col, Some(value)));
                 }
                 if !set_clauses.is_empty() {
-                    let id_placeholder = self.backend.placeholder(params.len() + 1);
-                    params.push(Cell::Int(id));
+                    let id_placeholder = self.id_placeholder(collection, params.len() + 1);
+                    params.push(id_cell.clone());
                     let sql = format!("UPDATE \"{collection}\" SET {} WHERE \"id\" = {id_placeholder}", set_clauses.join(", "));
                     self.backend.execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
                 }
@@ -1790,10 +1930,10 @@ db { users: User[] }
                 // esta consulta es la única señal de "no existe", cubre los
                 // dos casos con un solo camino.
                 let updated = self
-                    .select_rows(collection, columns, Some(id))?
+                    .select_rows(collection, columns, Some(id_cell))?
                     .into_iter()
                     .next()
-                    .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con id {id} en '{collection}'")))?;
+                    .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con id {id_display} en '{collection}'")))?;
                 self.publish(collection, &updated);
                 Ok(updated)
             }
@@ -1805,12 +1945,13 @@ db { users: User[] }
             // devuelve `false` (0 filas afectadas), igual que un `delete`
             // normal sobre un id que ya no existe.
             "delete" => {
-                let id = as_int(args.first().ok_or_else(|| RuntimeError::new("delete requiere 1 argumento"))?)?;
+                let id_value = args.into_iter().next().ok_or_else(|| RuntimeError::new("delete requiere 1 argumento"))?;
+                let (id_cell, _) = self.id_cell_and_display(&id_value)?;
                 // `select_rows(id: Some(_))` NUNCA filtra por soft-delete
                 // (ver su propio comentario) -- acá es exactamente lo que
                 // hace falta: encontrar la fila sea cual sea su estado, para
                 // saber si hay algo que borrar y qué publicar si se borra.
-                let existing = self.select_rows(collection, columns, Some(id))?.into_iter().next();
+                let existing = self.select_rows(collection, columns, Some(id_cell.clone()))?.into_iter().next();
                 let rows_affected = match self.soft_delete_fields.get(collection) {
                     Some(field) => {
                         let now_ms = std::time::SystemTime::now()
@@ -1820,16 +1961,16 @@ db { users: User[] }
                         let sql = format!(
                             "UPDATE \"{collection}\" SET \"{field}\" = {} WHERE \"id\" = {} AND \"{field}\" IS NULL",
                             self.backend.placeholder(1),
-                            self.backend.placeholder(2)
+                            self.id_placeholder(collection, 2)
                         );
                         self.backend
-                            .execute(&sql, &[Cell::Int(now_ms), Cell::Int(id)])
+                            .execute(&sql, &[Cell::Int(now_ms), id_cell])
                             .map_err(|e| RuntimeError::new(format!("delete (soft) falló: {e}")))?
                     }
                     None => {
-                        let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = {}", self.backend.placeholder(1));
+                        let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = {}", self.id_placeholder(collection, 1));
                         self.backend
-                            .execute(&sql, &[Cell::Int(id)])
+                            .execute(&sql, &[id_cell])
                             .map_err(|e| RuntimeError::new(format!("delete falló: {e}")))?
                     }
                 };
@@ -2152,6 +2293,63 @@ db { users: User[] }
         self.soft_delete_fields.get(collection).map(|field| format!("\"{field}\" IS NULL"))
     }
 
+    /// GRAMMAR.md §3.177: tipo de la PK de `collection` -- `IdKind::Int`
+    /// si no está en el mapa (nunca pasa en la práctica, ver el comentario
+    /// del campo `id_kinds`).
+    fn id_kind(&self, collection: &str) -> IdKind {
+        self.id_kinds.get(collection).copied().unwrap_or(IdKind::Int)
+    }
+
+    /// El `ColumnKind` con el que hay que DECODIFICAR la columna `"id"` al
+    /// leerla -- `Int` o `Text`, según `id_kind`. Mismo `ColumnKind::Text`
+    /// que ya usa cualquier otro campo `Uuid` (`ColumnPlan::kind`).
+    fn id_column_kind(&self, collection: &str) -> ColumnKind {
+        match self.id_kind(collection) {
+            IdKind::Int => ColumnKind::Int,
+            IdKind::Uuid => ColumnKind::Text,
+        }
+    }
+
+    /// El placeholder SQL para bindear un valor de id contra `collection`
+    /// -- igual al de siempre, salvo Postgres + PK `Uuid`, donde agrega el
+    /// cast `::uuid` explícito.
+    ///
+    /// Por qué hace falta: sin el cast, el servidor infiere el tipo del
+    /// parámetro DIRECTO de la columna destino (`uuid` nativo), y el
+    /// driver Rust (`postgres`, sin el feature `with-uuid-1`) manda un
+    /// `Cell::Text` en el formato binario de un STRING común -- los bytes
+    /// UTF-8 de los 36 caracteres del UUID -- que NO es el formato binario
+    /// de 16 bytes que un parámetro `uuid` de verdad espera: mismatch de
+    /// wire, error de decodificación del lado del servidor. El cast
+    /// `::uuid` fuerza al servidor a inferir el parámetro como
+    /// `unknown`/texto (que SÍ coincide con lo que el driver manda) y
+    /// recién convertir a `uuid` DESPUÉS, con el parser de texto normal de
+    /// Postgres -- el mismo truco que prácticamente todo cliente sin tipo
+    /// `uuid` nativo usa contra esta columna (`$1::uuid` en vez de `$1`).
+    /// SQLite nunca necesita esto -- no tiene un tipo `uuid`/binario
+    /// separado del texto, así que un `Cell::Text` normal ya es exacto.
+    fn id_placeholder(&self, collection: &str, n: usize) -> String {
+        let ph = self.backend.placeholder(n);
+        if self.id_kind(collection) == IdKind::Uuid && self.backend.is_postgres() {
+            format!("{ph}::uuid")
+        } else {
+            ph
+        }
+    }
+
+    /// El `Cell` para bindear/comparar en SQL, más su representación en
+    /// texto para un mensaje de error -- a partir del `Value` de id que el
+    /// checker ya validó (`Int` o `Uuid`, según `check_db_method`). Evita
+    /// repetir el mismo match en `find`/`applyPatch`/`delete`/`increment`/
+    /// `insert`.
+    fn id_cell_and_display(&self, v: &Value) -> Result<(Cell, String), RuntimeError> {
+        match v {
+            Value::Int(n) => Ok((Cell::Int(*n), n.to_string())),
+            Value::Uuid(s) => Ok((Cell::Text(s.clone()), s.clone())),
+            other => Err(RuntimeError::new(format!("id inválido: se esperaba Int o Uuid, se encontró {other:?}"))),
+        }
+    }
+
     /// `all` (`id: None`, ordenado por "id" para output determinístico,
     /// mismo orden de inserción que ya daba el `Vec` de antes) o `find`/la
     /// re-consulta de `insert`/`applyPatch` (`id: Some(_)`, a lo sumo 1 fila).
@@ -2167,11 +2365,13 @@ db { users: User[] }
     /// simplicidad (ver "Límites honestos", GRAMMAR.md §3.78): una fila
     /// soft-deleteada sigue siendo encontrable por id directo, solo
     /// desaparece de listados (`all`/`page`/`pageAfter`/agregaciones).
-    fn select_rows(&self, collection: &str, columns: &[ColumnPlan], id: Option<i64>) -> Result<Vec<Value>, RuntimeError> {
+    fn select_rows(&self, collection: &str, columns: &[ColumnPlan], id: Option<Cell>) -> Result<Vec<Value>, RuntimeError> {
         let mut col_list = vec!["\"id\"".to_string()];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
         let sql = match id {
-            Some(_) => format!("SELECT {} FROM \"{collection}\" WHERE \"id\" = {}", col_list.join(", "), self.backend.placeholder(1)),
+            Some(_) => {
+                format!("SELECT {} FROM \"{collection}\" WHERE \"id\" = {}", col_list.join(", "), self.id_placeholder(collection, 1))
+            }
             None => match self.soft_delete_where(collection) {
                 Some(cond) => format!("SELECT {} FROM \"{collection}\" WHERE {cond} ORDER BY \"id\"", col_list.join(", ")),
                 None => format!("SELECT {} FROM \"{collection}\" ORDER BY \"id\"", col_list.join(", ")),
@@ -2179,9 +2379,9 @@ db { users: User[] }
         };
         // El orden de `kinds` es el del SELECT: "id" primero, después las
         // columnas declaradas, en el mismo orden que `columns`.
-        let mut kinds = vec![ColumnKind::Int];
+        let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
-        let params: Vec<Cell> = id.map(|i| vec![Cell::Int(i)]).unwrap_or_default();
+        let params: Vec<Cell> = id.map(|c| vec![c]).unwrap_or_default();
 
         let rows = self
             .backend
@@ -2401,7 +2601,7 @@ db { users: User[] }
         let mut col_list = vec!["\"id\"".to_string()];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
         let sql = format!("SELECT {} FROM \"{collection}\" WHERE {where_clause} ORDER BY \"id\"", col_list.join(", "));
-        let mut kinds = vec![ColumnKind::Int];
+        let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
             .backend
@@ -2429,7 +2629,7 @@ db { users: User[] }
             self.backend.placeholder(1),
             self.backend.placeholder(2)
         );
-        let mut kinds = vec![ColumnKind::Int];
+        let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let params = vec![Cell::Int(limit), Cell::Int(offset)];
 
@@ -2612,7 +2812,7 @@ db { users: User[] }
             other => panic!("top_row llamado con un método que Db::call no debería enrutar acá: '{other}'"),
         };
         let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{field}\" {order} LIMIT 1", col_list.join(", "));
-        let mut kinds = vec![ColumnKind::Int];
+        let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
             .backend
@@ -2638,7 +2838,8 @@ db { users: User[] }
     /// aparte antes de escribir.
     fn increment(&self, collection: &str, columns: &[ColumnPlan], args: Vec<Value>) -> Result<Value, RuntimeError> {
         let mut it = args.into_iter();
-        let id = as_int(&it.next().ok_or_else(|| RuntimeError::new("increment requiere 3 argumentos (id, selector, delta)"))?)?;
+        let id_value = it.next().ok_or_else(|| RuntimeError::new("increment requiere 3 argumentos (id, selector, delta)"))?;
+        let (id_cell, id_display) = self.id_cell_and_display(&id_value)?;
         let selector = it.next();
         let field = closure_field_name(selector.as_ref(), "a incrementar")?;
         let delta = as_int(&it.next().ok_or_else(|| RuntimeError::new("increment requiere 3 argumentos (id, selector, delta)"))?)?;
@@ -2648,14 +2849,14 @@ db { users: User[] }
         let sql = format!(
             "UPDATE \"{collection}\" SET \"{field}\" = \"{field}\" + {} WHERE \"id\" = {}",
             self.backend.placeholder(1),
-            self.backend.placeholder(2)
+            self.id_placeholder(collection, 2)
         );
-        self.backend.execute(&sql, &[Cell::Int(delta), Cell::Int(id)]).map_err(|e| write_error("increment", e))?;
+        self.backend.execute(&sql, &[Cell::Int(delta), id_cell.clone()]).map_err(|e| write_error("increment", e))?;
         let updated = self
-            .select_rows(collection, columns, Some(id))?
+            .select_rows(collection, columns, Some(id_cell))?
             .into_iter()
             .next()
-            .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con id {id} en '{collection}'")))?;
+            .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con id {id_display} en '{collection}'")))?;
         self.publish(collection, &updated);
         Ok(updated)
     }
@@ -2684,10 +2885,21 @@ db { users: User[] }
     /// campo.
     fn row_to_fields(&self, collection: &str, cells: &[Cell], columns: &[ColumnPlan]) -> Result<Vec<(String, Value)>, RuntimeError> {
         let mut out = Vec::with_capacity(columns.len() + 1);
-        let Some(Cell::Int(id)) = cells.first() else {
-            panic!("la columna 'id' es la clave primaria: siempre es un entero no nulo, y llegó {:?}", cells.first());
+        // GRAMMAR.md §3.177: `id` es `Cell::Int` para una PK autoincremento
+        // o `Cell::Text` para una PK `Uuid` -- `id_column_kind` ya le pidió
+        // al SELECT que decodifique esta columna acorde (`select_rows`), así
+        // que la forma que llega acá siempre coincide con `id_kind`.
+        let (id_field, id_display) = match (self.id_kind(collection), cells.first()) {
+            (IdKind::Int, Some(Cell::Int(n))) => (Value::Int(*n), n.to_string()),
+            (IdKind::Uuid, Some(Cell::Text(s))) => (Value::Uuid(s.clone()), s.clone()),
+            _ => panic!(
+                "la columna 'id' de '{collection}' no matchea su IdKind ({:?}): llegó {:?}",
+                self.id_kind(collection),
+                cells.first()
+            ),
         };
-        out.push(("id".to_string(), Value::Int(*id)));
+        out.push(("id".to_string(), id_field));
+        let id = &id_display;
 
         let null_but_required = |field_name: &str| {
             RuntimeError::new(format!(

@@ -773,23 +773,46 @@ impl Checker {
         }
     }
 
-    /// Toda colección de `db` necesita un campo `id: Int` requerido --
-    /// es lo que hace posible `insert(x: Omit<T,"id">)` sin romper la
-    /// forma completa de T (GRAMMAR.md §2.1): sin esta regla, `insert`
-    /// exigiendo el struct COMPLETO habría rechazado el propio demo
-    /// insignia, donde `NewUser` es deliberadamente un subconjunto de `User`.
+    /// Toda colección de `db` necesita un campo `id: Int` o `id: Uuid`
+    /// requerido -- es lo que hace posible `insert(x: Omit<T,"id">)` sin
+    /// romper la forma completa de T (GRAMMAR.md §2.1): sin esta regla,
+    /// `insert` exigiendo el struct COMPLETO habría rechazado el propio
+    /// demo insignia, donde `NewUser` es deliberadamente un subconjunto
+    /// de `User`. `id: Uuid` (GRAMMAR.md §3.177): la PK se genera del
+    /// lado de la aplicación (mismo generador que `crypto.uuid()`) en
+    /// vez de autoincremento -- pensado para adoptar una tabla existente
+    /// con `id uuid`, el bloqueo real que impedía migrar iaacademy
+    /// (GRAMMAR.md §3.176).
     fn validate_db_element_type(&self, element_ty: &Type) -> Result<(), CheckError> {
         let Type::Struct { fields, .. } = element_ty else {
             return Err(err(format!(
                 "el tipo de elemento de una colección de 'db' tiene que ser un struct, se encontró {element_ty:?}"
             )));
         };
-        if !fields.iter().any(|f| f.name == "id" && f.ty == Type::Int && !f.optional) {
+        let id_ok = fields.iter().any(|f| f.name == "id" && !f.optional && matches!(f.ty, Type::Int | Type::Uuid));
+        if !id_ok {
             return Err(err(
-                "toda colección de 'db' necesita un campo 'id: Int' requerido (no opcional, no nullable)",
+                "toda colección de 'db' necesita un campo 'id: Int' o 'id: Uuid' requerido (no opcional, no nullable)",
             ));
         }
         Ok(())
+    }
+
+    /// El tipo REAL del campo `id` de una colección ya validada por
+    /// `validate_db_element_type` -- `Int` (autoincremento) o `Uuid`
+    /// (generado del lado de la aplicación, GRAMMAR.md §3.177).
+    /// `find`/`applyPatch`/`delete`/`increment`/`pageAfter` tipan su
+    /// argumento/cursor de id contra ESTE tipo en vez de un `Type::Int`
+    /// fijo, para aceptar los dos casos con el mismo código.
+    fn db_id_type(element_ty: &Type) -> Type {
+        let Type::Struct { fields, .. } = element_ty else {
+            unreachable!("validate_db_element_type ya garantizó que element_ty sea un struct");
+        };
+        fields
+            .iter()
+            .find(|f| f.name == "id")
+            .map(|f| f.ty.clone())
+            .expect("validate_db_element_type ya garantizó que 'id' exista")
     }
 
     /// Estampa el span de LA DECLARACIÓN en cada uno de los 5 puntos de
@@ -4414,9 +4437,9 @@ impl Checker {
             }
             "find" => {
                 let [id_arg] = args else {
-                    return Err(err("'find' toma exactamente 1 argumento (id: Int)"));
+                    return Err(err("'find' toma exactamente 1 argumento (id: Int o Uuid, según la PK de la colección)"));
                 };
-                self.check_expr(id_arg, &Type::Int, env)?;
+                self.check_expr(id_arg, &Self::db_id_type(element_ty), env)?;
                 Ok(Type::Optional(Box::new(element_ty.clone())))
             }
             "insert" => {
@@ -4445,17 +4468,17 @@ impl Checker {
             }
             "applyPatch" => {
                 let [id_arg, patch_arg] = args else {
-                    return Err(err("'applyPatch' toma exactamente 2 argumentos (id: Int, patch: Patch<T>)"));
+                    return Err(err("'applyPatch' toma exactamente 2 argumentos (id: Int o Uuid, patch: Patch<T>)"));
                 };
-                self.check_expr(id_arg, &Type::Int, env)?;
+                self.check_expr(id_arg, &Self::db_id_type(element_ty), env)?;
                 self.check_expr(patch_arg, &Type::PatchOf(Box::new(element_ty.clone())), env)?;
                 Ok(element_ty.clone())
             }
             "delete" => {
                 let [id_arg] = args else {
-                    return Err(err("'delete' toma exactamente 1 argumento (id: Int)"));
+                    return Err(err("'delete' toma exactamente 1 argumento (id: Int o Uuid, según la PK de la colección)"));
                 };
-                self.check_expr(id_arg, &Type::Int, env)?;
+                self.check_expr(id_arg, &Self::db_id_type(element_ty), env)?;
                 Ok(Type::Bool)
             }
             "deleteWhere" => {
@@ -4503,6 +4526,27 @@ impl Checker {
                 let [cursor_arg, limit_arg] = args else {
                     return Err(err("'pageAfter' toma exactamente 2 argumentos (cursor: Int?, limit: Int)"));
                 };
+                // GRAMMAR.md §3.177: rechazado a propósito sobre una PK
+                // Uuid, no solo "todavía no soportado". La garantía real
+                // de pageAfter ("nunca se salta una fila insertada
+                // durante la paginación") depende de que el id crezca EN
+                // EL MISMO ORDEN que la inserción -- cierto para un
+                // autoincremento, falso para un Uuid aleatorio: una fila
+                // insertada concurrentemente con id menor al cursor
+                // actual quedaría afuera de TODA página futura de ese
+                // pase, sin ningún error que lo señale. Dejarlo pasar con
+                // orden lexicográfico habría sido "compila y corre" con
+                // una garantía documentada rota en silencio.
+                if Self::db_id_type(element_ty) == Type::Uuid {
+                    return Err(err(
+                        "'pageAfter' no está soportado sobre una colección con 'id: Uuid' -- su garantía de que \
+                         nunca se salta una fila insertada durante la paginación depende de que el id crezca en \
+                         el mismo orden que la inserción (autoincremento); un Uuid aleatorio no tiene ese orden, \
+                         así que una fila insertada concurrentemente con id menor al cursor actual quedaría \
+                         afuera de toda página futura, en silencio. Usá 'page' (offset), que no depende de ese \
+                         orden, o un campo propio de fecha/secuencia para paginación estable",
+                    ));
+                }
                 self.check_expr(cursor_arg, &Type::Optional(Box::new(Type::Int)), env)?;
                 self.check_expr(limit_arg, &Type::Int, env)?;
                 Ok(Type::List(Box::new(element_ty.clone())))
@@ -4847,9 +4891,11 @@ impl Checker {
     /// `applyPatch`.
     fn check_increment(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
         let [id_arg, selector_arg, delta_arg] = args else {
-            return Err(err(format!("'{method}' toma exactamente 3 argumentos (id: Int, selector: |item: T| item.campo, delta: Int)")));
+            return Err(err(format!(
+                "'{method}' toma exactamente 3 argumentos (id: Int o Uuid, selector: |item: T| item.campo, delta: Int)"
+            )));
         };
-        self.check_expr(id_arg, &Type::Int, env)?;
+        self.check_expr(id_arg, &Self::db_id_type(element_ty), env)?;
         let (field_name, field_ty) = self.field_selector(element_ty, selector_arg, method, "a incrementar")?;
         if !matches!(field_ty, Type::Int) {
             return Err(err(format!(
@@ -5978,6 +6024,83 @@ type T = { id: Int, s: Status }")
         "#;
         let result = check_source(src);
         assert!(result.is_err(), "toda colección de db necesita un campo 'id: Int'");
+    }
+
+    // ---- `id: Uuid` como PK alternativa (GRAMMAR.md §3.177) ----
+
+    #[test]
+    fn db_collection_with_uuid_id_field_is_accepted() {
+        let src = r#"
+            type Lead = { id: Uuid, email: String }
+            db { leads: Lead[] }
+            fn one(id: Uuid) -> Lead? { db.leads.find(id) }
+        "#;
+        assert!(check_source(src).is_ok(), "'id: Uuid' tiene que ser una PK válida, igual que 'id: Int'");
+    }
+
+    #[test]
+    fn db_find_on_a_uuid_pk_collection_rejects_an_int_argument() {
+        let src = r#"
+            type Lead = { id: Uuid, email: String }
+            db { leads: Lead[] }
+            fn one(n: Int) -> Lead? { db.leads.find(n) }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        assert!(!errors.is_empty(), "un Int no puede ser el id de una colección con PK Uuid");
+    }
+
+    #[test]
+    fn db_find_on_an_int_pk_collection_still_rejects_a_uuid_argument() {
+        let src = r#"
+            type Post = { id: Int, title: String }
+            db { posts: Post[] }
+            fn one(u: Uuid) -> Post? { db.posts.find(u) }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        assert!(!errors.is_empty(), "un Uuid no puede ser el id de una colección con PK Int -- el camino de siempre no debe aflojar");
+    }
+
+    #[test]
+    fn db_apply_patch_delete_and_increment_accept_a_uuid_id_on_a_uuid_pk_collection() {
+        let src = r#"
+            type Lead = { id: Uuid, score: Int }
+            db { leads: Lead[] }
+            fn patch(id: Uuid, p: Patch<Lead>) -> Lead { db.leads.applyPatch(id, p) }
+            fn del(id: Uuid) -> Bool { db.leads.delete(id) }
+            fn bump(id: Uuid) -> Lead { db.leads.increment(id, |l: Lead| { l.score }, 1) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn page_after_is_rejected_on_a_uuid_pk_collection_with_a_clear_message() {
+        // GRAMMAR.md §3.177: rechazado a propósito, no "todavía no
+        // soportado" -- la garantía de pageAfter depende de que el id
+        // crezca en el mismo orden que la inserción, falso para un Uuid
+        // aleatorio.
+        let src = r#"
+            type Lead = { id: Uuid, email: String }
+            db { leads: Lead[] }
+            fn page() -> Lead[] { db.leads.pageAfter(null, 10) }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        assert!(!errors.is_empty());
+        let msg = errors[0].to_string();
+        assert!(msg.contains("pageAfter") && msg.contains("Uuid"), "{msg}");
+    }
+
+    #[test]
+    fn insert_on_a_uuid_pk_collection_still_omits_id_from_the_insertable_shape() {
+        // `Omit<T,"id">` (omit_id_field) es por NOMBRE, no por tipo -- este
+        // test confirma que sigue funcionando igual cuando ese campo
+        // omitido es 'Uuid' en vez de 'Int'.
+        let src = r#"
+            type Lead = { id: Uuid, email: String }
+            type NewLead = { email: String }
+            db { leads: Lead[] }
+            fn create(email: String) -> Lead { db.leads.insert(NewLead { email: email }) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
     }
 
     #[test]

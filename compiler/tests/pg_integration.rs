@@ -1241,6 +1241,164 @@ service Items {{
     assert_eq!(listed.as_array().map(|a| a.len()), Some(1), "list() también decodifica el id de 32 bits");
 }
 
+// ---- `id: Uuid` como PK alternativa (GRAMMAR.md §3.177) ----
+
+fn uuid_pk_link_source(collection: &str) -> String {
+    format!(
+        r#"
+type Lead = {{ id: Uuid, email: String, score: Int }}
+type NewLead = {{ email: String, score: Int }}
+db {{ {collection}: Lead[] }}
+service Leads {{
+  rpc create(email: String, score: Int) -> Lead {{ db.{collection}.insert(NewLead {{ email: email, score: score }}) }}
+  rpc get(id: Uuid) -> Lead? {{ db.{collection}.find(id) }}
+  rpc list() -> Lead[] {{ db.{collection}.all() }}
+  rpc update(id: Uuid, patch: Patch<Lead>) -> Lead {{ db.{collection}.applyPatch(id, patch) }}
+  rpc remove(id: Uuid) -> Bool {{ db.{collection}.delete(id) }}
+}}
+"#
+    )
+}
+
+#[test]
+fn uuid_pk_collection_supports_the_full_crud_cycle_against_a_fresh_postgres_table() {
+    // GRAMMAR.md §3.177, camino NO adoptado: `linkc serve` crea la tabla
+    // por su cuenta, con el tipo NATIVO `UUID` de Postgres para "id"
+    // (`create_postgres_table_sql`) -- confirma que el cast `::uuid`
+    // explícito que `Db::id_placeholder` agrega funciona de punta a punta
+    // contra el driver Postgres real (`postgres` crate, sin el feature
+    // `with-uuid-1`), no solo en la teoría del protocolo binario.
+    const COLLECTION: &str = "leads_uuid_pk_fresh";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("uuid-pk-fresh");
+    let src = temp.write("app.link", &uuid_pk_link_source(COLLECTION));
+    let server = Serve::start(&src, &url);
+
+    let created = server.rpc("Leads/create", r#"{"email":"a@example.com","score":3}"#);
+    let id = created["id"].as_str().expect("insert devuelve un id Uuid real, no un error de decodificación").to_string();
+    assert_eq!(id.len(), 36, "{created:?}");
+
+    let fetched = server.rpc("Leads/get", &format!(r#"{{"id":"{id}"}}"#));
+    assert_eq!(fetched["email"], "a@example.com", "find por el mismo uuid encuentra la fila real");
+
+    let updated = server.rpc("Leads/update", &format!(r#"{{"id":"{id}","patch":{{"score":9}}}}"#));
+    assert_eq!(updated["score"], 9);
+    assert_eq!(updated["id"], id, "applyPatch nunca cambia el id");
+
+    let listed = server.rpc("Leads/list", "{}");
+    assert_eq!(listed.as_array().map(|a| a.len()), Some(1));
+
+    let removed = server.rpc("Leads/remove", &format!(r#"{{"id":"{id}"}}"#));
+    assert_eq!(removed, true);
+    let gone = server.rpc("Leads/get", &format!(r#"{{"id":"{id}"}}"#));
+    assert!(gone.is_null(), "borrada de verdad: {gone:?}");
+}
+
+#[test]
+fn adopt_existing_uuid_pk_table_supports_the_full_crud_cycle_against_a_real_postgres_table() {
+    // El caso REAL que motiva GRAMMAR.md §3.177 -- reporte de adopción de
+    // iaacademy (vía skynet-43): tablas de producción YA EXISTENTES con
+    // "id uuid DEFAULT gen_random_uuid()", que `linkc serve --adopt-existing`
+    // nunca podía usar (rechazadas al conectar, GRAMMAR.md §3.36/§3.59).
+    // Crea la tabla A MANO (simulando la que ya existía en producción,
+    // generación de id por DEFAULT de Postgres incluida) y confirma que
+    // c-script -- que SIEMPRE genera su propio id del lado de la
+    // aplicación, nunca depende de ese DEFAULT -- puede leerla y escribirla
+    // de punta a punta sin migrar nada.
+    const COLLECTION: &str = "leads_uuid_pk_adopted";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                \"email\" TEXT NOT NULL, \
+                \"score\" BIGINT NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla preexistente con id uuid + DEFAULT gen_random_uuid(), como la produce otro backend");
+
+    let temp = TempDir::new("uuid-pk-adopted");
+    let src = temp.write("app.link", &uuid_pk_link_source(COLLECTION));
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+
+    let created = server.rpc("Leads/create", r#"{"email":"b@example.com","score":1}"#);
+    let id = created["id"].as_str().expect("insert devuelve un id Uuid real contra la tabla adoptada").to_string();
+    assert_eq!(id.len(), 36, "{created:?}");
+
+    let fetched = server.rpc("Leads/get", &format!(r#"{{"id":"{id}"}}"#));
+    assert_eq!(fetched["email"], "b@example.com");
+
+    // Confirma en SQL crudo que el id que c-script generó -- NO el
+    // DEFAULT de la columna, que nunca se ejercita en este camino -- es
+    // el que de verdad quedó en la fila.
+    let mut check_client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar de nuevo, por fuera de c-script");
+    let row = check_client
+        .query_one(&format!("SELECT \"id\"::text, \"email\" FROM \"{COLLECTION}\""), &[])
+        .expect("leer la fila insertada con SQL crudo");
+    let raw_id: String = row.get(0);
+    assert_eq!(raw_id, id, "el id que insertó c-script es un uuid REAL de la columna nativa, legible con SQL común");
+
+    let removed = server.rpc("Leads/remove", &format!(r#"{{"id":"{id}"}}"#));
+    assert_eq!(removed, true);
+}
+
+#[test]
+fn migrate_dry_run_reports_no_changes_for_an_existing_native_uuid_pk_table() {
+    // Antes de GRAMMAR.md §3.177, esta misma tabla hacía que `migrate
+    // --dry-run` reportara "¡ESTO FALLARÍA AL CONECTAR DE VERDAD!" (ver
+    // `a_preexisting_table_with_a_non_integer_id_fails_at_connect_not_at_first_insert`,
+    // que sigue siendo el comportamiento correcto para un .link que declara
+    // 'id: Int' contra esta misma tabla -- acá el .link declara 'id: Uuid',
+    // que SÍ es compatible).
+    const COLLECTION: &str = "leads_uuid_pk_dry_run";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                \"email\" TEXT NOT NULL, \
+                \"score\" BIGINT NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla preexistente con id uuid a mano");
+
+    let temp = TempDir::new("uuid-pk-dry-run");
+    let src = temp.write("app.link", &uuid_pk_link_source(COLLECTION));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("migrate")
+        .arg(&src)
+        .arg("--db")
+        .arg(&url)
+        .arg("--dry-run")
+        .output()
+        .expect("ejecutar linkc migrate --dry-run");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(!report.contains("FALLARÍA"), "una PK Uuid contra una columna uuid nativa es compatible, no un rechazo: {report}");
+    assert!(report.contains("Nada que migrar"), "{report}");
+}
+
 #[test]
 fn a_bad_connection_url_fails_with_a_message_instead_of_a_panic() {
     // Este no necesita base: prueba justamente el camino en que no hay ninguna.
@@ -1807,15 +1965,13 @@ fn introspect_warns_about_columns_it_cannot_map_with_confidence() {
 }
 
 #[test]
-fn introspect_warns_when_the_id_primary_key_is_not_actually_an_integer() {
-    // Reporte real de adopción (iaacademy, vía sesión skynet-43, 2026-08-29):
-    // una tabla con `id uuid DEFAULT gen_random_uuid()` PRIMARY KEY generaba
-    // `id: Int` sin ninguna advertencia -- el mapeo por NOMBRE de columna
-    // ("se llama id") pisaba por completo el mapeo por TIPO que sí advierte
-    // sobre `uuid` en cualquier otra columna. `linkc serve`/`migrate
-    // --dry-run` rechazan la tabla igual al conectar (§3.36), pero recién ahí
-    // -- después de ya haber escrito un .link entero alrededor de un
-    // `id: Int` que nunca fue real.
+fn introspect_emits_id_uuid_for_a_native_uuid_primary_key_with_no_warning() {
+    // Reporte real de adopción (iaacademy, vía sesión skynet-43, 2026-08-29)
+    // + GRAMMAR.md §3.177 (soporte real de `id: Uuid` como PK): una tabla
+    // con `id uuid` PRIMARY KEY ahora es un mapeo EXACTO, sin advertencia --
+    // antes de §3.177, generaba `id: Int` (v1.132.0 agregó una advertencia
+    // ahí; esta ronda reemplaza ese placeholder por el tipo real, ahora que
+    // c-script sabe adoptar esa forma de PK de punta a punta).
     const COLLECTION: &str = "legacy_leads";
     let Some(url) = pg_url() else {
         eprintln!("saltado: LINK_TEST_PG_URL no está definida");
@@ -1840,11 +1996,44 @@ fn introspect_warns_when_the_id_primary_key_is_not_actually_an_integer() {
     let generated = String::from_utf8_lossy(&output.stdout).to_string();
     let warnings = String::from_utf8_lossy(&output.stderr).to_string();
 
-    // Sigue emitiendo el placeholder de siempre (nunca omite la columna)...
+    assert!(generated.contains("id: Uuid,"), "{generated}");
+    assert!(warnings.is_empty(), "no debería haber ninguna advertencia sobre 'id': {warnings}");
+}
+
+#[test]
+fn introspect_still_warns_when_the_id_primary_key_is_neither_integer_nor_native_uuid() {
+    // Una PK "id" de un tipo que c-script no sabe adoptar como PK todavía
+    // (ni entero ni uuid nativo -- acá, TEXT, el caso de un backend legacy
+    // que guardaba un UUID como string plano) sigue emitiendo el placeholder
+    // `id: Int` de siempre, con una advertencia -- distinto del caso `uuid`
+    // nativo de arriba, que GRAMMAR.md §3.177 sí soporta de punta a punta.
+    const COLLECTION: &str = "legacy_orders";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" TEXT PRIMARY KEY, \
+                \"total\" BIGINT NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla con PK text a mano");
+
+    let output =
+        Command::new(env!("CARGO_BIN_EXE_linkc")).arg("introspect").arg(&url).output().expect("ejecutar linkc introspect");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let generated = String::from_utf8_lossy(&output.stdout).to_string();
+    let warnings = String::from_utf8_lossy(&output.stderr).to_string();
+
     assert!(generated.contains("id: Int,"), "{generated}");
-    // ...pero ahora avisa que ese placeholder es engañoso para esta tabla.
     assert!(
-        warnings.contains(COLLECTION) && warnings.contains("\"id\"") && warnings.to_lowercase().contains("uuid"),
+        warnings.contains(COLLECTION) && warnings.contains("\"id\"") && warnings.to_lowercase().contains("text"),
         "stderr: {warnings}"
     );
 }

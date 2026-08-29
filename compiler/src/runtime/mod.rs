@@ -1673,6 +1673,26 @@ fn os_random_bytes(n: usize) -> Result<Vec<u8>, RuntimeError> {
     Ok(buf)
 }
 
+/// UUIDv4 de verdad: 122 bits del CSPRNG del sistema (`os_random_bytes`).
+/// Antes era SHA-256 del reloj disfrazado de v4 -- dos llamadas en el
+/// mismo nanosegundo devolvían el mismo "identificador único". Extraído
+/// de `crypto.uuid()` (GRAMMAR.md §3.70) para que `runtime/db.rs` lo
+/// reuse también al generar la PK de una fila nueva en una colección con
+/// `id: Uuid` (GRAMMAR.md §3.177) -- mismo generador, un solo lugar que
+/// conoce el layout de bytes de un UUIDv4, nunca una segunda copia que
+/// pueda desalinearse de esta.
+pub(crate) fn generate_uuid_v4() -> Result<String, RuntimeError> {
+    let b = os_random_bytes(16)?;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3],
+        b[4], b[5],
+        b[6] & 0x0f, b[7],
+        (b[8] & 0x3f) | 0x80, b[9],
+        b[10], b[11], b[12], b[13], b[14], b[15]
+    ))
+}
+
 /// `UriEncode()` exacto de AWS Signature V4 (GRAMMAR.md §3.110, spec en
 /// docs.aws.amazon.com/general/latest/gr/sigv4-signed-request-examples.html):
 /// cada BYTE (no cada carácter -- un caracter UTF-8 multibyte se codifica
@@ -2121,14 +2141,19 @@ fn call_method(
                         let Value::Struct(row_fields) = &row else {
                             return Err(err("'upsert': la fila existente no es un struct"));
                         };
-                        let Some((_, Value::Int(id))) = row_fields.iter().find(|(n, _)| n == "id") else {
+                        // GRAMMAR.md §3.177: `id` puede ser `Value::Int` o
+                        // `Value::Uuid` según la PK de la colección --
+                        // `applyPatch` (checker.rs::check_db_method) ya
+                        // acepta los dos, así que acá alcanza con pasar el
+                        // `Value` de id tal cual, sin desenvolverlo a i64.
+                        let Some((_, id_value)) = row_fields.iter().find(|(n, _)| n == "id") else {
                             return Err(err("'upsert': la fila existente no tiene 'id'"));
                         };
-                        let id = *id;
+                        let id_value = id_value.clone();
                         let new_value =
                             call_callable(update_fn, vec![row], db, fns, checker, sessions, current_token, step_budget)?;
                         let new_value = augment_with_auto_update_fields(&coll, checker, new_value);
-                        db.call(&coll, "applyPatch", vec![Value::Int(id), new_value])
+                        db.call(&coll, "applyPatch", vec![id_value, new_value])
                     }
                     None => db.call(&coll, "insert", vec![insert_value]),
                 }
@@ -2515,21 +2540,7 @@ fn call_method(
                 // que ni siquiera `verifyPassword` va a reconocer.
                 Ok(Value::Bool(hash.starts_with("sha256$")))
             }
-            "uuid" => {
-                // UUIDv4 de verdad: 122 bits del CSPRNG del sistema. Antes era
-                // SHA-256 del reloj disfrazado de v4 -- dos llamadas en el mismo
-                // nanosegundo devolvían el mismo "identificador único".
-                let b = os_random_bytes(16)?;
-                let s = format!(
-                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-4{:01x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                    b[0], b[1], b[2], b[3],
-                    b[4], b[5],
-                    b[6] & 0x0f, b[7],
-                    (b[8] & 0x3f) | 0x80, b[9],
-                    b[10], b[11], b[12], b[13], b[14], b[15]
-                );
-                Ok(Value::Uuid(s))
-            }
+            "uuid" => Ok(Value::Uuid(generate_uuid_v4()?)),
             "randomInt" => {
                 let (min, max) = match (args.first(), args.get(1)) {
                     (Some(Value::Int(a)), Some(Value::Int(b))) => (*a, *b),
@@ -4947,6 +4958,128 @@ mod tests {
         let id = created["id"].as_i64().unwrap();
         let fetched = invoke_rpc(&program, "S", "get", &json!({"id": id}), &db).unwrap();
         assert_eq!(fetched["token"], json!(token), "el mismo uuid vuelve identico al leerlo de la base");
+    }
+
+    // ---- `id: Uuid` como PK alternativa (GRAMMAR.md §3.177) ----
+
+    /// El ciclo completo -- insert/find/applyPatch/increment/delete -- sobre
+    /// una colección cuya PK es `Uuid`, no `Int`. `insert` nunca recibe un
+    /// id (`Omit<T,"id">`, igual que siempre) -- lo genera el runtime del
+    /// lado de la app, mismo generador que `crypto.uuid()`.
+    #[test]
+    fn uuid_pk_collection_supports_the_full_crud_cycle_against_real_sqlite() {
+        let program = program_from(
+            r#"
+            type Lead = { id: Uuid, email: String, score: Int }
+            type NewLead = { email: String, score: Int }
+            db { leads: Lead[] }
+            service Leads {
+                rpc create(email: String) -> Lead { db.leads.insert(NewLead { email: email, score: 0 }) }
+                rpc get(id: Uuid) -> Lead? { db.leads.find(id) }
+                rpc patch(id: Uuid, p: Patch<Lead>) -> Lead { db.leads.applyPatch(id, p) }
+                rpc bump(id: Uuid) -> Lead { db.leads.increment(id, |l: Lead| { l.score }, 5) }
+                rpc remove(id: Uuid) -> Bool { db.leads.delete(id) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        let created = invoke_rpc(&program, "Leads", "create", &json!({"email": "a@example.com"}), &db).unwrap();
+        let id = created["id"].as_str().expect("id generado, con forma de uuid").to_string();
+        assert_eq!(id.len(), 36, "id: {id}");
+        assert_eq!(created["score"], json!(0));
+
+        let fetched = invoke_rpc(&program, "Leads", "get", &json!({"id": id}), &db).unwrap();
+        assert_eq!(fetched["email"], json!("a@example.com"), "find por el mismo uuid encuentra la fila real");
+
+        let patched = invoke_rpc(&program, "Leads", "patch", &json!({"id": id, "p": {"email": "b@example.com"}}), &db).unwrap();
+        assert_eq!(patched["email"], json!("b@example.com"));
+        assert_eq!(patched["id"], json!(id), "applyPatch nunca cambia el id");
+
+        let bumped = invoke_rpc(&program, "Leads", "bump", &json!({"id": id}), &db).unwrap();
+        assert_eq!(bumped["score"], json!(5), "increment sobre un campo Int de una colección con PK Uuid");
+
+        let removed = invoke_rpc(&program, "Leads", "remove", &json!({"id": id}), &db).unwrap();
+        assert_eq!(removed, json!(true));
+        let gone = invoke_rpc(&program, "Leads", "get", &json!({"id": id}), &db).unwrap();
+        assert_eq!(gone, serde_json::Value::Null, "borrada de verdad, find ya no la encuentra");
+
+        // Dos inserts seguidos nunca chocan de id -- confirma que cada
+        // `insert` genera un uuid FRESCO (CSPRNG real, no un contador).
+        let a = invoke_rpc(&program, "Leads", "create", &json!({"email": "x@example.com"}), &db).unwrap();
+        let b = invoke_rpc(&program, "Leads", "create", &json!({"email": "y@example.com"}), &db).unwrap();
+        assert_ne!(a["id"], b["id"]);
+    }
+
+    /// `upsert` sobre una colección con PK `Uuid` -- las dos ramas (insert
+    /// cuando no matchea, update en el lugar cuando sí) tienen que generar/
+    /// preservar un id `Uuid` real, nunca un `Value::Int` (el bug real que
+    /// este test hubiera atrapado: `upsert` desenvolvía `Value::Int`
+    /// directo del id de la fila existente antes de esta ronda).
+    #[test]
+    fn upsert_works_on_a_uuid_pk_collection_for_both_branches() {
+        let program = program_from(
+            r#"
+            type Counter = { id: Uuid, name: String, count: Int }
+            type NewCounter = { name: String, count: Int }
+            db { counters: Counter[] }
+            service S {
+                rpc bump(name: String) -> Counter {
+                    db.counters.upsert(
+                        |c: Counter| { c.name == name },
+                        NewCounter { name: name, count: 1 },
+                        |c: Counter| { NewCounter { name: c.name, count: c.count + 1 } }
+                    )
+                }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let created = invoke_rpc(&program, "S", "bump", &json!({"name": "clics"}), &db).unwrap();
+        assert_eq!(created["count"], json!(1));
+        let created_id = created["id"].as_str().expect("id uuid").to_string();
+        assert_eq!(created_id.len(), 36);
+
+        let updated = invoke_rpc(&program, "S", "bump", &json!({"name": "clics"}), &db).unwrap();
+        assert_eq!(updated["count"], json!(2), "la segunda llamada actualiza la MISMA fila, no inserta otra");
+        assert_eq!(updated["id"], json!(created_id), "upsert nunca cambia el id de la fila que actualiza");
+    }
+
+    /// `page`/`maxRow`/`minRow` sobre una colección con PK `Uuid` -- ninguno
+    /// de los tres ordena/filtra por `id`, pero los tres SELECCIONAN la
+    /// columna `"id"` como parte de la fila completa, así que decodificarla
+    /// con el `ColumnKind` equivocado (`select_rows_page`/`top_row`,
+    /// encontrado real vía el test de arriba de `upsert`, mismo bug en dos
+    /// lugares más) rompía estos tres métodos también.
+    #[test]
+    fn page_and_max_min_row_work_on_a_uuid_pk_collection() {
+        let program = program_from(
+            r#"
+            type Lead = { id: Uuid, email: String, score: Int }
+            type NewLead = { email: String, score: Int }
+            db { leads: Lead[] }
+            service Leads {
+                rpc create(email: String, score: Int) -> Lead { db.leads.insert(NewLead { email: email, score: score }) }
+                rpc list(limit: Int, offset: Int) -> Lead[] { db.leads.page(limit, offset) }
+                rpc top() -> Lead? { db.leads.maxRow(|l: Lead| { l.score }) }
+                rpc bottom() -> Lead? { db.leads.minRow(|l: Lead| { l.score }) }
+            }
+        "#,
+        );
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        invoke_rpc(&program, "Leads", "create", &json!({"email": "a@example.com", "score": 3}), &db).unwrap();
+        invoke_rpc(&program, "Leads", "create", &json!({"email": "b@example.com", "score": 9}), &db).unwrap();
+
+        let page = invoke_rpc(&program, "Leads", "list", &json!({"limit": 10, "offset": 0}), &db).unwrap();
+        assert_eq!(page.as_array().unwrap().len(), 2);
+        for row in page.as_array().unwrap() {
+            assert!(row["id"].as_str().map(|s| s.len() == 36).unwrap_or(false), "{row:?}");
+        }
+
+        let top = invoke_rpc(&program, "Leads", "top", &json!({}), &db).unwrap();
+        assert_eq!(top["score"], json!(9));
+        let bottom = invoke_rpc(&program, "Leads", "bottom", &json!({}), &db).unwrap();
+        assert_eq!(bottom["score"], json!(3));
     }
 
     // ---- `crypto.awsS3PresignedUrl` (GRAMMAR.md §3.110) ----
@@ -8363,6 +8496,36 @@ mod tests {
         let items = db_evolved.call("items", "all", vec![]).unwrap();
         let Value::List(rows) = items else { panic!("se esperaba lista"); };
         assert_eq!(rows.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// GRAMMAR.md §3.177: reabrir un archivo SQLite con una colección de PK
+    /// `Uuid` tiene que pasar `check_schema_matches` -- la fila `TEXT NOT
+    /// NULL` esperada para `"id"` en esa rama, exactamente igual que
+    /// `INTEGER` para una PK `Int` de siempre. Sin este test, la rama
+    /// `IdKind::Uuid` de `check_schema_matches` solo se ejercitaba en la
+    /// PRIMERA apertura (tabla vacía, `existing.is_empty()` corta antes de
+    /// comparar) -- nunca en un reinicio real contra un archivo ya escrito.
+    #[test]
+    fn reopening_a_uuid_pk_collection_matches_its_own_schema_and_keeps_the_row() {
+        let path = std::env::temp_dir().join("c_script_test_uuid_pk_reopen.db");
+        let _ = std::fs::remove_file(&path);
+
+        let program = program_from("type Lead = { id: Uuid, email: String } db { leads: Lead[] }");
+        let generated_id = {
+            let db = Db::new(&program, &path);
+            let inserted =
+                db.call("leads", "insert", vec![Value::Struct(vec![("email".into(), Value::Str("a@example.com".into()))])]).unwrap();
+            let Value::Struct(fields) = inserted else { panic!("se esperaba struct") };
+            let Some((_, Value::Uuid(id))) = fields.into_iter().find(|(n, _)| n == "id") else { panic!("se esperaba id: Uuid") };
+            id
+        };
+
+        // Reabrir el MISMO archivo -- `check_schema_matches` corre contra
+        // una tabla ya poblada esta vez, no una recién creada.
+        let db2 = Db::new(&program, &path);
+        let found = db2.call("leads", "find", vec![Value::Uuid(generated_id.clone())]).unwrap();
+        assert_ne!(found, Value::Null, "la fila insertada antes de reabrir sigue ahí, con el mismo id");
         let _ = std::fs::remove_file(&path);
     }
 

@@ -65,12 +65,27 @@ fn postgres_column_type(field: &FieldType, simple_enums: &HashSet<String>) -> &'
 /// columna.
 pub fn create_postgres_table_sql(
     collection: &str,
+    id_field_ty: &Type,
     fields: &[FieldType],
     simple_enums: &HashSet<String>,
     checks: &[(String, FieldCheck)],
     type_checks: &[String],
 ) -> String {
-    let mut cols = vec!["\"id\" BIGSERIAL PRIMARY KEY".to_string()];
+    // GRAMMAR.md §3.177: una PK `Uuid` usa el tipo NATIVO `UUID` de
+    // Postgres (a diferencia de un campo `Uuid` normal, que sigue
+    // mapeando a `TEXT` -- ver `link_to_postgres_type` -- porque acá SÍ
+    // hace falta poder adoptar una tabla existente cuya columna real ya
+    // es `uuid` nativo, el caso real que motiva esto). Sin
+    // `DEFAULT gen_random_uuid()`: c-script genera el valor del lado de
+    // la aplicación en CADA insert (`runtime/db.rs::Db::call`, "insert"),
+    // nunca depende de un default de columna -- agregarlo solo sumaría
+    // un requisito de versión (PostgreSQL 13+) sin ningún beneficio para
+    // el camino real, así que se deja afuera a propósito.
+    let id_def = match id_field_ty {
+        Type::Uuid => "\"id\" UUID PRIMARY KEY".to_string(),
+        _ => "\"id\" BIGSERIAL PRIMARY KEY".to_string(),
+    };
+    let mut cols = vec![id_def];
 
     for f in fields {
         let pg_type = postgres_column_type(f, simple_enums);
@@ -125,9 +140,10 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
     for (coll_name, elem_ty) in checker.db_collections() {
         if let Type::Struct { fields, .. } = elem_ty {
             let non_id_fields: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
+            let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
             let checks = checks_by_collection.get(coll_name).unwrap_or(&empty_checks);
             let type_checks = type_checks_by_collection.get(coll_name).unwrap_or(&empty_type_checks);
-            let sql = create_postgres_table_sql(coll_name, &non_id_fields, &simple_enums, checks, type_checks);
+            let sql = create_postgres_table_sql(coll_name, id_field_ty, &non_id_fields, &simple_enums, checks, type_checks);
             statements.push(sql);
         }
     }
