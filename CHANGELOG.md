@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.133.1] - 2026-08-29
+
+### 🔧 Proceso
+**v1.133.0 quedó con CI en rojo** -- el intento inicial de resolver el bind de un id `Uuid` contra una columna Postgres NATIVA `uuid` fue un cast SQL explícito (`$1::uuid` en vez de `$1`), asumiendo que forzaría al servidor a inferir el parámetro como texto. Verificado FALSO contra Postgres real en CI, no en teoría: el servidor sigue infiriendo el tipo desde la columna destino sin importar el cast, así que el mismatch de wire binario seguía pasando (`ERROR: incorrect binary data format in bind parameter 1`).
+
+El arreglo real: `Cell::to_sql` (`runtime/store.rs`) ahora detecta cuándo el servidor pide de verdad el tipo `uuid` y decodifica la forma canónica de 36 caracteres a sus 16 bytes binarios crudos a mano (`uuid_string_to_binary`) en vez de mandar el texto tal cual -- sin sumar la dependencia opcional `with-uuid-1`. La lectura tiene el mismo problema simétrico, resuelto igual (`ColumnKind::Uuid` nuevo, `PgUuidText`/`postgres_cell`). El cast `::uuid` -- que no hacía nada -- se sacó del todo.
+
+De paso, un test de `introspect` nuevo (v1.133.0) resultó frágil contra la base compartida de tests en paralelo -- corregido para chequear solo advertencias de SU propia tabla, no el stderr entero.
+
+**Verificado en CI contra Postgres real** -- las 3 pruebas de `pg_integration.rs` que v1.133.0 no llegó a pasar (fresco, `--adopt-existing` contra una tabla armada a mano igual a la de iaacademy, `introspect`) ahora sí. Suite completa sin regresiones.
+
 ## [1.133.0] - 2026-08-29
 
 ### ✨ Nuevo
@@ -19,13 +30,13 @@ service Leads {
 ```
 
 - La PK se genera SIEMPRE del lado de la aplicación (mismo generador que `crypto.uuid()`), nunca depende de `DEFAULT`/`RETURNING`/`last_insert_rowid()` -- es lo que hace posible adoptar una tabla existente sin tocarla.
-- SQLite: `TEXT PRIMARY KEY NOT NULL`. Postgres: tipo nativo `UUID PRIMARY KEY`, con un cast `::uuid` explícito en cada bind (sin sumar la dependencia `with-uuid-1` a la crate `postgres`) -- verificado contra una tabla adoptada de verdad con columna `uuid` nativa.
+- SQLite: `TEXT PRIMARY KEY NOT NULL`. Postgres: tipo nativo `UUID PRIMARY KEY` -- ver v1.133.1 para cómo el bind/lectura contra ese tipo nativo termina funcionando de verdad.
 - `find`/`applyPatch`/`delete`/`increment`/`insert`/`upsert`/`page`/`maxRow`/`minRow` funcionan igual que con `id: Int`. `pageAfter` queda RECHAZADO a propósito sobre una PK Uuid -- su garantía de no saltear filas concurrentes depende de que el id crezca en el mismo orden que la inserción, falso para un UUID aleatorio.
 - `linkc introspect` ahora emite `id: Uuid` directo (sin advertencia) para una PK `uuid` nativa; `linkc migrate --dry-run`/`--adopt-existing` la reconocen como compatible.
 
 **Bug real encontrado en el camino** (atrapado por el test de `upsert`, vía su pushdown de predicado): `find_where_conjunction`/`select_rows_page`/`top_row` (`runtime/db.rs`) tenían el mismo `ColumnKind::Int` hardcodeado para decodificar la columna `"id"` que `select_rows` ya tenía -- sin el fix, `findWhere`/`page`/`maxRow`/`minRow` sobre una colección Uuid rompían con un error de decodificación.
 
-**Verificado**: 6 tests de checker + 5 contra SQLite real + 3 contra un PostgreSQL real (fresco, `--adopt-existing` contra una tabla armada a mano igual a la de iaacademy, y `migrate --dry-run`). Suite completa sin regresiones (1316 tests locales, +14 sobre v1.132.0). Ver GRAMMAR.md §3.177.
+**Verificado localmente**: 6 tests de checker + 5 contra SQLite real. Suite local sin regresiones (1316 tests, +14 sobre v1.132.0) -- pero CI contra Postgres real quedó en rojo, ver v1.133.1. Ver GRAMMAR.md §3.177.
 
 ## [1.132.0] - 2026-08-29
 

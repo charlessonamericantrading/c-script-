@@ -106,11 +106,12 @@ impl ColumnPlan {
 }
 
 /// GRAMMAR.md §3.177: qué tipo es la PK de una colección -- deriva todo
-/// lo demás que cambia entre las dos formas (columna DDL INTEGER
+/// lo demás que cambia entre las dos formas: columna DDL INTEGER
 /// AUTOINCREMENT/BIGSERIAL vs TEXT/UUID, generación por autoincremento
-/// del motor vs generada del lado de la app antes del INSERT, y el cast
-/// `::uuid` explícito que Postgres necesita para bindear un valor de
-/// texto contra una columna `uuid` nativa -- ver `Db::id_placeholder`).
+/// del motor vs generada del lado de la app antes del INSERT, y el
+/// `ColumnKind` con el que se lee/escribe la columna `"id"`
+/// (`ColumnKind::Uuid`, distinto de `Text`, solo para esta PK -- ver
+/// `store.rs::Cell::to_sql`/`postgres_cell` para el porqué).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IdKind {
     Int,
@@ -768,14 +769,14 @@ pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str, e
     };
     // GRAMMAR.md §3.177: `id: Uuid` solo acepta una columna Postgres
     // NATIVA `uuid` -- no `text`/`varchar`, aunque guarden un UUID con
-    // forma válida. Es un scope deliberado, no un descuido: el bind de
-    // un parámetro contra esta columna (`Db::id_placeholder`) siempre
-    // agrega un cast `::uuid` explícito, que solo hace falta -- y solo
-    // es correcto -- cuando la columna real es `uuid` nativo. Aceptar
-    // también `text` acá abriría la puerta a un cast innecesario contra
-    // una columna que nunca lo necesitó, sin ningún caso real verificado
-    // que lo pida todavía (el motivador, iaacademy, tiene columnas
-    // genuinamente `uuid`).
+    // forma válida. Es un scope deliberado, no un descuido: el bind/la
+    // lectura de esta columna (`Cell::to_sql`/`postgres_cell`, store.rs)
+    // dan por sentado el formato BINARIO real de `uuid` (16 bytes), que
+    // solo es correcto contra una columna genuinamente `uuid`. Aceptar
+    // también `text` acá rompería esa lectura/escritura contra una
+    // columna que en realidad guarda texto plano, sin ningún caso real
+    // verificado que lo pida todavía (el motivador, iaacademy, tiene
+    // columnas genuinamente `uuid`).
     let ok = match expected {
         IdKind::Int => matches!(data_type.as_str(), "bigint" | "integer" | "smallint"),
         IdKind::Uuid => data_type == "uuid",
@@ -1856,20 +1857,7 @@ db { users: User[] }
                 let sql = if col_names.is_empty() {
                     format!("INSERT INTO \"{collection}\" DEFAULT VALUES")
                 } else {
-                    // El placeholder de "id" (siempre el primero cuando
-                    // está presente, empujado arriba antes que cualquier
-                    // otra columna) es el único que puede necesitar el
-                    // cast `::uuid` de Postgres -- el resto de las
-                    // columnas nunca son la PK.
-                    let placeholders: Vec<String> = (1..=col_names.len())
-                        .map(|n| {
-                            if generated_uuid.is_some() && n == 1 {
-                                self.id_placeholder(collection, n)
-                            } else {
-                                self.backend.placeholder(n)
-                            }
-                        })
-                        .collect();
+                    let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
                     format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "))
                 };
                 let (id_cell, id_display) = match generated_uuid {
@@ -1920,7 +1908,7 @@ db { users: User[] }
                     params.push(self.write_param(col, Some(value)));
                 }
                 if !set_clauses.is_empty() {
-                    let id_placeholder = self.id_placeholder(collection, params.len() + 1);
+                    let id_placeholder = self.backend.placeholder(params.len() + 1);
                     params.push(id_cell.clone());
                     let sql = format!("UPDATE \"{collection}\" SET {} WHERE \"id\" = {id_placeholder}", set_clauses.join(", "));
                     self.backend.execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
@@ -1961,14 +1949,14 @@ db { users: User[] }
                         let sql = format!(
                             "UPDATE \"{collection}\" SET \"{field}\" = {} WHERE \"id\" = {} AND \"{field}\" IS NULL",
                             self.backend.placeholder(1),
-                            self.id_placeholder(collection, 2)
+                            self.backend.placeholder(2)
                         );
                         self.backend
                             .execute(&sql, &[Cell::Int(now_ms), id_cell])
                             .map_err(|e| RuntimeError::new(format!("delete (soft) falló: {e}")))?
                     }
                     None => {
-                        let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = {}", self.id_placeholder(collection, 1));
+                        let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = {}", self.backend.placeholder(1));
                         self.backend
                             .execute(&sql, &[id_cell])
                             .map_err(|e| RuntimeError::new(format!("delete falló: {e}")))?
@@ -2305,35 +2293,19 @@ db { users: User[] }
     /// que ya usa cualquier otro campo `Uuid` (`ColumnPlan::kind`).
     fn id_column_kind(&self, collection: &str) -> ColumnKind {
         match self.id_kind(collection) {
+            // GRAMMAR.md §3.177: `ColumnKind::Uuid`, no `Text` -- distinto
+            // de cualquier otro campo `Uuid` normal (que sí es `Text`, sin
+            // cambios). SQLite decodifica los dos exactamente igual (no
+            // tiene un tipo separado del texto), pero Postgres SÍ: la PK
+            // usa el tipo NATIVO `uuid`, cuyo formato binario de verdad
+            // (16 bytes crudos) no es el mismo que el de un `TEXT` común
+            // (los bytes UTF-8 de los 36 caracteres) -- `postgres_cell`
+            // necesita saber la diferencia para leer la columna sin
+            // reventar contra una tabla adoptada con `id` nativamente
+            // `uuid`. Ver `store.rs::Cell::to_sql` para el lado de
+            // ESCRITURA del mismo problema.
             IdKind::Int => ColumnKind::Int,
-            IdKind::Uuid => ColumnKind::Text,
-        }
-    }
-
-    /// El placeholder SQL para bindear un valor de id contra `collection`
-    /// -- igual al de siempre, salvo Postgres + PK `Uuid`, donde agrega el
-    /// cast `::uuid` explícito.
-    ///
-    /// Por qué hace falta: sin el cast, el servidor infiere el tipo del
-    /// parámetro DIRECTO de la columna destino (`uuid` nativo), y el
-    /// driver Rust (`postgres`, sin el feature `with-uuid-1`) manda un
-    /// `Cell::Text` en el formato binario de un STRING común -- los bytes
-    /// UTF-8 de los 36 caracteres del UUID -- que NO es el formato binario
-    /// de 16 bytes que un parámetro `uuid` de verdad espera: mismatch de
-    /// wire, error de decodificación del lado del servidor. El cast
-    /// `::uuid` fuerza al servidor a inferir el parámetro como
-    /// `unknown`/texto (que SÍ coincide con lo que el driver manda) y
-    /// recién convertir a `uuid` DESPUÉS, con el parser de texto normal de
-    /// Postgres -- el mismo truco que prácticamente todo cliente sin tipo
-    /// `uuid` nativo usa contra esta columna (`$1::uuid` en vez de `$1`).
-    /// SQLite nunca necesita esto -- no tiene un tipo `uuid`/binario
-    /// separado del texto, así que un `Cell::Text` normal ya es exacto.
-    fn id_placeholder(&self, collection: &str, n: usize) -> String {
-        let ph = self.backend.placeholder(n);
-        if self.id_kind(collection) == IdKind::Uuid && self.backend.is_postgres() {
-            format!("{ph}::uuid")
-        } else {
-            ph
+            IdKind::Uuid => ColumnKind::Uuid,
         }
     }
 
@@ -2370,7 +2342,7 @@ db { users: User[] }
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
         let sql = match id {
             Some(_) => {
-                format!("SELECT {} FROM \"{collection}\" WHERE \"id\" = {}", col_list.join(", "), self.id_placeholder(collection, 1))
+                format!("SELECT {} FROM \"{collection}\" WHERE \"id\" = {}", col_list.join(", "), self.backend.placeholder(1))
             }
             None => match self.soft_delete_where(collection) {
                 Some(cond) => format!("SELECT {} FROM \"{collection}\" WHERE {cond} ORDER BY \"id\"", col_list.join(", ")),
@@ -2849,7 +2821,7 @@ db { users: User[] }
         let sql = format!(
             "UPDATE \"{collection}\" SET \"{field}\" = \"{field}\" + {} WHERE \"id\" = {}",
             self.backend.placeholder(1),
-            self.id_placeholder(collection, 2)
+            self.backend.placeholder(2)
         );
         self.backend.execute(&sql, &[Cell::Int(delta), id_cell.clone()]).map_err(|e| write_error("increment", e))?;
         let updated = self

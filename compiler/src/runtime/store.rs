@@ -51,6 +51,15 @@ pub(crate) enum ColumnKind {
     Timestamp,
     Float,
     Text,
+    /// GRAMMAR.md §3.177: la PK `"id"` de una colección con `id: Uuid` --
+    /// SOLO ese caso, nunca un campo `Uuid` común (que sigue siendo
+    /// `Text`, sin cambios). Distinto de `Text` porque del lado Postgres
+    /// esa columna usa el tipo NATIVO `uuid`, cuyo formato binario de
+    /// verdad (16 bytes crudos) no es el mismo que el de `TEXT` (los
+    /// bytes UTF-8 de la forma canónica de 36 caracteres) -- ver
+    /// `postgres_cell`. Del lado SQLite se comporta exactamente igual que
+    /// `Text` (no tiene un tipo `uuid` nativo separado).
+    Uuid,
     Bool,
     Json,
 }
@@ -339,7 +348,11 @@ fn sqlite_cell(row: &rusqlite::Row, i: usize, kind: ColumnKind) -> rusqlite::Res
             Some(f) => Cell::Float(f),
             None => Cell::Null,
         },
-        ColumnKind::Text => match row.get::<_, Option<String>>(i)? {
+        // `ColumnKind::Uuid` (GRAMMAR.md §3.177) es una PK `id: Uuid` --
+        // en SQLite es una columna TEXT común, se decodifica exactamente
+        // igual que `Text` (la distinción binaria/uuid nativo solo existe
+        // del lado Postgres, ver `postgres_cell`).
+        ColumnKind::Text | ColumnKind::Uuid => match row.get::<_, Option<String>>(i)? {
             Some(s) => Cell::Text(s),
             None => Cell::Null,
         },
@@ -467,6 +480,59 @@ impl<'a> postgres::types::FromSql<'a> for PgNumeric {
     }
 }
 
+/// GRAMMAR.md §3.177: los 16 bytes CRUDOS de un `uuid` nativo de Postgres
+/// -> su forma canónica de 36 caracteres (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`),
+/// la MISMA que `is_canonical_uuid` (runtime/mod.rs) ya valida en el resto
+/// del lenguaje. Sin la dependencia opcional `with-uuid-1` de la crate
+/// `postgres` (mismo criterio de siempre: un formato binario chico y fijo,
+/// documentado por el propio protocolo, no amerita sumar una dependencia
+/// nueva solo para esto -- mismo espíritu que `PgTimestampMicros`/`PgNumeric`
+/// arriba).
+struct PgUuidText(String);
+
+impl<'a> postgres::types::FromSql<'a> for PgUuidText {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let bytes: [u8; 16] = raw.try_into().map_err(|_| format!("'{ty}': se esperaban 16 bytes, llegaron {}", raw.len()))?;
+        Ok(PgUuidText(uuid_binary_to_string(&bytes)))
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        matches!(*ty, postgres::types::Type::UUID)
+    }
+}
+
+/// 16 bytes crudos -> forma canónica (`8-4-4-4-12` dígitos hex,
+/// minúscula). Inversa de `uuid_string_to_binary`, abajo.
+fn uuid_binary_to_string(bytes: &[u8; 16]) -> String {
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3],
+        bytes[4], bytes[5],
+        bytes[6], bytes[7],
+        bytes[8], bytes[9],
+        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+/// Forma canónica -> 16 bytes crudos. `None` si `s` no tiene exactamente 32
+/// dígitos hexadecimales una vez descontados los guiones -- nunca debería
+/// pasar en la práctica (todo `Value::Uuid` que llega hasta acá ya pasó por
+/// `is_canonical_uuid` en el borde, sea generado por `generate_uuid_v4` o
+/// recibido de un caller), pero un `Cell::to_sql` que devuelve un error
+/// claro ante una forma inesperada es más seguro que un panic en medio de
+/// una escritura real.
+fn uuid_string_to_binary(s: &str) -> Option<[u8; 16]> {
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 16];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
+}
+
 /// Una columna `Timestamp` (GRAMMAR.md §3.31/§3.91) contra Postgres puede
 /// ser físicamente UNA de dos cosas MUY distintas -- se prueban en orden,
 /// mismo criterio que `postgres_int_cell` con los tres anchos de entero:
@@ -533,6 +599,14 @@ fn postgres_cell(row: &postgres::Row, i: usize, kind: ColumnKind) -> Result<Cell
             Some(s) => Cell::Text(s),
             None => Cell::Null,
         },
+        // GRAMMAR.md §3.177: PK `id: Uuid` -- columna NATIVA `uuid`, 16
+        // bytes binarios crudos, no texto UTF-8 (`PgUuidText`, arriba).
+        // Leerla como `Option<String>` (la rama `Text` de acá arriba)
+        // fallaría: `String::accepts` no incluye el OID de `uuid`.
+        ColumnKind::Uuid => match row.try_get::<_, Option<PgUuidText>>(i).map_err(|e| e.to_string())? {
+            Some(PgUuidText(s)) => Cell::Text(s),
+            None => Cell::Null,
+        },
         ColumnKind::Bool => match row.try_get::<_, Option<bool>>(i).map_err(|e| e.to_string())? {
             Some(b) => Cell::Bool(b),
             None => Cell::Null,
@@ -596,6 +670,32 @@ impl postgres::types::ToSql for Cell {
                 _ => n.to_sql(ty, out),
             },
             Cell::Float(f) => f.to_sql(ty, out),
+            // GRAMMAR.md §3.177: `id: Uuid` -- una PK Uuid usa el tipo
+            // NATIVO `UUID` de Postgres (a diferencia de cualquier otro
+            // campo `Uuid`, que sigue siendo TEXT), para poder adoptar una
+            // columna que YA es `uuid` nativo en una base real. Cuando el
+            // servidor infiere `ty` como `uuid` (siempre que este `Cell`
+            // vaya a esa columna, nunca a otra), el formato BINARIO que
+            // espera son los 16 bytes crudos del uuid -- no los 36
+            // caracteres de su forma canónica en texto. Verificado en vivo
+            // contra Postgres real (CI, `pg_integration.rs`): un intento
+            // anterior de resolver esto con un cast SQL `::uuid` en el
+            // placeholder (en vez de esto) seguía fallando -- Postgres
+            // infiere el tipo del parámetro de la COLUMNA destino sin
+            // importar el cast, así que el único arreglo real es mandar
+            // los bytes en el formato que ese tipo pide. Sin sumar la
+            // dependencia opcional `with-uuid-1` de la crate `postgres`
+            // (mismo criterio de "cero dependencias nuevas" que el resto
+            // del proyecto): la forma canónica ya está validada en el
+            // borde (`is_canonical_uuid`, runtime/mod.rs) antes de llegar
+            // hasta acá, así que decodificarla a mano es un parseo fijo y
+            // chico, no un formato arbitrario.
+            Cell::Text(s) if *ty == postgres::types::Type::UUID => {
+                let bytes = uuid_string_to_binary(s)
+                    .ok_or_else(|| format!("'{s}' no es un uuid canónico de 36 caracteres -- no se puede bindear contra una columna 'uuid' nativa"))?;
+                out.extend_from_slice(&bytes);
+                Ok(postgres::types::IsNull::No)
+            }
             Cell::Text(s) => s.to_sql(ty, out),
             Cell::Bool(b) => b.to_sql(ty, out),
             Cell::Json(v) => v.to_sql(ty, out),

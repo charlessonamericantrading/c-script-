@@ -1997,7 +1997,14 @@ fn introspect_emits_id_uuid_for_a_native_uuid_primary_key_with_no_warning() {
     let warnings = String::from_utf8_lossy(&output.stderr).to_string();
 
     assert!(generated.contains("id: Uuid,"), "{generated}");
-    assert!(warnings.is_empty(), "no debería haber ninguna advertencia sobre 'id': {warnings}");
+    // `introspect` escanea TODA la base -- otros tests corriendo en
+    // paralelo (mismo motivo que el comentario de GRAMMAR.md §4831 sobre
+    // esta suite) pueden dejar SUS propias advertencias en el mismo
+    // stderr, de tablas ajenas a `COLLECTION`. Lo que este test fija es
+    // que la advertencia sobre "id" que existía ANTES de §3.177 ya no
+    // aparece para ESTA tabla puntual -- no que el stderr entero esté vacío.
+    let own_id_warning = warnings.lines().find(|line| line.contains(COLLECTION) && line.contains("\"id\""));
+    assert!(own_id_warning.is_none(), "no debería haber ninguna advertencia sobre 'id' de '{COLLECTION}': {own_id_warning:?}");
 }
 
 #[test]
