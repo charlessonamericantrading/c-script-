@@ -2381,17 +2381,27 @@ fn adopt_existing_reads_and_writes_a_native_inet_column_mapped_to_string() {
             )"
         ))
         .expect("crear la tabla con una columna inet nativa, como la real de iaacademy");
+    // El literal `inet` va EMBEBIDO en el SQL, no bindeado como parámetro:
+    // el cliente `postgres` (crudo, sin el `Cell` propio de c-script que
+    // esta ronda arregla) tampoco sabe bindear un `&str` contra una
+    // columna `inet` -- ni siquiera con un cast explícito en el SQL, el
+    // servidor sigue infiriendo el tipo del parámetro de la columna
+    // destino (mismo motivo, documentado en GRAMMAR.md §3.177/§3.178,
+    // por el que el propio `Cell::to_sql` de c-script necesitó un
+    // decodificador binario a mano en vez de un cast). Un literal SQL
+    // (`'203.0.113.7'`) no pasa por el bind de parámetros en absoluto --
+    // Postgres lo parsea con su propio `inet_in()` de siempre, sin
+    // involucrar al driver. Seguro acá: son constantes fijas del test,
+    // nunca input externo.
     client
-        .execute(
-            &format!("INSERT INTO \"{COLLECTION}\" (email, source_ip, user_agent) VALUES ($1, $2, $3)"),
-            &[&"a@example.com", &"203.0.113.7", &"Mozilla/5.0"],
-        )
-        .expect("sembrar una fila con source_ip real (SQL crudo, cast de texto a inet del lado del servidor)");
+        .batch_execute(&format!(
+            "INSERT INTO \"{COLLECTION}\" (email, source_ip, user_agent) VALUES ('a@example.com', '203.0.113.7', 'Mozilla/5.0')"
+        ))
+        .expect("sembrar una fila con source_ip real");
     client
-        .execute(&format!("INSERT INTO \"{COLLECTION}\" (email, source_ip, user_agent) VALUES ($1, NULL, $2)"), &[
-            &"b@example.com",
-            &"curl/8.0",
-        ])
+        .batch_execute(&format!(
+            "INSERT INTO \"{COLLECTION}\" (email, source_ip, user_agent) VALUES ('b@example.com', NULL, 'curl/8.0')"
+        ))
         .expect("sembrar una fila con source_ip NULL -- el caso 'sin IP registrada'");
 
     let temp = TempDir::new("adopt-inet-column");
