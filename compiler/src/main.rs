@@ -141,7 +141,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc pm2-config <archivo.link> <puerto> [-o <archivo>]   (genera un ecosystem.json de PM2, default ./ecosystem.json)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
-    out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve')"));
+    out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'; con --target-url/LINK_DOCTOR_TARGET_URL, además compara la versión local contra la de un 'linkc serve' real corriendo ahí, vía /health)"));
     out(&format!("     linkc db inspect <archivo.link> [--db <url|archivo>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor')"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
     out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)"));
@@ -457,7 +457,7 @@ fn redact_url_credentials(url: &str) -> String {
 /// para eso ya está `linkc migrate --dry-run`.
 fn cmd_doctor(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else {
-        eprintln!("uso: linkc doctor <archivo.link> [--db <url|archivo>]");
+        eprintln!("uso: linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>]");
         return ExitCode::FAILURE;
     };
     println!("linkc doctor -- diagnóstico de entorno para '{path}'\n");
@@ -516,6 +516,59 @@ fn cmd_doctor(args: &[String]) -> ExitCode {
         }
         Err(msg) => {
             println!("[ERROR] configuración de base de datos inválida: {msg}");
+            err_count += 1;
+        }
+    }
+
+    // `--target-url`/`LINK_DOCTOR_TARGET_URL`, opt-in: compara la versión
+    // LOCAL contra la de un `linkc serve` real ya corriendo (vía `/health`,
+    // que ya devuelve `version` desde siempre). Reporte de adopción real
+    // (iaacademy, vía la sesión skynet-43, 2026-08-29): el PC de desarrollo
+    // puede quedar en una versión vieja mientras el VPS de producción sigue
+    // avanzando -- compilar/testear local contra un binario más viejo que
+    // el de producción es una deriva silenciosa, sin ningún error que la
+    // señale. Sin el flag: comportamiento IDÉNTICO a siempre, cero
+    // requests salientes.
+    match read_flag_or_env(args, "--target-url", "LINK_DOCTOR_TARGET_URL") {
+        Ok(Some(target)) => {
+            let health_url = format!("{}/health", target.trim_end_matches('/'));
+            match ureq::get(&health_url).timeout(Duration::from_secs(5)).call() {
+                Ok(resp) => match serde_json::from_str::<serde_json::Value>(&resp.into_string().unwrap_or_default()) {
+                    Ok(json) => match json.get("version").and_then(|v| v.as_str()) {
+                        Some(remote) if remote == linkc::VERSION => {
+                            println!("[OK]    versión remota ({health_url}): {remote}, igual a la local");
+                            ok_count += 1;
+                        }
+                        Some(remote) => {
+                            println!(
+                                "[INFO]  versión remota ({health_url}): {remote}, distinta de la local ({}) -- \
+                                 compilar/testear acá contra un binario más viejo o más nuevo que el que corre \
+                                 ahí puede esconder una regresión o una feature que ese lado todavía no tiene",
+                                linkc::VERSION
+                            );
+                            ok_count += 1;
+                        }
+                        None => {
+                            println!(
+                                "[ERROR] versión remota ({health_url}): la respuesta no trae 'version' -- ¿es un servidor linkc?"
+                            );
+                            err_count += 1;
+                        }
+                    },
+                    Err(e) => {
+                        println!("[ERROR] versión remota ({health_url}): la respuesta no es JSON válido: {e}");
+                        err_count += 1;
+                    }
+                },
+                Err(e) => {
+                    println!("[ERROR] versión remota ({health_url}): no se pudo conectar/responder: {e}");
+                    err_count += 1;
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(msg) => {
+            println!("[ERROR] {msg}");
             err_count += 1;
         }
     }

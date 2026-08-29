@@ -1806,6 +1806,49 @@ fn introspect_warns_about_columns_it_cannot_map_with_confidence() {
     assert!(warnings.contains("opens_at") && warnings.to_lowercase().contains("time"), "stderr: {warnings}");
 }
 
+#[test]
+fn introspect_warns_when_the_id_primary_key_is_not_actually_an_integer() {
+    // Reporte real de adopción (iaacademy, vía sesión skynet-43, 2026-08-29):
+    // una tabla con `id uuid DEFAULT gen_random_uuid()` PRIMARY KEY generaba
+    // `id: Int` sin ninguna advertencia -- el mapeo por NOMBRE de columna
+    // ("se llama id") pisaba por completo el mapeo por TIPO que sí advierte
+    // sobre `uuid` en cualquier otra columna. `linkc serve`/`migrate
+    // --dry-run` rechazan la tabla igual al conectar (§3.36), pero recién ahí
+    // -- después de ya haber escrito un .link entero alrededor de un
+    // `id: Int` que nunca fue real.
+    const COLLECTION: &str = "legacy_leads";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" UUID PRIMARY KEY DEFAULT gen_random_uuid(), \
+                \"email\" TEXT NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla con PK uuid a mano");
+
+    let output =
+        Command::new(env!("CARGO_BIN_EXE_linkc")).arg("introspect").arg(&url).output().expect("ejecutar linkc introspect");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let generated = String::from_utf8_lossy(&output.stdout).to_string();
+    let warnings = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Sigue emitiendo el placeholder de siempre (nunca omite la columna)...
+    assert!(generated.contains("id: Int,"), "{generated}");
+    // ...pero ahora avisa que ese placeholder es engañoso para esta tabla.
+    assert!(
+        warnings.contains(COLLECTION) && warnings.contains("\"id\"") && warnings.to_lowercase().contains("uuid"),
+        "stderr: {warnings}"
+    );
+}
+
 // ---- modo adopción (`--adopt-existing`/`LINK_ADOPT_EXISTING`, GRAMMAR.md §3.67) ----
 
 #[test]

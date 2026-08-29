@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.132.0] - 2026-08-29
+
+### ✨ Nuevo
+Reporte de adopción real (proyecto nº5 del ecosistema, iaacademy, vía la sesión skynet-43) -- 3 tablas públicas con `id uuid` quedan bloqueadas por el requisito de PK entera (GRAMMAR.md §3.36/§3.59), rechazadas correctamente al conectar, pero dos gaps de HERRAMIENTAS sí eran nuevos:
+
+- **`linkc introspect` ahora avisa cuando la PK `"id"` no es realmente un entero.** Antes emitía `id: Int` para CUALQUIER PK llamada `"id"` sin mirar su tipo real en PostgreSQL -- una PK `id uuid` generaba el mismo `.link` "limpio" que una PK `id BIGSERIAL`, y la única señal de que algo estaba mal aparecía recién en `linkc serve`/`migrate --dry-run`, después de ya escribir un programa entero alrededor de un placeholder que nunca fue real. Mismo canal de advertencia por stderr que el resto de `introspect`, nunca omite la columna.
+- **`linkc doctor --target-url <url>` (o `LINK_DOCTOR_TARGET_URL`) detecta deriva de versión contra un `linkc serve` real ya corriendo.** Nuevo chequeo opt-in: compara `linkc::VERSION` local contra el `version` que `/health` ya devolvía -- `[OK]` si coinciden, `[INFO]` si difieren (no falla el chequeo, solo lo hace visible), `[ERROR]` si la URL no responde. Sin el flag, comportamiento idéntico a siempre.
+
+**Deliberadamente NO resuelto** -- el bloqueo real de iaacademy: aceptar `id: Uuid` (o cualquier tipo no entero) como PK de una colección. Toca `insert`/`insert_returning_id`, el tipo de parámetro de `insert`, el emisor SQLite y el checker -- señal de madurez general del lenguaje, no un ticket puntual, queda para su propia ronda de diseño. Ver GRAMMAR.md §3.176.
+
+**Verificado**: build release sin warnings; suite completa sin regresiones (1302 tests, +1 sobre v1.131.0 -- el nuevo test de CLI `introspect` contra Postgres real en `pg_integration.rs`); `linkc doctor --target-url` probado a mano contra un `linkc serve` real -- puerto cerrado (falla limpio, sin colgarse, sin panic) y versión igual (`[OK]`) contra un servidor real corriendo en este mismo round.
+
 ## [1.131.0] - 2026-08-28
 
 ### 🔧 Proceso

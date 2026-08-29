@@ -149,6 +149,27 @@ fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableI
         // El caso normal: "id" es la única PK -- c-script siempre la declara
         // como el primer campo, `Int` (GRAMMAR.md §3.59: BIGINT/integer/
         // smallint decodifican los tres igual desde esta ronda).
+        //
+        // Pero "se llama id" y "es un entero" son cosas distintas: una PK
+        // `id uuid DEFAULT gen_random_uuid()` también cae en esta rama por
+        // nombre, y hasta acá el campo se emitía como `id: Int` sin ninguna
+        // advertencia -- el mismo tipo `uuid` en cualquier OTRA columna sí
+        // dispara la advertencia de `map_pg_type` de abajo. `linkc migrate
+        // --dry-run`/`linkc serve` rechazan esa tabla al conectar (§3.36),
+        // pero para entonces ya se armó un .link entero alrededor de un
+        // `id: Int` que nunca fue real -- avisar acá, en el origen, ahorra
+        // ese viaje completo.
+        if let Some(id_col) = columns.iter().find(|c| c.name == "id") {
+            if !matches!(id_col.pg_type.as_str(), "bigint" | "integer" | "smallint") {
+                warnings.push(format!(
+                    "la clave primaria de '{table}' se llama \"id\" pero en PostgreSQL es '{}', no un entero -- \
+                     c-script REQUIERE 'id: Int' (BIGSERIAL/INTEGER/SMALLSERIAL) como PK autoincremental; \
+                     esta tabla no se puede adoptar tal cual con esta PK, 'linkc serve'/'linkc migrate --dry-run' \
+                     la van a rechazar al conectar",
+                    id_col.pg_type
+                ));
+            }
+        }
         fields.push("  id: Int,".to_string());
     } else if pk_columns.is_empty() {
         warnings.push(format!("la tabla '{table}' no tiene clave primaria -- c-script REQUIERE una columna \"id\" entera autoincremental; agregala antes de usar esta tabla"));
