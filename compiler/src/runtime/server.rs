@@ -892,7 +892,18 @@ fn handle_request(
             }
             None => client_ip,
         };
-        if !rate_limiter.lock().check(&bucket_identity, service_name, rpc_name, spec) {
+        // GRAMMAR.md §3.178: si `db` tiene la tabla interna de rate
+        // limiting distribuido lista (Postgres, sin --adopt-existing sin
+        // esa tabla ya creada), el límite se aplica contra el bucket REAL
+        // compartido por todas las instancias -- no uno por proceso.
+        // `None` (SQLite, o degradado por algún motivo) cae al
+        // `RateLimiter` en memoria de siempre, comportamiento IDÉNTICO al
+        // de antes de esta ronda.
+        let allowed = match db.check_rate_limit_distributed(&bucket_identity, service_name, rpc_name, spec) {
+            Some(allowed) => allowed,
+            None => rate_limiter.lock().check(&bucket_identity, service_name, rpc_name, spec),
+        };
+        if !allowed {
             metrics_store.lock().record_rate_limit_rejection(&method);
             let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
             log_done(log, req_id, Some(&method), 429, start, "");

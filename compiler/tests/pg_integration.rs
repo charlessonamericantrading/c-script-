@@ -1399,6 +1399,139 @@ fn migrate_dry_run_reports_no_changes_for_an_existing_native_uuid_pk_table() {
     assert!(report.contains("Nada que migrar"), "{report}");
 }
 
+// ---- rate limiting DISTRIBUIDO vía Postgres (GRAMMAR.md §3.178) ----
+
+const RATE_LIMIT_PROGRAM: &str = r#"
+service Sys {
+  @rate_limit("5/2s")
+  rpc ping() -> String { "pong" }
+}
+"#;
+
+/// `POST <url>` -- devuelve el status HTTP real (200/429/...), sin
+/// panickear ante un no-2xx (a diferencia de `Serve::rpc`, que sí lo hace
+/// -- acá el punto es justamente poder ver un 429 real sin abortar el test).
+fn post_status(url: &str, body: &str) -> u16 {
+    match ureq::post(url).set("Content-Type", "application/json").send_string(body) {
+        Ok(r) => r.status(),
+        Err(ureq::Error::Status(status, _)) => status,
+        Err(e) => panic!("POST {url} falló de red: {e}"),
+    }
+}
+
+#[test]
+fn distributed_rate_limit_shares_one_bucket_across_two_real_server_instances() {
+    // El punto entero de GRAMMAR.md §3.178: `@rate_limit("5/2s")` tiene que
+    // limitar a 5 requests cada 2s TOTAL entre las dos instancias, no 5 por
+    // instancia (10 en total) -- que es exactamente lo que pasaría con el
+    // `RateLimiter` en memoria de siempre, cada uno con su propio HashMap.
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    // Sin `reset_schema`: este programa no declara ningún `db {}`, nada
+    // que dropear -- pero SÍ hace falta arrancar con la tabla interna de
+    // rate limiting limpia, para que un bucket que otra corrida anterior
+    // dejó a medio consumir no arranque este test con menos capacidad
+    // disponible de la esperada.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"_linkc_internal_rate_limits\"");
+
+    let temp_a = TempDir::new("rate-limit-distributed-a");
+    let temp_b = TempDir::new("rate-limit-distributed-b");
+    let link_a = temp_a.write("app.link", RATE_LIMIT_PROGRAM);
+    let link_b = temp_b.write("app.link", RATE_LIMIT_PROGRAM);
+    // Arrancan una atrás de otra: la primera crea la tabla interna (sin
+    // --adopt-existing), la segunda la encuentra ya creada -- las dos
+    // terminan con `distributed_rate_limit = true` de todos modos
+    // (`postgres_table_exists`/`CREATE TABLE IF NOT EXISTS`, cualquiera
+    // de los dos caminos).
+    let server_a = Serve::start(&link_a, &url);
+    let server_b = Serve::start(&link_b, &url);
+    let url_a = format!("http://127.0.0.1:{}/Sys/ping", server_a.port);
+    let url_b = format!("http://127.0.0.1:{}/Sys/ping", server_b.port);
+
+    const REQUESTS_PER_SERVER: usize = 8; // 16 en total, contra una capacidad de 5
+    let statuses = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..REQUESTS_PER_SERVER * 2)
+            .map(|i| {
+                let target = if i % 2 == 0 { &url_a } else { &url_b };
+                scope.spawn(move || post_status(target, "{}"))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect::<Vec<u16>>()
+    });
+
+    let admitted = statuses.iter().filter(|&&s| s == 200).count();
+    let rejected = statuses.iter().filter(|&&s| s == 429).count();
+    assert_eq!(admitted, 5, "capacidad compartida entre las dos instancias: exactamente 5 admitidas, no 5 por instancia. statuses={statuses:?}");
+    assert_eq!(rejected, REQUESTS_PER_SERVER * 2 - 5, "el resto tiene que ser 429, nunca otro status: statuses={statuses:?}");
+}
+
+#[test]
+fn distributed_rate_limit_refills_over_time_like_the_in_memory_bucket() {
+    // Mismo algoritmo que `rate_limit::RateLimiter` (refill CONTINUO, no
+    // por ventanas fijas que resetean de golpe) -- agotar el bucket y
+    // esperar más que la ventana completa tiene que admitir de nuevo.
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"_linkc_internal_rate_limits\"");
+
+    let temp = TempDir::new("rate-limit-distributed-refill");
+    let link = temp.write("app.link", RATE_LIMIT_PROGRAM);
+    let server = Serve::start(&link, &url);
+    let ping_url = format!("http://127.0.0.1:{}/Sys/ping", server.port);
+
+    for _ in 0..5 {
+        assert_eq!(post_status(&ping_url, "{}"), 200, "las primeras 5 (la capacidad completa) tienen que admitirse");
+    }
+    assert_eq!(post_status(&ping_url, "{}"), 429, "la 6ta, sin que pase tiempo, tiene que rechazarse");
+
+    std::thread::sleep(std::time::Duration::from_millis(2200)); // > los 2s de la ventana completa
+    assert_eq!(post_status(&ping_url, "{}"), 200, "después de refillear la ventana completa, vuelve a admitir");
+}
+
+#[test]
+fn adopt_existing_falls_back_to_in_memory_rate_limiting_without_the_internal_table() {
+    // `--adopt-existing` nunca ejecuta DDL, ni siquiera para la tabla
+    // interna de rate limiting propia -- sin ella ya creada a mano, el
+    // servidor tiene que arrancar y servir requests normalmente (el
+    // `RateLimiter` en memoria de siempre, degradado en silencio salvo
+    // por el `distributed_rate_limit = false` interno), nunca un fallo de
+    // arranque por una tabla que ni siquiera es del usuario.
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"_linkc_internal_rate_limits\"");
+
+    let temp = TempDir::new("rate-limit-adopt-existing");
+    let link = temp.write("app.link", RATE_LIMIT_PROGRAM);
+    let server = Serve::start_with_args(&link, &url, &["--adopt-existing"]);
+    let ping_url = format!("http://127.0.0.1:{}/Sys/ping", server.port);
+
+    for _ in 0..5 {
+        assert_eq!(post_status(&ping_url, "{}"), 200, "el limitador en memoria sigue funcionando sin la tabla interna");
+    }
+    assert_eq!(post_status(&ping_url, "{}"), 429, "y sigue rechazando al agotar la capacidad, solo que por-proceso, no compartido");
+    let mut check_client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar de nuevo");
+    let exists = check_client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '_linkc_internal_rate_limits')",
+            &[],
+        )
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap_or(false);
+    assert!(!exists, "--adopt-existing nunca debe haber creado la tabla interna");
+}
+
 #[test]
 fn a_bad_connection_url_fails_with_a_message_instead_of_a_panic() {
     // Este no necesita base: prueba justamente el camino en que no hay ninguna.

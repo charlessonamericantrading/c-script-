@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.134.0] - 2026-08-29
+
+### ✨ Nuevo
+**`@rate_limit` distribuido vía Postgres** -- pedido explícito del usuario ("mejoremos estos límites y las fricciones") sobre el gap documentado de producción: N réplicas compartiendo una base diluían el límite real (hasta N × capacidad, no capacidad), con solo un contador en `/metrics` para notarlo, nunca una solución. Mismo `@rate_limit("N/ventana")` de siempre, sin sintaxis nueva -- lo que cambia es que, sobre Postgres, el bucket vive en una tabla interna (`_linkc_internal_rate_limits`, invisible para `db {}`/`introspect`/`migrate`) compartida de verdad por todas las instancias que apuntan a la misma base, en vez de un `HashMap` por proceso.
+
+- Mismo algoritmo exacto que el limitador en memoria (token bucket, refill continuo). Un solo UPSERT atómico (`INSERT ... ON CONFLICT ... DO UPDATE ... WHERE`), mismo criterio que `increment()`: nunca leer-y-después-escribir en dos pasos que puedan carrerear entre procesos.
+- Degrada, nunca rompe el arranque: sin la tabla (`--adopt-existing` sin crearla a mano, o un rol sin `CREATE TABLE`), esta instancia usa el limitador en memoria de siempre, comportamiento idéntico al de antes. SQLite no cambia -- un solo proceso ya tiene el estado exacto.
+- De paso, corregidas dos afirmaciones desactualizadas en el README ("No CSP or HSTS" -- HSTS existe hace varias rondas, `--hsts`; "sin `X-Forwarded-For`" -- `--trust-proxy` también existe hace rondas) encontradas auditando esta misma sección.
+
+**Verificado contra Postgres real**: DOS instancias `linkc serve` reales, procesos separados, apuntando a la misma base -- 16 requests concurrentes repartidas entre las dos contra `@rate_limit("5/2s")` admiten exactamente 5 en total, no 10 (5 por instancia). Refill real (agotar, esperar más que la ventana, volver a admitir). `--adopt-existing` sin la tabla: arranca y sigue limitando, por proceso. Suite completa sin regresiones. Ver GRAMMAR.md §3.178.
+
 ## [1.133.1] - 2026-08-29
 
 ### 🔧 Proceso

@@ -12,6 +12,7 @@
 use super::{as_int, generate_uuid_v4, json_to_typed_value, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
 use crate::ast::{BinaryOp, FieldCheck, Item, Program, TimeGranularity, TypeAnnotation, TypeExpr};
 use crate::checker::Checker;
+use crate::rate_limit::RateLimitSpec;
 use crate::types::{FieldType, Type};
 use super::store::{Backend, Cell, ColumnKind};
 use rusqlite::Connection;
@@ -664,6 +665,36 @@ pub(crate) fn sqlite_table_exists(connection: &Connection, collection: &str) -> 
         .is_ok()
 }
 
+/// GRAMMAR.md §3.178: rate limiting DISTRIBUIDO -- una tabla interna,
+/// prefijo reservado (nunca colisiona con una colección declarada por el
+/// usuario), compartida por TODAS las instancias de `linkc serve`/
+/// `serve-all` que apunten a la MISMA base Postgres. Solo Postgres: SQLite
+/// es de un solo archivo/proceso salvo un caso de borde raro, y el punto
+/// entero de esto es coordinar ENTRE procesos -- el `RateLimiter` en
+/// memoria (`rate_limit.rs`) ya es exacto para un solo proceso.
+const RATE_LIMIT_TABLE: &str = "_linkc_internal_rate_limits";
+
+fn create_rate_limit_table_sql() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS \"{RATE_LIMIT_TABLE}\" (\
+            \"bucket_key\" TEXT PRIMARY KEY, \
+            \"tokens\" DOUBLE PRECISION NOT NULL, \
+            \"capacity\" DOUBLE PRECISION NOT NULL, \
+            \"refill_per_sec\" DOUBLE PRECISION NOT NULL, \
+            \"last_seen_ms\" BIGINT NOT NULL\
+        )"
+    )
+}
+
+fn postgres_table_exists(backend: &Backend, table: &str) -> Result<bool, String> {
+    let rows = backend.query(
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1",
+        &[Cell::Text(table.to_string())],
+        &[ColumnKind::Int],
+    )?;
+    Ok(!rows.is_empty())
+}
+
 /// Adopción de tabla existente (`--adopt-existing`/`LINK_ADOPT_EXISTING`,
 /// GRAMMAR.md §3.67): a diferencia de `check_schema_matches`, NUNCA ejecuta
 /// `CREATE TABLE` ni `ALTER TABLE ADD COLUMN` -- el punto entero de este modo
@@ -1024,6 +1055,17 @@ pub struct Db {
     /// (sin entrada) es el caso normal -- la mayoría de colecciones no usa
     /// soft-delete.
     soft_delete_fields: HashMap<String, String>,
+    /// GRAMMAR.md §3.178: `true` si la tabla interna de rate limiting
+    /// distribuido (`RATE_LIMIT_TABLE`) está lista para usarse EN ESTE
+    /// proceso -- siempre `false` en SQLite (nunca aplica), y en Postgres
+    /// `true` salvo que `--adopt-existing` esté activo y la tabla no
+    /// exista ya (adoptar nunca ejecuta DDL, ni siquiera para esta tabla
+    /// propia) o la creación haya fallado por algún motivo (rol sin
+    /// permiso de `CREATE TABLE`, por ejemplo -- degradado, nunca fatal:
+    /// `check_rate_limit_distributed` devuelve `None` en ese caso, y el
+    /// caller (`runtime/server.rs`) cae al `RateLimiter` en memoria de
+    /// siempre, comportamiento IDÉNTICO al de antes de esta ronda).
+    distributed_rate_limit: bool,
 }
 
 /// Un cambio anunciado por OTRA instancia de `linkc serve` contra la misma
@@ -1366,6 +1408,10 @@ impl Db {
             argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
             http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
             soft_delete_fields,
+            // GRAMMAR.md §3.178: rate limiting distribuido es un concepto
+            // exclusivamente Postgres -- SQLite nunca lo necesita, un solo
+            // proceso ya tiene el estado exacto en memoria.
+            distributed_rate_limit: false,
         }
     }
 
@@ -1504,6 +1550,33 @@ impl Db {
         let remote_rx = spawn_remote_listener(url.to_string(), instance_id.clone());
         let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
 
+        // GRAMMAR.md §3.178: rate limiting distribuido -- tabla interna
+        // compartida por TODAS las instancias contra la MISMA base.
+        // `--adopt-existing` nunca ejecuta DDL, ni siquiera para esta
+        // tabla propia (mismo criterio que cualquier colección
+        // declarada) -- si ya existe (un operador la creó a mano, o una
+        // instancia anterior sin --adopt-existing ya la creó), se usa
+        // igual; si no, esta instancia cae al `RateLimiter` en memoria de
+        // siempre. Fuera de ese modo, se intenta crear -- un fallo acá
+        // (rol sin permiso de CREATE TABLE, poco común pero posible) NO
+        // aborta el arranque del servidor: solo esta pieza se degrada,
+        // con un aviso, nunca un servidor que no arranca por una tabla
+        // que ni siquiera es del usuario.
+        let distributed_rate_limit = if adopt_existing {
+            postgres_table_exists(&backend, RATE_LIMIT_TABLE).unwrap_or(false)
+        } else {
+            match backend.execute_ddl(&create_rate_limit_table_sql()) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!(
+                        "advertencia: no se pudo crear la tabla interna de rate limiting distribuido ({e}) -- \
+                         esta instancia usa el limitador en memoria de siempre (GRAMMAR.md §3.178)"
+                    );
+                    false
+                }
+            }
+        };
+
         Ok((
             Db {
                 backend,
@@ -1519,6 +1592,7 @@ impl Db {
                 argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
                 http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
                 soft_delete_fields,
+                distributed_rate_limit,
             },
             remote_rx,
         ))
@@ -1636,6 +1710,69 @@ db { users: User[] }
     /// que devuelve un resultado viejo no sirve para nada.
     pub fn health_check(&self) -> Result<(), String> {
         self.backend.execute_ddl("SELECT 1")
+    }
+
+    /// GRAMMAR.md §3.178: rate limit DISTRIBUIDO vía la tabla interna
+    /// `RATE_LIMIT_TABLE` -- `None` si no está disponible en este proceso
+    /// (`self.distributed_rate_limit == false`: SQLite, o Postgres con
+    /// `--adopt-existing` sin la tabla ya creada a mano, o la creación
+    /// falló al conectar), momento en el que el caller
+    /// (`runtime/server.rs`) cae al `RateLimiter` en memoria de siempre --
+    /// comportamiento IDÉNTICO al de antes de esta ronda. Mismo algoritmo
+    /// EXACTO que `rate_limit::RateLimiter` (token bucket, refill
+    /// continuo, nunca ventanas fijas) -- la única diferencia es que el
+    /// estado vive en una fila de Postgres compartida por todas las
+    /// instancias, en vez de un `HashMap` propio de cada proceso.
+    ///
+    /// Un solo UPSERT atómico -- mismo criterio que `increment()`
+    /// (`UPDATE ... SET col = col + ?`, nunca leer-y-después-escribir en
+    /// dos pasos separados que puedan carrerear bajo concurrencia real
+    /// entre procesos distintos): el refill/consumo se calcula DENTRO del
+    /// propio `SET`, referenciando `"{RATE_LIMIT_TABLE}".tokens`/
+    /// `.last_seen_ms` -- los valores REALES de la fila ya bloqueada por
+    /// el propio UPSERT en el momento de escribir, nunca un valor leído
+    /// por separado antes (que sí podría quedar desactualizado si otra
+    /// instancia escribe en el medio). La cláusula `WHERE` sobre la
+    /// acción `DO UPDATE` (sintaxis real de Postgres, no una comparación
+    /// aparte) hace que la fila NO se toque en absoluto si no hay
+    /// suficientes tokens -- ni siquiera `last_seen_ms` avanza, así que el
+    /// próximo intento sigue viendo el reloj real transcurrido y el
+    /// refill se sigue acumulando correctamente sin este paso.
+    /// `capacity`/`refill_per_sec` se reescriben en cada check exitoso
+    /// para que un redeploy con un `@rate_limit(...)` distinto converja
+    /// solo, sin necesitar limpiar la tabla a mano.
+    pub fn check_rate_limit_distributed(&self, client_identity: &str, service: &str, rpc: &str, spec: RateLimitSpec) -> Option<bool> {
+        if !self.distributed_rate_limit {
+            return None;
+        }
+        let bucket_key = format!("{client_identity}|{service}|{rpc}");
+        let capacity = spec.count as f64;
+        let refill_per_sec = capacity / spec.window.as_secs_f64();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let sql = format!(
+            "INSERT INTO \"{RATE_LIMIT_TABLE}\" (\"bucket_key\", \"tokens\", \"capacity\", \"refill_per_sec\", \"last_seen_ms\") \
+             VALUES ($1, $2 - 1, $2, $3, $4) \
+             ON CONFLICT (\"bucket_key\") DO UPDATE SET \
+                \"tokens\" = LEAST($2, \"{RATE_LIMIT_TABLE}\".\"tokens\" + GREATEST(0, $4 - \"{RATE_LIMIT_TABLE}\".\"last_seen_ms\")::double precision / 1000.0 * \"{RATE_LIMIT_TABLE}\".\"refill_per_sec\") - 1, \
+                \"capacity\" = $2, \
+                \"refill_per_sec\" = $3, \
+                \"last_seen_ms\" = $4 \
+             WHERE LEAST($2, \"{RATE_LIMIT_TABLE}\".\"tokens\" + GREATEST(0, $4 - \"{RATE_LIMIT_TABLE}\".\"last_seen_ms\")::double precision / 1000.0 * \"{RATE_LIMIT_TABLE}\".\"refill_per_sec\") >= 1.0 \
+             RETURNING \"tokens\""
+        );
+        let params = vec![Cell::Text(bucket_key), Cell::Float(capacity), Cell::Float(refill_per_sec), Cell::Int(now_ms)];
+        // Cualquier error (transitorio o no) degrada a `None` -- nunca deja
+        // una request colgada ni la rechaza por un problema de infra que no
+        // es culpa suya. `Backend::query` ya reintenta una conexión caída
+        // por su cuenta (`with_reconnect`, GRAMMAR.md §3.40) antes de
+        // llegar hasta acá.
+        match self.backend.query(&sql, &params, &[ColumnKind::Float]) {
+            Ok(rows) => Some(!rows.is_empty()),
+            Err(_) => None,
+        }
     }
 
     /// `GET /metrics` (GRAMMAR.md §3.149): tamaño de la base en bytes, o
