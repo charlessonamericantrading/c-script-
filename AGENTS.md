@@ -48,9 +48,18 @@ cargo test                   # unit + integration; spawns real LSP and HTTP subp
 ```bash
 linkc                        # lists subcommands (also: linkc --help)
 linkc build examples/users.link gen
-linkc test examples/users.link
+linkc test examples/users.link                                    # runs test "..." { } blocks
+linkc test examples/users.link examples/users.link.snap --update  # regenerates the contract SNAPSHOT
 linkc serve examples/users.link 8787
 ```
+
+`linkc test <file>` and `linkc test <file> <file>.snap [--update]` are two different
+checks sharing one subcommand — the snapshot form needs BOTH positional arguments. Running
+`linkc test <file> --update` (no `.snap` path) silently runs only the behavior tests and
+touches no snapshot file at all — no error, no "nothing to update" message, it just does not
+do what `--update` implies. This has actually shipped a stale `.snap` to CI once; if a
+release step is supposed to refresh a snapshot, verify the file's content actually changed
+(`git diff`), don't trust the command's exit code alone.
 
 The full end-to-end path that CI enforces, and the one to reproduce before claiming
 anything works: build the contract, type-check the frontend against it, then run the real
