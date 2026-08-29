@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.135.1"
+version = "1.136.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -35,6 +35,7 @@ runtime = [
     "dep:tokio-postgres-rustls",
     "dep:lettre",
     "dep:parking_lot",
+    "dep:flate2",
 ]
 
 [dependencies]
@@ -42,14 +43,15 @@ tiny_http = { version = "0.12", optional = true }
 serde_json = "1"
 serde = { version = "1.0", features = ["derive"] }
 wasm-encoder = "0.200"
-# Única excepción a "cero dependencias nuevas" del proyecto (ver GRAMMAR.md
-# §3.73): a diferencia de UUID/SHA-256/ISO-8601 (formas FIJAS y acotadas,
-# triviales de escanear a mano -- ver `is_canonical_uuid` en runtime/mod.rs),
-# un patrón de `@validate(regex, "...")` es TEXTO ARBITRARIO DEL USUARIO --
-# soportar solo un subconjunto de regex a mano sería un espejismo de
-# corrección, no una alternativa razonable. Pura Rust (sin dependencias C),
-# compila también a wasm32-unknown-unknown -- por eso NO está detrás del
-# feature `runtime` como rusqlite/postgres/etc.
+# Primera excepción real a "cero dependencias nuevas" del proyecto (ver
+# GRAMMAR.md §3.73 -- la segunda es `flate2`, más abajo): a diferencia de
+# UUID/SHA-256/ISO-8601 (formas FIJAS y acotadas, triviales de escanear a
+# mano -- ver `is_canonical_uuid` en runtime/mod.rs), un patrón de
+# `@validate(regex, "...")` es TEXTO ARBITRARIO DEL USUARIO -- soportar
+# solo un subconjunto de regex a mano sería un espejismo de corrección, no
+# una alternativa razonable. Pura Rust (sin dependencias C), compila
+# también a wasm32-unknown-unknown -- por eso NO está detrás del feature
+# `runtime` como rusqlite/postgres/etc.
 regex = "1"
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 sha2 = "0.10"
@@ -74,3 +76,15 @@ hmac = { version = "0.12", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring", "webpki-roots"], optional = true }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "hostname", "smtp-transport", "rustls-tls"], optional = true }
+# Segunda excepción real a "cero dependencias nuevas" (ver `regex` arriba
+# para la primera, GRAMMAR.md §3.180): GZIP/DEFLATE no es un formato
+# binario chico y fijo como los que este proyecto sí hand-rollea (UUID,
+# HMAC-SHA256, el wire de `inet`/`timestamp`/`numeric` de Postgres) -- es
+# un algoritmo de compresión real (LZ77 + Huffman), y un encoder DEFLATE
+# a mano, aunque técnicamente posible, es una superficie de bugs real (un
+# stream corrupto silencioso es mucho peor que un 500 limpio) sin ningún
+# beneficio sobre una implementación ya madura y ampliamente usada.
+# `flate2` con su backend por default (`miniz_oxide`, Rust puro) -- sin
+# `zlib-ng`/`cloudflare_zlib` ni ninguna dependencia C, mismo criterio de
+# "sin tooling nuevo que instalar" que el resto del proyecto.
+flate2 = { version = "1", optional = true }

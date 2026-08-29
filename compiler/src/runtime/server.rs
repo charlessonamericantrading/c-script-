@@ -690,7 +690,8 @@ fn handle_request(
     cors_headers.hsts = hsts.map(str::to_string);
 
     if *request.method() == tiny_http::Method::Options {
-        let _ = request.respond(cors_response(204, String::new(), &cors_headers));
+        let resp = cors_response(204, String::new(), &cors_headers, &request);
+        let _ = request.respond(resp);
         return;
     }
 
@@ -726,11 +727,13 @@ fn handle_request(
                 .map(|h| h.value.as_str().to_string());
             let ok = provided.as_deref().is_some_and(|p| super::constant_time_eq(p.as_bytes(), expected.as_bytes()));
             if !ok {
-                let _ = request.respond(cors_response(
+                let resp = cors_response(
                     401,
                     error_json("falta o es inválido el header X-Service-Api-Key -- este servidor requiere autenticación servidor-a-servidor"),
                     &cors_headers,
-                ));
+                    &request,
+                );
+                let _ = request.respond(resp);
                 log_done(log, req_id, None, 401, start, "error=\"service api key\"");
                 return;
             }
@@ -754,11 +757,13 @@ fn handle_request(
     let mut body = String::new();
     let _ = request.as_reader().take(max_body_bytes + 1).read_to_string(&mut body);
     if body.len() as u64 > max_body_bytes {
-        let _ = request.respond(cors_response(
+        let resp = cors_response(
             413,
             error_json(&format!("el body de la request supera el límite configurado ({max_body_bytes} bytes) -- ver --max-body-bytes/LINK_MAX_BODY_BYTES")),
             &cors_headers,
-        ));
+            &request,
+        );
+        let _ = request.respond(resp);
         // Todavía no se resolvió ningún `service.rpc` (eso pasa recién al
         // parsear el body) -- `None`, mismo criterio que cualquier rechazo
         // que ocurre antes de llegar tan lejos.
@@ -804,7 +809,8 @@ fn handle_request(
             "database": db_status,
         })
         .to_string();
-        let _ = request.respond(cors_response(status, health_json, &cors_headers));
+        let resp = cors_response(status, health_json, &cors_headers, &request);
+        let _ = request.respond(resp);
         log_done(log, req_id, Some("health"), status, start, "");
         return;
     }
@@ -837,7 +843,8 @@ fn handle_request(
         let size_bytes = db.size_bytes();
         let oversized_notify_drop_counts = db.oversized_notify_drop_counts();
         let metrics_text = metrics_store.lock().render_prometheus_text(&subscriber_counts, size_bytes, &oversized_notify_drop_counts);
-        let _ = request.respond(cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None));
+        let resp = cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None, &request);
+        let _ = request.respond(resp);
         log_done(log, req_id, Some("metrics"), 200, start, "");
         return;
     }
@@ -845,12 +852,14 @@ fn handle_request(
     let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, &route_table) {
         Ok(resolved) => resolved,
         Err(None) => {
-            let _ = request.respond(cors_response(404, error_json("URL debe tener la forma /Service/method"), &cors_headers));
+            let resp = cors_response(404, error_json("URL debe tener la forma /Service/method"), &cors_headers, &request);
+            let _ = request.respond(resp);
             log_done(log, req_id, None, 404, start, "");
             return;
         }
         Err(Some(msg)) => {
-            let _ = request.respond(cors_response(400, error_json(&msg), &cors_headers));
+            let resp = cors_response(400, error_json(&msg), &cors_headers, &request);
+            let _ = request.respond(resp);
             log_done(log, req_id, None, 400, start, &format!("error={msg:?}"));
             return;
         }
@@ -863,7 +872,8 @@ fn handle_request(
     // NOMBRE sin mirar sus anotaciones. 404, no 403 -- desde afuera, este
     // rpc "no existe" como endpoint, exactamente como uno mal escrito.
     if is_cron_member(&program, service_name, rpc_name) {
-        let _ = request.respond(cors_response(404, error_json("no existe ese rpc"), &cors_headers));
+        let resp = cors_response(404, error_json("no existe ese rpc"), &cors_headers, &request);
+        let _ = request.respond(resp);
         log_done(log, req_id, Some(&method), 404, start, "");
         return;
     }
@@ -905,7 +915,8 @@ fn handle_request(
         };
         if !allowed {
             metrics_store.lock().record_rate_limit_rejection(&method);
-            let _ = request.respond(cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers));
+            let resp = cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers, &request);
+            let _ = request.respond(resp);
             log_done(log, req_id, Some(&method), 429, start, "");
             return;
         }
@@ -919,7 +930,8 @@ fn handle_request(
     let token = extract_bearer_token(&request);
     let auth_gate = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name);
     if let Err((status, msg)) = auth_gate.outcome {
-        let _ = request.respond(cors_response(status, error_json(msg), &cors_headers));
+        let resp = cors_response(status, error_json(msg), &cors_headers, &request);
+        let _ = request.respond(resp);
         log_done_with_audit(log, req_id, Some(&method), status, start, &format!("error={msg:?}"), auth_gate.audit.as_ref());
         return;
     }
@@ -942,7 +954,8 @@ fn handle_request(
                 Err(e) => {
                     let status = status_for(&e);
                     let msg = e.to_string();
-                    let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
+                    let resp = cors_response(status, error_json(&msg), &cors_headers, &request);
+                    let _ = request.respond(resp);
                     log_done_with_audit(log, req_id, Some(&method), status, start, &format!("error={msg:?}"), auth_audit.as_ref());
                 }
             }
@@ -965,7 +978,8 @@ fn handle_request(
             Err(e) => {
                 let status = status_for(&e);
                 let msg = e.to_string();
-                let _ = request.respond(cors_response(status, error_json(&msg), &cors_headers));
+                let resp = cors_response(status, error_json(&msg), &cors_headers, &request);
+                let _ = request.respond(resp);
                 log_done_with_audit(log, req_id, Some(&method), status, start, &format!("error={msg:?}"), auth_audit.as_ref());
                 return;
             }
@@ -992,7 +1006,8 @@ fn handle_request(
         // 30 requests concurrentes insertaron 2 filas para un solo cargo).
         match idempotency_store.lock().reserve(service_name, rpc_name, key, &request_hash) {
             Lookup::Hit { status, body: cached_body, content_type } => {
-                let _ = request.respond(cors_response_with_type(status, cached_body, &content_type, &cors_headers, None, None));
+                let resp = cors_response_with_type(status, cached_body, &content_type, &cors_headers, None, None, &request);
+                let _ = request.respond(resp);
                 log_done_with_audit(log, req_id, Some(&method), status, start, "idempotent=\"replayed\"", auth_audit.as_ref());
                 db.clear_request_context();
                 return;
@@ -1001,7 +1016,8 @@ fn handle_request(
                 let msg = format!(
                     "'Idempotency-Key: {key}' ya se usó en '{method}' con un body distinto -- generá una clave nueva para una operación distinta"
                 );
-                let _ = request.respond(cors_response(409, error_json(&msg), &cors_headers));
+                let resp = cors_response(409, error_json(&msg), &cors_headers, &request);
+                let _ = request.respond(resp);
                 log_done_with_audit(log, req_id, Some(&method), 409, start, &format!("error={msg:?}"), auth_audit.as_ref());
                 db.clear_request_context();
                 return;
@@ -1010,7 +1026,8 @@ fn handle_request(
                 let msg = format!(
                     "'Idempotency-Key: {key}' ya tiene una request en vuelo para '{method}' -- esperá a que termine antes de reintentar"
                 );
-                let _ = request.respond(cors_response(409, error_json(&msg), &cors_headers));
+                let resp = cors_response(409, error_json(&msg), &cors_headers, &request);
+                let _ = request.respond(resp);
                 log_done_with_audit(log, req_id, Some(&method), 409, start, "idempotent=\"in-flight\"", auth_audit.as_ref());
                 db.clear_request_context();
                 return;
@@ -1030,7 +1047,8 @@ fn handle_request(
     let cache_key = cache_ttl.map(|_| args_json.to_string());
     if let (Some(_), Some(key)) = (cache_ttl, &cache_key) {
         if let Some((status, body, content_type)) = cache_store.lock().get(service_name, rpc_name, key) {
-            let _ = request.respond(cors_response_with_type(status, body, &content_type, &cors_headers, None, None));
+            let resp = cors_response_with_type(status, body, &content_type, &cors_headers, None, None, &request);
+            let _ = request.respond(resp);
             log_done_with_audit(log, req_id, Some(&method), status, start, "cache=\"hit\"", auth_audit.as_ref());
             db.clear_request_context();
             return;
@@ -1084,14 +1102,16 @@ fn handle_request(
     } else {
         String::new()
     };
-    let _ = request.respond(cors_response_with_type(
+    let resp = cors_response_with_type(
         status,
         response_body,
         &response_type,
         &cors_headers,
         response_location.as_deref(),
         response_cache_control.as_deref(),
-    ));
+        &request,
+    );
+    let _ = request.respond(resp);
     // GRAMMAR.md §3.149: alcance v0 -- solo el camino de dispatch NORMAL de
     // un rpc suma acá. Un hit de `@idempotent`/`@cache` (arriba, ambos
     // devuelven ANTES de llegar hasta acá) y un `stream` (spawneado en su
@@ -1816,8 +1836,42 @@ fn error_json(message: &str) -> String {
 
 const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
-fn cors_response(status: u16, body: String, cors: &CorsHeaders) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    cors_response_with_type(status, body, JSON_CONTENT_TYPE, cors, None, None)
+/// `true` si la request declaró soportar `gzip` en `Accept-Encoding` (RFC
+/// 9110 §12.5.3) -- mismo patrón de lectura de headers que ya usa este
+/// archivo para `Origin`/`X-Service-Api-Key` más arriba. Un cliente que no
+/// lo manda (o pide otra cosa, `br`/`deflate` sin `gzip`) recibe la
+/// respuesta sin comprimir, byte a byte igual que antes de esta ronda.
+fn accepts_gzip(request: &tiny_http::Request) -> bool {
+    request
+        .headers()
+        .iter()
+        .any(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Accept-Encoding") && h.value.as_str().to_ascii_lowercase().contains("gzip"))
+}
+
+/// Bajo qué tamaño de body NO vale la pena comprimir -- el propio overhead
+/// de GZIP (cabecera + checksum + tabla de Huffman) puede superar el ahorro
+/// real en una respuesta chica. Mismo orden de magnitud que el
+/// `gzip_min_length` que la mayoría de servidores reales (nginx, etc.) usan
+/// por default.
+const GZIP_MIN_BODY_BYTES: usize = 1024;
+
+/// `Some(bytes comprimidos)` si el cliente declaró soportar gzip Y el body
+/// supera el umbral mínimo -- `None` en cualquier otro caso (incluido un
+/// error de compresión, aunque escribir sobre un `Vec<u8>` en memoria no
+/// debería fallar nunca). El body sin comprimir es SIEMPRE una respuesta
+/// válida, así que cualquier duda cae para ese lado.
+fn maybe_gzip(body: &str, request_accepts_gzip: bool) -> Option<Vec<u8>> {
+    if !request_accepts_gzip || body.len() < GZIP_MIN_BODY_BYTES {
+        return None;
+    }
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(body.as_bytes()).ok()?;
+    encoder.finish().ok()
+}
+
+fn cors_response(status: u16, body: String, cors: &CorsHeaders, request: &tiny_http::Request) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
+    cors_response_with_type(status, body, JSON_CONTENT_TYPE, cors, None, None, request)
 }
 
 /// Igual que `cors_response` pero con el Content-Type que pidió el rpc
@@ -1853,12 +1907,24 @@ fn cors_response_with_type(
     cors: &CorsHeaders,
     location: Option<&str>,
     cache_control: Option<&str>,
+    request: &tiny_http::Request,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type_value.as_bytes())
         .unwrap_or_else(|_| {
             tiny_http::Header::from_bytes(&b"Content-Type"[..], JSON_CONTENT_TYPE.as_bytes()).unwrap()
         });
-    let mut response = tiny_http::Response::from_string(body).with_status_code(status).with_header(content_type);
+    // GRAMMAR.md §3.180: `Response::from_data`/`from_string` devuelven el
+    // MISMO tipo (`Response<Cursor<Vec<u8>>>`) -- por eso las dos ramas
+    // (comprimida/sin comprimir) pueden convivir en una sola variable
+    // `response` sin duplicar el resto de esta función más abajo.
+    let mut response = match maybe_gzip(&body, accepts_gzip(request)) {
+        Some(gzipped) => {
+            let response = tiny_http::Response::from_data(gzipped).with_status_code(status).with_header(content_type);
+            let encoding = tiny_http::Header::from_bytes(&b"Content-Encoding"[..], &b"gzip"[..]).unwrap();
+            response.with_header(encoding)
+        }
+        None => tiny_http::Response::from_string(body).with_status_code(status).with_header(content_type),
+    };
     if let Some(url) = location {
         if let Ok(location_header) = tiny_http::Header::from_bytes(&b"Location"[..], url.as_bytes()) {
             response = response.with_header(location_header);

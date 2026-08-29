@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.136.0] - 2026-08-29
+
+### ✨ Nuevo
+**Compresión GZIP de la respuesta HTTP** -- segundo ítem de "mejoremos estos límites y las fricciones", junto al rate limiter distribuido (v1.134.0). Transparente: sin flag nuevo, sin anotación nueva. Si la request trae `Accept-Encoding: gzip`, la respuesta viaja comprimida con `Content-Encoding: gzip`; si no, byte a byte igual que antes de esta ronda.
+
+- Solo GZIP, no brotli -- alcance v0 deliberado, `flate2` es la única dependencia nueva razonable acá (segunda excepción real a "cero dependencias nuevas" del proyecto, después de `regex`).
+- Umbral mínimo de 1024 bytes (`GZIP_MIN_BODY_BYTES`, mismo orden de magnitud que el default de nginx) -- un body chico no se comprime aunque el cliente lo acepte, evita gastar CPU sin ahorro real.
+- Un `stream` (SSE) queda excluido de forma estructural, no por un chequeo aparte -- ese camino escribe chunked transfer encoding a mano, nunca pasa por el único punto donde se decide comprimir (`cors_response_with_type`).
+- `client.ts` no necesita ningún cambio -- `fetch` del browser/Node descomprime GZIP solo.
+
+**Verificado contra un `linkc serve` real** (subprocess + `TcpStream`, mismo estilo que el resto de `server_http.rs`): un body grande con `Accept-Encoding: gzip` comprime y descomprime al JSON exacto esperado; el mismo body sin ese header no comprime; un body chico con el header tampoco comprime (umbral). Suite completa sin regresiones. Ver GRAMMAR.md §3.180.
+
 ## [1.135.1] - 2026-08-29
 
 ### 🔧 Proceso

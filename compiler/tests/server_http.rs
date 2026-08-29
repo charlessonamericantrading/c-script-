@@ -210,6 +210,59 @@ impl ServeProcess {
         (status, json)
     }
 
+    /// Como `post`, pero deja elegir si mandar `Accept-Encoding: gzip` y
+    /// devuelve los headers crudos + el body SIN decodificar -- necesario
+    /// para probar compresión (GRAMMAR.md §3.180), donde `post` (que asume
+    /// que el body siempre es JSON de texto plano) no sirve: un body
+    /// comprimido no parsea como JSON hasta pasar por `flate2::read::GzDecoder`.
+    fn post_raw(&self, path: &str, body: &Value, accept_gzip: bool) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", self.port)).expect("conectar al servidor 'linkc serve' real");
+        let body_str = body.to_string();
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            self.port,
+            body_str.len()
+        );
+        if accept_gzip {
+            request.push_str("Accept-Encoding: gzip\r\n");
+        }
+        request.push_str("\r\n");
+        request.push_str(&body_str);
+        stream.write_all(request.as_bytes()).expect("escribir la request HTTP");
+        stream.flush().ok();
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("leer la línea de estado HTTP");
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("línea de estado HTTP inesperada: {status_line:?}"));
+
+        let mut content_length = 0usize;
+        let mut headers = Vec::new();
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("leer un header de la respuesta");
+            if n == 0 || line.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.trim().split_once(':') {
+                let k = k.trim().to_string();
+                let v = v.trim().to_string();
+                if k.eq_ignore_ascii_case("content-length") {
+                    content_length = v.parse().unwrap_or(0);
+                }
+                headers.push((k, v));
+            }
+        }
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf).expect("leer el body de la respuesta");
+        (status, headers, buf)
+    }
+
     /// Termina el proceso hijo por su PID exacto (`Child::kill`, jamás un
     /// kill por nombre de imagen) -- `serve()` corre un loop infinito sobre
     /// `incoming_requests()` sin ningún camino de apagado limpio por señal
@@ -901,6 +954,75 @@ fn a_cron_rpc_is_never_reachable_over_http_even_at_its_default_path() {
     // de que is_cron_member exista solo en el papel.
     let (status, body) = server.post("/Jobs/tick", &json!({}), None);
     assert_eq!(status, 404, "un rpc @cron no puede ser invocado por HTTP, ni siquiera en su path por defecto: {body:?}");
+    server.shutdown();
+}
+
+// ---- Compresión GZIP de la respuesta HTTP (GRAMMAR.md §3.180) ----
+
+/// El string se arma en Rust (no con un método de stdlib de c-script como
+/// `.repeat()`, que puede no existir) y se incrusta como literal en el
+/// código fuente del programa de prueba -- 2000 bytes supera con margen el
+/// umbral `GZIP_MIN_BODY_BYTES` (1024) de `runtime/server.rs`.
+fn big_body_program() -> String {
+    let big = "x".repeat(2000);
+    format!(
+        r#"
+        service Big {{
+            rpc bigString() -> String {{ "{big}" }}
+            rpc smallString() -> String {{ "hola" }}
+        }}
+        "#
+    )
+}
+
+#[test]
+fn a_large_response_is_gzip_compressed_when_the_client_accepts_it_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("gzip-large-accepted", &big_body_program());
+
+    let (status, headers, raw_body) = server.post_raw("/Big/bigString", &json!({}), true);
+    assert_eq!(status, 200);
+    let content_encoding = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Content-Encoding")).map(|(_, v)| v.as_str());
+    assert_eq!(content_encoding, Some("gzip"), "un body grande con Accept-Encoding: gzip debe comprimirse -- headers: {headers:?}");
+
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(&raw_body[..]);
+    let mut decoded = String::new();
+    decoder.read_to_string(&mut decoded).expect("el body debe ser un stream GZIP válido");
+    let value: Value = serde_json::from_str(&decoded).expect("descomprimido, el body debe ser el JSON esperado");
+    assert_eq!(value.as_str().unwrap().len(), 2000, "el contenido real tiene que sobrevivir el viaje comprimido/descomprimido");
+
+    server.shutdown();
+}
+
+#[test]
+fn a_large_response_is_not_compressed_when_the_client_does_not_accept_gzip_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("gzip-large-not-accepted", &big_body_program());
+
+    let (status, headers, raw_body) = server.post_raw("/Big/bigString", &json!({}), false);
+    assert_eq!(status, 200);
+    assert!(
+        headers.iter().all(|(k, _)| !k.eq_ignore_ascii_case("Content-Encoding")),
+        "sin Accept-Encoding: gzip no debe agregarse Content-Encoding -- headers: {headers:?}"
+    );
+    let value: Value = serde_json::from_slice(&raw_body).expect("sin Accept-Encoding, el body es JSON de texto plano sin comprimir");
+    assert_eq!(value.as_str().unwrap().len(), 2000);
+
+    server.shutdown();
+}
+
+#[test]
+fn a_small_response_is_not_compressed_even_when_the_client_accepts_gzip_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("gzip-small-body", &big_body_program());
+
+    let (status, headers, raw_body) = server.post_raw("/Big/smallString", &json!({}), true);
+    assert_eq!(status, 200);
+    assert!(
+        headers.iter().all(|(k, _)| !k.eq_ignore_ascii_case("Content-Encoding")),
+        "un body chico no debe comprimirse aunque el cliente lo acepte -- GZIP_MIN_BODY_BYTES, headers: {headers:?}"
+    );
+    let value: Value = serde_json::from_slice(&raw_body).expect("body sin comprimir debe ser JSON de texto plano");
+    assert_eq!(value, "hola");
+
     server.shutdown();
 }
 
