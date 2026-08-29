@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.135.1] - 2026-08-29
+
+### 🔧 Proceso
+**v1.135.0 quedó con CI en rojo** -- pero el bug era del TEST, no del fix real. `adopt_existing_reads_and_writes_a_native_inet_column_mapped_to_string` sembraba su fila inicial con el cliente `postgres` crudo, bindeando `&str` como parámetro contra la columna `inet` -- el MISMO problema que motivó todo este round (el driver no sabe bindear texto contra un tipo nativo sin decodificación binaria), solo que en el cliente de prueba, no en `Cell::to_sql` de c-script. Arreglado sembrando con el literal embebido en el SQL (seguro -- son constantes fijas del test) en vez de un parámetro bindeado.
+
+**Verificado en CI contra Postgres real** -- el test que v1.135.0 no llegó a pasar ahora sí; confirma que el fix real (`postgres_string_cell`/`Cell::to_sql` para `uuid`/`inet`/`cidr`) funciona de punta a punta. Suite completa sin regresiones.
+
 ## [1.135.0] - 2026-08-29
 
 ### 🐛 Arreglado
