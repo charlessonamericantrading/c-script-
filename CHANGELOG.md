@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.136.1] - 2026-08-29
+
+### 🔧 Proceso
+**v1.136.0 quedó con CI en rojo** -- pero el bug era del PROCESO de release, no del código: al regenerar `examples/users.link.snap` localmente después de bumpear la versión, el comando corrió como `linkc test examples/users.link --update` -- sin el segundo argumento posicional (`examples/users.link.snap`) que `linkc test` en realidad requiere para saber a qué archivo escribir. El comando reportó "2 passed" y no tocó el snapshot en absoluto, así que el archivo committeado seguía con el stamp `v1.135.1` mientras el binario real ya decía `v1.136.0` -- CI (`linkc test examples/users.link examples/users.link.snap`, sin `--update`) lo detectó como deriva real en las dos plataformas (windows-latest y ubuntu-latest, mismo diff en ambas, confirmando que no era un problema de generación cross-platform sino simplemente el snapshot desactualizado).
+
+**Arreglado regenerando con los tres argumentos posicionales correctos** (`linkc test examples/users.link examples/users.link.snap --update`) -- el mismo comando exacto que sugiere el propio mensaje de error de CI. De paso, los archivos generados de `examples/taskboard/frontend/src/gen/*` también se resincronizaron al mismo patrón (solo el stamp de versión cambia, sin deriva de contenido).
+
+**Verificado en CI** -- el chequeo de deriva del contrato (GRAMMAR.md §3.29) que v1.136.0 no llegó a pasar en ninguna de las dos plataformas ahora sí. Suite completa sin regresiones.
+
 ## [1.136.0] - 2026-08-29
 
 ### ✨ Nuevo
