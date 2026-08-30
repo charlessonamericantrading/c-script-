@@ -1,6 +1,6 @@
 {
   "name": "link-lang",
-  "version": "1.150.2",
+  "version": "1.150.3",
   "description": "El compilador y runtime oficial para el lenguaje Link (End-to-End Type Safety con TypeScript)",
   "bin": {
     "linkc": "bin/linkc.js",
@@ -11,6 +11,9 @@
   ],
   "scripts": {
     "test": "node ./bin/linkc.js --version"
+  },
+  "dependencies": {
+    "cross-spawn": "^7.0.6"
   },
   "keywords": [
     "link",

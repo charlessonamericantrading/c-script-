@@ -5,7 +5,8 @@
 // 2. Usa el binario instalado globalmente en PATH o ~/.c-script/bin si existe.
 // 3. Si no existe, descarga automáticamente el binario precompilado desde GitHub Releases.
 
-const { spawn, spawnSync } = require('child_process');
+const crossSpawn = require('cross-spawn');
+const { spawnSync } = require('child_process');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -23,8 +24,32 @@ const repoLocalBinary = path.join(__dirname, '..', '..', 'compiler', 'target', '
 
 const args = process.argv.slice(2);
 
-function runBinary(binPath) {
-  const child = spawn(binPath, args, { stdio: 'inherit' });
+// Guarda contra recursión infinita: la rama 3 (abajo) puede resolver "linkc"
+// en el PATH y terminar encontrando OTRA instancia de ESTE MISMO script --
+// confirmado en vivo, ej. bajo `npx`, que agrega temporalmente
+// `node_modules/.bin` (con un shim apuntando de vuelta acá) al PATH antes de
+// correr nada. Sin esta guarda, ese hijo repetiría la MISMA búsqueda,
+// encontraría el MISMO shim, y así indefinidamente -- confirmado que produce
+// cientos de procesos `node.exe` reales en segundos, no una preocupación
+// teórica. `runBinary` marca esta variable de entorno en el hijo cuando
+// arranca vía PATH; si YA está marcada al arrancar, la rama 3 nunca se
+// intenta de nuevo -- pasa directo a la búsqueda/descarga normal.
+const REENTRANT_GUARD = 'LINKC_NPM_WRAPPER_REENTRANT';
+const isReentrant = process.env[REENTRANT_GUARD] === '1';
+
+// `cross-spawn` (no `child_process.spawn` a secas) porque la rama 3 puede
+// terminar lanzando un shim `.cmd`/`.bat` en vez de un `.exe` real -- Windows
+// nunca puede lanzar eso directo sin pasar por un shell, y la alternativa
+// obvia (`shell: true` + array de args) es exactamente el patrón que Node
+// mismo marcó inseguro (DEP0190: concatena argumentos sin escaparlos de
+// verdad -- un espacio o un `&` en un path/connection-string podría
+// romperse o inyectar). `cross-spawn` resuelve ambos problemas de forma
+// correcta y ya probada, sin que este wrapper tenga que reinventar el
+// quoting de línea de comandos de Windows a mano.
+function runBinary(binPath, viaPath) {
+  const opts = { stdio: 'inherit' };
+  if (viaPath) opts.env = { ...process.env, [REENTRANT_GUARD]: '1' };
+  const child = crossSpawn(binPath, args, opts);
   child.on('exit', (code) => process.exit(code || 0));
   child.on('error', (err) => {
     console.error(`Error al ejecutar ${binPath}:`, err.message);
@@ -174,15 +199,14 @@ if (fs.existsSync(repoLocalBinary)) {
 else if (fs.existsSync(cachedBinary)) {
   runBinary(cachedBinary);
 }
-// 3. Chequear en PATH global
-else {
-  const which = spawnSync(isWin ? 'where' : 'which', ['linkc']);
-  if (which.status === 0) {
-    runBinary('linkc');
-  } else {
-    // 4. Descargar automáticamente en demanda
-    downloadReleaseBinary((installedPath) => {
-      runBinary(installedPath);
-    });
-  }
+// 3. Chequear en PATH global -- salteada si ya estamos en un hijo reentrante
+// (ver REENTRANT_GUARD arriba), para no repetir la misma búsqueda que ya
+// llevó hasta acá.
+else if (!isReentrant && spawnSync(isWin ? 'where' : 'which', ['linkc']).status === 0) {
+  runBinary('linkc', true);
+} else {
+  // 4. Descargar automáticamente en demanda
+  downloadReleaseBinary((installedPath) => {
+    runBinary(installedPath);
+  });
 }
