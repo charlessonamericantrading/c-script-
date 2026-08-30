@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.150.1] - 2026-08-30
+
+### 🔧 Mantenimiento
+Regenera el snapshot del demo insignia (`examples/users.link.snap`) y los artefactos del ejemplo `taskboard` -- el bump de v1.149.0 a v1.150.0 no los había regenerado, y el string de versión estampado en cada header (GRAMMAR.md §3.83) hizo que CI detectara deriva real (GRAMMAR.md §3.29) en ambos runners. Sin cambio de comportamiento, un solo commit atómico código+artefactos esta vez para no repetir el error.
+
 ## [1.150.0] - 2026-08-30
 
 ### ✨ Nuevo
