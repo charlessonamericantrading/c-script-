@@ -282,3 +282,214 @@ pub fn import_postgres(program: &Program, url: &str, file: &ExportFile) -> Resul
     let db = Db::connect_postgres_for_testing(program, url, false)?;
     run_import(&db, &checker, &plans, file)
 }
+
+// ---- `linkc db shell` (GRAMMAR.md §3.189, PLAN.md §9.7 ítem 2 -- cierra la
+// suite de administración de datos): SQL arbitrario, de SOLO LECTURA, con
+// filas de tipo DINÁMICO -- a diferencia de `Backend::query` (`store.rs`,
+// reusado por export/import arriba), que exige `&[ColumnKind]` de antemano
+// porque siempre conoce la forma declarada. Acá no hay forma que conocer de
+// antemano: el usuario escribe SQL suelto, la forma del resultado solo se
+// sabe después de ejecutar. ----
+
+/// Una sentencia SQL contra SQLite, devuelta ya como texto -- headers +
+/// filas, cada celda formateada para mostrarse (nunca un `Value`/`Cell`
+/// tipado: no hay ningún `ColumnPlan` declarado que darle forma, el punto
+/// entero de un shell es aceptar CUALQUIER SQL). `rusqlite::Row::get_ref`
+/// decodifica cada celda SIN saber su tipo de antemano (`ValueRef` ya es un
+/// enum con Null/Integer/Real/Text/Blob) -- exactamente lo que hace falta
+/// acá y que `Backend::query` no ofrece.
+pub fn run_query_sqlite(connection: &Connection, sql: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    let mut stmt = connection.prepare(sql).map_err(|e| e.to_string())?;
+    let headers: Vec<String> = stmt.column_names().into_iter().map(str::to_string).collect();
+    let n = headers.len();
+    let mut rows_out = Vec::new();
+    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let mut cells = Vec::with_capacity(n);
+        for i in 0..n {
+            let text = match row.get_ref(i).map_err(|e| e.to_string())? {
+                rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                rusqlite::types::ValueRef::Integer(v) => v.to_string(),
+                rusqlite::types::ValueRef::Real(v) => v.to_string(),
+                rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                rusqlite::types::ValueRef::Blob(b) => format!("<blob, {} bytes>", b.len()),
+            };
+            cells.push(text);
+        }
+        rows_out.push(cells);
+    }
+    Ok((headers, rows_out))
+}
+
+/// Misma idea que `run_query_sqlite`, contra PostgreSQL real. `client.prepare`
+/// (no `client.query` directo) es lo que da los headers incluso cuando el
+/// resultado tiene CERO filas -- `Statement::columns()` está disponible antes
+/// de ejecutar nada, a diferencia de tratar de leerlos de la primera fila
+/// (que no existiría en ese caso).
+pub fn run_query_postgres(client: &mut postgres::Client, sql: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    let stmt = client.prepare(sql).map_err(|e| e.to_string())?;
+    let headers: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
+    let rows = client.query(&stmt, &[]).map_err(|e| e.to_string())?;
+    let mut rows_out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let mut cells = Vec::with_capacity(headers.len());
+        for (i, col) in row.columns().iter().enumerate() {
+            cells.push(format_pg_cell(row, i, col.type_()));
+        }
+        rows_out.push(cells);
+    }
+    Ok((headers, rows_out))
+}
+
+/// Formatea UNA celda de una fila Postgres a texto, sin conocer su tipo de
+/// antemano más que por el `Type` que la propia fila ya trae. Cubre los
+/// tipos nativos ya decodificados en algún lado de este proyecto (`uuid`
+/// vía `PgUuidText`, GRAMMAR.md §3.179; `numeric` vía `PgDecimal`, GRAMMAR.md
+/// §3.184 -- exacto, no el `PgNumeric` con pérdida que usa `Float`;
+/// `timestamp`/`timestamptz`/`date` vía `PgTimestampMicros`/`PgDateDays`,
+/// GRAMMAR.md §3.182, formateados ISO-8601 con `format_iso8601_millis`;
+/// `json`/`jsonb` vía `PgJsonText`, GRAMMAR.md §3.187) más los escalares
+/// nativos de `postgres-types`. Un tipo NO cubierto (`point`, `tsvector`,
+/// un tipo de extensión, etc.) cae a un placeholder legible -- nunca falla
+/// la consulta ENTERA por una sola columna de un tipo exótico.
+fn format_pg_cell(row: &postgres::Row, i: usize, ty: &postgres::types::Type) -> String {
+    use postgres::types::Type as PgType;
+    macro_rules! cell {
+        ($t:ty) => {
+            match row.try_get::<_, Option<$t>>(i) {
+                Ok(Some(v)) => v.to_string(),
+                Ok(None) => "NULL".to_string(),
+                Err(e) => format!("<error: {e}>"),
+            }
+        };
+    }
+    match *ty {
+        PgType::BOOL => cell!(bool),
+        PgType::INT2 => cell!(i16),
+        PgType::INT4 => cell!(i32),
+        PgType::INT8 => cell!(i64),
+        PgType::FLOAT4 => cell!(f32),
+        PgType::FLOAT8 => cell!(f64),
+        PgType::TEXT | PgType::VARCHAR | PgType::BPCHAR | PgType::NAME => cell!(String),
+        PgType::UUID => match row.try_get::<_, Option<crate::runtime::store::PgUuidText>>(i) {
+            Ok(Some(crate::runtime::store::PgUuidText(s))) => s,
+            Ok(None) => "NULL".to_string(),
+            Err(e) => format!("<error: {e}>"),
+        },
+        PgType::NUMERIC => match row.try_get::<_, Option<crate::runtime::store::PgDecimal>>(i) {
+            Ok(Some(crate::runtime::store::PgDecimal(raw))) => crate::runtime::format_decimal(raw),
+            Ok(None) => "NULL".to_string(),
+            Err(e) => format!("<error: {e}>"),
+        },
+        PgType::TIMESTAMP | PgType::TIMESTAMPTZ => match row.try_get::<_, Option<crate::runtime::store::PgTimestampMicros>>(i) {
+            Ok(Some(crate::runtime::store::PgTimestampMicros(micros))) => {
+                format_iso8601_millis(crate::runtime::timestamp::millis_from_pg_timestamp_micros(micros))
+            }
+            Ok(None) => "NULL".to_string(),
+            Err(e) => format!("<error: {e}>"),
+        },
+        PgType::DATE => match row.try_get::<_, Option<crate::runtime::store::PgDateDays>>(i) {
+            Ok(Some(crate::runtime::store::PgDateDays(days))) => {
+                format_iso8601_millis(crate::runtime::timestamp::millis_from_pg_date_days(days))
+            }
+            Ok(None) => "NULL".to_string(),
+            Err(e) => format!("<error: {e}>"),
+        },
+        PgType::JSON | PgType::JSONB => match row.try_get::<_, Option<crate::runtime::store::PgJsonText>>(i) {
+            Ok(Some(crate::runtime::store::PgJsonText(s))) => s,
+            Ok(None) => "NULL".to_string(),
+            Err(e) => format!("<error: {e}>"),
+        },
+        ref other => format!("<tipo no soportado: {other}>"),
+    }
+}
+
+/// Tabla alineada -- mismo espíritu que las columnas alineadas de `db
+/// inspect` (`main.rs::cmd_db_inspect`), extendido a un número arbitrario de
+/// columnas (acá no se sabe cuántas ni cuáles hasta ejecutar la consulta).
+fn format_table(headers: &[String], rows: &[Vec<String>]) -> String {
+    if headers.is_empty() {
+        return "(sin columnas)".to_string();
+    }
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    let pad = |s: &str, w: usize| format!("{s}{}", " ".repeat(w.saturating_sub(s.chars().count())));
+    let mut out = String::new();
+    out.push_str(&headers.iter().zip(&widths).map(|(h, w)| pad(h, *w)).collect::<Vec<_>>().join("  "));
+    out.push('\n');
+    out.push_str(&widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("  "));
+    for row in rows {
+        out.push('\n');
+        out.push_str(&row.iter().zip(&widths).map(|(c, w)| pad(c, *w)).collect::<Vec<_>>().join("  "));
+    }
+    out.push('\n');
+    out.push_str(&format!("({} fila(s))", rows.len()));
+    out
+}
+
+/// El loop del REPL en sí -- genérico sobre CÓMO se corre una consulta
+/// (`run_one`), así que SQLite y Postgres comparten exactamente el mismo
+/// bucle de lectura/impresión, solo difieren en cómo abren la conexión.
+/// Mismo patrón de "loop bloqueante, sin async, leyendo stdin línea por
+/// línea" que `Lsp::run_stdio` (`lsp.rs`) ya usa -- acá con framing MUCHO
+/// más simple: una línea de entrada es una consulta completa, sin el
+/// `Content-Length` que LSP sí necesita (no hay protocolo que respetar).
+/// Línea vacía, `.exit`/`.quit`, o EOF (cerrar stdin) terminan el loop
+/// limpio -- mismo criterio de cierre que `Lsp::run_stdio` usa para EOF.
+/// Después de cada consulta (éxito o error) se imprime un separador fijo
+/// (`--fin--`) -- así un cliente automatizado (`cli_db_shell.rs`) sabe
+/// exactamente dónde termina una respuesta sin tener que adivinar por la
+/// forma del resultado.
+fn run_shell_loop(mut run_one: impl FnMut(&str) -> Result<(Vec<String>, Vec<Vec<String>>), String>) -> Result<(), String> {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    loop {
+        print!("db> ");
+        let _ = stdout.flush();
+        let mut line = String::new();
+        let n = stdin.lock().read_line(&mut line).map_err(|e| e.to_string())?;
+        if n == 0 {
+            println!();
+            return Ok(());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == ".exit" || trimmed == ".quit" {
+            return Ok(());
+        }
+        match run_one(trimmed) {
+            Ok((headers, rows)) => println!("{}", format_table(&headers, &rows)),
+            Err(e) => println!("error: {e}"),
+        }
+        println!("--fin--");
+        let _ = stdout.flush();
+    }
+}
+
+/// `linkc db shell <archivo.link> [--db <url|archivo>]` contra SQLite --
+/// mismo `SQLITE_OPEN_READ_ONLY` que `inspect_sqlite` (`inspect.rs`) usa:
+/// SQLite mismo rechaza cualquier escritura para esta conexión, sin
+/// necesitar parsear el SQL a mano para adivinar si es un `SELECT`.
+pub fn run_shell_sqlite(db_path: &Path) -> Result<(), String> {
+    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("no se pudo abrir '{}' de solo lectura: {e}", db_path.display()))?;
+    run_shell_loop(|sql| run_query_sqlite(&connection, sql))
+}
+
+/// Misma idea, contra PostgreSQL real. No existe un modo de conexión de
+/// solo-lectura en este código todavía (a diferencia de SQLite) -- acá es
+/// donde hace falta por primera vez: `SET default_transaction_read_only =
+/// on`, UNA vez después de conectar, hace que el SERVIDOR MISMO rechace
+/// cualquier escritura de esta sesión, para cualquier SQL que el usuario
+/// escriba -- más robusto que parsear palabras clave del lado del cliente
+/// (un `WITH x AS (INSERT ...) SELECT ...` engañaría un parser de
+/// keywords, nunca a Postgres mismo).
+pub fn run_shell_postgres(url: &str) -> Result<(), String> {
+    let mut client = connect_postgres_client(url)?;
+    client.batch_execute("SET default_transaction_read_only = on").map_err(|e| e.to_string())?;
+    run_shell_loop(|sql| run_query_postgres(&mut client, sql))
+}

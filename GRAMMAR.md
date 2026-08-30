@@ -210,6 +210,7 @@
   - [3.186 `builtin_args!`: fast-path para curar un builtin nuevo — RESUELTO (tooling interno, no una feature del lenguaje)](#3186-builtin_args-fast-path-para-curar-un-builtin-nuevo--resuelto-tooling-interno-no-una-feature-del-lenguaje)
   - [3.187 `String` contra `json`/`jsonb` NATIVOS de Postgres — RESUELTO](#3187-string-contra-jsonjsonb-nativos-de-postgres--resuelto)
   - [3.188 Lint `manual-role-check-without-requires` — RESUELTO](#3188-lint-manual-role-check-without-requires--resuelto)
+  - [3.189 `linkc db shell` — RESUELTO, cierra PLAN.md §9.7 ítem 2](#3189-linkc-db-shell--resuelto-cierra-planmd-97-ítem-2)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6945,6 +6946,40 @@ lint: 1 advertencia(s) en app.link:
 **Recorrido exhaustivo por variante de `Expr`/`Stmt`** (`block_calls_auth_identity`/`expr_calls_auth_identity`, `lint.rs`), mismo patrón y mismo motivo que `block_uses_ident`/`expr_count_ident` ya establecen para `unused-var` (issue #11, GRAMMAR.md §3.115) -- una llamada a `auth.currentRole()` escondida adentro de una closure o un `match` tiene que seguir siendo visible; omitir un arm acá sería el mismo tipo de falso negativo silencioso que esa ronda ya encontró y cerró para otro lint.
 
 **Verificado**: 7 tests unitarios en `lint.rs` (positivo con `currentRole()`, positivo con `currentUserId()`, negativo con `@requires` real presente, negativo `@cron`, negativo sin ninguna llamada de auth, y dos casos de recorrido -- adentro de una closure y adentro de un `match` -- confirmando que el detector no se queda corto como `unused-var` una vez se quedó). 1 test de CLI contra el binario real (`cli_fmt_lint.rs`).
+
+### 3.189 `linkc db shell` — RESUELTO, cierra PLAN.md §9.7 ítem 2
+
+Última pieza de la suite de administración de datos que §3.175 (`inspect`) y §3.185 (`export`/`import`) dejaron pendiente. Un REPL de solo lectura sobre stdin/stdout: una línea de entrada = una consulta SQL, ejecutada contra la base real del `.link` dado -- sin conocer de antemano qué SQL va a llegar, así que hace falta un camino de "SQL arbitrario, filas de tipo dinámico" que no existía en ningún lado de este proyecto hasta ahora (`Backend::query`, el camino que `db.<coll>.find/all/...` usa, exige `&[ColumnKind]` de antemano).
+
+```
+$ linkc db shell app.link --db app.db
+db> SELECT id, name, price FROM items;
+id  name    price 
+--  ------  ------
+1   Widget  199900
+(1 fila(s))
+--fin--
+db> INSERT INTO items (name, price) VALUES ('hack', 1);
+error: attempt to write a readonly database
+--fin--
+db> .exit
+```
+
+**Mismo criterio de "loop bloqueante, sin async" que `Lsp::run_stdio`, con un framing MUCHO más simple** -- una línea completa es una consulta completa, sin el `Content-Length` que LSP necesita porque ahí sí hay un protocolo real que respetar. `resolve_db_source`/`--db`/`LINK_DATABASE_URL` se reusan idénticos a `inspect`/`export`/`import` -- `cmd_db_shell` (`main.rs`) deliberadamente NO llama a `load_and_check`: el shell no necesita el `.link` validado, solo el nombre del archivo para que `resolve_db_source` derive el `.db` por defecto.
+
+**Filas de tipo dinámico, sin `ColumnPlan` -- la única pieza genuinamente nueva.** SQLite: `Statement::column_names()` para los headers, `Row::get_ref(i) -> ValueRef` (ya un enum `Null`/`Integer`/`Real`/`Text`/`Blob`) para leer cada celda sin saber su tipo de antemano. Postgres: `Statement::columns()`/`Row::columns()` traen `.name()`/`.type_()` por columna -- `format_pg_cell` (`db_admin.rs`) hace dispatch manual por `Type`, reusando los decodificadores que ya existían para otro propósito: `PgUuidText` (§3.179), `PgDecimal` + `format_decimal` (§3.184, el camino EXACTO, no el `PgNumeric` con pérdida que usa `Float`), `PgTimestampMicros`/`PgDateDays` (§3.182), `PgJsonText` (§3.187). Un tipo no cubierto (`point`, `tsvector`, una extensión) cae a `<tipo no soportado: {ty}>` -- nunca falla la consulta ENTERA por una sola columna exótica. Las cinco structs de decodificación (`PgTimestampMicros`, `PgDateDays`, `PgDecimal`, `PgUuidText`, `PgJsonText`) pasaron de privadas del módulo a `pub(crate)` -- mismo movimiento de visibilidad que `ColumnPlan`/`sqlite_table_exists` ya tuvieron en rondas anteriores, sin cambio de comportamiento.
+
+**Solo lectura -- SQLite por CONEXIÓN, Postgres por SESIÓN, nunca parseando el SQL a mano.** SQLite abre `SQLITE_OPEN_READ_ONLY` (idéntico a `inspect`) -- el propio motor rechaza cualquier escritura. Postgres no tenía ningún modo de conexión de solo lectura en este código hasta ahora -- `db shell` es el primero en necesitarlo: `client.batch_execute("SET default_transaction_read_only = on")` una única vez después de conectar hace que el SERVIDOR rechace cualquier escritura de esa sesión para cualquier SQL que llegue, incluso un `WITH x AS (INSERT ...) SELECT ...` que engañaría a un parser de palabras clave del lado del cliente pero nunca a Postgres mismo.
+
+**Loop deliberadamente simple, con un separador fijo de fin-de-respuesta.** Línea vacía, `.exit`, `.quit`, o EOF (cerrar stdin) terminan el proceso limpio -- mismo criterio de cierre que `Lsp::run_stdio` usa para EOF. Un error (SQL inválido, escritura rechazada) se imprime y el loop sigue al siguiente prompt, nunca crashea. Después de CADA respuesta (éxito o error) se imprime `--fin--` como línea propia -- así un cliente automatizado sabe exactamente dónde termina una respuesta sin tener que adivinar por la forma variable del resultado (esto es lo que hace determinística la prueba contra el binario real, más abajo).
+
+**Límites honestos, deliberados**:
+- Una sentencia SQL por línea, sin soporte multi-línea ni separador `;` -- sin evidencia de demanda de algo más, y mucho más simple de testear determinísticamente.
+- Sin autocompletado, sin historial de comandos, sin edición de línea -- no hay `readline`/`rustyline`, una dependencia nueva fuera de alcance v0.
+- Muestra la fila en su representación FÍSICA de storage, no el valor lógico que un rpc real decodificaría -- un campo `Decimal` en SQLite aparece como su entero escalado crudo (`199900`, no `"19.9900"`), porque el shell no conoce el `.link` (SQL arbitrario, sin `ColumnPlan`). En Postgres esto no aplica para NUMERIC/UUID/TIMESTAMP/JSON (`format_pg_cell` los reconoce por el `Type` que la fila ya trae, sin necesitar el `.link`), pero SÍ para cualquier tipo que ese dispatch no cubra.
+- El placeholder de tipo-no-soportado en Postgres nunca falla la consulta entera -- una fila con una columna de un tipo exótico sigue siendo inspeccionable en sus otras columnas.
+
+**Verificado**: 6 tests de CLI contra el binario real (`cli_db_shell.rs`) -- un `SELECT` real contra una base poblada por un `linkc serve` real devuelve la fila real; un `INSERT` es rechazado con el mensaje real de conexión de solo lectura de SQLite y el loop sigue sirviendo después; SQL sintácticamente inválido reporta error sin tumbar el loop; `.exit`, línea vacía, y cierre de stdin terminan el proceso limpio con `child.wait()` en éxito. 2 tests contra Postgres real en `pg_integration.rs` -- `SET default_transaction_read_only` bloquea una escritura real del lado del SERVIDOR (confirmado con un conteo de filas aparte, no solo el texto del mensaje) y la sesión sigue sirviendo después; columnas nativas `numeric`/`uuid`/`jsonb` salen legibles (Decimal exacto vía `format_decimal`, UUID canónico, JSON comparado por valor -- jsonb reordena/renormaliza al guardar, §3.187, nunca por texto exacto). Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

@@ -145,6 +145,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc db inspect <archivo.link> [--db <url|archivo>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor')"));
     out(&format!("     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>] (vuelca cada colección declarada a un archivo JSON, byte-idéntico al wire real -- sin ejecutar ningún DDL)"));
     out(&format!("     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] (escribe las filas de un archivo de 'db export' contra un target, preservando el id original de cada fila -- un target vacío ES el caso 'seed')"));
+    out(&format!("     linkc db shell <archivo.link> [--db <url|archivo>] (REPL de solo lectura sobre stdin/stdout, una consulta SQL por línea -- SQLite abre de solo lectura, Postgres corre con default_transaction_read_only)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
     out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)"));
     out(&format!("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {{\"nombre_archivo\": puerto, ...}} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)"));
@@ -592,9 +593,10 @@ fn cmd_db(args: &[String]) -> ExitCode {
         Some("inspect") => cmd_db_inspect(&args[1..]),
         Some("export") => cmd_db_export(&args[1..]),
         Some("import") => cmd_db_import(&args[1..]),
+        Some("shell") => cmd_db_shell(&args[1..]),
         _ => {
             eprintln!(
-                "uso: linkc db inspect <archivo.link> [--db <url|archivo>]\n     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>]\n     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>]"
+                "uso: linkc db inspect <archivo.link> [--db <url|archivo>]\n     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>]\n     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>]\n     linkc db shell <archivo.link> [--db <url|archivo>]"
             );
             ExitCode::FAILURE
         }
@@ -777,6 +779,36 @@ fn cmd_db_import(args: &[String]) -> ExitCode {
         println!("  {name}  {n} fila(s) importadas");
     }
     println!("\n{} colección(es), {total_rows} fila(s) en total importadas", report.len());
+    ExitCode::SUCCESS
+}
+
+/// `linkc db shell <archivo.link> [--db <url|archivo>]` -- REPL de SOLO
+/// LECTURA sobre stdin/stdout, línea por línea (GRAMMAR.md §3.189, cierra
+/// PLAN.md §9.7 ítem 2, la suite de administración de datos). A diferencia
+/// de `inspect`/`export`/`import`, no necesita `load_and_check` -- el shell
+/// acepta SQL suelto, sin ninguna semántica de `.link` de por medio; el
+/// archivo de entrada solo le da a `resolve_db_source` el nombre por
+/// default de la base (`<archivo>.db`) si no hay `--db`/`LINK_DATABASE_URL`.
+fn cmd_db_shell(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("uso: linkc db shell <archivo.link> [--db <url|archivo>]");
+        return ExitCode::FAILURE;
+    };
+    let source = match resolve_db_source(path, args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("configuración de base de datos inválida: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = match &source {
+        runtime::server::DbSource::SqliteFile(db_path) => linkc::db_admin::run_shell_sqlite(db_path),
+        runtime::server::DbSource::Postgres(url) => linkc::db_admin::run_shell_postgres(url),
+    };
+    if let Err(msg) = result {
+        eprintln!("no se pudo iniciar el shell: {msg}");
+        return ExitCode::FAILURE;
+    }
     ExitCode::SUCCESS
 }
 

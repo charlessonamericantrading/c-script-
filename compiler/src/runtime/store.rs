@@ -417,7 +417,7 @@ fn postgres_int_cell(row: &postgres::Row, i: usize) -> Result<Option<i64>, Strin
 /// en vez de eso, mismo espíritu que el algoritmo de calendario de Hinnant
 /// en `runtime/timestamp.rs` -- un formato binario chico y documentado por
 /// el propio protocolo de Postgres no amerita una dependencia nueva.
-struct PgTimestampMicros(i64);
+pub(crate) struct PgTimestampMicros(pub(crate) i64);
 
 impl<'a> postgres::types::FromSql<'a> for PgTimestampMicros {
     fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
@@ -432,7 +432,7 @@ impl<'a> postgres::types::FromSql<'a> for PgTimestampMicros {
 
 /// Como `PgTimestampMicros`, para `date` nativo -- 4 bytes, entero de 32
 /// bits big-endian, DÍAS (no microsegundos) desde el mismo epoch 2000-01-01.
-struct PgDateDays(i32);
+pub(crate) struct PgDateDays(pub(crate) i32);
 
 impl<'a> postgres::types::FromSql<'a> for PgDateDays {
     fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
@@ -514,7 +514,7 @@ impl<'a> postgres::types::FromSql<'a> for PgNumeric {
 /// dígitos, más precisión que los 4 decimales de Decimal, redondea a
 /// 1234568 con el mismo `div_round` que el resto del tipo usa) antes de
 /// escribirlo acá.
-struct PgDecimal(i128);
+pub(crate) struct PgDecimal(pub(crate) i128);
 
 impl<'a> postgres::types::FromSql<'a> for PgDecimal {
     fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
@@ -634,7 +634,7 @@ fn decimal_scaled_to_pg_numeric_binary(raw: i128) -> Vec<u8> {
 /// documentado por el propio protocolo, no amerita sumar una dependencia
 /// nueva solo para esto -- mismo espíritu que `PgTimestampMicros`/`PgNumeric`
 /// arriba).
-struct PgUuidText(String);
+pub(crate) struct PgUuidText(pub(crate) String);
 
 impl<'a> postgres::types::FromSql<'a> for PgUuidText {
     fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
@@ -790,7 +790,7 @@ fn inet_string_to_binary(s: &str) -> Option<Vec<u8>> {
 /// antepone UN byte de versión (`0x01`, la única versión que el
 /// protocolo define hoy) antes del mismo texto.
 #[derive(Debug)]
-struct PgJsonText(String);
+pub(crate) struct PgJsonText(pub(crate) String);
 
 impl<'a> postgres::types::FromSql<'a> for PgJsonText {
     fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {

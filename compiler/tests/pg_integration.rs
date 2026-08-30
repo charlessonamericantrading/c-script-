@@ -4338,3 +4338,175 @@ fn generated_ddl_applies_cleanly_as_a_role_without_superuser_or_createrole() {
 
     admin.batch_execute(&format!("DROP TABLE IF EXISTS \"{COLLECTION}\"; DROP ROLE IF EXISTS {role};")).ok();
 }
+
+// ---- `linkc db shell` contra PostgreSQL real (GRAMMAR.md §3.189) ----
+//
+// `cli_db_shell.rs` ya prueba el subproceso real contra SQLite -- lo que
+// SOLO Postgres puede probar es que `SET default_transaction_read_only = on`
+// (`db_admin.rs::run_shell_postgres`) de verdad bloquea una escritura del
+// lado del SERVIDOR (no un parser de palabras clave del cliente, que un
+// `WITH ... AS (INSERT ...) SELECT ...` engañaría), y que columnas nativas
+// no triviales (`numeric`/`uuid`/`jsonb`) salen legibles por
+// `format_pg_cell`, no como el placeholder de tipo-no-soportado.
+
+struct PgShellProcess {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+impl PgShellProcess {
+    fn start(link_path: &PathBuf, url: &str) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_linkc"))
+            .arg("db")
+            .arg("shell")
+            .arg(link_path)
+            .arg("--db")
+            .arg(url)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("no se pudo iniciar 'linkc db shell' contra Postgres");
+        let stdin = child.stdin.take().expect("stdin del proceso hijo");
+        let stdout = BufReader::new(child.stdout.take().expect("stdout del proceso hijo"));
+        PgShellProcess { child, stdin, stdout }
+    }
+
+    fn send(&mut self, sql: &str) {
+        writeln!(self.stdin, "{sql}").expect("escribir la consulta al stdin del hijo");
+        self.stdin.flush().expect("flush del stdin del hijo");
+    }
+
+    /// Mismo despegue del prompt (`"db> "`, sin salto de línea, pegado a la
+    /// primera línea de cada respuesta) que `cli_db_shell.rs::ShellProcess::recv`.
+    fn recv(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut first = true;
+        loop {
+            let mut line = String::new();
+            let n = self.stdout.read_line(&mut line).expect("leer una línea del stdout del hijo");
+            assert_ne!(n, 0, "el proceso hijo cerró stdout antes de mandar '--fin--'");
+            let mut content = line.trim_end_matches(['\r', '\n']).to_string();
+            if first {
+                content = content.strip_prefix("db> ").unwrap_or(&content).to_string();
+                first = false;
+            }
+            if content == "--fin--" {
+                return lines;
+            }
+            lines.push(content);
+        }
+    }
+
+    fn shutdown(mut self) {
+        drop(self.stdin);
+        let status = self.child.wait().expect("esperar a que 'linkc db shell' termine");
+        assert!(status.success(), "linkc db shell debería salir limpio (código 0) al ver EOF en stdin, salió con {status:?}");
+    }
+}
+
+#[test]
+fn db_shell_read_only_session_blocks_a_real_write_enforced_by_the_server_against_postgres() {
+    const COLLECTION: &str = "items_db_shell_readonly";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como admin");
+    admin
+        .batch_execute(&format!("CREATE TABLE \"{COLLECTION}\" (\"id\" BIGSERIAL PRIMARY KEY, \"name\" TEXT NOT NULL)"))
+        .expect("crear la tabla");
+    admin.batch_execute(&format!("INSERT INTO \"{COLLECTION}\" (name) VALUES ('seed')")).expect("sembrar una fila");
+
+    let temp = TempDir::new("shell-readonly-pg");
+    let src = temp.write("app.link", &format!("type Item = {{ id: Int, name: String }}\ndb {{ {COLLECTION}: Item[] }}"));
+
+    let mut shell = PgShellProcess::start(&src, &url);
+    shell.send(&format!("INSERT INTO \"{COLLECTION}\" (name) VALUES ('hack')"));
+    let joined = shell.recv().join("\n");
+    assert!(joined.starts_with("error:"), "una escritura debe reportarse como error, no como resultado: {joined:?}");
+    assert!(
+        joined.to_lowercase().contains("read-only transaction"),
+        "el mensaje tiene que venir del SERVIDOR (default_transaction_read_only), no de un parser local de palabras clave: {joined:?}"
+    );
+
+    // Confirmar que el rechazo fue real, no solo el texto del mensaje.
+    let count: i64 = admin
+        .query_one(&format!("SELECT count(*) FROM \"{COLLECTION}\""), &[])
+        .expect("contar filas como admin")
+        .get(0);
+    assert_eq!(count, 1, "la fila 'hack' no debe existir de verdad -- el rechazo tiene que ser real: {joined:?}");
+
+    // El rechazo no debe tumbar la sesión -- confirmar que sigue sirviendo.
+    shell.send(&format!("SELECT count(*) FROM \"{COLLECTION}\""));
+    let joined2 = shell.recv().join("\n");
+    assert!(joined2.contains("1 fila(s)"), "el shell debe seguir respondiendo después del rechazo: {joined2:?}");
+
+    shell.shutdown();
+    admin.batch_execute(&format!("DROP TABLE IF EXISTS \"{COLLECTION}\"")).ok();
+}
+
+#[test]
+fn db_shell_formats_native_numeric_uuid_and_jsonb_columns_as_legible_text_against_postgres() {
+    const COLLECTION: &str = "items_db_shell_types";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como admin");
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"price\" NUMERIC NOT NULL, \
+                \"external_id\" UUID NOT NULL, \
+                \"properties\" JSONB NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla con columnas nativas no triviales");
+    admin
+        .batch_execute(&format!(
+            "INSERT INTO \"{COLLECTION}\" (price, external_id, properties) VALUES \
+             (19.99, '123e4567-e89b-12d3-a456-426614174000', '{{\"n\": 2}}'::jsonb)"
+        ))
+        .expect("sembrar una fila con tipos nativos no triviales");
+
+    let temp = TempDir::new("shell-types-pg");
+    let src = temp.write(
+        "app.link",
+        &format!("type Item = {{ id: Int, price: Decimal, externalId: String, properties: String }}\ndb {{ {COLLECTION}: Item[] }}"),
+    );
+
+    let mut shell = PgShellProcess::start(&src, &url);
+    shell.send(&format!("SELECT price, external_id, properties FROM \"{COLLECTION}\""));
+    let lines = shell.recv();
+    let joined = lines.join("\n");
+    assert!(!joined.contains("tipo no soportado"), "numeric/uuid/jsonb SÍ están cubiertos, no deberían caer al placeholder: {joined:?}");
+    assert!(joined.contains("19.9900"), "NUMERIC(19.99) debe mostrarse como Decimal escalado exacto vía format_decimal: {joined:?}");
+    assert!(
+        joined.contains("123e4567-e89b-12d3-a456-426614174000"),
+        "UUID debe mostrarse en su forma canónica de texto: {joined:?}"
+    );
+    // jsonb reordena/renormaliza al guardar (confirmado en la ronda que
+    // arregló GRAMMAR.md §3.187) -- comparar como VALOR json, no como texto
+    // exacto.
+    let properties_cell = lines
+        .iter()
+        .find(|l| l.contains('{') && l.contains('}'))
+        .unwrap_or_else(|| panic!("debe haber una celda con el jsonb sembrado: {lines:?}"));
+    let start = properties_cell.find('{').unwrap();
+    let end = properties_cell.rfind('}').unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&properties_cell[start..=end])
+        .unwrap_or_else(|e| panic!("la celda jsonb debe ser JSON válido ({e}): {properties_cell:?}"));
+    assert_eq!(parsed, serde_json::json!({"n": 2}));
+
+    shell.shutdown();
+    admin.batch_execute(&format!("DROP TABLE IF EXISTS \"{COLLECTION}\"")).ok();
+}

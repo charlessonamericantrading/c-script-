@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.145.0] - 2026-08-30
+
+### ✨ Nuevo
+**`linkc db shell <archivo.link> [--db <url|archivo>]`** (PLAN.md §9.7 ítem 2) -- última pieza de la suite de administración de datos, cierra el ítem entero junto con `db inspect`/`db export`/`db import`. REPL de SOLO LECTURA sobre stdin/stdout: una línea de entrada es una consulta SQL completa, ejecutada contra la base real -- mismo criterio de "loop bloqueante, sin async" que `Lsp::run_stdio`, con framing mucho más simple.
+
+- Camino nuevo de "SQL arbitrario, filas de tipo dinámico" -- SQLite vía `Row::get_ref`/`ValueRef`, Postgres vía dispatch manual por `Type` en `format_pg_cell`, reusando los decodificadores de rondas anteriores (`PgUuidText`/`PgDecimal`/`PgTimestampMicros`/`PgDateDays`/`PgJsonText`).
+- Solo lectura real: SQLite abre `SQLITE_OPEN_READ_ONLY`, Postgres corre `SET default_transaction_read_only = on` una vez tras conectar -- el SERVIDOR rechaza cualquier escritura de la sesión, robusto contra cualquier truco de SQL que engañaría a un parser de palabras clave del lado del cliente.
+- Un tipo Postgres no cubierto (`point`, `tsvector`, etc.) cae a un placeholder legible, nunca falla la consulta entera.
+
+**Verificado**: 6 tests de CLI contra el binario real + 2 contra Postgres real. Suite completa sin regresiones. Ver GRAMMAR.md §3.189.
+
 ## [1.144.0] - 2026-08-30
 
 ### ✨ Nuevo

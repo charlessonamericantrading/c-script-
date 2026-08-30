@@ -161,7 +161,7 @@ fn a_db_inspect_call_with_no_arguments_is_a_clean_usage_error() {
 
 #[test]
 fn an_unknown_db_sub_subcommand_is_a_clean_usage_error() {
-    let out = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("db").arg("shell").output().expect("ejecutar linkc db shell");
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("db").arg("bogus").output().expect("ejecutar linkc db bogus");
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("uso: linkc db inspect"), "{stderr}");
