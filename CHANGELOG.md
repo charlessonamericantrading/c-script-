@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.142.0] - 2026-08-30
+
+### 🔧 Interno
+**`builtin_args!`: fast-path para curar un builtin nuevo más rápido** (PLAN.md §9.2 ítem 2, "Pilar 2" del roadmap de concurrencia) -- tooling del compilador, NO una feature del lenguaje: ningún `.link` cambia, cero sintaxis nueva, cero tipo nuevo, cero builtin nuevo expuesto.
+
+- Investigación previa (2 forks) encontró que el pedido original -- FFI hacia `crates.io` entero -- no es viable con la arquitectura actual (`Value`/`Type` son enums cerrados matcheados exhaustivamente en checker/runtime/codegen, sin `libloading`/WASM-component en ningún lado) sin construir antes un sistema de macros/codegen completo, y choca con la política de "cero dependencias nuevas" ya sostenida. El usuario eligió explícitamente un fast-path para builtins curados en vez de FFI arbitrario.
+- Cada builtin (`crypto`/`http`/`math`/etc., ~74 en total) se define hoy en dos lugares que pueden desincronizarse a mano: un arm en `checker.rs` (tipado) y uno espejo en `runtime/mod.rs` (lógica real). El lado checker es máximamente regular -- el macro `builtin_args!` lo colapsa de 5-7 líneas a 1, reusando el mismo patrón de destructuring que ya usaban esos arms. El lado runtime sigue 100% a mano, a propósito -- su lógica varía demasiado para generarse.
+- Alcance v0: solo para builtins nuevos de acá en adelante. Retrofit de prueba en 2 arms existentes (`crypto.hashPassword`, `crypto.randomInt`) para confirmar equivalencia exacta -- encontrado en el camino: no existía cobertura de test para el mensaje de error de aridad de estos dos builtins, cerrado de paso con tests nuevos.
+
+**Verificado**: 4 tests nuevos en `checker.rs` (camino feliz + mensaje de aridad exacto para cada builtin retrofiteado) + los tests de comportamiento ya existentes sin modificar. Suite completa (1396 tests) sin regresiones. Ver GRAMMAR.md §3.186.
+
 ## [1.141.0] - 2026-08-30
 
 ### ✨ Nuevo

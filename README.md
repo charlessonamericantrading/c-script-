@@ -6,8 +6,8 @@
   
   <p>
     <a href="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml"><img src="https://github.com/charlessonamericantrading/c-script-/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-1392-success.svg" alt="Tests" /></a>
-    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.141.0-blue.svg" alt="Version" /></a>
+    <a href="#-testing--quality-assurance"><img src="https://img.shields.io/badge/tests-1396-success.svg" alt="Tests" /></a>
+    <a href="https://github.com/charlessonamericantrading/c-script-/releases"><img src="https://img.shields.io/badge/version-1.142.0-blue.svg" alt="Version" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-purple.svg" alt="License" /></a>
   </p>
 </div>
@@ -311,7 +311,7 @@ wasm-bindgen --target web --out-dir ../../playground/pkg --out-name playground_w
 
 ## 🧪 Testing & Quality Assurance
 
-Link is verified by **1392 automated unit, integration and CLI tests**, including tests that
+Link is verified by **1396 automated unit, integration and CLI tests**, including tests that
 spawn the real binary as a subprocess, drive a real HTTP server, and compile every c-script
 example published in this repository's documentation:
 

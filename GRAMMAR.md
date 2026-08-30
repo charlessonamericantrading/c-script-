@@ -207,6 +207,7 @@
   - [3.183 `link.lock` como pin real de dependencias git + locking entre procesos — RESUELTO](#3183-linklock-como-pin-real-de-dependencias-git--locking-entre-procesos--resuelto)
   - [3.184 `Decimal`: tipo numérico de precisión exacta (punto fijo, 4 decimales) — RESUELTO](#3184-decimal-tipo-numérico-de-precisión-exacta-punto-fijo-4-decimales--resuelto)
   - [3.185 `linkc db export`/`linkc db import` — RESUELTO PARCIAL](#3185-linkc-db-exportlinkc-db-import--resuelto-parcial)
+  - [3.186 `builtin_args!`: fast-path para curar un builtin nuevo — RESUELTO (tooling interno, no una feature del lenguaje)](#3186-builtin_args-fast-path-para-curar-un-builtin-nuevo--resuelto-tooling-interno-no-una-feature-del-lenguaje)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6851,6 +6852,53 @@ linkc db import -- 'export.json' contra SQLite embebido en 'staging.db'
 - **`linkc db shell` sigue pendiente** -- PLAN.md §9.7 ítem 2, para una ronda aparte.
 
 **Verificado**: 6 tests de CLI contra el binario real (`cli_db_export.rs` -- una `.db` inexistente exporta arrays vacíos, una base real poblada por `linkc serve` exporta filas físicas incluida una soft-deleted, una colección declarada pero nunca creada exporta vacío, el export calza byte a byte contra la respuesta RPC real de `all()`, casos de uso limpios) + 5 (`cli_db_import.rs` -- caso seed contra un target vacío con id original preservado y secuencia resincronizada confirmada vía un insert normal posterior, cruce de entornos idempotente sin perder filas previas, choque de id revierte TODO sin dejar nada a medias, colección desconocida no toca ni el archivo `.db`, caso de uso limpio) + 3 contra Postgres real en `pg_integration.rs` (round-trip completo con Decimal exacto, resync de secuencia real confirmado con un insert normal tras importar ids altos, colección con PK `Uuid` sin necesitar resync). Suite completa sin regresiones.
+
+### 3.186 `builtin_args!`: fast-path para curar un builtin nuevo — RESUELTO (tooling interno, no una feature del lenguaje)
+
+**Esta sección documenta el COMPILADOR, no el lenguaje -- un `.link` no cambia en absoluto acá: cero sintaxis nueva, cero tipo nuevo, cero builtin nuevo expuesto.** Se documenta igual, con el mismo criterio de rigor que cualquier otra sección, porque es una decisión de arquitectura real que afecta cómo crece la stdlib de acá en adelante.
+
+PLAN.md §9.2 ítem 2, "Pilar 2" del roadmap de concurrencia (propuesto por skynet-d3 a nombre del usuario, 26/08/2026): "FFI seguro y tipado hacia crates de Rust", para no seguir construyendo cada primitiva nueva (HTTP, SMTP, S3, HMAC...) a mano una por una. Investigación previa (2 forks, código real antes de proponer nada) estableció que el pedido ORIGINAL -- exponer `crates.io` entero -- **no es viable con la arquitectura actual sin construir antes un sistema de macros/codegen completo** (`Value`/`Type` son enums Rust CERRADOS, matcheados exhaustivamente en el checker, el intérprete y los tres emisores de codegen; no hay `libloading`/`dlopen`/WASM-component en ningún lado) **y choca de frente con la política de "cero dependencias nuevas"** que este proyecto sostiene en 3 archivos distintos (solo `regex`/`flate2` tuvieron excepción, cada una justificada). Presentado esto al usuario, eligió explícitamente: no atacar FFI arbitrario, sino un fast-path para seguir curando builtins a mano, mucho más rápido de agregar -- sin exponer crates arbitrarios, sin tocar la filosofía actual.
+
+**El problema real, medido**: cada builtin (`checker.rs::try_builtin_method`, ~74 arms entre `crypto`/`http`/`math`/`string`/`db`/`auth`/etc.) se define en DOS lugares que pueden desincronizarse a mano: un arm `(Type::X, "method") => {...}` en `checker.rs` (destructura N args exactos, un `check_expr` por cada uno, devuelve un `Type`) y un arm espejo `"method" => {...}` en `runtime/mod.rs::call_method` (la lógica real). El lado checker es **máximamente regular** -- los 51 arms de `crypto`/`http`/`math`/etc. siguen exactamente la misma forma, ninguno tiene aridad opcional/variable. El lado runtime NO es regular (20-30+ líneas de lógica real, llamadas a crates externos) -- no se puede generar, sigue escrito a mano.
+
+```
+macro_rules! builtin_args {
+    ($self:ident, $args:ident, $env:ident, $qualified_name:literal, [$(($pname:ident, $pdesc:literal, $pty:expr)),+ $(,)?] -> $ret:expr) => {{
+        let [$($pname),+] = $args else {
+            let n = 0usize $(+ { let _ = stringify!($pname); 1 })+;
+            let word = if n == 1 { "argumento" } else { "argumentos" };
+            let desc = [$($pdesc),+].join(", ");
+            return Err(err(format!("'{}' toma exactamente {n} {word} ({desc})", $qualified_name)));
+        };
+        $($self.check_expr($pname, &$pty, $env)?;)+
+        Some($ret)
+    }};
+}
+```
+
+Uso -- reemplaza un arm de 5-7 líneas por 1:
+
+```
+(Type::Crypto, "hashPassword") => builtin_args!(
+    self, args, env, "crypto.hashPassword",
+    [(pwd, "password: String", Type::String)] -> Type::String
+),
+```
+
+**Requiere al menos 1 argumento (repetición `+`, nunca `*`).** Un `+` fallaba con `*` -- encontrado en una revisión adversarial del propio diseño ANTES de escribir el código de verdad, no en el compilador: con `*`, un builtin de 0 args expandiría `[$($pdesc),*].join(", ")` a `[].join(", ")`, que no compila (`E0282`, un array vacío no tiene forma de inferir su tipo de elemento). Un builtin de 0 args (`crypto.uuid`, el único caso hoy) queda deliberadamente FUERA del alcance de este macro -- sigue con `expect_no_args` de siempre, que además tiene su propia frase ("no toma argumentos", distinta de "toma exactamente 0 argumentos ()") -- unificar los dos casos no vale la complejidad para un solo builtin existente.
+
+**El lado runtime (`call_method`) NO se toca, a propósito.** No hay forma sensata de generar 20-30 líneas de lógica real variable (Argon2, HTTP, HMAC...) -- intentarlo escondería la lógica de negocio detrás de una capa sin aportar nada. Este macro solo ataca el lado que de verdad es mecánico: el checker nunca tiene lógica propia, solo tipa.
+
+**Alcance v0: solo para builtins NUEVOS de acá en adelante, no un retrofit de los 74 existentes.** Retrofitear todo sería el cambio mecánico grande y riesgoso que el propio research desaconsejó. Como prueba de que el macro produce EXACTAMENTE el mismo comportamiento (mensaje de error incluido) antes de confiar en él para algo nuevo, se retrofitearon 2 arms existentes con argumentos de verdad -- `crypto.hashPassword` (1 arg) y `crypto.randomInt` (2 args, cubre la concordancia plural del mensaje que el de 1 arg no ejercita) -- verificado con tests nuevos que comparan el mensaje de error CARÁCTER A CARÁCTER contra el texto original (no existía cobertura de esto antes: los tests previos de estos dos builtins solo ejercitaban el camino feliz vía el intérprete, nunca el mensaje de aridad incorrecta del checker -- un hueco real, encontrado implementando esta ronda, cerrado de paso). Los otros 72 builtins quedan con su forma actual, sin urgencia de migrarlos.
+
+**Definido a nivel de módulo, antes de `impl Checker`, no como item adentro del `impl`** -- sin precedente en este código de un `macro_rules!` a nivel de item de un `impl` (el único macro previo, `runtime/server.rs:549`, es local al cuerpo de una función), y evitarlo no cuesta nada.
+
+**Límites honestos, deliberados**:
+- No ataca FFI arbitrario -- decisión explícita del usuario, no un recorte de alcance no comunicado.
+- Solo cubre el lado CHECKER (tipado). El lado runtime sigue 100% a mano.
+- No hay ningún mecanismo automático que impida que alguien agregue un builtin nuevo sin usar el macro -- sigue siendo una convención (documentada en AGENTS.md), no algo forzado por el compilador. El macro hace el camino fácil más corto que el camino manual, pero no lo prohíbe.
+
+**Verificado**: 4 tests nuevos en `checker.rs` (caso feliz + mensaje de aridad exacto, para `hashPassword` y `randomInt` cada uno) + los tests de comportamiento ya existentes de `crypto.hashPassword`/`crypto.randomInt` (camino feliz vía el intérprete) sin modificar, siguen pasando. Verificación manual contra el binario real: un programa `.link` con `crypto.randomInt(1)` (aridad incorrecta) da el mismo mensaje de error de siempre, palabra por palabra. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

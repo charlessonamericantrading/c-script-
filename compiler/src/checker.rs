@@ -39,6 +39,44 @@ fn err(msg: impl Into<String>) -> CheckError {
     CheckError { message: msg.into(), span: None, file: None }
 }
 
+/// Fast-path para un builtin CURADO nuevo (namespace.method) CON AL MENOS 1
+/// ARGUMENTO -- un builtin de 0 args sigue con `expect_no_args` de siempre,
+/// nunca con este macro (ver nota abajo). La forma destructurar-N-args-
+/// exactos + un `check_expr` por posición + devolver un `Type` es IDÉNTICA
+/// en decenas de arms de `try_builtin_method` (`crypto`/`http`/`math`/etc.)
+/// -- este macro la genera a partir de la firma declarada, reusando el
+/// MISMO patrón de slice (`let [a, b, ...] = args else { ... }`) que esos
+/// arms ya escriben a mano. El lado RUNTIME (`call_method`, `runtime/mod.rs`)
+/// sigue escrito a mano a propósito: la lógica real (Argon2, HTTP, HMAC...)
+/// varía demasiado para generarse, y tratar de unificarla escondería la
+/// lógica real detrás de una capa que no aporta nada ahí -- este macro SOLO
+/// ataca el lado que de verdad es mecánico, el checker nunca tiene lógica
+/// propia, solo tipa (GRAMMAR.md §3.186). Alcance v0: SOLO para builtins
+/// NUEVOS de acá en adelante, no un retrofit retroactivo de todos los que
+/// ya existen -- funcionan, están probados, tocarlos sin necesidad real es
+/// riesgo sin beneficio.
+///
+/// Requiere al menos 1 argumento (repetición `+`, nunca `*`): con `*` un
+/// builtin de 0 args expandiría `[$($pdesc),*].join(", ")` a `[].join(", ")`,
+/// que no compila (`E0282`, un array vacío no tiene forma de inferir su
+/// tipo de elemento) -- encontrado revisando este macro ANTES de escribirlo
+/// de verdad, no en el compilador. Un builtin de 0 args de todos modos tiene
+/// su propio mensaje distinto ("no toma argumentos" vs. "toma exactamente 0
+/// argumentos ()") -- unificar los dos casos no vale la complejidad para
+/// los pocos builtins sin argumentos que existen.
+macro_rules! builtin_args {
+    ($self:ident, $args:ident, $env:ident, $qualified_name:literal, [$(($pname:ident, $pdesc:literal, $pty:expr)),+ $(,)?] -> $ret:expr) => {{
+        let [$($pname),+] = $args else {
+            let n = 0usize $(+ { let _ = stringify!($pname); 1 })+;
+            let word = if n == 1 { "argumento" } else { "argumentos" };
+            let desc = [$($pdesc),+].join(", ");
+            return Err(err(format!("'{}' toma exactamente {n} {word} ({desc})", $qualified_name)));
+        };
+        $($self.check_expr($pname, &$pty, $env)?;)+
+        Some($ret)
+    }};
+}
+
 /// El tipo que `http.getWithHeaders`/`http.postWithHeaders` (GRAMMAR.md
 /// §3.47) esperan para cada header: SIN nombre (`name: None`) a propósito --
 /// el subtipado estructural (§3.2) ya acepta cualquier struct declarado por
@@ -4100,13 +4138,13 @@ impl Checker {
                 self.check_expr(length, &Type::Int, env)?;
                 Some(Type::String)
             }
-            (Type::Crypto, "hashPassword") => {
-                let [pwd] = args else {
-                    return Err(err("'crypto.hashPassword' toma exactamente 1 argumento (password: String)"));
-                };
-                self.check_expr(pwd, &Type::String, env)?;
-                Some(Type::String)
-            }
+            // GRAMMAR.md §3.186: retrofit de prueba del fast-path
+            // `builtin_args!` -- mensaje de error y comportamiento
+            // IDÉNTICOS al arm manual que reemplaza (1 argumento).
+            (Type::Crypto, "hashPassword") => builtin_args!(
+                self, args, env, "crypto.hashPassword",
+                [(pwd, "password: String", Type::String)] -> Type::String
+            ),
             (Type::Crypto, "verifyPassword") => {
                 let [pwd, hash] = args else {
                     return Err(err("'crypto.verifyPassword' toma exactamente 2 argumentos (password: String, hash: String)"));
@@ -4126,14 +4164,15 @@ impl Checker {
                 self.expect_no_args(args, "uuid")?;
                 Some(Type::Uuid)
             }
-            (Type::Crypto, "randomInt") => {
-                let [min, max] = args else {
-                    return Err(err("'crypto.randomInt' toma exactamente 2 argumentos (min: Int, max: Int)"));
-                };
-                self.check_expr(min, &Type::Int, env)?;
-                self.check_expr(max, &Type::Int, env)?;
-                Some(Type::Int)
-            }
+            // GRAMMAR.md §3.186: retrofit de prueba del fast-path
+            // `builtin_args!` -- mensaje de error y comportamiento
+            // IDÉNTICOS al arm manual que reemplaza (2 argumentos, cubre
+            // la concordancia plural del mensaje que "hashPassword" no
+            // ejercita).
+            (Type::Crypto, "randomInt") => builtin_args!(
+                self, args, env, "crypto.randomInt",
+                [(min, "min: Int", Type::Int), (max, "max: Int", Type::Int)] -> Type::Int
+            ),
             (Type::Crypto, "timingSafeEqual") => {
                 let [a, b] = args else {
                     return Err(err("'crypto.timingSafeEqual' toma exactamente 2 argumentos (a: String, b: String)"));
@@ -7780,6 +7819,46 @@ type T = { id: Int, s: Status }")
             fn bad() -> String { crypto.uuid() }
         "#;
         assert!(check_source(src).is_err());
+    }
+
+    // ---- GRAMMAR.md §3.186: fast-path `builtin_args!` -- prueba de
+    // equivalencia exacta contra el arm manual que reemplazó (mensaje de
+    // error de aridad incluido, no solo el tipo devuelto en el caso feliz).
+
+    #[test]
+    fn crypto_hash_password_type_checks_with_the_right_arity() {
+        let src = r#"
+            fn f() -> String { crypto.hashPassword("secreto") }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn crypto_hash_password_rejects_the_wrong_arity_with_the_same_message_as_before_the_macro() {
+        let src = r#"
+            fn f() -> String { crypto.hashPassword("a", "b") }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        let msg = format!("{:?}", errors);
+        assert!(msg.contains("'crypto.hashPassword' toma exactamente 1 argumento (password: String)"), "{msg}");
+    }
+
+    #[test]
+    fn crypto_random_int_type_checks_with_the_right_arity() {
+        let src = r#"
+            fn f() -> Int { crypto.randomInt(1, 6) }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn crypto_random_int_rejects_the_wrong_arity_with_the_same_message_as_before_the_macro() {
+        let src = r#"
+            fn f() -> Int { crypto.randomInt(1) }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        let msg = format!("{:?}", errors);
+        assert!(msg.contains("'crypto.randomInt' toma exactamente 2 argumentos (min: Int, max: Int)"), "{msg}");
     }
 
     #[test]

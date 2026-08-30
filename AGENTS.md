@@ -83,6 +83,13 @@ client against a real server.
 - **Do not add a feature claim to the README without a test that exercises it.** Several
   claims in this repository's history turned out to be aspirational; that is the failure
   mode to avoid.
+- **A new curated builtin method (`namespace.method`, fixed arity, no 0-arg case) gets its
+  checker-side arm via the `builtin_args!` macro** (`checker.rs`, right after `err()`), not
+  a hand-written `let [a, b] = args else { ... }` block — see GRAMMAR.md §3.186 for why and
+  its exact shape. This only covers the checker side (arg count/types → return `Type`); the
+  runtime dispatch arm in `runtime/mod.rs::call_method` still gets written by hand, since
+  that side's actual logic (the crypto/HTTP/etc. call) is never mechanical. A 0-arg builtin
+  keeps using `expect_no_args` instead, unrelated to this macro.
 
 ## Writing c-script: the mistakes that cost the most time
 
