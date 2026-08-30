@@ -991,6 +991,7 @@ impl Checker {
                                 .chain(checker.check_field_defaults(fields, &t.type_params))
                                 .chain(checker.check_field_auto_update(fields, &t.type_params))
                                 .chain(checker.check_field_soft_delete(fields, &t.type_params))
+                                .chain(checker.check_field_encrypted(fields, &t.type_params))
                                 .chain(checker.check_field_checks(fields, &t.type_params)),
                         );
                     }
@@ -1011,6 +1012,7 @@ impl Checker {
                                 .chain(checker.check_field_defaults(fields, &en.type_params))
                                 .chain(checker.check_field_auto_update(fields, &en.type_params))
                                 .chain(checker.check_field_soft_delete(fields, &en.type_params))
+                                .chain(checker.check_field_encrypted(fields, &en.type_params))
                                 .chain(checker.check_field_checks(fields, &en.type_params))
                             {
                                 let mut e = e;
@@ -2288,6 +2290,65 @@ impl Checker {
                 Ok(ty) => errors.push(
                     err(format!(
                         "'@softDelete' en el campo '{}': solo aplica sobre `Timestamp?` -- es `{ty}`",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                ),
+                Err(e) => errors.push(e.with_span(f.name_span)),
+            }
+        }
+        errors
+    }
+
+    /// `@encrypted` (GRAMMAR.md §3.191) solo sobre `String`/`String?` --
+    /// ningún otro tipo tiene sentido para AES-256-GCM (que opera sobre
+    /// texto, guardado en la MISMA columna `TEXT` de siempre, sin
+    /// `ColumnKind` nuevo). Incompatible con `@index`/`@unique` en el mismo
+    /// campo -- ver la doc de `FieldAnnotation::Encrypted` para el motivo
+    /// real (el nonce aleatorio hace que un constraint SQL sobre esa
+    /// columna sea una garantía falsa, no solo redundante).
+    fn check_field_encrypted(&self, fields: &[Field], type_params: &[String]) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        for f in fields {
+            if !f.encrypted() {
+                continue;
+            }
+            if f.index().is_some() {
+                errors.push(
+                    err(format!(
+                        "'@encrypted' en el campo '{}': incompatible con '@index'/'@unique' en el mismo campo -- el nonce aleatorio de AES-GCM hace que el ciphertext sea distinto en cada escritura, así que un constraint SQL sobre esa columna sería siempre \"único\", incluso para el mismo valor en texto plano",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+            }
+            // `x?: T?` (opcional-por-clave Y nullable-por-tipo a la vez,
+            // GRAMMAR.md §3.4) fuerza el envoltorio JSON en `ColumnPlan`
+            // (`for_field`) así T sea `String` -- el chokepoint de
+            // cifrado vive en la rama de columna NATIVA (`write_param`/
+            // `decode_row`, arm `(Type::String, Cell::Text(t))`), nunca
+            // en la rama JSON. Aceptar esta combinación dejaría el campo
+            // SIN cifrar, en silencio -- se rechaza acá, no en runtime.
+            if f.optional && matches!(f.ty, TypeExpr::Optional(_)) {
+                errors.push(
+                    err(format!(
+                        "'@encrypted' en el campo '{}': no se puede combinar con 'x?: T?' (opcional por clave Y nullable a la vez) -- fuerza el envoltorio JSON internamente, que este chokepoint de cifrado no cubre. Usá 'x: String?' (nullable, requerido por clave) en su lugar",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+            }
+            let ty = if type_params.is_empty() {
+                self.resolve_type(&f.ty)
+            } else {
+                self.resolve_type_abstract(&f.ty, type_params)
+            };
+            match ty {
+                Ok(Type::String) => {}
+                Ok(Type::Optional(inner)) if matches!(*inner, Type::String) => {}
+                Ok(ty) => errors.push(
+                    err(format!(
+                        "'@encrypted' en el campo '{}': solo aplica sobre `String`/`String?` -- es `{ty}`",
                         f.name
                     ))
                     .with_span(f.name_span),
@@ -4940,6 +5001,22 @@ impl Checker {
         Ok((field_name.to_string(), field.ty.clone(), granularity))
     }
 
+    /// ¿El campo `field_name` de `element_ty` (un `Type::Struct` ya
+    /// resuelto, sin anotaciones) lleva `@encrypted`? `Type::Struct` es
+    /// estructural -- hay que cruzar con `self.types` (el `TypeDecl`
+    /// ORIGINAL, con el `ast::Field` que sí conserva anotaciones) por el
+    /// `name: Some(...)` que un elemento de colección siempre conserva.
+    /// `false` (nunca un error) si `element_ty` no tiene nombre o no
+    /// resuelve a un `type` conocido -- mismo criterio permisivo que el
+    /// resto de los cruces de este archivo cuando la anotación
+    /// sencillamente no aplica.
+    fn field_is_encrypted(&self, element_ty: &Type, field_name: &str) -> bool {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { return false };
+        let Some(decl) = self.types.get(type_name) else { return false };
+        let TypeExpr::Struct(fields) = &decl.ty else { return false };
+        fields.iter().any(|f| f.name == field_name && f.encrypted())
+    }
+
     /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.52):
     /// agregación con `GROUP BY` empujada a SQL de verdad -- a diferencia de
     /// `findWhere`/`deleteWhere` (predicado como closure, evaluado en el
@@ -4958,6 +5035,20 @@ impl Checker {
         }
 
         let (key_field, key_ty, granularity) = self.group_key_selector(element_ty, &args[0], method)?;
+        // GRAMMAR.md §3.191: `GROUP BY` sobre una columna `@encrypted` (a
+        // diferencia de `findWhere`/`countWhere`/`deleteWhere`, que
+        // simplemente NO empujan un predicado sobre esa columna a SQL y
+        // caen a filtrado interpretado, seguro por construcción) no tiene
+        // ningún fallback -- `select_grouped` (`runtime/db.rs`) SIEMPRE
+        // arma un `GROUP BY` SQL real. Agrupar por ciphertext (distinto en
+        // cada escritura, por el nonce aleatorio de AES-GCM) daría un grupo
+        // por FILA siempre, en silencio -- sin fallback seguro posible,
+        // así que se rechaza acá, en compile-time.
+        if self.field_is_encrypted(element_ty, &key_field) {
+            return Err(err(format!(
+                "'{method}': no se puede agrupar por '{key_field}' -- es un campo '@encrypted', y el ciphertext es distinto en cada escritura (nonce aleatorio), así que agrupar por esa columna daría un grupo por fila siempre, en silencio"
+            )));
+        }
         match granularity {
             // GRAMMAR.md §3.157: truncado explícito -- SOLO válido sobre un
             // campo `Timestamp` de verdad, el resultado agrupado sigue
@@ -8938,6 +9029,37 @@ type T = { id: Int, s: Status }")
     // GRAMMAR.md §3.52: `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`.
 
     #[test]
+    fn sum_by_rejects_grouping_by_an_encrypted_field() {
+        // GRAMMAR.md §3.191: `select_grouped` (runtime/db.rs) SIEMPRE arma
+        // un GROUP BY real, sin fallback -- agrupar por ciphertext (distinto
+        // en cada escritura) daría un grupo por fila siempre, en silencio.
+        let src = r#"
+            type Order = { id: Int, @encrypted customerSsn: String, amountCents: Int }
+            db { orders: Order[] }
+            fn f() -> Int {
+                let rows = db.orders.sumBy(|o: Order| { o.customerSsn }, |o: Order| { o.amountCents });
+                rows.length()
+            }
+        "#;
+        let errs = check_source(src).expect_err("agrupar por un campo @encrypted debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("@encrypted") && e.message.contains("customerSsn")), "{errs:?}");
+    }
+
+    #[test]
+    fn count_by_also_rejects_grouping_by_an_encrypted_field() {
+        let src = r#"
+            type Order = { id: Int, @encrypted customerSsn: String }
+            type SsnCount = { key: String, value: Int }
+            db { orders: Order[] }
+            service S {
+                rpc counts() -> SsnCount[] { db.orders.countBy(|o: Order| { o.customerSsn }) }
+            }
+        "#;
+        let errs = check_source(src).expect_err("countBy agrupando por un campo @encrypted debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("@encrypted")), "{errs:?}");
+    }
+
+    #[test]
     fn sum_by_typechecks_with_a_real_field_selector_pair() {
         let src = r#"
             type Order = { id: Int, planId: String, amountCents: Int }
@@ -9727,6 +9849,53 @@ type T = { id: Int, s: Status }")
         let src = "type Task = { id: Int, @softDelete @softDelete deletedAt: Timestamp? = null }";
         let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
         let err = parse(tokens).expect_err("dos @softDelete en el mismo campo debe rechazarse");
+        assert!(format!("{err:?}").contains("repetido"), "{err:?}");
+    }
+
+    // ---- cifrado de campo a nivel de columna: `@encrypted` (GRAMMAR.md §3.191) ----
+
+    #[test]
+    fn encrypted_on_a_string_field_typechecks() {
+        let src = "type User = { id: Int, @encrypted ssn: String }";
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn encrypted_on_an_optional_string_field_typechecks() {
+        let src = "type User = { id: Int, @encrypted ssn: String? }";
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn encrypted_on_a_non_string_field_is_rejected() {
+        let src = "type User = { id: Int, @encrypted age: Int }";
+        let errs = check_source(src).expect_err("@encrypted sobre un Int debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("solo aplica sobre")), "{errs:?}");
+    }
+
+    #[test]
+    fn encrypted_combined_with_unique_on_the_same_field_is_rejected() {
+        // El nonce aleatorio hace que el ciphertext sea distinto en cada
+        // escritura -- un UNIQUE sobre esa columna sería siempre "único",
+        // incluso para el mismo valor en texto plano. Garantía falsa, no
+        // solo redundante.
+        let src = "type User = { id: Int, @encrypted @unique ssn: String }";
+        let errs = check_source(src).expect_err("@encrypted + @unique en el mismo campo debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("incompatible con '@index'/'@unique'")), "{errs:?}");
+    }
+
+    #[test]
+    fn encrypted_combined_with_index_on_the_same_field_is_rejected() {
+        let src = "type User = { id: Int, @encrypted @index ssn: String }";
+        let errs = check_source(src).expect_err("@encrypted + @index en el mismo campo debe rechazarse");
+        assert!(errs.iter().any(|e| e.message.contains("incompatible con '@index'/'@unique'")), "{errs:?}");
+    }
+
+    #[test]
+    fn a_second_encrypted_annotation_on_the_same_field_is_a_parse_error() {
+        let src = "type User = { id: Int, @encrypted @encrypted ssn: String }";
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let err = parse(tokens).expect_err("dos '@encrypted' en el mismo campo debe rechazarse");
         assert!(format!("{err:?}").contains("repetido"), "{err:?}");
     }
 

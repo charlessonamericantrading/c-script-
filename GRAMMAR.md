@@ -212,6 +212,7 @@
   - [3.188 Lint `manual-role-check-without-requires` — RESUELTO](#3188-lint-manual-role-check-without-requires--resuelto)
   - [3.189 `linkc db shell` — RESUELTO, cierra PLAN.md §9.7 ítem 2](#3189-linkc-db-shell--resuelto-cierra-planmd-97-ítem-2)
   - [3.190 `@requires(..., ownerOf: <colección>, id: <parámetro>, field: <campo>)` — RESUELTO, cierra RBAC (PLAN.md §9.5 ítem 3) y ABAC (ítem 4) juntos](#3190-requires-ownerof-colección-id-parámetro-field-campo--resuelto-cierra-rbac-planmd-95-ítem-3-y-abac-ítem-4-juntos)
+  - [3.191 `@encrypted` — RESUELTO, cierra PLAN.md §9.5 ítem 2 (cifrado de campo a nivel de columna)](#3191-encrypted--resuelto-cierra-planmd-95-ítem-2-cifrado-de-campo-a-nivel-de-columna)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -7039,6 +7040,60 @@ service Invoices {
 - Sin `id` con valor por default: si el parámetro nombrado en `id:` falta del body JSON, es un 400 inmediato -- no se evalúa ningún default expression que ese parámetro pudiera declarar (evitar duplicar el aparato completo de `eval_expr`/`Env`/`step_budget` solo para este borde, genuinamente raro: un id de recurso a verificar casi nunca tiene sentido con un default).
 
 **Verificado**: 8 tests de checker (`checker.rs`) -- cláusula válida tipa limpio con PK `Int` y con PK `Uuid`; colección/parámetro/campo inexistentes, cada uno con su propio mensaje; tipo de `id` que no coincide con la PK; campo que no es `Int` (incluido `Int?`, rechazado a propósito); una cláusula sobre `stream` es un error, no un no-op. 7 tests de parser (`parser.rs`) -- forma completa en orden, con OR de roles, sin cláusula (ownership: None, sin cambio de comportamiento), y cada palabra clave fuera de lugar o faltante como error de parseo. 5 tests de CLI contra el binario real (`server_http.rs`) -- dueño real (200), no-dueño con un rol igual de válido (403), recurso inexistente (404), rol incorrecto SIN llegar a tocar la base (403 incluso contra un id que no existe -- si el orden estuviera invertido, esa combinación daría 404), y Admin NO exento del chequeo en el rpc compartido pero SÍ puede leer cualquier factura vía el rpc separado sin cláusula. Suite completa sin regresiones.
+
+### 3.191 `@encrypted` — RESUELTO, cierra PLAN.md §9.5 ítem 2 (cifrado de campo a nivel de columna)
+
+Última pieza de la ronda de seguridad completa (junto con §3.188 el lint, y §3.190 RBAC/ABAC). Cifra un campo `String`/`String?` con AES-256-GCM ANTES de guardarlo, y lo descifra al leerlo -- puramente un detalle de ALMACENAMIENTO: el `Value` que ve el resto del programa (el intérprete, el wire JSON de cualquier rpc) sigue siendo el `String` plano de siempre, invisible del lado de `.link` salvo por la anotación misma.
+
+<!-- linkc:check -->
+```link
+type User = { id: Int, name: String, @encrypted ssn: String }
+type NewUser = { name: String, ssn: String }
+db { users: User[] }
+service Users {
+  rpc add(name: String, ssn: String) -> User { db.users.insert(NewUser { name: name, ssn: ssn }) }
+  rpc get(id: Int) -> User? { db.users.find(id) }
+}
+```
+
+```
+$ linkc serve app.link 8787 --db app.db
+error: el programa declara al menos un campo '@encrypted', pero no se configuró --encryption-key/LINK_ENCRYPTION_KEY
+
+$ linkc serve app.link 8787 --db app.db --encryption-key "CDXG1VdLU/xMH3p4PBXLw1C7uW3IyHDJuhbu3WIbPE8="
+$ curl -X POST localhost:8787/Users/add -d '{"name":"Ada","ssn":"123-45-6789"}'
+{"id":1,"name":"Ada","ssn":"123-45-6789"}
+
+$ linkc db shell app.link --db app.db
+db> SELECT ssn FROM users;
+ssn
+--------------------------------------------------
+GaFk2KJyII/zeZHoDJKTjyr3gb80ebA0X8WvSXwYyhjO9eWUajf2
+(1 fila(s))
+```
+
+**Tercera excepción real a "cero dependencias nuevas" (`aes-gcm`, RustCrypto) -- a propósito, no un descuido.** A diferencia de los formatos binarios de layout FIJO que este proyecto sí hand-rollea (UUID, HMAC-SHA256, el wire de `inet`/`timestamp`/`numeric` de Postgres -- todos parseo/serialización de una forma documentada, sin decisión criptográfica de por medio), un cifrador simétrico NUNCA debería hand-rollearse -- exactamente el tipo de caso donde el criterio de `regex`/`flate2` (GRAMMAR.md §3.73/§3.180) aplica con más fuerza, no menos. AEAD -- cifra Y autentica en una sola operación, evita el error clásico de cifrar sin autenticar (un byte manipulado del lado de la base se detecta como fallo de autenticación, no se descifra en silencio a texto corrupto).
+
+**Formato de almacenamiento: `nonce (12 bytes) || ciphertext || tag (16 bytes)`, todo en base64, guardado en la MISMA columna `TEXT` de siempre -- sin `ColumnKind` nuevo, sin `BYTEA` en Postgres.** `ColumnPlan` (`runtime/db.rs`) gana un campo `encrypted: bool`, poblado por `encrypted_fields_by_collection` (nueva, mismo cruce `program.items`/`checker.db_collections()` que `soft_delete_fields_by_collection` ya usa -- `Type::Struct` es estructural, sin anotaciones, así que hace falta volver al `ast::Field` original). Nonce nuevo y aleatorio en CADA escritura (`os_random_bytes`, el mismo CSPRNG del sistema que `crypto.uuid()`/`crypto.randomToken()` ya usan, promovido de privado a `pub(crate)` para este uso nuevo) -- confirmado con un test real: cifrar el mismo texto plano dos veces nunca da el mismo resultado.
+
+**Chokepoint único de cada lado, `write_param`/`decode_row` (`runtime/db.rs`), en la rama de columna NATIVA (nunca la rama JSON).** Por eso `@encrypted` rechaza en compile-time la combinación `x?: T?` (opcional por clave Y nullable a la vez) -- esa forma fuerza el envoltorio JSON en `ColumnPlan::for_field` así el tipo sea `String`, y el chokepoint de cifrado no vive ahí; aceptar la combinación habría dejado el campo SIN cifrar, en silencio. `write_param` pasó de infalible a `Result<Cell, RuntimeError>` (cifrar puede fallar si el CSPRNG falla, mismo motivo por el que `generate_uuid_v4()` ya es falible) -- los tres call-sites reales (`insert`/`applyPatch`/`upsert`) ya vivían adentro de una función `Result`, así que el cambio fue mecánico.
+
+**La guarda de correctness -- la pieza que más importa, no un detalle menor.** El nonce aleatorio hace que el ciphertext sea DISTINTO en cada escritura, incluso para el mismo valor en texto plano -- sin guardas, dos usos reales habrían compilado limpio y dado una respuesta incorrecta en SILENCIO:
+- **Predicados (`findWhere`/`countWhere`/`deleteWhere`/el lado `upsert` que matchea una fila existente)**: comparar un campo `@encrypted` contra un valor pusheado a SQL nunca podría matchear la fila correcta (compara ciphertexts distintos, no el valor real). `leaf_condition_sql` (`runtime/db.rs`) YA tenía exactamente el guard que hacía falta para esto -- `if col.json { return None }`, que fuerza el camino interpretado (traer todas las filas, filtrar en memoria) para una columna que no se puede comparar tal cual en SQL. Extenderlo a `if col.json || col.encrypted { return None }` fue TODO lo que hizo falta: el camino interpretado ya descifra al leer (`decode_row`), así que compara el valor REAL, correctamente, sin ningún código nuevo de por medio. Confirmado en vivo: `findWhere(|u| u.ssn == ssn)` sigue encontrando la fila correcta.
+- **`GROUP BY` (`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`)**: acá NO hay un camino interpretado de respaldo -- `select_grouped` siempre arma un `GROUP BY` SQL real. Agrupar por ciphertext daría un grupo por FILA siempre, en silencio (nunca un error, solo un resultado sin sentido) -- se rechaza en compile-time (`check_aggregate_by`, checker.rs), vía un nuevo `field_is_encrypted` que cruza `self.types` (el `TypeDecl` original, con anotaciones) por el nombre del tipo del elemento.
+- **`@index`/`@unique` en el mismo campo**: un `UNIQUE` SQL sobre una columna `@encrypted` sería siempre "único" -- ciphertext distinto en cada escritura, incluso repitiendo el mismo valor en texto plano. Rechazado en compile-time (`check_field_encrypted`, junto a la validación de tipo).
+
+**`linkc serve` rechaza arrancar sin clave -- fallar temprano, no en el primer uso.** `--encryption-key`/`LINK_ENCRYPTION_KEY` (32 bytes en base64 estándar) es obligatoria SOLO si el programa declara algún campo `@encrypted` (`encrypted_fields_by_collection` corre una vez al arrancar `serve()`) -- un programa sin ninguno no necesita configurar nada, cero cambio de comportamiento. Una clave de longitud incorrecta también falla limpio al arrancar, nunca trunca/paddea en silencio. La clave vive en `Db` (`encryption_key: RwLock<Option<[u8; 32]>>`, mismo criterio EXACTO que `argon2_params`/`http_timeout`: escrita UNA vez al arrancar, leída desde cualquier hilo de request).
+
+**Límites honestos, deliberados**:
+- `db export`/`db import` (GRAMMAR.md §3.185) TODAVÍA NO soportan una colección con algún campo `@encrypted` -- rechazan de entrada (`declared_collection_plans`, `db_admin.rs`), antes de tocar ninguna fila. `export` no tiene ninguna clave disponible en su camino de lectura (un `Backend` liviano, sin `Db`), y mostrar el ciphertext crudo sin avisar habría sido confuso, no solo incompleto -- un rechazo claro es más honesto que un passthrough silencioso. (`Db::import_row` sí reusa el mismo `write_param` que un `insert` normal -- si algún día `export` decripta y `import` vuelve a cifrar con clave, la escritura ya funciona gratis; el trabajo que falta es solo threadear `--encryption-key` a esos dos subcomandos.)
+- `linkc db shell` (GRAMMAR.md §3.189) no necesita ningún cambio -- nunca pasa por `decode_row` (SQL crudo, sin `ColumnPlan`), así que ya muestra el ciphertext tal cual, consistente con cómo trata cualquier otro valor físico (mismo espíritu que el Decimal escalado crudo que ya muestra para SQLite).
+- Sin `id` con default en la cláusula de dueño (§3.190) no aplica acá, pero un análogo real: `@encrypted` sobre `x?: T?` se rechaza en vez de soportarse (ver arriba) -- un límite real de dónde vive el chokepoint, no una limitación artificial.
+- Una sola clave estática, sin rotación en v0 -- mismo modelo que `--jwt-secret`/`--service-api-key` hoy. Rotar exige re-cifrar cada fila con la clave nueva; sin herramienta para eso todavía.
+- Solo sobre `String`/`String?` -- ningún tipo compuesto, mismo motivo que el resto de esta anotación: AES-GCM opera sobre texto, la columna sigue siendo `TEXT`.
+- `field_is_encrypted` (checker.rs) cruza por NOMBRE de tipo (`Type::Struct{name: Some(...)}`) -- un tipo anónimo/genérico sin nombre no puede tener un campo `@encrypted` reconocido en este chequeo (no debería ser alcanzable: `@encrypted` vive en `ast::Field`, siempre parte de un `type` con nombre real).
+
+**Verificado**: 9 tests unitarios de cifrado/descifrado (`runtime/encryption.rs`) -- round-trip exacto, dos cifrados del mismo texto plano NUNCA coinciden (nonce distinto), clave incorrecta falla limpio, un byte manipulado falla por autenticación (no da texto corrupto), payload truncado/base64 inválido fallan limpio, `parse_encryption_key` acepta exactamente 32 bytes y rechaza cualquier otra longitud. 8 tests de checker (`checker.rs`) -- tipo `String`/`String?` acepta, cualquier otro tipo rechaza, combinación con `@index`/`@unique` rechaza, `@encrypted` repetido es error de parseo, agrupar por un campo `@encrypted` (`sumBy`/`countBy`) rechaza. 7 tests de CLI contra el binario real (`cli_encrypted.rs`) -- `serve` rechaza sin clave y con clave de longitud incorrecta (confirmado que el puerto nunca se abre); el campo viaja en texto plano por HTTP en ambos sentidos (insert y read); la fila FÍSICA en SQLite (leída con `linkc db shell`, no asumida) nunca contiene el texto plano; `findWhere` sigue encontrando la fila correcta; `LINK_ENCRYPTION_KEY` funciona igual que el flag; `db export` rechaza limpio. 2 tests contra Postgres real (`pg_integration.rs`) -- mismo round-trip, mismo rechazo sin clave, fila física confirmada como ciphertext leyendo la columna cruda directamente. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

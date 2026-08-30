@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.146.0"
+version = "1.147.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -36,6 +36,7 @@ runtime = [
     "dep:lettre",
     "dep:parking_lot",
     "dep:flate2",
+    "dep:aes-gcm",
 ]
 
 [dependencies]
@@ -88,3 +89,14 @@ lettre = { version = "0.11.23", default-features = false, features = ["builder",
 # `zlib-ng`/`cloudflare_zlib` ni ninguna dependencia C, mismo criterio de
 # "sin tooling nuevo que instalar" que el resto del proyecto.
 flate2 = { version = "1", optional = true }
+# Tercera excepción real a "cero dependencias nuevas" (ver `regex`/`flate2`
+# arriba): a diferencia de los formatos binarios de layout FIJO que este
+# proyecto sí hand-rollea (UUID, HMAC-SHA256, el wire de `inet`/`timestamp`/
+# `numeric` de Postgres -- todos parseo/serialización de una forma
+# documentada, sin decisión criptográfica de por medio), un CIFRADOR
+# simétrico NUNCA debería hand-rollearse -- es exactamente el tipo de caso
+# donde "sin dependencia nueva salvo que no haya alternativa razonable"
+# aplica con más fuerza, no menos. `aes-gcm` (RustCrypto, implementación de
+# referencia del ecosistema) -- AEAD: cifra Y autentica en una sola
+# operación, evita el error clásico de cifrar sin autenticar.
+aes-gcm = { version = "0.10", optional = true }

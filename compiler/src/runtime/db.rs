@@ -9,7 +9,7 @@
 // mismo espíritu que contract.d.ts/client.ts/validators.ts (todos derivados
 // de la misma fuente de verdad, cero duplicación manual).
 
-use super::{as_int, generate_uuid_v4, json_to_typed_value, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
+use super::{as_int, encryption, generate_uuid_v4, json_to_typed_value, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
 use crate::ast::{BinaryOp, FieldCheck, Item, Program, TimeGranularity, TypeAnnotation, TypeExpr};
 use crate::checker::Checker;
 use crate::rate_limit::RateLimitSpec;
@@ -54,6 +54,12 @@ pub(crate) struct ColumnPlan {
     /// columna guarda el valor nativo tal cual (Int/Float/String/Bool/enum
     /// simple).
     pub(crate) json: bool,
+    /// `@encrypted` (GRAMMAR.md §3.191) -- `true` solo para un campo
+    /// `String`/`String?` así marcado (el checker ya lo garantizó). La
+    /// columna SQL sigue siendo `TEXT` normal, sin `ColumnKind` nuevo --
+    /// `write_param`/`decode_row` son los únicos dos puntos que miran este
+    /// campo, para cifrar al escribir/descifrar al leer.
+    pub(crate) encrypted: bool,
 }
 
 impl ColumnPlan {
@@ -64,16 +70,20 @@ impl ColumnPlan {
     /// texto JSON de `Value::Null` es simplemente `"null"`, así que ese
     /// tercer estado sale gratis de `value_to_json`/`json_to_typed_value`
     /// sin ningún caso especial en el resto de este archivo -- ver
-    /// `write_param`/`row_to_fields`.
-    pub(crate) fn for_field(field: FieldType, simple_enums: &HashSet<String>) -> Self {
+    /// `write_param`/`row_to_fields`. `encrypted` viene de
+    /// `encrypted_fields_by_collection` (el mismo cruce
+    /// `program.items`/`checker.db_collections()` que `soft_delete_fields_by_collection`
+    /// ya usa) -- `FieldType` es estructural, sin anotaciones, así que el
+    /// caller es quien la resuelve, no `for_field`.
+    pub(crate) fn for_field(field: FieldType, simple_enums: &HashSet<String>, encrypted: bool) -> Self {
         let double_optional = field.optional && matches!(field.ty, Type::Optional(_));
         let effective_ty: &Type = match &field.ty {
             Type::Optional(inner) => inner.as_ref(),
             other => other,
         };
         match if double_optional { None } else { native_sql_type(effective_ty, simple_enums) } {
-            Some(sql_type) => ColumnPlan { field, sql_type, json: false },
-            None => ColumnPlan { field, sql_type: "TEXT", json: true },
+            Some(sql_type) => ColumnPlan { field, sql_type, json: false, encrypted },
+            None => ColumnPlan { field, sql_type: "TEXT", json: true, encrypted },
         }
     }
 
@@ -211,6 +221,32 @@ fn soft_delete_fields_by_collection(program: &Program, checker: &Checker) -> Has
             let TypeExpr::Struct(fields) = &t.ty else { continue };
             if let Some(f) = fields.iter().find(|f| f.soft_delete()) {
                 result.insert(coll_name.clone(), f.name.clone());
+            }
+        }
+    }
+    result
+}
+
+/// Nombre de colección -> nombres de sus campos `@encrypted` (GRAMMAR.md
+/// §3.191) -- mismo cruce que `soft_delete_fields_by_collection`, pero SIN
+/// el límite de "a lo sumo uno" (varios campos `@encrypted` en el mismo
+/// struct son perfectamente válidos). `pub(crate)` -- `db_admin.rs`
+/// (`export`/`import`) también lo necesita, para rechazar de entrada un
+/// programa con algún campo `@encrypted` (ver GRAMMAR.md §3.191, "Límites
+/// honestos": ninguno de los dos soporta cifrado todavía).
+pub(crate) fn encrypted_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<String, HashSet<String>> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let TypeExpr::Struct(fields) = &t.ty else { continue };
+            let encrypted: HashSet<String> = fields.iter().filter(|f| f.encrypted()).map(|f| f.name.clone()).collect();
+            if !encrypted.is_empty() {
+                result.insert(coll_name.clone(), encrypted);
             }
         }
     }
@@ -1078,6 +1114,14 @@ pub struct Db {
     /// `--http-timeout`/`LINK_HTTP_TIMEOUT` (o su default, ver
     /// `main.rs::resolve_http_timeout`).
     http_timeout: parking_lot::RwLock<Duration>,
+    /// `--encryption-key`/`LINK_ENCRYPTION_KEY` (GRAMMAR.md §3.191) -- mismo
+    /// criterio EXACTO que `http_timeout` arriba: `None` hasta que
+    /// `server.rs` lo sobreescribe UNA vez al arrancar (después de
+    /// confirmar, si el programa declara algún campo `@encrypted`, que SÍ
+    /// hay una clave real configurada -- `serve()` rechaza arrancar si no).
+    /// `write_param`/`decode_row` lo leen para cifrar/descifrar cada campo
+    /// `ColumnPlan::encrypted`.
+    encryption_key: parking_lot::RwLock<Option<[u8; encryption::KEY_LEN]>>,
     /// Nombre de colección -> nombre del campo `@softDelete`, si esa
     /// colección tiene uno (GRAMMAR.md §3.78). Se calcula UNA vez al abrir
     /// la conexión (acá SÍ hay `Program`/`ast::Field` con anotaciones a
@@ -1373,8 +1417,10 @@ impl Db {
 
         let checks_by_collection = check_fields_by_collection(program, &checker);
         let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
+        let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let empty_type_checks: Vec<String> = Vec::new();
+        let empty_encrypted: HashSet<String> = HashSet::new();
         let mut columns = HashMap::new();
         let mut id_kinds = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
@@ -1384,8 +1430,12 @@ impl Db {
             let id_kind = IdKind::from_field_type(
                 &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty,
             );
-            let cols: Vec<ColumnPlan> =
-                fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
+            let encrypted_fields = encrypted_by_collection.get(name).unwrap_or(&empty_encrypted);
+            let cols: Vec<ColumnPlan> = fields
+                .iter()
+                .filter(|f| f.name != "id")
+                .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_fields.contains(&f.name)))
+                .collect();
             if adopt_existing {
                 // GRAMMAR.md §3.80/§3.96: `--adopt-existing` nunca ejecuta
                 // DDL, punto -- ni `@index`/`@unique`/`@check` es la
@@ -1438,6 +1488,7 @@ impl Db {
             instance_id: random_instance_id(),
             argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
             http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
+            encryption_key: parking_lot::RwLock::new(None),
             soft_delete_fields,
             // GRAMMAR.md §3.178: rate limiting distribuido es un concepto
             // exclusivamente Postgres -- SQLite nunca lo necesita, un solo
@@ -1487,8 +1538,10 @@ impl Db {
 
         let checks_by_collection = check_fields_by_collection(program, &checker);
         let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
+        let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let empty_type_checks: Vec<String> = Vec::new();
+        let empty_encrypted: HashSet<String> = HashSet::new();
         let mut columns = HashMap::new();
         let mut id_kinds = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
@@ -1497,8 +1550,12 @@ impl Db {
             };
             let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
             let id_kind = IdKind::from_field_type(id_field_ty);
-            let cols: Vec<ColumnPlan> =
-                fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
+            let encrypted_fields = encrypted_by_collection.get(name).unwrap_or(&empty_encrypted);
+            let cols: Vec<ColumnPlan> = fields
+                .iter()
+                .filter(|f| f.name != "id")
+                .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_fields.contains(&f.name)))
+                .collect();
             let non_id: Vec<FieldType> = cols.iter().map(|c| c.field.clone()).collect();
 
             if !adopt_existing {
@@ -1622,6 +1679,7 @@ impl Db {
                 instance_id,
                 argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
                 http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
+                encryption_key: parking_lot::RwLock::new(None),
                 soft_delete_fields,
                 distributed_rate_limit,
             },
@@ -1671,6 +1729,22 @@ impl Db {
     /// que esto no necesita clonar nada.
     pub(crate) fn http_timeout(&self) -> Duration {
         *self.http_timeout.read()
+    }
+
+    /// Fija la clave de `@encrypted` para lo que quede de vida del proceso
+    /// (GRAMMAR.md §3.191) -- mismo criterio que `set_argon2_params`/
+    /// `set_http_timeout`: `server.rs` lo llama UNA sola vez, antes de
+    /// aceptar la primera request, después de confirmar (si hace falta) que
+    /// hay una clave real configurada.
+    pub(crate) fn set_encryption_key(&self, key: Option<[u8; encryption::KEY_LEN]>) {
+        *self.encryption_key.write() = key;
+    }
+
+    /// La clave configurada, si hay -- la leen `write_param`/`decode_row`
+    /// en cada campo `ColumnPlan::encrypted`. `[u8; 32]` es `Copy`, así que
+    /// esto no necesita clonar nada más que el propio array.
+    pub(crate) fn encryption_key(&self) -> Option<[u8; encryption::KEY_LEN]> {
+        *self.encryption_key.read()
     }
 
     /// Fixture SOLO para tests y para el demo wasm (`bin/wasm_demo.rs`) --
@@ -2041,7 +2115,7 @@ db { users: User[] }
                 for col in columns {
                     let slot = fields.iter().find(|(n, _)| n == &col.field.name).map(|(_, v)| v);
                     col_names.push(format!("\"{}\"", col.field.name));
-                    params.push(self.write_param(col, slot));
+                    params.push(self.write_param(col, slot)?);
                 }
                 let sql = if col_names.is_empty() {
                     format!("INSERT INTO \"{collection}\" DEFAULT VALUES")
@@ -2094,7 +2168,7 @@ db { users: User[] }
                     // que también lo excluye de lo que el caller puede fijar.
                     let Some(col) = columns.iter().find(|c| name == &c.field.name) else { continue };
                     set_clauses.push(format!("\"{name}\" = {}", self.backend.placeholder(params.len() + 1)));
-                    params.push(self.write_param(col, Some(value)));
+                    params.push(self.write_param(col, Some(value))?);
                 }
                 if !set_clauses.is_empty() {
                     let id_placeholder = self.backend.placeholder(params.len() + 1);
@@ -2522,7 +2596,7 @@ db { users: User[] }
         for col in columns {
             let slot = fields.iter().find(|(n, _)| n == &col.field.name).map(|(_, v)| v);
             col_names.push(format!("\"{}\"", col.field.name));
-            params.push(self.write_param(col, slot));
+            params.push(self.write_param(col, slot)?);
         }
         let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
         let sql = format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "));
@@ -2722,10 +2796,17 @@ db { users: User[] }
             Cell::Int(*id)
         } else {
             let col = columns.iter().find(|c| c.field.name == field)?;
-            if col.json {
+            // `col.encrypted` (GRAMMAR.md §3.191): el ciphertext es distinto
+            // en cada escritura (nonce aleatorio) -- comparar contra el
+            // VALOR de un parámetro pusheado a SQL nunca podría matchear la
+            // fila correcta, así que esto cae al camino interpretado de
+            // siempre (`select_where_conjunction`/`select_rows` completo +
+            // filtrado en memoria, donde `col.encrypted` SÍ descifra antes
+            // de comparar) -- mismo criterio que `col.json` ya usa acá.
+            if col.json || col.encrypted {
                 return None;
             }
-            self.write_param(col, Some(value))
+            self.write_param(col, Some(value)).ok()?
         };
         let clause = format!("\"{field}\" {sql_op} {}", self.backend.placeholder(cells.len() + 1));
         cells.push(cell);
@@ -3153,7 +3234,8 @@ db { users: User[] }
     /// principal del accept-loop, server.rs) que nombra la colección y el
     /// campo.
     fn row_to_fields(&self, collection: &str, cells: &[Cell], columns: &[ColumnPlan]) -> Result<Vec<(String, Value)>, RuntimeError> {
-        decode_row(collection, cells, columns, self.id_kind(collection), &self.checker)
+        let key = self.encryption_key();
+        decode_row(collection, cells, columns, self.id_kind(collection), &self.checker, key.as_ref())
     }
 }
 
@@ -3170,6 +3252,7 @@ pub(crate) fn decode_row(
     columns: &[ColumnPlan],
     id_kind: IdKind,
     checker: &Checker,
+    encryption_key: Option<&[u8; encryption::KEY_LEN]>,
 ) -> Result<Vec<(String, Value)>, RuntimeError> {
     let mut out = Vec::with_capacity(columns.len() + 1);
     // GRAMMAR.md §3.177: `id` es `Cell::Int` para una PK autoincremento
@@ -3245,6 +3328,54 @@ pub(crate) fn decode_row(
                 continue;
             }
 
+            // `@encrypted` (GRAMMAR.md §3.191) -- el checker ya garantizó
+            // que un campo así marcado es `String`/`String?` sin `x?: T?`
+            // (así que nunca llega acá vía la rama JSON de arriba). Corre
+            // ANTES del match genérico de abajo porque descifrar es
+            // FALIBLE (clave incorrecta, dato corrompido) -- ese match
+            // devuelve `Option<Value>` sin lugar para propagar un `Err`.
+            if col.encrypted {
+                let value = match cell {
+                    Cell::Null => None,
+                    Cell::Text(t) => {
+                        // `encryption_key` es `None` solo si este `Db` nunca
+                        // tuvo `set_encryption_key` con `Some(...)` -- no
+                        // debería pasar nunca en un `linkc serve` real
+                        // (rechaza arrancar sin clave si hay campos
+                        // `@encrypted`, ver `server.rs::serve`), pero un
+                        // `RuntimeError` limpio acá es mejor que un panic si
+                        // de algún modo se llega igual (ej. un test que
+                        // arma un `Db` a mano sin pasar por `serve`).
+                        let Some(key) = encryption_key else {
+                            return Err(RuntimeError::new(format!(
+                                "la colección '{collection}' tiene un campo '@encrypted' ('{}') pero no hay ninguna clave de cifrado configurada en este proceso",
+                                col.field.name
+                            )));
+                        };
+                        let plaintext = encryption::decrypt_field(t, key).map_err(|e| {
+                            RuntimeError::new(format!(
+                                "la colección '{collection}' tiene una fila (id={id}) con un valor '@encrypted' en '{}' que no se pudo descifrar: {e}",
+                                col.field.name
+                            ))
+                        })?;
+                        Some(Value::Str(plaintext))
+                    }
+                    other => {
+                        return Err(RuntimeError::new(format!(
+                            "la colección '{collection}' tiene una fila (id={id}) cuya columna '@encrypted' '{}' debería contener texto cifrado pero la base devolvió {other:?}",
+                            col.field.name
+                        )))
+                    }
+                };
+                match value {
+                    Some(v) => out.push((col.field.name.clone(), v)),
+                    None if col.field.optional => {}
+                    None if matches!(col.field.ty, Type::Optional(_)) => out.push((col.field.name.clone(), Value::Null)),
+                    None => return Err(null_but_required(&col.field.name)),
+                }
+                continue;
+            }
+
             let effective_ty: &Type = match &col.field.ty {
                 Type::Optional(inner) => inner.as_ref(),
                 other => other,
@@ -3305,17 +3436,39 @@ impl Db {
     /// Valor a bindear para `col`, dado el valor del `Value::Struct` de entrada
     /// en esa clave (`None` si la clave está ausente -- solo alcanzable si
     /// `col.field.optional`, ver `ColumnPlan`). Inversa de `row_to_fields`.
-    fn write_param(&self, col: &ColumnPlan, slot: Option<&Value>) -> Cell {
-        let Some(v) = slot else { return Cell::Null };
+    /// Falible SOLO por `col.encrypted` (GRAMMAR.md §3.191) -- cifrar puede
+    /// fallar si el CSPRNG del sistema falla (`os_random_bytes`, el mismo
+    /// que usa la generación de PK `Uuid`) o si no hay ninguna clave
+    /// configurada (no debería pasar nunca en un `linkc serve` real, que
+    /// rechaza arrancar sin clave si hay campos `@encrypted` -- ver
+    /// `server.rs::serve`); un `RuntimeError` limpio acá es mejor que un
+    /// panic si de algún modo se llega igual.
+    fn write_param(&self, col: &ColumnPlan, slot: Option<&Value>) -> Result<Cell, RuntimeError> {
+        let Some(v) = slot else { return Ok(Cell::Null) };
         if col.json {
             // `value_to_json(Value::Null)` da el JSON `null` -- exactamente el
             // sentinel de "presente pero null" que el caso `x?: T?` necesita,
             // sin ningún código especial acá. Y no es lo mismo que un NULL de
             // SQL, que significa "clave ausente": los dos backends conservan
             // esa diferencia (TEXT "null" en SQLite, JSONB null en PostgreSQL).
-            return Cell::Json(value_to_json(v, &self.simple_enums));
+            return Ok(Cell::Json(value_to_json(v, &self.simple_enums)));
         }
-        match v {
+        if col.encrypted {
+            return Ok(match v {
+                Value::Null => Cell::Null,
+                Value::Str(s) => {
+                    let key = self.encryption_key().ok_or_else(|| {
+                        RuntimeError::new(format!(
+                            "la colección tiene un campo '@encrypted' ('{}') pero no hay ninguna clave de cifrado configurada en este proceso",
+                            col.field.name
+                        ))
+                    })?;
+                    Cell::Text(encryption::encrypt_field(s, &key)?)
+                }
+                other => panic!("un campo '@encrypted' solo puede recibir Value::Str/Value::Null -- el checker ya lo garantizó: {other:?}"),
+            });
+        }
+        Ok(match v {
             Value::Null => Cell::Null,
             Value::Int(n) => Cell::Int(*n),
             Value::Int64(n) => Cell::Int(*n),
@@ -3329,7 +3482,7 @@ impl Db {
             Value::Bool(b) => Cell::Bool(*b),
             Value::Variant { variant, .. } => Cell::Text(variant.clone()),
             other => panic!("valor no representable en una columna nativa de SQL: {other:?}"),
-        }
+        })
     }
 }
 

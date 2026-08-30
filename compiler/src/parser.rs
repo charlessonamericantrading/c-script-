@@ -621,9 +621,17 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     annotations.push(FieldAnnotation::Check(check));
                 }
+                // Sin paréntesis, mismo criterio que `@autoUpdate`/`@softDelete`
+                // (GRAMMAR.md §3.191).
+                "encrypted" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::Encrypted)) {
+                        return Err(self.error("'@encrypted' repetido sobre el mismo campo".to_string()));
+                    }
+                    annotations.push(FieldAnnotation::Encrypted);
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique' o '@check(...)')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)' o '@encrypted')"
                     )))
                 }
             }

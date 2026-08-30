@@ -312,6 +312,13 @@ impl Field {
             _ => None,
         })
     }
+
+    /// ¿Lleva `@encrypted`? (GRAMMAR.md §3.191) -- un campo `String`/`String?`
+    /// así marcado se cifra (AES-256-GCM) antes de guardarse y se descifra
+    /// al leerse; el `Value` que ve el resto del programa nunca cambia.
+    pub fn encrypted(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, FieldAnnotation::Encrypted))
+    }
 }
 
 impl PartialEq for Field {
@@ -352,6 +359,15 @@ pub enum FieldAnnotation {
     /// expresión booleana arbitraria, comparar dos campos entre sí) todavía
     /// no cubre.
     Check(FieldCheck),
+    /// `@encrypted` (sin paréntesis) -- solo sobre `String`/`String?`
+    /// (GRAMMAR.md §3.191). Cifrado a nivel de ALMACENAMIENTO únicamente --
+    /// invisible del lado de `.link`, el `Value` que ve el intérprete sigue
+    /// siendo el `String` plano. Incompatible con `@index`/`@unique` en el
+    /// mismo campo (el checker lo rechaza: el nonce aleatorio de AES-GCM
+    /// hace que el ciphertext sea distinto en cada escritura, así que un
+    /// constraint SQL sobre esa columna sería siempre "único", incluso para
+    /// el mismo valor en texto plano -- una garantía falsa, no una real).
+    Encrypted,
 }
 
 /// Las tres formas de `@check(...)` (GRAMMAR.md §3.96) -- mismo criterio de

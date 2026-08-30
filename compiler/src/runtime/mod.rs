@@ -4,6 +4,7 @@
 // (PLAN.md §4) — esto solo alcanza para que la demo E2E responda de verdad.
 
 pub mod db;
+pub(crate) mod encryption;
 pub mod server;
 pub mod session;
 pub(crate) mod store;
@@ -1815,7 +1816,7 @@ fn http_headers_from_value(items: &[Value]) -> Result<Vec<(String, String)>, Run
 /// Bytes del CSPRNG del sistema (BCryptGenRandom en Windows, getrandom(2) en
 /// Linux, random_get en WASI). Todo lo que en este lenguaje se llame
 /// "aleatorio" o "seguro" sale de acá, nunca del reloj.
-fn os_random_bytes(n: usize) -> Result<Vec<u8>, RuntimeError> {
+pub(crate) fn os_random_bytes(n: usize) -> Result<Vec<u8>, RuntimeError> {
     let mut buf = vec![0u8; n];
     getrandom::getrandom(&mut buf)
         .map_err(|e| err(format!("el sistema no pudo generar bytes aleatorios: {e}")))?;

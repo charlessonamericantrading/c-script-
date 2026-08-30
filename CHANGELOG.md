@@ -3,6 +3,21 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.147.0] - 2026-08-30
+
+### ✨ Nuevo
+**`@encrypted`** (PLAN.md §9.5 ítem 2, última pieza de la ronda de seguridad completa) -- AES-256-GCM sobre un campo `String`/`String?`, puramente a nivel de almacenamiento. `type User = { id: Int, @encrypted ssn: String }` -- el `Value` que ve el resto del programa sigue siendo el `String` plano de siempre.
+
+- `--encryption-key`/`LINK_ENCRYPTION_KEY` (32 bytes en base64) obligatoria SOLO si el programa declara algún campo `@encrypted` -- `linkc serve` rechaza arrancar sin ella, nunca falla recién en el primer uso.
+- `nonce (12 bytes) || ciphertext || tag`, todo en base64, en la MISMA columna `TEXT` de siempre -- sin `ColumnKind` nuevo.
+- `findWhere`/`countWhere`/`deleteWhere` sobre un campo `@encrypted` caen al camino interpretado de siempre (correcto, descifra antes de comparar) en vez de pushear una comparación contra ciphertext a SQL, que nunca podría matchear.
+- `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` agrupando por un campo `@encrypted`, y `@index`/`@unique` en el mismo campo, se rechazan en compile-time -- el nonce aleatorio los volvería garantías falsas, no solo redundantes.
+- Tercera excepción real a "cero dependencias nuevas" (`aes-gcm`, tras `regex`/`flate2`) -- un cifrador simétrico nunca debería hand-rollearse.
+
+**Límite honesto**: `db export`/`import` todavía no soportan una colección con campos `@encrypted` (rechazan de entrada, con mensaje claro); `db shell` no necesita cambios.
+
+**Verificado**: 9 tests unitarios de cifrado + 8 de checker + 7 de CLI contra el binario real (SQLite) + 2 contra Postgres real. Suite completa sin regresiones. Ver GRAMMAR.md §3.191.
+
 ## [1.146.0] - 2026-08-30
 
 ### ✨ Nuevo

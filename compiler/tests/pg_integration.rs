@@ -4510,3 +4510,87 @@ fn db_shell_formats_native_numeric_uuid_and_jsonb_columns_as_legible_text_agains
     shell.shutdown();
     admin.batch_execute(&format!("DROP TABLE IF EXISTS \"{COLLECTION}\"")).ok();
 }
+
+// ---- `@encrypted` (GRAMMAR.md §3.191) contra PostgreSQL real ----
+
+const ENCRYPTED_PROGRAM: &str = r#"
+type User = { id: Int, name: String, @encrypted ssn: String }
+type NewUser = { name: String, ssn: String }
+db { users: User[] }
+service Users {
+  rpc add(name: String, ssn: String) -> User { db.users.insert(NewUser { name: name, ssn: ssn }) }
+  rpc get(id: Int) -> User? { db.users.find(id) }
+}
+"#;
+
+// 32 bytes reales en base64 estándar -- clave de prueba fija, nunca usada
+// para nada real.
+const ENCRYPTED_TEST_KEY: &str = "CDXG1VdLU/xMH3p4PBXLw1C7uW3IyHDJuhbu3WIbPE8=";
+
+#[test]
+fn an_encrypted_field_stores_ciphertext_in_postgres_but_round_trips_to_the_exact_plaintext_over_http() {
+    const COLLECTION: &str = "users_encrypted";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("encrypted-pg");
+    let src = temp.write("app.link", &ENCRYPTED_PROGRAM.replace("users:", &format!("{COLLECTION}:")).replace("db.users", &format!("db.{COLLECTION}")));
+
+    let server = Serve::start_with_args(&src, &url, &["--encryption-key", ENCRYPTED_TEST_KEY]);
+    let created = server.rpc("Users/add", r#"{"name":"Ada","ssn":"123-45-6789"}"#);
+    assert_eq!(created["ssn"], "123-45-6789", "el wire nunca ve el cifrado: {created:?}");
+    let id = created["id"].as_i64().expect("id");
+
+    let fetched = server.rpc("Users/get", &format!(r#"{{"id":{id}}}"#));
+    assert_eq!(fetched["ssn"], "123-45-6789");
+    drop(server);
+
+    // La fila FÍSICA en Postgres -- confirmado leyendo la columna cruda,
+    // sin pasar por ningún código de este proyecto que "debería" haber
+    // descifrado.
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como admin");
+    let raw: String = admin
+        .query_one(&format!("SELECT ssn FROM \"{COLLECTION}\" WHERE id = $1"), &[&(id as i32)])
+        .expect("leer la fila cruda")
+        .get(0);
+    assert_ne!(raw, "123-45-6789", "el ssn NUNCA debe estar en texto plano en la columna física: {raw:?}");
+    assert!(raw.len() > 10, "debería haber un valor cifrado real guardado: {raw:?}");
+
+    admin.batch_execute(&format!("DROP TABLE IF EXISTS \"{COLLECTION}\"")).ok();
+}
+
+#[test]
+fn serve_refuses_to_start_against_postgres_too_without_a_key_when_the_program_declares_an_encrypted_field() {
+    const COLLECTION: &str = "users_encrypted_no_key";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("encrypted-pg-no-key");
+    let src = temp.write("app.link", &ENCRYPTED_PROGRAM.replace("users:", &format!("{COLLECTION}:")).replace("db.users", &format!("db.{COLLECTION}")));
+
+    let port = free_port();
+    let log_dir = src.parent().expect("el .link vive en algún directorio");
+    let out_path = log_dir.join(format!("serve-{port}.out"));
+    let err_path = log_dir.join(format!("serve-{port}.err"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("serve")
+        .arg(&src)
+        .arg(port.to_string())
+        .env("LINK_DATABASE_URL", &url)
+        .stdout(std::fs::File::create(&out_path).expect("crear el log de stdout"))
+        .stderr(std::fs::File::create(&err_path).expect("crear el log de stderr"))
+        .spawn()
+        .expect("iniciar 'linkc serve'");
+    let status = child.wait().expect("esperar a que 'linkc serve' termine");
+    assert!(!status.success(), "no debería arrancar sin clave si el programa declara @encrypted");
+    let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
+    assert!(stderr.contains("@encrypted") && stderr.contains("--encryption-key"), "{stderr}");
+}

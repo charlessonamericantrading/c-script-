@@ -33,7 +33,8 @@
 // el límite de `Send` de arriba: lo único que cruza al hilo escritor es
 // JSON puro, nunca `Db`/`Value`.
 
-use super::db::{now_ms, Db};
+use super::db::{encrypted_fields_by_collection, now_ms, Db};
+use super::encryption;
 use super::session::SessionStore;
 use super::{
     invoke_rpc_with_sessions, is_cron_member, is_stream_member, live_subscribe_collection, required_auth, required_cache,
@@ -367,6 +368,7 @@ pub fn serve(
     cors: CorsConfig,
     session_ttl: Option<Duration>,
     argon2_params: argon2::Params,
+    encryption_key: Option<String>,
     jwt_config: Option<(String, String, String)>,
     adopt_existing: bool,
     max_body_bytes: u64,
@@ -406,6 +408,29 @@ pub fn serve(
             }
         },
     };
+    // GRAMMAR.md §3.191: si el programa declara algún campo `@encrypted`,
+    // hace falta una clave real ANTES de aceptar la primera request --
+    // fallar acá, con un mensaje claro, es mejor que fallar recién en el
+    // primer insert/update sobre esa colección (o, peor, guardar el valor
+    // sin cifrar en silencio). `Checker::build_symbols` es barato y ya es
+    // el patrón establecido para esto (mismo que `invoke_rpc_with_sessions`
+    // reconstruye por invocación) -- no hace falta el `Checker` completo
+    // que `db` ya tiene adentro, y no está expuesto desde acá.
+    let (checker_for_encryption, _) = crate::checker::Checker::build_symbols(program);
+    let has_encrypted_fields = !encrypted_fields_by_collection(program, &checker_for_encryption).is_empty();
+    let encryption_key = match encryption_key {
+        Some(raw) => {
+            Some(encryption::parse_encryption_key(&raw).map_err(|e| format!("--encryption-key/LINK_ENCRYPTION_KEY inválida: {e}"))?)
+        }
+        None if has_encrypted_fields => {
+            return Err(
+                "el programa declara al menos un campo '@encrypted', pero no se configuró --encryption-key/LINK_ENCRYPTION_KEY (GRAMMAR.md §3.191)"
+                    .to_string(),
+            );
+        }
+        None => None,
+    };
+    db.set_encryption_key(encryption_key);
     // GRAMMAR.md §3.55: costo de `crypto.hashPassword` para lo que quede de
     // vida del proceso -- default de la crate si no se pasó ningún flag/env
     // var (ver `resolve_argon2_params` en `main.rs`).

@@ -18,7 +18,8 @@
 use crate::ast::Program;
 use crate::checker::Checker;
 use crate::runtime::db::{
-    connect_postgres_client, decode_row, id_column_kind_for, now_ms, sqlite_table_exists, ColumnPlan, Db, IdKind,
+    connect_postgres_client, decode_row, encrypted_fields_by_collection, id_column_kind_for, now_ms, sqlite_table_exists, ColumnPlan, Db,
+    IdKind,
 };
 use crate::runtime::store::Backend;
 use crate::runtime::timestamp::format_iso8601_millis;
@@ -54,10 +55,30 @@ struct CollectionPlan {
 /// Mismo `Checker::build_symbols` (sin instanciar ningún `Db`/DDL) que
 /// `inspect.rs::declared_collections` ya usa, extendido con el `ColumnPlan`
 /// completo de cada colección en vez de solo un conteo.
+///
+/// GRAMMAR.md §3.191, "Límites honestos": un programa con algún campo
+/// `@encrypted` se rechaza ACÁ, antes de tocar ninguna fila -- ni `export`
+/// ni `import` soportan cifrado todavía. `export` (que sí llega a
+/// `decode_row`, el chokepoint de descifrado) no tiene ninguna clave
+/// disponible ahí, y mostrar el ciphertext crudo sin avisar sería
+/// confuso, no solo incompleto; rechazar de entrada, con un mensaje
+/// claro, es más honesto que un passthrough silencioso. `db shell` NO
+/// necesita este chequeo -- nunca pasa por `decode_row` (SQL crudo,
+/// sin `ColumnPlan`), así que ya muestra el ciphertext tal cual, de forma
+/// consistente con cómo trata cualquier otro valor físico.
 fn declared_collection_plans(program: &Program) -> Result<(Checker, Vec<CollectionPlan>), String> {
     let (checker, errors) = Checker::build_symbols(program);
     if let Some(e) = errors.into_iter().next() {
         return Err(format!("programa inválido: {e}"));
+    }
+    let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
+    if let Some((coll, fields)) = encrypted_by_collection.iter().next() {
+        let mut names: Vec<&str> = fields.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        return Err(format!(
+            "'{coll}' tiene campo(s) '@encrypted' ({}) -- 'db export'/'db import' todavía no soportan colecciones con campos cifrados (GRAMMAR.md §3.191)",
+            names.join(", ")
+        ));
     }
     let simple_enums = simple_enum_names(program);
     let mut out: Vec<CollectionPlan> = checker
@@ -66,8 +87,11 @@ fn declared_collection_plans(program: &Program) -> Result<(Checker, Vec<Collecti
         .filter_map(|(name, ty)| match ty {
             Type::Struct { fields, .. } => {
                 let id_field_ty = &fields.iter().find(|f| f.name == "id")?.ty;
-                let columns: Vec<ColumnPlan> =
-                    fields.iter().filter(|f| f.name != "id").map(|f| ColumnPlan::for_field(f.clone(), &simple_enums)).collect();
+                let columns: Vec<ColumnPlan> = fields
+                    .iter()
+                    .filter(|f| f.name != "id")
+                    .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, false))
+                    .collect();
                 Some(CollectionPlan { name: name.clone(), columns, id_kind: IdKind::from_field_type(id_field_ty) })
             }
             _ => None,
@@ -110,7 +134,11 @@ fn read_all_rows(
     let rows = backend.query(&sql, &[], &kinds)?;
     rows.into_iter()
         .map(|cells| {
-            let fields = decode_row(&plan.name, &cells, &plan.columns, plan.id_kind, checker).map_err(|e| e.to_string())?;
+            // `None`: `declared_collection_plans` ya rechazó cualquier
+            // programa con un campo `@encrypted` (GRAMMAR.md §3.191), así
+            // que ninguna `col` de acá abajo tiene `encrypted: true` -- este
+            // parámetro nunca se usa de verdad para `export`.
+            let fields = decode_row(&plan.name, &cells, &plan.columns, plan.id_kind, checker, None).map_err(|e| e.to_string())?;
             Ok(value_to_json(&Value::Struct(fields), simple_enums))
         })
         .collect()
