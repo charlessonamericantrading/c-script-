@@ -4554,7 +4554,7 @@ fn an_encrypted_field_stores_ciphertext_in_postgres_but_round_trips_to_the_exact
     // descifrado.
     let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como admin");
     let raw: String = admin
-        .query_one(&format!("SELECT ssn FROM \"{COLLECTION}\" WHERE id = $1"), &[&(id as i32)])
+        .query_one(&format!("SELECT ssn FROM \"{COLLECTION}\" WHERE id = $1"), &[&id])
         .expect("leer la fila cruda")
         .get(0);
     assert_ne!(raw, "123-45-6789", "el ssn NUNCA debe estar en texto plano en la columna física: {raw:?}");

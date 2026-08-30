@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.147.1] - 2026-08-30
+
+### 🐛 Arreglado
+**CI en rojo tras v1.147.0, por un bug de test -- no un bug real.** El nuevo test de `@encrypted` contra Postgres real (`an_encrypted_field_stores_ciphertext_in_postgres_but_round_trips_to_the_exact_plaintext_over_http`) leía la fila cruda con `WHERE id = $1` bindeando `id as i32`, pero la columna real es `BIGSERIAL` (`int8`) -- el driver de Postgres rechaza el tipo (`WrongType { postgres: Int8, rust: "i32" }`). Corregido a bindear `id` (`i64`) directo, sin cast. El cifrado en sí (`write_param`/`decode_row`) ya funcionaba: 76 de 77 tests pasaron en CI.
+
 ## [1.147.0] - 2026-08-30
 
 ### ✨ Nuevo
