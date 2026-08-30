@@ -215,6 +215,7 @@
   - [3.191 `@encrypted` — RESUELTO, cierra PLAN.md §9.5 ítem 2 (cifrado de campo a nivel de columna)](#3191-encrypted--resuelto-cierra-planmd-95-ítem-2-cifrado-de-campo-a-nivel-de-columna)
   - [3.192 Bug real: `information_schema` hardcodeaba `'public'` (o no filtraba schema en absoluto) — RESUELTO](#3192-bug-real-information_schema-hardcodeaba-public-o-no-filtraba-schema-en-absoluto--resuelto)
   - [3.193 `--db-schema <nombre>`/`LINK_DATABASE_SCHEMA` — RESUELTO, cierra PLAN.md §9.3 ítem 4](#3193---db-schema-nombrelink_database_schema--resuelto-cierra-planmd-93-ítem-4)
+  - [3.194 `crypto.awsS3PresignedUploadUrl(...)`: URL firmada para SUBIR a S3 — RESUELTO, cierra la mitad que §3.110 había dejado abierta](#3194-cryptoawss3presigneduploadurl-url-firmada-para-subir-a-s3--resuelto-cierra-la-mitad-que-3110-había-dejado-abierta)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -4988,7 +4989,7 @@ rpc urlDeDescarga(f: Factura) -> String {
 
 **Alcance deliberado de esta ronda:**
 
-- **Solo `GET` (compartir/descargar), no `PUT`/subir.** El caso real reportado es "generar un link de descarga" -- una URL presignada para SUBIR necesita, además, que el cliente mande el `Content-Type`/tamaño exactos que la firma prevé, un contrato más amplio entre quien genera la URL y quien la usa que el caso de descarga no tiene. Queda para una ronda dedicada si aparece evidencia real de demanda.
+- ~~**Solo `GET` (compartir/descargar), no `PUT`/subir.**~~ -- **resuelto, ver `crypto.awsS3PresignedUploadUrl`, §3.194.** El caso real reportado acá era "generar un link de descarga" -- la mitad de SUBIDA quedó deliberadamente fuera de esta ronda por necesitar, además, atar el `Content-Type` que la firma prevé; se cerró después como una función hermana, sin cambiar nada de lo que ya funciona acá.
 - **Solo credenciales de larga duración (access key + secret key), sin `X-Amz-Security-Token`.** Credenciales temporales de AWS STS no están cubiertas.
 - **Estilo "virtual-hosted" (`bucket.s3.region.amazonaws.com`) siempre**, nunca el estilo de path (`s3.region.amazonaws.com/bucket`). Un nombre de bucket con puntos (que rompe el certificado TLS wildcard del estilo virtual-hosted) no tiene manejo especial -- caveat conocido y documentado de AWS, no algo que esta función intente resolver.
 - **Sin llamar a AWS para nada.** Es una función PURA -- ninguna request sale del proceso. Verificar que el resultado funciona de verdad contra un bucket real (permisos, que el objeto exista, que la cuenta esté bien configurada) sigue siendo responsabilidad de quien la usa; c-script no puede confirmar eso sin credenciales reales de AWS, que esta ronda no tenía disponibles.
@@ -7145,6 +7146,29 @@ Los dos procesos comparten la MISMA base `shared`, la MISMA colección `items` -
 - El nombre del schema no se valida contra ningún límite de PostgreSQL más allá de longitud/caracteres -- un nombre reservado (`pg_catalog`, `information_schema`) técnicamente pasa la validación de identificador y falla recién al conectar, con el error real de Postgres, no uno inventado acá.
 
 **Verificado**: 6 tests de CLI (`cli_db_schema.rs`) -- identificador inválido (empieza con dígito, o con forma de inyección SQL) rechazado limpio; combinado con un target SQLite (explícito o por default) rechazado limpio; `linkc doctor` reporta el error como línea `[ERROR]` sin crashear; `linkc serve-all` rechaza de entrada. 3 tests contra Postgres real (`pg_integration.rs`) -- crea el schema y la tabla aterriza ahí (confirmado que NO aterriza en `public`); dos programas con la MISMA colección, cada uno con su propio `--db-schema`, contra la MISMA base, sin verse entre sí (el caso motivador real); `--adopt-existing` nunca crea el schema, falla limpio si no existe. Suite completa sin regresiones.
+
+### 3.194 `crypto.awsS3PresignedUploadUrl(...)`: URL firmada para SUBIR a S3 — RESUELTO, cierra la mitad que §3.110 había dejado abierta
+
+§3.110 (`crypto.awsS3PresignedUrl`, solo `GET`) documentó desde el principio por qué la mitad de SUBIDA quedaba deliberadamente fuera de esa ronda: una URL presignada para `PUT` necesita, además, atar quién la usa a un `Content-Type` concreto -- un contrato más amplio entre quien genera la URL y quien la usa que el caso de descarga no tiene. PLAN.md §8.5.1 (barrido de higiene del backlog, 30/08/2026) confirmó que esa mitad seguía sin evidencia real de demanda pero tampoco bloqueada por nada -- alcance chico, mecanismo ya probado, sin necesitar diseño nuevo.
+
+```
+type Documento = { id: Int, s3Key: String }
+
+rpc urlDeSubida(d: Documento) -> String {
+  crypto.awsS3PresignedUploadUrl(
+    env.get("AWS_ACCESS_KEY_ID"), env.get("AWS_SECRET_ACCESS_KEY"),
+    "eu-west-1", "mis-facturas", d.s3Key, 900, "application/pdf"
+  )
+}
+```
+
+**`crypto.awsS3PresignedUploadUrl(accessKeyId: String, secretAccessKey: String, region: String, bucket: String, objectKey: String, expiresSeconds: Int, contentType: String) -> String`** -- mismo mecanismo AWS Signature V4 que `awsS3PresignedUrl` (misma derivación de clave de firma encadenando 4 HMAC-SHA256, mismo URI-encoding, mismo límite `expiresSeconds` en `1..=604800`), un séptimo parámetro nuevo (`contentType`) y dos diferencias reales en lo que se firma: el método HTTP firmado pasa de `GET` a `PUT`, y `Content-Type` se firma como un SEGUNDO header (junto a `host`, en orden alfabético -- `content-type` antes que `host`). Quien recibe la URL solo puede completar el upload con un `PUT` cuyo header `Content-Type` sea EXACTAMENTE ese valor -- cualquier otro (o ninguno) hace que S3 rechace la firma, no un chequeo del lado de c-script.
+
+Las dos funciones comparten toda la lógica de firma en un único helper privado del runtime (`aws_sigv4_presigned_url`) -- la derivación de clave, el URI-encoding y el orden de parámetros ya verificados byte a byte contra el vector oficial de AWS en §3.110 no se reimplementaron, se reusaron tal cual.
+
+**Alcance deliberado, mismo criterio que §3.110**: solo credenciales de larga duración (sin `X-Amz-Security-Token`/STS), solo estilo virtual-hosted, función pura sin llamar a AWS. **Ninguna forma de limitar el TAMAÑO del archivo subido** -- una URL presignada de `PUT` firma un header, no un rango de `Content-Length`; eso necesitaría una POST Policy de S3 (un mecanismo distinto por completo, con su propio documento de condiciones en base64 y su propia firma) en vez de una URL de query-string auth -- fuera de alcance, sin evidencia real de demanda todavía. Upload multipart directo (para archivos grandes, varias partes) tampoco está cubierto -- PLAN.md §8.5.1 sigue abierto en esa parte.
+
+**Verificado**: mismo estándar que §3.110 -- la derivación de clave y el URI-encoding son el código YA verificado contra el vector oficial `aws4_testsuite` de AWS, reusado sin cambios. 3 tests nuevos en `checker.rs` (aridad/tipos de los 7 argumentos) + 3 en `runtime/mod.rs`: estructura exacta de la URL (método implícito en la firma, `Content-Type` firmado ANTES que `host` en `X-Amz-SignedHeaders`, firma de 64 hex minúscula), la firma CAMBIA si el `Content-Type` cambia (confirmando que el header está de verdad atado a la firma, no solo presente en la URL de forma cosmética), y el mismo rechazo de `expiresSeconds` fuera de `1..=604800` que §3.110 ya tenía. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

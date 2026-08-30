@@ -4256,6 +4256,22 @@ impl Checker {
                 self.check_expr(expires_seconds, &Type::Int, env)?;
                 Some(Type::String)
             }
+            // GRAMMAR.md §3.194: mismo mecanismo SigV4 que `awsS3PresignedUrl`
+            // (GET, arriba), método PUT y un `contentType` que se firma como
+            // header adicional -- quien recibe la URL solo puede subir con
+            // ESE Content-Type exacto, no cualquiera.
+            (Type::Crypto, "awsS3PresignedUploadUrl") => builtin_args!(
+                self, args, env, "crypto.awsS3PresignedUploadUrl",
+                [
+                    (access_key_id, "accessKeyId: String", Type::String),
+                    (secret_access_key, "secretAccessKey: String", Type::String),
+                    (region, "region: String", Type::String),
+                    (bucket, "bucket: String", Type::String),
+                    (object_key, "objectKey: String", Type::String),
+                    (expires_seconds, "expiresSeconds: Int", Type::Int),
+                    (content_type, "contentType: String", Type::String)
+                ] -> Type::String
+            ),
             (Type::Crypto, "randomToken") => {
                 let [length] = args else {
                     return Err(err("'crypto.randomToken' toma exactamente 1 argumento (length: Int)"));
@@ -7961,6 +7977,34 @@ type T = { id: Int, s: Status }")
         let src = r#"
             fn f() -> String {
                 crypto.awsS3PresignedUrl("AKID", "secret", "us-east-1", "bucket", "key.pdf", "3600")
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn aws_s3_presigned_upload_url_takes_six_strings_and_an_int_and_returns_string() {
+        let src = r#"
+            fn f() -> String {
+                crypto.awsS3PresignedUploadUrl("AKID", "secret", "us-east-1", "bucket", "key.pdf", 3600, "application/pdf")
+            }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn aws_s3_presigned_upload_url_rejects_the_wrong_number_of_arguments() {
+        let src = r#"
+            fn f() -> String { crypto.awsS3PresignedUploadUrl("AKID", "secret") }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn aws_s3_presigned_upload_url_rejects_content_type_as_an_int() {
+        let src = r#"
+            fn f() -> String {
+                crypto.awsS3PresignedUploadUrl("AKID", "secret", "us-east-1", "bucket", "key.pdf", 3600, 1)
             }
         "#;
         assert!(check_source(src).is_err());

@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.150.0] - 2026-08-30
+
+### ✨ Nuevo
+**`crypto.awsS3PresignedUploadUrl(...)`** (PLAN.md §8.5.1) -- URL firmada AWS Signature V4 para SUBIR a S3 (`PUT`), cierra la mitad que `crypto.awsS3PresignedUrl` (§3.110, solo `GET`) había dejado deliberadamente abierta. Mismo mecanismo de firma ya verificado byte a byte contra el vector oficial `aws4_testsuite` de AWS -- reusado sin cambios vía un helper compartido -- con `Content-Type` firmado como header adicional: quien recibe la URL solo puede completar el upload con ESE Content-Type exacto.
+
+- Séptimo parámetro (`contentType: String`) sobre la misma firma de 6 argumentos de `awsS3PresignedUrl`.
+- Sin límite de tamaño de archivo (necesitaría una POST Policy de S3, mecanismo distinto) ni multipart directo -- límites honestos documentados, sin evidencia real de demanda todavía.
+
+**Verificado**: 3 tests de tipos en `checker.rs` + 3 en `runtime/mod.rs` (estructura exacta, la firma cambia si el Content-Type cambia, límite de `expiresSeconds`). Suite completa sin regresiones. Ver GRAMMAR.md §3.194.
+
 ## [1.149.0] - 2026-08-30
 
 ### ✨ Nuevo

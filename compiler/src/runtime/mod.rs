@@ -1886,6 +1886,75 @@ fn hmac_sha256_raw(key: &[u8], data: &[u8]) -> Result<Vec<u8>, RuntimeError> {
     Ok(mac.finalize().into_bytes().to_vec())
 }
 
+/// AWS Signature V4 para una URL prefirmada de S3, compartida entre
+/// `crypto.awsS3PresignedUrl` (GET, GRAMMAR.md §3.110) y
+/// `crypto.awsS3PresignedUploadUrl` (PUT, GRAMMAR.md §3.194) -- las dos
+/// difieren solo en el método HTTP firmado y en si hay un `content_type`
+/// que firmar como header adicional (`None` para la descarga, obligatorio
+/// para la subida: la URL resultante solo acepta un PUT con ESE
+/// Content-Type exacto, no cualquiera). Todo lo demás -- derivación de la
+/// clave de firma, codificación de URI, orden alfabético de parámetros --
+/// es el mismo mecanismo ya verificado byte a byte contra el vector
+/// oficial de AWS en `hmac_sha256_raw_chain_reproduces_the_official_aws_sigv4_test_vector`.
+#[allow(clippy::too_many_arguments)]
+fn aws_sigv4_presigned_url(
+    builtin_name: &str,
+    method: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+    region: &str,
+    bucket: &str,
+    object_key: &str,
+    expires_seconds: i64,
+    content_type: Option<&str>,
+) -> Result<Value, RuntimeError> {
+    if !(1..=604_800).contains(&expires_seconds) {
+        return Err(err(format!(
+            "{builtin_name}: 'expiresSeconds' tiene que estar entre 1 y 604800 (7 días, el máximo que AWS acepta con credenciales de larga duración), se recibió {expires_seconds}"
+        )));
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let (date_stamp, amz_date) = timestamp::format_aws_sigv4_datetime(now_ms);
+    let host = format!("{bucket}.s3.{region}.amazonaws.com");
+    let canonical_uri = format!("/{}", aws_uri_encode(object_key, false));
+    let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
+    let credential = format!("{access_key_id}/{credential_scope}");
+    // Los headers firmados van en orden ALFABÉTICO por nombre -- "content-type"
+    // antes que "host" -- tanto en la lista de `canonical_headers` como en el
+    // valor de `X-Amz-SignedHeaders`, mismo requisito de SigV4 que ya aplicaba
+    // al único header que existía hasta ahora (`host`).
+    let signed_headers = if content_type.is_some() { "content-type;host" } else { "host" };
+    let canonical_query_string = format!(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={amz_date}&X-Amz-Expires={expires_seconds}&X-Amz-SignedHeaders={}",
+        aws_uri_encode(&credential, true),
+        aws_uri_encode(signed_headers, true),
+    );
+    let canonical_headers = match content_type {
+        Some(ct) => format!("content-type:{ct}\nhost:{host}\n"),
+        None => format!("host:{host}\n"),
+    };
+    let canonical_request = format!("{method}\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD");
+    use sha2::{Digest, Sha256};
+    let hashed_canonical_request: String =
+        Sha256::digest(canonical_request.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashed_canonical_request}");
+    // Derivación de la clave de firma: 4 HMAC-SHA256 encadenados donde el
+    // resultado CRUDO (bytes, no su hex) de cada paso es la clave del
+    // siguiente -- GRAMMAR.md §3.110 explica por qué `crypto.hmacSha256`
+    // (String -> String) no alcanza para esto: no hay forma de volver a
+    // meter sus bytes crudos como clave.
+    let k_date = hmac_sha256_raw(format!("AWS4{secret_access_key}").as_bytes(), date_stamp.as_bytes())?;
+    let k_region = hmac_sha256_raw(&k_date, region.as_bytes())?;
+    let k_service = hmac_sha256_raw(&k_region, b"s3")?;
+    let k_signing = hmac_sha256_raw(&k_service, b"aws4_request")?;
+    let signature: String =
+        hmac_sha256_raw(&k_signing, string_to_sign.as_bytes())?.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(Value::Str(format!("https://{host}{canonical_uri}?{canonical_query_string}&X-Amz-Signature={signature}")))
+}
+
 /// Comparación que no corta en el primer byte distinto: dos secretos se comparan
 /// en tiempo constante para no filtrar, vía la duración, cuánto del valor
 /// esperado adivinó quien está probando.
@@ -2527,46 +2596,25 @@ fn call_method(
                             ))
                         }
                     };
-                if !(1..=604_800).contains(&expires_seconds) {
-                    return Err(err(format!(
-                        "crypto.awsS3PresignedUrl: 'expiresSeconds' tiene que estar entre 1 y 604800 (7 días, el máximo que AWS acepta con credenciales de larga duración), se recibió {expires_seconds}"
-                    )));
-                }
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                let (date_stamp, amz_date) = timestamp::format_aws_sigv4_datetime(now_ms);
-                let host = format!("{bucket}.s3.{region}.amazonaws.com");
-                let canonical_uri = format!("/{}", aws_uri_encode(object_key, false));
-                let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
-                let credential = format!("{access_key_id}/{credential_scope}");
-                // Orden ALFABÉTICO por nombre de parámetro -- ya lo están tal
-                // cual se arman acá, así que no hace falta un sort explícito
-                // (ver el test que confirma esto contra el vector oficial de
-                // AWS con dos valores del MISMO nombre, donde si importa).
-                let canonical_query_string = format!(
-                    "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={amz_date}&X-Amz-Expires={expires_seconds}&X-Amz-SignedHeaders=host",
-                    aws_uri_encode(&credential, true),
-                );
-                let canonical_headers = format!("host:{host}\n");
-                let canonical_request = format!("GET\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD");
-                use sha2::{Digest, Sha256};
-                let hashed_canonical_request: String =
-                    Sha256::digest(canonical_request.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
-                let string_to_sign = format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashed_canonical_request}");
-                // Derivación de la clave de firma: 4 HMAC-SHA256 encadenados
-                // donde el resultado CRUDO (bytes, no su hex) de cada paso es
-                // la clave del siguiente -- GRAMMAR.md §3.110 explica por qué
-                // `crypto.hmacSha256` (String -> String) no alcanza para esto:
-                // no hay forma de volver a meter sus bytes crudos como clave.
-                let k_date = hmac_sha256_raw(format!("AWS4{secret_access_key}").as_bytes(), date_stamp.as_bytes())?;
-                let k_region = hmac_sha256_raw(&k_date, region.as_bytes())?;
-                let k_service = hmac_sha256_raw(&k_region, b"s3")?;
-                let k_signing = hmac_sha256_raw(&k_service, b"aws4_request")?;
-                let signature: String =
-                    hmac_sha256_raw(&k_signing, string_to_sign.as_bytes())?.iter().map(|b| format!("{b:02x}")).collect();
-                Ok(Value::Str(format!("https://{host}{canonical_uri}?{canonical_query_string}&X-Amz-Signature={signature}")))
+                aws_sigv4_presigned_url(
+                    "crypto.awsS3PresignedUrl", "GET", access_key_id, secret_access_key, region, bucket, object_key, expires_seconds, None,
+                )
+            }
+            "awsS3PresignedUploadUrl" => {
+                let (access_key_id, secret_access_key, region, bucket, object_key, expires_seconds, content_type) =
+                    match (args.first(), args.get(1), args.get(2), args.get(3), args.get(4), args.get(5), args.get(6)) {
+                        (Some(Value::Str(a)), Some(Value::Str(s)), Some(Value::Str(r)), Some(Value::Str(b)), Some(Value::Str(k)), Some(Value::Int(e)), Some(Value::Str(c))) => {
+                            (a, s, r, b, k, *e, c)
+                        }
+                        _ => {
+                            return Err(err(
+                                "crypto.awsS3PresignedUploadUrl requiere (accessKeyId: String, secretAccessKey: String, region: String, bucket: String, objectKey: String, expiresSeconds: Int, contentType: String)",
+                            ))
+                        }
+                    };
+                aws_sigv4_presigned_url(
+                    "crypto.awsS3PresignedUploadUrl", "PUT", access_key_id, secret_access_key, region, bucket, object_key, expires_seconds, Some(content_type),
+                )
             }
             "randomToken" => {
                 let length = match args.first() {
@@ -5538,6 +5586,83 @@ mod tests {
         }
         // El máximo permitido (7 días) SÍ funciona.
         assert!(invoke_rpc(&program, "Docs", "share", &json!({"seconds": 604_800}), &db).is_ok());
+    }
+
+    // ---- `crypto.awsS3PresignedUploadUrl` (GRAMMAR.md §3.194) ----
+
+    /// Mismo espíritu que `aws_s3_presigned_url_has_the_exact_shape_s3_requires`
+    /// (arriba) -- estructura exacta, no un vector fijo (el timestamp interno
+    /// lo impide) -- más las dos diferencias reales de la variante de subida:
+    /// método `PUT` (nunca aparece firmado en la URL en sí, pero si el método
+    /// firmado estuviera mal, S3 rechazaría CUALQUIER PUT real con 403 -- acá
+    /// se confirma indirectamente reconstruyendo el `canonical_request` con
+    /// las mismas piezas ya verificadas contra el vector oficial de AWS) y
+    /// `Content-Type` como segundo header firmado, en orden alfabético antes
+    /// de `host`.
+    #[test]
+    fn aws_s3_presigned_upload_url_has_the_exact_shape_s3_requires() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc uploadUrl() -> String {
+                    crypto.awsS3PresignedUploadUrl("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "us-east-1", "mi-bucket", "facturas/2026/factura-42.pdf", 3600, "application/pdf")
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let url = invoke_rpc(&program, "Docs", "uploadUrl", &json!({}), &db).unwrap();
+        let url = url.as_str().unwrap();
+
+        assert!(url.starts_with("https://mi-bucket.s3.us-east-1.amazonaws.com/facturas/2026/factura-42.pdf?"), "{url}");
+        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"), "{url}");
+        assert!(url.contains("X-Amz-Credential=AKIDEXAMPLE%2F"), "{url}");
+        assert!(url.contains("X-Amz-Date="), "{url}");
+        assert!(url.contains("X-Amz-Expires=3600"), "{url}");
+        assert!(url.contains("X-Amz-SignedHeaders=content-type%3Bhost"), "content-type tiene que ir firmado, antes que host: {url}");
+        let sig = url.split("X-Amz-Signature=").nth(1).expect("la URL tiene que terminar con la firma");
+        assert_eq!(sig.len(), 64, "la firma es un SHA-256 en hex: {sig}");
+        assert!(sig.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "hex en minúscula: {sig}");
+    }
+
+    /// El `Content-Type` firmado tiene que cambiar la firma resultante --
+    /// si no la cambiara, el header no estaría realmente atado a la URL y
+    /// cualquiera podría subir con un Content-Type distinto igual.
+    #[test]
+    fn aws_s3_presigned_upload_url_signature_depends_on_content_type() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc uploadUrl(contentType: String) -> String {
+                    crypto.awsS3PresignedUploadUrl("AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "us-east-1", "mi-bucket", "k.pdf", 3600, contentType)
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let url_pdf = invoke_rpc(&program, "Docs", "uploadUrl", &json!({"contentType": "application/pdf"}), &db).unwrap();
+        let url_png = invoke_rpc(&program, "Docs", "uploadUrl", &json!({"contentType": "image/png"}), &db).unwrap();
+        let sig_pdf = url_pdf.as_str().unwrap().split("X-Amz-Signature=").nth(1).unwrap();
+        let sig_png = url_png.as_str().unwrap().split("X-Amz-Signature=").nth(1).unwrap();
+        assert_ne!(sig_pdf, sig_png, "un Content-Type distinto tiene que dar una firma distinta");
+    }
+
+    #[test]
+    fn aws_s3_presigned_upload_url_rejects_an_out_of_range_expiry() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc uploadUrl(seconds: Int) -> String {
+                    crypto.awsS3PresignedUploadUrl("AKID", "secret", "us-east-1", "b", "k", seconds, "application/pdf")
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        for bad in [0, -1, 604_801] {
+            invoke_rpc(&program, "Docs", "uploadUrl", &json!({"seconds": bad}), &db).expect_err(&format!("{bad} segundos debería rechazarse"));
+        }
+        assert!(invoke_rpc(&program, "Docs", "uploadUrl", &json!({"seconds": 604_800}), &db).is_ok());
     }
 
     // ---- `response.redirect` (GRAMMAR.md §3.111) ----
