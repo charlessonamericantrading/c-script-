@@ -1143,6 +1143,36 @@ fn checked_timestamp_offset(ms: i64, n: i64, unit_millis: i64, verb: &str) -> Re
         .ok_or_else(|| err(format!("desborde aritmético al sumar {verb} a un Timestamp")))
 }
 
+/// GRAMMAR.md §3.198: `String.padStart`/`padEnd` -- rellena `s` con `pad`
+/// (repetido y truncado según haga falta) hasta `target_length` CARACTERES,
+/// al principio o al final según `at_start`. Ya cumple o se pasa: se
+/// devuelve tal cual, sin truncar (mismo criterio "nunca se acorta un valor
+/// que el caller no pidió acortar" implícito en el resto del lenguaje).
+/// `target_length` acotado a un tope generoso pero real -- sin esto, un
+/// `length` adversarial (`i64::MAX`) intentaría asignar un string gigante
+/// en vez de fallar limpio, el mismo tipo de incidente que ya se encontró y
+/// cerró para `crypto.randomToken` (AUDIT-2026-08-27.md).
+fn pad_to_length(method_name: &str, s: &str, target_length: i64, pad: &str, at_start: bool) -> Result<Value, RuntimeError> {
+    const MAX_PAD_LENGTH: i64 = 1_000_000;
+    if target_length < 0 {
+        return Err(err(format!("'{method_name}': 'length' no puede ser negativo, se recibió {target_length}")));
+    }
+    if target_length > MAX_PAD_LENGTH {
+        return Err(err(format!("'{method_name}': 'length' no puede superar {MAX_PAD_LENGTH}, se recibió {target_length}")));
+    }
+    let current_len = s.chars().count() as i64;
+    if current_len >= target_length {
+        return Ok(Value::Str(s.to_string()));
+    }
+    let needed = (target_length - current_len) as usize;
+    if pad.is_empty() {
+        return Err(err(format!("'{method_name}': 'pad' no puede ser un string vacío -- hace falta rellenar hasta length={target_length}")));
+    }
+    let pad_chars: Vec<char> = pad.chars().collect();
+    let fill: String = (0..needed).map(|i| pad_chars[i % pad_chars.len()]).collect();
+    Ok(Value::Str(if at_start { format!("{fill}{s}") } else { format!("{s}{fill}") }))
+}
+
 /// Mensaje para `/`/`%`: distingue divisor cero (el caso casi siempre
 /// alcanzado con datos de usuario) del desborde real (`i64::MIN / -1`).
 fn div_or_rem_overflow_message(verb: &str, a: i64, b: i64) -> RuntimeError {
@@ -2523,6 +2553,56 @@ fn call_method(
             "toUpper" => Ok(Value::Str(s.to_uppercase())),
             "toLower" => Ok(Value::Str(s.to_lowercase())),
             "escapeHtml" => Ok(Value::Str(escape_html(&s))),
+            // GRAMMAR.md §3.198: indexado por CARACTER, no por byte -- igual
+            // que `length()` (`chars().count()`, no `.len()`), para que las
+            // dos formas de medir un string coincidan siempre en cualquier
+            // string no-ASCII. Rango inválido rechazado ANTES de tocar el
+            // string, mismo criterio que `dateFromParts`/`crypto.randomInt`.
+            "substring" => {
+                let (start, end) = match (args.first(), args.get(1)) {
+                    (Some(Value::Int(a)), Some(Value::Int(b))) => (*a, *b),
+                    _ => return Err(err("'substring' requiere dos argumentos Int (start, end)")),
+                };
+                let len = s.chars().count() as i64;
+                if start < 0 || end > len || start > end {
+                    return Err(err(format!(
+                        "'substring' fuera de rango: start={start}, end={end}, longitud={len} (se exige 0 <= start <= end <= longitud)"
+                    )));
+                }
+                Ok(Value::Str(s.chars().skip(start as usize).take((end - start) as usize).collect()))
+            }
+            "replace" => {
+                let (target, replacement) = match (args.first(), args.get(1)) {
+                    (Some(Value::Str(t)), Some(Value::Str(r))) => (t, r),
+                    _ => return Err(err("'replace' requiere dos argumentos String (target, replacement)")),
+                };
+                Ok(Value::Str(s.replace(target.as_str(), replacement.as_str())))
+            }
+            // Separador vacío: mismo comportamiento que `str::split` nativo
+            // de Rust (un elemento vacío antes del primer caracter y
+            // después del último, cada caracter en el medio) -- definido y
+            // testeado, no un caso especial inventado.
+            "split" => {
+                let separator = match args.first() {
+                    Some(Value::Str(sep)) => sep,
+                    _ => return Err(err("'split' requiere un argumento String (separator)")),
+                };
+                Ok(Value::List(s.split(separator.as_str()).map(|p| Value::Str(p.to_string())).collect()))
+            }
+            "padStart" => {
+                let (length, pad) = match (args.first(), args.get(1)) {
+                    (Some(Value::Int(l)), Some(Value::Str(p))) => (*l, p),
+                    _ => return Err(err("'padStart' requiere un argumento Int (length) y un argumento String (pad)")),
+                };
+                pad_to_length("padStart", &s, length, pad, true)
+            }
+            "padEnd" => {
+                let (length, pad) = match (args.first(), args.get(1)) {
+                    (Some(Value::Int(l)), Some(Value::Str(p))) => (*l, p),
+                    _ => return Err(err("'padEnd' requiere un argumento Int (length) y un argumento String (pad)")),
+                };
+                pad_to_length("padEnd", &s, length, pad, false)
+            }
             other => Err(err(format!("método desconocido sobre String: '{other}'"))),
         },
         Value::Timestamp(ms) => match method {
@@ -7859,6 +7939,162 @@ mod tests {
         let e = invoke_rpc(&program, "S", "addDays", &json!({"t": "2026-01-01T00:00:00.000Z", "n": i64::MAX}), &db)
             .expect_err("un n gigante tiene que desbordar limpio, no panickear");
         assert!(e.message.contains("desborde"), "{e}");
+    }
+
+    // ---- GRAMMAR.md §3.198: String.substring/replace/split/padStart/padEnd ----
+
+    /// Caso no-ASCII real -- confirma indexado por CARACTER, no por byte, y
+    /// que coincide con `.length()` sobre el mismo string (`length()` ya
+    /// usa `chars().count()`; un `.substring()` indexado por byte
+    /// discreparía en silencio acá).
+    #[test]
+    fn string_substring_indexes_by_character_not_by_byte() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc slice(s: String, start: Int, end: Int) -> String { s.substring(start, end) }
+                rpc len(s: String) -> Int { s.length() }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let s = "café niño"; // "é" y "ñ" son 2 bytes UTF-8 cada uno, 1 carácter cada uno
+        let len = invoke_rpc(&program, "S", "len", &json!({"s": s}), &db).unwrap();
+        assert_eq!(len, json!(9), "9 caracteres: c-a-f-é- -n-i-ñ-o");
+        let result = invoke_rpc(&program, "S", "slice", &json!({"s": s, "start": 0, "end": 4}), &db).unwrap();
+        assert_eq!(result, json!("café"), "corte por caracter, no por byte -- byte 4 caería a mitad de 'é'");
+    }
+
+    #[test]
+    fn string_substring_rejects_each_out_of_range_case_cleanly() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc slice(s: String, start: Int, end: Int) -> String { s.substring(start, end) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        invoke_rpc(&program, "S", "slice", &json!({"s": "abc", "start": -1, "end": 2}), &db).expect_err("start < 0");
+        invoke_rpc(&program, "S", "slice", &json!({"s": "abc", "start": 0, "end": 4}), &db).expect_err("end > longitud");
+        invoke_rpc(&program, "S", "slice", &json!({"s": "abc", "start": 2, "end": 1}), &db).expect_err("start > end");
+        // Rango válido en el borde (todo el string) SÍ funciona.
+        assert_eq!(invoke_rpc(&program, "S", "slice", &json!({"s": "abc", "start": 0, "end": 3}), &db).unwrap(), json!("abc"));
+    }
+
+    #[test]
+    fn string_replace_replaces_every_occurrence() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc r(s: String, target: String, replacement: String) -> String { s.replace(target, replacement) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "S", "r", &json!({"s": "a;b;c;d", "target": ";", "replacement": ","}), &db).unwrap();
+        assert_eq!(result, json!("a,b,c,d"), "TODAS las ocurrencias, no solo la primera");
+    }
+
+    #[test]
+    fn string_split_matches_native_rust_semantics_including_the_empty_separator() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc parts(s: String, sep: String) -> String[] { s.split(sep) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let normal = invoke_rpc(&program, "S", "parts", &json!({"s": "a,b,c", "sep": ","}), &db).unwrap();
+        assert_eq!(normal, json!(["a", "b", "c"]));
+        // Separador vacío: comportamiento nativo de Rust, definido y
+        // testeado -- no un panic, no un caso especial inventado.
+        let empty_sep = invoke_rpc(&program, "S", "parts", &json!({"s": "abc", "sep": ""}), &db).unwrap();
+        assert_eq!(empty_sep, json!(["", "a", "b", "c", ""]));
+    }
+
+    /// Los dos casos reales citados por un adoptador (MyFinance): sanear
+    /// `;`/saltos de línea antes de unir con `;` (ContaPlus/XDIARIO), y
+    /// padding fixed-width (A3 Contable).
+    #[test]
+    fn string_replace_and_pad_start_solve_the_real_contable_export_use_cases() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc sanitizeForCsv(concepto: String) -> String {
+                    concepto.replace(";", ",").replace("\n", " ")
+                }
+                rpc fixedWidthAmount(amount: String) -> String {
+                    amount.padStart(8, "0")
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let sanitized = invoke_rpc(&program, "S", "sanitizeForCsv", &json!({"concepto": "pago;factura\nurgente"}), &db).unwrap();
+        assert_eq!(sanitized, json!("pago,factura urgente"), "sin esto, un ';'/salto de línea real corrompería las columnas de ContaPlus");
+        let padded = invoke_rpc(&program, "S", "fixedWidthAmount", &json!({"amount": "1234"}), &db).unwrap();
+        assert_eq!(padded, json!("00001234"), "fixed-width de 8 para A3 Contable");
+    }
+
+    #[test]
+    fn string_pad_start_and_pad_end_do_not_truncate_a_value_already_at_or_over_length() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc padStart(s: String, n: Int) -> String { s.padStart(n, "0") }
+                rpc padEnd(s: String, n: Int) -> String { s.padEnd(n, "0") }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        assert_eq!(invoke_rpc(&program, "S", "padStart", &json!({"s": "12345", "n": 3}), &db).unwrap(), json!("12345"), "ya se pasa de largo -- se devuelve tal cual, sin acortar");
+        assert_eq!(invoke_rpc(&program, "S", "padEnd", &json!({"s": "12345", "n": 5}), &db).unwrap(), json!("12345"), "ya está exacto");
+    }
+
+    #[test]
+    fn string_pad_with_a_multi_char_pad_repeats_and_truncates_to_the_exact_fill() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc padEnd(s: String, n: Int, pad: String) -> String { s.padEnd(n, pad) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "S", "padEnd", &json!({"s": "x", "n": 6, "pad": "ab"}), &db).unwrap();
+        assert_eq!(result, json!("xababa"), "pad repetido y truncado a los 5 caracteres que faltan, no 'ab' completo de más");
+    }
+
+    #[test]
+    fn string_pad_rejects_an_empty_pad_when_padding_is_actually_needed() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc padStart(s: String, n: Int) -> String { s.padStart(n, "") }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        invoke_rpc(&program, "S", "padStart", &json!({"s": "x", "n": 5}), &db).expect_err("pad vacío pero hace falta rellenar");
+        // Si ya cumple la longitud, un pad vacío nunca hace falta -- no debería fallar.
+        assert!(invoke_rpc(&program, "S", "padStart", &json!({"s": "12345", "n": 3}), &db).is_ok());
+    }
+
+    #[test]
+    fn string_pad_reports_a_clean_error_for_a_negative_or_absurdly_large_length() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc padStart(s: String, n: Int) -> String { s.padStart(n, "0") }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        invoke_rpc(&program, "S", "padStart", &json!({"s": "x", "n": -1}), &db).expect_err("length negativo");
+        invoke_rpc(&program, "S", "padStart", &json!({"s": "x", "n": i64::MAX}), &db)
+            .expect_err("un length gigante tiene que rechazarse limpio, no intentar asignar un string gigante");
     }
 
     #[test]

@@ -219,6 +219,7 @@
   - [3.195 Bug crítico: `Decimal == Decimal` siempre daba `false` en runtime — RESUELTO](#3195-bug-crítico-decimal--decimal-siempre-daba-false-en-runtime--resuelto)
   - [3.196 Aritmética de `Timestamp`: `.addMillis()`/`.addSeconds()`/`.addMinutes()`/`.addHours()`/`.addDays()` — RESUELTO](#3196-aritmética-de-timestamp-addmillisaddsecondsaddminutesaddhoursadddays--resuelto)
   - [3.197 `auth.claim(name: String) -> String?` — RESUELTO](#3197-authclaimname-string---string--resuelto)
+  - [3.198 Métodos de `String`: `.substring()`, `.replace()`, `.split()`, `.padStart()`/`.padEnd()` — RESUELTO](#3198-métodos-de-string-substring-replace-split-padstartpadend--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -7237,6 +7238,34 @@ service Cuenta {
 **Una sesión INTERNA (creada por `createSession`/`createSessionWithId`) nunca tiene un mapa de claims genérico -- da `null` explícitamente, no un error.** Solo un JWT externo verdadero tiene claims arbitrarios; una sesión de este mismo programa solo guarda `enum_name`/`variant_name`/`user_id`.
 
 **Verificado**: 3 tests de checker (aridad/tipo del argumento, retorno `String?`) + 7 tests unitarios en `session.rs` (string/number-entero-sin-decimal/number-fraccionario/bool/claim ausente/valor no-escalar/sesión interna/sin JWT configurado) + 1 test end-to-end contra un `linkc serve` real (`server_http.rs`) reproduciendo el caso motivador exacto: un JWT con `tokenVersion: 3`, comparado contra `3.toString()` (`true`) y contra `4.toString()` (`false`, el caso de un token ya revocado). Suite completa sin regresiones.
+
+### 3.198 Métodos de `String`: `.substring()`, `.replace()`, `.split()`, `.padStart()`/`.padEnd()` — RESUELTO
+
+PLAN.md §9.14 ítem 1 -- superficie de `String` antes de esta ronda: `length`/`contains`/`startsWith`/`endsWith`/`trim`/`toUpper`/`toLower`/`escapeHtml` -- sin slicing, sin reemplazo, sin partir, sin relleno. Bloqueó de verdad, en producción, dos exports contables reales y ya auditados de un adoptador (MyFinance): formato A3 Contable (fixed-width, necesita `padStart`) y ContaPlus/XDIARIO (necesita sanear `;`/saltos de línea de un campo de texto libre con `.replace()` antes de unirlo con `;` -- un `;` suelto dentro de un concepto corrompería las columnas del software real de la gestoría).
+
+```
+type LineaContable = { concepto: String, importe: String }
+
+rpc exportarXdiario(lineas: LineaContable[]) -> String {
+  lineas
+    .map(|l: LineaContable| {
+      let conceptoSeguro = l.concepto.replace(";", ",").replace("\n", " ");
+      conceptoSeguro + ";" + l.importe.padStart(12, "0")
+    })
+    .join("\n")
+}
+```
+
+**`.substring(start: Int, end: Int) -> String`, `.replace(target: String, replacement: String) -> String`, `.split(separator: String) -> String[]`, `.padStart(length: Int, pad: String) -> String`, `.padEnd(length: Int, pad: String) -> String`.**
+
+- `.substring` corta por índice de CARACTER, no de byte -- obligatorio para consistencia interna, no una elección de estilo: `.length()` ya cuenta caracteres (`chars().count()`, nunca `.len()`), así que un `.substring()` indexado por byte discreparía en silencio con `.length()` en cualquier string no-ASCII (un byte a mitad de un caracter multi-byte panickearía o cortaría mal). Rango inválido (`start < 0`, `end > longitud`, `start > end`) rechazado ANTES de tocar el string, con un `RuntimeError` limpio nombrando qué falló -- mismo criterio preventivo que `dateFromParts`/`crypto.randomInt` ya usan.
+- `.replace` reemplaza TODAS las ocurrencias de `target`, no solo la primera.
+- `.split` con separador vacío sigue el comportamiento nativo de Rust (`str::split("")`): un elemento vacío antes del primer caracter y después del último, cada caracter individual en el medio -- definido y testeado, no un caso especial inventado ni un panic.
+- `.padStart`/`.padEnd` rellenan hasta `length` CARACTERES con `pad` repetido y truncado a la medida exacta que falta -- si el string ya alcanza o supera `length`, se devuelve tal cual, nunca se acorta. `pad` vacío es un error de runtime limpio SOLO si de verdad hace falta rellenar (si el string ya cumple la longitud, un `pad` vacío nunca se usa, así que no falla). `length` acotado a un máximo de 1.000.000 de caracteres -- sin este tope, un `length` adversarial (`Int::MAX`) intentaría asignar un string gigante en vez de fallar limpio, el mismo tipo de incidente que ya se encontró y cerró para `crypto.randomToken` (`AUDIT-2026-08-27.md`).
+
+**De paso, se completó la lista de completions del LSP para `String`** (`lsp.rs`): tenía solo 2 de los 8 métodos que YA existían antes de esta ronda (`length`/`contains`, faltaban `startsWith`/`endsWith`/`trim`/`toUpper`/`toLower`/`escapeHtml`) -- corregida a los 13 métodos reales en el mismo pase, no solo agregados los 5 nuevos sobre una lista que seguía incompleta.
+
+**Verificado**: tests de checker (aridad/tipos de los 5 métodos, incluida la composición real `.replace(...).replace(...)` y `.padStart(...)`) + tests de runtime: un caso NO-ASCII real ("café niño") confirmando que `.substring()` corta por caracter y coincide con `.length()`; los tres casos de rango inválido rechazados uno por uno; `.replace()` reemplazando todas las ocurrencias; `.split()` con separador normal y vacío; `.padStart()`/`.padEnd()` sin truncar un valor que ya cumple, con un `pad` multi-caracter repetido y truncado exacto, rechazando un `pad` vacío cuando sí hace falta, y rechazando un `length` negativo o absurdamente grande; los dos casos reales de MyFinance (sanear para CSV, padding fixed-width) reproducidos end-to-end. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

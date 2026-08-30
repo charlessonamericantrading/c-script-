@@ -3,6 +3,20 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.154.0] - 2026-08-31
+
+### ✨ Nuevo
+**Métodos de `String`: `.substring()`, `.replace()`, `.split()`, `.padStart()`/`.padEnd()`** (PLAN.md §9.14 ítem 1) -- superficie que faltaba desbloqueaba en producción dos exports contables reales de un adoptador (MyFinance): formato A3 Contable (fixed-width, necesita `.padStart()`) y ContaPlus/XDIARIO (necesita `.replace()` para sanear `;`/saltos de línea antes de unir con `;`).
+
+- `.substring(start, end)` indexa por CARACTER, no por byte -- consistente con `.length()`. Rango inválido rechazado limpio antes de tocar el string.
+- `.replace()` reemplaza todas las ocurrencias.
+- `.split(separator) -> String[]`, separador vacío con el comportamiento nativo de Rust (definido, testeado).
+- `.padStart()`/`.padEnd()` rellenan con `pad` repetido y truncado a la medida exacta, sin acortar un valor que ya cumple. `length` acotado a 1.000.000 de caracteres.
+
+De paso, completa las completions del LSP para `String` (tenía solo 2 de los 8 métodos que ya existían antes de esta ronda).
+
+**Verificado**: tests de checker + tests de runtime (un caso no-ASCII real confirmando indexado por caracter, los tres casos de rango inválido, reemplazo de todas las ocurrencias, separador vacío, padding sin truncar/con pad multi-caracter/con `pad` vacío rechazado cuando hace falta/con `length` negativo o gigante rechazado, y los dos casos reales de MyFinance reproducidos end-to-end). Suite completa (1151 tests) sin regresiones. Ver GRAMMAR.md §3.198.
+
 ## [1.153.0] - 2026-08-31
 
 ### ✨ Nuevo

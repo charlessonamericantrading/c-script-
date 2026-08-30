@@ -4153,6 +4153,29 @@ impl Checker {
                 self.expect_no_args(args, "escapeHtml")?;
                 Some(Type::String)
             }
+            // GRAMMAR.md §3.198: slicing/replace/split/padding -- superficie
+            // que faltaba, bloqueaba exports de texto real (fixed-width,
+            // CSV-safe) en un adoptador real.
+            (Type::String, "substring") => builtin_args!(
+                self, args, env, "String.substring",
+                [(start, "start: Int", Type::Int), (end, "end: Int", Type::Int)] -> Type::String
+            ),
+            (Type::String, "replace") => builtin_args!(
+                self, args, env, "String.replace",
+                [(target, "target: String", Type::String), (replacement, "replacement: String", Type::String)] -> Type::String
+            ),
+            (Type::String, "split") => builtin_args!(
+                self, args, env, "String.split",
+                [(separator, "separator: String", Type::String)] -> Type::List(Box::new(Type::String))
+            ),
+            (Type::String, "padStart") => builtin_args!(
+                self, args, env, "String.padStart",
+                [(length, "length: Int", Type::Int), (pad, "pad: String", Type::String)] -> Type::String
+            ),
+            (Type::String, "padEnd") => builtin_args!(
+                self, args, env, "String.padEnd",
+                [(length, "length: Int", Type::Int), (pad, "pad: String", Type::String)] -> Type::String
+            ),
             (Type::Timestamp, "toMillis") => {
                 self.expect_no_args(args, "toMillis")?;
                 Some(Type::Int64)
@@ -5981,6 +6004,52 @@ type T = { id: Int, s: Status }")
         // de OTP de 2FA, `now() < issuedAt.addMinutes(5)`.
         let src = r#"
             fn stillValid(issuedAt: Timestamp) -> Bool { now() < issuedAt.addMinutes(5) }
+        "#;
+        assert!(check_source(src).is_ok());
+    }
+
+    // ---- GRAMMAR.md §3.198: String.substring/replace/split/padStart/padEnd ----
+
+    #[test]
+    fn string_substring_takes_two_ints_and_returns_string() {
+        assert!(check_source("fn f(s: String) -> String { s.substring(0, 3) }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.substring(0) }").is_err(), "faltando 'end'");
+        assert!(check_source("fn f(s: String) -> String { s.substring(\"0\", 3) }").is_err(), "start tiene que ser Int");
+    }
+
+    #[test]
+    fn string_replace_takes_two_strings_and_returns_string() {
+        assert!(check_source("fn f(s: String) -> String { s.replace(\";\", \",\") }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.replace(\";\") }").is_err());
+        assert!(check_source("fn f(s: String) -> String { s.replace(1, \",\") }").is_err());
+    }
+
+    #[test]
+    fn string_split_takes_a_string_and_returns_list_of_string() {
+        assert!(check_source("fn f(s: String) -> String[] { s.split(\",\") }").is_ok(), "{:?}", check_source("fn f(s: String) -> String[] { s.split(\",\") }"));
+        assert!(check_source("fn f(s: String) -> Int[] { s.split(\",\") }").is_err(), "split devuelve String[], no Int[]");
+    }
+
+    #[test]
+    fn string_pad_start_and_pad_end_take_an_int_and_a_string_and_return_string() {
+        assert!(check_source("fn f(s: String) -> String { s.padStart(10, \"0\") }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.padEnd(10, \"0\") }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.padStart(\"10\", \"0\") }").is_err(), "length tiene que ser Int");
+        assert!(check_source("fn f(s: String) -> String { s.padEnd(10, 0) }").is_err(), "pad tiene que ser String");
+    }
+
+    /// Los dos casos reales citados por un adoptador (MyFinance): sanear
+    /// `;`/saltos de línea antes de unir con `;` (ContaPlus/XDIARIO), y
+    /// padding fixed-width (A3 Contable).
+    #[test]
+    fn string_methods_compose_for_the_real_contable_export_use_cases() {
+        let src = r#"
+            fn sanitizeForCsv(concepto: String) -> String {
+                concepto.replace(";", ",").replace("\n", " ")
+            }
+            fn fixedWidthAmount(amount: String) -> String {
+                amount.padStart(12, "0")
+            }
         "#;
         assert!(check_source(src).is_ok());
     }

@@ -1458,9 +1458,23 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             }
             Some(methods)
         }
+        // Lista ya estaba desactualizada ANTES de sumar substring/replace/
+        // split/padStart/padEnd (GRAMMAR.md §3.198) -- solo tenía 2 de los 8
+        // métodos reales que ya existían. Completada acá en el mismo pase.
         Type::String => Some(vec![
             method("length()", "Get the length of this string"),
             method("contains(sub)", "Check if this string contains a substring"),
+            method("startsWith(prefix)", "Check if this string starts with a prefix"),
+            method("endsWith(suffix)", "Check if this string ends with a suffix"),
+            method("trim()", "Trim leading and trailing whitespace"),
+            method("toUpper()", "Convert this string to uppercase"),
+            method("toLower()", "Convert this string to lowercase"),
+            method("escapeHtml()", "Escape HTML special characters"),
+            method("substring(start, end)", "Get a substring by character index"),
+            method("replace(target, replacement)", "Replace all occurrences of target with replacement"),
+            method("split(separator)", "Split this string into a List<String>"),
+            method("padStart(length, pad)", "Pad this string at the start up to length"),
+            method("padEnd(length, pad)", "Pad this string at the end up to length"),
         ]),
         Type::Int => Some(vec![
             method("toFloat()", "Convert this Int to Float"),
@@ -1802,6 +1816,11 @@ mod tests {
         let col = code.find("s.").unwrap() + 2;
         let completions = get_completions(code, 0, col, None);
         assert!(completions.iter().any(|c| c["label"] == "contains(sub)"), "{completions:?}");
+        // GRAMMAR.md §3.198 -- la lista estaba desactualizada antes de esta
+        // ronda (solo tenía 2 de los 8 métodos que ya existían); confirma
+        // que quedó completa, no solo que los métodos NUEVOS aparecen.
+        assert!(completions.iter().any(|c| c["label"] == "toUpper()"), "{completions:?}");
+        assert!(completions.iter().any(|c| c["label"] == "substring(start, end)"), "{completions:?}");
         assert!(!completions.iter().any(|c| c["label"] == "map(fn)"), "un String no tiene 'map' (método de lista): {completions:?}");
     }
 
