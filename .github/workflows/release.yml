@@ -99,6 +99,11 @@ jobs:
             cp editors/vscode/c-script-vscode-1.0.0.vsix release-assets/
           fi
 
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+
       - name: Create or Update GitHub Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')

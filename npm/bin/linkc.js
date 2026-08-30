@@ -10,6 +10,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const https = require('https');
+const crypto = require('crypto');
 
 const REPO = 'charlessonamericantrading/c-script-';
 const isWin = os.platform() === 'win32';
@@ -47,6 +48,49 @@ function resolveAsset() {
   return null;
 }
 
+// Sigue redirects (GitHub siempre 302 de /releases/latest/download/<asset>
+// hacia la URL real del asset en /releases/download/<tag>/<asset>) y entrega
+// la respuesta final (status 200) a `onResponse`. Cualquier otro status, o un
+// error de conexión, corta el proceso con un mensaje claro -- nunca deja al
+// caller adivinar por qué algo quedó a medias.
+function httpGetFollowingRedirects(url, onResponse) {
+  https.get(url, (res) => {
+    if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+      return httpGetFollowingRedirects(res.headers.location, onResponse);
+    }
+    if (res.statusCode !== 200) {
+      console.error(`[link-lang] Falló la descarga (HTTP ${res.statusCode}): ${url}`);
+      process.exit(1);
+    }
+    onResponse(res);
+  }).on('error', (err) => {
+    console.error('[link-lang] Error de conexión:', err.message);
+    process.exit(1);
+  });
+}
+
+// SHA256SUMS.txt (generado por release.yml, formato `sha256sum` estándar:
+// "<hex en minúscula>  <nombre de archivo>" por línea) es el único registro
+// de qué binario es el legítimo -- sin esto, un CDN o registro comprometido
+// podría entregar un binario distinto al que el asset dice ser, y correría
+// igual, sin ningún aviso.
+function fetchChecksums(callback) {
+  const url = `https://github.com/${REPO}/releases/latest/download/SHA256SUMS.txt`;
+  httpGetFollowingRedirects(url, (res) => {
+    let body = '';
+    res.setEncoding('utf8');
+    res.on('data', (chunk) => { body += chunk; });
+    res.on('end', () => {
+      const checksums = new Map();
+      for (const line of body.split('\n')) {
+        const match = line.match(/^([0-9a-f]{64})\s+\*?(.+)$/);
+        if (match) checksums.set(match[2].trim(), match[1]);
+      }
+      callback(checksums);
+    });
+  });
+}
+
 function downloadReleaseBinary(callback) {
   const asset = resolveAsset();
   if (!asset) {
@@ -65,29 +109,36 @@ function downloadReleaseBinary(callback) {
   const tempFile = path.join(os.tmpdir(), `linkc_download_${Date.now()}_${asset}`);
   const file = fs.createWriteStream(tempFile);
 
-  function followRedirect(targetUrl) {
-    https.get(targetUrl, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return followRedirect(res.headers.location);
-      }
-      if (res.statusCode !== 200) {
-        console.error(`[link-lang] Falló la descarga (HTTP ${res.statusCode}).`);
-        process.exit(1);
-      }
-      res.pipe(file);
-      file.on('finish', () => {
-        file.close(() => {
-          extractAsset(tempFile, asset, callback);
+  httpGetFollowingRedirects(url, (res) => {
+    res.pipe(file);
+    file.on('finish', () => {
+      file.close(() => {
+        fetchChecksums((checksums) => {
+          verifyChecksumAndExtract(tempFile, asset, checksums, callback);
         });
       });
-    }).on('error', (err) => {
-      fs.unlink(tempFile, () => {});
-      console.error('[link-lang] Error de conexión:', err.message);
-      process.exit(1);
     });
-  }
+  });
+}
 
-  followRedirect(url);
+function verifyChecksumAndExtract(tempFile, asset, checksums, callback) {
+  const expected = checksums.get(asset);
+  if (!expected) {
+    fs.unlink(tempFile, () => {});
+    console.error(`[link-lang] SHA256SUMS.txt no lista un checksum para '${asset}' -- abortando, no se puede confirmar que el binario descargado sea el legítimo.`);
+    process.exit(1);
+  }
+  const hash = crypto.createHash('sha256');
+  hash.update(fs.readFileSync(tempFile));
+  const actual = hash.digest('hex');
+  if (actual !== expected) {
+    fs.unlink(tempFile, () => {});
+    console.error(`[link-lang] El checksum SHA-256 del binario descargado NO coincide con el publicado -- abortando, nunca se ejecuta un binario sin verificar.`);
+    console.error(`  esperado: ${expected}`);
+    console.error(`  obtenido: ${actual}`);
+    process.exit(1);
+  }
+  extractAsset(tempFile, asset, callback);
 }
 
 function extractAsset(tempFile, asset, callback) {

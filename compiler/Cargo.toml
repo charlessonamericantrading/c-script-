@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.150.1"
+version = "1.150.2"
 edition = "2021"
 default-run = "linkc"
 

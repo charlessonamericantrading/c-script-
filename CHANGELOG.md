@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.150.2] - 2026-08-30
+
+### ✨ Nuevo
+**Paquete npm `link-lang` listo para publicar** (PLAN.md §8.1 ítem 1) -- el instalador (`npm/bin/linkc.js`, descarga el binario correcto por plataforma desde GitHub Releases) ya existía desde v1.16.0, pero nunca quedó terminado de dejar publicable: versión desincronizada, sin `README.md`, sin verificación de integridad del binario descargado. Los tres cerrados.
+
+- `SHA256SUMS.txt` generado en cada release (`release.yml`) y verificado contra el binario descargado ANTES de ejecutarlo nunca -- un mismatch aborta limpio, nunca corre un binario sin confirmar.
+- `npm/README.md` nuevo para la página del paquete en npm.
+- `package.json` sincronizado a la versión real, más `repository.directory`/`homepage`/`bugs`/`files`/`engines`.
+
+**Verificado end-to-end contra un release real** (no solo leyendo el código): descarga limpia en frío (sin build local, sin cache, sin PATH), checksum verificado, extracción y ejecución del binario real, versión correcta impresa. Solo falta `npm publish`, que necesita las credenciales de la cuenta npm del usuario.
+
 ## [1.150.1] - 2026-08-30
 
 ### 🔧 Mantenimiento

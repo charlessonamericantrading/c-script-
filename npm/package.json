@@ -1,13 +1,16 @@
 {
   "name": "link-lang",
-  "version": "1.16.0",
+  "version": "1.150.2",
   "description": "El compilador y runtime oficial para el lenguaje Link (End-to-End Type Safety con TypeScript)",
   "bin": {
     "linkc": "./bin/linkc.js",
     "link": "./bin/linkc.js"
   },
+  "files": [
+    "bin/"
+  ],
   "scripts": {
-    "test": "node ./bin/linkc.js --help"
+    "test": "node ./bin/linkc.js --version"
   },
   "keywords": [
     "link",
@@ -21,8 +24,21 @@
   ],
   "author": "Charlesson UK Consulting Group LTD",
   "license": "MIT",
+  "homepage": "https://github.com/charlessonamericantrading/c-script-#readme",
+  "bugs": {
+    "url": "https://github.com/charlessonamericantrading/c-script-/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/charlessonamericantrading/c-script-.git"
-  }
+    "url": "git+https://github.com/charlessonamericantrading/c-script-.git",
+    "directory": "npm"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "win32",
+    "linux",
+    "darwin"
+  ]
 }

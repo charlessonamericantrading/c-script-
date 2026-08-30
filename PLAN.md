@@ -341,7 +341,7 @@ El servidor RPC y el `client.ts` comparten el mismo emisor de tipos, garantizand
 Con las Fases 0 a 3 completadas y el núcleo v1.28.0 plenamente operativo, las siguientes prioridades definen la evolución hacia la versión 2.0:
 
 ### 8.1 Ecosistema y Distribución
-1. **Publicación en el registro npm**: Empaquetar y publicar `link-lang` en npm para permitir ejecución vía `npx linkc` o instalación global estándar.
+1. **Publicación en el registro npm**: Empaquetar y publicar `link-lang` en npm para permitir ejecución vía `npx linkc` o instalación global estándar. **Paquete listo (30/08/2026)**, ver `npm/` -- ya existía un instalador funcional desde v1.16.0 (`npm/bin/linkc.js`, descarga el binario correcto por plataforma desde GitHub Releases) que nadie había terminado de dejar publicable: sin `README.md` para la página de npm, versión desincronizada (`1.16.0` vs. la real), sin verificación de integridad del binario descargado. Los tres cerrados esta ronda -- suma además verificación SHA-256 real (`SHA256SUMS.txt`, nuevo paso en `release.yml`, verificado contra el binario descargado antes de ejecutarlo NUNCA, no solo un TODO) porque este paquete descarga y ejecuta un binario en la máquina de quien lo instala. Falta únicamente **`npm publish`**, que necesita las credenciales de la cuenta npm del usuario -- lo único que quedó, ver §9.12 ítem 1.
 2. **Ampliación del Playground Web**: Soporte para resolución de múltiples archivos y ejecución simulada de tests en el navegador mediante `wasm32-unknown-unknown`.
 
 ### 8.2 Base de Datos y Consultas Avanzadas
