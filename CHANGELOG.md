@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.145.1] - 2026-08-30
+
+### 🐛 Arreglado
+**CI en rojo tras v1.145.0, por un bug real en `linkc db shell` -- no un bug de test.** `postgres::Error::to_string()` es deliberadamente parco para un error de tipo `Kind::Db` (confirmado leyendo la fuente de `tokio-postgres`): imprime literalmente `"db error"`, sin el mensaje real del servidor (severidad, texto, `DETAIL`, `HINT`), que vive aparte en el `DbError` accesible vía `.as_db_error()`. Cualquier error de Postgres contra `db shell` -- una escritura rechazada, SQL inválido, lo que sea -- se mostraba como el inútil `"error: db error"`, sin ninguna pista real de qué pasó. El test nuevo contra Postgres real (`db_shell_read_only_session_blocks_a_real_write_enforced_by_the_server_against_postgres`) lo agarró en CI antes de llegar a ningún usuario.
+
+- `pg_error_text` (`db_admin.rs`), único punto de conversión de un `postgres::Error` a texto en `run_query_postgres`/`run_shell_postgres`, prefiere `DbError::to_string()` (mensaje real del servidor) cuando existe.
+
+Suite completa sin regresiones. Ver GRAMMAR.md §3.189.
+
 ## [1.145.0] - 2026-08-30
 
 ### ✨ Nuevo

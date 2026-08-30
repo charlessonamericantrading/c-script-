@@ -321,15 +321,33 @@ pub fn run_query_sqlite(connection: &Connection, sql: &str) -> Result<(Vec<Strin
     Ok((headers, rows_out))
 }
 
+/// `postgres::Error::to_string()` es deliberadamente parco para un error de
+/// tipo `Kind::Db` (confirmado leyendo la fuente de `tokio-postgres`) -- imprime
+/// LITERALMENTE el string fijo `"db error"`, sin el mensaje real del servidor
+/// (severidad, texto, DETAIL, HINT), que vive aparte en el `DbError` accesible
+/// vía `.as_db_error()`. Descubierto en CI, no localmente: el mensaje real de
+/// Postgres para una escritura rechazada por `default_transaction_read_only`
+/// (`ERROR: cannot execute INSERT in a read-only transaction`) se perdía
+/// entero, dejando al usuario del shell sin ninguna pista de qué pasó. Esta
+/// función es el único punto de conversión de un `postgres::Error` a texto en
+/// todo `run_query_postgres` -- mismo criterio de "chokepoint único" que el
+/// resto de este módulo ya usa para otras conversiones.
+fn pg_error_text(e: postgres::Error) -> String {
+    match e.as_db_error() {
+        Some(db_err) => db_err.to_string(),
+        None => e.to_string(),
+    }
+}
+
 /// Misma idea que `run_query_sqlite`, contra PostgreSQL real. `client.prepare`
 /// (no `client.query` directo) es lo que da los headers incluso cuando el
 /// resultado tiene CERO filas -- `Statement::columns()` está disponible antes
 /// de ejecutar nada, a diferencia de tratar de leerlos de la primera fila
 /// (que no existiría en ese caso).
 pub fn run_query_postgres(client: &mut postgres::Client, sql: &str) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
-    let stmt = client.prepare(sql).map_err(|e| e.to_string())?;
+    let stmt = client.prepare(sql).map_err(pg_error_text)?;
     let headers: Vec<String> = stmt.columns().iter().map(|c| c.name().to_string()).collect();
-    let rows = client.query(&stmt, &[]).map_err(|e| e.to_string())?;
+    let rows = client.query(&stmt, &[]).map_err(pg_error_text)?;
     let mut rows_out = Vec::with_capacity(rows.len());
     for row in &rows {
         let mut cells = Vec::with_capacity(headers.len());
@@ -490,6 +508,6 @@ pub fn run_shell_sqlite(db_path: &Path) -> Result<(), String> {
 /// keywords, nunca a Postgres mismo).
 pub fn run_shell_postgres(url: &str) -> Result<(), String> {
     let mut client = connect_postgres_client(url)?;
-    client.batch_execute("SET default_transaction_read_only = on").map_err(|e| e.to_string())?;
+    client.batch_execute("SET default_transaction_read_only = on").map_err(pg_error_text)?;
     run_shell_loop(|sql| run_query_postgres(&mut client, sql))
 }
