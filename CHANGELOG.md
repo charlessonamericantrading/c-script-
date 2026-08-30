@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.143.0] - 2026-08-30
+
+### 🐛 Arreglado
+**Escritura contra una columna `json`/`jsonb` NATIVA de Postgres fallaba SIEMPRE, con o sin valor.** Bug real de producción, severidad alta, reportado por skynet-43 (iaacademy): una columna `jsonb` adoptada (`properties`, una tabla de analíticas), mapeada a `String?` -- la forma que `linkc introspect` ya recomienda para JSON sin tipo propio -- daba `"error deserializing column N"` al escribir, la fila nunca se insertaba. `null` fallaba igual que un valor real. Impacto: ~2-3 min con un endpoint público de analíticas devolviendo 500 a todo visitante, antes de revertir a SQL crudo.
+
+- Causa (confirmada leyendo el código fuente de `postgres-types`, no solo documentación): `String::accepts` no incluye `json`/`jsonb` -- el rechazo pasa por tipo de columna, antes de mirar el valor.
+- Mismo patrón que `uuid`/`inet` (§3.177/§3.179): `json` es texto UTF-8 crudo; `jsonb` antepone un byte de versión (`0x01`). `PgJsonText` nueva (`runtime/store.rs`) resuelve lectura, un caso simétrico en `Cell::to_sql` resuelve escritura.
+- Sin cambios a la advertencia de `linkc introspect` para `json`/`jsonb` -- sigue siendo consejo válido sobre MODELADO (¿`String` genérico o un `type` propio?), no sobre si `String` funciona.
+
+**Verificado contra Postgres real**: el repro exacto reportado (columna `jsonb`, escritura con contenido y con `null`, confirmado con un operador `jsonb` real que solo funciona si se guardó como `jsonb` de verdad) + un segundo test para `json` (no `jsonb`, formato binario distinto) + 5 tests unitarios locales de la codificación/decodificación en sí. Suite completa (1403 tests) sin regresiones. Ver GRAMMAR.md §3.187.
+
 ## [1.142.0] - 2026-08-30
 
 ### 🔧 Interno

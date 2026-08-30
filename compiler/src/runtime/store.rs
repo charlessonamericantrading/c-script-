@@ -768,16 +768,59 @@ fn inet_string_to_binary(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Bug real de producción, confirmado en vivo (iaacademy, vía skynet-43,
+/// 30/08/2026 -- ~2-3 min de 500 reales en un endpoint público de
+/// analíticas antes de revertir): una columna `json`/`jsonb` NATIVA
+/// adoptada, mapeada a un campo `String`/`String?` (la forma que
+/// GRAMMAR.md ya recomienda para JSON sin tipo propio declarado), fallaba
+/// SIEMPRE al escribir -- "error deserializing column N", la fila nunca
+/// se insertaba, con o sin valor (fallaba igual con `null`). Causa:
+/// `postgres-types::String::accepts` (la crate, no este código) SOLO
+/// acepta `VARCHAR`/`TEXT`/`BPCHAR`/`NAME`/`UNKNOWN` -- ni `json` ni
+/// `jsonb` están en esa lista, así que el intento de bindear/leer un
+/// `Cell::Text` normal contra esa columna rechaza el tipo antes de
+/// siquiera mirar los bytes. Mismo tipo de gap que `uuid`/`inet`/
+/// `timestamp` (GRAMMAR.md §3.177/§3.179/§3.182): una columna nativa con
+/// formato binario propio que el campo `String` normal de c-script nunca
+/// esperó tener que hablar. `PgJsonText` (abajo) resuelve el lado de
+/// LECTURA; `Cell::to_sql` (más abajo en este archivo) resuelve
+/// ESCRITURA -- confirmado el formato binario exacto leyendo el código
+/// fuente de `postgres-types` (`Json<T>::to_sql`/`from_sql`, no solo
+/// documentación): `json` es texto UTF-8 crudo, sin envoltorio; `jsonb`
+/// antepone UN byte de versión (`0x01`, la única versión que el
+/// protocolo define hoy) antes del mismo texto.
+#[derive(Debug)]
+struct PgJsonText(String);
+
+impl<'a> postgres::types::FromSql<'a> for PgJsonText {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let text_bytes = if *ty == postgres::types::Type::JSONB {
+            match raw.first() {
+                Some(1) => &raw[1..],
+                Some(v) => return Err(format!("'{ty}': versión de codificación jsonb no soportada ({v}), solo se conoce la versión 1").into()),
+                None => return Err(format!("'{ty}': jsonb truncado, faltó el byte de versión").into()),
+            }
+        } else {
+            raw
+        };
+        Ok(PgJsonText(String::from_utf8(text_bytes.to_vec()).map_err(|e| format!("'{ty}': contenido no es UTF-8 válido: {e}"))?))
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        matches!(*ty, postgres::types::Type::JSON | postgres::types::Type::JSONB)
+    }
+}
+
 /// Una columna `String` (GRAMMAR.md §2.1) contra Postgres puede ser
 /// físicamente TEXT/VARCHAR (la convención normal) o -- una tabla YA
-/// EXISTENTE, adoptada -- `uuid`/`inet`/`cidr` NATIVOS, con formato
-/// binario propio que no es texto UTF-8. Mismo criterio de "probar en
-/// orden" que `postgres_int_cell`/`postgres_timestamp_cell`/
+/// EXISTENTE, adoptada -- `uuid`/`inet`/`cidr`/`json`/`jsonb` NATIVOS, con
+/// formato binario propio que no es texto UTF-8 tal cual. Mismo criterio
+/// de "probar en orden" que `postgres_int_cell`/`postgres_timestamp_cell`/
 /// `postgres_float_cell`: `String` primero (el caso normal, sin costo
 /// extra), `PgUuidText` después (reusa el mismo decodificador que la PK
 /// `id: Uuid`, GRAMMAR.md §3.177 -- un campo `String` normal mapeado a
 /// una columna `uuid` nativa es el mismo problema, solo que no es la
-/// PK), y `PgInetText` al final (GRAMMAR.md §3.179).
+/// PK), `PgInetText` (GRAMMAR.md §3.179), y `PgJsonText` al final.
 fn postgres_string_cell(row: &postgres::Row, i: usize) -> Result<Option<String>, String> {
     if let Ok(v) = row.try_get::<_, Option<String>>(i) {
         return Ok(v);
@@ -785,7 +828,10 @@ fn postgres_string_cell(row: &postgres::Row, i: usize) -> Result<Option<String>,
     if let Ok(v) = row.try_get::<_, Option<PgUuidText>>(i) {
         return Ok(v.map(|PgUuidText(s)| s));
     }
-    row.try_get::<_, Option<PgInetText>>(i).map(|v| v.map(|PgInetText(s)| s)).map_err(|e| e.to_string())
+    if let Ok(v) = row.try_get::<_, Option<PgInetText>>(i) {
+        return Ok(v.map(|PgInetText(s)| s));
+    }
+    row.try_get::<_, Option<PgJsonText>>(i).map(|v| v.map(|PgJsonText(s)| s)).map_err(|e| e.to_string())
 }
 
 /// Una columna `Timestamp` (GRAMMAR.md §3.31/§3.91) contra Postgres puede
@@ -1014,6 +1060,24 @@ impl postgres::types::ToSql for Cell {
                 out.extend_from_slice(&bytes);
                 Ok(postgres::types::IsNull::No)
             }
+            // Mismo bug, lado de ESCRITURA: `String::to_sql` (la crate) no
+            // acepta `json`/`jsonb` -- confirmado leyendo el código fuente
+            // real de `postgres-types` (`Json<T>::to_sql`), no solo
+            // documentación. `jsonb` antepone el mismo byte de versión
+            // (`0x01`) que `PgJsonText::from_sql` (arriba) espera al leer;
+            // `json` es el texto UTF-8 crudo, sin envoltorio. Postgres
+            // mismo valida que el string sea JSON bien formado al escribir
+            // -- sin validación propia acá, mismo criterio que el resto de
+            // este archivo (la base es la que hace cumplir su propio tipo).
+            Cell::Text(s) if *ty == postgres::types::Type::JSONB => {
+                out.extend_from_slice(&[1]);
+                out.extend_from_slice(s.as_bytes());
+                Ok(postgres::types::IsNull::No)
+            }
+            Cell::Text(s) if *ty == postgres::types::Type::JSON => {
+                out.extend_from_slice(s.as_bytes());
+                Ok(postgres::types::IsNull::No)
+            }
             Cell::Text(s) => s.to_sql(ty, out),
             Cell::Bool(b) => b.to_sql(ty, out),
             Cell::Json(v) => v.to_sql(ty, out),
@@ -1114,6 +1178,60 @@ mod inet_tests {
         // exacto que Postgres documenta para el protocolo binario de inet.
         let bytes = inet_string_to_binary("192.168.1.1").unwrap();
         assert_eq!(bytes, vec![2, 32, 0, 4, 192, 168, 1, 1]);
+    }
+}
+
+/// GRAMMAR.md §3.187: como `inet_tests` arriba -- la decodificación
+/// binaria de `json`/`jsonb` en sí (`PgJsonText::from_sql`) es lógica
+/// PURA, sin Postgres real de por medio. El byte de versión de `jsonb`
+/// (siempre `1`, la única versión que el protocolo define hoy) se
+/// construye a mano acá, igual que `Cell::to_sql` lo hace en escritura --
+/// encontrar un error de layout acá es mucho más barato que en CI.
+#[cfg(test)]
+mod json_tests {
+    use super::*;
+
+    fn decode(ty: postgres::types::Type, bytes: &[u8]) -> String {
+        let PgJsonText(s) = <PgJsonText as postgres::types::FromSql>::from_sql(&ty, bytes).expect("decodificar");
+        s
+    }
+
+    #[test]
+    fn jsonb_strips_the_leading_version_byte() {
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(br#"{"a":1}"#);
+        assert_eq!(decode(postgres::types::Type::JSONB, &bytes), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn json_has_no_version_byte_the_raw_text_is_the_whole_payload() {
+        // A diferencia de jsonb, el formato binario de json ES el texto
+        // crudo -- ni un byte de más.
+        assert_eq!(decode(postgres::types::Type::JSON, br#"{"a":1}"#), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn jsonb_rejects_an_unknown_encoding_version_with_a_clean_error_not_a_panic() {
+        let mut bytes = vec![2u8]; // versión 2 no existe -- Postgres solo definió la 1
+        bytes.extend_from_slice(br#"{}"#);
+        let err = <PgJsonText as postgres::types::FromSql>::from_sql(&postgres::types::Type::JSONB, &bytes).unwrap_err();
+        assert!(err.to_string().contains("versión"), "{err}");
+    }
+
+    #[test]
+    fn jsonb_rejects_a_truncated_empty_payload_with_a_clean_error_not_a_panic() {
+        let err = <PgJsonText as postgres::types::FromSql>::from_sql(&postgres::types::Type::JSONB, &[]).unwrap_err();
+        assert!(err.to_string().contains("truncado"), "{err}");
+    }
+
+    #[test]
+    fn accepts_only_json_and_jsonb_not_plain_text() {
+        // El bug real (skynet-43): `String::accepts` (la crate) rechaza
+        // json/jsonb -- por eso una fila con `null` fallaba IGUAL que una
+        // con contenido, el rechazo pasa antes de mirar el valor.
+        assert!(<PgJsonText as postgres::types::FromSql>::accepts(&postgres::types::Type::JSON));
+        assert!(<PgJsonText as postgres::types::FromSql>::accepts(&postgres::types::Type::JSONB));
+        assert!(!<PgJsonText as postgres::types::FromSql>::accepts(&postgres::types::Type::TEXT));
     }
 }
 

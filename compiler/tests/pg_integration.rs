@@ -2441,6 +2441,136 @@ service Leads {{
     assert_eq!(raw_type, "inet", "el insert tiene que haber escrito un valor inet real, no forzado el tipo de la columna");
 }
 
+// ---- `String` contra `json`/`jsonb` NATIVOS de Postgres (GRAMMAR.md §3.187) ----
+
+/// Bug real de producción, confirmado en vivo (iaacademy, vía skynet-43,
+/// 30/08/2026): una columna `jsonb` NATIVA adoptada, mapeada a `String?`
+/// (la forma que GRAMMAR.md ya recomienda para JSON sin tipo propio
+/// declarado), fallaba SIEMPRE al escribir -- "error deserializing column
+/// N", la fila nunca se insertaba, CON o SIN valor (`null` fallaba
+/// igual). ~2-3 min de 500 reales en un endpoint público de analíticas
+/// antes de revertir a SQL crudo.
+#[test]
+fn adopt_existing_reads_and_writes_a_native_jsonb_column_mapped_to_string() {
+    const COLLECTION: &str = "events_jsonb_column";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BIGSERIAL PRIMARY KEY, \
+                \"kind\" TEXT NOT NULL, \
+                \"properties\" JSONB\
+            )"
+        ))
+        .expect("crear la tabla con una columna jsonb nativa, como la real de iaacademy");
+    client
+        .batch_execute(&format!(
+            "INSERT INTO \"{COLLECTION}\" (kind, properties) VALUES ('click', '{{\"button\":\"cta\",\"n\":2}}'::jsonb)"
+        ))
+        .expect("sembrar una fila con properties real");
+    client
+        .batch_execute(&format!("INSERT INTO \"{COLLECTION}\" (kind, properties) VALUES ('pageview', NULL)"))
+        .expect("sembrar una fila con properties NULL");
+
+    let temp = TempDir::new("adopt-jsonb-column");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Event = {{ id: Int, kind: String, properties: String? }}
+type NewEvent = {{ kind: String, properties: String? }}
+db {{ {COLLECTION}: Event[] }}
+service Events {{
+  rpc list() -> Event[] {{ db.{COLLECTION}.all() }}
+  rpc create(kind: String, properties: String?) -> Event {{ db.{COLLECTION}.insert(NewEvent {{ kind: kind, properties: properties }}) }}
+}}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+    let listed = server.rpc("Events/list", "{}");
+    let rows = listed.as_array().unwrap_or_else(|| panic!("se esperaba una lista, llegó: {listed:?}"));
+    assert_eq!(rows.len(), 2, "{listed:?}");
+    let click = rows.iter().find(|r| r["kind"] == "click").expect("la fila con properties");
+    assert_eq!(click["properties"], r#"{"button":"cta","n":2}"#, "el jsonb tiene que decodificarse como el texto JSON real: {click:?}");
+    let pageview = rows.iter().find(|r| r["kind"] == "pageview").expect("la fila sin properties");
+    assert_eq!(pageview["properties"], serde_json::Value::Null, "NULL en jsonb sigue siendo NULL: {pageview:?}");
+
+    // Escritura: el repro exacto de skynet-43 -- con contenido Y con null,
+    // los dos tienen que funcionar (antes del fix, los dos fallaban igual).
+    let created = server.rpc("Events/create", r#"{"kind":"purchase","properties":"{\"amount\":19.99}"}"#);
+    assert_eq!(created["properties"], r#"{"amount":19.99}"#, "{created:?}");
+    let created_null = server.rpc("Events/create", r#"{"kind":"logout","properties":null}"#);
+    assert_eq!(created_null["properties"], serde_json::Value::Null, "{created_null:?}");
+
+    // Confirma con SQL crudo que quedó guardada como jsonb real, consultable.
+    let raw: String = client
+        .query_one("SELECT properties->>'amount' FROM \"events_jsonb_column\" WHERE kind = 'purchase'", &[])
+        .map(|row| row.get(0))
+        .expect("leer con un operador jsonb real -- falla si no se guardó como jsonb de verdad");
+    assert_eq!(raw, "19.99", "el insert tiene que haber escrito un jsonb real, consultable con ->>: {raw}");
+}
+
+/// Mismo bug, la otra mitad: una columna `json` (no `jsonb`) -- formato
+/// binario DISTINTO (texto UTF-8 crudo, sin el byte de versión que
+/// `jsonb` antepone) -- confirma que el fix distingue los dos casos
+/// correctamente, no solo uno de los dos.
+#[test]
+fn adopt_existing_reads_and_writes_a_native_json_column_mapped_to_string() {
+    const COLLECTION: &str = "events_json_column";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!("CREATE TABLE \"{COLLECTION}\" (\"id\" BIGSERIAL PRIMARY KEY, \"payload\" JSON)"))
+        .expect("crear la tabla con una columna json (no jsonb) nativa");
+    client
+        .batch_execute(&format!("INSERT INTO \"{COLLECTION}\" (payload) VALUES ('{{\"a\":1}}'::json)"))
+        .expect("sembrar una fila con payload real");
+
+    let temp = TempDir::new("adopt-json-column");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Event = {{ id: Int, payload: String? }}
+type NewEvent = {{ payload: String? }}
+db {{ {COLLECTION}: Event[] }}
+service Events {{
+  rpc list() -> Event[] {{ db.{COLLECTION}.all() }}
+  rpc create(payload: String?) -> Event {{ db.{COLLECTION}.insert(NewEvent {{ payload: payload }}) }}
+}}
+"#
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+    let listed = server.rpc("Events/list", "{}");
+    let rows = listed.as_array().unwrap_or_else(|| panic!("se esperaba una lista, llegó: {listed:?}"));
+    assert_eq!(rows[0]["payload"], r#"{"a":1}"#, "{rows:?}");
+
+    let created = server.rpc("Events/create", r#"{"payload":"{\"b\":2}"}"#);
+    assert_eq!(created["payload"], r#"{"b":2}"#, "{created:?}");
+    let raw_type: String = client
+        .query_one("SELECT pg_typeof(payload)::text FROM \"events_json_column\" WHERE payload::text = '{\"b\":2}'", &[])
+        .map(|row| row.get(0))
+        .expect("leer el tipo real con SQL crudo");
+    assert_eq!(raw_type, "json", "el insert tiene que haber escrito un valor json real: {raw_type}");
+}
+
 #[test]
 fn adopt_existing_reads_and_writes_a_native_uuid_column_mapped_to_plain_string() {
     // La SEGUNDA mitad del mismo reporte: un campo declarado `String` (NO
