@@ -4168,6 +4168,29 @@ impl Checker {
                 self.expect_no_args(args, "toIsoString")?;
                 Some(Type::String)
             }
+            // GRAMMAR.md §3.196: aritmética de Timestamp -- Value::Timestamp
+            // ya es milisegundos planos desde epoch, sumar/restar tiempo es
+            // aritmética entera pura, sin lógica de calendario.
+            (Type::Timestamp, "addMillis") => builtin_args!(
+                self, args, env, "Timestamp.addMillis",
+                [(n, "n: Int64", Type::Int64)] -> Type::Timestamp
+            ),
+            (Type::Timestamp, "addSeconds") => builtin_args!(
+                self, args, env, "Timestamp.addSeconds",
+                [(n, "n: Int", Type::Int)] -> Type::Timestamp
+            ),
+            (Type::Timestamp, "addMinutes") => builtin_args!(
+                self, args, env, "Timestamp.addMinutes",
+                [(n, "n: Int", Type::Int)] -> Type::Timestamp
+            ),
+            (Type::Timestamp, "addHours") => builtin_args!(
+                self, args, env, "Timestamp.addHours",
+                [(n, "n: Int", Type::Int)] -> Type::Timestamp
+            ),
+            (Type::Timestamp, "addDays") => builtin_args!(
+                self, args, env, "Timestamp.addDays",
+                [(n, "n: Int", Type::Int)] -> Type::Timestamp
+            ),
             (Type::Math, "sqrt") => {
                 let [arg] = args else {
                     return Err(err("'math.sqrt' toma exactamente 1 argumento (x: Float)"));
@@ -5920,6 +5943,34 @@ type T = { id: Int, s: Status }")
 
         let wrong_ret = check_source("fn bad() -> Int { dateFromParts(2026, 1, 1, 0, 0, 0) }");
         assert!(wrong_ret.is_err());
+    }
+
+    /// GRAMMAR.md §3.196 -- aritmética de `Timestamp` vía método, `n`
+    /// negativo resta (sin un `.subtract*` separado).
+    #[test]
+    fn timestamp_arithmetic_methods_take_the_right_int_type_and_return_timestamp() {
+        assert!(check_source("fn f(t: Timestamp) -> Timestamp { t.addMillis(1000.toInt64()) }").is_ok());
+        assert!(check_source("fn f(t: Timestamp) -> Timestamp { t.addMillis(1000) }").is_err(), "addMillis toma Int64, sin mezcla implícita con un literal Int (mismo criterio que el resto del lenguaje)");
+        assert!(check_source("fn f(t: Timestamp) -> Timestamp { t.addSeconds(30) }").is_ok());
+        assert!(check_source("fn f(t: Timestamp) -> Timestamp { t.addMinutes(5) }").is_ok());
+        assert!(check_source("fn f(t: Timestamp) -> Timestamp { t.addHours(-2) }").is_ok(), "n negativo tipa igual -- resta en runtime");
+        assert!(check_source("fn f(t: Timestamp) -> Timestamp { t.addDays(1) }").is_ok());
+    }
+
+    #[test]
+    fn timestamp_arithmetic_methods_reject_the_wrong_argument_type() {
+        assert!(check_source("fn f(t: Timestamp) -> Timestamp { t.addMinutes(\"5\") }").is_err());
+        assert!(check_source("fn f(t: Timestamp) -> Timestamp { t.addDays() }").is_err(), "sin argumento tiene que rechazarse, no asumir 0");
+    }
+
+    #[test]
+    fn timestamp_arithmetic_composes_with_comparison_for_a_real_otp_expiry_check() {
+        // El caso real reportado por un adoptador (MyFinance): expiración
+        // de OTP de 2FA, `now() < issuedAt.addMinutes(5)`.
+        let src = r#"
+            fn stillValid(issuedAt: Timestamp) -> Bool { now() < issuedAt.addMinutes(5) }
+        "#;
+        assert!(check_source(src).is_ok());
     }
 
     /// `sitemapXml(urls: {loc, lastmod?}[]) -> String` (GRAMMAR.md §3.116) --

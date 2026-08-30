@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.152.0] - 2026-08-31
+
+### ✨ Nuevo
+**Aritmética de `Timestamp`** (PLAN.md §9.14 ítem 4) -- `.addMillis(n: Int64)`, `.addSeconds(n: Int)`, `.addMinutes(n: Int)`, `.addHours(n: Int)`, `.addDays(n: Int)`, todas devolviendo `Timestamp`. `n` negativo resta. `Value::Timestamp` ya es milisegundos planos desde epoch -- aritmética entera pura, `checked_mul`/`checked_add` en las dos operaciones (nunca cruda). Resuelve el caso real de un adoptador en producción (MyFinance): `now().addMinutes(5)` para expiración real de un código OTP de 2FA, hoy imposible.
+
+De paso, corrige dos lugares que quedaron desactualizados desde que `toMillis`/`diffMillis`/`toIsoString` se agregaron sin nunca documentarse ni reflejarse en las completions del LSP (`Type::Timestamp => Some(vec![])` seguía devolviendo una lista vacía).
+
+**Verificado**: tests de checker (aridad/tipos, `n` negativo tipa igual) + tests de runtime (suma/resta exacta por unidad, el caso real de expiración de OTP con datos de prueba, desborde con `n` gigante da error limpio no panic). Suite completa (1129 tests) sin regresiones. Ver GRAMMAR.md §3.196.
+
 ## [1.151.0] - 2026-08-31
 
 ### 🐛 Arreglado

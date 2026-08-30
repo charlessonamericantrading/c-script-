@@ -217,6 +217,7 @@
   - [3.193 `--db-schema <nombre>`/`LINK_DATABASE_SCHEMA` — RESUELTO, cierra PLAN.md §9.3 ítem 4](#3193---db-schema-nombrelink_database_schema--resuelto-cierra-planmd-93-ítem-4)
   - [3.194 `crypto.awsS3PresignedUploadUrl(...)`: URL firmada para SUBIR a S3 — RESUELTO, cierra la mitad que §3.110 había dejado abierta](#3194-cryptoawss3presigneduploadurl-url-firmada-para-subir-a-s3--resuelto-cierra-la-mitad-que-3110-había-dejado-abierta)
   - [3.195 Bug crítico: `Decimal == Decimal` siempre daba `false` en runtime — RESUELTO](#3195-bug-crítico-decimal--decimal-siempre-daba-false-en-runtime--resuelto)
+  - [3.196 Aritmética de `Timestamp`: `.addMillis()`/`.addSeconds()`/`.addMinutes()`/`.addHours()`/`.addDays()` — RESUELTO](#3196-aritmética-de-timestamp-addmillisaddsecondsaddminutesaddhoursadddays--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -1395,7 +1396,7 @@ La otra fila "no -- nunca se implementó" que quedaba en la tabla de tipos origi
 
 **Sin dependencia nueva -- algoritmo de calendario civil adaptado, no una librería.** El cálculo año/mes/día ↔ días-desde-epoch (`compiler/src/runtime/timestamp.rs`) es un puerto directo del algoritmo público de Howard Hinnant (`civil_from_days`/`days_from_civil`, dominio público/CC0, el mismo que usa `libc++` para `std::chrono::year_month_day`) -- aritmética entera exacta, sin tabla de lookup, correcto en años bisiestos y en fronteras de siglo (1900 no es bisiesto, 2000 sí) por construcción, no por casos especiales a mano. Mismo espíritu que el SHA-256 de `lockfile.rs` o el diff LCS de `linkc test`: un algoritmo chico y bien definido no amerita sumar una crate de calendario completa. El parseo (`parse_iso8601_millis`) reusa el propio algoritmo como su validador: una fecha que no existe (30 de febrero) hace que el cálculo "se derrame" hacia el mes siguiente, así que convertir el resultado de vuelta y compararlo contra los campos originales detecta el derrame sin duplicar ninguna tabla de "días por mes" a mano.
 
-**Solo comparable -- sin aritmética, sin ser scrutinee de `match`, sin métodos.** `<`/`<=`/`>`/`>=`/`==`/`!=` funcionan entre dos `Timestamp` (mismo mecanismo que ordena `Int`); `+`/`-`/`*`/`/`/`%` y `-` unario se rechazan -- no existe un tipo `Duration`, así que "sumar" a un `Timestamp` no tiene un significado definido todavía, diseño futuro aparte. Excluido como scrutinee de `match`, mismo criterio que ya excluye `Float` a propósito. Sin ningún método propio (`.algo()` sobre un `Timestamp` es siempre un error del checker) -- la completion del LSP para un receptor `Timestamp` devuelve una lista vacía explícita, no el fallback genérico con métodos de otros tipos que acá no aplican.
+**Solo comparable con los operadores nativos -- sin `+`/`-`/`*`/`/`/`%`, sin ser scrutinee de `match`. [ACTUALIZADO -- ver §3.196 para aritmética vía método.]** `<`/`<=`/`>`/`>=`/`==`/`!=` funcionan entre dos `Timestamp` (mismo mecanismo que ordena `Int`); los operadores aritméticos INFIJOS (`+`/`-`/`*`/`/`/`%`, `-` unario) siguen rechazados -- no existe un tipo `Duration`, así que `t1 + t2` no tiene un significado definido. Lo que SÍ existe desde §3.196 es aritmética por MÉTODO (`.addSeconds(n)`/`.addMinutes(n)`/etc.), que no necesita un tipo `Duration` porque el "cuánto sumar" es un `Int`/`Int64` plano, no otro `Timestamp`. Excluido como scrutinee de `match`, mismo criterio que ya excluye `Float` a propósito. **Métodos propios**: `toMillis() -> Int64` (milisegundos desde epoch), `diffMillis(other: Timestamp) -> Int64` (diferencia en milisegundos), `toIsoString() -> String` (mismo formato ISO-8601 fijo de arriba) -- los tres ya existían en el compilador antes de este párrafo sin haber quedado documentados acá (mismo patrón que le pasó a `base64.encode`/`decode`, §3.112: una capacidad real, invisible hasta que alguien la busca). Más `addMillis`/`addSeconds`/`addMinutes`/`addHours`/`addDays` (§3.196), nuevos.
 
 **Sin construcción desde código fuente en v0 -- límite real, documentado, no un olvido. [ACTUALIZADO -- ver §3.32 y §3.90].** Al momento de escribir este párrafo, no había `now()`: el lenguaje no tenía NINGÚN mecanismo de función builtin sin receptor (`Expr::Call` solo reconocía una `fn` de usuario por nombre, o un método vía `receptor.metodo(...)`) -- agregar uno era territorio arquitectónico nuevo, no parte de "agregar un tipo". Ese límite quedó resuelto en dos pasos posteriores: §3.32 agregó `now()` (el instante actual), y §3.90 agregó `dateFromParts(...)` (una fecha/hora arbitraria construida a mano, para cálculos como "el primer día del trimestre fiscal"). Tampoco hay auto-stamping de una columna tipo `createdAt` al hacer `insert` en `db` -- ver `@autoUpdate` (GRAMMAR.md, sección de columnas automáticas) para ese caso, que sí quedó resuelto por separado. Un valor `Timestamp` ya no está limitado a llegar como parámetro de un `rpc` o a estar guardado en `db`: también se puede construir en código con `now()` o `dateFromParts(...)`.
 
@@ -7189,13 +7190,39 @@ Antes del fix, `same(10.0000, 10.0000)` devolvía `false`. El checker dejaba pas
 
 **Verificado**: 2 tests nuevos en `runtime/mod.rs` contra un `linkc serve`/`invoke_rpc` real -- `10.0000 == 10.0000` da `true` (antes daba `false`), `10.0000 != 10.0000` da `false` (antes daba `true`), `10.0000 != 11.0000` sigue dando `true` (ya funcionaba, confirmado que el fix no lo rompió) -- más un test confirmando que el orden (`<`) sigue intacto. Suite completa sin regresiones.
 
+### 3.196 Aritmética de `Timestamp`: `.addMillis()`/`.addSeconds()`/`.addMinutes()`/`.addHours()`/`.addDays()` — RESUELTO
+
+PLAN.md §9.14 ítem 4 -- `Value::Timestamp` ya es milisegundos planos desde epoch (`i64`) internamente, no una fecha descompuesta en partes de calendario -- sumar/restar tiempo es aritmética entera pura, sin tocar el algoritmo de calendario de Hinnant que este proyecto ya tiene (§3.31, usado solo para `dateFromParts`/`toIsoString`/parseo, nunca para esto). Reporte real de un adoptador en producción (MyFinance): expiración de 5 minutos para un código OTP de 2FA era imposible de calcular ("ahora + N minutos" no existía en ningún punto del lenguaje) -- terminaron apoyándose solo en "de un solo uso" en vez de una expiración temporal real.
+
+```
+type Otp = { userId: Int, code: String, expiresAt: Timestamp }
+
+rpc issueOtp(userId: Int, code: String) -> Otp {
+  db.otps.insert(Otp { userId: userId, code: code, expiresAt: now().addMinutes(5) })
+}
+
+rpc verifyOtp(userId: Int, code: String) -> Bool {
+  match db.otps.findWhere(|o: Otp| { o.userId == userId && o.code == code }) {
+    matches: Otp[] => matches.length() > 0 && now() < matches[0].expiresAt,
+  }
+}
+```
+
+**`.addMillis(n: Int64)`, `.addSeconds(n: Int)`, `.addMinutes(n: Int)`, `.addHours(n: Int)`, `.addDays(n: Int)`, las cinco devolviendo `Timestamp`.** `n` negativo resta (no hay un método `.subtract*` separado -- `t.addMinutes(-5)` ya expresa "5 minutos antes" sin sumar superficie nueva). Cada una convierte `n` a milisegundos según su unidad y lo suma al valor ya envuelto.
+
+**Aritmética verificada (`checked_mul`/`checked_add`), nunca cruda -- convención obligatoria de este proyecto desde `AUDIT-2026-08-27.md` #16, no una elección de estilo de esta ronda.** Tanto la multiplicación por la escala del unit (`n * 86_400_000` para días) como la suma final al valor ya envuelto pueden desbordar por separado con un `n` adversarial -- las dos operaciones están verificadas, con un `RuntimeError` limpio (`"desborde aritmético al sumar <unidad> a un Timestamp"`) en vez de un panic o un wraparound silencioso. Mismo criterio que ya obligó a retrofitear `.sum()` de `List<Int>` con `checked_add` por el mismo motivo.
+
+**Alcance deliberadamente acotado, mismo criterio de siempre -- resolver el caso evidenciado, no la generalización hipotética**: sin constructor desde milisegundos crudos, sin forma de descomponer un `Timestamp` existente de vuelta a partes de calendario (año/mes/día/hora/minuto/segundo) -- la función privada que ya hace esa descomposición internamente (usada solo por el formateo ISO-8601) no se expone todavía, sin evidencia real de demanda de esa mitad. Sin un tipo `Duration` -- `n` es siempre un entero plano en la unidad del método, no un valor de primera clase que se pueda guardar/pasar entre rpcs.
+
+**Verificado**: tests de checker (aridad/tipos de los 5 métodos) + tests de runtime (`invoke_rpc`) confirmando suma/resta exacta en milisegundos para cada unidad, `n` negativo restando correctamente, y un `n` lo bastante grande como para desbordar dando `RuntimeError` limpio en vez de panic. Suite completa sin regresiones.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
 |---|---|---|---|
 | `Int`, `Float` | `number` | número | — |
 | `Int64` | `bigint` | string en el wire (decimal, ej. `"9223372036854775807"`), revivido a `bigint` real del lado TS | mismo rango `i64` que `Int` -- el WIRE sigue siendo string (§3.30) para no perder precisión, pero `client.ts` ahora lo revive a `bigint` real (§3.156). `.toInt64()`/`.toInt()` para convertir; sin mezcla implícita con `Int` |
-| `Timestamp` | `string` | string ISO-8601 de forma fija, ej. `"2026-08-08T14:30:00.000Z"` | milisegundos desde epoch UTC internamente -- ver §3.31. Obtenible con `now() -> Timestamp` (§3.32) o `dateFromParts(...) -> Timestamp` (§3.90). Solo comparable (`< <= > >= == !=`); sin aritmética |
+| `Timestamp` | `string` | string ISO-8601 de forma fija, ej. `"2026-08-08T14:30:00.000Z"` | milisegundos desde epoch UTC internamente -- ver §3.31. Obtenible con `now() -> Timestamp` (§3.32) o `dateFromParts(...) -> Timestamp` (§3.90). Comparable (`< <= > >= == !=`); sin operadores infijos (`+`/`-`), pero con aritmética por método (`.addMinutes(n)`/etc., §3.196) |
 | `now()` | `now(): Timestamp` | `"2026-08-15T12:00:00.000Z"` | función builtin de fecha y hora actual en UTC (§3.32) |
 | `dateFromParts(year, month, day, hour, minute, second)` | `dateFromParts(year: number, month: number, day: number, hour: number, minute: number, second: number): Timestamp` | `"2026-07-01T00:00:00.000Z"` | función builtin que construye un `Timestamp` arbitrario a partir de sus componentes de calendario; `bad_request` (400) si la fecha no existe (§3.90) |
 | `assert`, `panic` | — | — | funciones builtin de aserción y control de tests en backend (§3.33) |

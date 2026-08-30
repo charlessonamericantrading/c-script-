@@ -1130,6 +1130,19 @@ fn checked_int_numeric_op(
     }
 }
 
+/// GRAMMAR.md §3.196: `Timestamp.addSeconds`/`addMinutes`/`addHours`/`addDays`
+/// -- convierte `n` a milisegundos y lo suma al valor ya envuelto, con
+/// `checked_*` en las DOS operaciones (la multiplicación por la escala del
+/// unit Y la suma final pueden desbordar por separado con un `n`
+/// adversarial) -- mismo criterio obligatorio que el resto del runtime desde
+/// AUDIT-2026-08-27.md #16, nunca aritmética cruda.
+fn checked_timestamp_offset(ms: i64, n: i64, unit_millis: i64, verb: &str) -> Result<Value, RuntimeError> {
+    n.checked_mul(unit_millis)
+        .and_then(|delta| ms.checked_add(delta))
+        .map(Value::Timestamp)
+        .ok_or_else(|| err(format!("desborde aritmético al sumar {verb} a un Timestamp")))
+}
+
 /// Mensaje para `/`/`%`: distingue divisor cero (el caso casi siempre
 /// alcanzado con datos de usuario) del desborde real (`i64::MIN / -1`).
 fn div_or_rem_overflow_message(verb: &str, a: i64, b: i64) -> RuntimeError {
@@ -2522,6 +2535,43 @@ fn call_method(
                 Ok(Value::Int64(ms - other_ms))
             }
             "toIsoString" => Ok(Value::Str(timestamp::format_iso8601_millis(ms))),
+            "addMillis" => {
+                let n = match args.first() {
+                    Some(Value::Int64(n)) => *n,
+                    _ => return Err(err("'addMillis' requiere un argumento Int64")),
+                };
+                ms.checked_add(n)
+                    .map(Value::Timestamp)
+                    .ok_or_else(|| err("desborde aritmético al sumar milisegundos a un Timestamp"))
+            }
+            "addSeconds" => {
+                let n = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err(err("'addSeconds' requiere un argumento Int")),
+                };
+                checked_timestamp_offset(ms, n, 1_000, "segundos")
+            }
+            "addMinutes" => {
+                let n = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err(err("'addMinutes' requiere un argumento Int")),
+                };
+                checked_timestamp_offset(ms, n, 60_000, "minutos")
+            }
+            "addHours" => {
+                let n = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err(err("'addHours' requiere un argumento Int")),
+                };
+                checked_timestamp_offset(ms, n, 3_600_000, "horas")
+            }
+            "addDays" => {
+                let n = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err(err("'addDays' requiere un argumento Int")),
+                };
+                checked_timestamp_offset(ms, n, 86_400_000, "días")
+            }
             other => Err(err(format!("método desconocido sobre Timestamp: '{other}'"))),
         },
         Value::Math => match method {
@@ -7721,6 +7771,81 @@ mod tests {
         let e = invoke_rpc(&program, "S", "bad", &json!({}), &Db::seeded()).expect_err("30 de febrero no existe");
         assert_eq!(e.kind, ErrorKind::BadRequest, "una fecha inválida es error del CALLER, no del servidor: {e}");
         assert!(e.message.contains("2026-02-30"), "{e}");
+    }
+
+    // ---- GRAMMAR.md §3.196: aritmética de Timestamp ----
+
+    #[test]
+    fn timestamp_arithmetic_adds_the_exact_number_of_milliseconds_per_unit() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc addMillis(t: Timestamp, n: Int64) -> Timestamp { t.addMillis(n) }
+                rpc addSeconds(t: Timestamp, n: Int) -> Timestamp { t.addSeconds(n) }
+                rpc addMinutes(t: Timestamp, n: Int) -> Timestamp { t.addMinutes(n) }
+                rpc addHours(t: Timestamp, n: Int) -> Timestamp { t.addHours(n) }
+                rpc addDays(t: Timestamp, n: Int) -> Timestamp { t.addDays(n) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let base = "2026-01-01T00:00:00.000Z";
+        assert_eq!(invoke_rpc(&program, "S", "addMillis", &json!({"t": base, "n": "500"}), &db).unwrap(), json!("2026-01-01T00:00:00.500Z"));
+        assert_eq!(invoke_rpc(&program, "S", "addSeconds", &json!({"t": base, "n": 30}), &db).unwrap(), json!("2026-01-01T00:00:30.000Z"));
+        assert_eq!(invoke_rpc(&program, "S", "addMinutes", &json!({"t": base, "n": 5}), &db).unwrap(), json!("2026-01-01T00:05:00.000Z"));
+        assert_eq!(invoke_rpc(&program, "S", "addHours", &json!({"t": base, "n": 2}), &db).unwrap(), json!("2026-01-01T02:00:00.000Z"));
+        assert_eq!(invoke_rpc(&program, "S", "addDays", &json!({"t": base, "n": 1}), &db).unwrap(), json!("2026-01-02T00:00:00.000Z"));
+    }
+
+    #[test]
+    fn timestamp_arithmetic_with_a_negative_n_subtracts() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc addMinutes(t: Timestamp, n: Int) -> Timestamp { t.addMinutes(n) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "S", "addMinutes", &json!({"t": "2026-01-01T00:05:00.000Z", "n": -5}), &db).unwrap();
+        assert_eq!(result, json!("2026-01-01T00:00:00.000Z"), "n negativo resta -- sin un método .subtract* separado");
+    }
+
+    /// Caso real reportado por un adoptador en producción (MyFinance):
+    /// expiración de 5 minutos para un código OTP de 2FA, hoy imposible sin
+    /// esto -- terminaban apoyándose solo en "de un solo uso".
+    #[test]
+    fn timestamp_arithmetic_solves_the_real_otp_expiry_use_case() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc stillValid(issuedAt: Timestamp, checkedAt: Timestamp) -> Bool {
+                    checkedAt < issuedAt.addMinutes(5)
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let issued = "2026-01-01T00:00:00.000Z";
+        let within = invoke_rpc(&program, "S", "stillValid", &json!({"issuedAt": issued, "checkedAt": "2026-01-01T00:04:59.999Z"}), &db).unwrap();
+        assert_eq!(within, json!(true), "4m59.999s después sigue vigente");
+        let expired = invoke_rpc(&program, "S", "stillValid", &json!({"issuedAt": issued, "checkedAt": "2026-01-01T00:05:00.001Z"}), &db).unwrap();
+        assert_eq!(expired, json!(false), "5m0.001s después ya venció");
+    }
+
+    #[test]
+    fn timestamp_arithmetic_reports_a_clean_overflow_error_not_a_panic() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc addDays(t: Timestamp, n: Int) -> Timestamp { t.addDays(n) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "S", "addDays", &json!({"t": "2026-01-01T00:00:00.000Z", "n": i64::MAX}), &db)
+            .expect_err("un n gigante tiene que desbordar limpio, no panickear");
+        assert!(e.message.contains("desborde"), "{e}");
     }
 
     #[test]

@@ -1471,10 +1471,19 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
         // GRAMMAR.md §3.184: sin `.toInt()` -- ver la nota en runtime/mod.rs
         // sobre por qué (perdería la parte fraccionaria en silencio).
         Type::Decimal => Some(vec![method("toFloat()", "Convert this Decimal to Float (lossy for extreme magnitudes)")]),
-        // Lista vacía EXPLÍCITA, no `None` -- v0 no tiene ningún método
-        // sobre Timestamp (GRAMMAR.md §3.31); caer al fallback genérico
-        // ofrecería métodos de otros tipos que acá no aplican.
-        Type::Timestamp => Some(vec![]),
+        // GRAMMAR.md §3.31/§3.196 -- lista ya estaba desactualizada ANTES de
+        // sumar la aritmética (toMillis/diffMillis/toIsoString existían y no
+        // aparecían acá); corregida a los 8 métodos reales.
+        Type::Timestamp => Some(vec![
+            method("toMillis()", "Convert this Timestamp to milliseconds since epoch"),
+            method("diffMillis(other)", "Difference in milliseconds between two Timestamps"),
+            method("toIsoString()", "Convert this Timestamp to an ISO-8601 string"),
+            method("addMillis(n)", "Add n milliseconds to this Timestamp"),
+            method("addSeconds(n)", "Add n seconds to this Timestamp"),
+            method("addMinutes(n)", "Add n minutes to this Timestamp"),
+            method("addHours(n)", "Add n hours to this Timestamp"),
+            method("addDays(n)", "Add n days to this Timestamp"),
+        ]),
         Type::Float => Some(vec![
             method("toInt()", "Convert this Float to Int"),
             method("toDecimal()", "Convert this Float to Decimal (rounds to 4 decimals)"),
@@ -1809,14 +1818,19 @@ mod tests {
     }
 
     #[test]
-    fn test_completion_after_dot_on_a_timestamp_receiver_offers_nothing() {
-        // v0 no tiene ningún método sobre Timestamp (GRAMMAR.md §3.31) --
-        // lista vacía tailoreada, no el fallback genérico con métodos de
-        // otros tipos que acá no aplican.
+    fn test_completion_after_dot_on_a_timestamp_receiver_offers_its_real_methods() {
+        // GRAMMAR.md §3.31/§3.196 -- lista tailoreada a los métodos reales de
+        // Timestamp (toMillis/diffMillis/toIsoString/addMillis/addSeconds/
+        // addMinutes/addHours/addDays), no el fallback genérico con métodos
+        // de otros tipos que acá no aplican. Esta lista estaba vacía en el
+        // código antes de esta ronda, desactualizada desde que toMillis/
+        // diffMillis/toIsoString se agregaron sin corregirla.
         let code = "fn f(t: Timestamp) -> Int { t. }\n";
         let col = code.find("t.").unwrap() + 2;
         let completions = get_completions(code, 0, col, None);
-        assert!(completions.is_empty(), "{completions:?}");
+        assert!(completions.iter().any(|c| c["label"] == "toMillis()"), "{completions:?}");
+        assert!(completions.iter().any(|c| c["label"] == "addMinutes(n)"), "{completions:?}");
+        assert!(!completions.iter().any(|c| c["label"] == "map(fn)"), "un Timestamp no tiene métodos de lista: {completions:?}");
     }
 
     #[test]
