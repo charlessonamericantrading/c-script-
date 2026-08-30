@@ -659,6 +659,14 @@ service Secured {
   rpc myId() -> Int? {
     auth.currentUserId()
   }
+
+  rpc myClaim(name: String) -> String? {
+    auth.claim(name)
+  }
+
+  rpc tokenVersionMatches(expected: Int) -> Bool {
+    auth.claim("tokenVersion") == expected.toString()
+  }
 }
 "#;
 
@@ -728,6 +736,37 @@ fn auth_current_role_and_current_user_id_read_jwt_claims_over_a_real_subprocess(
     let (status, body) = server.post("/Secured/myId", &json!({}), Some(&jwt));
     assert_eq!(status, 200, "body: {body:?}");
     assert_eq!(body, json!(123), "'sub' como string de dígitos tiene que parsear a Int");
+
+    server.shutdown();
+}
+
+/// GRAMMAR.md §3.197 -- el caso real motivador (MyFinance): revocar un JWT
+/// tras un reset de contraseña comparando un claim `tokenVersion` contra el
+/// valor real en DB, algo imposible antes de esta ronda.
+#[test]
+fn auth_claim_reads_an_arbitrary_named_claim_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program_and_args("jwt-claim", JWT_PROGRAM, &["--jwt-secret", "shh"]);
+
+    let jwt = make_jwt("shh", "HS256", r#"{"role":"Admin","sub":1,"plan":"pro","tokenVersion":3}"#);
+
+    let (status, body) = server.post("/Secured/myClaim", &json!({"name": "plan"}), Some(&jwt));
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body, "pro");
+
+    // El caso real: comparar el claim numérico contra Int.toString() sin
+    // que un "3.0" vs "3" rompa la comparación en silencio.
+    let (status, body) = server.post("/Secured/tokenVersionMatches", &json!({"expected": 3}), Some(&jwt));
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body, json!(true));
+
+    let (status, body) = server.post("/Secured/tokenVersionMatches", &json!({"expected": 4}), Some(&jwt));
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body, json!(false), "tokenVersion revocado (valor real en DB distinto) tiene que dar false");
+
+    // Un claim que no existe en el token da null, no un error.
+    let (status, body) = server.post("/Secured/myClaim", &json!({"name": "noExiste"}), Some(&jwt));
+    assert_eq!(status, 200, "body: {body:?}");
+    assert_eq!(body, serde_json::Value::Null);
 
     server.shutdown();
 }

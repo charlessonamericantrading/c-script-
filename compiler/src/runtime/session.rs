@@ -317,6 +317,46 @@ impl SessionStore {
             _ => None,
         }
     }
+
+    /// GRAMMAR.md §3.197: accessor genérico de un claim JWT por NOMBRE --
+    /// mismo mecanismo exacto que `role_for`/`user_id_for` (mismo mapa
+    /// COMPLETO que `verify_jwt` ya devuelve, nada se re-parsea), pero el
+    /// nombre del claim llega en cada llamada en vez de fijarse una vez al
+    /// arrancar (a diferencia de `--jwt-role-claim`/`--jwt-user-id-claim`,
+    /// que fijan un nombre para siempre en un slot de significado fijo).
+    ///
+    /// Una sesión INTERNA (creada por este mismo programa) nunca tiene un
+    /// mapa de claims genérico -- solo `enum_name`/`variant_name`/`user_id`
+    /// -- así que da `None` explícitamente para un token interno, reflejando
+    /// a propósito el mismo criterio que `role_for`/`user_id_for` ya
+    /// aplican, en vez de asumir que nunca se va a llamar así.
+    ///
+    /// Conversión a `String` consciente del caso real (revocar un token
+    /// comparando un claim `tokenVersion` contra el valor real en DB), no
+    /// una repr JSON genérica: un `Number` sin parte fraccionaria se
+    /// imprime como `"3"`, no `"3.0"` -- así `auth.claim("tokenVersion") ==
+    /// user.tokenVersion.toString()` compara igual sin importar si el
+    /// emisor del JWT serializó el entero como float. `Object`/`Array`/
+    /// `Null`/claim ausente -> `None`, sin una forma plana sensata.
+    pub fn claim_for(&self, token: &str, name: &str) -> Option<String> {
+        {
+            let mut sessions = self.sessions.lock();
+            if let Some(entry) = sessions.get(token) {
+                if entry.expires_at.is_some_and(|exp| Instant::now() >= exp) {
+                    sessions.remove(token);
+                }
+                return None;
+            }
+        }
+        let jwt = self.jwt.as_ref()?;
+        let claims = verify_jwt(token, &jwt.secret)?;
+        match claims.get(name)? {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.as_i64().map(|i| i.to_string()).unwrap_or_else(|| n.to_string())),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            _ => None,
+        }
+    }
 }
 
 impl Default for SessionStore {
@@ -618,6 +658,66 @@ mod tests {
         // test lo deja explícito igual.
         assert_eq!(store.role_for(&token), Some(("Role".to_string(), "Agent".to_string())));
         assert_eq!(store.user_id_for(&token), Some(99));
+    }
+
+    // ---- GRAMMAR.md §3.197: auth.claim(name) ----
+
+    #[test]
+    fn claim_for_reads_a_string_claim() {
+        let store = SessionStore::new().with_jwt("shh".to_string(), "role".to_string(), "sub".to_string());
+        let jwt = make_jwt("shh", "HS256", r#"{"role":"Admin","sub":1,"plan":"pro"}"#);
+        assert_eq!(store.claim_for(&jwt, "plan"), Some("pro".to_string()));
+    }
+
+    /// El caso real motivador (MyFinance): `tokenVersion` es un número
+    /// entero en el JWT -- tiene que imprimirse como `"3"`, NUNCA `"3.0"`,
+    /// para que `auth.claim("tokenVersion") == user.tokenVersion.toString()`
+    /// compare igual sin importar cómo el emisor serializó el entero.
+    #[test]
+    fn claim_for_stringifies_an_integer_valued_number_without_a_trailing_decimal() {
+        let store = SessionStore::new().with_jwt("shh".to_string(), "role".to_string(), "sub".to_string());
+        let jwt = make_jwt("shh", "HS256", r#"{"role":"Admin","sub":1,"tokenVersion":3}"#);
+        assert_eq!(store.claim_for(&jwt, "tokenVersion"), Some("3".to_string()), "no '3.0'");
+    }
+
+    #[test]
+    fn claim_for_stringifies_a_genuinely_fractional_number() {
+        let store = SessionStore::new().with_jwt("shh".to_string(), "role".to_string(), "sub".to_string());
+        let jwt = make_jwt("shh", "HS256", r#"{"role":"Admin","sub":1,"score":3.5}"#);
+        assert_eq!(store.claim_for(&jwt, "score"), Some("3.5".to_string()));
+    }
+
+    #[test]
+    fn claim_for_stringifies_a_bool_claim() {
+        let store = SessionStore::new().with_jwt("shh".to_string(), "role".to_string(), "sub".to_string());
+        let jwt = make_jwt("shh", "HS256", r#"{"role":"Admin","sub":1,"verified":true}"#);
+        assert_eq!(store.claim_for(&jwt, "verified"), Some("true".to_string()));
+    }
+
+    #[test]
+    fn claim_for_gives_none_for_an_absent_claim_or_a_non_scalar_value() {
+        let store = SessionStore::new().with_jwt("shh".to_string(), "role".to_string(), "sub".to_string());
+        let jwt = make_jwt("shh", "HS256", r#"{"role":"Admin","sub":1,"meta":{"a":1},"tags":[1,2]}"#);
+        assert_eq!(store.claim_for(&jwt, "noExiste"), None);
+        assert_eq!(store.claim_for(&jwt, "meta"), None, "un objeto no tiene una forma plana sensata");
+        assert_eq!(store.claim_for(&jwt, "tags"), None, "un array tampoco");
+    }
+
+    #[test]
+    fn claim_for_gives_none_for_an_internal_session_token() {
+        // Una sesión interna nunca tiene un mapa de claims genérico -- solo
+        // enum_name/variant_name/user_id -- reflejado explícitamente, no
+        // asumido.
+        let store = SessionStore::new().with_jwt("shh".to_string(), "role".to_string(), "sub".to_string());
+        let token = store.create_with_user_id("Role".to_string(), "Agent".to_string(), Some(99));
+        assert_eq!(store.claim_for(&token, "anything"), None);
+    }
+
+    #[test]
+    fn claim_for_gives_none_without_jwt_configured() {
+        let store = SessionStore::new();
+        let jwt = make_jwt("cualquier-cosa", "HS256", r#"{"role":"Admin","sub":1,"plan":"pro"}"#);
+        assert_eq!(store.claim_for(&jwt, "plan"), None);
     }
 }
 

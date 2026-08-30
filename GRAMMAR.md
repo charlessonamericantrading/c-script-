@@ -218,6 +218,7 @@
   - [3.194 `crypto.awsS3PresignedUploadUrl(...)`: URL firmada para SUBIR a S3 — RESUELTO, cierra la mitad que §3.110 había dejado abierta](#3194-cryptoawss3presigneduploadurl-url-firmada-para-subir-a-s3--resuelto-cierra-la-mitad-que-3110-había-dejado-abierta)
   - [3.195 Bug crítico: `Decimal == Decimal` siempre daba `false` en runtime — RESUELTO](#3195-bug-crítico-decimal--decimal-siempre-daba-false-en-runtime--resuelto)
   - [3.196 Aritmética de `Timestamp`: `.addMillis()`/`.addSeconds()`/`.addMinutes()`/`.addHours()`/`.addDays()` — RESUELTO](#3196-aritmética-de-timestamp-addmillisaddsecondsaddminutesaddhoursadddays--resuelto)
+  - [3.197 `auth.claim(name: String) -> String?` — RESUELTO](#3197-authclaimname-string---string--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -7215,6 +7216,27 @@ rpc verifyOtp(userId: Int, code: String) -> Bool {
 **Alcance deliberadamente acotado, mismo criterio de siempre -- resolver el caso evidenciado, no la generalización hipotética**: sin constructor desde milisegundos crudos, sin forma de descomponer un `Timestamp` existente de vuelta a partes de calendario (año/mes/día/hora/minuto/segundo) -- la función privada que ya hace esa descomposición internamente (usada solo por el formateo ISO-8601) no se expone todavía, sin evidencia real de demanda de esa mitad. Sin un tipo `Duration` -- `n` es siempre un entero plano en la unidad del método, no un valor de primera clase que se pueda guardar/pasar entre rpcs.
 
 **Verificado**: tests de checker (aridad/tipos de los 5 métodos) + tests de runtime (`invoke_rpc`) confirmando suma/resta exacta en milisegundos para cada unidad, `n` negativo restando correctamente, y un `n` lo bastante grande como para desbordar dando `RuntimeError` limpio en vez de panic. Suite completa sin regresiones.
+
+### 3.197 `auth.claim(name: String) -> String?` — RESUELTO
+
+PLAN.md §9.14 ítem 3 -- hasta esta ronda, `--jwt-role-claim`/`--jwt-user-id-claim` (§3.64) eran los ÚNICOS dos claims de un JWT accesibles desde `.link`, cada uno fijado a un slot de significado fijo UNA vez al arrancar. Un adoptador real en producción (MyFinance) reportó un caso de seguridad genuino, no una molestia de ergonomía: su JWT real lleva un claim `tokenVersion` (para invalidar sesiones tras un reset de contraseña), pero ningún rpc podía leerlo -- un token técnicamente revocado seguía siendo válido hasta su expiración natural (15 minutos en su caso).
+
+```
+service Cuenta {
+  @authenticated
+  rpc revisarSesion(tokenVersionReal: Int) -> Bool {
+    auth.claim("tokenVersion") == tokenVersionReal.toString()
+  }
+}
+```
+
+**`auth.claim(name: String) -> String?`** lee CUALQUIER claim por nombre, pasado como argumento en cada llamada -- a diferencia de `--jwt-role-claim`/`--jwt-user-id-claim`, no necesita ningún flag de CLI nuevo. `verify_jwt` (el verificador HS256 interno) ya decodifica el mapa COMPLETO de claims para leer `role`/`sub`; `auth.claim` simplemente lee un campo más del mismo mapa ya decodificado, sin volver a parsear nada.
+
+**Conversión a `String` consciente del caso real, no una representación JSON genérica.** El valor crudo de un claim puede ser string, number o bool. Un `Number` SIN parte fraccionaria se imprime como `"3"`, nunca `"3.0"` -- así `auth.claim("tokenVersion") == tokenVersionReal.toString()` compara igual sin importar si el emisor del JWT serializó el entero como float (un mismatch silencioso ahí sería exactamente el tipo de bug de revocación que este método existe para cerrar). Un `Number` con parte fraccionaria real se imprime tal cual (`"3.5"`). Un `Bool` se imprime `"true"`/`"false"`. Un claim ausente, o de forma `Object`/`Array`/`null` (sin una representación plana con sentido), da `null` -- mismo criterio de indistinguibilidad que `currentRole()`/`currentUserId()` ya usan entre "sin sesión"/"token vencido"/"claim inexistente".
+
+**Una sesión INTERNA (creada por `createSession`/`createSessionWithId`) nunca tiene un mapa de claims genérico -- da `null` explícitamente, no un error.** Solo un JWT externo verdadero tiene claims arbitrarios; una sesión de este mismo programa solo guarda `enum_name`/`variant_name`/`user_id`.
+
+**Verificado**: 3 tests de checker (aridad/tipo del argumento, retorno `String?`) + 7 tests unitarios en `session.rs` (string/number-entero-sin-decimal/number-fraccionario/bool/claim ausente/valor no-escalar/sesión interna/sin JWT configurado) + 1 test end-to-end contra un `linkc serve` real (`server_http.rs`) reproduciendo el caso motivador exacto: un JWT con `tokenVersion: 3`, comparado contra `3.toString()` (`true`) y contra `4.toString()` (`false`, el caso de un token ya revocado). Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

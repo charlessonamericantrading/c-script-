@@ -4915,6 +4915,18 @@ impl Checker {
                 self.expect_no_args(args, "currentUserId")?;
                 Ok(Type::Optional(Box::new(Type::Int)))
             }
+            // GRAMMAR.md §3.197: accessor genérico de un claim JWT por
+            // nombre -- a diferencia de currentRole/currentUserId (slots
+            // fijos configurados UNA vez al arrancar via --jwt-role-claim/
+            // --jwt-user-id-claim), el nombre del claim es un argumento
+            // normal en cada llamada, sin flag de CLI nuevo.
+            "claim" => {
+                let [name] = args else {
+                    return Err(err("'claim' toma exactamente 1 argumento (name: String)"));
+                };
+                self.check_expr(name, &Type::String, env)?;
+                Ok(Type::Optional(Box::new(Type::String)))
+            }
             // GRAMMAR.md §3.152: bloqueo de cuenta configurable -- tres
             // primitivas chicas en vez de un mecanismo mágico, mismo
             // criterio que el resto del lenguaje (§9.1 del PLAN): quien
@@ -4945,7 +4957,7 @@ impl Checker {
                 Ok(Type::Void)
             }
             other => Err(err(format!(
-                "'{other}' no es un método conocido de 'auth' (createSession/createSessionWithId/destroySession/destroyAllSessions/currentRole/currentUserId/recordFailedLogin/failedLoginCount/resetFailedLogins)"
+                "'{other}' no es un método conocido de 'auth' (createSession/createSessionWithId/destroySession/destroyAllSessions/currentRole/currentUserId/claim/recordFailedLogin/failedLoginCount/resetFailedLogins)"
             ))),
         }
     }
@@ -8654,6 +8666,35 @@ type T = { id: Int, s: Status }")
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("currentUserId"), "debería mencionar 'currentUserId': {msg}");
+    }
+
+    /// GRAMMAR.md §3.197 -- `auth.claim(name)` toma exactamente 1 argumento
+    /// String y devuelve `String?`, a diferencia de `currentRole`/
+    /// `currentUserId` (sin argumentos, slots fijos).
+    #[test]
+    fn auth_claim_types_as_optional_string_and_takes_exactly_one_string_argument() {
+        let src = r#"
+            service S {
+                rpc tokenVersion() -> String? { auth.claim("tokenVersion") }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        let no_args = r#"
+            service S {
+                rpc bad() -> String? { auth.claim() }
+            }
+        "#;
+        let result = check_source(no_args);
+        assert!(result.is_err());
+        assert!(format!("{:?}", result.unwrap_err()).contains("claim"), "debería mencionar 'claim'");
+
+        let wrong_type = r#"
+            service S {
+                rpc bad() -> String? { auth.claim(42) }
+            }
+        "#;
+        assert!(check_source(wrong_type).is_err());
     }
 
     #[test]

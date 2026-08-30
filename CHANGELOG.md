@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.153.0] - 2026-08-31
+
+### ✨ Nuevo
+**`auth.claim(name: String) -> String?`** (PLAN.md §9.14 ítem 3) -- accessor genérico de un claim JWT por nombre. Hasta ahora solo `--jwt-role-claim`/`--jwt-user-id-claim` (slots fijos configurados una vez al arrancar) eran accesibles. `auth.claim` lee CUALQUIER claim, nombrado en cada llamada, del mismo mapa de claims que `verify_jwt` ya decodifica completo -- sin flag de CLI nuevo. Cierra un riesgo de seguridad real reportado por un adoptador en producción (MyFinance): revocar un JWT tras un reset de contraseña comparando un claim `tokenVersion` contra el valor real en DB, antes imposible (un token revocado seguía válido hasta su expiración natural).
+
+Conversión a `String` consciente del caso real: un `Number` entero se imprime `"3"`, nunca `"3.0"` -- así `auth.claim("tokenVersion") == real.toString()` compara igual sin importar cómo el emisor serializó el claim.
+
+**Verificado**: tests de checker + 7 tests unitarios en `session.rs` (string/number-entero/number-fraccionario/bool/claim ausente/no-escalar/sesión interna/sin JWT) + 1 test end-to-end contra un `linkc serve` real reproduciendo el caso de revocación exacto. Suite completa sin regresiones. Ver GRAMMAR.md §3.197.
+
 ## [1.152.0] - 2026-08-31
 
 ### ✨ Nuevo

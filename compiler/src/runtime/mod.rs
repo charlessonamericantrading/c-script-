@@ -3228,6 +3228,18 @@ fn call_method(
                 let user_id = current_token.and_then(|tok| sessions.user_id_for(tok));
                 Ok(user_id.map(Value::Int).unwrap_or(Value::Null))
             }
+            // GRAMMAR.md §3.197: accessor genérico de un claim JWT --
+            // mismo criterio de indistinguibilidad que currentRole/
+            // currentUserId (`null` para "sin sesión"/"token vencido"/
+            // "claim ausente" por igual, nunca revela cuál de los tres).
+            "claim" => {
+                let name = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("auth.claim requiere un argumento String (name)")),
+                };
+                let claim = current_token.and_then(|tok| sessions.claim_for(tok, name));
+                Ok(claim.map(Value::Str).unwrap_or(Value::Null))
+            }
             // GRAMMAR.md §3.152: bloqueo de cuenta configurable -- tres
             // primitivas sobre `SessionStore` (mismo store que ya guarda
             // sesiones, un solo lugar en memoria de un solo proceso).
@@ -4555,6 +4567,7 @@ mod tests {
         let ten_b = parse_decimal("10.0000").unwrap();
         let eleven = parse_decimal("11.0000").unwrap();
         assert_eq!(Value::Decimal(ten_a), Value::Decimal(ten_b), "dos Decimal con el mismo valor escalado deben ser == en Rust también, no solo en el wire");
+        assert_ne!(Value::Decimal(ten_a), Value::Decimal(eleven), "valores escalados distintos siguen siendo != en Rust");
 
         let same = invoke_rpc(&program, "Money", "same", &json!({"a": "10.0000", "b": "10.0000"}), &db).unwrap();
         assert_eq!(same, json!(true), "10.0000 == 10.0000 tiene que dar true -- antes del fix daba false siempre");
