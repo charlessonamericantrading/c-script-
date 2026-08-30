@@ -123,6 +123,15 @@ fn to_pascal_case(table_name: &str) -> String {
     table_name.split(|c| c == '_' || c == '-').filter(|s| !s.is_empty()).map(capitalize).collect()
 }
 
+/// GRAMMAR.md §3.192: las tres consultas de este archivo (dos acá, una en
+/// `generate_link_from_postgres` más abajo) hardcodeaban `table_schema =
+/// 'public'` -- `linkc introspect` no podía ver NINGUNA tabla fuera de
+/// `public`, sin ningún error que lo explicara (la tabla simplemente no
+/// aparecía). `current_schemas(false)` (el `search_path` EFECTIVO de la
+/// sesión, función nativa de Postgres) reemplaza el literal fijo -- ahora
+/// introspecciona lo que la sesión REALMENTE ve, sea `public` (el default
+/// de casi cualquier conexión) o cualquier otro schema que la URL/rol
+/// haya configurado (`options=-c search_path=...`, GRAMMAR.md §3.193).
 fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableIntrospection, String> {
     let pk_rows = client
         .query(
@@ -130,7 +139,7 @@ fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableI
              FROM information_schema.table_constraints tc \
              JOIN information_schema.key_column_usage kcu \
                ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema \
-             WHERE tc.table_schema = 'public' AND tc.table_name = $1 AND tc.constraint_type = 'PRIMARY KEY'",
+             WHERE tc.table_schema = ANY(current_schemas(false)) AND tc.table_name = $1 AND tc.constraint_type = 'PRIMARY KEY'",
             &[&table],
         )
         .map_err(|e| format!("no se pudo leer la clave primaria de '{table}': {e}"))?;
@@ -140,7 +149,7 @@ fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableI
         .query(
             "SELECT column_name, data_type, is_nullable \
              FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = $1 \
+             WHERE table_schema = ANY(current_schemas(false)) AND table_name = $1 \
              ORDER BY ordinal_position",
             &[&table],
         )
@@ -221,7 +230,7 @@ pub fn generate_link_from_postgres(url: &str) -> Result<(String, Vec<String>), S
     let table_rows = client
         .query(
             "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+             WHERE table_schema = ANY(current_schemas(false)) AND table_type = 'BASE TABLE' \
              ORDER BY table_name",
             &[],
         )

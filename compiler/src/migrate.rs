@@ -130,7 +130,15 @@ pub fn dry_run_postgres(program: &Program, url: &str) -> Result<String, String> 
 }
 
 pub(crate) fn existing_columns(backend: &Backend, collection: &str) -> Result<HashSet<String>, String> {
-    let sql = format!("SELECT column_name FROM information_schema.columns WHERE table_name = {}", backend.placeholder(1));
+    // GRAMMAR.md §3.192: mismo fix de `table_schema` que las funciones
+    // equivalentes de `runtime/db.rs` -- sin esto, una tabla de OTRO schema
+    // con el mismo nombre podía leerse por error (`linkc migrate --dry-run`,
+    // `db export`, y el loop de `ADD COLUMN` de la auto-migración, los tres
+    // reusan esta función).
+    let sql = format!(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = {} AND table_schema = ANY(current_schemas(false))",
+        backend.placeholder(1)
+    );
     let rows = backend.query(&sql, &[Cell::Text(collection.to_string())], &[ColumnKind::Text])?;
     Ok(rows.into_iter().filter_map(|row| row.into_iter().next()).filter_map(|cell| if let Cell::Text(s) = cell { Some(s) } else { None }).collect())
 }

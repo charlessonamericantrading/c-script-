@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.148.0] - 2026-08-30
+
+### 🐛 Arreglado
+**`information_schema.*` hardcodeaba `'public'` (o no filtraba schema en absoluto)** -- encontrado investigando PLAN.md §9.3 ítem 4 (`--db-schema`), antes de diseñar la feature: 8 consultas reales en `runtime/db.rs`/`migrate.rs`/`introspect.rs`, 4 de las 8 sin NINGÚN filtro de schema. Un bug real, alcanzable hoy por cualquiera con un `search_path` propio configurado -- una tabla en cualquier schema que no fuera `public` era invisible para `--adopt-existing`/`linkc introspect`/`linkc migrate --dry-run`/`db export`, o (peor) dos tablas del mismo nombre en schemas distintos podían leerse cruzadas en silencio.
+
+- Fix: `table_schema = ANY(current_schemas(false))` en las 8 -- la función nativa de Postgres que da el `search_path` EFECTIVO de la sesión, la misma fuente que el propio motor usa para resolver un identificador sin calificar.
+- Sin cambio de comportamiento para el caso `public` de siempre (la inmensa mayoría de las conexiones).
+
+**Verificado**: 2 tests contra Postgres real -- `linkc introspect` ve una tabla en un schema no-`public` con el `search_path` correcto (y NO la ve sin él, control negativo); `--adopt-existing` adopta correctamente una tabla en un schema no-`public`. Suite completa sin regresiones. Ver GRAMMAR.md §3.192.
+
 ## [1.147.1] - 2026-08-30
 
 ### 🐛 Arreglado

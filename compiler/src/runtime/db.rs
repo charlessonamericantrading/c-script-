@@ -753,9 +753,22 @@ fn create_rate_limit_table_sql() -> String {
     )
 }
 
+/// GRAMMAR.md §3.192: `table_schema = ANY(current_schemas(false))` -- antes
+/// hardcodeaba `table_schema = 'public'`, así que una tabla en cualquier
+/// OTRO schema (visible por el `search_path` real de la sesión) se
+/// reportaba como inexistente aunque estuviera ahí -- bug latente real,
+/// independiente de `--db-schema`/§3.192, que ya podía morder a cualquiera
+/// con un `search_path` propio configurado del lado de Postgres (`options=`
+/// en la URL, o un rol con un `search_path` por default distinto de
+/// `public`). `current_schemas(false)` es la función nativa de Postgres que
+/// devuelve el `search_path` EFECTIVO de la sesión (`false` excluye
+/// schemas implícitos como `pg_catalog`) -- la misma fuente de verdad que
+/// Postgres mismo usa para resolver un identificador sin calificar, así
+/// que esta consulta ahora ve exactamente lo mismo que vería un
+/// `CREATE TABLE`/`SELECT` sin `"schema".` explícito contra la misma sesión.
 fn postgres_table_exists(backend: &Backend, table: &str) -> Result<bool, String> {
     let rows = backend.query(
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1",
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = ANY(current_schemas(false)) AND table_name = $1",
         &[Cell::Text(table.to_string())],
         &[ColumnKind::Int],
     )?;
@@ -848,8 +861,14 @@ fn check_schema_for_adoption(connection: &Connection, collection: &str, columns:
 /// variante `Row::get` sin chequear que usaba justo el fetch del id nuevo).
 /// "id" es el único caso donde ese error limpio no alcanzaba a tiempo.
 pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str, expected: IdKind) -> Result<(), String> {
+    // GRAMMAR.md §3.192: sin NINGÚN filtro de `table_schema` antes de esta
+    // ronda -- con más de un schema visible en el `search_path` de la
+    // sesión (o dos tablas del mismo nombre en schemas distintos), esto
+    // podía leer la columna "id" de la tabla EQUIVOCADA en silencio. Mismo
+    // fix que `postgres_table_exists`: filtrar por el `search_path`
+    // EFECTIVO de la sesión, no una tabla-de-cualquier-schema-que-matchee.
     let sql = format!(
-        "SELECT data_type FROM information_schema.columns WHERE table_name = {} AND column_name = 'id'",
+        "SELECT data_type FROM information_schema.columns WHERE table_name = {} AND column_name = 'id' AND table_schema = ANY(current_schemas(false))",
         backend.placeholder(1)
     );
     let rows = backend
@@ -928,7 +947,13 @@ fn warn_if_table_looks_unrelated(backend: &Backend, collection: &str, columns: &
     if columns.is_empty() {
         return;
     }
-    let sql = format!("SELECT column_name FROM information_schema.columns WHERE table_name = {}", backend.placeholder(1));
+    // GRAMMAR.md §3.192: mismo fix de `table_schema` que
+    // `validate_existing_id_column` -- sin esto, una tabla de OTRO schema
+    // con el mismo nombre podía compararse acá por error.
+    let sql = format!(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = {} AND table_schema = ANY(current_schemas(false))",
+        backend.placeholder(1)
+    );
     let Ok(rows) = backend.query(&sql, &[Cell::Text(collection.to_string())], &[ColumnKind::Text]) else {
         // Best-effort: un fallo acá nunca debe impedir que el connect siga
         // su curso normal -- el resto del código ya maneja errores reales
@@ -994,7 +1019,12 @@ fn warn_if_table_looks_unrelated(backend: &Backend, collection: &str, columns: &
 /// descubre en la primera lectura/escritura, con el error normal de
 /// `store.rs`, no acá -- límite honesto, documentado en GRAMMAR.md §3.67).
 fn validate_columns_exist_for_adoption(backend: &Backend, collection: &str, columns: &[ColumnPlan]) -> Result<(), String> {
-    let sql = format!("SELECT column_name FROM information_schema.columns WHERE table_name = {}", backend.placeholder(1));
+    // GRAMMAR.md §3.192: mismo fix de `table_schema` que
+    // `validate_existing_id_column`/`warn_if_table_looks_unrelated`.
+    let sql = format!(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = {} AND table_schema = ANY(current_schemas(false))",
+        backend.placeholder(1)
+    );
     let rows = backend
         .query(&sql, &[Cell::Text(collection.to_string())], &[ColumnKind::Text])
         .map_err(|e| format!("no se pudo verificar el esquema de '{collection}' en PostgreSQL: {e}"))?;

@@ -4594,3 +4594,82 @@ fn serve_refuses_to_start_against_postgres_too_without_a_key_when_the_program_de
     let stderr = std::fs::read_to_string(&err_path).unwrap_or_default();
     assert!(stderr.contains("@encrypted") && stderr.contains("--encryption-key"), "{stderr}");
 }
+
+// ---- fix real: `information_schema` respeta el `search_path` de la sesión, no un `'public'` fijo (GRAMMAR.md §3.192) ----
+
+#[test]
+fn linkc_introspect_sees_a_table_in_a_non_public_schema_when_search_path_names_it() {
+    // Antes de esta ronda, `introspect_table`/`generate_link_from_postgres`
+    // (introspect.rs) hardcodeaban `table_schema = 'public'` -- una tabla en
+    // CUALQUIER otro schema era invisible para `linkc introspect`, sin
+    // importar el `search_path` real de la conexión. `options=-c
+    // search_path%3D...` en la URL es el mecanismo NATIVO de Postgres (sin
+    // ningún código propio de este proyecto) -- confirmado leyendo la
+    // fuente de `tokio_postgres::Config`.
+    const SCHEMA: &str = "linkc_test_schema_introspect";
+    const TABLE: &str = "widgets";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como admin");
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA}\" CASCADE")).ok();
+    admin.batch_execute(&format!("CREATE SCHEMA \"{SCHEMA}\"")).expect("crear el schema de test");
+    admin
+        .batch_execute(&format!("CREATE TABLE \"{SCHEMA}\".\"{TABLE}\" (\"id\" BIGSERIAL PRIMARY KEY, \"name\" TEXT NOT NULL)"))
+        .expect("crear una tabla en el schema no-public");
+
+    let scoped_url = with_query_param(&url, &format!("options=-c%20search_path%3D{SCHEMA}"));
+    let output = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("introspect").arg(&scoped_url).output().expect("ejecutar linkc introspect");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let generated = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(generated.contains("type Widgets"), "debe ver la tabla del schema no-public: {generated}");
+
+    // Control negativo: SIN el search_path apuntando a ese schema, la misma
+    // tabla es invisible (confirma que la prueba de arriba de verdad
+    // depende del search_path, no de algún otro efecto).
+    let output_default =
+        Command::new(env!("CARGO_BIN_EXE_linkc")).arg("introspect").arg(&url).output().expect("ejecutar linkc introspect");
+    let generated_default = String::from_utf8_lossy(&output_default.stdout).to_string();
+    assert!(!generated_default.contains("type Widgets"), "sin el search_path correcto, la tabla NO debería aparecer: {generated_default}");
+
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA}\" CASCADE")).ok();
+}
+
+#[test]
+fn adopt_existing_finds_a_table_in_a_non_public_schema_when_search_path_names_it() {
+    // Mismo fix, del lado de `--adopt-existing` (`postgres_table_exists`/
+    // `validate_existing_id_column`/`validate_columns_exist_for_adoption`,
+    // runtime/db.rs) -- sin él, `linkc serve --adopt-existing` reportaba
+    // "la colección no existe" para una tabla que SÍ existe, con el
+    // search_path correcto, en otro schema.
+    const SCHEMA: &str = "linkc_test_schema_adopt";
+    const COLLECTION: &str = "adopted_widgets";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como admin");
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA}\" CASCADE")).ok();
+    admin.batch_execute(&format!("CREATE SCHEMA \"{SCHEMA}\"")).expect("crear el schema de test");
+    admin
+        .batch_execute(&format!(
+            "CREATE TABLE \"{SCHEMA}\".\"{COLLECTION}\" (\"id\" BIGSERIAL PRIMARY KEY, \"name\" TEXT NOT NULL)"
+        ))
+        .expect("crear la tabla a adoptar en el schema no-public");
+
+    let temp = TempDir::new("adopt-existing-non-public-schema");
+    let src = temp.write("app.link", &format!("type Item = {{ id: Int, name: String }}\ndb {{ {COLLECTION}: Item[] }}"));
+
+    let scoped_url = with_query_param(&url, &format!("options=-c%20search_path%3D{SCHEMA}"));
+    let server = Serve::start_with_args(&src, &scoped_url, &["--adopt-existing"]);
+    let (status, body) = server.health();
+    assert_eq!(status, 200, "el server debe arrancar limpio, adoptando la tabla del schema no-public: {body:?}");
+    drop(server);
+
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA}\" CASCADE")).ok();
+}
