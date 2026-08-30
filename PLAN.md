@@ -646,6 +646,19 @@ Demostrado en `examples/taskboard/frontend/src/App.tsx`: `createTask` ahora pasa
 
 Ninguno atacado todavía esta ronda -- quedan documentados con evidencia real para priorizar, siguiendo el mismo criterio del resto de esta sección (resolver el caso evidenciado cuando se ataque, no antes).
 
+**Ataque planeado (31/08/2026)**: los 4 ítems de arriba, más un bug crítico no relacionado (`Decimal == Decimal` siempre `false` en runtime, encontrado durante la validación de diseño) van en un plan de 5 piezas -- ver commits siguientes para el detalle de cada una.
+
+**Segundo reporte de MyFinance (31/08/2026), tras una auditoría explícita pedida por el usuario -- "¿qué le falta a Link para reemplazar Node/Express del todo, no solo un subconjunto?"**. 2 hallazgos genuinamente nuevos, de tamaño mucho mayor a los 4 de arriba -- quedan documentados para una ronda propia futura, deliberadamente NO sumados al ataque en curso de los 4 ítems de arriba:
+
+5. **Sin generación de PDF/Excel real**: MYF genera facturas/presupuestos en PDF real (`pdfkit`) y hace parsing/generación de Excel (`exceljs`) para exports e importación de extractos bancarios. c-script no tiene ningún primitivo para generar bytes de PDF/XLSX -- solo puede adjuntar un blob YA generado (base64) a un email. Sin esto, facturación con PDF real no puede migrar nunca. Alcance grande: necesitaría sumar una dependencia de generación de documentos (excepción nueva a "cero dependencias"), diseño propio de API (¿qué subconjunto de PDF/XLSX cubrir?), decisión de alcance previa antes de atacar -- no es una ronda autocontenida como las 4 de arriba.
+6. **Sin protocolo MCP real (sesión + streaming bidireccional)**: MYF expone un servidor MCP real para claude.ai (`@modelcontextprotocol/sdk`, `StreamableHTTPServerTransport`, `mcp-session-id`, framing JSON-RPC `tools/list`/`tools/call`, OAuth2). El mecanismo de `stream` de c-script hoy es SSE unidireccional (`subscribe()`) -- sin concepto de sesión ni de streaming bidireccional. Portar esto de verdad necesita más que RPCs request/response. Alcance grande, cambio real al modelo de ejecución (mismo tipo de ítem que PLAN.md §9.4 ítem 1, "hooks de middleware", que se dejó explícitamente abierto por el mismo motivo) -- necesita su propio discovery antes de diseñar nada.
+
+**Confirmado como YA cubierto por el plan en curso, no un ítem nuevo**: el reporte pide "sesión de admin revocable al instante, sin cookies" -- exactamente lo que la Pieza 2 del plan en curso (`auth.claim(name) -> String?`) resuelve: comparar `auth.claim("tokenVersion")` contra el valor real en DB en cada rpc da revocación tan rápida como la siguiente request de esa sesión, sin necesitar cookies. Nada nuevo que sumar acá.
+
+**Confirmado como ya trackeado, no nuevo**: SMTP asíncrono (PLAN.md §8.3.3) -- este reporte lo refuerza con evidencia real (8+ triggers de email en producción), no agrega alcance nuevo.
+
+**Explícitamente fuera de alcance de este proyecto, por decisión propia del reporte** (no se suma acá): SSR de React (decisión de arquitectura de MyFinance, no algo que un compilador de backend deba resolver), OCR de recibos (MyFinance ya tiene un camino 100% portable hoy, vía `http.postWithHeaders` a una API de visión -- adoptarlo es decisión suya), servir el bundle estático del frontend (ya vive detrás de Nginx, sin requisito nuevo).
+
 ---
 
 ### Sobre el nombre
