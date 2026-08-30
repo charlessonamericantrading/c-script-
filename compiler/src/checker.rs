@@ -842,7 +842,7 @@ impl Checker {
     /// `find`/`applyPatch`/`delete`/`increment`/`pageAfter` tipan su
     /// argumento/cursor de id contra ESTE tipo en vez de un `Type::Int`
     /// fijo, para aceptar los dos casos con el mismo código.
-    fn db_id_type(element_ty: &Type) -> Type {
+    pub(crate) fn db_id_type(element_ty: &Type) -> Type {
         let Type::Struct { fields, .. } = element_ty else {
             unreachable!("validate_db_element_type ya garantizó que element_ty sea un struct");
         };
@@ -2569,7 +2569,7 @@ impl Checker {
         self.check_cache_annotation(r, is_stream)?;
         self.check_cors_annotation(r)?;
         self.check_cron_annotation(r, is_stream)?;
-        let Some(Annotation::Requires { enum_name, variant_names }) = r.auth() else {
+        let Some(Annotation::Requires { enum_name, variant_names, ownership }) = r.auth() else {
             return Ok(());
         };
         let decl = self.enums.get(enum_name).ok_or_else(|| {
@@ -2585,6 +2585,70 @@ impl Checker {
                     r.name
                 )));
             }
+        }
+        if let Some(clause) = ownership {
+            if is_stream {
+                // `server.rs` deliberadamente SALTEA esta etapa para
+                // `stream` (una suscripción de larga vida re-chequeando
+                // dueño por evento es un problema distinto, límite honesto
+                // de GRAMMAR.md §3.190) -- aceptar la cláusula acá sería
+                // dejarla silenciosamente sin efecto en runtime, exactamente
+                // el tipo de bug de "parece protegido pero no lo está" que
+                // este proyecto rechaza en tiempo de compilación siempre
+                // que puede detectarlo.
+                return Err(err(format!(
+                    "@requires(..., ownerOf: {}) en '{}': la cláusula de dueño no se puede usar sobre un 'stream' -- solo sobre 'rpc' (GRAMMAR.md §3.190)",
+                    clause.collection, r.name
+                )));
+            }
+            self.check_requires_ownership_clause(r, clause)?;
+        }
+        Ok(())
+    }
+
+    /// `@requires(..., ownerOf: <colección>, id: <parámetro>, field: <campo>)`
+    /// (GRAMMAR.md §3.190) -- las tres validaciones que hacen que la
+    /// cláusula tenga sentido antes de que `server.rs` la use en runtime:
+    /// la colección existe, `id` nombra un parámetro real de ESTE rpc cuyo
+    /// tipo coincide con la PK de esa colección (mismo criterio que
+    /// `find`/`applyPatch` ya exigen vía `db_id_type`), y `field` es un
+    /// campo `Int` real de esa colección (tiene que calzar con
+    /// `auth.currentUserId(): Int?` para la comparación).
+    fn check_requires_ownership_clause(&self, r: &RpcDecl, clause: &OwnershipClause) -> Result<(), CheckError> {
+        let Some(element_ty) = self.db_collections().get(&clause.collection) else {
+            return Err(err(format!(
+                "@requires(..., ownerOf: {}) en '{}': '{}' no es una colección declarada en 'db'",
+                clause.collection, r.name, clause.collection
+            )));
+        };
+        let Some(param) = r.params.iter().find(|p| p.name == clause.id_param) else {
+            return Err(err(format!(
+                "@requires(..., id: {}) en '{}': '{}' no es un parámetro de este rpc",
+                clause.id_param, r.name, clause.id_param
+            )));
+        };
+        let param_ty = self.resolve_type(&param.ty)?;
+        let id_ty = Self::db_id_type(element_ty);
+        if param_ty != id_ty {
+            return Err(err(format!(
+                "@requires(..., id: {}) en '{}': '{}' tiene que ser {id_ty} (la PK de '{}'), es {param_ty}",
+                clause.id_param, r.name, clause.id_param, clause.collection
+            )));
+        }
+        let Type::Struct { fields, .. } = element_ty else {
+            unreachable!("db_collections() ya garantizó que element_ty sea un struct (validate_db_element_type)");
+        };
+        let Some(field) = fields.iter().find(|f| f.name == clause.field) else {
+            return Err(err(format!(
+                "@requires(..., field: {}) en '{}': '{}' no es un campo de '{}'",
+                clause.field, r.name, clause.field, clause.collection
+            )));
+        };
+        if field.ty != Type::Int {
+            return Err(err(format!(
+                "@requires(..., field: {}) en '{}': '{}' tiene que ser Int (se compara contra auth.currentUserId()), es {}",
+                clause.field, r.name, clause.field, field.ty
+            )));
         }
         Ok(())
     }
@@ -8082,6 +8146,173 @@ type T = { id: Int, s: Status }")
         // usar @requires sobre la variante unitaria (Admin).
         let src = r#"
             enum Role { Admin, Member, ServiceAccount { scopes: String[] } }
+            service S {
+                @requires(Role.Admin)
+                rpc deleteThing(id: Int) -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    // ---- @requires(..., ownerOf: ..., id: ..., field: ...) -- GRAMMAR.md §3.190 ----
+
+    #[test]
+    fn requires_ownership_clause_with_a_valid_collection_param_and_field_type_checks() {
+        let src = r#"
+            enum Role { Agent }
+            type Invoice = { id: Int, ownerId: Int, amount: Int }
+            db { invoices: Invoice[] }
+            service S {
+                @requires(Role.Agent, ownerOf: invoices, id: id, field: ownerId)
+                rpc getInvoice(id: Int) -> Invoice? { db.invoices.find(id) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn requires_ownership_clause_naming_an_undeclared_collection_is_rejected() {
+        let src = r#"
+            enum Role { Agent }
+            type Invoice = { id: Int, ownerId: Int }
+            db { invoices: Invoice[] }
+            service S {
+                @requires(Role.Agent, ownerOf: noExiste, id: id, field: ownerId)
+                rpc getInvoice(id: Int) -> Invoice? { db.invoices.find(id) }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("noExiste"), "debería señalar la colección inexistente: {msg}");
+    }
+
+    #[test]
+    fn requires_ownership_clause_naming_a_param_that_does_not_exist_is_rejected() {
+        let src = r#"
+            enum Role { Agent }
+            type Invoice = { id: Int, ownerId: Int }
+            db { invoices: Invoice[] }
+            service S {
+                @requires(Role.Agent, ownerOf: invoices, id: noExiste, field: ownerId)
+                rpc getInvoice(id: Int) -> Invoice? { db.invoices.find(id) }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("noExiste"), "debería señalar el parámetro inexistente: {msg}");
+    }
+
+    #[test]
+    fn requires_ownership_clause_where_the_id_param_type_does_not_match_the_collections_pk_is_rejected() {
+        let src = r#"
+            enum Role { Agent }
+            type Invoice = { id: Int, ownerId: Int }
+            db { invoices: Invoice[] }
+            service S {
+                @requires(Role.Agent, ownerOf: invoices, id: id, field: ownerId)
+                rpc getInvoice(id: String) -> Void { }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("id") && msg.contains("Int"), "debería señalar el tipo esperado (la PK, Int): {msg}");
+    }
+
+    #[test]
+    fn requires_ownership_clause_naming_a_field_that_does_not_exist_is_rejected() {
+        let src = r#"
+            enum Role { Agent }
+            type Invoice = { id: Int, ownerId: Int }
+            db { invoices: Invoice[] }
+            service S {
+                @requires(Role.Agent, ownerOf: invoices, id: id, field: noExiste)
+                rpc getInvoice(id: Int) -> Invoice? { db.invoices.find(id) }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("noExiste"), "debería señalar el campo inexistente: {msg}");
+    }
+
+    #[test]
+    fn requires_ownership_clause_field_that_is_not_int_is_rejected() {
+        let src = r#"
+            enum Role { Agent }
+            type Invoice = { id: Int, ownerId: String }
+            db { invoices: Invoice[] }
+            service S {
+                @requires(Role.Agent, ownerOf: invoices, id: id, field: ownerId)
+                rpc getInvoice(id: Int) -> Invoice? { db.invoices.find(id) }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("ownerId") && msg.contains("Int"), "debería señalar que el campo tiene que ser Int: {msg}");
+    }
+
+    #[test]
+    fn requires_ownership_clause_field_that_is_nullable_int_is_rejected() {
+        // `Int?` no calza con `auth.currentUserId(): Int?` de forma directa
+        // sin ambigüedad -- se rechaza en compile-time en vez de dejar un
+        // "siempre 403" silencioso en runtime cuando el campo da null.
+        let src = r#"
+            enum Role { Agent }
+            type Invoice = { id: Int, ownerId: Int? }
+            db { invoices: Invoice[] }
+            service S {
+                @requires(Role.Agent, ownerOf: invoices, id: id, field: ownerId)
+                rpc getInvoice(id: Int) -> Invoice? { db.invoices.find(id) }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("ownerId"), "debería señalar el campo: {msg}");
+    }
+
+    #[test]
+    fn requires_ownership_clause_works_with_a_uuid_pk_collection() {
+        let src = r#"
+            enum Role { Agent }
+            type Invoice = { id: Uuid, ownerId: Int }
+            db { invoices: Invoice[] }
+            service S {
+                @requires(Role.Agent, ownerOf: invoices, id: id, field: ownerId)
+                rpc getInvoice(id: Uuid) -> Invoice? { db.invoices.find(id) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn requires_ownership_clause_on_a_stream_is_rejected_since_server_rs_never_enforces_it_there() {
+        // `server.rs` saltea deliberadamente esta etapa para `stream`
+        // (límite honesto de GRAMMAR.md §3.190) -- aceptar la cláusula en
+        // el checker sería dejarla silenciosamente sin efecto en runtime.
+        let src = r#"
+            enum Role { Agent }
+            type Invoice = { id: Int, ownerId: Int }
+            db { invoices: Invoice[] }
+            service S {
+                @requires(Role.Agent, ownerOf: invoices, id: id, field: ownerId)
+                stream watchInvoice(id: Int) -> Invoice[] { [] }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("stream"), "debería señalar que la cláusula no aplica a stream: {msg}");
+    }
+
+    #[test]
+    fn requires_without_an_ownership_clause_still_type_checks_exactly_as_before() {
+        let src = r#"
+            enum Role { Admin }
             service S {
                 @requires(Role.Admin)
                 rpc deleteThing(id: Int) -> Void { }

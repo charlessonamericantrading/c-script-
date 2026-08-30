@@ -620,6 +620,19 @@ impl RpcDecl {
     }
 }
 
+/// `ownerOf: <colección>, id: <parámetro>, field: <campo>` dentro de un
+/// `@requires` (GRAMMAR.md §3.190) -- `id` nombra EXPLÍCITAMENTE cuál
+/// parámetro del propio rpc trae el id del recurso (nunca por posición,
+/// mismo criterio que `@rate_limit(..., key: <param>)`). `field` tiene que
+/// ser un campo `Int` de esa colección, comparado en runtime contra
+/// `auth.currentUserId()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OwnershipClause {
+    pub collection: String,
+    pub id_param: String,
+    pub field: String,
+}
+
 /// Anotaciones de un rpc/stream. Se permiten varias, pero no cualquier
 /// combinación: el checker rechaza dos de auth, dos de `@content_type`, dos
 /// de `@route`, y tanto `@content_type` como `@route` sobre un `stream`.
@@ -632,7 +645,13 @@ pub enum Annotation {
     /// `enum_name` (el parser ya lo exige -- mezclar dos enums distintos en
     /// un solo `@requires` no tendría significado: una sesión tiene un rol
     /// de UN enum, nunca de dos a la vez).
-    Requires { enum_name: String, variant_names: Vec<String> },
+    /// `ownership`, desde GRAMMAR.md §3.190: `@requires(Role.Agent, ownerOf:
+    /// invoices, id: id, field: ownerId)` -- una condición adicional, más
+    /// allá del rol, evaluada contra un recurso real guardado en `db`.
+    /// Aplica a TODOS los roles listados en el mismo `@requires`, sin
+    /// excepción por rol -- un rol que necesite bypasearla se modela como un
+    /// rpc SEPARADO con su propio `@requires` sin cláusula.
+    Requires { enum_name: String, variant_names: Vec<String>, ownership: Option<OwnershipClause> },
     /// `@content_type("text/html; charset=utf-8")` -- ver GRAMMAR.md §3.35.
     ContentType(String),
     /// `@route("/blog/:slug")` -- URL alternativa, amigable para crawlers,

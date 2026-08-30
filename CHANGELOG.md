@@ -3,6 +3,19 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.146.0] - 2026-08-30
+
+### ✨ Nuevo
+**`@requires(Role.X, ownerOf: <colección>, id: <parámetro>, field: <campo>)`** (PLAN.md §9.5 ítems 3 y 4, RBAC por recurso y ABAC -- resultaron ser la MISMA feature) -- una condición adicional, más allá del rol, evaluada contra un recurso real guardado en `db`. Ejemplo motivador: "solo el dueño de una factura puede leerla".
+
+- `id:` nombra explícitamente el parámetro del propio rpc que trae el id del recurso -- nunca por posición, mismo criterio que `@rate_limit(..., key: ...)`.
+- Comparación DIRECTA (`campo == currentUserId()`), sin máquina de expresiones -- deliberadamente angosto, auditable a simple vista.
+- Etapa NUEVA y SEPARADA en runtime, después del chequeo de rol de siempre (que no cambia en nada): id mal formado -> 400, recurso inexistente -> 404, no sos el dueño -> 403.
+- `ownerOf` aplica a TODOS los roles del mismo `@requires` -- un rol que necesite bypasear el chequeo se modela como un rpc separado, nunca una excepción implícita.
+- Rechazado en compile-time sobre un `stream` (no se enforce ahí) y si `field` es `Int?` (evita un "siempre 403" silencioso).
+
+**Verificado**: 8 tests de checker + 7 de parser + 5 contra el binario real. Suite completa sin regresiones. Ver GRAMMAR.md §3.190.
+
 ## [1.145.1] - 2026-08-30
 
 ### 🐛 Arreglado

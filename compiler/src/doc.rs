@@ -320,9 +320,13 @@ fn render_enum_decl(e: &EnumDecl) -> String {
 /// se olvide del otro.
 fn annotation_badges(r: &RpcDecl) -> String {
     let auth_badge = match r.auth() {
-        Some(Annotation::Requires { enum_name, variant_names }) => {
+        Some(Annotation::Requires { enum_name, variant_names, ownership }) => {
             let roles = variant_names.iter().map(|v| format!("{enum_name}.{v}")).collect::<Vec<_>>().join(" | ");
-            format!(r#"<span class="badge auth-badge">🔒 @requires({roles})</span>"#)
+            let owner_suffix = match ownership {
+                Some(clause) => format!(", ownerOf: {}", clause.collection),
+                None => String::new(),
+            };
+            format!(r#"<span class="badge auth-badge">🔒 @requires({roles}{owner_suffix})</span>"#)
         }
         Some(Annotation::Authenticated) => r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string(),
         // `auth()` nunca devuelve ContentType, Route, RateLimit,

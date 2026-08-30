@@ -211,6 +211,7 @@
   - [3.187 `String` contra `json`/`jsonb` NATIVOS de Postgres — RESUELTO](#3187-string-contra-jsonjsonb-nativos-de-postgres--resuelto)
   - [3.188 Lint `manual-role-check-without-requires` — RESUELTO](#3188-lint-manual-role-check-without-requires--resuelto)
   - [3.189 `linkc db shell` — RESUELTO, cierra PLAN.md §9.7 ítem 2](#3189-linkc-db-shell--resuelto-cierra-planmd-97-ítem-2)
+  - [3.190 `@requires(..., ownerOf: <colección>, id: <parámetro>, field: <campo>)` — RESUELTO, cierra RBAC (PLAN.md §9.5 ítem 3) y ABAC (ítem 4) juntos](#3190-requires-ownerof-colección-id-parámetro-field-campo--resuelto-cierra-rbac-planmd-95-ítem-3-y-abac-ítem-4-juntos)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6982,6 +6983,62 @@ db> .exit
 **Bug real encontrado en CI, no localmente (sin Postgres en esta máquina de desarrollo): `postgres::Error::to_string()` es deliberadamente parco para un error de tipo `Kind::Db`** -- confirmado leyendo la fuente de `tokio-postgres` (`error/mod.rs`), imprime LITERALMENTE el string fijo `"db error"`, sin el mensaje real del servidor (severidad, texto, `DETAIL`, `HINT`), que vive aparte en el `DbError` accesible vía `.as_db_error()`. El primer intento de esta ronda perdía el mensaje real de Postgres para toda escritura rechazada (`ERROR: cannot execute INSERT in a read-only transaction` se volvía el inútil `"error: db error"`) -- el test contra Postgres real de más abajo lo agarró antes de llegar a ningún usuario. `pg_error_text` (`db_admin.rs`), único punto de conversión de un `postgres::Error` a texto en todo el módulo, prefiere `DbError::to_string()` cuando existe. Mismo tipo de lección que §3.187 (verificar el comportamiento real de una dependencia externa, nunca solo su firma de tipos).
 
 **Verificado**: 6 tests de CLI contra el binario real (`cli_db_shell.rs`) -- un `SELECT` real contra una base poblada por un `linkc serve` real devuelve la fila real; un `INSERT` es rechazado con el mensaje real de conexión de solo lectura de SQLite y el loop sigue sirviendo después; SQL sintácticamente inválido reporta error sin tumbar el loop; `.exit`, línea vacía, y cierre de stdin terminan el proceso limpio con `child.wait()` en éxito. 2 tests contra Postgres real en `pg_integration.rs` -- `SET default_transaction_read_only` bloquea una escritura real del lado del SERVIDOR (confirmado con un conteo de filas aparte, no solo el texto del mensaje, y con el mensaje real -- `read-only transaction` -- no el placeholder genérico) y la sesión sigue sirviendo después; columnas nativas `numeric`/`uuid`/`jsonb` salen legibles (Decimal exacto vía `format_decimal`, UUID canónico, JSON comparado por valor -- jsonb reordena/renormaliza al guardar, §3.187, nunca por texto exacto). Suite completa sin regresiones.
+
+### 3.190 `@requires(..., ownerOf: <colección>, id: <parámetro>, field: <campo>)` — RESUELTO, cierra RBAC (PLAN.md §9.5 ítem 3) y ABAC (ítem 4) juntos
+
+El ejemplo motivador real de PLAN.md para ABAC ("solo el dueño de una factura puede leerla") y el pedido de RBAC ("permisos más allá de todo-o-nada por rol") resultaron ser la MISMA necesidad al diseñarlos: una condición adicional, más allá del rol, evaluada contra un recurso real guardado en `db`. Un solo mecanismo nuevo cierra los dos ítems, no dos por separado. Deliberadamente ANGOSTO -- ni una expresión arbitraria (`where: <expr>`) ni ningún reuso de la máquina de `@check`/`@unique where` -- mismo criterio que Decimal (escala fija) o `Int64.sum()` (solo `Int`): resolver el caso evidenciado con una forma auditable a simple vista, no la generalización hipotética.
+
+<!-- linkc:check -->
+```link
+enum Role { Agent, Admin }
+
+type Invoice = { id: Int, ownerId: Int, amount: Int }
+type NewInvoice = { ownerId: Int, amount: Int }
+db { invoices: Invoice[] }
+
+service Invoices {
+  rpc seed(ownerId: Int, amount: Int) -> Invoice {
+    db.invoices.insert(NewInvoice { ownerId: ownerId, amount: amount })
+  }
+
+  // Agent Y Admin pueden llamar a este rpc -- pero SOLO si son el dueño
+  // real de ESTA factura (ownerId == auth.currentUserId()), no por el
+  // solo hecho de tener uno de esos dos roles.
+  @requires(Role.Agent | Role.Admin, ownerOf: invoices, id: id, field: ownerId)
+  rpc getInvoice(id: Int) -> Invoice? {
+    db.invoices.find(id)
+  }
+
+  // Un Admin que necesita bypasear el chequeo de dueño se modela como un
+  // rpc SEPARADO, sin cláusula -- nunca una excepción implícita por rol
+  // escondida adentro del mismo `@requires`.
+  @requires(Role.Admin)
+  rpc adminGetInvoice(id: Int) -> Invoice? {
+    db.invoices.find(id)
+  }
+}
+```
+
+**Sintaxis: `id:` nombra EXPLÍCITAMENTE cuál parámetro del propio rpc trae el id del recurso -- nunca por posición.** Mismo criterio que `@rate_limit(..., key: <param>)` (GRAMMAR.md §3.142) ya estableció: nombrar el parámetro en la anotación, no adivinar por orden. Las tres palabras clave (`ownerOf`/`id`/`field`) son obligatorias y EN ESE ORDEN si aparece alguna -- cada una se valida por separado con su propio mensaje de error (`parser.rs`), mismo espíritu que `@rate_limit` pero con tres nombres en vez de uno.
+
+**AST: un tercer campo aditivo, nunca una variante nueva.** `Annotation::Requires` (`ast.rs`, antes `{ enum_name, variant_names }`) gana `ownership: Option<OwnershipClause>` -- todo match existente (`server.rs`, `checker.rs`, `doc.rs`, `runtime/mod.rs`) siguió compilando agregando `..`/el campo nuevo, y `@requires(Role.X)` sin cláusula quedó con `ownership: None`, sin cambio de comportamiento (confirmado: los 1081 tests unitarios existentes pasaron sin tocar ninguno, apenas se agregó el campo).
+
+**Checker: tres validaciones antes de que `server.rs` confíe en la cláusula, `check_requires_ownership_clause`** -- `ownerOf` tiene que ser una colección real (`self.db_collections()`, la MISMA fuente que `db_admin.rs`/`inspect.rs` ya usan); `id:` tiene que nombrar un parámetro real de ESTE rpc cuyo tipo coincida EXACTO con la PK de esa colección (`Checker::db_id_type`, la misma función que `find`/`applyPatch` ya usan para tipar su propio argumento de id -- promovida de privada a `pub(crate)` para este uso nuevo, sin cambio de comportamiento); `field:` tiene que ser un campo `Int` real de esa colección (no `Int?` -- un campo nullable se rechaza en COMPILE-TIME en vez de dejar un "siempre 403" silencioso en runtime cuando el campo da `null`, ya que `Type::Optional(Int) != Type::Int` estructuralmente). **Una cláusula sobre un `stream` es un error del checker, no un no-op silencioso** -- `server.rs` deliberadamente nunca corre esta etapa para un stream (ver abajo), así que aceptarla ahí habría sido exactamente el tipo de "parece protegido pero no lo está" que este proyecto rechaza en compile-time siempre que puede detectarlo.
+
+**Runtime -- el punto arquitectónico real: una etapa NUEVA Y SEPARADA, no un cambio al chequeo de rol existente.** `check_auth_gate` (`server.rs`, GRAMMAR.md §3.14) sigue corriendo EXACTAMENTE igual, mismo lugar, mismo costo cero para el caso común (`@requires(Role.X)` sin cláusula nunca entra al `if let` nuevo). La etapa de dueño (`check_resource_ownership`, nueva) se inserta justo después de que `auth_gate.outcome` ya dio `Ok` y antes de la rama de `stream` -- streams quedan fuera de alcance v0 (una suscripción de larga vida re-chequeando dueño por evento es un problema distinto). Decodifica SOLO el parámetro `id:` nombrado (vía `json_to_typed_value`, el mismo camino que cada parámetro normal ya usa) contra el tipo de la PK derivado de la colección (nunca vuelve a buscar el `RpcDecl`: el checker ya garantizó en compile-time que el tipo del parámetro coincide), y hace `db.call(&collection, "find", vec![id_value])` -- el mismo `Db::call` público que el propio `find` del rpc ya usa. Tres desenlaces: id mal formado -> 400 (el rol ya se confirmó, sin riesgo de fuga nueva); `find` devuelve `Value::Null` -> 404; fila encontrada pero el campo no coincide con `sessions.user_id_for(token)` (la MISMA función que `auth.currentUserId()` ya llama) -> 403, con el MISMO mensaje genérico que `check_auth_gate` ya usa para un rol que no matchea (hallado en el review adversarial de esa ronda: nombrar el motivo real le regalaría a un atacante de bajo privilegio un mapeo gratis de qué falló).
+
+**Comparación DIRECTA, sin máquina de expresiones -- a propósito, no un atajo.** A diferencia de `@check(<expr>)`/`@unique where <expr>` (que sí necesitan un validador de forma + un evaluador general, porque su forma es arbitraria), acá la forma es FIJA (`campo == currentUserId()`): comparar un `Value::Int` leído del struct encontrado contra `sessions.user_id_for(token)` es simple, directo, y exactamente tan general como el caso real necesita. Meter la máquina de `@check` acá habría sido una capa sin beneficio real, y una superficie de seguridad más difícil de auditar a simple vista.
+
+**`ownerOf` aplica a TODOS los roles listados en el mismo `@requires`, sin excepción por rol -- confirmado con un test real: `adminGetInvoice` de arriba, no `getInvoice`, es el único camino para que un Admin lea una factura ajena.** Un rol que necesite bypasear el chequeo de dueño se modela como un rpc SEPARADO con su propio `@requires` sin cláusula -- mantiene la anotación auditable de un vistazo, sin una excepción implícita escondida en qué rol es "especial". `linkc doc` refleja la cláusula en el badge de auth (`🔒 @requires(Role.Agent | Role.Admin, ownerOf: invoices)`) -- mismo criterio de auditabilidad, ahora también en la documentación generada.
+
+**Límites honestos, deliberados**:
+- Sin ownership multi-hop ("el cliente de la factura, cuyo gestor..."). `field` es un campo directo, un solo salto.
+- Sin combinaciones booleanas arbitrarias ("dueño O admin") -- se modela como dos rpcs separados (ver `adminGetInvoice` arriba).
+- `field` tiene que ser `Int` (para calzar con `currentUserId(): Int?`) -- una PK de usuario `Uuid` no encaja en v0; revisar si `currentUserId()` alguna vez gana una variante `Uuid`.
+- Streams quedan fuera de alcance -- solo `rpc`, rechazado en compile-time si se intenta sobre un `stream` (ver arriba).
+- Sin `id` con valor por default: si el parámetro nombrado en `id:` falta del body JSON, es un 400 inmediato -- no se evalúa ningún default expression que ese parámetro pudiera declarar (evitar duplicar el aparato completo de `eval_expr`/`Env`/`step_budget` solo para este borde, genuinamente raro: un id de recurso a verificar casi nunca tiene sentido con un default).
+
+**Verificado**: 8 tests de checker (`checker.rs`) -- cláusula válida tipa limpio con PK `Int` y con PK `Uuid`; colección/parámetro/campo inexistentes, cada uno con su propio mensaje; tipo de `id` que no coincide con la PK; campo que no es `Int` (incluido `Int?`, rechazado a propósito); una cláusula sobre `stream` es un error, no un no-op. 7 tests de parser (`parser.rs`) -- forma completa en orden, con OR de roles, sin cláusula (ownership: None, sin cambio de comportamiento), y cada palabra clave fuera de lugar o faltante como error de parseo. 5 tests de CLI contra el binario real (`server_http.rs`) -- dueño real (200), no-dueño con un rol igual de válido (403), recurso inexistente (404), rol incorrecto SIN llegar a tocar la base (403 incluso contra un id que no existe -- si el orden estuviera invertido, esa combinación daría 404), y Admin NO exento del chequeo en el rpc compartido pero SÍ puede leer cualquier factura vía el rpc separado sin cláusula. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

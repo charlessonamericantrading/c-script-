@@ -716,8 +716,46 @@ impl Parser {
                         self.eat(&TokenKind::Dot)?;
                         variant_names.push(self.eat_ident()?);
                     }
+                    // `, ownerOf: <colección>, id: <parámetro>, field: <campo>`
+                    // (GRAMMAR.md §3.190) -- las tres palabras clave son
+                    // obligatorias y en ESE orden si aparece alguna, mismo
+                    // espíritu que `@rate_limit(..., key: <param>)` pero con
+                    // tres nombres en vez de uno, así que cada una se valida
+                    // por separado con su propio mensaje.
+                    let ownership = if self.check(&TokenKind::Comma) {
+                        self.advance();
+                        let kw = self.eat_ident()?;
+                        if kw != "ownerOf" {
+                            return Err(self.error(format!(
+                                "'@requires' solo acepta 'ownerOf: <colección>, id: <parámetro>, field: <campo>' como argumentos extra, no '{kw}'"
+                            )));
+                        }
+                        self.eat(&TokenKind::Colon)?;
+                        let collection = self.eat_ident()?;
+                        self.eat(&TokenKind::Comma)?;
+                        let kw = self.eat_ident()?;
+                        if kw != "id" {
+                            return Err(self.error(format!(
+                                "'@requires(..., ownerOf: {collection})' tiene que seguir con 'id: <parámetro>', no '{kw}'"
+                            )));
+                        }
+                        self.eat(&TokenKind::Colon)?;
+                        let id_param = self.eat_ident()?;
+                        self.eat(&TokenKind::Comma)?;
+                        let kw = self.eat_ident()?;
+                        if kw != "field" {
+                            return Err(self.error(format!(
+                                "'@requires(..., id: {id_param})' tiene que seguir con 'field: <campo>', no '{kw}'"
+                            )));
+                        }
+                        self.eat(&TokenKind::Colon)?;
+                        let field = self.eat_ident()?;
+                        Some(OwnershipClause { collection, id_param, field })
+                    } else {
+                        None
+                    };
                     self.eat(&TokenKind::RParen)?;
-                    Annotation::Requires { enum_name, variant_names }
+                    Annotation::Requires { enum_name, variant_names, ownership }
                 }
                 "content_type" => {
                     self.eat(&TokenKind::LParen)?;
@@ -2230,6 +2268,77 @@ mod tests {
     #[test]
     fn rate_limit_annotation_rejects_a_second_argument_that_is_not_key() {
         let tokens = tokenize(r#"service S { @rate_limit("5/1m", other: email) rpc f(email: String) -> Int { 1 } }"#).unwrap();
+        assert!(parse(tokens).is_err());
+    }
+
+    // ---- @requires(..., ownerOf: ..., id: ..., field: ...) -- GRAMMAR.md §3.190 ----
+
+    #[test]
+    fn requires_without_an_ownership_clause_parses_ownership_as_none() {
+        let prog = parse_source("service S { @requires(Role.Admin) rpc f(id: Int) -> Int { 1 } }");
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(r.annotations, vec![Annotation::Requires { enum_name: "Role".to_string(), variant_names: vec!["Admin".to_string()], ownership: None }]);
+    }
+
+    #[test]
+    fn requires_parses_a_full_ownership_clause_in_order() {
+        let prog = parse_source(
+            "service S { @requires(Role.Agent, ownerOf: invoices, id: id, field: ownerId) rpc f(id: Int) -> Int { 1 } }",
+        );
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(
+            r.annotations,
+            vec![Annotation::Requires {
+                enum_name: "Role".to_string(),
+                variant_names: vec!["Agent".to_string()],
+                ownership: Some(OwnershipClause {
+                    collection: "invoices".to_string(),
+                    id_param: "id".to_string(),
+                    field: "ownerId".to_string(),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn requires_ownership_clause_also_works_with_a_multi_role_requires() {
+        let prog = parse_source(
+            "service S { @requires(Role.Agent | Role.Admin, ownerOf: invoices, id: id, field: ownerId) rpc f(id: Int) -> Int { 1 } }",
+        );
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(
+            r.annotations,
+            vec![Annotation::Requires {
+                enum_name: "Role".to_string(),
+                variant_names: vec!["Agent".to_string(), "Admin".to_string()],
+                ownership: Some(OwnershipClause {
+                    collection: "invoices".to_string(),
+                    id_param: "id".to_string(),
+                    field: "ownerId".to_string(),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn requires_ownership_clause_rejects_a_second_argument_that_is_not_owner_of() {
+        let tokens = tokenize("service S { @requires(Role.Agent, other: invoices) rpc f(id: Int) -> Int { 1 } }").unwrap();
+        assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn requires_ownership_clause_rejects_out_of_order_keywords() {
+        let tokens =
+            tokenize("service S { @requires(Role.Agent, ownerOf: invoices, field: ownerId, id: id) rpc f(id: Int) -> Int { 1 } }").unwrap();
+        assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn requires_ownership_clause_rejects_a_missing_field_keyword() {
+        let tokens = tokenize("service S { @requires(Role.Agent, ownerOf: invoices, id: id) rpc f(id: Int) -> Int { 1 } }").unwrap();
         assert!(parse(tokens).is_err());
     }
 

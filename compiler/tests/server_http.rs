@@ -1026,3 +1026,139 @@ fn a_small_response_is_not_compressed_even_when_the_client_accepts_gzip_over_a_r
     server.shutdown();
 }
 
+// ---- @requires(..., ownerOf: ..., id: ..., field: ...) -- GRAMMAR.md §3.190 ----
+//
+// Ejemplo motivador real: solo el dueño de una factura (o un Admin, que
+// tiene su PROPIO rpc sin cláusula -- ver `adminGetInvoice` abajo) puede
+// leerla vía `getInvoice`. Cuatro desenlaces contra el servidor real: dueño
+// real (200), no-dueño con un rol igual de válido (403), recurso
+// inexistente (404), y rol incorrecto SIN llegar a tocar la base (403 igual
+// para un id que ni existe -- si el orden estuviera invertido, esa combinación
+// daría 404, no 403).
+const OWNERSHIP_PROGRAM: &str = r#"
+enum Role { Agent, Admin, Member }
+
+type Invoice = { id: Int, ownerId: Int, amount: Int }
+type NewInvoice = { ownerId: Int, amount: Int }
+db { invoices: Invoice[] }
+
+service Auth {
+  rpc login(role: Role, userId: Int) -> String {
+    auth.createSessionWithId(role, userId)
+  }
+}
+
+service Invoices {
+  rpc seed(ownerId: Int, amount: Int) -> Invoice {
+    db.invoices.insert(NewInvoice { ownerId: ownerId, amount: amount })
+  }
+
+  @requires(Role.Agent | Role.Admin, ownerOf: invoices, id: id, field: ownerId)
+  rpc getInvoice(id: Int) -> Invoice? {
+    db.invoices.find(id)
+  }
+
+  // Un Admin que necesita bypasear el chequeo de dueño se modela como un rpc
+  // SEPARADO, sin cláusula -- mismo criterio que el diseño documenta: nunca
+  // una excepción implícita escondida adentro de la misma anotación.
+  @requires(Role.Admin)
+  rpc adminGetInvoice(id: Int) -> Invoice? {
+    db.invoices.find(id)
+  }
+}
+"#;
+
+#[test]
+fn ownership_clause_lets_the_real_owner_read_their_own_resource_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("ownership-owner", OWNERSHIP_PROGRAM);
+
+    let (_, owner_token) = server.post("/Auth/login", &json!({"role": "Agent", "userId": 7}), None);
+    let owner_token = owner_token.as_str().unwrap().to_string();
+
+    let (status, created) = server.post("/Invoices/seed", &json!({"ownerId": 7, "amount": 100}), None);
+    assert_eq!(status, 200, "body: {created:?}");
+    let id = created["id"].as_i64().expect("la factura sembrada debe tener id");
+
+    let (status, body) = server.post("/Invoices/getInvoice", &json!({"id": id}), Some(&owner_token));
+    assert_eq!(status, 200, "el dueño real debe poder leer su propia factura: {body:?}");
+    assert_eq!(body["ownerId"], 7);
+
+    server.shutdown();
+}
+
+#[test]
+fn ownership_clause_rejects_a_different_user_with_the_same_valid_role_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("ownership-not-owner", OWNERSHIP_PROGRAM);
+
+    let (_, other_token) = server.post("/Auth/login", &json!({"role": "Agent", "userId": 999}), None);
+    let other_token = other_token.as_str().unwrap().to_string();
+
+    let (_, created) = server.post("/Invoices/seed", &json!({"ownerId": 7, "amount": 100}), None);
+    let id = created["id"].as_i64().expect("la factura sembrada debe tener id");
+
+    let (status, body) = server.post("/Invoices/getInvoice", &json!({"id": id}), Some(&other_token));
+    assert_eq!(status, 403, "Agent es un rol válido para el rpc, pero no es el dueño de ESTA factura: {body:?}");
+
+    server.shutdown();
+}
+
+#[test]
+fn ownership_clause_reports_404_for_a_resource_that_does_not_exist_over_a_real_subprocess() {
+    let server = ServeProcess::start_with_program("ownership-not-found", OWNERSHIP_PROGRAM);
+
+    let (_, token) = server.post("/Auth/login", &json!({"role": "Agent", "userId": 7}), None);
+    let token = token.as_str().unwrap().to_string();
+
+    let (status, body) = server.post("/Invoices/getInvoice", &json!({"id": 999999}), Some(&token));
+    assert_eq!(status, 404, "un rol válido contra un id que no existe debe dar 404, no 403: {body:?}");
+
+    server.shutdown();
+}
+
+#[test]
+fn ownership_clause_rejects_the_wrong_role_before_ever_touching_the_database_over_a_real_subprocess() {
+    // La prueba de que el rol se chequea ANTES de la etapa de dueño (nunca
+    // al revés): `Member` es un rol real (login exitoso, sesión real), pero
+    // NO está en `@requires(Role.Agent | Role.Admin, ...)` de `getInvoice` --
+    // así que `check_auth_gate` lo rechaza con 403 antes de que la etapa de
+    // dueño llegue a correr. Contra un id que NO EXISTE: si el orden
+    // estuviera invertido (dueño antes que rol), esta combinación daría 404
+    // (la etapa de dueño SÍ tocaría la base para buscar ese id), no 403.
+    let server = ServeProcess::start_with_program("ownership-wrong-role", OWNERSHIP_PROGRAM);
+
+    let (_, member_token) = server.post("/Auth/login", &json!({"role": "Member", "userId": 1}), None);
+    let member_token = member_token.as_str().unwrap().to_string();
+
+    let (status, body) = server.post("/Invoices/getInvoice", &json!({"id": 999999}), Some(&member_token));
+    assert_eq!(
+        status, 403,
+        "Member no está en la lista de roles del rpc -- 403 por el rol, incluso contra un id que no existe: {body:?}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
+fn ownership_clause_applies_to_every_role_listed_in_the_same_requires_including_admin() {
+    // "Aplica a TODOS los roles listados en el mismo @requires, sin
+    // excepción por rol" -- Admin, aunque también está en la lista de
+    // `getInvoice`, NO bypasea el chequeo de dueño ahí (a diferencia de
+    // `adminGetInvoice`, un rpc SEPARADO sin cláusula, que sí puede leer
+    // cualquier factura).
+    let server = ServeProcess::start_with_program("ownership-admin-not-exempt", OWNERSHIP_PROGRAM);
+
+    let (_, admin_token) = server.post("/Auth/login", &json!({"role": "Admin", "userId": 1}), None);
+    let admin_token = admin_token.as_str().unwrap().to_string();
+
+    let (_, created) = server.post("/Invoices/seed", &json!({"ownerId": 7, "amount": 100}), None);
+    let id = created["id"].as_i64().expect("la factura sembrada debe tener id");
+
+    let (status, body) = server.post("/Invoices/getInvoice", &json!({"id": id}), Some(&admin_token));
+    assert_eq!(status, 403, "Admin está en la lista de roles, pero no es dueño de esta factura -- sin excepción implícita: {body:?}");
+
+    let (status, body) = server.post("/Invoices/adminGetInvoice", &json!({"id": id}), Some(&admin_token));
+    assert_eq!(status, 200, "el rpc SEPARADO sin cláusula sí puede leer cualquier factura: {body:?}");
+
+    server.shutdown();
+}
+

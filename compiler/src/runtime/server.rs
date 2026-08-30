@@ -937,6 +937,26 @@ fn handle_request(
     }
     let auth_audit = auth_gate.audit;
 
+    // `@requires(..., ownerOf: <colección>, id: <parámetro>, field: <campo>)`
+    // (GRAMMAR.md §3.190) -- etapa NUEVA Y SEPARADA del chequeo de rol de
+    // arriba, que no cambia en nada: mismo costo cero para el caso común sin
+    // cláusula (`ownership: None`, el `if let` de abajo ni entra). El rol ya
+    // se confirmó acá, así que un id mal formado es un 400 normal, sin
+    // riesgo de fuga nueva. Streams quedan fuera de alcance v0 -- una
+    // suscripción de larga vida re-chequeando dueño por evento es un
+    // problema distinto (límite honesto documentado en GRAMMAR.md §3.190).
+    if !is_stream_member(&program, service_name, rpc_name) {
+        if let Some(Annotation::Requires { ownership: Some(clause), .. }) = required_auth(&program, service_name, rpc_name) {
+            let (checker, _) = crate::checker::Checker::build_symbols(&program);
+            if let Err((status, msg)) = check_resource_ownership(clause, &args_json, &checker, db, sessions, token.as_deref()) {
+                let resp = cors_response(status, error_json(&msg), &cors_headers, &request);
+                let _ = request.respond(resp);
+                log_done_with_audit(log, req_id, Some(&method), status, start, &format!("error={msg:?}"), auth_audit.as_ref());
+                return;
+            }
+        }
+    }
+
     if is_stream_member(&program, service_name, rpc_name) {
         // Push real v0 (GRAMMAR.md §3.16): si el cuerpo matchea el
         // shape reconocido (`ast::recognize_live_subscribe`), esto NUNCA
@@ -1503,7 +1523,7 @@ fn check_auth_gate(
         // variante nada más, sin la comparación de identidad de enum que sí
         // aplica a una sesión creada por `auth.createSession(WithId)` desde
         // este mismo programa.
-        Annotation::Requires { enum_name, variant_names }
+        Annotation::Requires { enum_name, variant_names, .. }
             if (role_enum.is_empty() || &role_enum == enum_name) && variant_names.iter().any(|v| v == &role_variant) =>
         {
             Ok(())
@@ -1531,6 +1551,59 @@ fn check_auth_gate(
         | Annotation::Cron(_) => Ok(()),
     };
     AuthGateResult { audit: mk_audit(outcome.is_ok()), outcome }
+}
+
+/// `@requires(..., ownerOf: <colección>, id: <parámetro>, field: <campo>)`
+/// (GRAMMAR.md §3.190) -- comparación DIRECTA, sin ninguna máquina de
+/// expresiones (a diferencia de `@check`/`@unique where`): la forma es FIJA
+/// (`campo == currentUserId()`), así que comparar el `Value::Int` leído del
+/// struct encontrado contra `sessions.user_id_for(token)` (la MISMA función
+/// que `auth.currentUserId()` ya llama) alcanza. `checker` ya la construyó
+/// el caller (`Checker::build_symbols`, un solo build por request, mismo
+/// criterio que `invoke_rpc_with_sessions` ya usa para el resto de los
+/// parámetros) -- el tipo del id se deriva de la PK de la colección
+/// (`Checker::db_id_type`), no del parámetro del rpc: el checker ya
+/// garantizó en tiempo de compilación que los dos coinciden
+/// (`check_requires_ownership_clause`), así que no hace falta volver a
+/// buscar el `RpcDecl` acá.
+fn check_resource_ownership(
+    clause: &crate::ast::OwnershipClause,
+    args_json: &serde_json::Value,
+    checker: &crate::checker::Checker,
+    db: &Db,
+    sessions: &SessionStore,
+    token: Option<&str>,
+) -> Result<(), (u16, String)> {
+    let element_ty = checker
+        .db_collections()
+        .get(&clause.collection)
+        .unwrap_or_else(|| unreachable!("check_requires_ownership_clause ya garantizó que '{}' es una colección real", clause.collection));
+    let id_ty = crate::checker::Checker::db_id_type(element_ty);
+    let Some(id_json) = args_json.get(&clause.id_param) else {
+        return Err((400, format!("falta el parámetro '{}'", clause.id_param)));
+    };
+    let id_value = super::json_to_typed_value(id_json, &id_ty, checker, &clause.id_param).map_err(|e| (status_for(&e), e.to_string()))?;
+    let found = db.call(&clause.collection, "find", vec![id_value]).map_err(|e| (status_for(&e), e.to_string()))?;
+    // Cualquier otra cosa que no sea `Value::Struct` (`find` devuelve
+    // `Value::Null` cuando no hay fila) cuenta como "no encontrado" --
+    // defensivo, nunca un panic sobre una forma inesperada.
+    let super::Value::Struct(fields) = found else {
+        return Err((404, "recurso no encontrado".to_string()));
+    };
+    let owner_id = fields.iter().find(|(n, _)| n == &clause.field).and_then(|(_, v)| match v {
+        super::Value::Int(n) => Some(*n),
+        _ => None,
+    });
+    let current_user_id = token.and_then(|tok| sessions.user_id_for(tok));
+    // Mismo mensaje genérico que `check_auth_gate` ya usa para un rol que no
+    // matchea -- sin nombrar el motivo (hallado en el review adversarial de
+    // esa ronda: nombrarlo le regala a un atacante un mapeo gratis de qué
+    // falló).
+    if owner_id.is_some() && owner_id == current_user_id {
+        Ok(())
+    } else {
+        Err((403, "no tenés permiso para esta operación".to_string()))
+    }
 }
 
 /// El Content-Type que declaró el rpc con `@content_type("...")`, si lo hizo
