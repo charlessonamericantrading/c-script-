@@ -2499,15 +2499,27 @@ service Events {{
     let listed = server.rpc("Events/list", "{}");
     let rows = listed.as_array().unwrap_or_else(|| panic!("se esperaba una lista, llegó: {listed:?}"));
     assert_eq!(rows.len(), 2, "{listed:?}");
+    // Comparación SEMÁNTICA, no de texto exacto: `jsonb` (a diferencia de
+    // `json`, ver el test hermano abajo) NO preserva el texto de entrada
+    // tal cual -- reordena claves y normaliza espacios al reserializar
+    // desde su árbol binario interno (comportamiento real y documentado
+    // de Postgres, confirmado en CI: `{"button":"cta","n":2}` volvió como
+    // `{"n": 2, "button": "cta"}`, mismo VALOR, texto distinto). El
+    // contrato real de un roundtrip jsonb es equivalencia de VALOR, nunca
+    // byte a byte.
     let click = rows.iter().find(|r| r["kind"] == "click").expect("la fila con properties");
-    assert_eq!(click["properties"], r#"{"button":"cta","n":2}"#, "el jsonb tiene que decodificarse como el texto JSON real: {click:?}");
+    let click_props: serde_json::Value =
+        serde_json::from_str(click["properties"].as_str().expect("properties es un string")).expect("properties es JSON válido");
+    assert_eq!(click_props, serde_json::json!({"button": "cta", "n": 2}), "el jsonb tiene que decodificar al mismo VALOR JSON: {click:?}");
     let pageview = rows.iter().find(|r| r["kind"] == "pageview").expect("la fila sin properties");
     assert_eq!(pageview["properties"], serde_json::Value::Null, "NULL en jsonb sigue siendo NULL: {pageview:?}");
 
     // Escritura: el repro exacto de skynet-43 -- con contenido Y con null,
     // los dos tienen que funcionar (antes del fix, los dos fallaban igual).
     let created = server.rpc("Events/create", r#"{"kind":"purchase","properties":"{\"amount\":19.99}"}"#);
-    assert_eq!(created["properties"], r#"{"amount":19.99}"#, "{created:?}");
+    let created_props: serde_json::Value =
+        serde_json::from_str(created["properties"].as_str().expect("properties es un string")).expect("properties es JSON válido");
+    assert_eq!(created_props, serde_json::json!({"amount": 19.99}), "{created:?}");
     let created_null = server.rpc("Events/create", r#"{"kind":"logout","properties":null}"#);
     assert_eq!(created_null["properties"], serde_json::Value::Null, "{created_null:?}");
 

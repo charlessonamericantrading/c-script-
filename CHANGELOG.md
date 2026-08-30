@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.143.1] - 2026-08-30
+
+### 🐛 Arreglado
+**CI en rojo tras v1.143.0, por una aserción de test incorrecta -- no un bug real.** El nuevo test de `jsonb` contra Postgres real (`pg_integration.rs`) esperaba texto EXACTO de vuelta (`{"button":"cta","n":2}`), pero `jsonb` (a diferencia de `json`) no preserva el texto de entrada tal cual -- Postgres lo reparsea a su árbol binario interno y lo reserializa al leer, reordenando claves y normalizando espacios (`{"n": 2, "button": "cta"}`, MISMO valor, texto distinto -- comportamiento real y documentado de Postgres). El fix en sí (`Cell::to_sql`/`PgJsonText`) ya funcionaba correctamente -- confirmado en CI: 72 de 73 tests pasaron, incluido el hermano de `json` (que sí preserva texto exacto). Corregidas las dos aserciones de texto exacto a comparación semántica (parsear y comparar el VALOR JSON, no los bytes) -- el contrato real de un roundtrip `jsonb` es equivalencia de valor, nunca byte a byte.
+
+Suite completa (1403 tests) sin regresiones.
+
 ## [1.143.0] - 2026-08-30
 
 ### 🐛 Arreglado
