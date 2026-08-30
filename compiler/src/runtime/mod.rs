@@ -131,6 +131,7 @@ impl PartialEq for Value {
         match (self, other) {
             (Int(a), Int(b)) => a == b,
             (Int64(a), Int64(b)) => a == b,
+            (Decimal(a), Decimal(b)) => a == b,
             (Timestamp(a), Timestamp(b)) => a == b,
             (Float(a), Float(b)) => a == b,
             (Str(a), Str(b)) => a == b,
@@ -4480,6 +4481,55 @@ mod tests {
     #[test]
     fn decimal_add_reports_a_clean_overflow_error_not_a_panic() {
         assert!(decimal_add(i128::MAX, 1).is_err());
+    }
+
+    // Bug real encontrado validando el diseño de PLAN.md §9.14 (31/08/2026):
+    // `impl PartialEq for Value` no tenía ningún arm para `(Decimal, Decimal)`
+    // -- caía al `_ => false` genérico, así que TODA comparación `Decimal ==
+    // Decimal` daba `false` en runtime (y `!=` daba `true`), incluso un valor
+    // contra sí mismo, pese a que el checker lo dejaba tipar limpio y `<`/`>`
+    // sí funcionaban (`compare()` sí tenía su arm). Para un lenguaje donde
+    // `Decimal` es el tipo de dinero, esto es serio -- ver GRAMMAR.md §3.199.
+    #[test]
+    fn decimal_equals_decimal_compares_the_scaled_value_not_always_false() {
+        let program = program_from(
+            r#"
+            service Money {
+                rpc same(a: Decimal, b: Decimal) -> Bool { a == b }
+                rpc different(a: Decimal, b: Decimal) -> Bool { a != b }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let ten_a = parse_decimal("10.0000").unwrap();
+        let ten_b = parse_decimal("10.0000").unwrap();
+        let eleven = parse_decimal("11.0000").unwrap();
+        assert_eq!(Value::Decimal(ten_a), Value::Decimal(ten_b), "dos Decimal con el mismo valor escalado deben ser == en Rust también, no solo en el wire");
+
+        let same = invoke_rpc(&program, "Money", "same", &json!({"a": "10.0000", "b": "10.0000"}), &db).unwrap();
+        assert_eq!(same, json!(true), "10.0000 == 10.0000 tiene que dar true -- antes del fix daba false siempre");
+
+        let different = invoke_rpc(&program, "Money", "different", &json!({"a": "10.0000", "b": "11.0000"}), &db).unwrap();
+        assert_eq!(different, json!(true), "10.0000 != 11.0000 sigue dando true (esto ya funcionaba, confirmar que el fix no lo rompió)");
+
+        let not_different = invoke_rpc(&program, "Money", "different", &json!({"a": "10.0000", "b": "10.0000"}), &db).unwrap();
+        assert_eq!(not_different, json!(false), "10.0000 != 10.0000 tiene que dar false -- antes del fix daba true siempre");
+    }
+
+    #[test]
+    fn decimal_ordering_was_never_affected_by_the_equality_bug() {
+        // compare() (usado por </>/<=/>=) ya tenía su arm de Decimal antes de
+        // este fix -- confirmando que no se rompió nada al arreglar `==`.
+        let program = program_from(
+            r#"
+            service Money {
+                rpc lessThan(a: Decimal, b: Decimal) -> Bool { a < b }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "Money", "lessThan", &json!({"a": "9.0000", "b": "10.0000"}), &db).unwrap();
+        assert_eq!(result, json!(true));
     }
 
     #[test]

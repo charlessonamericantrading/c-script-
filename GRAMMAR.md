@@ -216,6 +216,7 @@
   - [3.192 Bug real: `information_schema` hardcodeaba `'public'` (o no filtraba schema en absoluto) — RESUELTO](#3192-bug-real-information_schema-hardcodeaba-public-o-no-filtraba-schema-en-absoluto--resuelto)
   - [3.193 `--db-schema <nombre>`/`LINK_DATABASE_SCHEMA` — RESUELTO, cierra PLAN.md §9.3 ítem 4](#3193---db-schema-nombrelink_database_schema--resuelto-cierra-planmd-93-ítem-4)
   - [3.194 `crypto.awsS3PresignedUploadUrl(...)`: URL firmada para SUBIR a S3 — RESUELTO, cierra la mitad que §3.110 había dejado abierta](#3194-cryptoawss3presigneduploadurl-url-firmada-para-subir-a-s3--resuelto-cierra-la-mitad-que-3110-había-dejado-abierta)
+  - [3.195 Bug crítico: `Decimal == Decimal` siempre daba `false` en runtime — RESUELTO](#3195-bug-crítico-decimal--decimal-siempre-daba-false-en-runtime--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -7169,6 +7170,24 @@ Las dos funciones comparten toda la lógica de firma en un único helper privado
 **Alcance deliberado, mismo criterio que §3.110**: solo credenciales de larga duración (sin `X-Amz-Security-Token`/STS), solo estilo virtual-hosted, función pura sin llamar a AWS. **Ninguna forma de limitar el TAMAÑO del archivo subido** -- una URL presignada de `PUT` firma un header, no un rango de `Content-Length`; eso necesitaría una POST Policy de S3 (un mecanismo distinto por completo, con su propio documento de condiciones en base64 y su propia firma) en vez de una URL de query-string auth -- fuera de alcance, sin evidencia real de demanda todavía. Upload multipart directo (para archivos grandes, varias partes) tampoco está cubierto -- PLAN.md §8.5.1 sigue abierto en esa parte.
 
 **Verificado**: mismo estándar que §3.110 -- la derivación de clave y el URI-encoding son el código YA verificado contra el vector oficial `aws4_testsuite` de AWS, reusado sin cambios. 3 tests nuevos en `checker.rs` (aridad/tipos de los 7 argumentos) + 3 en `runtime/mod.rs`: estructura exacta de la URL (método implícito en la firma, `Content-Type` firmado ANTES que `host` en `X-Amz-SignedHeaders`, firma de 64 hex minúscula), la firma CAMBIA si el `Content-Type` cambia (confirmando que el header está de verdad atado a la firma, no solo presente en la URL de forma cosmética), y el mismo rechazo de `expiresSeconds` fuera de `1..=604800` que §3.110 ya tenía. Suite completa sin regresiones.
+
+### 3.195 Bug crítico: `Decimal == Decimal` siempre daba `false` en runtime — RESUELTO
+
+Encontrado el 31/08/2026 validando el diseño de la ronda de PLAN.md §9.14 (no buscado a propósito) -- `impl PartialEq for Value` (`runtime/mod.rs`, escrito a mano en vez de derivado, por el ciclo que `Closure` introduciría) tenía arms para `Int`/`Int64`/`Timestamp`/`Float`/`Str`/`Uuid`/`Bool`/`Struct`/... pero **ningún arm para `(Decimal, Decimal)`** -- caía al `_ => false` genérico del `match`. `BinaryOp::Eq`/`NotEq` llaman `l == r` directo sobre `Value`, así que **toda comparación `Decimal == Decimal` en un programa `.link` corriendo daba `false`, y toda `!=` daba `true`, incluso comparando un valor contra sí mismo**.
+
+```
+service Money {
+  rpc same(a: Decimal, b: Decimal) -> Bool { a == b }
+}
+```
+
+Antes del fix, `same(10.0000, 10.0000)` devolvía `false`. El checker dejaba pasar la comparación sin ningún problema (sin caso especial para `Decimal` en `Eq`/`NotEq`, y de hecho un test de checker ya confirmaba que *tipa* limpio) -- el bug era puramente de *valor* en runtime, invisible para cualquier test que solo verificara que el programa compila. El orden (`<`/`>`/`<=`/`>=`) nunca estuvo afectado -- la función `compare()` que los implementa sí tenía su arm de `Decimal` desde siempre.
+
+**Por qué esto es más serio que un bug cualquiera**: `Decimal` es el tipo que este lenguaje ofrece específicamente para dinero (GRAMMAR.md §3.184). Un adoptador real en producción (MyFinance, fintech) reportó cálculos fiscales y de facturación construidos sobre `Decimal` -- cualquier `if montoActual == montoEsperado` en ese código real daba `false` siempre, en silencio, sin ningún error que lo señalara.
+
+**Fix**: una línea, `(Decimal(a), Decimal(b)) => a == b` (comparación directa del `i128` interno escalado -- `Decimal` no necesita ninguna lógica de redondeo/epsilon para igualdad, a diferencia de `Float`, porque su representación ya es un entero de punto fijo exacto).
+
+**Verificado**: 2 tests nuevos en `runtime/mod.rs` contra un `linkc serve`/`invoke_rpc` real -- `10.0000 == 10.0000` da `true` (antes daba `false`), `10.0000 != 10.0000` da `false` (antes daba `true`), `10.0000 != 11.0000` sigue dando `true` (ya funcionaba, confirmado que el fix no lo rompió) -- más un test confirmando que el orden (`<`) sigue intacto. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

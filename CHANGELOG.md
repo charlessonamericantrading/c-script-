@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.151.0] - 2026-08-31
+
+### 🐛 Arreglado
+**Bug crítico: `Decimal == Decimal` siempre daba `false` en runtime** (PLAN.md §9.14, encontrado validando el diseño de esta misma ronda) -- `impl PartialEq for Value` no tenía ningún arm para `(Decimal, Decimal)`, así que toda comparación `Decimal == Decimal` en un programa corriendo daba `false` en silencio (y `!=` daba `true`), pese a que el checker tipaba limpio y el orden (`<`/`>`) funcionaba bien. Para un lenguaje donde `Decimal` es el tipo de dinero, esto es serio -- un adoptador real (MyFinance) construyó cálculos fiscales y de facturación sobre `Decimal`. Fix de una línea. Ver GRAMMAR.md §3.195.
+
 ## [1.150.2] - 2026-08-30
 
 ### ✨ Nuevo
