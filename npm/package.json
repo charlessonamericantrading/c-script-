@@ -3,8 +3,8 @@
   "version": "1.150.2",
   "description": "El compilador y runtime oficial para el lenguaje Link (End-to-End Type Safety con TypeScript)",
   "bin": {
-    "linkc": "./bin/linkc.js",
-    "link": "./bin/linkc.js"
+    "linkc": "bin/linkc.js",
+    "link": "bin/linkc.js"
   },
   "files": [
     "bin/"
