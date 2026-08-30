@@ -142,12 +142,12 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
     out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
     out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'; con --target-url/LINK_DOCTOR_TARGET_URL, además compara la versión local contra la de un 'linkc serve' real corriendo ahí, vía /health)"));
-    out(&format!("     linkc db inspect <archivo.link> [--db <url|archivo>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor')"));
-    out(&format!("     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>] (vuelca cada colección declarada a un archivo JSON, byte-idéntico al wire real -- sin ejecutar ningún DDL)"));
-    out(&format!("     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] (escribe las filas de un archivo de 'db export' contra un target, preservando el id original de cada fila -- un target vacío ES el caso 'seed')"));
-    out(&format!("     linkc db shell <archivo.link> [--db <url|archivo>] (REPL de solo lectura sobre stdin/stdout, una consulta SQL por línea -- SQLite abre de solo lectura, Postgres corre con default_transaction_read_only)"));
+    out(&format!("     linkc db inspect <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor'; --db-schema/LINK_DATABASE_SCHEMA solo Postgres)"));
+    out(&format!("     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>] (vuelca cada colección declarada a un archivo JSON, byte-idéntico al wire real -- sin ejecutar ningún DDL)"));
+    out(&format!("     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>] (escribe las filas de un archivo de 'db export' contra un target, preservando el id original de cada fila -- un target vacío ES el caso 'seed')"));
+    out(&format!("     linkc db shell <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (REPL de solo lectura sobre stdin/stdout, una consulta SQL por línea -- SQLite abre de solo lectura, Postgres corre con default_transaction_read_only)"));
     out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; clave de @encrypted vía --encryption-key/LINK_ENCRYPTION_KEY (32 bytes en base64), obligatoria si el programa declara algún campo @encrypted; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)"));
+    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--db-schema <nombre>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; sin schema propio por default (el 'public' de siempre), o namespacing vía --db-schema/LINK_DATABASE_SCHEMA (crea el schema si no existe, salvo --adopt-existing) para compartir una base entre varios .link sin colisión de nombre de tabla -- solo PostgreSQL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; clave de @encrypted vía --encryption-key/LINK_ENCRYPTION_KEY (32 bytes en base64), obligatoria si el programa declara algún campo @encrypted; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)"));
     out(&format!("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {{\"nombre_archivo\": puerto, ...}} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)"));
     out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
     out(&format!("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)"));
@@ -379,7 +379,7 @@ fn cmd_introspect(args: &[String]) -> ExitCode {
 /// (`check_schema_matches`, GRAMMAR.md §3.17), antes de tocar nada.
 fn cmd_migrate(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else {
-        eprintln!("uso: linkc migrate <archivo.link> --db <url-postgres> --dry-run");
+        eprintln!("uso: linkc migrate <archivo.link> --db <url-postgres> [--db-schema <nombre>] --dry-run");
         return ExitCode::FAILURE;
     };
     if !args.iter().any(|a| a == "--dry-run") {
@@ -409,12 +409,20 @@ fn cmd_migrate(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let db_schema = match resolve_db_schema(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
     };
 
-    match linkc::migrate::dry_run_postgres(&program, &url) {
+    match linkc::migrate::dry_run_postgres(&program, &url, db_schema.as_deref()) {
         Ok(report) => {
             println!("{report}");
             ExitCode::SUCCESS
@@ -460,7 +468,7 @@ fn redact_url_credentials(url: &str) -> String {
 /// para eso ya está `linkc migrate --dry-run`.
 fn cmd_doctor(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else {
-        eprintln!("uso: linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>]");
+        eprintln!("uso: linkc doctor <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] [--target-url <url>]");
         return ExitCode::FAILURE;
     };
     println!("linkc doctor -- diagnóstico de entorno para '{path}'\n");
@@ -496,6 +504,15 @@ fn cmd_doctor(args: &[String]) -> ExitCode {
         }
     }
 
+    let db_schema = match resolve_db_schema(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            println!("[ERROR] {msg}");
+            err_count += 1;
+            None
+        }
+    };
+
     match resolve_db_source(path, args) {
         Ok(runtime::server::DbSource::SqliteFile(db_path)) => {
             println!(
@@ -503,10 +520,14 @@ fn cmd_doctor(args: &[String]) -> ExitCode {
                 display_path(&db_path)
             );
             ok_count += 1;
+            if db_schema.is_some() {
+                println!("[ERROR] --db-schema/LINK_DATABASE_SCHEMA solo aplica a PostgreSQL -- SQLite no tiene concepto de schema");
+                err_count += 1;
+            }
         }
         Ok(runtime::server::DbSource::Postgres(url)) => {
             println!("[INFO]  base de datos: PostgreSQL configurada ({})", redact_url_credentials(&url));
-            match runtime::db::check_postgres_connectivity(&url) {
+            match runtime::db::check_postgres_connectivity(&url, db_schema.as_deref()) {
                 Ok(()) => {
                     println!("[OK]    conectividad a PostgreSQL: conectó y respondió (solo lectura, no se tocó ningún schema)");
                     ok_count += 1;
@@ -596,7 +617,7 @@ fn cmd_db(args: &[String]) -> ExitCode {
         Some("shell") => cmd_db_shell(&args[1..]),
         _ => {
             eprintln!(
-                "uso: linkc db inspect <archivo.link> [--db <url|archivo>]\n     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>]\n     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>]\n     linkc db shell <archivo.link> [--db <url|archivo>]"
+                "uso: linkc db inspect <archivo.link> [--db <url|archivo>] [--db-schema <nombre>]\n     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>]\n     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>]\n     linkc db shell <archivo.link> [--db <url|archivo>] [--db-schema <nombre>]"
             );
             ExitCode::FAILURE
         }
@@ -611,7 +632,7 @@ fn cmd_db(args: &[String]) -> ExitCode {
 /// resolvedor de `--db`/`LINK_DATABASE_URL` que esos dos y que `serve`).
 fn cmd_db_inspect(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else {
-        eprintln!("uso: linkc db inspect <archivo.link> [--db <url|archivo>]");
+        eprintln!("uso: linkc db inspect <archivo.link> [--db <url|archivo>] [--db-schema <nombre>]");
         return ExitCode::FAILURE;
     };
     let program = match load_and_check(path) {
@@ -625,12 +646,26 @@ fn cmd_db_inspect(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let db_schema = match resolve_db_schema(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(msg) = reject_db_schema_on_sqlite(&source, &db_schema) {
+        eprintln!("{msg}");
+        return ExitCode::FAILURE;
+    }
     let (label, result) = match &source {
         runtime::server::DbSource::SqliteFile(db_path) => {
             (format!("SQLite embebido en '{}'", display_path(db_path)), linkc::inspect::inspect_sqlite(&program, db_path))
         }
         runtime::server::DbSource::Postgres(url) => {
-            (format!("PostgreSQL ({})", redact_url_credentials(url)), linkc::inspect::inspect_postgres(&program, url))
+            (
+                format!("PostgreSQL ({})", redact_url_credentials(url)),
+                linkc::inspect::inspect_postgres(&program, url, db_schema.as_deref()),
+            )
         }
     };
     let statuses = match result {
@@ -671,7 +706,7 @@ fn cmd_db_inspect(args: &[String]) -> ExitCode {
 /// solo lectura que `db inspect`.
 fn cmd_db_export(args: &[String]) -> ExitCode {
     let (Some(path), Some(out_path)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc db export <archivo.link> <archivo.json> [--db <url|archivo>]");
+        eprintln!("uso: linkc db export <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>]");
         return ExitCode::FAILURE;
     };
     let program = match load_and_check(path) {
@@ -685,13 +720,25 @@ fn cmd_db_export(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let db_schema = match resolve_db_schema(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(msg) = reject_db_schema_on_sqlite(&source, &db_schema) {
+        eprintln!("{msg}");
+        return ExitCode::FAILURE;
+    }
     let (label, result) = match &source {
         runtime::server::DbSource::SqliteFile(db_path) => {
             (format!("SQLite embebido en '{}'", display_path(db_path)), linkc::db_admin::export_sqlite(&program, db_path))
         }
-        runtime::server::DbSource::Postgres(url) => {
-            (format!("PostgreSQL ({})", redact_url_credentials(url)), linkc::db_admin::export_postgres(&program, url))
-        }
+        runtime::server::DbSource::Postgres(url) => (
+            format!("PostgreSQL ({})", redact_url_credentials(url)),
+            linkc::db_admin::export_postgres(&program, url, db_schema.as_deref()),
+        ),
     };
     let file = match result {
         Ok(f) => f,
@@ -730,7 +777,7 @@ fn cmd_db_export(args: &[String]) -> ExitCode {
 /// revierte TODO el import, nunca deja datos a medias.
 fn cmd_db_import(args: &[String]) -> ExitCode {
     let (Some(path), Some(in_path)) = (args.first(), args.get(1)) else {
-        eprintln!("uso: linkc db import <archivo.link> <archivo.json> [--db <url|archivo>]");
+        eprintln!("uso: linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>]");
         return ExitCode::FAILURE;
     };
     let program = match load_and_check(path) {
@@ -758,13 +805,25 @@ fn cmd_db_import(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let db_schema = match resolve_db_schema(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(msg) = reject_db_schema_on_sqlite(&source, &db_schema) {
+        eprintln!("{msg}");
+        return ExitCode::FAILURE;
+    }
     let (label, result) = match &source {
         runtime::server::DbSource::SqliteFile(db_path) => {
             (format!("SQLite embebido en '{}'", display_path(db_path)), linkc::db_admin::import_sqlite(&program, db_path, &file))
         }
-        runtime::server::DbSource::Postgres(url) => {
-            (format!("PostgreSQL ({})", redact_url_credentials(url)), linkc::db_admin::import_postgres(&program, url, &file))
-        }
+        runtime::server::DbSource::Postgres(url) => (
+            format!("PostgreSQL ({})", redact_url_credentials(url)),
+            linkc::db_admin::import_postgres(&program, url, &file, db_schema.as_deref()),
+        ),
     };
     let report = match result {
         Ok(r) => r,
@@ -791,7 +850,7 @@ fn cmd_db_import(args: &[String]) -> ExitCode {
 /// default de la base (`<archivo>.db`) si no hay `--db`/`LINK_DATABASE_URL`.
 fn cmd_db_shell(args: &[String]) -> ExitCode {
     let Some(path) = args.first() else {
-        eprintln!("uso: linkc db shell <archivo.link> [--db <url|archivo>]");
+        eprintln!("uso: linkc db shell <archivo.link> [--db <url|archivo>] [--db-schema <nombre>]");
         return ExitCode::FAILURE;
     };
     let source = match resolve_db_source(path, args) {
@@ -801,9 +860,20 @@ fn cmd_db_shell(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let db_schema = match resolve_db_schema(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(msg) = reject_db_schema_on_sqlite(&source, &db_schema) {
+        eprintln!("{msg}");
+        return ExitCode::FAILURE;
+    }
     let result = match &source {
         runtime::server::DbSource::SqliteFile(db_path) => linkc::db_admin::run_shell_sqlite(db_path),
-        runtime::server::DbSource::Postgres(url) => linkc::db_admin::run_shell_postgres(url),
+        runtime::server::DbSource::Postgres(url) => linkc::db_admin::run_shell_postgres(url, db_schema.as_deref()),
     };
     if let Err(msg) = result {
         eprintln!("no se pudo iniciar el shell: {msg}");
@@ -1247,7 +1317,14 @@ fn cmd_test(args: &[String]) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let adopt_existing = resolve_adopt_existing(args);
-            match runtime::db::Db::connect_postgres_for_testing(&program, &url, adopt_existing) {
+            let db_schema = match resolve_db_schema(args) {
+                Ok(s) => s,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match runtime::db::Db::connect_postgres_for_testing(&program, &url, adopt_existing, db_schema.as_deref()) {
                 Ok(db) => runtime::run_program_tests_against_db(&program, filter.as_deref(), &db),
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -1576,6 +1653,17 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let db_schema = match resolve_db_schema(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(msg) = reject_db_schema_on_sqlite(&source, &db_schema) {
+        eprintln!("{msg}");
+        return ExitCode::FAILURE;
+    }
 
     let cors = match resolve_cors_origins(args) {
         Ok(origins) => match origins {
@@ -1694,6 +1782,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             &host,
             port,
             source.clone(),
+            db_schema.clone(),
             cors.clone(),
             session_ttl,
             argon2_params.clone(),
@@ -1907,7 +1996,18 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
         eprintln!(
             "linkc serve-all no soporta --db/LINK_DATABASE_URL compartido entre servicios -- cada .link usa su propio \
              archivo SQLite ('<archivo>.db' al lado del .link, igual que 'linkc serve' sin --db). Apuntar varios \
-             servicios a la MISMA base todavía no está soportado (--db-schema/--db-prefix, sin implementar)."
+             servicios a la MISMA base todavía no está soportado."
+        );
+        return ExitCode::FAILURE;
+    }
+    // `--db-schema`/`LINK_DATABASE_SCHEMA` (GRAMMAR.md §3.193) presupone una
+    // URL de Postgres real a la que aplicarlo -- `serve-all` nunca tiene
+    // una (cada servicio usa SQLite local, ver el rechazo de `--db` arriba),
+    // así que el flag acá sería silenciosamente inerte sin este rechazo.
+    if args.iter().any(|a| a == "--db-schema") || std::env::var("LINK_DATABASE_SCHEMA").ok().filter(|v| !v.trim().is_empty()).is_some() {
+        eprintln!(
+            "linkc serve-all no soporta --db-schema/LINK_DATABASE_SCHEMA -- cada servicio usa su propio archivo SQLite \
+             local, nunca una URL de Postgres compartida (ver el rechazo de --db arriba)."
         );
         return ExitCode::FAILURE;
     }
@@ -2213,6 +2313,11 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
                         &host,
                         port,
                         source.clone(),
+                        // `serve-all` nunca conecta a Postgres (cada servicio
+                        // usa su propio SQLite local, ver el rechazo de
+                        // --db-schema más arriba en cmd_serve_all) -- siempre
+                        // None acá, no hay ningún schema que aplicar.
+                        None,
                         cors.clone(),
                         session_ttl,
                         argon2_params.clone(),
@@ -2564,4 +2669,57 @@ fn resolve_db_source(path: &str, args: &[String]) -> Result<runtime::server::DbS
     } else {
         Ok(runtime::server::DbSource::SqliteFile(PathBuf::from(value)))
     }
+}
+
+/// `--db-schema <nombre>`/`LINK_DATABASE_SCHEMA` (GRAMMAR.md §3.193) --
+/// namespacing de Postgres para compartir una base entre varios `.link` sin
+/// pensar en colisiones de nombre de tabla. Se interpola DIRECTO en SQL
+/// (`SET search_path`/`CREATE SCHEMA IF NOT EXISTS`, ni `search_path` ni un
+/// nombre de schema se pueden bindear como parámetro) -- por eso se valida
+/// ACÁ, como un identificador SQL simple, antes de que llegue a ningún lado
+/// que arme una consulta con él.
+fn resolve_db_schema(args: &[String]) -> Result<Option<String>, String> {
+    let raw = read_flag_or_env(args, "--db-schema", "LINK_DATABASE_SCHEMA")?;
+    match raw {
+        Some(name) => {
+            validate_schema_identifier(&name)?;
+            Ok(Some(name))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Letras/dígitos/`_`, sin empezar con un dígito, hasta 63 caracteres (el
+/// límite real de un identificador de Postgres, `NAMEDATALEN` - 1) -- mismo
+/// criterio de "identificador simple, nada más" que un nombre de colección
+/// de `.link` ya respeta por construcción de la gramática (acá no hay
+/// gramática que lo garantice: el valor viene de un flag/env var).
+fn validate_schema_identifier(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 63
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "--db-schema/LINK_DATABASE_SCHEMA: '{name}' no es un identificador SQL válido -- solo letras, dígitos y '_', sin \
+             empezar con un dígito, hasta 63 caracteres (el límite de un identificador de Postgres)"
+        ))
+    }
+}
+
+/// `--db-schema` solo tiene sentido contra PostgreSQL -- SQLite no tiene
+/// ningún concepto de schema/namespace. Rechazado acá mismo, con el motivo,
+/// en vez de ignorarlo en silencio (que dejaría a alguien pensando que
+/// tiene aislamiento cuando en realidad no pasa nada).
+fn reject_db_schema_on_sqlite(source: &runtime::server::DbSource, schema: &Option<String>) -> Result<(), String> {
+    if schema.is_some() && matches!(source, runtime::server::DbSource::SqliteFile(_)) {
+        return Err(
+            "--db-schema/LINK_DATABASE_SCHEMA solo aplica a PostgreSQL -- SQLite no tiene concepto de schema. \
+             Sacá el flag, o apuntá --db/LINK_DATABASE_URL a una URL postgres://"
+                .to_string(),
+        );
+    }
+    Ok(())
 }

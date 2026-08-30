@@ -365,6 +365,7 @@ pub fn serve(
     host: &str,
     port: u16,
     source: DbSource,
+    db_schema: Option<String>,
     cors: CorsConfig,
     session_ttl: Option<Duration>,
     argon2_params: argon2::Params,
@@ -401,7 +402,7 @@ pub fn serve(
         // la base no existe todavía). Eso merece un mensaje que se entienda,
         // devuelto como `Err` -- no un exit del proceso entero, ver el
         // comentario de `serve` arriba.
-        DbSource::Postgres(url) => match Db::connect_postgres_with_options(program, &url, adopt_existing) {
+        DbSource::Postgres(url) => match Db::connect_postgres_with_options(program, &url, adopt_existing, db_schema.as_deref()) {
             Ok((db, rx)) => (db, Some(rx)),
             Err(e) => {
                 return Err(format!("error: {e}\n       revisá la URL de conexión (LINK_DATABASE_URL o --db) y que la base esté levantada"));

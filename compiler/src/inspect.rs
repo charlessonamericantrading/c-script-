@@ -89,10 +89,14 @@ pub fn inspect_sqlite(program: &Program, db_path: &Path) -> Result<Vec<Collectio
 /// conjunto VACÍO de columnas es indistinguible de "la tabla no existe":
 /// toda tabla real tiene al menos `"id"`) en vez de duplicar la consulta a
 /// `information_schema`.
-pub fn inspect_postgres(program: &Program, url: &str) -> Result<Vec<CollectionStatus>, String> {
+pub fn inspect_postgres(program: &Program, url: &str, schema: Option<&str>) -> Result<Vec<CollectionStatus>, String> {
     let collections = declared_collections(program)?;
-    let client = connect_postgres_client(url)?;
-    let backend = Backend::Postgres { client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)), url: url.to_string() };
+    let client = connect_postgres_client(url, schema)?;
+    let backend = Backend::Postgres {
+        client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)),
+        url: url.to_string(),
+        schema: schema.map(str::to_string),
+    };
     let mut out = Vec::with_capacity(collections.len());
     for (name, declared_columns) in collections {
         let exists = !crate::migrate::existing_columns(&backend, &name)?.is_empty();

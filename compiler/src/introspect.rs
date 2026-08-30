@@ -225,8 +225,16 @@ fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableI
 /// falla por una tabla individual rara: cada advertencia queda asociada a
 /// la tabla que la generó, para que el caller decida cómo mostrarlas
 /// (`main.rs` las manda a stderr, prefijadas con el nombre de tabla).
+/// `linkc introspect <db-url>` -- a diferencia de `serve`/`db shell`/etc.,
+/// no tiene ningún flag propio (`main.rs` la llama con la URL cruda tal
+/// cual el usuario la pasó) -- así que no toma `--db-schema` (GRAMMAR.md
+/// §3.193) por separado. Un `search_path` propio se compone gratis vía el
+/// mecanismo NATIVO de Postgres, embebido en la URL misma
+/// (`?options=-c%20search_path%3D...`), sin que este comando necesite saber
+/// nada al respecto -- y `introspect_table`/§3.192 ya respeta cualquier
+/// `search_path` real de la sesión, sea cual sea su origen.
 pub fn generate_link_from_postgres(url: &str) -> Result<(String, Vec<String>), String> {
-    let mut client = connect_postgres_client(url)?;
+    let mut client = connect_postgres_client(url, None)?;
     let table_rows = client
         .query(
             "SELECT table_name FROM information_schema.tables \

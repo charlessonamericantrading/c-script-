@@ -1284,7 +1284,18 @@ pub(crate) struct RequestContext {
 /// (incluido el default si no se especifica, `prefer`) intenta TLS primero
 /// -- y si el servidor no lo ofrece, la propia `tokio-postgres` cae a texto
 /// plano sola, sin código extra acá (GRAMMAR.md §3.40).
-pub(crate) fn connect_postgres_client(url: &str) -> Result<postgres::Client, String> {
+/// `schema` (GRAMMAR.md §3.193, `--db-schema`/`LINK_DATABASE_SCHEMA`) fija
+/// `SET search_path` UNA vez, justo después de conectar -- mismo mecanismo
+/// que `db_admin.rs::run_shell_postgres` ya usa para `default_transaction_read_only`
+/// (`client.batch_execute`, sesión-level, nunca la URL: evita toda la
+/// fragilidad de mezclar/escapar un query param `options=` a mano). `SET
+/// search_path` a un schema que TODAVÍA no existe no es un error en Postgres
+/// -- simplemente se salta al resolver nombres hasta que exista, así que
+/// esto es seguro de llamar ANTES de que `Db::connect_postgres_with_options`
+/// corra su propio `CREATE SCHEMA IF NOT EXISTS` (ver ahí). Esta función NO
+/// crea nada -- eso es responsabilidad exclusiva del ÚNICO caller con
+/// permiso de correr DDL.
+pub(crate) fn connect_postgres_client(url: &str, schema: Option<&str>) -> Result<postgres::Client, String> {
     // rustls exige un crypto provider de proceso instalado ANTES del primer
     // `ClientConfig::builder()` -- se instala UNA vez; `install_default()`
     // devuelve `Err` si ya había uno (llamado desde acá Y desde un
@@ -1292,12 +1303,18 @@ pub(crate) fn connect_postgres_client(url: &str) -> Result<postgres::Client, Str
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let config: postgres::Config = url.parse().map_err(|e| format!("URL de conexión inválida: {e}"))?;
-    if config.get_ssl_mode() == postgres::config::SslMode::Disable {
-        postgres::Client::connect(url, postgres::NoTls).map_err(|e| format!("no se pudo conectar a PostgreSQL: {e}"))
+    let mut client = if config.get_ssl_mode() == postgres::config::SslMode::Disable {
+        postgres::Client::connect(url, postgres::NoTls).map_err(|e| format!("no se pudo conectar a PostgreSQL: {e}"))?
     } else {
         let tls = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
-        postgres::Client::connect(url, tls).map_err(|e| format!("no se pudo conectar a PostgreSQL: {e}"))
+        postgres::Client::connect(url, tls).map_err(|e| format!("no se pudo conectar a PostgreSQL: {e}"))?
+    };
+    if let Some(schema) = schema {
+        client
+            .batch_execute(&format!("SET search_path TO \"{schema}\""))
+            .map_err(|e| format!("no se pudo fijar search_path a '{schema}': {e}"))?;
     }
+    Ok(client)
 }
 
 /// `linkc doctor` (GRAMMAR.md §3.100): confirma que la base configurada
@@ -1309,8 +1326,8 @@ pub(crate) fn connect_postgres_client(url: &str) -> Result<postgres::Client, Str
 /// porque `main.rs` -- un crate binario separado de esta librería -- lo
 /// llama directo, mismo motivo que `connect_postgres_for_testing` (§3.99,
 /// más abajo en este archivo).
-pub fn check_postgres_connectivity(url: &str) -> Result<(), String> {
-    let mut client = connect_postgres_client(url)?;
+pub fn check_postgres_connectivity(url: &str, schema: Option<&str>) -> Result<(), String> {
+    let mut client = connect_postgres_client(url, schema)?;
     client.execute("SELECT 1", &[]).map_err(|e| format!("conectó pero la consulta de prueba falló: {e}"))?;
     Ok(())
 }
@@ -1332,7 +1349,11 @@ fn spawn_remote_listener(url: String, instance_id: String) -> Receiver<RemoteCha
     std::thread::spawn(move || {
         use postgres::fallible_iterator::FallibleIterator;
         loop {
-            let mut client = match connect_postgres_client(&url) {
+            // Sin `schema`: esta conexión solo hace LISTEN/lee NOTIFY sobre
+            // un canal GLOBAL de nombre fijo (`REMOTE_CHANGE_CHANNEL`),
+            // nunca referencia ninguna tabla -- `search_path` no aplica acá,
+            // sin importar si `--db-schema` está configurado.
+            let mut client = match connect_postgres_client(&url, None) {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("LISTEN {REMOTE_CHANGE_CHANNEL}: no se pudo conectar ({e}), reintentando en 5s");
@@ -1555,6 +1576,7 @@ impl Db {
         program: &Program,
         url: &str,
         adopt_existing: bool,
+        schema: Option<&str>,
     ) -> Result<(Self, Receiver<RemoteChange>), String> {
         let (checker, symbol_errors) = Checker::build_symbols(program);
         if let Some(e) = symbol_errors.into_iter().next() {
@@ -1562,9 +1584,26 @@ impl Db {
         }
         let simple_enums = simple_enum_names(program);
 
-        let client = connect_postgres_client(url)?;
-        let backend =
-            Backend::Postgres { client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)), url: url.to_string() };
+        let mut client = connect_postgres_client(url, schema)?;
+        // GRAMMAR.md §3.193: el ÚNICO lugar de todo el proyecto que crea un
+        // schema -- `connect_postgres_client` (arriba) solo fija
+        // `search_path`, nunca DDL, así que sirve para todos los callers
+        // de solo lectura (`db shell`/`inspect`/`export`/`introspect`) sin
+        // ningún efecto secundario. `--adopt-existing` nunca ejecuta DDL,
+        // ni siquiera esto -- si el schema no existe todavía, la
+        // validación de adopción de más abajo falla con su mensaje normal
+        // ("la colección no existe"), consistente con cómo trata una
+        // TABLA faltante.
+        if let (Some(schema), false) = (schema, adopt_existing) {
+            client
+                .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
+                .map_err(|e| format!("no se pudo crear el schema '{schema}': {e}"))?;
+        }
+        let backend = Backend::Postgres {
+            client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)),
+            url: url.to_string(),
+            schema: schema.map(str::to_string),
+        };
 
         let checks_by_collection = check_fields_by_collection(program, &checker);
         let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
@@ -1725,8 +1764,8 @@ impl Db {
     /// nombrable desde afuera). Descarta el receiver -- un `linkc test` es
     /// una corrida de una sola vez, sin ningún otro proceso escuchando
     /// cambios en vivo, así que no hace falta esa plomería acá.
-    pub fn connect_postgres_for_testing(program: &Program, url: &str, adopt_existing: bool) -> Result<Self, String> {
-        Self::connect_postgres_with_options(program, url, adopt_existing).map(|(db, _remote_rx)| db)
+    pub fn connect_postgres_for_testing(program: &Program, url: &str, adopt_existing: bool, schema: Option<&str>) -> Result<Self, String> {
+        Self::connect_postgres_with_options(program, url, adopt_existing, schema).map(|(db, _remote_rx)| db)
     }
 
     /// Fija el costo de `crypto.hashPassword` para lo que quede de vida del

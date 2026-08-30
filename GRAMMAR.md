@@ -214,6 +214,7 @@
   - [3.190 `@requires(..., ownerOf: <colección>, id: <parámetro>, field: <campo>)` — RESUELTO, cierra RBAC (PLAN.md §9.5 ítem 3) y ABAC (ítem 4) juntos](#3190-requires-ownerof-colección-id-parámetro-field-campo--resuelto-cierra-rbac-planmd-95-ítem-3-y-abac-ítem-4-juntos)
   - [3.191 `@encrypted` — RESUELTO, cierra PLAN.md §9.5 ítem 2 (cifrado de campo a nivel de columna)](#3191-encrypted--resuelto-cierra-planmd-95-ítem-2-cifrado-de-campo-a-nivel-de-columna)
   - [3.192 Bug real: `information_schema` hardcodeaba `'public'` (o no filtraba schema en absoluto) — RESUELTO](#3192-bug-real-information_schema-hardcodeaba-public-o-no-filtraba-schema-en-absoluto--resuelto)
+  - [3.193 `--db-schema <nombre>`/`LINK_DATABASE_SCHEMA` — RESUELTO, cierra PLAN.md §9.3 ítem 4](#3193---db-schema-nombrelink_database_schema--resuelto-cierra-planmd-93-ítem-4)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -7107,6 +7108,43 @@ Encontrado investigando PLAN.md §9.3 ítem 4 (`--db-schema`, ver §3.193 más a
 **Verificado contra Postgres real, no solo leyendo el código**: `linkc introspect` con una URL que fija `search_path` a un schema no-`public` (`options=-c%20search_path%3D<schema>`, el mecanismo NATIVO de conexión de Postgres, confirmado leyendo la fuente de `tokio_postgres::Config` -- sin código propio de este proyecto de por medio) ahora SÍ ve una tabla creada en ese schema -- con un control negativo confirmando que la MISMA tabla es invisible sin ese `search_path`. `linkc serve --adopt-existing` con la misma URL adopta correctamente una tabla que vive en un schema no-`public`, donde antes hubiera fallado con "la colección no existe" pese a que la tabla existía de verdad.
 
 **Verificado**: 2 tests contra Postgres real (`pg_integration.rs`) -- `linkc introspect` ve una tabla en un schema no-`public` con el `search_path` correcto, y NO la ve sin él (control negativo); `--adopt-existing` conecta limpio contra una tabla en un schema no-`public`. Suite completa sin regresiones (1114 tests unitarios, sin ningún cambio de comportamiento para el caso `public` de siempre).
+
+### 3.193 `--db-schema <nombre>`/`LINK_DATABASE_SCHEMA` — RESUELTO, cierra PLAN.md §9.3 ítem 4
+
+Namespacing de PostgreSQL para compartir una base entre varios `.link` sin pensar en colisiones de nombre de tabla. La nota original de PLAN.md (24/08/2026) temía "decenas de sitios en 3 archivos" que arman SQL con el nombre de colección tal cual, y difirió la feature entera por eso. Un research fork (30/08/2026, código real antes de diseñar nada) encontró que esa estimación estaba desactualizada: el grueso de esos sitios no necesita NINGÚN cambio, porque Postgres ya resuelve un identificador SIN calificar (`CREATE TABLE "items"`, `SELECT * FROM "items"`) contra el `search_path` de la SESIÓN -- es el motor mismo el que decide en qué schema aterriza cada `"tabla"` sin comillas de schema, no el código de este proyecto. El único trabajo real (§3.192, ya cerrado) era el puñado de consultas a `information_schema` que ignoraban ese `search_path`.
+
+<!-- linkc:check -->
+```link
+type Item = { id: Int, name: String }
+db { items: Item[] }
+service Items {
+  rpc add(name: String) -> Item { db.items.insert(Item { id: 0, name: name }) }
+}
+```
+
+```
+$ linkc serve app.link 8787 --db postgres://localhost/shared --db-schema tenant_a
+$ linkc serve app.link 8788 --db postgres://localhost/shared --db-schema tenant_b
+```
+
+Los dos procesos comparten la MISMA base `shared`, la MISMA colección `items` -- pero cada uno lee y escribe en su propio schema (`tenant_a`/`tenant_b`), sin verse entre sí, sin ningún cambio en el `.link`.
+
+**Mecanismo: `SET search_path` a nivel de SESIÓN, nunca calificar cada SQL generado a mano.** `connect_postgres_client` (`runtime/db.rs`, el ÚNICO punto de todo el proyecto que abre una conexión nueva a Postgres -- usado por `serve`, `db shell`/`inspect`/`export`/`import`, `linkc migrate --dry-run`, `linkc test --db`, y el reconnect automático tras una caída) corre `client.batch_execute("SET search_path TO \"<schema>\"")` UNA vez, justo después de conectar, si `--db-schema` está configurado -- mismo mecanismo EXACTO que `db_admin.rs::run_shell_postgres` ya usa para `default_transaction_read_only` (GRAMMAR.md §3.189): sesión, nunca la URL, evita toda la fragilidad de escapar/mezclar un query param `options=` a mano. `Backend::Postgres` guarda el schema junto a la `url` (mismo campo que ya guardaba para reconectar, GRAMMAR.md §3.40) -- una reconexión real después de una caída reaplica `SET search_path`, no solo abre una conexión nueva "pelada" que silenciosamente volvería a `public`.
+
+**`CREATE SCHEMA IF NOT EXISTS`, un único lugar, con el mismo criterio que `CREATE TABLE`.** Solo `Db::connect_postgres_with_options` (el constructor real de `linkc serve`/`linkc test --db`, el ÚNICO lugar de todo el proyecto con permiso de correr DDL) lo ejecuta -- ANTES de crear cualquier tabla, y NUNCA si `--adopt-existing` está activo (mismo criterio exacto que ya rige `CREATE TABLE`: adoptar significa asumir que todo ya existe, sin tocar DDL). `db shell`/`inspect`/`export`/`introspect` -- de solo lectura por diseño -- nunca ejecutan esto, solo `SET search_path`: si el schema no existe todavía, `SET search_path` a un nombre inexistente NO es un error en Postgres (se salta al resolver nombres hasta que exista), así que estas herramientas simplemente ven "0 filas"/"no existe", el mismo comportamiento honesto de siempre.
+
+**`--db-schema` interpola DIRECTO en SQL (`SET search_path`/`CREATE SCHEMA IF NOT EXISTS` no aceptan un nombre de schema como parámetro bindeado) -- validado como identificador SQL simple ANTES de llegar a ningún lado que arme una consulta.** Letras/dígitos/`_`, sin empezar con un dígito, hasta 63 caracteres (`NAMEDATALEN` - 1, el límite real de Postgres) -- cualquier otra cosa (comillas, `;`, espacios) se rechaza con un error de CLI limpio, nunca llega a interpolarse.
+
+**`linkc introspect` NO tiene su propio `--db-schema`** -- a diferencia del resto, su interfaz es "pasá la URL cruda", sin flags propios; un `search_path` se compone gratis con el `options=` nativo de la URL misma (§3.192), sin que este comando necesite saber nada al respecto. `linkc serve-all` RECHAZA `--db-schema` de entrada -- nunca conecta a Postgres (cada servicio usa su propio SQLite local, mismo criterio que ya rechaza `--db`/`LINK_DATABASE_URL` compartido), así que el flag ahí sería silenciosamente inerte sin este rechazo.
+
+**Solo PostgreSQL -- SQLite no tiene ningún concepto de schema.** `--db-schema` combinado con un target SQLite (el default sin `--db`, o `--db` apuntando a un archivo) es un error de CLI limpio, nunca un no-op silencioso que deje a alguien pensando que tiene aislamiento cuando en realidad no pasa nada.
+
+**Límites honestos, deliberados**:
+- `linkc introspect`/`linkc serve-all` sin soporte directo (ver arriba) -- el primero compone con el mecanismo nativo de la URL, el segundo estructuralmente no aplica.
+- Sin rotación/migración de schema (mover datos de un schema a otro) -- fuera de alcance v0, sin evidencia de demanda.
+- El nombre del schema no se valida contra ningún límite de PostgreSQL más allá de longitud/caracteres -- un nombre reservado (`pg_catalog`, `information_schema`) técnicamente pasa la validación de identificador y falla recién al conectar, con el error real de Postgres, no uno inventado acá.
+
+**Verificado**: 6 tests de CLI (`cli_db_schema.rs`) -- identificador inválido (empieza con dígito, o con forma de inyección SQL) rechazado limpio; combinado con un target SQLite (explícito o por default) rechazado limpio; `linkc doctor` reporta el error como línea `[ERROR]` sin crashear; `linkc serve-all` rechaza de entrada. 3 tests contra Postgres real (`pg_integration.rs`) -- crea el schema y la tabla aterriza ahí (confirmado que NO aterriza en `public`); dos programas con la MISMA colección, cada uno con su propio `--db-schema`, contra la MISMA base, sin verse entre sí (el caso motivador real); `--adopt-existing` nunca crea el schema, falla limpio si no existe. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

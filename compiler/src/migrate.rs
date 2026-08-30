@@ -32,7 +32,7 @@ use std::collections::HashSet;
 /// sin ejecutar ninguna de esas sentencias. Conecta de verdad (necesita
 /// leer `information_schema.columns` para saber qué ya existe), pero solo
 /// hace `SELECT` -- nunca `CREATE`/`ALTER`.
-pub fn dry_run_postgres(program: &Program, url: &str) -> Result<String, String> {
+pub fn dry_run_postgres(program: &Program, url: &str, schema: Option<&str>) -> Result<String, String> {
     let (checker, errors) = Checker::build_symbols(program);
     if let Some(e) = errors.into_iter().next() {
         return Err(format!("programa inválido: {e}"));
@@ -44,8 +44,12 @@ pub fn dry_run_postgres(program: &Program, url: &str) -> Result<String, String> 
         .map(|(k, _)| k.clone())
         .collect();
 
-    let client = connect_postgres_client(url)?;
-    let backend = Backend::Postgres { client: parking_lot::ReentrantMutex::new(RefCell::new(client)), url: url.to_string() };
+    let client = connect_postgres_client(url, schema)?;
+    let backend = Backend::Postgres {
+        client: parking_lot::ReentrantMutex::new(RefCell::new(client)),
+        url: url.to_string(),
+        schema: schema.map(str::to_string),
+    };
     let checks_by_collection = check_fields_by_collection(program, &checker);
     let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
     let indexed_by_collection = index_fields_by_collection(program, &checker);

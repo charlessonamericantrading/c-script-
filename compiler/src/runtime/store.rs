@@ -102,6 +102,11 @@ pub(crate) enum Backend {
         /// la conexión inicial (`db::connect_postgres_client`), sin
         /// duplicar esa lógica acá (GRAMMAR.md §3.40).
         url: String,
+        /// `--db-schema`/`LINK_DATABASE_SCHEMA` (GRAMMAR.md §3.193), si se
+        /// configuró -- guardado por el MISMO motivo que `url`: un
+        /// reconnect (`with_reconnect`) tiene que reaplicar `SET
+        /// search_path` en la conexión NUEVA, no solo en la original.
+        schema: Option<String>,
     },
 }
 
@@ -147,10 +152,10 @@ impl Backend {
                     params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
                 conn.execute(sql, refs.as_slice()).map_err(|e| e.to_string())
             }
-            Backend::Postgres { client, url } => {
+            Backend::Postgres { client, url, schema } => {
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     params.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
-                with_reconnect(client, url, |c| c.execute(sql, refs.as_slice())).map(|n| n as usize)
+                with_reconnect(client, url, schema.as_deref(), |c| c.execute(sql, refs.as_slice())).map(|n| n as usize)
             }
         }
     }
@@ -159,7 +164,7 @@ impl Backend {
     pub(crate) fn execute_ddl(&self, sql: &str) -> Result<(), String> {
         match self {
             Backend::Sqlite(conn) => conn.lock().execute_batch(sql).map_err(|e| e.to_string()),
-            Backend::Postgres { client, url } => with_reconnect(client, url, |c| c.batch_execute(sql)),
+            Backend::Postgres { client, url, schema } => with_reconnect(client, url, schema.as_deref(), |c| c.batch_execute(sql)),
         }
     }
 
@@ -189,10 +194,10 @@ impl Backend {
                     .map_err(|e| e.to_string())?;
                 rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
             }
-            Backend::Postgres { client, url } => {
+            Backend::Postgres { client, url, schema } => {
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     params.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
-                let rows = with_reconnect(client, url, |c| c.query(sql, refs.as_slice()))?;
+                let rows = with_reconnect(client, url, schema.as_deref(), |c| c.query(sql, refs.as_slice()))?;
                 rows.iter()
                     .map(|row| {
                         kinds
@@ -222,11 +227,11 @@ impl Backend {
             // (`lastval()`) es por sesión: con una segunda conexión de por medio
             // devolvería el id de otra fila. `RETURNING` lo resuelve en la misma
             // sentencia, sin ventana de carrera posible.
-            Backend::Postgres { client, url } => {
+            Backend::Postgres { client, url, schema } => {
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     params.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
                 let returning = format!("{sql} RETURNING \"id\"");
-                let row = with_reconnect(client, url, |c| c.query_one(&returning, refs.as_slice()))?;
+                let row = with_reconnect(client, url, schema.as_deref(), |c| c.query_one(&returning, refs.as_slice()))?;
                 // `Row::get` (a diferencia de todo lo demás en este archivo)
                 // PANICKEA si el valor no convierte al tipo pedido -- documentado
                 // así en tokio-postgres. `Db::connect_postgres` ya rechaza al
@@ -266,8 +271,8 @@ impl Backend {
     pub(crate) fn notify(&self, channel: &str, payload: &str) -> Result<(), String> {
         match self {
             Backend::Sqlite(_) => Ok(()),
-            Backend::Postgres { client, url } => {
-                with_reconnect(client, url, |c| c.execute("SELECT pg_notify($1, $2)", &[&channel, &payload])).map(|_| ())
+            Backend::Postgres { client, url, schema } => {
+                with_reconnect(client, url, schema.as_deref(), |c| c.execute("SELECT pg_notify($1, $2)", &[&channel, &payload])).map(|_| ())
             }
         }
     }
@@ -291,13 +296,18 @@ impl Backend {
 fn with_reconnect<T>(
     client: &parking_lot::ReentrantMutex<RefCell<postgres::Client>>,
     url: &str,
+    schema: Option<&str>,
     op: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error>,
 ) -> Result<T, String> {
     let guard = client.lock();
     let result = op(&mut guard.borrow_mut());
     if let Err(e) = &result {
         if e.is_closed() {
-            if let Ok(fresh) = super::db::connect_postgres_client(url) {
+            // `connect_postgres_client` reaplica `SET search_path` (GRAMMAR.md
+            // §3.193) como parte de conectar -- una conexión NUEVA tras una
+            // caída no hereda la sesión vieja, así que sin esto una
+            // reconexión real perdería silenciosamente el schema configurado.
+            if let Ok(fresh) = super::db::connect_postgres_client(url, schema) {
                 *guard.borrow_mut() = fresh;
             }
         }

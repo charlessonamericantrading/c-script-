@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.149.0] - 2026-08-30
+
+### ✨ Nuevo
+**`--db-schema <nombre>`/`LINK_DATABASE_SCHEMA`** (PLAN.md §9.3 ítem 4) -- namespacing de PostgreSQL para compartir una base entre varios `.link` sin colisión de nombre de tabla. `linkc serve app.link 8787 --db postgres://host/shared --db-schema tenant_a` y otro proceso con `--db-schema tenant_b` sobre la MISMA base, MISMA colección -- cada uno lee y escribe en su propio schema.
+
+- `SET search_path` una vez al conectar (`connect_postgres_client`, el único punto de conexión de todo el proyecto) -- cubre `serve`/`db shell`/`inspect`/`export`/`import`/`migrate --dry-run`/`test --db`/el reconnect automático, todos gratis.
+- `CREATE SCHEMA IF NOT EXISTS` solo en el constructor real de `serve`, nunca bajo `--adopt-existing` -- mismo criterio que ya rige `CREATE TABLE`.
+- Solo PostgreSQL -- combinado con SQLite es un error de CLI limpio, nunca un no-op silencioso.
+- `linkc introspect` compone con `options=` nativo de la URL en vez de un flag propio; `linkc serve-all` lo rechaza de entrada (nunca conecta a Postgres).
+
+**Verificado**: 6 tests de CLI + 3 contra Postgres real, incluido el caso motivador exacto: dos programas con la MISMA colección, cada uno con su propio `--db-schema`, sin colisión. Suite completa sin regresiones. Ver GRAMMAR.md §3.193.
+
 ## [1.148.0] - 2026-08-30
 
 ### 🐛 Arreglado

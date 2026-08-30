@@ -4673,3 +4673,146 @@ fn adopt_existing_finds_a_table_in_a_non_public_schema_when_search_path_names_it
 
     admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA}\" CASCADE")).ok();
 }
+
+// ---- `--db-schema`/`LINK_DATABASE_SCHEMA` (GRAMMAR.md §3.193) ----
+
+#[test]
+fn db_schema_creates_the_schema_and_places_the_table_there_not_in_public() {
+    const SCHEMA: &str = "linkc_test_db_schema_create";
+    const COLLECTION: &str = "widgets";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como admin");
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA}\" CASCADE")).ok();
+
+    let temp = TempDir::new("db-schema-create");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            "type Item = {{ id: Int, name: String }}\ndb {{ {COLLECTION}: Item[] }}\n\
+             service Widgets {{ rpc add(name: String) -> Item {{ db.{COLLECTION}.insert(Item {{ id: 0, name: name }}) }} }}"
+        ),
+    );
+
+    let server = Serve::start_with_args(&src, &url, &["--db-schema", SCHEMA]);
+    let created = server.rpc("Widgets/add", r#"{"name":"Ada"}"#);
+    assert!(created["id"].is_i64(), "{created:?}");
+    drop(server);
+
+    // La tabla existe en EL SCHEMA nombrado, no en `public` -- confirmado
+    // leyendo `information_schema` con el schema EXPLÍCITO, sin depender
+    // del `search_path` de ESTA conexión de test.
+    let in_target: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2",
+            &[&SCHEMA, &COLLECTION],
+        )
+        .expect("consultar information_schema")
+        .get(0);
+    assert_eq!(in_target, 1, "la tabla debe existir en '{SCHEMA}'");
+    let in_public: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1",
+            &[&COLLECTION],
+        )
+        .expect("consultar information_schema")
+        .get(0);
+    assert_eq!(in_public, 0, "la tabla NO debe haber caído en 'public'");
+
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA}\" CASCADE")).ok();
+}
+
+#[test]
+fn two_programs_with_the_same_collection_name_use_different_schemas_without_colliding() {
+    // El caso motivador real de PLAN.md §9.3 ítem 4: compartir una base
+    // Postgres entre varios `.link` sin pensar en colisiones de nombre.
+    // Dos programas, la MISMA colección "items", cada uno con su propio
+    // --db-schema, contra la MISMA base -- cada uno solo ve sus propias
+    // filas.
+    const SCHEMA_A: &str = "linkc_test_db_schema_tenant_a";
+    const SCHEMA_B: &str = "linkc_test_db_schema_tenant_b";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como admin");
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA_A}\" CASCADE")).ok();
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA_B}\" CASCADE")).ok();
+
+    let temp = TempDir::new("db-schema-two-tenants");
+    let src = temp.write("app.link", "type Item = { id: Int, name: String }\ndb { items: Item[] }\nservice Items { rpc add(name: String) -> Item { db.items.insert(Item { id: 0, name: name }) } rpc list() -> Item[] { db.items.all() } }");
+
+    let server_a = Serve::start_with_args(&src, &url, &["--db-schema", SCHEMA_A]);
+    server_a.rpc("Items/add", r#"{"name":"tenant A item"}"#);
+    let list_a = server_a.rpc("Items/list", "{}");
+    assert_eq!(list_a.as_array().unwrap().len(), 1, "{list_a:?}");
+    drop(server_a);
+
+    let server_b = Serve::start_with_args(&src, &url, &["--db-schema", SCHEMA_B]);
+    let list_b_before = server_b.rpc("Items/list", "{}");
+    assert_eq!(
+        list_b_before.as_array().unwrap().len(),
+        0,
+        "el schema B es un namespace DISTINTO -- no debe ver la fila que A insertó: {list_b_before:?}"
+    );
+    server_b.rpc("Items/add", r#"{"name":"tenant B item"}"#);
+    let list_b_after = server_b.rpc("Items/list", "{}");
+    assert_eq!(list_b_after.as_array().unwrap().len(), 1);
+    assert_eq!(list_b_after[0]["name"], "tenant B item");
+    drop(server_b);
+
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA_A}\" CASCADE")).ok();
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA_B}\" CASCADE")).ok();
+}
+
+#[test]
+fn adopt_existing_with_db_schema_never_creates_the_schema_and_fails_cleanly_if_missing() {
+    // `--adopt-existing` nunca ejecuta DDL, ni siquiera `CREATE SCHEMA IF
+    // NOT EXISTS` -- mismo criterio que ya rige para `CREATE TABLE`. Contra
+    // un schema que NO existe, el fallo tiene que ser limpio (el mensaje
+    // normal de "la colección no existe"), nunca crear el schema en
+    // silencio ni un panic.
+    const SCHEMA: &str = "linkc_test_db_schema_adopt_missing";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut admin = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como admin");
+    admin.batch_execute(&format!("DROP SCHEMA IF EXISTS \"{SCHEMA}\" CASCADE")).ok();
+
+    let temp = TempDir::new("db-schema-adopt-missing");
+    let src = temp.write("app.link", "type Item = { id: Int, name: String }\ndb { items: Item[] }");
+
+    let port = free_port();
+    let log_dir = src.parent().expect("el .link vive en algún directorio");
+    let out_path = log_dir.join(format!("serve-{port}.out"));
+    let err_path = log_dir.join(format!("serve-{port}.err"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("serve")
+        .arg(&src)
+        .arg(port.to_string())
+        .arg("--adopt-existing")
+        .arg("--db-schema")
+        .arg(SCHEMA)
+        .env("LINK_DATABASE_URL", &url)
+        .stdout(std::fs::File::create(&out_path).expect("crear el log de stdout"))
+        .stderr(std::fs::File::create(&err_path).expect("crear el log de stderr"))
+        .spawn()
+        .expect("iniciar 'linkc serve'");
+    let status = child.wait().expect("esperar a que 'linkc serve' termine");
+    assert!(!status.success(), "no debería arrancar: el schema no existe y --adopt-existing nunca lo crea");
+
+    let exists: i64 = admin
+        .query_one("SELECT count(*) FROM information_schema.schemata WHERE schema_name = $1", &[&SCHEMA])
+        .expect("consultar information_schema.schemata")
+        .get(0);
+    assert_eq!(exists, 0, "--adopt-existing NUNCA debe crear el schema, ni siquiera al fallar");
+}

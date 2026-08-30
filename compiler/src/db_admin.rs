@@ -181,11 +181,15 @@ pub fn export_sqlite(program: &Program, db_path: &Path) -> Result<ExportFile, St
 /// que `inspect_postgres`. Backend armado a mano, sin ningún `Db` (sin hilo
 /// LISTEN/NOTIFY, sin tabla de rate-limit -- nada de eso pertenece a un
 /// export de solo lectura).
-pub fn export_postgres(program: &Program, url: &str) -> Result<ExportFile, String> {
+pub fn export_postgres(program: &Program, url: &str, schema: Option<&str>) -> Result<ExportFile, String> {
     let (checker, plans) = declared_collection_plans(program)?;
     let simple_enums = simple_enum_names(program);
-    let client = connect_postgres_client(url)?;
-    let backend = Backend::Postgres { client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)), url: url.to_string() };
+    let client = connect_postgres_client(url, schema)?;
+    let backend = Backend::Postgres {
+        client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)),
+        url: url.to_string(),
+        schema: schema.map(str::to_string),
+    };
     let mut collections = HashMap::with_capacity(plans.len());
     for plan in &plans {
         let exists = !crate::migrate::existing_columns(&backend, &plan.name)?.is_empty();
@@ -304,10 +308,10 @@ pub fn import_sqlite(program: &Program, db_path: &Path, file: &ExportFile) -> Re
 /// `connect_postgres_for_testing` (envoltorio público existente que
 /// descarta el receiver de LISTEN/NOTIFY: un `linkc db import` es una
 /// corrida de una sola vez, sin nada más escuchando cambios en vivo).
-pub fn import_postgres(program: &Program, url: &str, file: &ExportFile) -> Result<ImportReport, String> {
+pub fn import_postgres(program: &Program, url: &str, file: &ExportFile, schema: Option<&str>) -> Result<ImportReport, String> {
     let (checker, plans) = declared_collection_plans(program)?;
     validate_known_collections(&plans, file)?;
-    let db = Db::connect_postgres_for_testing(program, url, false)?;
+    let db = Db::connect_postgres_for_testing(program, url, false, schema)?;
     run_import(&db, &checker, &plans, file)
 }
 
@@ -534,8 +538,8 @@ pub fn run_shell_sqlite(db_path: &Path) -> Result<(), String> {
 /// escriba -- más robusto que parsear palabras clave del lado del cliente
 /// (un `WITH x AS (INSERT ...) SELECT ...` engañaría un parser de
 /// keywords, nunca a Postgres mismo).
-pub fn run_shell_postgres(url: &str) -> Result<(), String> {
-    let mut client = connect_postgres_client(url)?;
+pub fn run_shell_postgres(url: &str, schema: Option<&str>) -> Result<(), String> {
+    let mut client = connect_postgres_client(url, schema)?;
     client.batch_execute("SET default_transaction_read_only = on").map_err(pg_error_text)?;
     run_shell_loop(|sql| run_query_postgres(&mut client, sql))
 }
