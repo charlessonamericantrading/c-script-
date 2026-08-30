@@ -209,6 +209,7 @@
   - [3.185 `linkc db export`/`linkc db import` — RESUELTO PARCIAL](#3185-linkc-db-exportlinkc-db-import--resuelto-parcial)
   - [3.186 `builtin_args!`: fast-path para curar un builtin nuevo — RESUELTO (tooling interno, no una feature del lenguaje)](#3186-builtin_args-fast-path-para-curar-un-builtin-nuevo--resuelto-tooling-interno-no-una-feature-del-lenguaje)
   - [3.187 `String` contra `json`/`jsonb` NATIVOS de Postgres — RESUELTO](#3187-string-contra-jsonjsonb-nativos-de-postgres--resuelto)
+  - [3.188 Lint `manual-role-check-without-requires` — RESUELTO](#3188-lint-manual-role-check-without-requires--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -6912,6 +6913,38 @@ Bug real de producción, severidad alta, reportado por skynet-43 (iaacademy) el 
 **Límite honesto, deliberado**: sin cambios a `linkc introspect` -- su advertencia existente para `json`/`jsonb` ("la forma real del JSON no se puede inferir de `information_schema`; declará un `type` propio si corresponde") sigue siendo consejo válido, es sobre MODELADO (¿`String` genérico o un `type` con la forma real?), no sobre si `String` funciona -- ahora sí funciona, de punta a punta.
 
 **Verificado contra Postgres real** (`pg_integration.rs`): una tabla adoptada con `properties jsonb`, el repro exacto reportado -- lectura de una fila con contenido real y de una con `NULL`, escritura de un valor nuevo Y de `null` (los dos fallaban igual antes del fix), confirmado con un operador `jsonb` real (`properties->>'amount'`) que solo funciona si de verdad se guardó como `jsonb`, no forzado a otro tipo. Segundo test aparte para `json` (no `jsonb`) -- formato binario distinto, confirma que el fix distingue los dos casos. Más 6 tests unitarios locales (sin Postgres, la decodificación binaria en sí es lógica pura): el byte de versión de `jsonb` se quita correctamente, `json` no tiene ningún byte de más, una versión de encoding desconocida se rechaza limpio (no panic), un payload truncado (vacío) se rechaza limpio, y `accepts` solo es cierto para `json`/`jsonb`, nunca para `TEXT` plano.
+
+### 3.188 Lint `manual-role-check-without-requires` — RESUELTO
+
+PLAN.md §9.5 ítem 1, primer ítem de la ronda de seguridad -- reformulación ya decidida en una ronda anterior, esta cierra la implementación. El lint original ("`@requires(Role.X)` que nunca llama a `auth.currentRole()`/`currentUserId()`") resultó ser de mala señal al auditarlo: el caso MÁS COMÚN y CORRECTO de `@requires(Role.Admin)` (gating de un solo rol, sin necesitar diferenciar comportamiento adentro del cuerpo) nunca llama a ninguno de los dos -- implementarlo tal cual habría generado ruido constante sobre código perfectamente bien escrito. La versión con señal real es la INVERSA.
+
+<!-- linkc:check -->
+```link
+enum Role { Admin, Member }
+service Users {
+  rpc deleteUser(id: Int) -> Bool {
+    if auth.currentRole() != "Admin" {
+      panic("no autorizado");
+    } else {
+    }
+    true
+  }
+}
+```
+
+```
+$ linkc lint app.link
+lint: 1 advertencia(s) en app.link:
+  [manual-role-check-without-requires] app.link:3:3: 'deleteUser' llama a auth.currentRole()/currentUserId() para hacer su propia verificación de rol, pero no tiene @requires/@authenticated -- un bug en esa lógica ad-hoc bypasea el chequeo entero en silencio; declará @requires(Role.X) o @authenticated en el rpc
+```
+
+**Detecta un rpc que hace su PROPIA verificación manual de rol adentro del cuerpo (llamando a `auth.currentRole()`/`auth.currentUserId()`), sin `@requires`/`@authenticated` en su propia anotación.** El riesgo real: el chequeo de autorización vive en lógica ad-hoc del cuerpo en vez de en la anotación central -- un bug ahí (una condición invertida, una rama olvidada) bypasea el chequeo entero en silencio, y el rpc sigue *pareciendo* protegido a simple vista porque llama a las funciones correctas.
+
+**Mismo criterio que el lint `mixed-service-auth` (`lint.rs`) ya usa para excluir `@cron`**: nunca alcanzable vía HTTP (GRAMMAR.md §3.159), así que su falta de `@requires` no dice nada real sobre superficie expuesta. Un rpc que YA tiene `@requires`/`@authenticated` Y además llama a `auth.currentRole()` adentro del cuerpo NO dispara este lint -- el chequeo real ya corrió antes de que el cuerpo empiece (`check_auth_gate`, GRAMMAR.md §3.14), así que esa llamada es a lo sumo redundante, nunca la única defensa.
+
+**Recorrido exhaustivo por variante de `Expr`/`Stmt`** (`block_calls_auth_identity`/`expr_calls_auth_identity`, `lint.rs`), mismo patrón y mismo motivo que `block_uses_ident`/`expr_count_ident` ya establecen para `unused-var` (issue #11, GRAMMAR.md §3.115) -- una llamada a `auth.currentRole()` escondida adentro de una closure o un `match` tiene que seguir siendo visible; omitir un arm acá sería el mismo tipo de falso negativo silencioso que esa ronda ya encontró y cerró para otro lint.
+
+**Verificado**: 7 tests unitarios en `lint.rs` (positivo con `currentRole()`, positivo con `currentUserId()`, negativo con `@requires` real presente, negativo `@cron`, negativo sin ninguna llamada de auth, y dos casos de recorrido -- adentro de una closure y adentro de un `match` -- confirmando que el detector no se queda corto como `unused-var` una vez se quedó). 1 test de CLI contra el binario real (`cli_fmt_lint.rs`).
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

@@ -132,6 +132,39 @@ fn linkc_lint_flags_a_secret_compared_with_double_equals() {
     assert!(stdout.contains("timingSafeEqual"), "{stdout}");
 }
 
+/// GRAMMAR.md §3.188: un rpc que hace su propia verificación manual de rol
+/// (`auth.currentRole()`), sin `@requires`/`@authenticated` -- contra el
+/// binario real, no solo la unidad de lint.rs.
+#[test]
+fn linkc_lint_flags_a_manual_role_check_with_no_requires_annotation() {
+    let temp = TempDir::new("lint-manual-role-check");
+    let src = r#"
+        service S {
+            rpc deleteUser(id: Int) -> Bool {
+                if auth.currentRole() != "Admin" {
+                    panic("no autorizado");
+                } else {
+                }
+                true
+            }
+        }
+    "#;
+    let file = temp.write("app.link", src);
+
+    let res = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("lint")
+        .arg(&file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(res.status.success());
+    let stdout = String::from_utf8_lossy(&res.stdout);
+    assert!(stdout.contains("manual-role-check-without-requires"), "{stdout}");
+    assert!(stdout.contains("deleteUser"), "{stdout}");
+}
+
 #[test]
 fn linkc_lint_fix_applies_autofixes_in_place() {
     let temp = TempDir::new("lint-fix-test");

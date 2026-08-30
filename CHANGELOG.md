@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.144.0] - 2026-08-30
+
+### ✨ Nuevo
+**Lint `manual-role-check-without-requires`** (PLAN.md §9.5 ítem 1, primer ítem de la ronda de seguridad) -- reformulación ya decidida en una ronda anterior (el lint original, "`@requires` que nunca llama a `auth.currentRole()`", era de mala señal: el caso más común y correcto de `@requires(Role.Admin)` nunca llama a ninguno de los dos). La versión implementada es la inversa: detecta un rpc que hace su PROPIA verificación manual de rol adentro del cuerpo (`auth.currentRole()`/`currentUserId()`), sin `@requires`/`@authenticated` en su propia anotación -- el chequeo real vive en lógica ad-hoc del cuerpo, un bug ahí bypasea todo en silencio.
+
+- Recorrido exhaustivo por variante de `Expr`/`Stmt` (mismo patrón que `unused-var` ya usa) -- una llamada escondida en una closure o un `match` sigue siendo detectada.
+- `@cron` excluido, mismo criterio que `mixed-service-auth` (nunca alcanzable vía HTTP). Un rpc que YA tiene `@requires` y además llama a `auth.currentRole()` no dispara -- esa llamada es a lo sumo redundante, nunca la única defensa.
+
+**Verificado**: 7 tests unitarios + 1 contra el binario real. Suite completa (1410 tests) sin regresiones. Ver GRAMMAR.md §3.188.
+
 ## [1.143.1] - 2026-08-30
 
 ### 🐛 Arreglado

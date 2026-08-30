@@ -55,6 +55,34 @@ pub fn lint_program(program: &Program) -> Vec<LintWarning> {
                         Member::Rpc(r) | Member::Stream(r) => r,
                     };
                     lint_block(&rpc.body, &mut warnings);
+                    // GRAMMAR.md §3.188: reformulación del lint de
+                    // "autorización de fachada" original (esa versión
+                    // resultó ser de mala señal -- el caso MÁS COMÚN y
+                    // CORRECTO de `@requires(Role.Admin)` nunca llama a
+                    // `auth.currentRole()`/`currentUserId()`, así que
+                    // exigirlo habría sido ruido constante sobre código
+                    // bien escrito). La versión con señal real es la
+                    // INVERSA: un rpc que hace su PROPIA verificación
+                    // manual de rol adentro del cuerpo, llamando a
+                    // `auth.currentRole()`/`currentUserId()`, pero SIN
+                    // `@requires`/`@authenticated` en su propia anotación
+                    // -- el chequeo real vive en lógica ad-hoc del cuerpo,
+                    // así que un bug ahí bypasea todo en silencio (el
+                    // rpc sigue pareciendo "protegido" a simple vista).
+                    // Mismo criterio que `mixed-service-auth` arriba para
+                    // excluir `@cron`: nunca alcanzable vía HTTP, así que
+                    // su falta de auth no dice nada real.
+                    if rpc.cron().is_none() && rpc.auth().is_none() && block_calls_auth_identity(&rpc.body) {
+                        warnings.push(LintWarning {
+                            rule: "manual-role-check-without-requires",
+                            message: format!(
+                                "'{}' llama a auth.currentRole()/currentUserId() para hacer su propia verificación de rol, pero no tiene @requires/@authenticated -- un bug en esa lógica ad-hoc bypasea el chequeo entero en silencio; declará @requires(Role.X) o @authenticated en el rpc",
+                                rpc.name
+                            ),
+                            line: rpc.span.line,
+                            col: rpc.span.col,
+                        });
+                    }
                 }
             }
             Item::Const(c) => {
@@ -482,6 +510,65 @@ fn expr_count_ident(expr: &Expr, target: &str) -> usize {
     }
 }
 
+/// GRAMMAR.md §3.188: ¿este bloque llama a `auth.currentRole()`/
+/// `auth.currentUserId()` en algún lugar? Mismo recorrido exhaustivo por
+/// variante de `Stmt`/`Expr` que `block_uses_ident`/`expr_count_ident` ya
+/// establecen arriba -- mismo motivo (GRAMMAR.md §3.115): omitir un arm acá
+/// dejaría una llamada real (ej. adentro de una closure o un `match`)
+/// invisible para `manual-role-check-without-requires`, el mismo tipo de
+/// bug que esa ronda ya encontró y cerró para `unused-var`.
+fn block_calls_auth_identity(block: &Block) -> bool {
+    for stmt in &block.stmts {
+        let found = match &stmt.node {
+            Stmt::Let { value, .. } | Stmt::Assign { value, .. } => expr_calls_auth_identity(&value.node),
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => expr_calls_auth_identity(&e.node),
+            Stmt::Return(None) => false,
+            Stmt::While { cond, body } => expr_calls_auth_identity(&cond.node) || block_calls_auth_identity(body),
+        };
+        if found {
+            return true;
+        }
+    }
+    block.tail.as_ref().is_some_and(|t| expr_calls_auth_identity(&t.node))
+}
+
+fn expr_calls_auth_identity(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { callee, args } => {
+            let is_auth_identity_call = matches!(
+                &callee.node,
+                Expr::FieldAccess { base, field }
+                    if matches!(&base.node, Expr::Ident(name) if name == "auth")
+                        && (field == "currentRole" || field == "currentUserId")
+            );
+            is_auth_identity_call || expr_calls_auth_identity(&callee.node) || args.iter().any(|a| expr_calls_auth_identity(&a.node))
+        }
+        Expr::Unary { operand, .. }
+        | Expr::Paren(operand)
+        | Expr::FieldAccess { base: operand, .. }
+        | Expr::TupleIndex { base: operand, .. } => expr_calls_auth_identity(&operand.node),
+        Expr::Binary { left, right, .. } => expr_calls_auth_identity(&left.node) || expr_calls_auth_identity(&right.node),
+        Expr::Index { base, index } => expr_calls_auth_identity(&base.node) || expr_calls_auth_identity(&index.node),
+        Expr::ArrayLit(elems) | Expr::TupleLit(elems) => elems.iter().any(|e| expr_calls_auth_identity(&e.node)),
+        Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| expr_calls_auth_identity(&v.node)),
+        Expr::Closure { body, .. } | Expr::Transaction(body) => block_calls_auth_identity(body),
+        Expr::If { cond, then_block, else_block } => {
+            expr_calls_auth_identity(&cond.node) || block_calls_auth_identity(then_block) || block_calls_auth_identity(else_block)
+        }
+        Expr::Match { scrutinee, arms } => {
+            expr_calls_auth_identity(&scrutinee.node)
+                || arms.iter().any(|arm| {
+                    arm.guard.as_ref().is_some_and(|g| expr_calls_auth_identity(&g.node))
+                        || match &arm.body {
+                            MatchArmBody::Expr(e) => expr_calls_auth_identity(&e.node),
+                            MatchArmBody::Block(b) => block_calls_auth_identity(b),
+                        }
+                })
+        }
+        _ => false,
+    }
+}
+
 /// Corrige automáticamente advertencias corregibles del linter (unused-mut y unused-var).
 pub fn fix_source(source: &str, _warnings: &[LintWarning]) -> String {
     let mut fixed = source.to_string();
@@ -589,6 +676,126 @@ mod tests {
             !warnings.iter().any(|w| w.rule == "mixed-service-auth"),
             "un @cron no debería contar como rpc 'público' para este lint: {warnings:?}"
         );
+    }
+
+    // ---- `manual-role-check-without-requires` (GRAMMAR.md §3.188) ----
+
+    #[test]
+    fn a_manual_role_check_with_no_requires_annotation_is_flagged() {
+        let code = r#"
+            enum Role { Admin, Member }
+            service S {
+                rpc deleteUser(id: Int) -> Bool {
+                    if auth.currentRole() != "Admin" {
+                        panic("no autorizado");
+                    } else {
+                    }
+                    true
+                }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        let hit = warnings.iter().find(|w| w.rule == "manual-role-check-without-requires");
+        assert!(hit.is_some(), "{warnings:?}");
+        assert!(hit.unwrap().message.contains("deleteUser"), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_manual_check_of_current_user_id_with_no_requires_is_also_flagged() {
+        let code = r#"
+            service S {
+                rpc me(id: Int) -> Bool { auth.currentUserId() == id }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(warnings.iter().any(|w| w.rule == "manual-role-check-without-requires"), "{warnings:?}");
+    }
+
+    /// Caso legítimo, no un bug: el rpc SÍ tiene `@requires` -- el chequeo
+    /// real ya vive en la anotación (aplicado ANTES de que el cuerpo
+    /// corra), así que llamar a `auth.currentRole()` adentro del cuerpo
+    /// (para lógica adicional, no para el gate de autorización en sí) es
+    /// redundante como mucho, nunca la única defensa.
+    #[test]
+    fn a_manual_check_alongside_a_real_requires_annotation_is_not_flagged() {
+        let code = r#"
+            enum Role { Admin, Member }
+            service S {
+                @requires(Role.Admin)
+                rpc deleteUser(id: Int) -> Bool {
+                    if auth.currentRole() != "Admin" {
+                        panic("no autorizado");
+                    } else {
+                    }
+                    true
+                }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "manual-role-check-without-requires"),
+            "un rpc que YA tiene @requires no es el caso que este lint busca: {warnings:?}"
+        );
+    }
+
+    /// Mismo criterio que `mixed-service-auth`: un `@cron` nunca es
+    /// alcanzable vía HTTP, así que su falta de `@requires` no es una
+    /// superficie real, aunque su cuerpo llame a `auth.currentRole()` (algo
+    /// que ni siquiera tendría sentido, pero no es este lint el que debe
+    /// avisarlo).
+    #[test]
+    fn a_cron_job_calling_auth_identity_is_not_flagged() {
+        let code = r#"
+            service S {
+                @cron("5m")
+                rpc sweep() -> Void { let r = auth.currentRole(); }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "manual-role-check-without-requires"),
+            "un @cron nunca es alcanzable vía HTTP: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_body_with_no_auth_identity_call_at_all_is_not_flagged() {
+        let code = r#"
+            service S {
+                rpc ping() -> Void { }
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(!warnings.iter().any(|w| w.rule == "manual-role-check-without-requires"), "{warnings:?}");
+    }
+
+    /// El caso de issue #11 (GRAMMAR.md §3.115), pero para ESTE detector:
+    /// una llamada a `auth.currentRole()` que aparece SOLO adentro de una
+    /// closure (o un `match`) tiene que ser visible igual -- si
+    /// `expr_calls_auth_identity` alguna vez perdiera un arm, este es
+    /// exactamente el tipo de falso negativo silencioso que reaparecería.
+    #[test]
+    fn an_auth_identity_call_inside_a_closure_or_match_is_still_detected() {
+        let code = r#"
+            service S {
+                rpc a(ids: Int[]) -> Int[] {
+                    ids.filter(|x: Int| { auth.currentUserId() == x })
+                }
+            }
+        "#;
+        assert!(lint_warnings(code).iter().any(|w| w.rule == "manual-role-check-without-requires"), "closure case");
+
+        let code2 = r#"
+            service S {
+                rpc b(id: Int?) -> Bool {
+                    match id {
+                        n: Int => auth.currentUserId() == n,
+                        null => false,
+                    }
+                }
+            }
+        "#;
+        assert!(lint_warnings(code2).iter().any(|w| w.rule == "manual-role-check-without-requires"), "match case");
     }
 
     #[test]
