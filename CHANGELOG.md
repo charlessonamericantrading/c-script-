@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.155.0] - 2026-08-31
+
+### 🐛 Arreglado
+**Bug crítico: `Decimal.toFloat()`/`.toString()` inalcanzables en runtime** -- tipaban limpio en el checker y su dispatch en `runtime/mod.rs` estaba correctamente escrito, pero `Expr::FieldAccess` (el paso previo que decide si `x.metodo` puede diferirse a `Value::BoundMethod`) tenía su propio allowlist de tipos elegibles, y a `Value::Decimal` le faltaba estar ahí -- así que cualquier método sobre un `Decimal` fallaba antes de llegar al dispatch real, con el mismo error que un campo inexistente. Reportado por la sesión `fix-myf-audit-findings` (adoptador MyFinance) inmediatamente tras actualizar a v1.152.0 para verificar el fix de `Decimal == Decimal` (v1.151.0) -- era un bug distinto y nuevo, no el mismo. Reproducido en vivo contra un `linkc serve` real antes y después del fix, confirmando el mismo texto de error desaparece.
+
+**Verificado**: 1 test de runtime nuevo (`invoke_rpc`) cubriendo `.toFloat()`/`.toString()` sobre un `Decimal` recibido como parámetro y `.toFloat()` encadenado directo sobre `.toDecimal()`. Suite completa sin regresiones. Ver GRAMMAR.md §3.199.
+
 ## [1.154.0] - 2026-08-31
 
 ### ✨ Nuevo

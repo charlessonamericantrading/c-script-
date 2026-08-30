@@ -220,6 +220,7 @@
   - [3.196 Aritmética de `Timestamp`: `.addMillis()`/`.addSeconds()`/`.addMinutes()`/`.addHours()`/`.addDays()` — RESUELTO](#3196-aritmética-de-timestamp-addmillisaddsecondsaddminutesaddhoursadddays--resuelto)
   - [3.197 `auth.claim(name: String) -> String?` — RESUELTO](#3197-authclaimname-string---string--resuelto)
   - [3.198 Métodos de `String`: `.substring()`, `.replace()`, `.split()`, `.padStart()`/`.padEnd()` — RESUELTO](#3198-métodos-de-string-substring-replace-split-padstartpadend--resuelto)
+  - [3.199 Bug crítico: `Decimal.toFloat()`/`.toString()` inalcanzables en runtime — RESUELTO](#3199-bug-crítico-decimaltofloattostring-inalcanzables-en-runtime--resuelto)
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -7266,6 +7267,27 @@ rpc exportarXdiario(lineas: LineaContable[]) -> String {
 **De paso, se completó la lista de completions del LSP para `String`** (`lsp.rs`): tenía solo 2 de los 8 métodos que YA existían antes de esta ronda (`length`/`contains`, faltaban `startsWith`/`endsWith`/`trim`/`toUpper`/`toLower`/`escapeHtml`) -- corregida a los 13 métodos reales en el mismo pase, no solo agregados los 5 nuevos sobre una lista que seguía incompleta.
 
 **Verificado**: tests de checker (aridad/tipos de los 5 métodos, incluida la composición real `.replace(...).replace(...)` y `.padStart(...)`) + tests de runtime: un caso NO-ASCII real ("café niño") confirmando que `.substring()` corta por caracter y coincide con `.length()`; los tres casos de rango inválido rechazados uno por uno; `.replace()` reemplazando todas las ocurrencias; `.split()` con separador normal y vacío; `.padStart()`/`.padEnd()` sin truncar un valor que ya cumple, con un `pad` multi-caracter repetido y truncado exacto, rechazando un `pad` vacío cuando sí hace falta, y rechazando un `length` negativo o absurdamente grande; los dos casos reales de MyFinance (sanear para CSV, padding fixed-width) reproducidos end-to-end. Suite completa sin regresiones.
+
+### 3.199 Bug crítico: `Decimal.toFloat()`/`.toString()` inalcanzables en runtime — RESUELTO
+
+Reportado el 31/08/2026 por la sesión `fix-myf-audit-findings` (adoptador MyFinance) inmediatamente después de actualizar a v1.152.0 para verificar el fix de §3.195 -- no era ese bug, era uno distinto y nuevo. El checker tipa `Decimal.toFloat()`/`Decimal.toString()` sin ningún problema (§3.184), y el `match method` que los implementa en `runtime/mod.rs` (`Value::Decimal(n) => { "toFloat" => ..., "toString" => ... }`) está correctamente escrito -- pero **nunca se llegaba a ejecutar**.
+
+```
+service Money {
+  rpc probar() -> Float {
+    let d = 123.45.toDecimal();
+    d.toFloat()
+  }
+}
+```
+
+Antes del fix, esto compilaba limpio con `linkc build` pero fallaba en `linkc serve` con `error en runtime: no se puede acceder al campo 'toFloat' sobre Decimal("123.4500")` -- literalmente el mismo mensaje que produce un `.campo` sobre un campo que no existe.
+
+**Causa real**: `x.metodo` se resuelve en dos pasos separados. `Expr::FieldAccess` corre primero y decide si el valor base es de un tipo elegible para diferir la resolución -- si lo es, lo envuelve en `Value::BoundMethod`, que recién se despacha al `match method` real cuando el `Expr::Call` que lo envuelve corre. Ese primer paso tiene su PROPIO allowlist de variantes de `Value` elegibles (`Service`, `DbCollection`, `List`, `Int`, `Int64`, `Float`, `Bool`, `Str`, `Uuid`, `Timestamp`, `Auth`, `Math`, `Crypto`, `Http`, `Json`, `Base64`, `Env`, `Request`, `Smtp`, `Response`) -- y **a `Value::Decimal` le faltaba estar en esa lista**, así que caía al brazo genérico `other => Err(...)` antes de llegar siquiera a existir como `BoundMethod`, sin importar lo bien escrito que estuviera el dispatch real más abajo en el mismo archivo. Confirmado en vivo antes del fix contra un `linkc serve` real (no solo leyendo el código): el error reproducido coincidió carácter por carácter con el reporte original.
+
+**Fix**: agregar `Value::Decimal(_)` a ese allowlist (`runtime/mod.rs`, brazo de `Expr::FieldAccess`) -- una línea, ningún cambio al dispatch real, que ya estaba bien.
+
+**Verificado**: 1 test nuevo en `runtime/mod.rs` (`invoke_rpc`) confirmando `.toFloat()`/`.toString()` sobre un `Decimal` recibido como parámetro, y `.toFloat()` encadenado directo sobre el resultado de `.toDecimal()` sin pasar por un `let` intermedio -- los tres casos fallaban antes del fix. Reproducido además en vivo contra un `linkc serve` real (`curl` contra ambos rpcs), confirmando que el error exacto reportado ya no ocurre. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

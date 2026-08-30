@@ -489,7 +489,7 @@ pub(crate) fn eval_expr(
                     .map(|(_, v)| v)
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Decimal(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -4673,6 +4673,45 @@ mod tests {
         let db = Db::seeded();
         let result = invoke_rpc(&program, "Money", "lessThan", &json!({"a": "9.0000", "b": "10.0000"}), &db).unwrap();
         assert_eq!(result, json!(true));
+    }
+
+    // Bug real reportado por la sesión fix-myf-audit-findings tras actualizar
+    // a v1.152.0 (31/08/2026): `Decimal.toFloat()`/`.toString()` tipan limpio
+    // en el checker y su dispatch en `Value::Decimal(n) => match method` más
+    // abajo en este mismo archivo está bien escrito -- pero nunca se llega a
+    // ejecutar. `Expr::FieldAccess` tiene su propio allowlist de variantes de
+    // `Value` elegibles para envolverse en `Value::BoundMethod` (el mecanismo
+    // que difiere la resolución de `x.method` hasta que el `Expr::Call` que
+    // lo envuelve corre de verdad) -- y a `Value::Decimal` le faltaba estar
+    // en esa lista, así que cualquier método sobre un Decimal fallaba ANTES
+    // de llegar al dispatch real, con el mismo error genérico que un campo
+    // inexistente: "no se puede acceder al campo 'toFloat' sobre Decimal(...)".
+    // Reproducido en vivo contra un `linkc serve` real antes de este fix,
+    // confirmando el mismo texto de error -- ver GRAMMAR.md §3.199.
+    #[test]
+    fn decimal_to_float_and_to_string_are_reachable_through_field_access() {
+        let program = program_from(
+            r#"
+            service Money {
+                rpc asFloat(a: Decimal) -> Float { a.toFloat() }
+                rpc asString(a: Decimal) -> String { a.toString() }
+                rpc chained() -> Float { 123.45.toDecimal().toFloat() }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+
+        let as_float = invoke_rpc(&program, "Money", "asFloat", &json!({"a": "10.5000"}), &db)
+            .expect("Decimal.toFloat() via un local `let`-bound tiene que resolver, no fallar en FieldAccess");
+        assert_eq!(as_float, json!(10.5));
+
+        let as_string = invoke_rpc(&program, "Money", "asString", &json!({"a": "10.5000"}), &db)
+            .expect("Decimal.toString() via un local `let`-bound tiene que resolver, no fallar en FieldAccess");
+        assert_eq!(as_string, json!("10.5000"));
+
+        let chained = invoke_rpc(&program, "Money", "chained", &json!({}), &db)
+            .expect("Decimal.toFloat() encadenado directo sobre el resultado de .toDecimal() tambien tiene que resolver");
+        assert_eq!(chained, json!(123.45));
     }
 
     #[test]
