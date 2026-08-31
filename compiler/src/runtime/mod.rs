@@ -489,6 +489,15 @@ pub(crate) fn eval_expr(
                     .map(|(_, v)| v)
                     .unwrap_or(Value::Null)),
                 Value::Db => Ok(Value::DbCollection(field.clone())),
+                // GRAMMAR.md §3.199: este allowlist es un segundo lugar,
+                // SEPARADO del `match method` real de cada tipo (más abajo
+                // en este archivo), que decide si `x.metodo` puede siquiera
+                // volverse un `Value::BoundMethod` a la espera de que el
+                // `Expr::Call` que lo envuelve corra. `Value::Decimal` tuvo
+                // un método bien implementado ahí abajo pero INALCANZABLE
+                // durante meses porque faltaba acá -- al agregar una
+                // variante `Value` nueva con métodos propios, sumarla ACÁ
+                // también, no solo en su `match method`.
                 Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Decimal(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
