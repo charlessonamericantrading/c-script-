@@ -1526,6 +1526,10 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             "build(blocks)",
             "Build a PDF document from a list of PdfBlock, returned as a base64-encoded String",
         )]),
+        Type::Excel => Some(vec![
+            method("build(sheets)", "Build an .xlsx workbook from a list of ExcelSheet, returned as a base64-encoded String"),
+            method("parse(base64)", "Parse a base64-encoded .xlsx workbook into a list of ExcelSheet"),
+        ]),
         Type::Struct { fields, .. } => Some(
             fields
                 .iter()

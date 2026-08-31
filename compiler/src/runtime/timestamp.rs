@@ -63,6 +63,21 @@ pub(crate) fn format_iso8601_millis(total_ms: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}.{ms:03}Z")
 }
 
+/// Mismo cálculo que `format_iso8601_millis`, pero devolviendo los
+/// componentes sueltos en vez de un string -- para GRAMMAR.md §3.202
+/// (`excel.build`), que necesita año/mes/día/hora/minuto/segundo/milis
+/// para construir un `rust_xlsxwriter::ExcelDateTime`, no un string ISO.
+pub(crate) fn ymd_hms_milli_from_millis(total_ms: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
+    let days = total_ms.div_euclid(MS_PER_DAY);
+    let ms_of_day = total_ms.rem_euclid(MS_PER_DAY);
+    let (y, m, d) = civil_from_days(days);
+    let hour = ms_of_day / MS_PER_HOUR;
+    let min = (ms_of_day % MS_PER_HOUR) / MS_PER_MIN;
+    let sec = (ms_of_day % MS_PER_MIN) / MS_PER_SEC;
+    let ms = ms_of_day % MS_PER_SEC;
+    (y, m, d, hour, min, sec, ms)
+}
+
 /// Inversa de `format_iso8601_millis`. `None` si `s` no matchea EXACTAMENTE
 /// la forma fija de 24 bytes (ancho fijo, 'Z' obligatorio -- sin offsets de
 /// timezone, sin precisión variable, GRAMMAR.md §3.31 -- así que el año

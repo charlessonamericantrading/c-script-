@@ -152,6 +152,9 @@ pub enum Type {
     /// Tipo interno para el módulo `pdf` builtin (GRAMMAR.md §3.201) --
     /// generar bytes de PDF real a partir de una lista de `PdfBlock`.
     Pdf,
+    /// Tipo interno para el módulo `excel` builtin (GRAMMAR.md §3.202) --
+    /// generar y parsear bytes de `.xlsx` real.
+    Excel,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -233,6 +236,7 @@ impl std::fmt::Display for Type {
             Type::Smtp => write!(f, "smtp"),
             Type::Response => write!(f, "response"),
             Type::Pdf => write!(f, "pdf"),
+            Type::Excel => write!(f, "excel"),
         }
     }
 }

@@ -5,6 +5,7 @@
 
 pub mod db;
 pub(crate) mod encryption;
+pub(crate) mod excel;
 pub(crate) mod pdf;
 pub mod server;
 pub mod session;
@@ -101,6 +102,8 @@ pub enum Value {
     Base64,
     /// Marcador interno para el módulo `pdf` (GRAMMAR.md §3.201)
     Pdf,
+    /// Marcador interno para el módulo `excel` (GRAMMAR.md §3.202)
+    Excel,
     /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
     Env,
     /// Marcador interno para el módulo `request` (GRAMMAR.md §3.38) -- body
@@ -200,6 +203,7 @@ impl std::fmt::Debug for Value {
             Value::Json => write!(f, "Json"),
             Value::Base64 => write!(f, "Base64"),
             Value::Pdf => write!(f, "Pdf"),
+            Value::Excel => write!(f, "Excel"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
             Value::Smtp => write!(f, "Smtp"),
@@ -427,6 +431,9 @@ pub(crate) fn eval_expr(
             if name == "pdf" {
                 return Ok(Value::Pdf);
             }
+            if name == "excel" {
+                return Ok(Value::Excel);
+            }
             if name == "env" {
                 return Ok(Value::Env);
             }
@@ -505,7 +512,7 @@ pub(crate) fn eval_expr(
                 // durante meses porque faltaba acá -- al agregar una
                 // variante `Value` nueva con métodos propios, sumarla ACÁ
                 // también, no solo en su `match method`.
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Decimal(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Env | Value::Request | Value::Smtp | Value::Response => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Decimal(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Env | Value::Request | Value::Smtp | Value::Response => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -1334,7 +1341,7 @@ fn decimal_from_int(n: i64) -> Result<Value, RuntimeError> {
 /// magnitud financiera real -- la precisión de f64 (~15-17 dígitos
 /// significativos) excede por muchísimo la resolución de 4 decimales;
 /// límite honesto documentado en GRAMMAR.md §3.184 para el caso patológico.
-fn decimal_from_float(f: f64) -> Result<Value, RuntimeError> {
+pub(crate) fn decimal_from_float(f: f64) -> Result<Value, RuntimeError> {
     if !f.is_finite() {
         return Err(err(format!("no se puede convertir {f} a Decimal -- no es un número finito")));
     }
@@ -2290,6 +2297,98 @@ fn pdf_block_spec_from_value(v: Value) -> Result<pdf::PdfBlockSpec, RuntimeError
     }
 }
 
+/// `Value::Variant { enum_name: "ExcelCell", ... }` -> `excel::ExcelCellSpec`,
+/// mismo patrón que `pdf_block_spec_from_value`.
+fn excel_cell_spec_from_value(v: &Value) -> Result<excel::ExcelCellSpec, RuntimeError> {
+    let Value::Variant { enum_name, variant, fields } = v else {
+        return Err(err("excel.build: cada celda de 'rows' tiene que ser un ExcelCell"));
+    };
+    if enum_name != "ExcelCell" {
+        return Err(err(format!("excel.build: se esperaba un ExcelCell, se encontró un valor de '{enum_name}'")));
+    }
+    let value_field = || fields.iter().find(|(n, _)| n == "value").map(|(_, v)| v);
+    match variant.as_str() {
+        "Text" => match value_field() {
+            Some(Value::Str(s)) => Ok(excel::ExcelCellSpec::Text(s.clone())),
+            _ => Err(err("ExcelCell.Text: falta el campo 'value', o no es String")),
+        },
+        "Number" => match value_field() {
+            Some(Value::Decimal(n)) => Ok(excel::ExcelCellSpec::Number(*n)),
+            _ => Err(err("ExcelCell.Number: falta el campo 'value', o no es Decimal")),
+        },
+        "Date" => match value_field() {
+            Some(Value::Timestamp(ms)) => Ok(excel::ExcelCellSpec::Date(*ms)),
+            _ => Err(err("ExcelCell.Date: falta el campo 'value', o no es Timestamp")),
+        },
+        "Bool" => match value_field() {
+            Some(Value::Bool(b)) => Ok(excel::ExcelCellSpec::Bool(*b)),
+            _ => Err(err("ExcelCell.Bool: falta el campo 'value', o no es Bool")),
+        },
+        "Empty" => Ok(excel::ExcelCellSpec::Empty),
+        other => Err(err(format!("excel.build: variante desconocida de ExcelCell: '{other}'"))),
+    }
+}
+
+fn excel_cell_spec_to_value(spec: excel::ExcelCellSpec) -> Value {
+    let (variant, fields): (&str, Vec<(String, Value)>) = match spec {
+        excel::ExcelCellSpec::Text(s) => ("Text", vec![("value".to_string(), Value::Str(s))]),
+        excel::ExcelCellSpec::Number(n) => ("Number", vec![("value".to_string(), Value::Decimal(n))]),
+        excel::ExcelCellSpec::Date(ms) => ("Date", vec![("value".to_string(), Value::Timestamp(ms))]),
+        excel::ExcelCellSpec::Bool(b) => ("Bool", vec![("value".to_string(), Value::Bool(b))]),
+        excel::ExcelCellSpec::Empty => ("Empty", vec![]),
+    };
+    Value::Variant { enum_name: "ExcelCell".to_string(), variant: variant.to_string(), fields }
+}
+
+/// `Value::Struct` con forma `ExcelSheet` -> `excel::ExcelSheetSpec`, mismo
+/// patrón de lookup de campos que `smtp_attachments_from_value`.
+fn excel_sheet_spec_from_value(v: &Value) -> Result<excel::ExcelSheetSpec, RuntimeError> {
+    let Value::Struct(fields) = v else {
+        return Err(err("excel.build: cada elemento de 'sheets' tiene que ser un ExcelSheet"));
+    };
+    let name = match fields.iter().find(|(n, _)| n == "name") {
+        Some((_, Value::Str(s))) => s.clone(),
+        _ => return Err(err("ExcelSheet: falta el campo 'name', o no es String")),
+    };
+    let headers = match fields.iter().find(|(n, _)| n == "headers") {
+        Some((_, Value::List(items))) => items
+            .iter()
+            .map(|v| match v {
+                Value::Str(s) => Ok(s.clone()),
+                _ => Err(err("ExcelSheet: 'headers' tiene que ser String[]")),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(err("ExcelSheet: falta el campo 'headers', o no es String[]")),
+    };
+    let rows = match fields.iter().find(|(n, _)| n == "rows") {
+        Some((_, Value::List(items))) => items
+            .iter()
+            .map(|row| match row {
+                Value::List(cells) => cells.iter().map(excel_cell_spec_from_value).collect::<Result<Vec<_>, _>>(),
+                _ => Err(err("ExcelSheet: 'rows' tiene que ser ExcelCell[][]")),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return Err(err("ExcelSheet: falta el campo 'rows', o no es ExcelCell[][]")),
+    };
+    Ok(excel::ExcelSheetSpec { name, headers, rows })
+}
+
+fn excel_sheet_spec_to_value(spec: excel::ExcelSheetSpec) -> Value {
+    Value::Struct(vec![
+        ("name".to_string(), Value::Str(spec.name)),
+        ("headers".to_string(), Value::List(spec.headers.into_iter().map(Value::Str).collect())),
+        (
+            "rows".to_string(),
+            Value::List(
+                spec.rows
+                    .into_iter()
+                    .map(|row| Value::List(row.into_iter().map(excel_cell_spec_to_value).collect()))
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
 fn call_method(
     receiver: Value,
     method: &str,
@@ -3079,6 +3178,34 @@ fn call_method(
                 Ok(Value::Str(base64::engine::general_purpose::STANDARD.encode(bytes)))
             }
             other => Err(err(format!("método desconocido sobre pdf: '{other}'"))),
+        },
+        Value::Excel => match method {
+            "build" => {
+                let sheets = match args.into_iter().next() {
+                    Some(Value::List(items)) => items,
+                    _ => return Err(err("excel.build requiere un argumento ExcelSheet[]")),
+                };
+                let specs = sheets
+                    .iter()
+                    .map(excel_sheet_spec_from_value)
+                    .collect::<Result<Vec<_>, RuntimeError>>()?;
+                let bytes = excel::build(&specs).map_err(err)?;
+                use base64::Engine;
+                Ok(Value::Str(base64::engine::general_purpose::STANDARD.encode(bytes)))
+            }
+            "parse" => {
+                let b64 = match args.into_iter().next() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("excel.parse requiere un argumento String")),
+                };
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64.as_bytes())
+                    .map_err(|e| err(format!("excel.parse: el argumento no es base64 válido: {e}")))?;
+                let specs = excel::parse(&bytes).map_err(err)?;
+                Ok(Value::List(specs.into_iter().map(excel_sheet_spec_to_value).collect()))
+            }
+            other => Err(err(format!("método desconocido sobre excel: '{other}'"))),
         },
         Value::Env => match method {
             "get" => {
@@ -4592,7 +4719,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -8756,6 +8883,105 @@ mod tests {
         let db = Db::seeded();
         let e = invoke_rpc(&program, "Docs", "make", &json!({}), &db).unwrap_err();
         assert!(e.message.contains("columna"), "mensaje inesperado: {}", e.message);
+    }
+
+    // ---- excel.build / excel.parse (GRAMMAR.md §3.202) ----
+
+    #[test]
+    fn excel_build_produces_bytes_that_start_with_the_zip_magic_header() {
+        // `.xlsx` es un contenedor ZIP -- la firma real es "PK\x03\x04",
+        // no "%PDF-" como el caso de PDF.
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make() -> String {
+                    excel.build([ExcelSheet {
+                        name: "Hoja1",
+                        headers: ["Concepto", "Importe"],
+                        rows: [[ExcelCell.Text { value: "Servicio" }, ExcelCell.Number { value: 100.00.toDecimal() }]],
+                    }])
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let b64 = invoke_rpc(&program, "Docs", "make", &json!({}), &db).expect("excel.build tiene que generar un .xlsx real");
+        let b64 = b64.as_str().unwrap();
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).expect("excel.build tiene que devolver base64 válido");
+        assert!(bytes.starts_with(b"PK\x03\x04"), "un .xlsx real siempre arranca con la firma ZIP 'PK\\x03\\x04'");
+    }
+
+    #[test]
+    fn excel_build_and_parse_round_trip_all_five_cell_variants_exactly() {
+        // Round-trip real: acá se controlan las dos puntas, así que se
+        // puede confirmar exactitud (no solo "no crashea") -- el Decimal
+        // tiene que volver EXACTO (no 1234.5678 -> 1234.5678000001 por el
+        // viaje por f64) y la fecha al mismo milisegundo exacto.
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc roundtrip() -> ExcelSheet[] {
+                    excel.parse(excel.build([ExcelSheet {
+                        name: "Hoja1",
+                        headers: ["Texto", "Numero", "Fecha", "Booleano", "Vacio"],
+                        rows: [[
+                            ExcelCell.Text { value: "hola" },
+                            ExcelCell.Number { value: 1234.5678.toDecimal() },
+                            ExcelCell.Date { value: dateFromParts(2026, 3, 15, 10, 30, 0) },
+                            ExcelCell.Bool { value: true },
+                            ExcelCell.Empty {},
+                        ]],
+                    }]))
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "Docs", "roundtrip", &json!({}), &db)
+            .expect("excel.build + excel.parse tienen que ir y volver sin error");
+        assert_eq!(result.as_array().unwrap().len(), 1, "una sola hoja");
+        let sheet = &result[0];
+        assert_eq!(sheet["name"], json!("Hoja1"));
+        assert_eq!(sheet["headers"], json!(["Texto", "Numero", "Fecha", "Booleano", "Vacio"]));
+        let row = &sheet["rows"][0];
+        assert_eq!(row[0], json!({"type": "Text", "value": "hola"}));
+        assert_eq!(row[1], json!({"type": "Number", "value": "1234.5678"}), "el Decimal tiene que volver exacto, no aproximado por el viaje por f64");
+        assert_eq!(row[2], json!({"type": "Date", "value": "2026-03-15T10:30:00.000Z"}), "la fecha tiene que volver al mismo milisegundo exacto");
+        assert_eq!(row[3], json!({"type": "Bool", "value": true}));
+        assert_eq!(row[4], json!({"type": "Empty"}));
+    }
+
+    #[test]
+    fn excel_build_sheet_with_a_mismatched_row_length_is_a_clean_runtime_error() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make() -> String {
+                    excel.build([ExcelSheet { name: "H", headers: ["a", "b"], rows: [[ExcelCell.Text { value: "1" }]] }])
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "Docs", "make", &json!({}), &db).unwrap_err();
+        assert!(e.message.contains("columna"), "mensaje inesperado: {}", e.message);
+    }
+
+    #[test]
+    fn excel_parse_on_bytes_that_are_not_a_real_xlsx_is_a_clean_runtime_error_not_a_panic() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make(b64: String) -> ExcelSheet[] { excel.parse(b64) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        // Base64 válido, pero el contenido decodificado no es un .xlsx real.
+        let not_xlsx_b64 = "aG9sYSBtdW5kbw==";
+        let e = invoke_rpc(&program, "Docs", "make", &json!({"b64": not_xlsx_b64}), &db).unwrap_err();
+        assert!(e.message.contains("excel.parse"), "mensaje inesperado: {}", e.message);
     }
 
     // ---- constructo de loop: `while` (GRAMMAR.md §3.15) ----

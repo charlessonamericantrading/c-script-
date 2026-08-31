@@ -3,6 +3,19 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.158.0] - 2026-08-31
+
+### ✨ Nuevo
+**`excel.build(sheets: ExcelSheet[]) -> String` / `excel.parse(base64: String) -> ExcelSheet[]` -- generación y parsing real de `.xlsx`** (PLAN.md §9.15 ítem 2, segundo ítem de la ronda posterior a MyFinance) -- a diferencia de PDF, acá hacían falta las dos direcciones: MYF genera exports en `.xlsx` real y también parsea extractos bancarios para conciliar.
+
+Dos crates nuevas, no una: `rust_xlsxwriter` (escritura) + `calamine` (lectura) -- quinta y sexta excepción conjunta a "cero dependencias nuevas", comparten `zip` como dependencia transitiva. `ExcelCell` (`Text`/`Number`/`Date`/`Bool`/`Empty`) es un ADT reservado por el compilador, mismo mecanismo que `PdfBlock` (§3.201) -- `Number` carga `Decimal`, no `Float`, coherente con que este lenguaje ya trata `Decimal` como el tipo de dinero. `ExcelSheet`, en cambio, es un struct y NO necesita reservarse por nombre -- este lenguaje subtipa structs estructuralmente (a diferencia de los enums, nominales), así que cualquier `type` de usuario con la misma forma tipa igual de bien.
+
+**Bug real encontrado por un test de round-trip antes de shippear, no en producción**: `write_datetime` sin un `Format` con `set_num_format(...)` explícito escribe una fecha indistinguible de un número común al leerla de vuelta -- ni Excel real ni `calamine` la reconocen. Fix aplicado antes de cerrar el ítem.
+
+**Verificado end-to-end contra un `linkc serve` real con `openpyxl`** (Python, implementación completamente independiente): fechas como `datetime` real, montos exactos, texto con acentos en UTF-8 nativo perfecto -- sin el límite de WinAnsiEncoding que tuvo `pdf.build`.
+
+**Verificado además**: tests de checker (aridad/tipo, ADT, colisión de nombre reservado, y un test que confirma la subtipificación ESTRUCTURAL de `ExcelSheet` contra un `type` de usuario con otro nombre) + tests de runtime (firma ZIP `PK\x03\x04`, round-trip exacto de las 5 variantes de celda -- Decimal y fecha vuelven exactos, fila con columnas inconsistentes rechazada limpio, bytes que no son un `.xlsx` real dan un error limpio). Suite completa sin regresiones. Ver GRAMMAR.md §3.202.
+
 ## [1.157.0] - 2026-08-31
 
 ### ✨ Nuevo

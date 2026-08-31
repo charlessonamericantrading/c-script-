@@ -223,6 +223,7 @@
   - [3.199 Bug crítico: `Decimal.toFloat()`/`.toString()` inalcanzables en runtime — RESUELTO](#3199-bug-crítico-decimaltofloattostring-inalcanzables-en-runtime--resuelto)
   - [3.200 `List<T>`: concatenación vía `+` y `.contains()` — RESUELTO](#3200-listt-concatenación-vía--y-contains--resuelto)
   - [3.201 `pdf.build(blocks: PdfBlock[]) -> String` — RESUELTO](#3201-pdfbuildblocks-pdfblock---string--resuelto)
+  - [3.202 `excel.build(sheets: ExcelSheet[]) -> String` / `excel.parse(base64: String) -> ExcelSheet[]` — RESUELTO](#3202-excelbuildsheets-excelsheet---string--excelparsebase64-string---excelsheet--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7352,6 +7353,56 @@ rpc facturaPdf(cliente: String, lineas: String[][], total: String) -> String {
 **Integración con `smtp.sendMessage`'s `contentBase64` (§3.141), cero fricción**: como el lenguaje no tiene tipo de bytes, un adjunto binario real ya viaja como `contentBase64: String` -- `pdf.build(...)` devuelve exactamente esa forma, así que `attachments: [{ filename: "factura.pdf", contentType: "application/pdf", contentBase64: pdf.build(blocks) }]` funciona directo, sin tocar el mecanismo de adjuntos existente.
 
 **Verificado además**: tests de checker (aridad/tipo de `pdf.build`, `PdfBlock.Text`/`.Table` tipan como cualquier ADT, un `enum PdfBlock` de usuario es rechazado por colisión de nombre) + tests de runtime (`invoke_rpc`: el resultado decodificado empieza con la firma `%PDF-`; acentos y € no rompen la generación; 80 líneas de texto fuerzan una segunda página, confirmado contando objetos `/MediaBox` en los bytes crudos; una tabla con una fila de largo de columnas inconsistente da un `RuntimeError` limpio). Suite completa sin regresiones.
+
+### 3.202 `excel.build(sheets: ExcelSheet[]) -> String` / `excel.parse(base64: String) -> ExcelSheet[]` — RESUELTO
+
+PLAN.md §9.15 ítem 2, inmediatamente después de cerrar el ítem 1 (`pdf.build`, §3.201). Mismo origen que PDF (el "segundo reporte" de MyFinance, §9.14 ítem 5): MYF genera exports en `.xlsx` real y también PARSEA `.xlsx` para importar extractos bancarios y conciliar -- a diferencia de PDF, acá hacían falta las dos direcciones.
+
+```
+enum ExcelCell {
+  Text   { value: String },
+  Number { value: Decimal },
+  Date   { value: Timestamp },
+  Bool   { value: Bool },
+  Empty,
+}
+
+type ExtractoBancario = { fecha: Timestamp, concepto: String, importe: String, conciliado: Bool }
+
+rpc extractoXlsx(movimientos: ExtractoBancario[]) -> String {
+  excel.build([ExcelSheet {
+    name: "Movimientos",
+    headers: ["Fecha", "Concepto", "Importe", "Conciliado"],
+    rows: movimientos.map(|m: ExtractoBancario| {
+      [ExcelCell.Date { value: m.fecha }, ExcelCell.Text { value: m.concepto }, ExcelCell.Number { value: m.importe.toDecimal() }, ExcelCell.Bool { value: m.conciliado }]
+    }),
+  }])
+}
+
+rpc importarExtracto(base64: String) -> ExcelSheet[] { excel.parse(base64) }
+```
+
+**Dos crates, no una -- quinta Y sexta excepción conjunta a "cero dependencias nuevas"** (después de `regex` §3.73, `flate2` §3.180, `aes-gcm` §3.191, `pdf-writer` §3.201): `.xlsx` (OOXML) es un contenedor ZIP con XML adentro, mismo tipo de formato real y complejo que ya justificó `pdf-writer` -- pero ninguna crate madura del ecosistema escribe Y lee `.xlsx` bien a la vez. `rust_xlsxwriter` (escritura) y `calamine` (lectura), las dos MIT, activamente mantenidas, comparten `zip` como dependencia transitiva -- sumar las dos no duplica la superficie de "implementación de ZIP", solo el mapeo OOXML↔celdas de cada una.
+
+**`ExcelCell` es un ADT reservado por el compilador -- MISMO mecanismo que `PdfBlock` (§3.201)**: pre-registrado en `checker.enums` antes de procesar el programa del usuario, reusa el mecanismo genérico de ADT sin infraestructura nueva. `Number` carga `Decimal`, no `Float` -- este lenguaje ya trata `Decimal` como el tipo de dinero (§3.184), y el caso real (conciliación bancaria) es justo donde la precisión importa; la conversión a/desde el `f64` crudo que `.xlsx` guarda internamente pasa por los bordes de `runtime/excel.rs`, nunca se expone un `Float` a `.link`.
+
+**`ExcelSheet`, en cambio, NO necesita reservarse por nombre -- es un `struct`, y este lenguaje subtipa structs ESTRUCTURALMENTE, enums NOMINALMENTE (§3.2)**. `excel.build`/`excel.parse` se tipan contra la FORMA `{ name: String, headers: String[], rows: ExcelCell[][] }` directo -- cualquier `type` de usuario con esa forma exacta tipa igual de bien, tenga o no el nombre `ExcelSheet` (a diferencia de `PdfBlock.Text{...}`, que sí necesita el nombre nominal exacto). Registrar `ExcelSheet` en `checker.types` es una mejora de ERGONOMÍA (nombra el tipo en errores, evita repetir la forma completa en cada firma), no un requisito de corrección -- una distinción de arquitectura real entre los dos mecanismos, no un detalle cosmético.
+
+**El punto de diseño real que motivó `ExcelCell` en vez de copiar `PdfBlock.Table`'s `rows: String[][]`**: en un `.xlsx` real, una celda numérica escrita como texto no es sumable/filtrable en Excel -- hubiera sido una regresión real contra lo que `exceljs` ya hace hoy en MyFinance, no una simplificación válida.
+
+**Gotcha real, documentado por la propia crate, no por este proyecto**: `calamine::ExcelDateTime` reproduce A PROPÓSITO el bug histórico de Excel de la fecha inexistente `1900-02-29` -- su método `.to_ymd_hms_milli()` ya da el resultado que Excel real mostraría, quirk incluido, sin código extra de este lado.
+
+**Bug real encontrado durante la verificación manual, no antes**: `rust_xlsxwriter::Worksheet::write_datetime` SIN un `Format` con `set_num_format(...)` explícito escribe el número de serie de la fecha, pero la celda queda INDISTINGUIBLE de un número común al leerla de vuelta -- ni Excel real ni `calamine` la reconocen como fecha sin el formato. Un test de round-trip (`excel.build` seguido de `excel.parse` sobre el mismo resultado) lo atrapó de inmediato: la fecha volvía como `ExcelCell.Number`, no `ExcelCell.Date`. Fix: `Format::new().set_num_format("yyyy-mm-dd hh:mm:ss.000")` aplicado vía `write_with_format`.
+
+**Texto: UTF-8 nativo, SIN el límite de WinAnsiEncoding que tuvo `pdf.build`** -- a diferencia de PDF (que necesita una fuente estándar sin embeber y por lo tanto un rango de caracteres acotado, §3.201), el formato OOXML de `.xlsx` usa UTF-8 real para las shared strings. Verificado end-to-end con `openpyxl` (implementación completamente independiente, Python): "Consultoría"/"descripción" (con tilde/ñ) se escriben y se leen de vuelta byte-a-byte correctos (`\xc3\xad` = 'í' en UTF-8), sin ningún caso especial ni límite de rango de caracteres.
+
+**`excel.parse` siempre trata la primera fila de cada hoja como encabezados** -- límite v1 documentado: si el `.xlsx` de entrada no tiene una fila de encabezados real, esa primera fila de datos aparece en `headers`, no en `rows`. Coincide con el caso real citado (los extractos bancarios reales siempre traen encabezados) -- un round-trip de una hoja SIN encabezados (`headers: []`) no está garantizado, a diferencia de una CON encabezados.
+
+**Otros límites v1, deliberados**: sin fórmulas, sin formato condicional, sin gráficos, sin múltiples hojas con referencias cruzadas entre sí. Una variante de `calamine::Data` sin equivalente directo en `ExcelCell` (`Error`, `DurationIso`, `DateTimeIso`) se representa como `ExcelCell.Text` con su forma de texto -- NUNCA se descarta en silencio.
+
+**Integración con `smtp.sendMessage`'s `contentBase64` (§3.141), cero fricción, mismo criterio que `pdf.build`**: `excel.build(...)` devuelve exactamente la forma que un adjunto espera.
+
+**Verificado**: tests de checker (aridad/tipo de `excel.build`/`excel.parse`, `ExcelCell.*` tipa como cualquier ADT, un `enum ExcelCell` de usuario rechazado por colisión de nombre, **un `type` de usuario con OTRO nombre pero la misma forma que `ExcelSheet` tipa igual de bien** -- el test que prueba que la subtipificación estructural es real, no solo plausible) + tests de runtime (`invoke_rpc`: el resultado decodificado empieza con la firma ZIP `PK\x03\x04`; **round-trip real de las 5 variantes de celda** -- `excel.build` seguido de `excel.parse` sobre el mismo resultado, confirmando que el `Decimal` vuelve EXACTO -- `1234.5678`, no aproximado por el viaje por `f64` -- y la fecha vuelve al mismo milisegundo exacto; fila con largo de columnas inconsistente rechazada limpio; bytes que no son un `.xlsx` real dan un `RuntimeError` limpio, no un panic). Verificación manual end-to-end contra un `linkc serve` real: extracto bancario de prueba (fechas + texto con acentos + montos + booleanos), decodificado a un `.xlsx` real en disco, abierto con `openpyxl` (independiente de este proyecto) -- confirmó fechas como `datetime` real (no como número), montos exactos, texto UTF-8 perfecto. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.157.0"
+version = "1.158.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -38,6 +38,8 @@ runtime = [
     "dep:flate2",
     "dep:aes-gcm",
     "dep:pdf-writer",
+    "dep:rust_xlsxwriter",
+    "dep:calamine",
 ]
 
 [dependencies]
@@ -118,3 +120,16 @@ aes-gcm = { version = "0.10", optional = true }
 # framework GUI Azul completo, ~717K SLoC de árbol transitivo, y `genpdf`
 # por estar abandonada desde 2021).
 pdf-writer = { version = "0.15", optional = true }
+# Quinta Y sexta excepción real a "cero dependencias nuevas" (ver `pdf-writer`
+# arriba, GRAMMAR.md §3.202) -- una excepción conjunta, no dos separadas:
+# `.xlsx` (OOXML) es un contenedor ZIP con XML adentro, la misma clase de
+# formato real y complejo que ya justificó `pdf-writer` -- ninguna crate
+# madura del ecosistema escribe Y lee `.xlsx` bien a la vez, así que hacen
+# falta dos. Las dos comparten `zip` como dependencia transitiva, así que
+# sumar las dos no duplica la superficie de "implementación de ZIP", solo
+# el mapeo OOXML<->celdas de cada una. `rust_xlsxwriter` (escritura) y
+# `calamine` (lectura) -- ambas MIT, activamente mantenidas, evaluadas
+# contra el mismo criterio de licencia/mantenimiento/tamaño de árbol que
+# las excepciones anteriores.
+rust_xlsxwriter = { version = "0.99", optional = true }
+calamine = { version = "0.36", optional = true }

@@ -635,6 +635,96 @@ fn pdf_block_enum_decl() -> EnumDecl {
     }
 }
 
+/// `enum ExcelCell { Text { value: String }, Number { value: Decimal },
+/// Date { value: Timestamp }, Bool { value: Bool }, Empty }` -- mismo
+/// mecanismo que `pdf_block_enum_decl` (ADT reservado por el compilador,
+/// pre-registrado en `checker.enums`). `Number` carga `Decimal`, no
+/// `Float` -- este lenguaje ya trata `Decimal` como el tipo de dinero
+/// (GRAMMAR.md §3.184), y el caso real (conciliación bancaria) es
+/// justamente donde la precisión importa; la conversión a/desde el `f64`
+/// crudo que `.xlsx` almacena internamente pasa por los bordes de
+/// `runtime/excel.rs`, nunca se expone un `Float` acá. `Empty` es una
+/// variante unitaria (`fields: None`), igual que `Role.Admin` -- se
+/// construye igual, `ExcelCell.Empty {}` con llaves (CLAUDE.md/AGENTS.md).
+fn excel_cell_enum_decl() -> EnumDecl {
+    let dummy = Span::new(0, 0, 0, 0);
+    let named = |name: &str| TypeExpr::Named(name.to_string(), vec![], dummy);
+    let field = |name: &str, ty: TypeExpr| Field {
+        name: name.to_string(),
+        optional: false,
+        ty,
+        name_span: dummy,
+        annotations: vec![],
+        default: None,
+    };
+    EnumDecl {
+        name: "ExcelCell".to_string(),
+        type_params: vec![],
+        variants: vec![
+            Variant { name: "Text".to_string(), fields: Some(vec![field("value", named("String"))]) },
+            Variant { name: "Number".to_string(), fields: Some(vec![field("value", named("Decimal"))]) },
+            Variant { name: "Date".to_string(), fields: Some(vec![field("value", named("Timestamp"))]) },
+            Variant { name: "Bool".to_string(), fields: Some(vec![field("value", named("Bool"))]) },
+            Variant { name: "Empty".to_string(), fields: None },
+        ],
+        span: dummy,
+    }
+}
+
+/// `type ExcelSheet = { name: String, headers: String[], rows: ExcelCell[][] }`
+/// -- a diferencia de `ExcelCell` (un enum, NOMINAL en este lenguaje,
+/// GRAMMAR.md §3.2), `ExcelSheet` es un STRUCT, y los structs subtipan
+/// ESTRUCTURALMENTE -- así que registrarlo acá es una mejora de
+/// ERGONOMÍA (nombra el tipo en errores, permite a un usuario escribir
+/// `sheets: ExcelSheet[]` sin repetir la forma completa), no un requisito
+/// de corrección: cualquier struct de OTRO nombre con la misma forma ya
+/// tipa igual de bien contra `excel.build`/`excel.parse` sin este
+/// pre-registro, por subtipado estructural puro.
+fn excel_sheet_type_decl() -> TypeDecl {
+    let dummy = Span::new(0, 0, 0, 0);
+    let named = |name: &str| TypeExpr::Named(name.to_string(), vec![], dummy);
+    let field = |name: &str, ty: TypeExpr| Field {
+        name: name.to_string(),
+        optional: false,
+        ty,
+        name_span: dummy,
+        annotations: vec![],
+        default: None,
+    };
+    TypeDecl {
+        name: "ExcelSheet".to_string(),
+        type_params: vec![],
+        ty: TypeExpr::Struct(vec![
+            field("name", named("String")),
+            field("headers", TypeExpr::List(Box::new(named("String")))),
+            field("rows", TypeExpr::List(Box::new(TypeExpr::List(Box::new(named("ExcelCell")))))),
+        ]),
+        annotations: vec![],
+        span: dummy,
+    }
+}
+
+/// `Type::Struct` resuelto para la forma de `ExcelSheet` -- usado en la
+/// firma de `excel.build`/`excel.parse` en vez de resolver `TypeExpr` a
+/// mano dos veces. Mismo `name: Some("ExcelSheet")` que resolvería
+/// `resolve_named_type_subst` si un usuario escribiera el tipo por nombre
+/// -- así que un struct nombrado explícitamente O uno estructuralmente
+/// idéntico con otro nombre tipan igual acá (§3.2).
+fn excel_sheet_struct_type() -> Type {
+    Type::Struct {
+        name: Some("ExcelSheet".to_string()),
+        fields: vec![
+            FieldType { name: "name".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "headers".to_string(), optional: false, ty: Type::List(Box::new(Type::String)) },
+            FieldType {
+                name: "rows".to_string(),
+                optional: false,
+                ty: Type::List(Box::new(Type::List(Box::new(Type::Enum("ExcelCell".to_string()))))),
+            },
+        ],
+    }
+}
+
 impl Checker {
     /// Construye las tablas de símbolos (types/enums/fns) sin chequear los
     /// cuerpos de fn/rpc. Lo usa tanto `check_program` como el emisor de
@@ -666,6 +756,13 @@ impl Checker {
         // cae en la rama de "enum duplicado" de ese mismo loop (mismo
         // mensaje de error que colisionar con cualquier otro enum).
         checker.enums.insert("PdfBlock".to_string(), pdf_block_enum_decl());
+        // GRAMMAR.md §3.202: mismo mecanismo que `PdfBlock` arriba, para
+        // `ExcelCell` (ADT nominal). `ExcelSheet` es un `type` (struct),
+        // no un `enum` -- se pre-registra en `checker.types` por ergonomía
+        // (ver el comentario de `excel_sheet_type_decl`), no porque haga
+        // falta para que el subtipado estructural funcione.
+        checker.enums.insert("ExcelCell".to_string(), excel_cell_enum_decl());
+        checker.types.insert("ExcelSheet".to_string(), excel_sheet_type_decl());
         let mut errors = Vec::new();
 
         for item in &program.items {
@@ -3640,6 +3737,9 @@ impl Checker {
                 if name == "pdf" {
                     return Ok(Type::Pdf);
                 }
+                if name == "excel" {
+                    return Ok(Type::Excel);
+                }
                 if name == "env" {
                     return Ok(Type::Env);
                 }
@@ -4621,6 +4721,14 @@ impl Checker {
             (Type::Pdf, "build") => builtin_args!(
                 self, args, env, "pdf.build",
                 [(blocks, "blocks: PdfBlock[]", Type::List(Box::new(Type::Enum("PdfBlock".to_string()))))] -> Type::String
+            ),
+            (Type::Excel, "build") => builtin_args!(
+                self, args, env, "excel.build",
+                [(sheets, "sheets: ExcelSheet[]", Type::List(Box::new(excel_sheet_struct_type())))] -> Type::String
+            ),
+            (Type::Excel, "parse") => builtin_args!(
+                self, args, env, "excel.parse",
+                [(base64, "base64: String", Type::String)] -> Type::List(Box::new(excel_sheet_struct_type()))
             ),
             (Type::List(_inner), "join") => {
                 let [sep_arg] = args else {
@@ -9039,6 +9147,96 @@ type T = { id: Int, s: Status }")
         "#;
         let errors = check_source(src).unwrap_err();
         assert!(errors[0].to_string().contains("ya está declarado"), "{:?}", errors);
+    }
+
+    // ---- excel.build / excel.parse (GRAMMAR.md §3.202) ----
+
+    #[test]
+    fn excel_build_takes_an_excel_sheet_list_and_returns_string() {
+        let src = r#"
+            fn make() -> String {
+                excel.build([ExcelSheet {
+                    name: "Hoja1",
+                    headers: ["Concepto", "Importe"],
+                    rows: [[ExcelCell.Text { value: "Servicio" }, ExcelCell.Number { value: 100.00.toDecimal() }]],
+                }])
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn excel_parse_takes_a_string_and_returns_an_excel_sheet_list() {
+        let src = r#"
+            fn f(b64: String) -> ExcelSheet[] { excel.parse(b64) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn excel_build_rejects_zero_arguments() {
+        let src = r#"
+            fn f() -> String { excel.build() }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn excel_parse_rejects_a_non_string_argument() {
+        let src = r#"
+            fn f() -> ExcelSheet[] { excel.parse(123) }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn excel_cell_variants_type_like_any_adt() {
+        let src = r#"
+            fn make() -> ExcelCell[] {
+                [
+                    ExcelCell.Text { value: "x" },
+                    ExcelCell.Number { value: 1.5.toDecimal() },
+                    ExcelCell.Date { value: now() },
+                    ExcelCell.Bool { value: true },
+                    ExcelCell.Empty {},
+                ]
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn user_cannot_declare_their_own_excel_cell_enum() {
+        let src = r#"
+            enum ExcelCell { Foo }
+            fn f() -> Int { 1 }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        assert!(errors[0].to_string().contains("ya está declarado"), "{:?}", errors);
+    }
+
+    #[test]
+    fn excel_sheet_subtypes_structurally_unlike_the_nominal_pdf_block() {
+        // A diferencia de `PdfBlock` (un enum, NOMINAL en este lenguaje),
+        // `ExcelSheet` es un struct -- subtipa ESTRUCTURALMENTE (§3.2). Un
+        // `type` de usuario con OTRO nombre pero la MISMA forma tiene que
+        // tipar igual de bien contra `excel.build`, sin necesitar llamarse
+        // "ExcelSheet". Este test es el que prueba que el diseño es
+        // correcto, no solo plausible.
+        let src = r#"
+            type MiHoja = { name: String, headers: String[], rows: ExcelCell[][] }
+            fn f(hojas: MiHoja[]) -> String { excel.build(hojas) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn excel_sheet_with_a_mismatched_shape_is_rejected() {
+        let src = r#"
+            type NoEsUnaHoja = { titulo: String }
+            fn f(x: NoEsUnaHoja[]) -> String { excel.build(x) }
+        "#;
+        assert!(check_source(src).is_err());
     }
 
     // ---- spans en errores de TIPOS (LSP prerrequisito 3/3, Ronda B) ----
