@@ -224,6 +224,7 @@
   - [3.200 `List<T>`: concatenación vía `+` y `.contains()` — RESUELTO](#3200-listt-concatenación-vía--y-contains--resuelto)
   - [3.201 `pdf.build(blocks: PdfBlock[]) -> String` — RESUELTO](#3201-pdfbuildblocks-pdfblock---string--resuelto)
   - [3.202 `excel.build(sheets: ExcelSheet[]) -> String` / `excel.parse(base64: String) -> ExcelSheet[]` — RESUELTO](#3202-excelbuildsheets-excelsheet---string--excelparsebase64-string---excelsheet--resuelto)
+  - [3.203 MCP real -- sesión, tools/list/tools/call, streaming bidireccional — RESUELTO](#3203-mcp-real----sesión-toolslisttoolscall-streaming-bidireccional--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7403,6 +7404,51 @@ rpc importarExtracto(base64: String) -> ExcelSheet[] { excel.parse(base64) }
 **Integración con `smtp.sendMessage`'s `contentBase64` (§3.141), cero fricción, mismo criterio que `pdf.build`**: `excel.build(...)` devuelve exactamente la forma que un adjunto espera.
 
 **Verificado**: tests de checker (aridad/tipo de `excel.build`/`excel.parse`, `ExcelCell.*` tipa como cualquier ADT, un `enum ExcelCell` de usuario rechazado por colisión de nombre, **un `type` de usuario con OTRO nombre pero la misma forma que `ExcelSheet` tipa igual de bien** -- el test que prueba que la subtipificación estructural es real, no solo plausible) + tests de runtime (`invoke_rpc`: el resultado decodificado empieza con la firma ZIP `PK\x03\x04`; **round-trip real de las 5 variantes de celda** -- `excel.build` seguido de `excel.parse` sobre el mismo resultado, confirmando que el `Decimal` vuelve EXACTO -- `1234.5678`, no aproximado por el viaje por `f64` -- y la fecha vuelve al mismo milisegundo exacto; fila con largo de columnas inconsistente rechazada limpio; bytes que no son un `.xlsx` real dan un `RuntimeError` limpio, no un panic). Verificación manual end-to-end contra un `linkc serve` real: extracto bancario de prueba (fechas + texto con acentos + montos + booleanos), decodificado a un `.xlsx` real en disco, abierto con `openpyxl` (independiente de este proyecto) -- confirmó fechas como `datetime` real (no como número), montos exactos, texto UTF-8 perfecto. Suite completa sin regresiones.
+
+### 3.203 MCP real -- sesión, tools/list/tools/call, streaming bidireccional — RESUELTO
+
+PLAN.md §9.15 ítem 3, último de la ronda posterior a MyFinance (tras PDF §3.201, Excel §3.202). Origen: §9.14 ítem 6 -- MyFinance expone un servidor MCP real para claude.ai (`@modelcontextprotocol/sdk`, `StreamableHTTPServerTransport`) para que un LLM pueda invocar sus `rpc` como *tools* -- `stream`/`subscribe()` (§3.13/§3.16) es SSE unidireccional, sin sesión de conexión ni forma de que el servidor inicie una llamada hacia el cliente.
+
+```
+enum Role { Admin }
+
+service Auth {
+  rpc login() -> String { auth.createSession(Role.Admin {}) }
+}
+
+service Facturacion {
+  rpc totalDelMes(mes: String) -> Decimal { db.facturas.sumBy(|f: Factura| { f.importe }) }
+
+  // Expuesto como tool MCP "Facturacion_resumirConIA" -- adentro, un solo
+  // turno de texto hacia el cliente MCP conectado, bloqueando hasta que
+  // responda.
+  rpc resumirConIA(datos: String) -> String {
+    mcp.sample("Resumí esta factura en una línea: " + datos)
+  }
+}
+```
+
+Dos forks de research (arquitectura contra la spec pública de `Streamable HTTP transport`, después integración contra el código real de este repo) más un spike aislado con `tiny_http` real (mismo mecanismo que `linkc serve` usa) establecieron que la brecha real tenía 3 piezas de tamaño desparejo -- el usuario decidió explícitamente implementar las 3 en esta ronda, no diferir la más nueva pese a no tener todavía un caso de uso real citado para ella.
+
+**Sin anotación `.link` nueva (`@mcp`) -- flag de servidor, mismo criterio que `openapi.json`**. `openapi_emit.rs::emit_openapi_json` ya expone TODAS las `service`s sin ningún opt-in -- ningún `rpc` necesita marcarse para aparecer en `openapi.json`. `linkc serve --mcp-jwt-secret <clave>` (o `LINK_MCP_JWT_SECRET`) sigue el mismo criterio: con el flag puesto, todo `rpc` no-`stream` y no-`@cron` de toda `service` queda expuesto como tool MCP -- sin este flag, `/mcp` no existe en absoluto (mismo comportamiento "invisible cuando está apagado" que el resto de los flags opcionales de este servidor). La autorización de cada tool sigue viniendo de las anotaciones YA existentes del `rpc` (`@authenticated`/`@requires`) -- MCP es un transporte más sobre el mismo `rpc` protegido, nunca una superficie nueva sin auditar.
+
+**Sesión -- `Mcp-Session-Id` es un JWT propio que este servidor firma, no un token opaco.** `POST /mcp` con `method: "initialize"` exige un `Authorization: Bearer <token>` normal (la sesión YA establecida por el login existente del programa, §3.51/§3.64) y, si pasa, firma una sesión MCP nueva con los MISMOS claims de rol/`user_id` -- así un `tools/call` posterior autentica el `rpc` subyacente con el header `Mcp-Session-Id` solo, sin pedir un segundo token. `DELETE /mcp` la revoca. Hallazgo real de la investigación de integración: este servidor **nunca había tenido, antes de esta pieza, ninguna función de FIRMA de JWT en producción** -- `session.rs` solo sabía verificar JWT externos (§3.64); `sign_mcp_session` es la primera. Como un JWT autocontenido no se puede invalidar antes de su propia expiración sin algo guardado del lado del servidor, `SessionStore` suma un registro chico de `jti` revocados (`mcp_revoked_jti`) -- no una tabla de sesiones completa.
+
+**`role_for`/`user_id_for` (`session.rs`) reconocen un `Mcp-Session-Id` como una TERCERA fuente de identidad**, junto a una sesión interna y un JWT externo -- así `check_auth_gate`/`handle_rpc` (`runtime/server.rs`) se reusan TAL CUAL para `tools/call`, sin ningún camino de auth paralelo: un `@requires(Role.Admin)` que ya protege un `rpc` por la vía REST normal aplica IDÉNTICO vía MCP (confirmado con un test de integración dedicado), y `auth.currentRole()`/`currentUserId()` dentro del cuerpo de un `rpc` invocado vía `tools/call` funcionan sin ningún cambio en ese código.
+
+**`tools/list` reusa `type_to_json_schema` (`codegen/openapi_emit.rs`, ahora `pub(crate)`)** -- el mismo mapeo `Type` -> JSON Schema que `openapi.json` ya usa, sin una segunda copia. El nombre de cada tool es `"{service}_{rpc}"`; `tools/call` lo resuelve de vuelta buscando la coincidencia EXACTA entre los mismos tools que `tools/list` generaría -- no un `split` estadístico del string (un nombre de `service`/`rpc` puede tener guiones bajos propios, así que partir a mano sería ambiguo).
+
+**Streaming bidireccional -- `mcp.sample(prompt: String) -> String`, alcance v1 deliberadamente angosto**: un solo turno de texto, sin roles ni historial multi-turno. `GET /mcp` (con `Mcp-Session-Id`) abre una conexión SSE de larga duración, mismo patrón que `write_live_stream` (push real, §3.16) pero registrada por `jti` de sesión MCP, no por colección de `db`. Al llamar `mcp.sample`, el servidor arma una request `sampling/createMessage` real, la empuja por esa conexión, y bloquea (con timeout de 30s) hasta que una respuesta correlacionada llega por un `POST /mcp` nuevo y separado -- en otro hilo. Este es el problema real que la Pieza C resolvía: `linkc serve` corre un hilo real por request (§3.158), sin ningún mecanismo previo para que un hilo "espere algo que va a llegar por otra conexión más tarde". El PUSH en sí ya era una extensión natural de lo que el pub-sub de `stream` había construido -- lo que rompía la reutilización era específicamente la mitad "esperar la respuesta correlacionada".
+
+**Spike aislado, corrido ANTES de tocar producción**: un programa standalone con `tiny_http` 0.12 (la misma versión que usa `runtime/server.rs`) probó `GET /wait/{id}` (bloquea con `recv_timeout` sobre un `Arc<Mutex<HashMap<id, Sender>>>`) + `POST /respond/{id}` (entrega) contra un servidor real levantado -- confirmó los 3 caminos (entrega cross-conexión, timeout con limpieza del mapa, id desconocido con 404 limpio) antes de integrar nada al binario real. La integración real (`runtime/mcp.rs`) usa la MISMA forma, con un `thread_local!` (`CURRENT_MCP`, mismo mecanismo exacto que `CURRENT_REQUEST` en `runtime/db.rs`, GRAMMAR.md §3.38 -- un hilo por request hace que "el contexto de la request actual" sea justo lo que un `thread_local!` modela) para que `mcp.sample` sepa a qué sesión/conexión pertenece la invocación que lo llamó, sin tener que enhebrar ese contexto a mano por toda la pila de `invoke_rpc_with_sessions`.
+
+**Bug real encontrado y corregido durante la implementación, no dejado para más adelante**: `tools/call` envolvía el resultado de un `rpc -> String` con comillas JSON de más dentro del bloque de texto (`"hola"` en vez de `hola`) -- un cliente MCP real le mostraría las comillas literales al usuario/LLM. Solo un resultado NO-string (número/objeto/array/booleano) se serializa de verdad a JSON para el campo `text`; un `String` va tal cual.
+
+**Verificado end-to-end contra el servidor real, no solo unitario**: un driver de test con dos conexiones reales (una `GET /mcp` bloqueada leyendo eventos SSE reales con `Transfer-Encoding: chunked`, una `POST /mcp` de `tools/call` en un hilo aparte) confirma el round-trip completo -- el prompt llega exacto al otro lado, la respuesta vuelve exacta como resultado del `rpc`. Un segundo test confirma el camino de timeout REAL (nadie responde, 30s, sin quedar colgado). Un tercero confirma que llamar `mcp.sample` sin ninguna conexión `GET /mcp` abierta da un error de runtime limpio, nunca un panic ni un bloqueo indefinido.
+
+**Fuera de alcance, a propósito**: `mcp.sample` es de un solo turno, sin historial ni roles de mensaje (`system`/`assistant` además de `user`); sin OAuth2/OIDC (la spec lo permite pero no lo exige -- este servidor sigue autenticando `initialize` con el mecanismo de sesión/JWT que ya tenía, §3.51/§3.64, consciente de que §9.12 ítem 7 ya documenta que OAuth2 nativo queda bloqueado hasta tener un proveedor de identidad real contra el cual probarlo); sin `elicitation`/`roots` ni el resto de las capacidades opcionales de la spec; el TTL de una sesión MCP es fijo (1 hora, `MCP_SESSION_TTL_SECS`), sin flag propio todavía.
+
+**Verificado**: tests de checker (aridad/tipo de `mcp.sample`) + un test de runtime confirmando que `mcp.sample` es alcanzable a través de `Expr::FieldAccess` (mismo criterio que el test de Decimal, §3.199 -- `Value::Mcp` no volvió a faltar en ese allowlist) + 15 tests de integración HTTP contra el binario real (`cli_mcp.rs`): ciclo completo `initialize`->`tools/list`->`tools/call`->`DELETE`; revocación real; `@requires` aplicado idéntico vía MCP; el round-trip completo de `mcp.sample` con dos conexiones reales; el camino de timeout real; y el de "sin conexión abierta". Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

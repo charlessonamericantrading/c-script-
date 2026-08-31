@@ -3740,6 +3740,9 @@ impl Checker {
                 if name == "excel" {
                     return Ok(Type::Excel);
                 }
+                if name == "mcp" {
+                    return Ok(Type::Mcp);
+                }
                 if name == "env" {
                     return Ok(Type::Env);
                 }
@@ -4729,6 +4732,10 @@ impl Checker {
             (Type::Excel, "parse") => builtin_args!(
                 self, args, env, "excel.parse",
                 [(base64, "base64: String", Type::String)] -> Type::List(Box::new(excel_sheet_struct_type()))
+            ),
+            (Type::Mcp, "sample") => builtin_args!(
+                self, args, env, "mcp.sample",
+                [(prompt, "prompt: String", Type::String)] -> Type::String
             ),
             (Type::List(_inner), "join") => {
                 let [sep_arg] = args else {
@@ -9235,6 +9242,32 @@ type T = { id: Int, s: Status }")
         let src = r#"
             type NoEsUnaHoja = { titulo: String }
             fn f(x: NoEsUnaHoja[]) -> String { excel.build(x) }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    // ---- mcp.sample (GRAMMAR.md §3.203, Pieza C) ----
+
+    #[test]
+    fn mcp_sample_takes_a_string_and_returns_a_string() {
+        let src = r#"
+            fn f(prompt: String) -> String { mcp.sample(prompt) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn mcp_sample_rejects_zero_arguments() {
+        let src = r#"
+            fn f() -> String { mcp.sample() }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn mcp_sample_rejects_a_non_string_argument() {
+        let src = r#"
+            fn f() -> String { mcp.sample(123) }
         "#;
         assert!(check_source(src).is_err());
     }

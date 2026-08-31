@@ -105,6 +105,8 @@ pub enum Value {
     Pdf,
     /// Marcador interno para el módulo `excel` (GRAMMAR.md §3.202)
     Excel,
+    /// Marcador interno para el módulo `mcp` (GRAMMAR.md §3.203)
+    Mcp,
     /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
     Env,
     /// Marcador interno para el módulo `request` (GRAMMAR.md §3.38) -- body
@@ -205,6 +207,7 @@ impl std::fmt::Debug for Value {
             Value::Base64 => write!(f, "Base64"),
             Value::Pdf => write!(f, "Pdf"),
             Value::Excel => write!(f, "Excel"),
+            Value::Mcp => write!(f, "Mcp"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
             Value::Smtp => write!(f, "Smtp"),
@@ -435,6 +438,9 @@ pub(crate) fn eval_expr(
             if name == "excel" {
                 return Ok(Value::Excel);
             }
+            if name == "mcp" {
+                return Ok(Value::Mcp);
+            }
             if name == "env" {
                 return Ok(Value::Env);
             }
@@ -513,7 +519,7 @@ pub(crate) fn eval_expr(
                 // durante meses porque faltaba acá -- al agregar una
                 // variante `Value` nueva con métodos propios, sumarla ACÁ
                 // también, no solo en su `match method`.
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Decimal(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Env | Value::Request | Value::Smtp | Value::Response => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Decimal(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Mcp | Value::Env | Value::Request | Value::Smtp | Value::Response => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -3208,6 +3214,16 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre excel: '{other}'"))),
         },
+        Value::Mcp => match method {
+            "sample" => {
+                let prompt = match args.into_iter().next() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("mcp.sample requiere un argumento String")),
+                };
+                mcp::sample(&prompt).map(Value::Str).map_err(err)
+            }
+            other => Err(err(format!("método desconocido sobre mcp: '{other}'"))),
+        },
         Value::Env => match method {
             "get" => {
                 let name = match args.first() {
@@ -4720,7 +4736,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Mcp | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -8983,6 +8999,31 @@ mod tests {
         let not_xlsx_b64 = "aG9sYSBtdW5kbw==";
         let e = invoke_rpc(&program, "Docs", "make", &json!({"b64": not_xlsx_b64}), &db).unwrap_err();
         assert!(e.message.contains("excel.parse"), "mensaje inesperado: {}", e.message);
+    }
+
+    // ---- mcp.sample (GRAMMAR.md §3.203, Pieza C) ----
+
+    #[test]
+    fn mcp_sample_is_reachable_through_field_access_and_fails_cleanly_without_a_session() {
+        // GRAMMAR.md §3.199: mismo test de "no vuelvas a faltar en el
+        // allowlist de Expr::FieldAccess" que Decimal ya tiene -- este test
+        // corre FUERA de cualquier contexto MCP real (`invoke_rpc` no pasa
+        // por `runtime/mcp.rs::handle_tools_call`), así que la única forma
+        // de que esto falle con "no se puede acceder al campo 'sample'" es
+        // que `Value::Mcp` vuelva a faltar en ese allowlist -- si en cambio
+        // falla con el mensaje de "no hay sesión MCP activa", el método SÍ
+        // se alcanzó, que es lo único que este test necesita confirmar.
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc ask(prompt: String) -> String { mcp.sample(prompt) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "Docs", "ask", &json!({"prompt": "hola"}), &db).unwrap_err();
+        assert!(e.message.contains("mcp.sample"), "mensaje inesperado (¿mcp.sample sigue inalcanzable?): {}", e.message);
+        assert!(e.message.contains("sesión MCP activa"), "mensaje inesperado: {}", e.message);
     }
 
     // ---- constructo de loop: `while` (GRAMMAR.md §3.15) ----

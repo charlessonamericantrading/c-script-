@@ -155,6 +155,9 @@ pub enum Type {
     /// Tipo interno para el módulo `excel` builtin (GRAMMAR.md §3.202) --
     /// generar y parsear bytes de `.xlsx` real.
     Excel,
+    /// Tipo interno para el módulo `mcp` builtin (GRAMMAR.md §3.203) --
+    /// `mcp.sample`, streaming bidireccional real de MCP.
+    Mcp,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -237,6 +240,7 @@ impl std::fmt::Display for Type {
             Type::Response => write!(f, "response"),
             Type::Pdf => write!(f, "pdf"),
             Type::Excel => write!(f, "excel"),
+            Type::Mcp => write!(f, "mcp"),
         }
     }
 }

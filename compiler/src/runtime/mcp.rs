@@ -21,8 +21,170 @@ use super::session::SessionStore;
 use crate::ast::{Item, Member, Program};
 use crate::checker::Checker;
 use crate::codegen::openapi_emit::type_to_json_schema;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::mpsc::SyncSender;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub(crate) const SESSION_HEADER: &str = "Mcp-Session-Id";
+
+/// Cuántos mensajes iniciados por el servidor puede acumular una conexión
+/// `GET /mcp` antes de que `mcp.sample` empiece a fallar en vez de
+/// bloquear -- mismo criterio y mismo orden de magnitud que
+/// `Db::LIVE_STREAM_BUFFER` (`runtime/db.rs`, GRAMMAR.md §3.16): un cliente
+/// MCP real procesa un `sampling/createMessage` bastante más rápido de lo
+/// que este servidor podría generarlos en secuencia (cada uno bloquea la
+/// invocación del `rpc` que lo pidió hasta tener respuesta), así que un
+/// buffer chico alcanza de sobra.
+pub(crate) const CONNECTION_BUFFER: usize = 32;
+
+/// Cuánto espera `mcp.sample` una respuesta correlacionada antes de
+/// rendirse -- deliberadamente generoso (un cliente MCP real puede
+/// necesitar completar una llamada a un LLM), pero acotado: sin esto, un
+/// cliente que nunca responde dejaría el hilo de ESE `rpc` bloqueado para
+/// siempre (mismo espíritu que `MAX_WHILE_ITERATIONS`, GRAMMAR.md §3.15 --
+/// un backstop contra el caso colgado, no una cuota fina de recursos).
+const SAMPLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Estado compartido de la Pieza C, construido UNA vez en `server::serve`
+/// junto a los demás `Arc` (mismo criterio que `Db::subscribers`,
+/// `runtime/db.rs`) y clonado (barato: dos incrementos de refcount) por
+/// request en `spawn_handler!`.
+#[derive(Clone)]
+pub(crate) struct McpSharedState {
+    /// A qué conexión `GET /mcp` abierta empujarle un mensaje iniciado por
+    /// el servidor, por `jti` de sesión MCP.
+    pub(crate) connections: Arc<parking_lot::Mutex<HashMap<String, SyncSender<serde_json::Value>>>>,
+    /// La tabla de correlación en sí -- exactamente la forma validada por
+    /// el spike aislado de PLAN.md §9.15 ítem 3 (`GET`/`POST` ->
+    /// `recv_timeout` -> limpieza en timeout, candado tomado y soltado,
+    /// nunca sostenido durante el bloqueo).
+    pending: Arc<parking_lot::Mutex<HashMap<String, std::sync::mpsc::Sender<serde_json::Value>>>>,
+}
+
+impl McpSharedState {
+    pub(crate) fn new() -> Self {
+        McpSharedState { connections: Arc::new(parking_lot::Mutex::new(HashMap::new())), pending: Arc::new(parking_lot::Mutex::new(HashMap::new())) }
+    }
+}
+
+thread_local! {
+    /// Contexto MCP de la sesión que invocó, vía `tools/call`, el `rpc` que
+    /// está corriendo AHORA MISMO en ESTE hilo -- mismo mecanismo exacto
+    /// que `CURRENT_REQUEST` (`runtime/db.rs`, GRAMMAR.md §3.38): un hilo
+    /// por request (GRAMMAR.md §3.158) hace que un `thread_local!` sea
+    /// exactamente "el contexto de la request actual", sin candado ni
+    /// riesgo de que dos requests concurrentes se pisen. Fijado por
+    /// `handle_post` justo antes de invocar el `rpc`, limpiado apenas
+    /// vuelve.
+    static CURRENT_MCP: RefCell<Option<(String, McpSharedState)>> = const { RefCell::new(None) };
+}
+
+fn set_current(jti: String, state: McpSharedState) {
+    CURRENT_MCP.with(|c| *c.borrow_mut() = Some((jti, state)));
+}
+
+fn clear_current() {
+    CURRENT_MCP.with(|c| *c.borrow_mut() = None);
+}
+
+fn current() -> Option<(String, McpSharedState)> {
+    CURRENT_MCP.with(|c| c.borrow().clone())
+}
+
+fn fresh_id() -> String {
+    let mut buf = [0u8; 16];
+    let _ = getrandom::getrandom(&mut buf);
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `mcp.sample(prompt: String) -> String` (GRAMMAR.md §3.203, Pieza C) --
+/// alcance v1 deliberadamente angosto: un solo turno de texto, sin roles
+/// ni historial multi-turno. Arma una request `sampling/createMessage`
+/// real, la empuja por la conexión `GET /mcp` abierta de la sesión actual
+/// (`CURRENT_MCP`), y bloquea (con timeout) hasta que una respuesta
+/// correlacionada llegue por `POST /mcp` (`handle_correlated_response`,
+/// más abajo) -- exactamente el mecanismo que el spike aislado validó.
+pub(crate) fn sample(prompt: &str) -> Result<String, String> {
+    let Some((jti, state)) = current() else {
+        return Err(
+            "mcp.sample: no hay ninguna sesión MCP activa en este hilo -- solo se puede llamar dentro de un rpc invocado vía tools/call, con una conexión GET /mcp abierta para esa sesión (GRAMMAR.md §3.203)"
+                .to_string(),
+        );
+    };
+    let Some(sender) = state.connections.lock().get(&jti).cloned() else {
+        return Err(
+            "mcp.sample: no hay ninguna conexión GET /mcp abierta para esta sesión -- el cliente MCP tiene que mantener el stream abierto para poder recibir mensajes iniciados por el servidor"
+                .to_string(),
+        );
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    let id = fresh_id();
+    state.pending.lock().insert(id.clone(), tx);
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "sampling/createMessage",
+        "params": { "messages": [{ "role": "user", "content": { "type": "text", "text": prompt } }] },
+    });
+    if sender.try_send(request).is_err() {
+        state.pending.lock().remove(&id);
+        return Err("mcp.sample: no se pudo entregar el mensaje -- la conexión GET /mcp de esta sesión está saturada o cerrada".to_string());
+    }
+
+    match rx.recv_timeout(SAMPLE_TIMEOUT) {
+        Ok(response) => extract_sample_text(&response),
+        Err(_) => {
+            state.pending.lock().remove(&id);
+            Err("mcp.sample: el cliente MCP no respondió dentro del tiempo límite (30s)".to_string())
+        }
+    }
+}
+
+/// `result.content[0].text` (la forma real de una respuesta de
+/// `sampling/createMessage`, mismo formato de bloques de contenido que
+/// `tools/call` ya usa) -- o el mensaje de un `error` JSON-RPC, si el
+/// cliente lo devolvió así.
+fn extract_sample_text(response: &serde_json::Value) -> Result<String, String> {
+    if let Some(error) = response.get("error") {
+        let message = error.get("message").and_then(|m| m.as_str()).unwrap_or("error desconocido");
+        return Err(format!("mcp.sample: el cliente MCP devolvió un error: {message}"));
+    }
+    response
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|first| first.get("text"))
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "mcp.sample: la respuesta del cliente MCP no tiene la forma esperada (result.content[0].text)".to_string())
+}
+
+/// Un `POST /mcp` sin `method` pero CON `id` es una respuesta JSON-RPC
+/// correlacionada (a un `sampling/createMessage` que este servidor inició)
+/// -- distinto de una REQUEST sin `method`, que sigue siendo un error 400
+/// (ver `handle_post`). Busca+saca el `Sender` pendiente (nunca lo deja
+/// después de entregar -- mismo criterio "remove antes de send" que el
+/// spike aislado confirmó necesario para que un timeout tardío no reciba
+/// una entrega fantasma).
+fn handle_correlated_response(state: &McpSharedState, parsed: &serde_json::Value) -> (u16, serde_json::Value) {
+    let id = match parsed.get("id") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => return (400, serde_json::json!({"error": "falta 'id'"})),
+    };
+    match state.pending.lock().remove(&id) {
+        Some(tx) => {
+            let _ = tx.send(parsed.clone());
+            (200, serde_json::json!({"delivered": true}))
+        }
+        None => (404, serde_json::json!({"error": format!("no hay ninguna request pendiente con id '{id}'")})),
+    }
+}
 
 /// Versión de la spec `Streamable HTTP transport` contra la que se diseñó
 /// esta implementación.
@@ -130,6 +292,7 @@ fn handle_tools_call(
     program: &Program,
     db: &Db,
     sessions: &SessionStore,
+    mcp_state: &McpSharedState,
     mcp_session_id: Option<&str>,
     params: &serde_json::Value,
     request_id: &serde_json::Value,
@@ -148,11 +311,33 @@ fn handle_tools_call(
     if let Err((status, msg)) = auth_gate.outcome {
         return (status, err_response(request_id, -32001, msg));
     }
-    let (status, body_str, _content_type, _location, _cache_control) =
-        handle_rpc(program, db, sessions, Some(session_token), &service_name, &rpc_name, arguments);
+    // GRAMMAR.md §3.203, Pieza C: `mcp.sample` (dentro del cuerpo de ESTE
+    // `rpc`, si lo llama) necesita saber a qué sesión/conexión pertenece
+    // esta invocación -- fijado en el `thread_local!` de este hilo justo
+    // antes de invocar, limpiado apenas vuelve (con o sin error). Un
+    // `Mcp-Session-Id` que no verificó (no debería pasar: `check_auth_gate`
+    // de arriba ya lo hubiera rechazado) simplemente deja el contexto sin
+    // fijar -- `mcp.sample` da su propio error claro en ese caso, nunca un
+    // panic.
+    if let Some((_, _, jti)) = sessions.verify_mcp_session(session_token) {
+        set_current(jti, mcp_state.clone());
+    }
+    let result = handle_rpc(program, db, sessions, Some(session_token), &service_name, &rpc_name, arguments);
+    clear_current();
+    let (status, body_str, _content_type, _location, _cache_control) = result;
     if (200..300).contains(&status) {
         let result_value: serde_json::Value = serde_json::from_str(&body_str).unwrap_or(serde_json::Value::Null);
-        let content = serde_json::json!({ "content": [{ "type": "text", "text": result_value.to_string() }] });
+        // Un `rpc -> String` no debe terminar con comillas JSON de más
+        // adentro del bloque de texto -- `"hola"` (con comillas) en vez de
+        // `hola` sería un bug real, no una simplificación: un cliente MCP
+        // real le mostraría las comillas al usuario/LLM. Solo un resultado
+        // NO-string (número/objeto/array/bool) se serializa a JSON de
+        // verdad para el campo `text`.
+        let text = match &result_value {
+            serde_json::Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let content = serde_json::json!({ "content": [{ "type": "text", "text": text }] });
         (200, ok_response(request_id, content))
     } else {
         let message = serde_json::from_str::<serde_json::Value>(&body_str)
@@ -172,15 +357,18 @@ pub(crate) struct PostResult {
     pub new_session_id: Option<String>,
 }
 
-/// Dispatch de `POST /mcp` por `method` del cuerpo JSON-RPC. La entrega de
-/// una respuesta correlacionada (Pieza C) todavía no está conectada --
-/// cualquier `method` que no sea `initialize`/`tools/list`/`tools/call` da
-/// un 501 explícito, nunca un 404/500 genérico que confunda "no
-/// implementado todavía" con "no existe".
+/// Dispatch de `POST /mcp` por `method` del cuerpo JSON-RPC. Un cuerpo SIN
+/// `method` pero CON `id` es una respuesta correlacionada (Pieza C) a un
+/// `sampling/createMessage` que este servidor inició -- distinto de una
+/// request sin `method` de verdad, que sigue siendo un 400. Cualquier
+/// `method` real que no sea `initialize`/`tools/list`/`tools/call` da un
+/// 501 explícito, nunca un 404/500 genérico que confunda "no implementado
+/// todavía" con "no existe".
 pub(crate) fn handle_post(
     program: &Program,
     db: &Db,
     sessions: &SessionStore,
+    mcp_state: &McpSharedState,
     bearer_token: Option<&str>,
     mcp_session_id: Option<&str>,
     body: &str,
@@ -193,6 +381,11 @@ pub(crate) fn handle_post(
     };
     let request_id = parsed.get("id").cloned().unwrap_or(serde_json::Value::Null);
     let method = parsed.get("method").and_then(|m| m.as_str());
+
+    if method.is_none() && parsed.get("id").is_some() {
+        let (status, body) = handle_correlated_response(mcp_state, &parsed);
+        return PostResult { status, body, new_session_id: None };
+    }
 
     match method {
         Some("initialize") => {
@@ -211,16 +404,12 @@ pub(crate) fn handle_post(
         }
         Some("tools/call") => {
             let params = parsed.get("params").cloned().unwrap_or(serde_json::Value::Null);
-            let (status, body) = handle_tools_call(program, db, sessions, mcp_session_id, &params, &request_id);
+            let (status, body) = handle_tools_call(program, db, sessions, mcp_state, mcp_session_id, &params, &request_id);
             PostResult { status, body, new_session_id: None }
         }
         Some(other) => PostResult {
             status: 501,
-            body: err_response(
-                &request_id,
-                -32601,
-                &format!("método MCP todavía no soportado: '{other}' (GRAMMAR.md §3.203 -- streaming bidireccional llega en la próxima pieza de esta ronda)"),
-            ),
+            body: err_response(&request_id, -32601, &format!("método MCP todavía no soportado: '{other}'")),
             new_session_id: None,
         },
         None => {

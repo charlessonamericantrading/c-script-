@@ -1530,6 +1530,10 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             method("build(sheets)", "Build an .xlsx workbook from a list of ExcelSheet, returned as a base64-encoded String"),
             method("parse(base64)", "Parse a base64-encoded .xlsx workbook into a list of ExcelSheet"),
         ]),
+        Type::Mcp => Some(vec![method(
+            "sample(prompt)",
+            "Ask the connected MCP client to sample a single-turn text completion, blocking until it responds",
+        )]),
         Type::Struct { fields, .. } => Some(
             fields
                 .iter()

@@ -479,6 +479,11 @@ pub fn serve(
     // `GET /metrics` (GRAMMAR.md §3.149): mismo criterio que los tres de
     // arriba.
     let metrics_store = MetricsStore::new();
+    // MCP real (GRAMMAR.md §3.203): construido SIEMPRE (barato -- dos
+    // `HashMap` vacíos bajo `Arc<Mutex<...>>`), igual que los stores de
+    // arriba -- el gate real es `mcp_secret.is_none()` más abajo, en
+    // `handle_request`, no la existencia de este estado.
+    let mcp_state = super::mcp::McpSharedState::new();
     println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     // Pilar 1 del roadmap de concurrencia (26/08/2026, a partir del pedido
@@ -595,6 +600,7 @@ pub fn serve(
             let hsts = hsts.clone();
             let service_api_key = service_api_key.clone();
             let mcp_secret = mcp_secret.clone();
+            let mcp_state = mcp_state.clone();
             let request = $request;
             std::thread::spawn(move || {
                 handle_request(
@@ -613,6 +619,7 @@ pub fn serve(
                     service_api_key.as_deref(),
                     log,
                     mcp_secret.as_deref(),
+                    mcp_state,
                     request,
                 );
             });
@@ -698,6 +705,7 @@ fn handle_request(
     service_api_key: Option<&str>,
     log: LogConfig,
     mcp_secret: Option<&str>,
+    mcp_state: super::mcp::McpSharedState,
     mut request: tiny_http::Request,
 ) {
     // Resuelto UNA vez por request, antes de cualquier otra cosa --
@@ -906,6 +914,7 @@ fn handle_request(
                         &program,
                         &db,
                         &sessions,
+                        &mcp_state,
                         extract_bearer_token(&request).as_deref(),
                         mcp_session_id.as_deref(),
                         &body,
@@ -927,13 +936,37 @@ fn handle_request(
                     log_done(log, req_id, Some("mcp"), status, start, "");
                     return;
                 }
-                // `GET /mcp` (la conexión SSE de larga duración) es la
-                // Pieza C -- todavía no conectada en esta versión.
+                // `GET /mcp` (Pieza C, GRAMMAR.md §3.203): conexión SSE de
+                // larga duración por la que este servidor empuja mensajes
+                // que ÉL inicia (`sampling/createMessage`, vía
+                // `mcp.sample`) -- mismo patrón que `write_live_stream`
+                // (push real de §3.16), pero registrado en
+                // `mcp_state.connections` por `jti` de sesión MCP, no en
+                // `Db::subscribers` por colección.
+                tiny_http::Method::Get => {
+                    let Some(token) = mcp_session_id.as_deref() else {
+                        let resp = cors_response(400, error_json("falta el header Mcp-Session-Id"), &cors_headers, &request);
+                        let _ = request.respond(resp);
+                        log_done(log, req_id, Some("mcp"), 400, start, "");
+                        return;
+                    };
+                    let Some((_, _, jti)) = sessions.verify_mcp_session(token) else {
+                        let resp = cors_response(404, error_json("sesión MCP inválida o ya terminada"), &cors_headers, &request);
+                        let _ = request.respond(resp);
+                        log_done(log, req_id, Some("mcp"), 404, start, "");
+                        return;
+                    };
+                    let (tx, rx) = std::sync::mpsc::sync_channel(super::mcp::CONNECTION_BUFFER);
+                    mcp_state.connections.lock().insert(jti.clone(), tx);
+                    let cors_headers_owned = cors_headers.clone();
+                    let mcp_state = mcp_state.clone();
+                    std::thread::spawn(move || write_mcp_stream(request, rx, jti, mcp_state, cors_headers_owned, req_id, start, log));
+                    return;
+                }
                 _ => {
-                    let resp =
-                        cors_response(501, error_json("GET /mcp (streaming) llega en una pieza futura de esta misma ronda -- GRAMMAR.md §3.203"), &cors_headers, &request);
+                    let resp = cors_response(405, error_json("método no soportado sobre /mcp"), &cors_headers, &request);
                     let _ = request.respond(resp);
-                    log_done(log, req_id, Some("mcp"), 501, start, "");
+                    log_done(log, req_id, Some("mcp"), 405, start, "");
                     return;
                 }
             }
@@ -1978,6 +2011,43 @@ fn write_live_stream(
     }
     let _ = writer.write_all(b"0\r\n\r\n").and_then(|_| writer.flush());
     log_done(log, req_id, Some(&method), 200, start, &format!("sent={sent}"));
+}
+
+/// `GET /mcp` (GRAMMAR.md §3.203, Pieza C) -- mismo patrón que
+/// `write_live_stream`, pero sin `snapshot` inicial (una conexión MCP no
+/// tiene "estado actual" que replicar, a diferencia de una colección de
+/// `db`) y con una limpieza EXPLÍCITA de `mcp_state.connections` al
+/// terminar -- a diferencia de `Db::subscribers` (que poda perezosamente
+/// recién en la PRÓXIMA publicación), acá conviene una limpieza inmediata:
+/// un `mcp.sample` que corriera justo después de que el cliente se
+/// desconectó, pero ANTES de una futura reconexión, tiene que enterarse de
+/// que no hay conexión abierta (error claro) en vez de mandar a un canal
+/// muerto en silencio.
+fn write_mcp_stream(
+    request: tiny_http::Request,
+    events: Receiver<serde_json::Value>,
+    jti: String,
+    mcp_state: super::mcp::McpSharedState,
+    cors: CorsHeaders,
+    req_id: u64,
+    start: std::time::Instant,
+    log: LogConfig,
+) {
+    let mut writer = request.into_writer();
+    let header = sse_preamble(&cors);
+    let mut sent = 0usize;
+    if writer.write_all(header.as_bytes()).is_ok() {
+        let _ = writer.flush();
+        for event in &events {
+            if write_chunk(&mut writer, format!("data: {event}\n\n").as_bytes()).is_err() {
+                break;
+            }
+            sent += 1;
+        }
+        let _ = writer.write_all(b"0\r\n\r\n").and_then(|_| writer.flush());
+    }
+    mcp_state.connections.lock().remove(&jti);
+    log_done(log, req_id, Some("mcp"), 200, start, &format!("sent={sent}"));
 }
 
 /// Un chunk de HTTP chunked transfer encoding: tamaño en hex + CRLF + datos

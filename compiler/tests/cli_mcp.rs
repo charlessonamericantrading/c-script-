@@ -1,12 +1,15 @@
-// MCP real (GRAMMAR.md §3.203) -- Pieza A: sesión (`initialize`/`DELETE`).
-// Se prueba contra el BINARIO real hablando HTTP de verdad, mismo criterio
-// que el resto de los tests de este estilo (`cli_service_api_key.rs`): que
-// el código compile no prueba que `--mcp-jwt-secret` de verdad habilite
-// `/mcp`, que `initialize` de verdad exija un `Authorization: Bearer` real
-// y devuelva un `Mcp-Session-Id` usable, ni que `DELETE` de verdad revoque
-// esa sesión.
+// MCP real (GRAMMAR.md §3.203) -- sesión (Pieza A), tools/list/tools/call
+// (Pieza B), mcp.sample + streaming bidireccional (Pieza C). Se prueba
+// contra el BINARIO real hablando HTTP de verdad, mismo criterio que el
+// resto de los tests de este estilo (`cli_service_api_key.rs`): que el
+// código compile no prueba que `--mcp-jwt-secret` de verdad habilite
+// `/mcp`, que `initialize` de verdad exija un `Authorization: Bearer` real,
+// que `@requires` aplique idéntico vía `tools/call`, ni que la correlación
+// cross-hilo de `mcp.sample` funcione contra el servidor real (el spike
+// aislado de PLAN.md §9.15 ítem 3 ya probó que el MECANISMO funciona bajo
+// `tiny_http` -- esto prueba que la INTEGRACIÓN real también).
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -25,6 +28,8 @@ service Calc {
 
   @requires(Role.Admin)
   rpc adminOnly() -> String { "solo admin" }
+
+  rpc askLlm(prompt: String) -> String { mcp.sample(prompt) }
 }
 "#;
 
@@ -348,4 +353,150 @@ fn tools_call_respects_the_rpcs_existing_requires_annotation() {
         &[("Mcp-Session-Id", &mcp_session_id)],
     );
     assert_eq!(status, 403, "un Member no debería poder llamar un tool @requires(Role.Admin): {body}");
+}
+
+// ---- Pieza C: mcp.sample + streaming bidireccional real ----
+
+/// `GET /mcp` conectado a mano por un `TcpStream` -- mismo patrón que
+/// `StreamClient` en `pg_integration.rs` (`Transfer-Encoding: chunked`,
+/// un evento SSE por chunk, `write_chunk` en `runtime/server.rs` nunca
+/// parte uno en dos ni junta dos en uno).
+struct McpStreamClient {
+    reader: BufReader<TcpStream>,
+}
+
+impl McpStreamClient {
+    fn connect(port: u16, mcp_session_id: &str) -> Self {
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("conectar a GET /mcp");
+        stream.set_read_timeout(Some(Duration::from_secs(10))).expect("fijar read timeout");
+        let request = format!(
+            "GET /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nMcp-Session-Id: {mcp_session_id}\r\nConnection: keep-alive\r\n\r\n"
+        );
+        let mut stream = stream;
+        stream.write_all(request.as_bytes()).expect("escribir GET /mcp");
+        stream.flush().ok();
+
+        let mut reader = BufReader::new(stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("línea de estado de GET /mcp");
+        assert!(status_line.contains("200"), "GET /mcp no arrancó bien: {status_line}");
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("header de GET /mcp");
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+        McpStreamClient { reader }
+    }
+
+    fn next_event(&mut self) -> Option<serde_json::Value> {
+        let mut size_line = String::new();
+        self.reader.read_line(&mut size_line).ok()?;
+        let size = usize::from_str_radix(size_line.trim(), 16).ok()?;
+        if size == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; size];
+        self.reader.read_exact(&mut buf).ok()?;
+        let mut crlf = [0u8; 2];
+        self.reader.read_exact(&mut crlf).ok()?;
+        let chunk = String::from_utf8_lossy(&buf);
+        let data = chunk.strip_prefix("data: ")?.trim_end_matches(['\n', '\r']);
+        serde_json::from_str(data).ok()
+    }
+}
+
+#[test]
+fn mcp_sample_without_an_open_get_connection_is_a_clean_runtime_error() {
+    let temp = TempDir::new("sample-no-connection");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+    let mcp_session_id = login_and_initialize(&server);
+
+    // Sin ningún GET /mcp abierto para esta sesión -- mcp.sample tiene que
+    // fallar limpio, no colgarse.
+    let (status, _, body) = server.request(
+        "POST",
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Calc_askLlm","arguments":{"prompt":"hola"}}}"#,
+        &[("Mcp-Session-Id", &mcp_session_id)],
+    );
+    assert_eq!(status, 500, "body: {body}");
+    assert!(body.contains("no hay ninguna conexión"), "body: {body}");
+}
+
+#[test]
+fn mcp_sample_full_round_trip_over_a_real_get_connection_and_a_real_post_response() {
+    let temp = TempDir::new("sample-round-trip");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+    let mcp_session_id = login_and_initialize(&server);
+
+    // La conexión GET tiene que estar abierta ANTES de que tools/call
+    // dispare mcp.sample, para no correr una carrera real.
+    let mut stream_client = McpStreamClient::connect(server.port, &mcp_session_id);
+
+    // `std::thread::scope` (no `std::thread::spawn`): `Serve::request` toma
+    // `&self`, así que el hilo de `tools/call` puede pedir prestado
+    // `&server` directo, sin `Arc` ni ningún truco -- `tools/call` bloquea
+    // (mcp.sample espera la respuesta correlacionada) mientras el hilo
+    // PRINCIPAL lee el evento SSE y lo responde.
+    std::thread::scope(|scope| {
+        let call_thread = scope.spawn(|| {
+            server.request(
+                "POST",
+                "/mcp",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Calc_askLlm","arguments":{"prompt":"¿cuánto es 2+2?"}}}"#,
+                &[("Mcp-Session-Id", &mcp_session_id)],
+            )
+        });
+
+        let event = stream_client.next_event().expect("tiene que llegar un evento sampling/createMessage");
+        assert_eq!(event["method"], "sampling/createMessage", "evento inesperado: {event}");
+        let sample_id = event["id"].clone();
+        let sample_prompt = event["params"]["messages"][0]["content"]["text"].as_str().unwrap_or_default();
+        assert_eq!(sample_prompt, "¿cuánto es 2+2?");
+
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": sample_id,
+            "result": { "content": [{ "type": "text", "text": "4" }] },
+        })
+        .to_string();
+        let (status, _, body) = server.request("POST", "/mcp", &response, &[]);
+        assert_eq!(status, 200, "entrega de la respuesta correlacionada: {body}");
+
+        let (status, _, body) = call_thread.join().expect("el hilo de tools/call no debería panickear");
+        assert_eq!(status, 200, "body: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body debe ser JSON");
+        assert_eq!(parsed["result"]["content"][0]["text"], "4", "body: {body}");
+    });
+}
+
+/// Conexión GET abierta pero NADIE responde -- `mcp.sample` tiene que
+/// cortar limpio al timeout (30s, `mcp.rs::SAMPLE_TIMEOUT`), nunca
+/// quedarse colgado para siempre. Test real, no simulado -- deliberadamente
+/// más lento que el resto de la suite (mismo trade-off que cualquier test
+/// de un timeout real de producción: probarlo de verdad cuesta esperar).
+#[test]
+fn mcp_sample_that_never_gets_a_response_times_out_cleanly() {
+    let temp = TempDir::new("sample-timeout");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+    let mcp_session_id = login_and_initialize(&server);
+    let _stream_client = McpStreamClient::connect(server.port, &mcp_session_id);
+
+    let start = std::time::Instant::now();
+    let (status, _, body) = server.request(
+        "POST",
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Calc_askLlm","arguments":{"prompt":"nadie va a responder"}}}"#,
+        &[("Mcp-Session-Id", &mcp_session_id)],
+    );
+    let elapsed = start.elapsed();
+    assert_eq!(status, 500, "body: {body}");
+    assert!(body.contains("no respondió"), "body: {body}");
+    assert!(elapsed >= Duration::from_secs(29), "cortó demasiado rápido ({elapsed:?}) -- ¿el timeout dejó de aplicar?");
+    assert!(elapsed < Duration::from_secs(45), "tardó demasiado ({elapsed:?}) -- ¿quedó colgado en vez de cortar al timeout?");
 }

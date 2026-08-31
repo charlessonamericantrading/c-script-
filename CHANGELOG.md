@@ -3,6 +3,29 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.161.0] - 2026-08-31
+
+### ✨ Nuevo
+**MCP real -- Pieza C: `mcp.sample(prompt: String) -> String` + streaming bidireccional** (PLAN.md §9.15 ítem 3, cierra la ronda posterior a MyFinance) -- `GET /mcp` abre una conexión SSE de larga duración (mismo patrón que `write_live_stream`, push real §3.16), y `mcp.sample` arma una request `sampling/createMessage` real, la empuja por esa conexión, y bloquea (30s de timeout) hasta que una respuesta correlacionada llega por un `POST /mcp` nuevo y separado, en otro hilo -- la coordinación cross-hilo que un spike aislado con `tiny_http` real validó antes de tocar producción, integrada de verdad vía un `thread_local!` (`CURRENT_MCP`, mismo mecanismo que `CURRENT_REQUEST` de `db.rs`).
+
+**Bug real encontrado y corregido en el camino**: `tools/call` envolvía un resultado `String` con comillas JSON de más dentro del bloque de texto (`"hola"` en vez de `hola`) -- un cliente MCP real le mostraría las comillas literales.
+
+**Verificado end-to-end contra el binario real**: un driver de test con dos conexiones reales (`GET /mcp` bloqueada leyendo eventos SSE + `POST /mcp` de `tools/call` en un hilo aparte) confirma el round-trip completo; un segundo test confirma el timeout real (30s, sin quedar colgado); un tercero confirma el error limpio sin conexión abierta. Suite completa sin regresiones. Con esto se cierra PLAN.md §9.15 completo (PDF v1.157.0, Excel v1.158.0, MCP v1.159.0-v1.161.0). Ver GRAMMAR.md §3.203.
+
+## [1.160.0] - 2026-08-31
+
+### ✨ Nuevo
+**MCP real -- Pieza B: `tools/list` y `tools/call`** (PLAN.md §9.15 ítem 3) -- `role_for`/`user_id_for` (`session.rs`) se extendieron para reconocer un `Mcp-Session-Id` como una TERCERA fuente de identidad (junto a sesión interna y JWT externo), así `check_auth_gate`/`handle_rpc` (`runtime/server.rs`) se reusan tal cual para `tools/call`, sin ningún camino de auth paralelo -- un `@requires(Role.Admin)` que ya protege un `rpc` por REST aplica idéntico vía MCP, confirmado con un test dedicado. `tools/list` reusa `type_to_json_schema` (`codegen/openapi_emit.rs`, ahora `pub(crate)`), mismo mapeo Type->JSON Schema que `openapi.json` ya usa.
+
+**Verificado**: 5 tests de integración nuevos contra el binario real (`cli_mcp.rs`). Suite completa sin regresiones. Ver GRAMMAR.md §3.203.
+
+## [1.159.0] - 2026-08-31
+
+### ✨ Nuevo
+**MCP real -- Pieza A: sesión (`initialize`/`DELETE`)** (PLAN.md §9.15 ítem 3, primer ítem de MCP en la ronda posterior a MyFinance) -- `linkc serve --mcp-jwt-secret` habilita `/mcp`, sin ninguna anotación `.link` nueva (mismo criterio "sin opt-in" que `openapi.json` ya usa para exponer cada `service`). `POST /mcp` con `method: "initialize"` exige un `Authorization: Bearer` normal y firma una sesión MCP nueva embebiendo el mismo rol/`user_id` -- primera función de FIRMA de JWT en producción de este proyecto (antes solo se verificaban JWT externos, §3.64). `DELETE /mcp` revoca vía un registro chico de `jti` (`mcp_revoked_jti`).
+
+**Verificado**: 7 tests de integración nuevos contra el binario real (`cli_mcp.rs`). Suite completa sin regresiones. Ver GRAMMAR.md §3.203.
+
 ## [1.158.0] - 2026-08-31
 
 ### ✨ Nuevo
