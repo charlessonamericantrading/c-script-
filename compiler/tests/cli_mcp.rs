@@ -13,10 +13,18 @@ use std::process::{Child, Command};
 use std::time::Duration;
 
 const PROGRAM: &str = r#"
-enum Role { Admin }
+enum Role { Admin, Member }
 
 service Auth {
   rpc login() -> String { auth.createSession(Role.Admin {}) }
+  rpc loginAsMember() -> String { auth.createSession(Role.Member {}) }
+}
+
+service Calc {
+  rpc add(a: Int, b: Int) -> Int { a + b }
+
+  @requires(Role.Admin)
+  rpc adminOnly() -> String { "solo admin" }
 }
 "#;
 
@@ -217,9 +225,127 @@ fn a_session_terminated_by_delete_is_rejected_by_a_later_request() {
 
 #[test]
 fn an_unknown_mcp_method_gets_a_clean_501_not_a_crash() {
+    // `tools/list`/`tools/call` ya están implementados (Pieza B) -- un
+    // método real pero todavía no conectado (Pieza C, streaming
+    // bidireccional) es el caso real de "no implementado todavía".
     let temp = TempDir::new("unknown-method");
     let src = temp.write("app.link", PROGRAM);
     let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
-    let (status, _, body) = server.request("POST", "/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]);
+    let (status, _, body) = server.request("POST", "/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"sampling/createMessage"}"#, &[]);
     assert_eq!(status, 501, "body: {body}");
+}
+
+// ---- Pieza B: tools/list / tools/call ----
+
+#[test]
+fn tools_list_exposes_every_non_stream_non_cron_rpc_with_a_json_schema() {
+    let temp = TempDir::new("tools-list");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+    let (status, _, body) = server.request("POST", "/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#, &[]);
+    assert_eq!(status, 200, "body: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("body debe ser JSON");
+    let tools = parsed["result"]["tools"].as_array().expect("result.tools debe ser un array");
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"Calc_add"), "{names:?}");
+    assert!(names.contains(&"Calc_adminOnly"), "{names:?}");
+    let add_tool = tools.iter().find(|t| t["name"] == "Calc_add").expect("Calc_add tiene que estar en la lista");
+    assert_eq!(add_tool["inputSchema"]["properties"]["a"]["type"], "integer");
+    assert_eq!(add_tool["inputSchema"]["required"], serde_json::json!(["a", "b"]));
+}
+
+#[test]
+fn tools_call_without_a_session_is_rejected() {
+    let temp = TempDir::new("call-no-session");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+    let (status, _, body) = server.request(
+        "POST",
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"Calc_add","arguments":{"a":1,"b":2}}}"#,
+        &[],
+    );
+    assert_eq!(status, 401, "body: {body}");
+}
+
+/// Hace el ciclo completo `login` -> `initialize` y devuelve el
+/// `Mcp-Session-Id` resultante, para los tests de `tools/call` que
+/// necesitan una sesión MCP real ya establecida.
+fn login_and_initialize(server: &Serve) -> String {
+    let token = login(server);
+    let (status, headers, body) = server.request(
+        "POST",
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        &[("Authorization", &format!("Bearer {token}"))],
+    );
+    assert_eq!(status, 200, "body: {body}");
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Mcp-Session-Id")).map(|(_, v)| v.clone()).expect("initialize debe devolver Mcp-Session-Id")
+}
+
+#[test]
+fn tools_call_invokes_the_real_rpc_and_wraps_the_result_in_mcp_content_blocks() {
+    let temp = TempDir::new("call-ok");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+    let mcp_session_id = login_and_initialize(&server);
+
+    let (status, _, body) = server.request(
+        "POST",
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Calc_add","arguments":{"a":3,"b":4}}}"#,
+        &[("Mcp-Session-Id", &mcp_session_id)],
+    );
+    assert_eq!(status, 200, "body: {body}");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("body debe ser JSON");
+    assert_eq!(parsed["result"]["content"][0]["type"], "text");
+    assert_eq!(parsed["result"]["content"][0]["text"], "7");
+}
+
+#[test]
+fn tools_call_on_an_unknown_tool_is_a_clean_404() {
+    let temp = TempDir::new("call-unknown-tool");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+    let mcp_session_id = login_and_initialize(&server);
+
+    let (status, _, body) = server.request(
+        "POST",
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"NoExiste_foo","arguments":{}}}"#,
+        &[("Mcp-Session-Id", &mcp_session_id)],
+    );
+    assert_eq!(status, 404, "body: {body}");
+}
+
+/// El mismo `@requires(Role.Admin)` que ya protege el `rpc` por la vía
+/// REST normal (GRAMMAR.md §3.14) tiene que aplicar IDÉNTICO vía
+/// `tools/call` -- confirma que no hay un camino de auth paralelo sin
+/// auditar para MCP.
+#[test]
+fn tools_call_respects_the_rpcs_existing_requires_annotation() {
+    let temp = TempDir::new("call-requires");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+
+    let (status, _, body) = server.request("POST", "/Auth/loginAsMember", "{}", &[]);
+    assert_eq!(status, 200, "body: {body}");
+    let member_token: String = serde_json::from_str(&body).expect("login debe devolver un token string");
+    let (status, headers, body) = server.request(
+        "POST",
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        &[("Authorization", &format!("Bearer {member_token}"))],
+    );
+    assert_eq!(status, 200, "body: {body}");
+    let mcp_session_id =
+        headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("Mcp-Session-Id")).map(|(_, v)| v.clone()).expect("initialize debe devolver Mcp-Session-Id");
+
+    let (status, _, body) = server.request(
+        "POST",
+        "/mcp",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Calc_adminOnly","arguments":{}}}"#,
+        &[("Mcp-Session-Id", &mcp_session_id)],
+    );
+    assert_eq!(status, 403, "un Member no debería poder llamar un tool @requires(Role.Admin): {body}");
 }

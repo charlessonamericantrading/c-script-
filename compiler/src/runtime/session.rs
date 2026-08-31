@@ -182,6 +182,16 @@ pub struct SessionStore {
     /// arriba: `parking_lot::Mutex`, propio candado, nunca sostenido más
     /// allá de la operación puntual que lo pide.
     mcp_revoked_jti: parking_lot::Mutex<HashSet<String>>,
+    /// `Some` solo si `--mcp-jwt-secret`/`LINK_MCP_JWT_SECRET` está
+    /// configurado (GRAMMAR.md §3.203) -- guardado ACÁ (no pasado como
+    /// parámetro suelto en cada llamada) para que `role_for`/`user_id_for`
+    /// reconozcan un `Mcp-Session-Id` como una tercera fuente de identidad
+    /// válida, transparente para cualquier código que YA llame a esos dos
+    /// métodos (`check_auth_gate`, `auth.currentRole()`/`currentUserId()`
+    /// dentro del cuerpo de un `rpc`) -- sin este campo, un `rpc` invocado
+    /// vía `tools/call` vería `auth.currentRole()` devolver `None` aunque
+    /// la sesión MCP sea perfectamente válida.
+    mcp_secret: Option<String>,
 }
 
 impl SessionStore {
@@ -192,6 +202,7 @@ impl SessionStore {
             ttl: None,
             jwt: None,
             mcp_revoked_jti: parking_lot::Mutex::new(HashSet::new()),
+            mcp_secret: None,
         }
     }
 
@@ -206,7 +217,17 @@ impl SessionStore {
             ttl: Some(ttl),
             jwt: None,
             mcp_revoked_jti: parking_lot::Mutex::new(HashSet::new()),
+            mcp_secret: None,
         }
+    }
+
+    /// GRAMMAR.md §3.203: habilita reconocer un `Mcp-Session-Id` en
+    /// `role_for`/`user_id_for`/`sign_mcp_session`/`verify_mcp_session` --
+    /// builder consumidor, mismo patrón que `with_jwt` (se encadena:
+    /// `SessionStore::new().with_mcp_secret(...)`).
+    pub fn with_mcp_secret(mut self, secret: String) -> Self {
+        self.mcp_secret = Some(secret);
+        self
     }
 
     /// `auth.recordFailedLogin(identifier)` (GRAMMAR.md §3.152) -- agrega
@@ -329,6 +350,17 @@ impl SessionStore {
                 return Some((entry.enum_name.clone(), entry.variant_name.clone()));
             }
         }
+        // GRAMMAR.md §3.203: un `Mcp-Session-Id` es una TERCERA fuente de
+        // identidad, además de una sesión propia y un JWT externo -- así
+        // `auth.currentRole()`/`currentUserId()` dentro de un `rpc`
+        // invocado vía `tools/call` funcionan sin ningún cambio en ESE
+        // código, y `check_auth_gate` (`runtime/server.rs`) reusa esta
+        // misma función sin saber que el token es de MCP. Mismo sentinel
+        // `enum_name = ""` que un JWT externo -- ninguno de los dos tiene
+        // un enum de c-script asociado.
+        if let Some((role, _, _)) = self.verify_mcp_session(token) {
+            return Some((String::new(), role));
+        }
         let jwt = self.jwt.as_ref()?;
         let claims = verify_jwt(token, &jwt.secret)?;
         let variant = claims.get(&jwt.role_claim)?.as_str()?.to_string();
@@ -351,6 +383,9 @@ impl SessionStore {
                 }
                 return entry.user_id;
             }
+        }
+        if let Some((_, user_id, _)) = self.verify_mcp_session(token) {
+            return user_id;
         }
         let jwt = self.jwt.as_ref()?;
         let claims = verify_jwt(token, &jwt.secret)?;
@@ -410,7 +445,13 @@ impl SessionStore {
     /// del mismo CSPRNG que `fresh_token`) es lo único que
     /// `revoke_mcp_session` necesita guardar para poder terminar esta
     /// sesión antes de que expire sola.
-    pub fn sign_mcp_session(&self, role: &str, user_id: Option<i64>, secret: &str) -> String {
+    /// `None` si `--mcp-jwt-secret` no está configurado -- no debería
+    /// alcanzarse en la práctica (el único caller, `runtime/mcp.rs`, solo
+    /// corre cuando `server.rs` ya confirmó que `/mcp` está habilitado),
+    /// pero `Option` en vez de `.expect(...)` porque un panic en el hilo de
+    /// una request real (GRAMMAR.md §3.164) es peor que un 500 explicado.
+    pub fn sign_mcp_session(&self, role: &str, user_id: Option<i64>) -> Option<String> {
+        let secret = self.mcp_secret.as_deref()?;
         let jti = fresh_token();
         let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 + MCP_SESSION_TTL_SECS;
         let mut claims = serde_json::Map::new();
@@ -420,17 +461,18 @@ impl SessionStore {
             claims.insert("sub".to_string(), serde_json::json!(uid));
         }
         claims.insert("exp".to_string(), serde_json::json!(exp));
-        sign_jwt(&claims, secret)
+        Some(sign_jwt(&claims, secret))
     }
 
     /// Verifica un `Mcp-Session-Id` -- firma/expiración vía `verify_jwt`
-    /// (mismo camino que un JWT externo, pero con `secret` propio de MCP,
-    /// nunca `self.jwt`), MÁS el chequeo de revocación que un JWT
-    /// autocontenido no puede hacer solo. `None` para cualquier falla --
+    /// (mismo camino que un JWT externo, pero con `self.mcp_secret`, nunca
+    /// `self.jwt`), MÁS el chequeo de revocación que un JWT autocontenido
+    /// no puede hacer solo. `None` para cualquier falla -- MCP deshabilitado,
     /// firma inválida, expirado, revocado, o sin los claims que
     /// `sign_mcp_session` siempre pone -- indistinguibles desde afuera, mismo
     /// criterio que `role_for` ya aplica para una sesión normal.
-    pub fn verify_mcp_session(&self, token: &str, secret: &str) -> Option<(String, Option<i64>, String)> {
+    pub fn verify_mcp_session(&self, token: &str) -> Option<(String, Option<i64>, String)> {
+        let secret = self.mcp_secret.as_deref()?;
         let claims = verify_jwt(token, secret)?;
         let jti = claims.get("jti")?.as_str()?.to_string();
         if self.mcp_revoked_jti.lock().contains(&jti) {

@@ -454,6 +454,14 @@ pub fn serve(
         Some((secret, role_claim, user_id_claim)) => sessions.with_jwt(secret, role_claim, user_id_claim),
         None => sessions,
     };
+    // MCP real (GRAMMAR.md §3.203): guardado en el store mismo (no un
+    // parámetro suelto por llamada) para que `role_for`/`user_id_for`
+    // reconozcan un `Mcp-Session-Id` de forma transparente -- ver el
+    // comentario de `SessionStore::mcp_secret` (session.rs).
+    let sessions = match &mcp_secret {
+        Some(secret) => sessions.with_mcp_secret(secret.clone()),
+        None => sessions,
+    };
     let backend = if db.is_postgres() { "PostgreSQL" } else { "SQLite" };
     // `@route` (GRAMMAR.md §3.37): armada UNA vez al arrancar, nunca por
     // request -- el programa ya pasó el checker antes de llegar a `serve`,
@@ -885,11 +893,23 @@ fn handle_request(
     // otro path que no matchea nada -- MCP deshabilitado es indistinguible
     // de MCP inexistente, mismo criterio que el resto de los flags
     // opcionales de este servidor.
-    if let Some(mcp_secret) = mcp_secret {
+    if mcp_secret.is_some() {
         if path == "/mcp" {
+            let mcp_session_id = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv(super::mcp::SESSION_HEADER))
+                .map(|h| h.value.as_str().to_string());
             match *request.method() {
                 tiny_http::Method::Post => {
-                    let result = super::mcp::handle_post(&sessions, extract_bearer_token(&request).as_deref(), mcp_secret, &body);
+                    let result = super::mcp::handle_post(
+                        &program,
+                        &db,
+                        &sessions,
+                        extract_bearer_token(&request).as_deref(),
+                        mcp_session_id.as_deref(),
+                        &body,
+                    );
                     let mut resp = cors_response(result.status, result.body.to_string(), &cors_headers, &request);
                     if let Some(session_id) = result.new_session_id {
                         if let Ok(header) = tiny_http::Header::from_bytes(&b"Mcp-Session-Id"[..], session_id.as_bytes()) {
@@ -901,12 +921,7 @@ fn handle_request(
                     return;
                 }
                 tiny_http::Method::Delete => {
-                    let mcp_session_id = request
-                        .headers()
-                        .iter()
-                        .find(|h| h.field.equiv(super::mcp::SESSION_HEADER))
-                        .map(|h| h.value.as_str().to_string());
-                    let status = super::mcp::handle_delete_session(&sessions, mcp_session_id.as_deref(), mcp_secret);
+                    let status = super::mcp::handle_delete_session(&sessions, mcp_session_id.as_deref());
                     let resp = cors_response(status, String::new(), &cors_headers, &request);
                     let _ = request.respond(resp);
                     log_done(log, req_id, Some("mcp"), status, start, "");
@@ -1550,8 +1565,8 @@ fn extract_idempotency_key(request: &tiny_http::Request) -> Option<String> {
 /// denegó"). `audit` es `Some` SOLO cuando el rpc de verdad declaró
 /// `@authenticated`/`@requires` -- un rpc público no genera ruido de
 /// auditoría, no hay ninguna decisión de autorización que registrar ahí.
-struct AuthGateResult {
-    outcome: Result<(), (u16, &'static str)>,
+pub(crate) struct AuthGateResult {
+    pub(crate) outcome: Result<(), (u16, &'static str)>,
     audit: Option<AuthAudit>,
 }
 
@@ -1571,7 +1586,7 @@ struct AuthAudit {
 /// resueltos para que `auth.createSession`/`destroySession` funcionen
 /// dentro de un cuerpo. Nunca construye ningún `Value` del intérprete: solo
 /// compara strings contra lo que `SessionStore` ya guarda.
-fn check_auth_gate(
+pub(crate) fn check_auth_gate(
     program: &Program,
     sessions: &SessionStore,
     token: Option<&str>,
@@ -1723,7 +1738,7 @@ fn declared_cache_control(program: &Program, service_name: &str, rpc_name: &str)
 /// request usó la dirección `/Service/rpc` de siempre, o de un segmento de
 /// URL si usó una `@route` (GRAMMAR.md §3.37). Esta función no sabe ni le
 /// importa de cuál de los dos vino.
-fn handle_rpc(
+pub(crate) fn handle_rpc(
     program: &Program,
     db: &Db,
     sessions: &SessionStore,

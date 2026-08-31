@@ -56,7 +56,7 @@ pub(crate) fn literal_expr_to_json(e: &Expr) -> Value {
     }
 }
 
-fn type_to_json_schema(ty: &Type) -> Value {
+pub(crate) fn type_to_json_schema(ty: &Type) -> Value {
     match ty {
         Type::Int => json!({ "type": "integer", "format": "int32" }),
         Type::Int64 => json!({ "type": "integer", "format": "int64" }),
