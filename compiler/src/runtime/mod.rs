@@ -5,6 +5,7 @@
 
 pub mod db;
 pub(crate) mod encryption;
+pub(crate) mod pdf;
 pub mod server;
 pub mod session;
 pub(crate) mod store;
@@ -98,6 +99,8 @@ pub enum Value {
     Json,
     /// Marcador interno para el módulo `base64`
     Base64,
+    /// Marcador interno para el módulo `pdf` (GRAMMAR.md §3.201)
+    Pdf,
     /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
     Env,
     /// Marcador interno para el módulo `request` (GRAMMAR.md §3.38) -- body
@@ -196,6 +199,7 @@ impl std::fmt::Debug for Value {
             Value::Http => write!(f, "Http"),
             Value::Json => write!(f, "Json"),
             Value::Base64 => write!(f, "Base64"),
+            Value::Pdf => write!(f, "Pdf"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
             Value::Smtp => write!(f, "Smtp"),
@@ -420,6 +424,9 @@ pub(crate) fn eval_expr(
             if name == "base64" {
                 return Ok(Value::Base64);
             }
+            if name == "pdf" {
+                return Ok(Value::Pdf);
+            }
             if name == "env" {
                 return Ok(Value::Env);
             }
@@ -498,7 +505,7 @@ pub(crate) fn eval_expr(
                 // durante meses porque faltaba acá -- al agregar una
                 // variante `Value` nueva con métodos propios, sumarla ACÁ
                 // también, no solo en su `match method`.
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Decimal(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response => {
+                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Decimal(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Env | Value::Request | Value::Smtp | Value::Response => {
                     Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
                 }
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
@@ -2221,6 +2228,68 @@ fn call_json_ld(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Convierte un `Value::Variant { enum_name: "PdfBlock", ... }` (construido
+/// por el checker contra el `EnumDecl` sintético de `pdf_block_enum_decl`,
+/// checker.rs) a la forma plana que `pdf::build` espera. Valida
+/// `enum_name`/`variant` defensivamente aunque el checker ya lo garantiza --
+/// mismo criterio que el resto de este runtime, nunca confiar ciegamente en
+/// que pasó por chequeo de tipos antes de llegar acá.
+fn pdf_block_spec_from_value(v: Value) -> Result<pdf::PdfBlockSpec, RuntimeError> {
+    let Value::Variant { enum_name, variant, fields } = v else {
+        return Err(err("pdf.build: cada elemento de 'blocks' tiene que ser un PdfBlock"));
+    };
+    if enum_name != "PdfBlock" {
+        return Err(err(format!("pdf.build: se esperaba un PdfBlock, se encontró un valor de '{enum_name}'")));
+    }
+    match variant.as_str() {
+        "Text" => {
+            let content = match fields.iter().find(|(n, _)| n == "content") {
+                Some((_, Value::Str(s))) => s.clone(),
+                _ => return Err(err("PdfBlock.Text: falta el campo 'content', o no es String")),
+            };
+            let bold = match fields.iter().find(|(n, _)| n == "bold") {
+                Some((_, Value::Bool(b))) => *b,
+                _ => return Err(err("PdfBlock.Text: falta el campo 'bold', o no es Bool")),
+            };
+            let size = match fields.iter().find(|(n, _)| n == "size") {
+                Some((_, Value::Int(n))) => *n as f32,
+                _ => return Err(err("PdfBlock.Text: falta el campo 'size', o no es Int")),
+            };
+            Ok(pdf::PdfBlockSpec::Text { content, bold, size })
+        }
+        "Table" => {
+            let headers = match fields.iter().find(|(n, _)| n == "headers") {
+                Some((_, Value::List(items))) => items
+                    .iter()
+                    .map(|v| match v {
+                        Value::Str(s) => Ok(s.clone()),
+                        _ => Err(err("PdfBlock.Table: 'headers' tiene que ser String[]")),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => return Err(err("PdfBlock.Table: falta el campo 'headers', o no es String[]")),
+            };
+            let rows = match fields.iter().find(|(n, _)| n == "rows") {
+                Some((_, Value::List(items))) => items
+                    .iter()
+                    .map(|row| match row {
+                        Value::List(cells) => cells
+                            .iter()
+                            .map(|v| match v {
+                                Value::Str(s) => Ok(s.clone()),
+                                _ => Err(err("PdfBlock.Table: cada celda de 'rows' tiene que ser String")),
+                            })
+                            .collect::<Result<Vec<_>, _>>(),
+                        _ => Err(err("PdfBlock.Table: 'rows' tiene que ser String[][]")),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => return Err(err("PdfBlock.Table: falta el campo 'rows', o no es String[][]")),
+            };
+            Ok(pdf::PdfBlockSpec::Table { headers, rows })
+        }
+        other => Err(err(format!("pdf.build: variante desconocida de PdfBlock: '{other}'"))),
+    }
+}
+
 fn call_method(
     receiver: Value,
     method: &str,
@@ -2994,6 +3063,22 @@ fn call_method(
                 Ok(Value::Str(s))
             }
             other => Err(err(format!("método desconocido sobre base64: '{other}'"))),
+        },
+        Value::Pdf => match method {
+            "build" => {
+                let blocks = match args.into_iter().next() {
+                    Some(Value::List(items)) => items,
+                    _ => return Err(err("pdf.build requiere un argumento PdfBlock[]")),
+                };
+                let specs = blocks
+                    .into_iter()
+                    .map(pdf_block_spec_from_value)
+                    .collect::<Result<Vec<_>, RuntimeError>>()?;
+                let bytes = pdf::build(&specs).map_err(err)?;
+                use base64::Engine;
+                Ok(Value::Str(base64::engine::general_purpose::STANDARD.encode(bytes)))
+            }
+            other => Err(err(format!("método desconocido sobre pdf: '{other}'"))),
         },
         Value::Env => match method {
             "get" => {
@@ -4507,7 +4592,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -8582,6 +8667,95 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, json!([1, 2]), "los dos movimientos de $100 tienen que conciliar contra facturas DISTINTAS, no la misma dos veces");
+    }
+
+    // ---- pdf.build (GRAMMAR.md §3.201) ----
+
+    #[test]
+    fn pdf_build_produces_bytes_that_start_with_the_pdf_magic_header() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make() -> String {
+                    pdf.build([
+                        PdfBlock.Text { content: "Factura #1", bold: true, size: 18 },
+                        PdfBlock.Table { headers: ["Concepto", "Importe"], rows: [["Servicio", "100.00"]] },
+                    ])
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let b64 = invoke_rpc(&program, "Docs", "make", &json!({}), &db).expect("pdf.build tiene que generar un PDF real");
+        let b64 = b64.as_str().unwrap();
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).expect("pdf.build tiene que devolver base64 válido");
+        assert!(bytes.starts_with(b"%PDF-"), "un PDF real siempre arranca con la firma '%PDF-'");
+    }
+
+    #[test]
+    fn pdf_build_handles_spanish_accented_characters_and_the_euro_sign() {
+        // GRAMMAR.md §3.201: WinAnsiEncoding, no UTF-8 crudo -- si esto no
+        // codificara bien, no crashearía (encode_winansi nunca falla), pero
+        // sí perdería contenido en silencio. Confirma al menos que no
+        // explota y que el PDF resultante sigue siendo válido.
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make() -> String {
+                    pdf.build([PdfBlock.Text { content: "Facturación de servicios: 100€ (José Núñez)", bold: false, size: 12 }])
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let b64 = invoke_rpc(&program, "Docs", "make", &json!({}), &db).expect("pdf.build tiene que generar un PDF real");
+        let b64 = b64.as_str().unwrap();
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).expect("pdf.build tiene que devolver base64 válido");
+        assert!(bytes.starts_with(b"%PDF-"));
+    }
+
+    #[test]
+    fn pdf_build_paginates_automatically_when_content_overflows_a_page() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make() -> String {
+                    let mut blocks: PdfBlock[] = [];
+                    let mut i = 0;
+                    while i < 80 {
+                        blocks = blocks + [PdfBlock.Text { content: "linea de contenido de la factura", bold: false, size: 12 }];
+                        i = i + 1;
+                    }
+                    pdf.build(blocks)
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let b64 = invoke_rpc(&program, "Docs", "make", &json!({}), &db).expect("pdf.build tiene que generar un PDF real");
+        let b64 = b64.as_str().unwrap();
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let page_count = bytes.windows(b"/MediaBox".len()).filter(|w| *w == b"/MediaBox").count();
+        assert!(page_count >= 2, "80 líneas de texto deberían desbordar una sola página A4, se contaron {page_count} página(s) (por /MediaBox)");
+    }
+
+    #[test]
+    fn pdf_build_table_with_a_mismatched_row_length_is_a_clean_runtime_error() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make() -> String {
+                    pdf.build([PdfBlock.Table { headers: ["a", "b"], rows: [["1"]] }])
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "Docs", "make", &json!({}), &db).unwrap_err();
+        assert!(e.message.contains("columna"), "mensaje inesperado: {}", e.message);
     }
 
     // ---- constructo de loop: `while` (GRAMMAR.md §3.15) ----

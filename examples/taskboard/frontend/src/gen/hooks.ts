@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.156.0 — no editar a mano.
+// Generado automáticamente por linkc v1.157.0 — no editar a mano.
 
 import { useState, useEffect, useCallback, useRef, useSyncExternalStore } from "react";
 import type { BoardStats, ColumnId, NewTask, Patch, Task, TasksClient } from "./contract";

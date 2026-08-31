@@ -594,6 +594,47 @@ pub struct Checker {
     in_transaction: std::sync::atomic::AtomicBool,
 }
 
+/// `enum PdfBlock { Text { content: String, bold: Bool, size: Int }, Table {
+/// headers: String[], rows: String[][] } }` -- construido a mano (no hay
+/// texto fuente que parsear) porque es un ADT reservado por el compilador,
+/// pre-registrado en `checker.enums` por `build_symbols` (ver el comentario
+/// ahí). `Span::new(0, 0, 0, 0)` en todos lados: ningún nodo de este
+/// `EnumDecl` corresponde a una posición real del archivo del usuario.
+fn pdf_block_enum_decl() -> EnumDecl {
+    let dummy = Span::new(0, 0, 0, 0);
+    let named = |name: &str| TypeExpr::Named(name.to_string(), vec![], dummy);
+    let field = |name: &str, ty: TypeExpr| Field {
+        name: name.to_string(),
+        optional: false,
+        ty,
+        name_span: dummy,
+        annotations: vec![],
+        default: None,
+    };
+    EnumDecl {
+        name: "PdfBlock".to_string(),
+        type_params: vec![],
+        variants: vec![
+            Variant {
+                name: "Text".to_string(),
+                fields: Some(vec![
+                    field("content", named("String")),
+                    field("bold", named("Bool")),
+                    field("size", named("Int")),
+                ]),
+            },
+            Variant {
+                name: "Table".to_string(),
+                fields: Some(vec![
+                    field("headers", TypeExpr::List(Box::new(named("String")))),
+                    field("rows", TypeExpr::List(Box::new(TypeExpr::List(Box::new(named("String")))))),
+                ]),
+            },
+        ],
+        span: dummy,
+    }
+}
+
 impl Checker {
     /// Construye las tablas de símbolos (types/enums/fns) sin chequear los
     /// cuerpos de fn/rpc. Lo usa tanto `check_program` como el emisor de
@@ -613,6 +654,18 @@ impl Checker {
             in_stream_body: std::sync::atomic::AtomicBool::new(false),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
         };
+        // `PdfBlock` (GRAMMAR.md §3.201) es un ADT reservado por el
+        // compilador, no un enum que el usuario declare -- su forma la dicta
+        // lo que `pdf.build` sabe renderizar. Pre-registrarlo ACÁ, antes del
+        // loop de abajo, reusa el mecanismo genérico de ADT tal cual (mismo
+        // camino que cualquier enum de usuario: `resolve_named_type_subst`
+        // ya resuelve cualquier nombre presente en `checker.enums`,
+        // `synth_struct_lit` ya tipa `Enum.Variante { ... }` contra
+        // `checker.enums`) -- sin ESTO, no haría falta ningún caso especial
+        // nuevo. Como bonus gratis, un `enum PdfBlock { ... }` de usuario
+        // cae en la rama de "enum duplicado" de ese mismo loop (mismo
+        // mensaje de error que colisionar con cualquier otro enum).
+        checker.enums.insert("PdfBlock".to_string(), pdf_block_enum_decl());
         let mut errors = Vec::new();
 
         for item in &program.items {
@@ -3584,6 +3637,9 @@ impl Checker {
                 if name == "base64" {
                     return Ok(Type::Base64);
                 }
+                if name == "pdf" {
+                    return Ok(Type::Pdf);
+                }
                 if name == "env" {
                     return Ok(Type::Env);
                 }
@@ -4562,6 +4618,10 @@ impl Checker {
                 self.check_expr(str_arg, &Type::String, env)?;
                 Some(Type::String)
             }
+            (Type::Pdf, "build") => builtin_args!(
+                self, args, env, "pdf.build",
+                [(blocks, "blocks: PdfBlock[]", Type::List(Box::new(Type::Enum("PdfBlock".to_string()))))] -> Type::String
+            ),
             (Type::List(_inner), "join") => {
                 let [sep_arg] = args else {
                     return Err(err("'join' toma exactamente 1 argumento (sep: String)"));
@@ -8927,6 +8987,58 @@ type T = { id: Int, s: Status }")
             fn has(xs: ((Int) -> Bool)[], target: (Int) -> Bool) -> Bool { xs.contains(target) }
         "#;
         assert!(check_source(src).is_err());
+    }
+
+    // ---- pdf.build (GRAMMAR.md §3.201) ----
+
+    #[test]
+    fn pdf_build_takes_a_pdf_block_list_and_returns_string() {
+        let src = r#"
+            fn make() -> String {
+                pdf.build([PdfBlock.Text { content: "hola", bold: false, size: 12 }])
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn pdf_build_rejects_zero_arguments() {
+        let src = r#"
+            fn f() -> String { pdf.build() }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn pdf_build_rejects_an_argument_of_the_wrong_type() {
+        let src = r#"
+            fn f() -> String { pdf.build(["no es PdfBlock"]) }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn pdf_block_table_variant_types_like_any_adt() {
+        let src = r#"
+            fn make() -> String {
+                pdf.build([PdfBlock.Table { headers: ["a", "b"], rows: [["1", "2"]] }])
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn user_cannot_declare_their_own_pdf_block_enum() {
+        // `PdfBlock` es un ADT reservado por el compilador (pre-registrado
+        // en `checker.enums` por `build_symbols`) -- un usuario que declare
+        // su propio `enum PdfBlock` cae en la misma rama de "enum
+        // duplicado" que colisionar con cualquier otro enum.
+        let src = r#"
+            enum PdfBlock { Foo }
+            fn f() -> Int { 1 }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        assert!(errors[0].to_string().contains("ya está declarado"), "{:?}", errors);
     }
 
     // ---- spans en errores de TIPOS (LSP prerrequisito 3/3, Ronda B) ----

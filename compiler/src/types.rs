@@ -149,6 +149,9 @@ pub enum Type {
     /// controlar la respuesta HTTP de ESTE rpc (por ahora, solo el status
     /// code en el camino de éxito).
     Response,
+    /// Tipo interno para el módulo `pdf` builtin (GRAMMAR.md §3.201) --
+    /// generar bytes de PDF real a partir de una lista de `PdfBlock`.
+    Pdf,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -229,6 +232,7 @@ impl std::fmt::Display for Type {
             Type::Request => write!(f, "request"),
             Type::Smtp => write!(f, "smtp"),
             Type::Response => write!(f, "response"),
+            Type::Pdf => write!(f, "pdf"),
         }
     }
 }

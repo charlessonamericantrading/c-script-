@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.156.0"
+version = "1.157.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -37,6 +37,7 @@ runtime = [
     "dep:parking_lot",
     "dep:flate2",
     "dep:aes-gcm",
+    "dep:pdf-writer",
 ]
 
 [dependencies]
@@ -100,3 +101,20 @@ flate2 = { version = "1", optional = true }
 # referencia del ecosistema) -- AEAD: cifra Y autentica en una sola
 # operación, evita el error clásico de cifrar sin autenticar.
 aes-gcm = { version = "0.10", optional = true }
+# Cuarta excepción real a "cero dependencias nuevas" (ver `regex`/`flate2`/
+# `aes-gcm` arriba, GRAMMAR.md §3.201): PDF (objetos indirectos, tabla xref,
+# streams, diccionarios de fuente) es un FORMATO real y complejo, no un
+# layout binario chico y fijo como los que este proyecto sí hand-rollea --
+# escribir el xref/trailer a mano es la misma clase de superficie de bugs
+# silenciosos que ya justificó `flate2` (un PDF corrupto que algunos
+# lectores toleran y otros no es peor que un error de build limpio).
+# `pdf-writer` (RustCrypto/Typst) es deliberadamente BAJO NIVEL -- da la
+# sintaxis binaria del PDF (objetos, streams, xref), no layout de texto ni
+# fuentes embebidas -- coincide con el mismo criterio de "una crate mínima
+# para el formato de fondo, el resto se hand-rollea arriba" que ya rige el
+# resto del proyecto (mismo mantenedor que `regex`/`flate2` en la práctica:
+# ecosistema Typst/RustCrypto, activamente mantenida, solo 4 dependencias
+# directas triviales -- se descartaron `printpdf` por arrastrar el
+# framework GUI Azul completo, ~717K SLoC de árbol transitivo, y `genpdf`
+# por estar abandonada desde 2021).
+pdf-writer = { version = "0.15", optional = true }

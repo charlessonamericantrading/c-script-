@@ -222,6 +222,7 @@
   - [3.198 Métodos de `String`: `.substring()`, `.replace()`, `.split()`, `.padStart()`/`.padEnd()` — RESUELTO](#3198-métodos-de-string-substring-replace-split-padstartpadend--resuelto)
   - [3.199 Bug crítico: `Decimal.toFloat()`/`.toString()` inalcanzables en runtime — RESUELTO](#3199-bug-crítico-decimaltofloattostring-inalcanzables-en-runtime--resuelto)
   - [3.200 `List<T>`: concatenación vía `+` y `.contains()` — RESUELTO](#3200-listt-concatenación-vía--y-contains--resuelto)
+  - [3.201 `pdf.build(blocks: PdfBlock[]) -> String` — RESUELTO](#3201-pdfbuildblocks-pdfblock---string--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7313,6 +7314,44 @@ service Conciliacion {
 **Límite honesto, conocido, preexistente -- no nuevo de esta pieza**: un literal `[]` vacío no se puede sintetizar sin un tipo esperado (mismo límite que ya tiene `??`), así que `xs + []` sin contexto de tipo falla -- el workaround es bindear el `[]` vacío a un `let` tipado primero. El caso real citado (`acc + [x]`, lado derecho no vacío) no lo pisa.
 
 **Verificado**: tests de checker (concatenación de listas del mismo tipo ok, tipos distintos y `List + escalar` rechazados con el mensaje de error actualizado, `.contains()` tipa sobre `List<Int>` y rechaza sobre `List<Struct>`/`List<Function>`) + tests de runtime: concatenación preserva el orden; un `while` real acumulando una lista creciente vía `acc = acc + [x]` a través de varias iteraciones (filtrando pares de una lista de enteros); `.contains()` con un elemento presente, uno ausente, y una lista vacía; el caso real de MyFinance (dedup de conciliación bancaria) reproducido con datos de prueba -- 2 movimientos del mismo importe exacto contra 2 facturas del mismo importe, confirmando que cada factura se usa como máximo una vez, no que la primera absorbe a las dos. De paso, se completó la lista de completions del LSP para `List<T>` (`lsp.rs`): le faltaban `join()`/`reverse()` (ya existentes, válidos para cualquier `T`) desde antes de esta ronda. Suite completa sin regresiones.
+
+### 3.201 `pdf.build(blocks: PdfBlock[]) -> String` — RESUELTO
+
+PLAN.md §9.15 ítem 1 -- primer ítem de la ronda posterior a §9.14, el "segundo reporte" de MyFinance: generar PDF real (facturas/presupuestos). Antes de esto, c-script no tenía ningún primitivo para producir bytes de PDF -- solo podía adjuntar a un email un blob YA generado en base64 (`smtp.sendMessage`, §3.141). Sin esto, facturación con PDF real no podía migrar nunca.
+
+```
+enum PdfBlock {
+  Text  { content: String, bold: Bool, size: Int },
+  Table { headers: String[], rows: String[][] },
+}
+
+rpc facturaPdf(cliente: String, lineas: String[][], total: String) -> String {
+  pdf.build([
+    PdfBlock.Text { content: "Factura", bold: true, size: 18 },
+    PdfBlock.Text { content: "Cliente: " + cliente, bold: false, size: 12 },
+    PdfBlock.Table { headers: ["Concepto", "Importe"], rows: lineas },
+    PdfBlock.Text { content: "Total: " + total, bold: true, size: 14 },
+  ])
+}
+```
+
+**`PdfBlock` es un ADT reservado por el compilador, no un enum que el usuario declare** -- su forma la dicta lo que `pdf.build` sabe renderizar (por eso el bloque de arriba lo muestra entre paréntesis, a modo de referencia: escribirlo de verdad en un archivo `.link` colisiona con el que el compilador ya registra). Mecánicamente no hace falta ninguna infraestructura nueva: se pre-registra el mismo `EnumDecl` en `checker.enums` antes de procesar el resto del programa, y el mecanismo GENÉRICO de ADT que ya tipa cualquier enum de usuario (`ValidationError`, `Result<T,E>`, ...) hace el resto -- `PdfBlock.Text { ... }` tipa exactamente igual que cualquier otro ADT. Como efecto colateral gratis, un `enum PdfBlock { ... }` de usuario cae en la misma rama de "enum duplicado" que colisionar con cualquier otro enum.
+
+**Crate elegida: `pdf-writer` (RustCrypto/ecosistema Typst), cuarta excepción real a "cero dependencias nuevas"** (después de `regex` §3.73, `flate2` §3.180, `aes-gcm` §3.191) -- mismo criterio: un FORMATO real y complejo (objetos indirectos, tabla xref, streams -- la sintaxis binaria de un PDF) no es de los que este proyecto hand-rollea (esos son formatos chicos y fijos, como UUID o el wire de Postgres). **Se aparta, con evidencia real, de los dos candidatos que PLAN.md §9.15 había nombrado originalmente** (`printpdf`, `genpdf`): `printpdf` arrastra el framework GUI Azul completo desde que fusionó capacidades de layout (~717K SLoC de árbol transitivo, 16-34MB), y `genpdf` está abandonada desde 2021 (además de estar construida sobre `printpdf`, heredaría el mismo problema). `pdf-writer` es deliberadamente BAJO NIVEL -- da la sintaxis binaria del PDF, no layout de texto ni fuentes embebidas -- así que TODO el layout (posición, wrap, paginación) se hand-rollea arriba, en `runtime/pdf.rs`, separado en dos pasadas: `layout` decide qué va en cada página sin tocar la API de `pdf-writer` para nada, `render` convierte eso en bytes de PDF reales.
+
+**Alcance v1, todo deliberado, documentado como límite honesto**:
+- Página A4 fija (595×842pt), márgenes fijos (50pt) -- sin parámetro de configuración.
+- Una de las 14 fuentes estándar de PDF (Helvetica/Helvetica-Bold, según `bold`) **sin embeber** -- evita toda la complejidad de fuentes custom.
+- `Text`: wrap por ANCHO PROMEDIO estimado de caracter (`pdf-writer` no da métricas de glyph reales para una fuente sin embeber) -- aproximación, no medición pixel-perfect.
+- `Table`: columnas de ancho IGUAL (ancho útil de página / cantidad de columnas), encabezados en negrita si `headers` no está vacío. **Sin wrap dentro de una celda** -- el contenido se TRUNCA al ancho estimado de columna en vez de desbordar visualmente sobre la columna vecina. Toda fila tiene que tener la misma cantidad de columnas que `headers` (o que la primera fila, si `headers` está vacío) -- si no, `RuntimeError` limpio nombrando qué fila y cuántas columnas se esperaban.
+- **Paginación automática vertical** -- el único trabajo de layout real de este ítem: cuando el contenido no entra antes del margen inferior, la página actual se cierra y arranca una nueva.
+- Texto codificado como `/Encoding /WinAnsiEncoding` (no UTF-8 crudo, que `pdf-writer` no interpreta para una fuente sin embeber) -- cubre ASCII más el rango Latin-1 (0xA0-0xFF, donde caen ñ/á/é/í/ó/ú/¿/¡, lo que necesita una factura real en español) y un caso especial para el símbolo € (U+20AC → byte 0x80, la única posición donde WinAnsi diverge de Latin-1 que un documento financiero real probablemente use). Cualquier otro caracter (CJK, emoji, ...) se reemplaza por `?` -- sin soporte Unicode completo.
+
+**Verificado end-to-end contra un `linkc serve` real, no solo contra los tests** -- con un hallazgo real: se armó una factura de prueba (texto + tabla + acentos + €), se invocó el rpc por HTTP de verdad, se decodificó la respuesta base64 a un `.pdf` en disco, y se abrió con `pdftotext` (poppler) real. El resultado: el PDF es válido y se abre limpio; "José Núñez Peña"/"Consultoría" se escriben y se EXTRAEN perfectos (confirmado byte a byte: `\xe9`/`\xfa`/`\xf1`/`\xed`, exactamente Latin-1); pero el símbolo **€ se escribe correcto según el estándar (byte `0x80`, la posición que la propia especificación PDF define para WinAnsiEncoding) y sin embargo `pdftotext` no lo recupera al extraer texto plano** -- una limitación real de extracción sobre una fuente estándar sin embeber, no un bug de este lado (el byte que se escribe es el que el estándar pide). Se documenta así, explícitamente, en vez de asumir que "€ funciona" sin haberlo comprobado: tratalo como best-effort para EXTRACCIÓN de texto plano, no como garantizado en cualquier lector -- los caracteres acentuados en español sí quedaron confirmados de punta a punta.
+
+**Integración con `smtp.sendMessage`'s `contentBase64` (§3.141), cero fricción**: como el lenguaje no tiene tipo de bytes, un adjunto binario real ya viaja como `contentBase64: String` -- `pdf.build(...)` devuelve exactamente esa forma, así que `attachments: [{ filename: "factura.pdf", contentType: "application/pdf", contentBase64: pdf.build(blocks) }]` funciona directo, sin tocar el mecanismo de adjuntos existente.
+
+**Verificado además**: tests de checker (aridad/tipo de `pdf.build`, `PdfBlock.Text`/`.Table` tipan como cualquier ADT, un `enum PdfBlock` de usuario es rechazado por colisión de nombre) + tests de runtime (`invoke_rpc`: el resultado decodificado empieza con la firma `%PDF-`; acentos y € no rompen la generación; 80 líneas de texto fuerzan una segunda página, confirmado contando objetos `/MediaBox` en los bytes crudos; una tabla con una fila de largo de columnas inconsistente da un `RuntimeError` limpio). Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

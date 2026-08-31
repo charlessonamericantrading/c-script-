@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.157.0] - 2026-08-31
+
+### ✨ Nuevo
+**`pdf.build(blocks: PdfBlock[]) -> String` -- generación real de PDF** (PLAN.md §9.15 ítem 1, primer ítem de la ronda posterior a la de MyFinance) -- `c-script` no tenía ningún primitivo para producir bytes de PDF, solo podía adjuntar a un email un blob YA generado. `PdfBlock` (`Text { content, bold, size }` / `Table { headers, rows }`) es un ADT reservado por el compilador, no declarado por el usuario -- se pre-registra y reusa el mismo mecanismo genérico de ADT que ya tipa `ValidationError`/`Result<T,E>`, sin infraestructura nueva.
+
+Cuarta excepción real a "cero dependencias nuevas": `pdf-writer` (ecosistema Typst) -- se aparta, con evidencia real, de los dos candidatos originalmente evaluados (`printpdf`: arrastra el framework GUI Azul completo, ~717K SLoC; `genpdf`: abandonada desde 2021). Alcance v1: página A4 fija, márgenes fijos, Helvetica sin embeber, paginación automática vertical, columnas de tabla de igual ancho (celdas truncadas, sin wrap). `contentBase64` de `smtp.sendMessage` (§3.141) recibe el resultado directo, sin fricción.
+
+**Verificado end-to-end contra un `linkc serve` real, no solo tests**: una factura de prueba generada, decodificada a un `.pdf` real en disco y abierta con `pdftotext` (poppler). Los acentos en español ("José Núñez Peña", "Consultoría") se escriben y extraen perfectos. Se encontró y documentó un límite real en el camino: el símbolo € se escribe correcto según el estándar PDF (WinAnsiEncoding, byte `0x80`) pero `pdftotext` no lo extrae -- queda como best-effort para extracción de texto plano, no garantizado, documentado honestamente en vez de asumido.
+
+**Verificado además**: tests de checker (aridad/tipo, ADT, colisión de nombre reservado) + tests de runtime (firma `%PDF-`, acentos/€ no rompen la generación, paginación real con 80 líneas forzando una segunda página, fila de tabla con columnas inconsistentes rechazada limpio). Suite completa sin regresiones. Ver GRAMMAR.md §3.201.
+
 ## [1.156.0] - 2026-08-31
 
 ### ✨ Nuevo

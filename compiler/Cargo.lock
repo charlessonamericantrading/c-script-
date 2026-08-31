@@ -754,7 +754,7 @@ dependencies = [
 
 [[package]]
 name = "linkc"
-version = "1.156.0"
+version = "1.157.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -764,6 +764,7 @@ dependencies = [
  "hmac 0.12.1",
  "lettre",
  "parking_lot",
+ "pdf-writer",
  "postgres",
  "regex",
  "rusqlite",
@@ -913,6 +914,18 @@ dependencies = [
  "base64ct",
  "rand_core 0.6.4",
  "subtle",
+]
+
+[[package]]
+name = "pdf-writer"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5e456864a7a304047bff84977dc6fb162bd956475d40ba50b2dcecaada7f753"
+dependencies = [
+ "bitflags",
+ "itoa",
+ "memchr",
+ "ryu",
 ]
 
 [[package]]
@@ -1191,6 +1204,12 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "scopeguard"

@@ -1522,6 +1522,10 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             method("currentRole()", "Get the caller's authenticated role (String?)"),
             method("currentUserId()", "Get the caller's authenticated user id (Int?)"),
         ]),
+        Type::Pdf => Some(vec![method(
+            "build(blocks)",
+            "Build a PDF document from a list of PdfBlock, returned as a base64-encoded String",
+        )]),
         Type::Struct { fields, .. } => Some(
             fields
                 .iter()
