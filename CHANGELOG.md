@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.156.0] - 2026-08-31
+
+### ✨ Nuevo
+**`List<T>`: concatenación vía `+` y `.contains()`** (PLAN.md §9.14 ítem 2, última pieza de la ronda MyFinance) -- `List<T> + List<T> -> List<T>` (mismo `T`, sin mezclar) combinado con `let mut`/reasignación (ya existente) resuelve "acumular una lista creciendo en un loop" sin ningún constructo de mutación nuevo. Más `.contains(item: T) -> Bool`, acotado a `Int`/`Int64`/`Float`/`String`/`Bool`/`Uuid`/`Timestamp` (Decimal, Struct/Variant quedan afuera a propósito -- ver GRAMMAR.md §3.200 para el motivo de cada exclusión). Desbloquea un caso real reportado por un adoptador en producción (MyFinance): marcar facturas ya conciliadas durante conciliación bancaria, para no cruzar el mismo movimiento contra dos facturas del mismo importe exacto.
+
+De paso, completa las completions del LSP para `List<T>` (le faltaban `join()`/`reverse()`, ya existentes, desde antes de esta ronda).
+
+**Verificado**: tests de checker (concatenación, mezcla de tipos y `List + escalar` rechazados, `.contains()` tipa sobre `List<Int>` y rechaza sobre `List<Struct>`/`List<Function>`) + tests de runtime (concatenación preserva orden, un `while` real acumulando una lista creciente, `.contains()` con elemento presente/ausente/lista vacía, y el caso real de dedup de conciliación bancaria reproducido con datos de prueba). Suite completa sin regresiones. Ver GRAMMAR.md §3.200.
+
+Con esto se cierra la ronda de 5 piezas de PLAN.md §9.14 (v1.151.0-v1.156.0): los 4 gaps reales reportados por MyFinance, más el bug crítico de `Decimal == Decimal` encontrado en el camino.
+
 ## [1.155.0] - 2026-08-31
 
 ### 🐛 Arreglado

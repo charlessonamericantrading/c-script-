@@ -940,9 +940,18 @@ fn eval_binary(
         // (IDs tipo snowflake, montos grandes, un contador que crece sin
         // límite declarado). Mismo mecanismo que Div/Rem: `checked_*` +
         // `RuntimeError` limpio en vez de panic/wrap.
+        // PLAN.md §9.14 ítem 2: concatenación pura -- a diferencia de
+        // `.sum()` (GRAMMAR.md §3.101), nunca necesita inspeccionar el tipo
+        // de elemento (una lista vacía no es ambigua para "pegar dos Vec",
+        // solo lo es para "sumar sus elementos"), así que no hereda esa
+        // limitación.
         Add => match (l, r) {
             (Value::Str(a), Value::Str(b)) => Ok(Value::Str(a + &b)),
             (Value::Decimal(a), Value::Decimal(b)) => decimal_add(a, b),
+            (Value::List(mut a), Value::List(b)) => {
+                a.extend(b);
+                Ok(Value::List(a))
+            }
             (l, r) => checked_int_numeric_op(l, r, i64::checked_add, |a, b| a + b, |a, b| {
                 err(format!("desborde aritmético al sumar {a} y {b}"))
             }),
@@ -2485,6 +2494,14 @@ fn call_method(
                 let mut rev = items;
                 rev.reverse();
                 Ok(Value::List(rev))
+            }
+            // PLAN.md §9.14 ítem 2 -- el checker ya acotó el tipo de
+            // elemento a los que tienen un `PartialEq` sólido (Decimal/
+            // Struct/Variant quedan afuera, ver checker.rs), así que
+            // reusar `==` acá es seguro sin ningún caso especial.
+            "contains" => {
+                let target = args.into_iter().next().ok_or_else(|| err("'contains' requiere 1 argumento"))?;
+                Ok(Value::Bool(items.contains(&target)))
             }
             other => Err(err(format!("método de lista desconocido: '{other}'"))),
         },
@@ -8442,6 +8459,120 @@ mod tests {
         );
         let result = invoke_rpc(&program, "S", "total", &json!({"xs": [1, 2, 3]}), &Db::seeded()).unwrap();
         assert_eq!(result, json!(0));
+    }
+
+    // ---- PLAN.md §9.14 ítem 2: List<T> + List<T> y .contains() (GRAMMAR.md §3.200) ----
+
+    #[test]
+    fn list_plus_list_concatenates_in_order() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc merge(a: Int[], b: Int[]) -> Int[] { a + b }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "merge", &json!({"a": [1, 2], "b": [3, 4, 5]}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!([1, 2, 3, 4, 5]));
+    }
+
+    // El caso real que motivó esta pieza: `let mut`/reasignación ya existía
+    // para acumular escalares (ver `while_loop_aggregates_a_list_without_recursion`
+    // más abajo) -- lo único que faltaba era que `+` aceptara List<T>, y con
+    // eso el MISMO mecanismo ya existente resuelve "acumular una lista
+    // creciendo en un loop" sin ningún constructo de mutación nuevo.
+    #[test]
+    fn while_loop_accumulates_a_growing_list_via_plus() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc evens(xs: Int[]) -> Int[] {
+                    let mut acc: Int[] = [];
+                    let mut i = 0;
+                    while i < xs.length() {
+                        if xs[i] % 2 == 0 {
+                            acc = acc + [xs[i]];
+                        } else {
+                        }
+                        i = i + 1;
+                    }
+                    acc
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(&program, "S", "evens", &json!({"xs": [1, 2, 3, 4, 5, 6]}), &Db::seeded()).unwrap();
+        assert_eq!(result, json!([2, 4, 6]));
+    }
+
+    #[test]
+    fn list_contains_finds_a_present_element_and_not_an_absent_one() {
+        let program = program_from(
+            r#"
+            service S {
+                rpc has(xs: Int[], target: Int) -> Bool { xs.contains(target) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let present = invoke_rpc(&program, "S", "has", &json!({"xs": [10, 20, 30], "target": 20}), &db).unwrap();
+        assert_eq!(present, json!(true));
+        let absent = invoke_rpc(&program, "S", "has", &json!({"xs": [10, 20, 30], "target": 99}), &db).unwrap();
+        assert_eq!(absent, json!(false));
+        let empty = invoke_rpc(&program, "S", "has", &json!({"xs": [], "target": 1}), &db).unwrap();
+        assert_eq!(empty, json!(false));
+    }
+
+    // Caso real de MyFinance (PLAN.md §9.14 ítem 2): marcar facturas ya
+    // conciliadas para no cruzar el mismo movimiento bancario contra dos
+    // facturas del mismo importe exacto. Reproducido con datos de prueba: 2
+    // movimientos de $100 (mismo importe), 2 facturas de $100 -- confirma
+    // que cada factura se usa como máximo una vez, no que la primera
+    // absorbe a las dos.
+    #[test]
+    fn list_plus_and_contains_solve_the_real_bank_reconciliation_dedup_use_case() {
+        let program = program_from(
+            r#"
+            type Movimiento = { id: Int, monto: Int }
+            type Factura = { id: Int, monto: Int }
+
+            service Conciliacion {
+                rpc conciliar(movimientos: Movimiento[], facturas: Factura[]) -> Int[] {
+                    let mut usadas: Int[] = [];
+                    let mut matched: Int[] = [];
+                    let mut i = 0;
+                    while i < movimientos.length() {
+                        let mov = movimientos[i];
+                        let mut j = 0;
+                        while j < facturas.length() {
+                            let fac = facturas[j];
+                            if fac.monto == mov.monto && !usadas.contains(fac.id) {
+                                usadas = usadas + [fac.id];
+                                matched = matched + [mov.id];
+                                j = facturas.length();
+                            } else {
+                            }
+                            j = j + 1;
+                        }
+                        i = i + 1;
+                    }
+                    matched
+                }
+            }
+        "#,
+        );
+        let result = invoke_rpc(
+            &program,
+            "Conciliacion",
+            "conciliar",
+            &json!({
+                "movimientos": [{"id": 1, "monto": 100}, {"id": 2, "monto": 100}],
+                "facturas": [{"id": 11, "monto": 100}, {"id": 12, "monto": 100}],
+            }),
+            &Db::seeded(),
+        )
+        .unwrap();
+        assert_eq!(result, json!([1, 2]), "los dos movimientos de $100 tienen que conciliar contra facturas DISTINTAS, no la misma dos veces");
     }
 
     // ---- constructo de loop: `while` (GRAMMAR.md §3.15) ----

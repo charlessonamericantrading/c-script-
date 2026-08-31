@@ -3875,9 +3875,18 @@ impl Checker {
                     (Type::Decimal, Type::Decimal) => Ok(Type::Decimal),
                     (Type::Float, Type::Float) => Ok(Type::Float),
                     (Type::String, Type::String) => Ok(Type::String),
+                    // PLAN.md §9.14 ítem 2: concatenación pura de listas del
+                    // mismo tipo de elemento -- combinada con `let mut`/
+                    // reasignación (ya existente, ver ast.rs) resuelve
+                    // "acumular una lista creciendo en un loop" sin inventar
+                    // ningún mecanismo de mutación nuevo. A diferencia de
+                    // `.sum()`, concatenar nunca necesita inspeccionar el
+                    // tipo de elemento en runtime -- así que no hereda la
+                    // ambigüedad de lista vacía que `.sum()` sí tiene.
+                    (Type::List(a), Type::List(b)) if a == b => Ok(Type::List(a.clone())),
                     (Type::Dynamic, _) | (_, Type::Dynamic) => Ok(Type::Dynamic),
                     _ => Err(err(format!(
-                        "'+' requiere Int+Int, Int64+Int64, Decimal+Decimal, Float+Float o String+String sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
+                        "'+' requiere Int+Int, Int64+Int64, Decimal+Decimal, Float+Float, String+String o List<T>+List<T> (mismo T) sin mezclar (GRAMMAR.md §3.7); se encontró {l:?} y {r:?}"
                     ))),
                 }
             }
@@ -4622,6 +4631,22 @@ impl Checker {
                 let result_ty = self.synth_callback_result(f_arg, inner, env)?;
                 Some(Type::List(Box::new(result_ty)))
             }
+            // PLAN.md §9.14 ítem 2: ¿aparece `item` en la lista? Acotado a
+            // los tipos de elemento donde `==` en runtime (Value::PartialEq)
+            // ya es sólido -- Decimal queda fuera (el bug de igualdad,
+            // §3.195, recién se cerró esta misma ronda) y también Struct/
+            // Variant (su PartialEq es sensible al ORDEN textual de un
+            // literal fuente -- un bug latente preexistente que extender
+            // `.contains()` ahí lo heredaría en silencio, fuera de alcance
+            // de esta pieza). `List<T>` anidada tampoco entra, sin evidencia
+            // de demanda todavía.
+            (Type::List(inner), "contains") if matches!(
+                inner.as_ref(),
+                Type::Int | Type::Int64 | Type::Float | Type::String | Type::Bool | Type::Uuid | Type::Timestamp
+            ) => builtin_args!(
+                self, args, env, "contains",
+                [(item, "item: T", (**inner).clone())] -> Type::Bool
+            ),
             _ => None,
         };
         Ok(ty)
@@ -8836,6 +8861,72 @@ type T = { id: Int, s: Status }")
         "#;
         let errors = check_source(src).unwrap_err();
         assert!(errors[0].to_string().contains("no toma argumentos"), "{:?}", errors[0]);
+    }
+
+    // ---- PLAN.md §9.14 ítem 2: List<T> + List<T> y .contains() ----
+
+    #[test]
+    fn list_plus_list_of_the_same_element_type_concatenates() {
+        let src = r#"
+            fn merge(a: Int[], b: Int[]) -> Int[] { a + b }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_plus_list_of_a_different_element_type_is_rejected_with_a_clear_message() {
+        let src = r#"
+            fn merge(a: Int[], b: String[]) -> Int[] { a + b }
+        "#;
+        let errors = check_source(src).unwrap_err();
+        let msg = errors[0].to_string();
+        assert!(msg.contains("List<T>+List<T>"), "{msg}");
+    }
+
+    #[test]
+    fn list_plus_scalar_is_still_rejected_same_as_before_this_round() {
+        let src = r#"
+            fn f(a: Int[], b: Int) -> Int[] { a + b }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn list_contains_on_an_int_list_returns_bool() {
+        let src = r#"
+            fn has(xs: Int[], target: Int) -> Bool { xs.contains(target) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_contains_takes_exactly_one_argument_of_the_element_type() {
+        let src = r#"
+            fn f(xs: Int[]) -> Bool { xs.contains("no es Int") }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn list_contains_on_a_list_of_struct_is_rejected_not_just_undocumented() {
+        // PLAN.md §9.14 ítem 2 -- Struct/Variant quedan explícitamente
+        // afuera de esta ronda (PartialEq sensible al orden textual de un
+        // literal fuente, GRAMMAR.md §3.200), así que `.contains()` sobre
+        // `List<Struct>` no debe tipar en absoluto, no solo quedar "sin
+        // ejemplo" en la documentación.
+        let src = r#"
+            type Item = { id: Int }
+            fn has(xs: Item[], target: Item) -> Bool { xs.contains(target) }
+        "#;
+        assert!(check_source(src).is_err(), "'.contains()' sobre List<Struct> no debería tipar");
+    }
+
+    #[test]
+    fn list_contains_on_a_list_of_function_is_rejected() {
+        let src = r#"
+            fn has(xs: ((Int) -> Bool)[], target: (Int) -> Bool) -> Bool { xs.contains(target) }
+        "#;
+        assert!(check_source(src).is_err());
     }
 
     // ---- spans en errores de TIPOS (LSP prerrequisito 3/3, Ronda B) ----

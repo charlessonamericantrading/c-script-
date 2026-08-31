@@ -1445,16 +1445,29 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
         // `sum()` (GRAMMAR.md §3.101) solo se ofrece para `List<Int>` -- a
         // diferencia de length/take/map/filter (válidos para cualquier `T`),
         // ofrecerlo siempre sugeriría un método que no tipa para `List<String>`
-        // u otro elemento no numérico.
+        // u otro elemento no numérico. `contains()` (GRAMMAR.md §3.200) es
+        // el mismo caso, acotado a los tipos donde el checker lo acepta
+        // (ver checker.rs) -- Decimal/Struct/Variant/List anidada quedan
+        // afuera. La lista ya estaba incompleta ANTES de esta ronda --
+        // `join()`/`reverse()` (siempre válidos, cualquier `T`) faltaban,
+        // agregados en el mismo pase que `contains()`.
         Type::List(inner) => {
             let mut methods = vec![
                 method("length()", "Get the length of this list"),
                 method("take(limit)", "Take the first N items"),
                 method("map(fn)", "Map this list's items"),
                 method("filter(fn)", "Filter this list's items"),
+                method("join(sep)", "Join this list's items into a String"),
+                method("reverse()", "Reverse this list"),
             ];
             if matches!(inner.as_ref(), Type::Int) {
                 methods.push(method("sum()", "Sum all elements of this List<Int>"));
+            }
+            if matches!(
+                inner.as_ref(),
+                Type::Int | Type::Int64 | Type::Float | Type::String | Type::Bool | Type::Uuid | Type::Timestamp
+            ) {
+                methods.push(method("contains(item)", "Check if this list contains an item"));
             }
             Some(methods)
         }
@@ -1807,6 +1820,31 @@ mod tests {
         assert!(
             !completions.iter().any(|c| c["label"] == "contains(sub)"),
             "una lista no tiene 'contains' (método de String) -- la lista no debería estar sin tailorear: {completions:?}"
+        );
+        // GRAMMAR.md §3.200 -- la lista estaba desactualizada antes de esta
+        // ronda (le faltaban join/reverse, ya existentes) -- confirma que
+        // quedó completa, no solo que .contains() (el método NUEVO, con su
+        // propio label "contains(item)", distinto del "contains(sub)" de
+        // String de arriba) aparece.
+        assert!(completions.iter().any(|c| c["label"] == "contains(item)"), "{completions:?}");
+        assert!(completions.iter().any(|c| c["label"] == "join(sep)"), "{completions:?}");
+        assert!(completions.iter().any(|c| c["label"] == "reverse()"), "{completions:?}");
+    }
+
+    #[test]
+    fn test_completion_after_dot_on_a_list_of_struct_receiver_never_offers_contains() {
+        // PLAN.md §9.14 ítem 2 -- `.contains()` está acotado a tipos de
+        // elemento donde `==` en runtime ya es sólido (checker.rs); un
+        // `List<T>` de un struct no debería sugerirlo, aunque tipe limpio
+        // para otros métodos genéricos como `.length()`.
+        let code = "type Item = { id: Int }\nfn f(xs: Item[]) -> Int { xs. }\n";
+        let line1 = code.lines().nth(1).unwrap();
+        let col = line1.find("xs.").unwrap() + 3;
+        let completions = get_completions(code, 1, col, None);
+        assert!(completions.iter().any(|c| c["label"] == "length()"), "{completions:?}");
+        assert!(
+            !completions.iter().any(|c| c["label"] == "contains(item)"),
+            "List<Struct> no debería ofrecer .contains() -- fuera de alcance de esta ronda: {completions:?}"
         );
     }
 

@@ -221,6 +221,8 @@
   - [3.197 `auth.claim(name: String) -> String?` — RESUELTO](#3197-authclaimname-string---string--resuelto)
   - [3.198 Métodos de `String`: `.substring()`, `.replace()`, `.split()`, `.padStart()`/`.padEnd()` — RESUELTO](#3198-métodos-de-string-substring-replace-split-padstartpadend--resuelto)
   - [3.199 Bug crítico: `Decimal.toFloat()`/`.toString()` inalcanzables en runtime — RESUELTO](#3199-bug-crítico-decimaltofloattostring-inalcanzables-en-runtime--resuelto)
+  - [3.200 `List<T>`: concatenación vía `+` y `.contains()` — RESUELTO](#3200-listt-concatenación-vía--y-contains--resuelto)
+
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
   - [4.2 Validación en los dos extremos](#42-validación-en-los-dos-extremos)
@@ -7288,6 +7290,29 @@ Antes del fix, esto compilaba limpio con `linkc build` pero fallaba en `linkc se
 **Fix**: agregar `Value::Decimal(_)` a ese allowlist (`runtime/mod.rs`, brazo de `Expr::FieldAccess`) -- una línea, ningún cambio al dispatch real, que ya estaba bien.
 
 **Verificado**: 1 test nuevo en `runtime/mod.rs` (`invoke_rpc`) confirmando `.toFloat()`/`.toString()` sobre un `Decimal` recibido como parámetro, y `.toFloat()` encadenado directo sobre el resultado de `.toDecimal()` sin pasar por un `let` intermedio -- los tres casos fallaban antes del fix. Reproducido además en vivo contra un `linkc serve` real (`curl` contra ambos rpcs), confirmando que el error exacto reportado ya no ocurre. Suite completa sin regresiones.
+
+### 3.200 `List<T>`: concatenación vía `+` y `.contains()` — RESUELTO
+
+PLAN.md §9.14 ítem 2 -- última pieza de la ronda MyFinance. `let mut`/reasignación YA existía y ya permitía acumular escalares en un `while` (`let mut total = 0; total = total + x;`); lo único que faltaba era que `+` aceptara `List<T>` -- con eso, el MISMO mecanismo ya existente resuelve "acumular una lista creciendo en un loop", sin ningún constructo de mutación nuevo. Bloqueó de verdad, en producción, marcar facturas ya conciliadas durante conciliación bancaria (para no cruzar el mismo movimiento contra dos facturas del mismo importe exacto) -- forzaba un workaround aceptado pero imperfecto.
+
+```
+service Conciliacion {
+  rpc marcarUsadas(ids: Int[], nuevoId: Int) -> Int[] {
+    ids + [nuevoId]
+  }
+  rpc yaUsada(ids: Int[], candidato: Int) -> Bool {
+    ids.contains(candidato)
+  }
+}
+```
+
+**`List<T> + List<T> -> List<T>`** (mismo `T` a ambos lados, sin mezclar -- mismo criterio que ya rige Int/Int64/Decimal/Float/String). A diferencia de `.sum()` (§3.101), concatenar nunca necesita inspeccionar el tipo de elemento -- una lista vacía no es ambigua para "pegar dos `Vec`", solo lo es para "sumar sus elementos" -- así que `List<T> + List<T>` no hereda esa limitación ni siquiera para `T` no numérico. Deliberadamente SIN un arm `List<T> + T -> List<T>` (agregar un elemento suelto sin envolverlo) -- `acc + [x]` ya expresa lo mismo envolviendo en un literal, sin sumar sobrecarga de operador nueva.
+
+**`.contains(item: T) -> Bool`**, acotado a los tipos de elemento donde `==` en runtime (`Value::PartialEq`) ya es sólido: `Int`, `Int64`, `Float`, `String`, `Bool`, `Uuid`, `Timestamp`. **Deliberadamente afuera**: `Decimal` (su bug de igualdad, §3.195, recién se cerró esta misma ronda -- sin margen para extender `.contains()` sobre un `==` todavía fresco), y `Struct`/`Variant` (su `PartialEq` es sensible al ORDEN TEXTUAL de un literal fuente -- dos structs literalmente iguales pero con campos en distinto orden en el código no comparan `==`; un valor que llega por wire/DB sí es canónico, así que el riesgo real es solo entre dos literales frescos en código -- extender `.contains()` ahí heredaría ese bug latente en silencio). `List<T>` anidada tampoco entra. Sin evidencia de demanda real de ninguno de los tres todavía -- el caso citado de MyFinance es sobre `Int` (IDs de factura).
+
+**Límite honesto, conocido, preexistente -- no nuevo de esta pieza**: un literal `[]` vacío no se puede sintetizar sin un tipo esperado (mismo límite que ya tiene `??`), así que `xs + []` sin contexto de tipo falla -- el workaround es bindear el `[]` vacío a un `let` tipado primero. El caso real citado (`acc + [x]`, lado derecho no vacío) no lo pisa.
+
+**Verificado**: tests de checker (concatenación de listas del mismo tipo ok, tipos distintos y `List + escalar` rechazados con el mensaje de error actualizado, `.contains()` tipa sobre `List<Int>` y rechaza sobre `List<Struct>`/`List<Function>`) + tests de runtime: concatenación preserva el orden; un `while` real acumulando una lista creciente vía `acc = acc + [x]` a través de varias iteraciones (filtrando pares de una lista de enteros); `.contains()` con un elemento presente, uno ausente, y una lista vacía; el caso real de MyFinance (dedup de conciliación bancaria) reproducido con datos de prueba -- 2 movimientos del mismo importe exacto contra 2 facturas del mismo importe, confirmando que cada factura se usa como máximo una vez, no que la primera absorbe a las dos. De paso, se completó la lista de completions del LSP para `List<T>` (`lsp.rs`): le faltaban `join()`/`reverse()` (ya existentes, válidos para cualquier `T`) desde antes de esta ronda. Suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
