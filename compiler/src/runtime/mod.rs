@@ -163,6 +163,20 @@ impl PartialEq for Value {
             (Http, Http) => true,
             (Json, Json) => true,
             (Base64, Base64) => true,
+            // Mismo marcador interno singleton que Db/Auth/Math/... arriba
+            // -- ver la lista gemela en `value_to_json` y en los 4 sitios de
+            // codegen (`Type::Pdf | Type::Excel | ... `). Faltaban acá: el
+            // checker tipa `pdf == pdf` como válido (Eq exige tipos
+            // compatibles, GRAMMAR.md ahí mismo), pero sin este brazo caía
+            // en el `_ => false` de abajo -- el mismo `X == X` que da `true`
+            // para `math`/`json`/etc daba `false` para estos.
+            (Pdf, Pdf) => true,
+            (Excel, Excel) => true,
+            (Mcp, Mcp) => true,
+            (Env, Env) => true,
+            (Request, Request) => true,
+            (Smtp, Smtp) => true,
+            (Response, Response) => true,
             (BoundMethod(a, m1), BoundMethod(b, m2)) => a == b && m1 == m2,
             (FnRef(a), FnRef(b)) => a == b,
             // Nunca iguales, ni siquiera el mismo closure consigo mismo --
@@ -9024,6 +9038,35 @@ mod tests {
         let e = invoke_rpc(&program, "Docs", "ask", &json!({"prompt": "hola"}), &db).unwrap_err();
         assert!(e.message.contains("mcp.sample"), "mensaje inesperado (¿mcp.sample sigue inalcanzable?): {}", e.message);
         assert!(e.message.contains("sesión MCP activa"), "mensaje inesperado: {}", e.message);
+    }
+
+    #[test]
+    fn module_marker_singletons_compare_equal_to_themselves() {
+        // Auditoría del lenguaje (2026-09-01): el checker tipa `pdf == pdf`
+        // como válido (Eq exige tipos compatibles, mismo tipo a ambos
+        // lados) -- pero `impl PartialEq for Value` nunca había extendido
+        // el grupo "marcador interno singleton" (que sí cubre a
+        // Db/Auth/Math/Crypto/Http/Json/Base64) a Pdf/Excel/Mcp/Env/
+        // Request/Smtp/Response, así que caían en el `_ => false` final:
+        // `math == math` daba `true` pero `pdf == pdf` daba `false`,
+        // inconsistencia silenciosa reproducida contra el binario real
+        // antes de este fix. Confirma que también valen `env`/`request`
+        // (marcadores más viejos, con el mismo hueco).
+        let program = program_from(
+            r#"
+            service Check {
+                rpc pdfSelfEq() -> Bool { pdf == pdf }
+                rpc excelSelfEq() -> Bool { excel == excel }
+                rpc mcpSelfEq() -> Bool { mcp == mcp }
+                rpc envSelfEq() -> Bool { env == env }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        for rpc in ["pdfSelfEq", "excelSelfEq", "mcpSelfEq", "envSelfEq"] {
+            let result = invoke_rpc(&program, "Check", rpc, &json!({}), &db).unwrap();
+            assert_eq!(result, json!(true), "{rpc} debería dar true, igual que math == math");
+        }
     }
 
     // ---- constructo de loop: `while` (GRAMMAR.md §3.15) ----

@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.162.0] - 2026-09-01
+
+### 🐛 Arreglado
+**Auditoría del lenguaje: `pdf == pdf` (y `excel`/`mcp`/`env`/`request`/`smtp`/`response`) daba `false` -- debería dar `true`, igual que `math == math`.** Estos identificadores son marcadores internos singleton (los mismos módulos `pdf`/`excel`/`mcp`/etc. de GRAMMAR.md §3.201-3.203, más `env`/`request`/`smtp`/`response` de §3.38/3.43/3.46). El checker tipa `X == X` como válido para cualquier tipo comparado consigo mismo (GRAMMAR.md, regla de `==`/`!=`), pero `impl PartialEq for Value` (`runtime/mod.rs`) nunca había extendido a estas 7 variantes el mismo grupo "marcador interno singleton -> siempre igual a sí mismo" que ya cubre a `Db`/`Auth`/`Math`/`Crypto`/`Http`/`Json`/`Base64` -- caían en el `_ => false` final. Mismo patrón recurrente de este proyecto (un sitio nuevo se agrega a 4 lugares pero se olvida un 5º) -- encontrado con una auditoría dedicada, no en producción: reproducido primero contra el binario real (`linkc test`) antes de tocar el código, con test de regresión nuevo (`module_marker_singletons_compare_equal_to_themselves`, `runtime/mod.rs`). Impacto real bajo (nadie escribe `pdf == pdf` a propósito) pero es una inconsistencia silenciosa alcanzable desde código de usuario válido, sin ningún error o warning de por medio.
+
 ## [1.161.0] - 2026-08-31
 
 ### ✨ Nuevo

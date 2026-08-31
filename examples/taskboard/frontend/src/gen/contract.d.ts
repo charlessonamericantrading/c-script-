@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.161.0 — no editar a mano.
+// Generado automáticamente por linkc v1.162.0 — no editar a mano.
 
 export type Result<T, E> = { type: "Ok"; value: T } | { type: "Err"; error: E };
 export type Patch<T> = Partial<T>;
