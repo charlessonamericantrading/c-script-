@@ -378,6 +378,7 @@ pub fn serve(
     service_api_key: Option<String>,
     log: LogConfig,
     hsts: Option<String>,
+    mcp_secret: Option<String>,
 ) -> Result<(), String> {
     let server = tiny_http::Server::http((host, port)).map_err(|e| format!("no se pudo iniciar el servidor en {host}:{port}: {e}"))?;
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
@@ -585,6 +586,7 @@ pub fn serve(
             let cors = cors.clone();
             let hsts = hsts.clone();
             let service_api_key = service_api_key.clone();
+            let mcp_secret = mcp_secret.clone();
             let request = $request;
             std::thread::spawn(move || {
                 handle_request(
@@ -602,6 +604,7 @@ pub fn serve(
                     trust_proxy,
                     service_api_key.as_deref(),
                     log,
+                    mcp_secret.as_deref(),
                     request,
                 );
             });
@@ -686,6 +689,7 @@ fn handle_request(
     trust_proxy: bool,
     service_api_key: Option<&str>,
     log: LogConfig,
+    mcp_secret: Option<&str>,
     mut request: tiny_http::Request,
 ) {
     // Resuelto UNA vez por request, antes de cualquier otra cosa --
@@ -873,6 +877,52 @@ fn handle_request(
         let _ = request.respond(resp);
         log_done(log, req_id, Some("metrics"), 200, start, "");
         return;
+    }
+
+    // MCP real (GRAMMAR.md §3.203) -- solo existe con `--mcp-jwt-secret`/
+    // `LINK_MCP_JWT_SECRET` configurado; sin eso, `path == "/mcp"` cae
+    // directo al 404 normal de `resolve_route` de abajo, como cualquier
+    // otro path que no matchea nada -- MCP deshabilitado es indistinguible
+    // de MCP inexistente, mismo criterio que el resto de los flags
+    // opcionales de este servidor.
+    if let Some(mcp_secret) = mcp_secret {
+        if path == "/mcp" {
+            match *request.method() {
+                tiny_http::Method::Post => {
+                    let result = super::mcp::handle_post(&sessions, extract_bearer_token(&request).as_deref(), mcp_secret, &body);
+                    let mut resp = cors_response(result.status, result.body.to_string(), &cors_headers, &request);
+                    if let Some(session_id) = result.new_session_id {
+                        if let Ok(header) = tiny_http::Header::from_bytes(&b"Mcp-Session-Id"[..], session_id.as_bytes()) {
+                            resp = resp.with_header(header);
+                        }
+                    }
+                    let _ = request.respond(resp);
+                    log_done(log, req_id, Some("mcp"), result.status, start, "");
+                    return;
+                }
+                tiny_http::Method::Delete => {
+                    let mcp_session_id = request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv(super::mcp::SESSION_HEADER))
+                        .map(|h| h.value.as_str().to_string());
+                    let status = super::mcp::handle_delete_session(&sessions, mcp_session_id.as_deref(), mcp_secret);
+                    let resp = cors_response(status, String::new(), &cors_headers, &request);
+                    let _ = request.respond(resp);
+                    log_done(log, req_id, Some("mcp"), status, start, "");
+                    return;
+                }
+                // `GET /mcp` (la conexión SSE de larga duración) es la
+                // Pieza C -- todavía no conectada en esta versión.
+                _ => {
+                    let resp =
+                        cors_response(501, error_json("GET /mcp (streaming) llega en una pieza futura de esta misma ronda -- GRAMMAR.md §3.203"), &cors_headers, &request);
+                    let _ = request.respond(resp);
+                    log_done(log, req_id, Some("mcp"), 501, start, "");
+                    return;
+                }
+            }
+        }
     }
 
     let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, &route_table) {

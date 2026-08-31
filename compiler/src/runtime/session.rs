@@ -12,7 +12,7 @@
 //! dependencia nueva: `hmac`/`sha2` ya estaban por `crypto.hmacSha256`, y
 //! `base64` ya estaba por `base64.encode`/`decode`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// 128 bits del CSPRNG del sistema (BCryptGenRandom/ProcessPrng en Windows,
@@ -99,6 +99,29 @@ fn verify_jwt(token: &str, secret: &str) -> Option<serde_json::Map<String, serde
     Some(claims)
 }
 
+/// Firma un JWT HS256 de verdad -- inversa de `verify_jwt`, mismo esqueleto
+/// que el helper de test `make_jwt` (más abajo, `#[cfg(test)]`) pero de
+/// PRODUCCIÓN: GRAMMAR.md §3.203 (sesión MCP) es el primer caso donde este
+/// servidor EMITE un JWT propio, no solo verifica uno externo (§3.64) --
+/// `verify_jwt`/`sign_jwt` son deliberadamente funciones libres separadas
+/// de `SessionStore`, sin compartir ningún estado, para que quede claro que
+/// firmar y verificar son operaciones simétricas pero independientes (quien
+/// firma no necesita `SessionStore.jwt`, que es la config de VERIFICACIÓN
+/// de JWT externos).
+fn sign_jwt(claims: &serde_json::Map<String, serde_json::Value>, secret: &str) -> String {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header_b64 = engine.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload_b64 = engine.encode(serde_json::to_vec(claims).expect("un serde_json::Map siempre serializa"));
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC-SHA256 acepta cualquier longitud de clave");
+    mac.update(signing_input.as_bytes());
+    let sig_b64 = engine.encode(mac.finalize().into_bytes());
+    format!("{signing_input}.{sig_b64}")
+}
+
 /// `--jwt-secret`/`--jwt-role-claim`/`--jwt-user-id-claim` (o sus env vars),
 /// resueltos UNA vez al arrancar (`main.rs::resolve_jwt_config`). `None` en
 /// el `SessionStore` entero (el default): el comportamiento es IDÉNTICO al
@@ -151,11 +174,25 @@ pub struct SessionStore {
     /// (GRAMMAR.md §3.64) -- `None` es el default, comportamiento idéntico
     /// al de antes de esta ronda.
     jwt: Option<JwtConfig>,
+    /// GRAMMAR.md §3.203 (MCP, Pieza A): `jti` de cada sesión MCP terminada
+    /// explícitamente vía `DELETE /mcp`. Un JWT autocontenido no se puede
+    /// invalidar antes de su propia expiración sin ALGO guardado del lado
+    /// del servidor -- este set es ese "algo", deliberadamente chico (solo
+    /// ids, nunca la sesión completa). Mismo molde que `failed_logins`
+    /// arriba: `parking_lot::Mutex`, propio candado, nunca sostenido más
+    /// allá de la operación puntual que lo pide.
+    mcp_revoked_jti: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl SessionStore {
     pub fn new() -> Self {
-        SessionStore { sessions: parking_lot::Mutex::new(HashMap::new()), failed_logins: parking_lot::Mutex::new(HashMap::new()), ttl: None, jwt: None }
+        SessionStore {
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            failed_logins: parking_lot::Mutex::new(HashMap::new()),
+            ttl: None,
+            jwt: None,
+            mcp_revoked_jti: parking_lot::Mutex::new(HashSet::new()),
+        }
     }
 
     /// Como `new()`, pero cada sesión que este store cree expira `ttl`
@@ -163,7 +200,13 @@ impl SessionStore {
     /// `runtime::server::serve`, cuando `--session-ttl`/`LINK_SESSION_TTL`
     /// están configurados.
     pub fn with_ttl(ttl: Duration) -> Self {
-        SessionStore { sessions: parking_lot::Mutex::new(HashMap::new()), failed_logins: parking_lot::Mutex::new(HashMap::new()), ttl: Some(ttl), jwt: None }
+        SessionStore {
+            sessions: parking_lot::Mutex::new(HashMap::new()),
+            failed_logins: parking_lot::Mutex::new(HashMap::new()),
+            ttl: Some(ttl),
+            jwt: None,
+            mcp_revoked_jti: parking_lot::Mutex::new(HashSet::new()),
+        }
     }
 
     /// `auth.recordFailedLogin(identifier)` (GRAMMAR.md §3.152) -- agrega
@@ -357,7 +400,64 @@ impl SessionStore {
             _ => None,
         }
     }
+
+    /// GRAMMAR.md §3.203 (MCP, Pieza A) -- `initialize` firma un JWT propio
+    /// de sesión MCP, embebiendo el MISMO rol/`user_id` que ya autenticó la
+    /// request (un `Authorization: Bearer` normal, resuelto vía
+    /// `role_for`/`user_id_for` ANTES de llamar acá) -- así un `tools/call`
+    /// posterior autentica el `rpc` subyacente con el header
+    /// `Mcp-Session-Id` solo, sin pedir un segundo token. `jti` (128 bits
+    /// del mismo CSPRNG que `fresh_token`) es lo único que
+    /// `revoke_mcp_session` necesita guardar para poder terminar esta
+    /// sesión antes de que expire sola.
+    pub fn sign_mcp_session(&self, role: &str, user_id: Option<i64>, secret: &str) -> String {
+        let jti = fresh_token();
+        let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64 + MCP_SESSION_TTL_SECS;
+        let mut claims = serde_json::Map::new();
+        claims.insert("jti".to_string(), serde_json::json!(jti));
+        claims.insert("role".to_string(), serde_json::json!(role));
+        if let Some(uid) = user_id {
+            claims.insert("sub".to_string(), serde_json::json!(uid));
+        }
+        claims.insert("exp".to_string(), serde_json::json!(exp));
+        sign_jwt(&claims, secret)
+    }
+
+    /// Verifica un `Mcp-Session-Id` -- firma/expiración vía `verify_jwt`
+    /// (mismo camino que un JWT externo, pero con `secret` propio de MCP,
+    /// nunca `self.jwt`), MÁS el chequeo de revocación que un JWT
+    /// autocontenido no puede hacer solo. `None` para cualquier falla --
+    /// firma inválida, expirado, revocado, o sin los claims que
+    /// `sign_mcp_session` siempre pone -- indistinguibles desde afuera, mismo
+    /// criterio que `role_for` ya aplica para una sesión normal.
+    pub fn verify_mcp_session(&self, token: &str, secret: &str) -> Option<(String, Option<i64>, String)> {
+        let claims = verify_jwt(token, secret)?;
+        let jti = claims.get("jti")?.as_str()?.to_string();
+        if self.mcp_revoked_jti.lock().contains(&jti) {
+            return None;
+        }
+        let role = claims.get("role")?.as_str()?.to_string();
+        let user_id = match claims.get("sub") {
+            Some(serde_json::Value::Number(n)) => n.as_i64(),
+            Some(serde_json::Value::String(s)) => s.parse::<i64>().ok(),
+            _ => None,
+        };
+        Some((role, user_id, jti))
+    }
+
+    /// `DELETE /mcp` -- idempotente, mismo criterio que `destroy`: revocar
+    /// un `jti` ya revocado (o uno que nunca existió) no es un error.
+    pub fn revoke_mcp_session(&self, jti: &str) {
+        self.mcp_revoked_jti.lock().insert(jti.to_string());
+    }
 }
+
+/// GRAMMAR.md §3.203: sin flag/env var propio en v1 -- alcance angosto a
+/// propósito, mismo criterio que otros límites v1 de esta ronda (PDF/Excel,
+/// GRAMMAR.md §3.201/§3.202). Una hora alcanza para una sesión de trabajo
+/// real con un cliente MCP; renovar es tan simple como llamar `initialize`
+/// de nuevo.
+const MCP_SESSION_TTL_SECS: i64 = 3600;
 
 impl Default for SessionStore {
     fn default() -> Self {

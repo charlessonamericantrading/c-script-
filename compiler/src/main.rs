@@ -1629,7 +1629,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>]"
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--mcp-jwt-secret <clave>]"
         );
         return ExitCode::FAILURE;
     };
@@ -1771,6 +1771,14 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     };
 
+    let mcp_secret = match resolve_mcp_config(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let program = match load_and_check(path) {
         Ok(p) => p,
         Err(code) => return code,
@@ -1795,6 +1803,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             service_api_key.clone(),
             log,
             hsts.clone(),
+            mcp_secret.clone(),
         )
     };
     match run_serve_with_backoff(attempt, restart_backoff, path) {
@@ -2204,6 +2213,13 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let mcp_secret = match resolve_mcp_config(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let (ports, updated_registry): (Vec<u16>, Option<serde_json::Map<String, serde_json::Value>>) = match &port_registry {
         Some(path) => match resolve_stable_ports(&link_files, port_base, path) {
@@ -2304,6 +2320,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             let is_exempt = path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| service_api_key_exempt.contains(name));
             let service_api_key = if is_exempt { None } else { service_api_key.clone() };
             let hsts = hsts.clone();
+            let mcp_secret = mcp_secret.clone();
             let label = path.to_string_lossy().to_string();
             std::thread::spawn(move || {
                 let source = runtime::server::DbSource::SqliteFile(path.with_extension("db"));
@@ -2330,6 +2347,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
                         service_api_key.clone(),
                         log,
                         hsts.clone(),
+                        mcp_secret.clone(),
                     )
                 };
                 match run_serve_with_backoff(attempt, restart_backoff, &label) {
@@ -2583,6 +2601,16 @@ fn resolve_jwt_config(args: &[String]) -> Result<Option<(String, String, String)
     let role_claim = read_flag_or_env(args, "--jwt-role-claim", "LINK_JWT_ROLE_CLAIM")?.unwrap_or_else(|| "role".to_string());
     let user_id_claim = read_flag_or_env(args, "--jwt-user-id-claim", "LINK_JWT_USER_ID_CLAIM")?.unwrap_or_else(|| "sub".to_string());
     Ok(Some((secret, role_claim, user_id_claim)))
+}
+
+/// MCP real (GRAMMAR.md §3.203): `--mcp-jwt-secret`/`LINK_MCP_JWT_SECRET`
+/// es el único flag que de verdad importa -- sin él, `None` entero, `/mcp`
+/// no existe (mismo criterio que `resolve_jwt_config`). Necesita un
+/// secreto PROPIO, distinto de `--jwt-secret`: ese es solo de VERIFICACIÓN
+/// de JWT externos (GRAMMAR.md §3.64), este servidor FIRMA sus propios JWT
+/// de sesión MCP con este otro.
+fn resolve_mcp_config(args: &[String]) -> Result<Option<String>, String> {
+    Ok(read_flag_or_env(args, "--mcp-jwt-secret", "LINK_MCP_JWT_SECRET")?.filter(|v| !v.trim().is_empty()))
 }
 
 /// "Ns"/"Nm"/"Nh"/"Nd" (segundos/minutos/horas/días) -- mismo espíritu que
