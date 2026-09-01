@@ -262,3 +262,81 @@ fn a_genuinely_infinite_while_inside_a_test_block_still_hits_the_real_cap() {
         "stdout: {stdout}"
     );
 }
+
+// GRAMMAR.md §3.208: `--diagnostics-json` (flag global, PLAN.md §9.16
+// ítem 5) -- un error de TIPOS (checker) reportado como JSON estructurado
+// a stdout en vez de texto humano a stderr.
+#[test]
+fn diagnostics_json_reports_a_type_error_as_a_structured_json_array_on_stdout() {
+    let project = TempDir::new("diagnostics-json-type-error");
+    let entry = project.write(
+        "main.link",
+        r#"
+        enum Role { Admin, Member }
+        type User = { id: Int, role: Role }
+        fn make() -> User { User { id: 1, role: Role.Admin } }
+        "#,
+    );
+
+    let output = run_linkc_test_with_args(&entry, &["--diagnostics-json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.trim().is_empty(), "el texto humano no debería ir a stderr con el flag prendido: {stderr}");
+    let diags: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("stdout no es JSON válido ({e}): {stdout}"));
+    let arr = diags.as_array().expect("se esperaba un array JSON");
+    assert_eq!(arr.len(), 1, "{arr:?}");
+    assert!(arr[0]["message"].as_str().unwrap().contains("es una variante de enum usada como valor"), "{arr:?}");
+    assert_eq!(arr[0]["line"], 4);
+    assert!(arr[0]["file"].as_str().unwrap().ends_with("main.link"), "{arr:?}");
+}
+
+// Mismo flag, pero un error de SINTAXIS (parser, antes de que el checker
+// corra) -- confirma que `report_load_error` respeta el flag igual que
+// `report_check_errors`, no solo uno de los dos caminos.
+#[test]
+fn diagnostics_json_reports_a_syntax_error_as_a_structured_json_array_on_stdout() {
+    let project = TempDir::new("diagnostics-json-syntax-error");
+    let entry = project.write(
+        "main.link",
+        r#"
+        type User = { id: Int, name: String }
+        fn f(users: User[]) -> Bool { users.find(|u: User| -> Bool { u.id > 0 }).isSome() }
+        "#,
+    );
+
+    let output = run_linkc_test_with_args(&entry, &["--diagnostics-json"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.trim().is_empty(), "el texto humano no debería ir a stderr con el flag prendido: {stderr}");
+    let diags: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("stdout no es JSON válido ({e}): {stdout}"));
+    let arr = diags.as_array().expect("se esperaba un array JSON");
+    assert_eq!(arr.len(), 1, "{arr:?}");
+    assert!(arr[0]["message"].as_str().unwrap().contains("no lleva anotación de tipo de retorno"), "{arr:?}");
+}
+
+// El flag global funciona ANTES del subcomando (`linkc --diagnostics-json
+// test x.link`), no solo después -- se saca de `args` en `main()` antes de
+// que `cmd_test` vea la lista, así que la posición no debería importar.
+#[test]
+fn diagnostics_json_works_when_the_flag_comes_before_the_subcommand() {
+    let project = TempDir::new("diagnostics-json-flag-first");
+    let entry = project.write("main.link", "fn f() -> Int { 1 + }");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("--diagnostics-json")
+        .arg("test")
+        .arg(&entry)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("no se pudo iniciar 'linkc --diagnostics-json test'");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!output.status.success());
+    let diags: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("stdout no es JSON válido ({e}): {stdout}"));
+    assert!(diags.as_array().is_some_and(|a| !a.is_empty()), "{diags:?}");
+}

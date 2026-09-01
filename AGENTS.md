@@ -73,6 +73,12 @@ The full end-to-end path that CI enforces, and the one to reproduce before claim
 anything works: build the contract, type-check the frontend against it, then run the real
 client against a real server.
 
+**`--diagnostics-json`** (global flag, any position — `linkc test x.link --diagnostics-json`
+or `linkc --diagnostics-json test x.link` both work) makes any subcommand that fails to load
+or type-check a program print `[{file, line, column, message}]` to stdout instead of the
+human-formatted text to stderr — parse this instead of scraping the `-->` snippet format
+when driving `linkc` programmatically. See GRAMMAR.md §3.208.
+
 ## Rules of this codebase
 
 - **Run it; do not reason about it.** This project's real bugs have consistently been

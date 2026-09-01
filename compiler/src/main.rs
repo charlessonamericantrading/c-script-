@@ -9,6 +9,24 @@ use std::time::{Duration, SystemTime};
 
 use modules::display_path;
 
+/// GRAMMAR.md §3.208: activado por el flag global `--diagnostics-json`
+/// (sacado de `args` en `main()`, ver ahí). Cuando está prendido,
+/// `report_load_error`/`report_check_errors` imprimen un array JSON a
+/// STDOUT en vez del texto humano de siempre a stderr -- un agente (o
+/// cualquier integración externa) parseando `{file, line, column,
+/// message}` en vez de scrapear prosa en español con posición inline. Un
+/// `AtomicBool` alcanza: `linkc` es un proceso de un solo uso por
+/// invocación, nunca hace falta más que "prendido o no" para toda su vida.
+static DIAGNOSTICS_JSON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn diagnostics_json_enabled() -> bool {
+    DIAGNOSTICS_JSON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn print_diagnostics_json(diags: &[serde_json::Value]) {
+    println!("{}", serde_json::to_string(diags).unwrap_or_else(|_| "[]".to_string()));
+}
+
 /// `LoadError::Other` (IO, ciclos, etc.) se muestra como siempre. Para
 /// `LoadError::Syntax`, usa `diagnostics::render_diagnostic` -- snippet +
 /// caret en la línea/columna real -- en vez del `Display` plano de una
@@ -17,14 +35,30 @@ use modules::display_path;
 /// fallar de una forma más confusa.
 fn report_load_error(e: &modules::LoadError) {
     let modules::LoadError::Syntax { path, errors } = e else {
-        eprintln!("{e}");
+        if diagnostics_json_enabled() {
+            print_diagnostics_json(&[serde_json::json!({
+                "file": null, "line": null, "column": null, "message": e.to_string(),
+            })]);
+        } else {
+            eprintln!("{e}");
+        }
         return;
     };
+    let file_label = display_path(path);
+    if diagnostics_json_enabled() {
+        let diags: Vec<serde_json::Value> = errors
+            .iter()
+            .map(|(span, message)| serde_json::json!({
+                "file": file_label, "line": span.line, "column": span.col, "message": message,
+            }))
+            .collect();
+        print_diagnostics_json(&diags);
+        return;
+    }
     let Ok(source) = fs::read_to_string(path) else {
         eprintln!("{e}");
         return;
     };
-    let file_label = display_path(path);
     for (span, message) in errors {
         eprintln!("{}", diagnostics::render_diagnostic(&source, &file_label, *span, message));
     }
@@ -57,6 +91,19 @@ fn report_check_errors(mut errors: Vec<checker::CheckError>) {
         Some(s) => (0, s.line, s.col),
         None => (1, 0, 0),
     });
+    if diagnostics_json_enabled() {
+        let diags: Vec<serde_json::Value> = errors
+            .iter()
+            .map(|e| serde_json::json!({
+                "file": e.file.as_deref().map(display_path),
+                "line": e.span.map(|s| s.line),
+                "column": e.span.map(|s| s.col),
+                "message": e.message,
+            }))
+            .collect();
+        print_diagnostics_json(&diags);
+        return;
+    }
     let mut source_cache: std::collections::HashMap<PathBuf, Option<String>> = std::collections::HashMap::new();
     for e in &errors {
         let rendered = match (&e.file, e.span) {
@@ -74,7 +121,17 @@ fn report_check_errors(mut errors: Vec<checker::CheckError>) {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    // GRAMMAR.md §3.208: `--diagnostics-json` es un flag GLOBAL, no de un
+    // subcomando puntual -- se saca de `args` ACÁ, antes de que cualquier
+    // `cmd_*` vea la lista, precisamente para no chocar con el parseo
+    // posicional de cada uno (`args.first()` como el archivo, etc.). Puede
+    // ir en cualquier posición (`linkc test x.link --diagnostics-json` o
+    // `linkc --diagnostics-json test x.link`, las dos funcionan igual).
+    let mut args: Vec<String> = env::args().collect();
+    if let Some(idx) = args.iter().position(|a| a == "--diagnostics-json") {
+        args.remove(idx);
+        DIAGNOSTICS_JSON.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     match args.get(1).map(String::as_str) {
         Some("build") => cmd_build(&args[2..]),
         Some("test") => cmd_test(&args[2..]),
@@ -128,6 +185,7 @@ fn print_usage(to_stderr: bool) {
         }
     };
     out(&format!("uso: linkc <subcomando> [opciones]"));
+    out(&format!("     --diagnostics-json (flag global, cualquier posición): en cualquier subcomando que falle por un error de carga o de tipos, imprime un array JSON [{{file, line, column, message}}] a stdout en vez del texto humano de siempre a stderr -- para un agente o integración externa parseando errores sin scrapear prosa, GRAMMAR.md §3.208"));
     out(&format!("subcomandos conocidos:"));
     out(&format!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)"));
     out(&format!("     linkc build <archivo.link> <outdir> [--diff <anterior>] [--update-deps]    (genera contratos TS, cliente, hooks, schemas Zod, OpenAPI, llms.txt y llms-full.txt; --diff compara el contract.d.ts nuevo contra uno guardado antes; --update-deps ignora el pin de link.lock y re-resuelve cada dependencia git contra su remoto real)"));

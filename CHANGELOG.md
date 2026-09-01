@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.167.0] - 2026-09-01
+
+### ✨ Nuevo
+**Compatibilidad con IA (PLAN.md §9.16 ítem 5): `--diagnostics-json`, flag global que imprime `[{file, line, column, message}]` a stdout en vez del texto humano de siempre a stderr, para cualquier subcomando que falle al cargar o tipar un programa.** Antes, la única salida era prosa en español con posición inline -- frágil de parsear programáticamente para un agente, un editor, o una integración de CI. `lsp.rs` ya convertía estos mismos errores a JSON para el protocolo LSP, confirmando que la forma es viable; se escribió un emisor propio más simple (línea/columna 1-indexed, sin estado de documento) en vez de reutilizarlo tal cual. Funciona en cualquier posición del argumento y para TODO subcomando que carga/tipa (no solo `build`/`test`/`check`) -- centralizado en las dos funciones de reporte ya compartidas por los 13 sitios de llamada, más barato que threadear un parámetro por cada uno. 3 tests de integración nuevos contra el binario real. Ver GRAMMAR.md §3.208.
+
 ## [1.166.0] - 2026-09-01
 
 ### 🔧 Interno
