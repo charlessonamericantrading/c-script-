@@ -272,9 +272,8 @@ fn diagnostics_json_reports_a_type_error_as_a_structured_json_array_on_stdout() 
     let entry = project.write(
         "main.link",
         r#"
-        enum Role { Admin, Member }
-        type User = { id: Int, role: Role }
-        fn make() -> User { User { id: 1, role: Role.Admin } }
+        enum Outcome { Good { value: Int }, Bad }
+        fn f() -> Outcome { Outcome.Good }
         "#,
     );
 
@@ -287,8 +286,8 @@ fn diagnostics_json_reports_a_type_error_as_a_structured_json_array_on_stdout() 
     let diags: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("stdout no es JSON válido ({e}): {stdout}"));
     let arr = diags.as_array().expect("se esperaba un array JSON");
     assert_eq!(arr.len(), 1, "{arr:?}");
-    assert!(arr[0]["message"].as_str().unwrap().contains("es una variante de enum usada como valor"), "{arr:?}");
-    assert_eq!(arr[0]["line"], 4);
+    assert!(arr[0]["message"].as_str().unwrap().contains("es una variante de enum CON campos"), "{arr:?}");
+    assert_eq!(arr[0]["line"], 3);
     assert!(arr[0]["file"].as_str().unwrap().ends_with("main.link"), "{arr:?}");
 }
 

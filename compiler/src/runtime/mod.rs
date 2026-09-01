@@ -604,6 +604,30 @@ pub(crate) fn eval_expr(
             Err(err(format!("variable no declarada en runtime: '{name}'")))
         }
         Expr::FieldAccess { base, field } => {
+            // GRAMMAR.md §3.209: espejo exacto del chequeo del checker
+            // (checker.rs, mismo brazo) -- `Enum.Variante` sin campos, sin
+            // `{}`, es azúcar por `Enum.Variante {}`. El checker ya
+            // garantizó en compile-time que esto es válido (rechaza el
+            // caso con campos y el de una variante inexistente), así que
+            // acá alcanza con reconstruir el mismo `StructLit` sintético y
+            // delegar a la construcción real -- nunca diverge de lo que el
+            // checker aprobó, porque es literalmente el mismo camino de
+            // evaluación que `Enum.Variante {}` ya usaba.
+            if let Expr::Ident(base_name) = &base.node {
+                if env.get(base_name).is_none() {
+                    if let Some(decl) = checker.enums.get(base_name) {
+                        if let Some(variant) = decl.variants.iter().find(|v| &v.name == field) {
+                            if variant.fields.as_ref().is_none_or(|fs| fs.is_empty()) {
+                                let synthetic = Spanned {
+                                    node: Expr::StructLit { name: base_name.clone(), variant: Some(field.clone()), fields: vec![] },
+                                    span: e.span,
+                                };
+                                return eval_expr(&synthetic, env, db, fns, checker, sessions, current_token, step_budget);
+                            }
+                        }
+                    }
+                }
+            }
             let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token, step_budget)?;
             match base_v {
                 Value::Struct(fields) | Value::Variant { fields, .. } => Ok(fields

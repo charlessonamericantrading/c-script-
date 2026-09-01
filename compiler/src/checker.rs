@@ -3029,6 +3029,22 @@ impl Checker {
             Expr::StructLit { name, variant, fields } if self.is_user_generic(name) => {
                 self.check_generic_struct_lit(name, variant.as_deref(), fields, expected, env)
             }
+            // GRAMMAR.md §3.209: mismo caso que el brazo de arriba, pero
+            // para la forma AZÚCAR sin llaves (`Maybe.Nothing`, no
+            // `Maybe.Nothing {}`) de una variante sin campos de un enum
+            // GENÉRICO -- el fallback genérico de más abajo (`_ =>`) llama
+            // a `synth_expr_inner` en modo SÍNTESIS, sin `expected`, así
+            // que no tiene de dónde sacar los argumentos de tipo
+            // (`Maybe<Int>`); acá SÍ está disponible, así que se redirige
+            // al mismo `check_generic_struct_lit` que ya resuelve la forma
+            // con llaves. Sin este brazo, `Maybe.Nothing {}` tipaba en un
+            // contexto con `expected` (ej. la rama de un `if` cuyo tipo ya
+            // se conoce) pero la forma sin llaves no -- una asimetría
+            // nueva que este mismo ítem existe para cerrar, no para crear.
+            Expr::FieldAccess { base, field } if self.is_bare_unit_variant_of_generic_enum(base, field, env) => {
+                let Expr::Ident(base_name) = &base.node else { unreachable!("garantizado por el guard de arriba") };
+                self.check_generic_struct_lit(base_name, Some(field.as_str()), &[], expected, env)
+            }
             // '[]' vacío: sin esto, synth_expr fallaría (no hay elemento del
             // que inferir el tipo). Con un List(T) esperado, alcanza con
             // verificar que efectivamente se pidió una lista -- vacía
@@ -3151,6 +3167,24 @@ impl Checker {
     fn is_user_generic(&self, name: &str) -> bool {
         self.types.get(name).is_some_and(|d| !d.type_params.is_empty())
             || self.enums.get(name).is_some_and(|d| !d.type_params.is_empty())
+    }
+
+    /// GRAMMAR.md §3.209: mismo chequeo que la síntesis de `Expr::FieldAccess`
+    /// (`synth_expr_inner`) usa para decidir si `Enum.Variante` sin llaves es
+    /// azúcar válida -- repetido acá, no extraído a un helper compartido con
+    /// esa otra función, porque las dos formas AHÍ necesitan el `&Expr::Ident`
+    /// desenvuelto de maneras ligeramente distintas (una para armar el
+    /// mensaje de error, esta solo para el guard de un match).
+    fn is_bare_unit_variant_of_generic_enum(&self, base: &Spanned<Expr>, field: &str, env: &Env) -> bool {
+        let Expr::Ident(base_name) = &base.node else { return false };
+        if env.contains_key(base_name) {
+            return false;
+        }
+        if !self.is_user_generic(base_name) {
+            return false;
+        }
+        let Some(decl) = self.enums.get(base_name) else { return false };
+        decl.variants.iter().find(|v| &v.name == field).is_some_and(|v| v.fields.as_ref().is_none_or(|fs| fs.is_empty()))
     }
 
     fn check_generic_struct_lit(
@@ -3832,30 +3866,59 @@ impl Checker {
                 }
             }
             Expr::FieldAccess { base, field } => {
-                // GRAMMAR.md §3.206: `Enum.Variante` sin `{}` en posición de
-                // EXPRESIÓN no es una variante válida -- el parser solo
-                // reconoce un literal de variante si ve `{` después (a
-                // propósito, no tiene tabla de símbolos para desambiguar
-                // antes). Sin este chequeo, `base` (el `Ident` del nombre
-                // del enum) caía en el brazo de arriba y daba "variable no
-                // declarada: 'Role'" -- activamente engañoso, porque `Role`
-                // SÍ está declarado (como enum), y el mensaje no menciona
-                // para nada el arreglo real. `!env.contains_key` primero:
-                // una variable local que sombree el nombre del enum sigue
-                // resolviendo como variable, igual que el chequeo de `db`
-                // de más abajo respeta esa misma prioridad.
+                // GRAMMAR.md §3.209 (evolución de §3.206): `Enum.Variante`
+                // sin `{}` en posición de EXPRESIÓN -- el parser SIEMPRE
+                // parsea esto como `FieldAccess` (nunca tiene tabla de
+                // símbolos para elegir otra forma en el momento), así que
+                // la desambiguación real pasa acá, en el checker, no en el
+                // parser. `!env.contains_key` primero: una variable local
+                // que sombree el nombre del enum sigue resolviendo como
+                // variable, igual que el chequeo de `db` de más abajo
+                // respeta esa misma prioridad.
                 if let Expr::Ident(base_name) = &base.node {
                     if !env.contains_key(base_name) {
                         if let Some(decl) = self.enums.get(base_name) {
-                            if let Some(variant) = decl.variants.iter().find(|v| &v.name == field) {
-                                let forma = if variant.fields.as_ref().is_some_and(|fs| !fs.is_empty()) {
-                                    format!("'{base_name}.{field} {{ ... }}'")
-                                } else {
-                                    format!("'{base_name}.{field} {{}}'")
-                                };
-                                return Err(err(format!(
-                                    "'{base_name}.{field}' es una variante de enum usada como valor -- como expresión necesita llaves: {forma}. Sin llaves, '{base_name}.{field}' solo es válido dentro de una anotación (@requires({base_name}.{field})) o de un patrón de 'match' ({base_name}.{field} => ...) -- GRAMMAR.md §3.206"
-                                )));
+                            match decl.variants.iter().find(|v| &v.name == field) {
+                                // Variante SIN campos (unitaria, o `{}`
+                                // explícita pero vacía): `Enum.Variante` es
+                                // azúcar por `Enum.Variante {}` -- exactamente
+                                // la misma construcción, delegada al mismo
+                                // camino que ya la tipa (StructLit), para que
+                                // las dos formas nunca puedan divergir en
+                                // comportamiento. Antes de esta ronda esto
+                                // era un error pidiendo agregar `{}`; ahora
+                                // `{}` es opcional cuando no hay nada que
+                                // agregar.
+                                Some(variant) if variant.fields.as_ref().is_none_or(|fs| fs.is_empty()) => {
+                                    return self.synth_expr_inner(
+                                        &Expr::StructLit { name: base_name.clone(), variant: Some(field.clone()), fields: vec![] },
+                                        env,
+                                    );
+                                }
+                                // Variante CON campos: no hay de dónde
+                                // inferir los valores sin llaves, así que
+                                // acá SÍ sigue siendo un error -- pero
+                                // dirigido, no el "variable no declarada"
+                                // genérico de antes de §3.206.
+                                Some(_) => {
+                                    return Err(err(format!(
+                                        "'{base_name}.{field}' es una variante de enum CON campos -- no se puede usar sin llaves, no hay de dónde inferir sus valores: escribí '{base_name}.{field} {{ ... }}' (GRAMMAR.md §3.209)"
+                                    )));
+                                }
+                                // `field` no nombra ninguna variante real de
+                                // este enum -- ya sabemos que `base_name` es
+                                // un enum, no una variable, así que "variable
+                                // no declarada" sería la respuesta equivocada
+                                // sin importar qué diga `field`.
+                                None => {
+                                    let variant_names: Vec<&str> = decl.variants.iter().map(|v| v.name.as_str()).collect();
+                                    return Err(match find_best_suggestion(field, variant_names) {
+                                        Some(sug) => err(format!(
+                                            "'{base_name}' no tiene ninguna variante '{field}' -- ¿quisiste decir '{base_name}.{sug}'?"
+                                        )),
+                                        None => err(format!("'{base_name}' no tiene ninguna variante '{field}'")),
+                                    });
+                                }
                             }
                         }
                     }
@@ -6494,20 +6557,67 @@ type T = { id: Int, s: Status }")
     }
 
     #[test]
-    fn bare_enum_variant_used_as_a_value_names_the_real_mistake() {
-        // GRAMMAR.md §3.206: antes de este fix, esto daba "variable no
-        // declarada: 'Role'" -- activamente engañoso, porque `Role` SÍ
-        // está declarado (como enum); el mensaje no mencionaba para nada
-        // que el arreglo real es agregar `{}`.
+    fn bare_unit_enum_variant_is_now_valid_as_a_value_no_braces_needed() {
+        // GRAMMAR.md §3.209 (evolución de §3.206): antes de §3.206 esto daba
+        // "variable no declarada: 'Role'" -- activamente engañoso, porque
+        // `Role` SÍ está declarado (como enum). §3.206 mejoró el MENSAJE
+        // (pedía agregar `{}`); §3.209 va más allá y elimina la asimetría de
+        // raíz -- una variante SIN campos no necesita llaves para nada,
+        // `Role.Admin` y `Role.Admin {}` son ahora la MISMA expresión válida.
         let src = r#"
             enum Role { Admin, Member }
             type User = { id: Int, role: Role }
             fn make() -> User { User { id: 1, role: Role.Admin } }
         "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn bare_data_carrying_enum_variant_still_needs_braces_no_values_to_infer() {
+        // A diferencia del caso de arriba, una variante CON campos no puede
+        // omitir las llaves -- no hay de dónde sacar los valores. Sigue
+        // siendo un error, pero dirigido (GRAMMAR.md §3.209), nunca el
+        // "variable no declarada" genérico de antes de §3.206.
+        let src = r#"
+            enum Outcome { Good { value: Int }, Bad }
+            fn f() -> Outcome { Outcome.Good }
+        "#;
         let errs = check_source(src).unwrap_err();
-        assert!(errs[0].message.contains("es una variante de enum usada como valor"), "{}", errs[0].message);
-        assert!(errs[0].message.contains("Role.Admin {}"), "{}", errs[0].message);
+        assert!(errs[0].message.contains("es una variante de enum CON campos"), "{}", errs[0].message);
+        assert!(errs[0].message.contains("Outcome.Good { ... }"), "{}", errs[0].message);
         assert!(!errs[0].message.contains("variable no declarada"), "{}", errs[0].message);
+    }
+
+    #[test]
+    fn bare_reference_to_a_nonexistent_variant_suggests_the_real_one() {
+        // Tercer caso: `base_name` SÍ es un enum conocido, pero `field` no
+        // nombra ninguna de sus variantes -- ya sabemos que no es una
+        // variable, así que "variable no declarada" seguiría siendo la
+        // respuesta equivocada acá también.
+        let src = r#"
+            enum Role { Admin, Member }
+            fn f() -> Role { Role.Admn }
+        "#;
+        let errs = check_source(src).unwrap_err();
+        assert!(errs[0].message.contains("no tiene ninguna variante 'Admn'"), "{}", errs[0].message);
+        assert!(errs[0].message.contains("¿quisiste decir 'Role.Admin'?"), "{}", errs[0].message);
+    }
+
+    #[test]
+    fn bare_unit_variant_of_a_generic_enum_infers_type_args_from_context() {
+        // GRAMMAR.md §3.209: sin el brazo dedicado en `check_expr_inner`,
+        // esto fallaba con "'Maybe' es genérico -- necesita un tipo
+        // esperado..." aunque el `expected` SÍ estaba disponible en este
+        // contexto (la otra rama del `if` ya fija `Maybe<Int>`) -- el
+        // fallback de síntesis pura no lo propagaba. La forma CON llaves
+        // (`Maybe.Nothing {}`) ya funcionaba acá antes de este ítem.
+        let src = r#"
+            enum Maybe<T> { Just { value: T }, Nothing }
+            fn f(has: Bool) -> Maybe<Int> {
+                if has { Maybe.Just { value: 1 } } else { Maybe.Nothing }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 
     #[test]

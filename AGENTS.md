@@ -109,8 +109,13 @@ when driving `linkc` programmatically. See GRAMMAR.md §3.208.
 
 Full list in [`llms.txt`](llms.txt). The three that break almost every first attempt:
 
-1. An enum variant used as a **value** needs braces — `Role.Member {}`. In an annotation
-   (`@requires(Role.Admin)`) and in a `match` pattern (`Role.Admin => ...`) it has none.
+1. An enum variant used as a **value** only needs braces when it carries fields —
+   `Outcome.Good { value: 1 }`, never `Outcome.Good` alone. A variant with no fields
+   (`Role.Member`) needs no braces anywhere — as a value, in an annotation
+   (`@requires(Role.Admin)`), or in a `match` pattern — the three positions agree now
+   (GRAMMAR.md §3.209). Getting this wrong still fails, but the compiler now says exactly
+   which of the two rules applies and how to fix it, instead of a misleading "undeclared
+   variable" (GRAMMAR.md §3.206).
 2. Closures carry no return type: `|u: User| { u.active }`, never `|u: User| -> Bool {...}`.
 3. `T?` still can't be dereferenced via `if`. `if x != null { x.name }` is an error — there's
    no narrowing through `if`, deliberately. Use `match x { v: T => v.name, null => ... }`

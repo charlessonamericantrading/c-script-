@@ -9,9 +9,11 @@ hooks, Zod schemas and OpenAPI from it.
 the real CLI commands, and the syntax mistakes that break almost every first
 attempt. The two that matter most:
 
-1. An enum variant used as a **value** needs braces — `Role.Member {}`, not
-   `Role.Member`. In `@requires(Role.Admin)` and in a `match` pattern it has
-   none.
+1. An enum variant used as a **value** only needs braces if it carries
+   fields — `Outcome.Good { value: 1 }`, not `Outcome.Good` alone. A
+   variant with no fields needs none anywhere: `Role.Member` works
+   directly as a value, same as in `@requires(Role.Admin)` or a `match`
+   pattern.
 2. A closure carries no return-type annotation: `|u: User| { u.active }`,
    never `|u: User| -> Bool { ... }`.
 

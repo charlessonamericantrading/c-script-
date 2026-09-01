@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.168.0] - 2026-09-01
+
+### ✨ Nuevo
+**Compatibilidad con IA (PLAN.md §9.16 ítem 1(b)): una variante de enum sin campos ya no necesita `{}` para usarse como valor -- `Role.Member` funciona directo, igual que ya funcionaba dentro de una anotación o un patrón de `match`.** Cierra la asimetría de raíz que §3.206 solo había diagnosticado mejor sin eliminar. El discovery real: no hacía falta tocar el parser (que siempre produce la misma forma sintáctica, `Ident.Ident`, para este caso, sin importar si `Ident` es una variable o un enum) -- la desambiguación es puramente semántica, resuelta en el checker/runtime reusando la construcción de `StructLit` que ya existía para la forma con llaves, sin duplicar lógica. Una variante CON campos sigue necesitando llaves (no hay de dónde inferir los valores), ahora con un mensaje dirigido en vez del genérico de antes de §3.206; una variante inexistente da una sugerencia por distancia de edición. De paso, cerrado un caso encontrado en la propia verificación: un enum GENÉRICO (`Maybe<T>`) sin llaves en un contexto con tipo esperado (ej. una rama de `if`) no inferia sus argumentos de tipo -- la forma con llaves sí, la nueva forma sin llaves ahora también. `AGENTS.md`/`llms.txt`/`CLAUDE.md` actualizados para dejar de advertir de una regla que ya no aplica al caso común. Ver GRAMMAR.md §3.209.
+
 ## [1.167.0] - 2026-09-01
 
 ### ✨ Nuevo

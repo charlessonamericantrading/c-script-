@@ -148,10 +148,14 @@ Does NOT work today — do not propose designs that depend on these:
 Every one of these was a real bug in this repository's own documentation. They are the
 difference between code that compiles and code that does not.
 
-1. **An enum variant used as a VALUE needs braces**: `Role.Member {}`, not `Role.Member`.
-   Inside an annotation it is written without braces: `@requires(Role.Admin)`. Inside a
-   `match` pattern, also without braces: `Filter.All => ...`. This single rule causes most
-   first-attempt failures.
+1. **An enum variant used as a VALUE only needs braces when it carries fields**:
+   `Outcome.Good { value: 1 }`, not `Outcome.Good` alone — there's nowhere to infer the field
+   values from. A variant with NO fields needs no braces anywhere: `Role.Member` works
+   directly as a value, exactly as it already does inside an annotation
+   (`@requires(Role.Admin)`) and inside a `match` pattern (`Filter.All => ...`) — the three
+   positions agree (GRAMMAR.md §3.209). Before that, this single rule caused most
+   first-attempt failures; getting it wrong still fails, but the compiler now names which of
+   the two cases applies instead of a misleading "undeclared variable" (GRAMMAR.md §3.206).
 2. **Closures take no return-type annotation**: `|t: Todo| { !t.completed }`, never
    `|t: Todo| -> Bool { ... }`.
 3. **A `T?` still can't be dereferenced via `if`.** `if x != null` type-checks as a boolean
@@ -369,8 +373,8 @@ db {
 }
 
 service Todos {
-  // Note `Filter.All {}`: an enum variant in expression position needs braces.
-  rpc list(filter: Filter = Filter.All {}) -> Todo[] {
+  // `Filter.All` needs no braces here -- it has no fields (GRAMMAR.md §3.209).
+  rpc list(filter: Filter = Filter.All) -> Todo[] {
     match filter {
       Filter.All => db.todos.all(),
       Filter.Pending => db.todos.findWhere(|t: Todo| { !t.completed }),
