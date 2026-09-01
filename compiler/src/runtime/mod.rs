@@ -134,6 +134,112 @@ pub enum Value {
     Closure(Vec<String>, Block, Env),
 }
 
+/// GRAMMAR.md §3.206: exhaustivo A PROPÓSITO, sin brazo `_`. Decide si
+/// `Expr::FieldAccess` sobre este `Value` puede volverse un
+/// `Value::BoundMethod` a la espera de que el `Expr::Call` que lo envuelve
+/// corra -- este chequeo es un allowlist SEPARADO del `match method` real
+/// de cada tipo (más abajo en este archivo), y por eso mismo es exactamente
+/// donde ya se coló un bug real una vez: `Value::Decimal` tuvo un método
+/// bien implementado ahí abajo pero INALCANZABLE durante meses porque
+/// faltaba acá (GRAMMAR.md §3.199). Antes, este chequeo era una unión de
+/// patrones inline con un brazo `other => Err(...)` -- agregar una
+/// variante `Value` nueva con métodos propios y olvidar sumarla ahí
+/// compilaba limpio y fallaba en runtime, silencioso hasta que alguien
+/// llamara al método. Extraído a una función propia SIN `_` para que ese
+/// mismo olvido sea un error de `cargo build` -- toda variante de `Value`
+/// tiene que clasificarse acá, explícitamente, la próxima vez que se
+/// agregue una.
+fn supports_bound_method_access(v: &Value) -> bool {
+    match v {
+        Value::Service(_)
+        | Value::DbCollection(_)
+        | Value::List(_)
+        | Value::Int(_)
+        | Value::Int64(_)
+        | Value::Decimal(_)
+        | Value::Float(_)
+        | Value::Bool(_)
+        | Value::Str(_)
+        | Value::Uuid(_)
+        | Value::Timestamp(_)
+        | Value::Auth
+        | Value::Math
+        | Value::Crypto
+        | Value::Http
+        | Value::Json
+        | Value::Base64
+        | Value::Pdf
+        | Value::Excel
+        | Value::Mcp
+        | Value::Env
+        | Value::Request
+        | Value::Smtp
+        | Value::Response => true,
+        // Estos ya se manejan ANTES de llegar a `supports_bound_method_access`
+        // (Struct/Variant/Db), o genuinamente no tienen ningún método propio
+        // hoy (Null/Tuple/BoundMethod/FnRef/Closure) -- `false` es la
+        // clasificación correcta para las cinco últimas, no un catch-all
+        // perezoso.
+        Value::Struct(_)
+        | Value::Variant { .. }
+        | Value::Db
+        | Value::Null
+        | Value::Tuple(_)
+        | Value::BoundMethod(_, _)
+        | Value::FnRef(_)
+        | Value::Closure(_, _, _) => false,
+    }
+}
+
+/// GRAMMAR.md §3.206: exhaustivo A PROPÓSITO, sin brazo `_` -- clasifica
+/// cada variante `Value` que es un marcador interno singleton sin datos
+/// propios (los módulos `db`/`auth`/`math`/`crypto`/`http`/`json`/`base64`/
+/// `pdf`/`excel`/`mcp`/`env`/`request`/`smtp`/`response`). `impl PartialEq
+/// for Value` la usa para tratar `X == X` como `true` para cualquiera de
+/// ellos, nunca entre sí -- antes esto era 14 brazos `(X, X) => true`
+/// escritos a mano, y 7 de ellos (`Pdf`/`Excel`/`Mcp`/`Env`/`Request`/
+/// `Smtp`/`Response`) faltaron durante meses, cayendo en el `_ => false`
+/// final sin que nada lo marcara (GRAMMAR.md §3.162, v1.162.0). Al vivir
+/// acá, sin `_`, agregar un marcador interno nuevo a `Value` sin sumarlo a
+/// esta clasificación es ahora un error de `cargo build`, no un `X == X`
+/// silenciosamente `false`.
+fn is_marker_singleton(v: &Value) -> bool {
+    match v {
+        Value::Db
+        | Value::Auth
+        | Value::Math
+        | Value::Crypto
+        | Value::Http
+        | Value::Json
+        | Value::Base64
+        | Value::Pdf
+        | Value::Excel
+        | Value::Mcp
+        | Value::Env
+        | Value::Request
+        | Value::Smtp
+        | Value::Response => true,
+        Value::Int(_)
+        | Value::Int64(_)
+        | Value::Decimal(_)
+        | Value::Timestamp(_)
+        | Value::Float(_)
+        | Value::Str(_)
+        | Value::Uuid(_)
+        | Value::Bool(_)
+        | Value::Null
+        | Value::Struct(_)
+        | Value::Variant { .. }
+        | Value::List(_)
+        | Value::Tuple(_)
+        | Value::DbCollection(_)
+        | Value::Service(_)
+        | Value::BoundMethod(_, _)
+        | Value::FnRef(_)
+        | Value::Closure(_, _, _) => false,
+    }
+}
+
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         use Value::*;
@@ -154,29 +260,11 @@ impl PartialEq for Value {
             ) => en1 == en2 && v1 == v2 && f1 == f2,
             (List(a), List(b)) => a == b,
             (Tuple(a), Tuple(b)) => a == b,
-            (Db, Db) => true,
             (DbCollection(a), DbCollection(b)) => a == b,
-            (Auth, Auth) => true,
             (Service(a), Service(b)) => a == b,
-            (Math, Math) => true,
-            (Crypto, Crypto) => true,
-            (Http, Http) => true,
-            (Json, Json) => true,
-            (Base64, Base64) => true,
-            // Mismo marcador interno singleton que Db/Auth/Math/... arriba
-            // -- ver la lista gemela en `value_to_json` y en los 4 sitios de
-            // codegen (`Type::Pdf | Type::Excel | ... `). Faltaban acá: el
-            // checker tipa `pdf == pdf` como válido (Eq exige tipos
-            // compatibles, GRAMMAR.md ahí mismo), pero sin este brazo caía
-            // en el `_ => false` de abajo -- el mismo `X == X` que da `true`
-            // para `math`/`json`/etc daba `false` para estos.
-            (Pdf, Pdf) => true,
-            (Excel, Excel) => true,
-            (Mcp, Mcp) => true,
-            (Env, Env) => true,
-            (Request, Request) => true,
-            (Smtp, Smtp) => true,
-            (Response, Response) => true,
+            // Ver `is_marker_singleton` -- cualquiera de los 14 módulos
+            // internos comparado consigo mismo da `true`, nunca entre sí.
+            (a, b) if is_marker_singleton(a) && is_marker_singleton(b) => std::mem::discriminant(a) == std::mem::discriminant(b),
             (BoundMethod(a, m1), BoundMethod(b, m2)) => a == b && m1 == m2,
             (FnRef(a), FnRef(b)) => a == b,
             // Nunca iguales, ni siquiera el mismo closure consigo mismo --
@@ -533,9 +621,7 @@ pub(crate) fn eval_expr(
                 // durante meses porque faltaba acá -- al agregar una
                 // variante `Value` nueva con métodos propios, sumarla ACÁ
                 // también, no solo en su `match method`.
-                Value::Service(_) | Value::DbCollection(_) | Value::List(_) | Value::Int(_) | Value::Int64(_) | Value::Decimal(_) | Value::Float(_) | Value::Bool(_) | Value::Str(_) | Value::Uuid(_) | Value::Timestamp(_) | Value::Auth | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Mcp | Value::Env | Value::Request | Value::Smtp | Value::Response => {
-                    Ok(Value::BoundMethod(Box::new(base_v), field.clone()))
-                }
+                ref v if supports_bound_method_access(v) => Ok(Value::BoundMethod(Box::new(base_v), field.clone())),
                 other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other:?}"))),
             }
         }

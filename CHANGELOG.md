@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.166.0] - 2026-09-01
+
+### 🔧 Interno
+**Compatibilidad con IA (PLAN.md §9.16 ítem 3): dos allowlists sobre `Value` con catch-all genérico convertidas a funciones exhaustivas sin `_`, para que agregar una variante `Value` nueva sin clasificarla sea un error de `cargo build`.** No es una hipótesis -- es la clase de bug que ya rompió producción tres veces (v1.162.0, GRAMMAR.md §3.204/v1.163.0, GRAMMAR.md §3.199), siempre con la misma forma: una variante nueva se agrega a `Value`, se olvida en UN sitio con `_ =>`/`other =>`, tipa limpio y rompe en runtime. `impl PartialEq for Value` (el bug exacto de v1.162.0, 14 brazos `(X,X)=>true` a mano) y la eligibilidad de `Expr::FieldAccess` → `Value::BoundMethod` (el bug exacto de §3.199) ahora delegan en `is_marker_singleton`/`supports_bound_method_access`, dos funciones que clasifican las 32 variantes de `Value` sin ningún brazo `_` -- una variante nueva sin clasificar ahí no compila. Comportamiento idéntico antes/después, confirmado contra el binario real. Auditados ~56 sitios similares en total; los otros 4 (los emisores de codegen que ya excluyen `Type::Pdf`/etc.) resultaron YA exhaustivos sin `_`, nada que arreglar; el resto queda documentado como fuera de alcance de esta ronda (mayormente heurísticas genuinamente abiertas, no enums cerrados mal clasificados). Ver GRAMMAR.md §3.207.
+
 ## [1.165.0] - 2026-09-01
 
 ### 📝 Documentación
