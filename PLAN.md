@@ -757,7 +757,11 @@ Idea directamente inspirada por esta misma sesión: el error real de Rust (`E060
 - ~~**3**~~ -- las dos instancias reales de "falta un arm en el enésimo allowlist" (`impl PartialEq for Value`, la eligibilidad de `BoundMethod`) convertidas a funciones exhaustivas sin `_` -- agregar una variante `Value` nueva sin clasificarla ahora no compila. v1.166.0, GRAMMAR.md §3.207.
 - ~~**5**~~ -- `--diagnostics-json`, flag global, diagnósticos de carga/tipos como `[{file, line, column, message}]` en vez de texto humano -- reusa la forma que `lsp.rs` ya probaba en producción para el protocolo LSP. v1.167.0, GRAMMAR.md §3.208.
 
-**Quedan abiertos, tal como este plan ya los dejó marcados**: **1(b)** (eliminar la asimetría de llaves en la gramática, no solo diagnosticarla) -- necesita su propio discovery arquitectónico Y decisión explícita del usuario, no se ataca sin eso. **6** (códigos de error estables + `linkc explain`) -- necesita taxonomía propia primero, deliberadamente no atacado en esta ronda.
+**Segunda ronda ejecutada (01/09/2026), tras luz verde explícita del usuario ("hazlo, creálo todo") sobre los dos ítems que habían quedado abiertos**:
+- ~~**1(b)**~~ -- `Enum.Variante` sin campos ya no necesita `{}` como expresión -- `Role.Member` funciona directo, igual que ya funcionaba en una anotación o un `match`. El discovery real: no hacía falta tocar el parser (siempre produce la misma forma sintáctica, la ambigüedad es semántica) -- resuelto en checker/runtime reusando la construcción de `StructLit` ya existente. Cerró de paso un caso de enums genéricos encontrado en la propia verificación. v1.168.0, GRAMMAR.md §3.209.
+- ~~**6**~~ -- códigos de error estables (`error[L0001]: ...`, mismo formato que `rustc`) + `linkc explain <código>`. Taxonomía resuelta con un set curado de 5 códigos (no todo error tiene uno, mismo criterio que `rustc`) sobre los errores ya documentados en profundidad. Cerró de paso un bug real encontrado verificando el repro (`||` sin espacio lexeaba distinto de `| |`, solo uno de los dos daba el mensaje dirigido). v1.169.0, GRAMMAR.md §3.210.
+
+**Con esto, PLAN.md §9.16 queda completo -- los 7 ítems originales resueltos, v1.164.0 a v1.169.0, cada uno con GRAMMAR.md, tests, suite completa, CI y Release Binaries verificados.**
 
 ---
 
