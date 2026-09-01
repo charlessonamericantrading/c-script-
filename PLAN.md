@@ -751,6 +751,14 @@ Idea directamente inspirada por esta misma sesión: el error real de Rust (`E060
 
 **Nada de esto está implementado todavía** -- este documento es el plan, no la ronda. Igual que §9.14/§9.15, queda a la espera de que el usuario indique con cuáles ítems arrancar.
 
+**Ronda ejecutada (01/09/2026, `/loop implementa el plan`)**: los 5 ítems con primer paso concreto ya nombrado -- 1(a), 2, 3, 4, 5 -- quedaron RESUELTOS, en ese orden, cada uno su propia versión con suite completa + CI + Release Binaries verificados vía `gh run view --exit-status`:
+- ~~**1(a)**~~ y ~~**2**~~ -- mensajes de error dirigidos para los dos errores de `AGENTS.md`/`llms.txt` que daban un mensaje engañoso/ininteligible (enum sin llaves como valor, closure con tipo de retorno anotado). v1.164.0, GRAMMAR.md §3.206.
+- ~~**4**~~ -- `linkc test <archivo>` sin bloques `test{}` ya era el camino rápido sin DB/intérprete; fix puramente documental (`--help`/`AGENTS.md`/`llms.txt`). v1.165.0 (mismo §3.206) -- **esta versión quedó con CI en rojo por un snapshot sin regenerar, corregido hacia adelante por v1.166.0**, ver CHANGELOG.md [1.166.0].
+- ~~**3**~~ -- las dos instancias reales de "falta un arm en el enésimo allowlist" (`impl PartialEq for Value`, la eligibilidad de `BoundMethod`) convertidas a funciones exhaustivas sin `_` -- agregar una variante `Value` nueva sin clasificarla ahora no compila. v1.166.0, GRAMMAR.md §3.207.
+- ~~**5**~~ -- `--diagnostics-json`, flag global, diagnósticos de carga/tipos como `[{file, line, column, message}]` en vez de texto humano -- reusa la forma que `lsp.rs` ya probaba en producción para el protocolo LSP. v1.167.0, GRAMMAR.md §3.208.
+
+**Quedan abiertos, tal como este plan ya los dejó marcados**: **1(b)** (eliminar la asimetría de llaves en la gramática, no solo diagnosticarla) -- necesita su propio discovery arquitectónico Y decisión explícita del usuario, no se ataca sin eso. **6** (códigos de error estables + `linkc explain`) -- necesita taxonomía propia primero, deliberadamente no atacado en esta ronda.
+
 ---
 
 ### Sobre el nombre
