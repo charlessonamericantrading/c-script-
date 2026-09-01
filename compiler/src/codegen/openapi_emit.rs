@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use serde_json::{json, Value};
-use crate::ast::{Expr, FieldValidator, Item, Member, Program, TypeExpr, UnaryOp};
+use crate::ast::{EnumDecl, Expr, FieldValidator, Item, Member, Program, TypeDecl, TypeExpr, UnaryOp};
 use crate::checker::Checker;
 use crate::types::Type;
 
@@ -151,6 +151,125 @@ pub(crate) fn type_to_json_schema(ty: &Type) -> Value {
     }
 }
 
+// Bug real, misma familia que el schema Zod de un enum ADT (zod_emit.rs,
+// GRAMMAR.md §3.132): esto describía CUALQUIER enum como
+// `{"type":"string","enum":[...]}`, sin importar si sus variantes llevaban
+// datos. Un ADT (`ValidationError { InvalidEmail { field: String }, ... }`,
+// real en `examples/users.link`) viaja como un OBJETO con tag `type` --
+// documentarlo como un string en `openapi.json` describe algo que el
+// servidor nunca manda. Mismo criterio `all_unit` que `emit_enum_decl`
+// (ts_emit.rs) y `emit_zod_schemas` (zod_emit.rs) ya usan.
+fn enum_openapi_schema(e: &EnumDecl, checker: &Checker) -> Result<Value, String> {
+    let all_unit = e.variants.iter().all(|v| v.fields.is_none());
+    if all_unit {
+        let variants: Vec<Value> = e.variants.iter().map(|v| json!(v.name)).collect();
+        return Ok(json!({ "type": "string", "enum": variants }));
+    }
+    let mut variant_schemas = Vec::new();
+    for v in &e.variants {
+        let mut props = json!({ "type": { "const": v.name } });
+        let mut required = vec!["type".to_string()];
+        if let Some(fields) = &v.fields {
+            for f in fields {
+                // Mismo fix que en `zod_emit.rs` (GRAMMAR.md §3.132) para un
+                // ADT genérico -- sin esto, un `enum Result<T, E> { Ok {
+                // value: T }, ... }` (el ejemplo educativo de la propia
+                // documentación) rompía `linkc build` entero.
+                let ty = if e.type_params.is_empty() {
+                    checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
+                } else {
+                    checker.resolve_type_abstract(&f.ty, &e.type_params).map_err(|e| e.to_string())?
+                };
+                props[f.name.as_str()] = type_to_json_schema(&ty);
+                if !f.optional && f.default.is_none() {
+                    required.push(f.name.clone());
+                }
+            }
+        }
+        variant_schemas.push(json!({
+            "type": "object",
+            "properties": props,
+            "required": required
+        }));
+    }
+    Ok(json!({ "oneOf": variant_schemas }))
+}
+
+/// `None` si `t.ty` no es un `TypeExpr::Struct` (un `type X = Int[]` de
+/// alias, por ejemplo) -- mismo `if let` que el llamador original tenía
+/// inline, ahora factorizado para poder reusarse sobre `ExcelSheet`
+/// (`checker::excel_sheet_type_decl()`, siempre un struct) sin duplicar el
+/// cuerpo.
+fn struct_openapi_schema(t: &TypeDecl, checker: &Checker) -> Result<Option<Value>, String> {
+    let TypeExpr::Struct(fields) = &t.ty else { return Ok(None) };
+    let mut props = json!({});
+    let mut required = Vec::new();
+    for f in fields {
+        // Mismo bug/fix que en `zod_emit.rs` (GRAMMAR.md §3.132): un `type
+        // Box<T> = { value: T }` rompía `linkc build` ENTERO ("tipo
+        // desconocido: 'T'") con `resolve_type` a secas -- confirmado a mano
+        // contra el binario real. `resolve_type_abstract` deja `T` como
+        // `Type::TypeParam`; `type_to_json_schema` no tiene un caso especial
+        // para eso, así que cae al `match` sin patrón exhaustivo... -- ver
+        // el fix en esa función.
+        let ty = if t.type_params.is_empty() {
+            checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
+        } else {
+            checker.resolve_type_abstract(&f.ty, &t.type_params).map_err(|e| e.to_string())?
+        };
+        let mut schema = type_to_json_schema(&ty);
+        // `@deprecated` sobre un campo (GRAMMAR.md §3.71) -- "deprecated" es
+        // una keyword estándar de JSON Schema 2020-12 (la que usa OpenAPI
+        // 3.1), así que no hace falta ninguna extensión propietaria.
+        if let Some(reason) = f.deprecated() {
+            if let Some(obj) = schema.as_object_mut() {
+                obj.insert("deprecated".to_string(), json!(true));
+                obj.insert("description".to_string(), json!(reason));
+            }
+        }
+        // `@validate(...)` sobre un campo (GRAMMAR.md §3.73) -- "format"/
+        // "pattern" son también keywords estándar de JSON Schema, no una
+        // extensión propia. Solo se aplica al campo directo, no dentro de
+        // `Optional` -- `type_to_json_schema` ya envuelve un `String?` en
+        // `anyOf` (ver arriba), donde no hay un único objeto de propiedades
+        // sobre el que escribir.
+        if let Some(v) = f.validator() {
+            if let Some(obj) = schema.as_object_mut() {
+                match v {
+                    FieldValidator::Email => {
+                        obj.insert("format".to_string(), json!("email"));
+                    }
+                    FieldValidator::Regex(pattern) => {
+                        obj.insert("pattern".to_string(), json!(pattern));
+                    }
+                }
+            }
+        }
+        // `= default` (GRAMMAR.md §3.74) -- un campo con default puede
+        // omitirse de un request body igual que uno `?:`, así que sale de
+        // `required`. Cuando el default es un literal simple (no una
+        // llamada como `crypto.uuid()`, que no tiene forma JSON fija) se
+        // suma además como `"default"` -- keyword estándar de JSON Schema,
+        // valor puramente informativo para quien lea el spec.
+        if let Some(default) = &f.default {
+            if let Some(obj) = schema.as_object_mut() {
+                if let Some(v) = scalar_literal_json(&default.node) {
+                    obj.insert("default".to_string(), v);
+                }
+            }
+        }
+        props[f.name.as_str()] = schema;
+        if !f.optional && f.default.is_none() {
+            required.push(f.name.clone());
+        }
+    }
+    Ok(Some(json!({
+        "type": "object",
+        "properties": props,
+        "required": required
+    })))
+}
+
 pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, String> {
     let (checker, errors) = Checker::build_symbols(program);
     if let Some(e) = errors.into_iter().next() {
@@ -159,133 +278,38 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
 
     let mut schemas = BTreeMap::new();
 
+    // `PdfBlock`/`ExcelCell`/`ExcelSheet` (GRAMMAR.md §3.201/§3.202) son ADTs
+    // reservados por el compilador -- pre-registrados en `checker.enums`/
+    // `checker.types` por `Checker::build_symbols`, NUNCA en `program.items`
+    // (no hay texto fuente que parsear para ellos). El loop de abajo, que
+    // declara el schema de cualquier `Item::Enum`/`Item::Type` del programa,
+    // nunca los ve -- así que un `rpc` que usara `PdfBlock` como tipo de
+    // retorno generaba un `$ref: "#/components/schemas/PdfBlock"` colgante,
+    // sin ninguna entrada real en `components.schemas` (spec OpenAPI
+    // inválido, confirmado). Se declaran acá, incondicionalmente, antes de
+    // iterar `program.items` -- mismo criterio "ADT siempre disponible" que
+    // `ts_emit.rs::emit_contract` ya aplica para `PdfBlock`/`ExcelCell`/
+    // `ExcelSheet` en `contract.d.ts`.
+    schemas.insert(
+        "PdfBlock".to_string(),
+        enum_openapi_schema(&crate::checker::pdf_block_enum_decl(), &checker)?,
+    );
+    schemas.insert(
+        "ExcelCell".to_string(),
+        enum_openapi_schema(&crate::checker::excel_cell_enum_decl(), &checker)?,
+    );
+    if let Some(schema) = struct_openapi_schema(&crate::checker::excel_sheet_type_decl(), &checker)? {
+        schemas.insert("ExcelSheet".to_string(), schema);
+    }
+
     for item in &program.items {
         match item {
             Item::Enum(e) => {
-                // Bug real, misma familia que el schema Zod de un enum ADT
-                // (zod_emit.rs, GRAMMAR.md §3.132): esto describía CUALQUIER
-                // enum como `{"type":"string","enum":[...]}`, sin importar
-                // si sus variantes llevaban datos. Un ADT (`ValidationError
-                // { InvalidEmail { field: String }, ... }`, real en
-                // `examples/users.link`) viaja como un OBJETO con tag
-                // `type` -- documentarlo como un string en `openapi.json`
-                // describe algo que el servidor nunca manda. Mismo criterio
-                // `all_unit` que `emit_enum_decl` (ts_emit.rs) y
-                // `emit_zod_schemas` (zod_emit.rs) ya usan.
-                let all_unit = e.variants.iter().all(|v| v.fields.is_none());
-                let schema = if all_unit {
-                    let variants: Vec<Value> = e.variants.iter().map(|v| json!(v.name)).collect();
-                    json!({ "type": "string", "enum": variants })
-                } else {
-                    let mut variant_schemas = Vec::new();
-                    for v in &e.variants {
-                        let mut props = json!({ "type": { "const": v.name } });
-                        let mut required = vec!["type".to_string()];
-                        if let Some(fields) = &v.fields {
-                            for f in fields {
-                                // Mismo fix que en `zod_emit.rs` (GRAMMAR.md
-                                // §3.132) para un ADT genérico -- sin esto,
-                                // un `enum Result<T, E> { Ok { value: T },
-                                // ... }` (el ejemplo educativo de la propia
-                                // documentación) rompía `linkc build` entero.
-                                let ty = if e.type_params.is_empty() {
-                                    checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
-                                } else {
-                                    checker.resolve_type_abstract(&f.ty, &e.type_params).map_err(|e| e.to_string())?
-                                };
-                                props[f.name.as_str()] = type_to_json_schema(&ty);
-                                if !f.optional && f.default.is_none() {
-                                    required.push(f.name.clone());
-                                }
-                            }
-                        }
-                        variant_schemas.push(json!({
-                            "type": "object",
-                            "properties": props,
-                            "required": required
-                        }));
-                    }
-                    json!({ "oneOf": variant_schemas })
-                };
-                schemas.insert(e.name.clone(), schema);
+                schemas.insert(e.name.clone(), enum_openapi_schema(e, &checker)?);
             }
             Item::Type(t) => {
-                if let TypeExpr::Struct(fields) = &t.ty {
-                    let mut props = json!({});
-                    let mut required = Vec::new();
-                    for f in fields {
-                        // Mismo bug/fix que en `zod_emit.rs` (GRAMMAR.md
-                        // §3.132): un `type Box<T> = { value: T }` rompía
-                        // `linkc build` ENTERO ("tipo desconocido: 'T'")
-                        // con `resolve_type` a secas -- confirmado a mano
-                        // contra el binario real. `resolve_type_abstract`
-                        // deja `T` como `Type::TypeParam`;
-                        // `type_to_json_schema` no tiene un caso especial
-                        // para eso, así que cae al `match` sin patrón
-                        // exhaustivo... -- ver el fix en esa función.
-                        let ty = if t.type_params.is_empty() {
-                            checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
-                        } else {
-                            checker.resolve_type_abstract(&f.ty, &t.type_params).map_err(|e| e.to_string())?
-                        };
-                        let mut schema = type_to_json_schema(&ty);
-                        // `@deprecated` sobre un campo (GRAMMAR.md §3.71) --
-                        // "deprecated" es una keyword estándar de JSON Schema
-                        // 2020-12 (la que usa OpenAPI 3.1), así que no hace
-                        // falta ninguna extensión propietaria.
-                        if let Some(reason) = f.deprecated() {
-                            if let Some(obj) = schema.as_object_mut() {
-                                obj.insert("deprecated".to_string(), json!(true));
-                                obj.insert("description".to_string(), json!(reason));
-                            }
-                        }
-                        // `@validate(...)` sobre un campo (GRAMMAR.md §3.73)
-                        // -- "format"/"pattern" son también keywords
-                        // estándar de JSON Schema, no una extensión propia.
-                        // Solo se aplica al campo directo, no dentro de
-                        // `Optional` -- `type_to_json_schema` ya envuelve un
-                        // `String?` en `anyOf` (ver arriba), donde no hay un
-                        // único objeto de propiedades sobre el que escribir.
-                        if let Some(v) = f.validator() {
-                            if let Some(obj) = schema.as_object_mut() {
-                                match v {
-                                    FieldValidator::Email => {
-                                        obj.insert("format".to_string(), json!("email"));
-                                    }
-                                    FieldValidator::Regex(pattern) => {
-                                        obj.insert("pattern".to_string(), json!(pattern));
-                                    }
-                                }
-                            }
-                        }
-                        // `= default` (GRAMMAR.md §3.74) -- un campo con
-                        // default puede omitirse de un request body igual
-                        // que uno `?:`, así que sale de `required`. Cuando
-                        // el default es un literal simple (no una llamada
-                        // como `crypto.uuid()`, que no tiene forma JSON
-                        // fija) se suma además como `"default"` -- keyword
-                        // estándar de JSON Schema, valor puramente
-                        // informativo para quien lea el spec.
-                        if let Some(default) = &f.default {
-                            if let Some(obj) = schema.as_object_mut() {
-                                if let Some(v) = scalar_literal_json(&default.node) {
-                                    obj.insert("default".to_string(), v);
-                                }
-                            }
-                        }
-                        props[f.name.as_str()] = schema;
-                        if !f.optional && f.default.is_none() {
-                            required.push(f.name.clone());
-                        }
-                    }
-                    schemas.insert(
-                        t.name.clone(),
-                        json!({
-                            "type": "object",
-                            "properties": props,
-                            "required": required
-                        }),
-                    );
+                if let Some(schema) = struct_openapi_schema(t, &checker)? {
+                    schemas.insert(t.name.clone(), schema);
                 }
             }
             _ => {}
@@ -756,5 +780,58 @@ mod tests {
         let spec: Value = serde_json::from_str(&spec_str).unwrap();
 
         assert!(spec["paths"]["/Tasks/list"]["post"]["responses"]["200"]["content"]["application/json"]["example"].is_null());
+    }
+
+    /// Auditoría del lenguaje (2026-09-01), GRAMMAR.md §3.204: `PdfBlock`/
+    /// `ExcelCell`/`ExcelSheet` (§3.201/§3.202) son ADTs reservados por el
+    /// compilador, pre-registrados en `checker.enums`/`checker.types` --
+    /// NUNCA aparecen en `program.items`, así que el loop de
+    /// `emit_openapi_json` que declara el schema de cualquier `Item::Enum`/
+    /// `Item::Type` nunca los veía. Un `rpc` que usara `PdfBlock` como tipo
+    /// de retorno generaba un `$ref: "#/components/schemas/PdfBlock"`
+    /// COLGANTE -- spec OpenAPI inválido, confirmado antes del fix contra
+    /// el binario real (`components.schemas` completamente vacío).
+    #[test]
+    fn pdf_and_excel_reserved_types_get_a_real_schema_not_a_dangling_ref() {
+        let code = r#"
+            service Docs {
+                rpc makeBlock() -> PdfBlock { PdfBlock.Text { content: "hola", bold: true, size: 12 } }
+                rpc importSheet(sheets: ExcelSheet[]) -> Bool { true }
+            }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Docs API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        let schemas = &spec["components"]["schemas"];
+        assert!(schemas["PdfBlock"].is_object(), "PdfBlock sin schema real: {schemas}");
+        assert!(schemas["ExcelCell"].is_object(), "ExcelCell sin schema real: {schemas}");
+        assert!(schemas["ExcelSheet"].is_object(), "ExcelSheet sin schema real: {schemas}");
+        // `ExcelSheet.rows: ExcelCell[][]` referencia `ExcelCell` -- confirma
+        // que el `$ref` interno también resuelve contra un schema real.
+        assert_eq!(schemas["ExcelSheet"]["properties"]["rows"]["items"]["items"]["$ref"], "#/components/schemas/ExcelCell");
+    }
+
+    /// Mismos dos tipos, esta vez sobre un programa que NUNCA los usa --
+    /// tienen que seguir declarados igual (mismo criterio "ADT siempre
+    /// disponible" que ya rige `Result<T,E>`/`Patch<T>` en `contract.d.ts`),
+    /// no solo cuando algún `rpc` los referencia.
+    #[test]
+    fn pdf_and_excel_reserved_types_are_declared_even_when_unused() {
+        let code = r#"
+            service Tasks {
+                rpc list() -> Int { 1 }
+            }
+        "#;
+        let tokens = lexer::tokenize(code).unwrap();
+        let program = parser::parse(tokens).unwrap();
+        let spec_str = emit_openapi_json(&program, "Tasks API").unwrap();
+        let spec: Value = serde_json::from_str(&spec_str).unwrap();
+
+        let schemas = &spec["components"]["schemas"];
+        assert!(schemas["PdfBlock"].is_object());
+        assert!(schemas["ExcelCell"].is_object());
+        assert!(schemas["ExcelSheet"].is_object());
     }
 }

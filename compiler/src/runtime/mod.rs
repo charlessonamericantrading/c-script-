@@ -6,7 +6,7 @@
 pub mod db;
 pub(crate) mod encryption;
 pub(crate) mod excel;
-pub(crate) mod mcp;
+pub mod mcp;
 pub(crate) mod pdf;
 pub mod server;
 pub mod session;

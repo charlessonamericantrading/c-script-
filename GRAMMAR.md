@@ -7450,6 +7450,40 @@ Dos forks de research (arquitectura contra la spec pública de `Streamable HTTP 
 
 **Verificado**: tests de checker (aridad/tipo de `mcp.sample`) + un test de runtime confirmando que `mcp.sample` es alcanzable a través de `Expr::FieldAccess` (mismo criterio que el test de Decimal, §3.199 -- `Value::Mcp` no volvió a faltar en ese allowlist) + 15 tests de integración HTTP contra el binario real (`cli_mcp.rs`): ciclo completo `initialize`->`tools/list`->`tools/call`->`DELETE`; revocación real; `@requires` aplicado idéntico vía MCP; el round-trip completo de `mcp.sample` con dos conexiones reales; el camino de timeout real; y el de "sin conexión abierta". Suite completa sin regresiones.
 
+### 3.204 `PdfBlock`/`ExcelCell`/`ExcelSheet` en `contract.d.ts`/`openapi.json`/`schemas.ts` — RESUELTO
+
+Auditoría del lenguaje pedida por el usuario ("has una auditoría en el lenguaje, por si encontrás algún error o bug", 01/09/2026), tras cerrar PLAN.md §9.15 entero (PDF §3.201, Excel §3.202, MCP §3.203). Un fork de investigación cruzó las tres piezas de esa ronda entre sí y encontró que un `rpc` cuyo tipo de parámetro/retorno fuera `PdfBlock`/`ExcelCell`/`ExcelSheet` generaba artefactos rotos:
+
+```
+service Docs {
+  rpc makeBlock() -> PdfBlock { PdfBlock.Text { content: "hola", bold: true, size: 12 } }
+  rpc importSheet(sheets: ExcelSheet[]) -> Bool { true }
+}
+```
+
+Antes del fix: `contract.d.ts` **referenciaba** `PdfBlock`/`ExcelSheet` en la firma de `DocsClient` sin declararlos nunca (`Cannot find name 'PdfBlock'` en `tsc` real); `openapi.json` tenía un `$ref: "#/components/schemas/PdfBlock"` colgante, con `components.schemas` vacío; `schemas.ts` salía completamente vacío (solo el import de `zod`) para cualquier programa que usara `pdf`/`excel`. Los tres confirmados a mano contra el binario real antes de tocar código.
+
+**Causa real, la misma en los tres emisores**: `PdfBlock`/`ExcelCell` (enums) y `ExcelSheet` (struct) son ADTs reservados por el compilador -- `checker.rs` los pre-registra en `checker.enums`/`checker.types` DIRECTAMENTE (`pdf_block_enum_decl()`/`excel_cell_enum_decl()`/`excel_sheet_type_decl()`, §3.201/§3.202), no hay texto fuente que parsear para ellos. Pero `ts_emit.rs::emit_contract`, `openapi_emit.rs::emit_openapi_json` y `zod_emit.rs::emit_zod_schemas` descubren qué tipos declarar iterando `program.items` -- que NUNCA contiene estos tres ADTs. `validators_emit.rs` no tenía este bug (usa `checker.resolve_type(...)` sobre las firmas de cada `rpc`, no una iteración de `program.items`), pero como `validators.ts` importa estos nombres DESDE `contract.d.ts` (`import type { PdfBlock, ExcelSheet, ... } from "./contract"`), heredaba el error de todos modos si `contract.d.ts` nunca los exportaba.
+
+**Fix**: los tres emisores ahora declaran `PdfBlock`/`ExcelCell`/`ExcelSheet` **incondicionalmente**, antes de iterar `program.items` -- mismo criterio que `Result<T,E>`/`Patch<T>` en `contract.d.ts` (siempre presentes, sin importar si el programa los usa). Cada emisor reusa las MISMAS funciones constructoras de `checker.rs` (ahora `pub(crate)`) que ya pre-registran estos ADTs para el checker, así que la forma nunca puede divergir entre "lo que el checker tipa" y "lo que el codegen declara". `openapi_emit.rs`/`zod_emit.rs` factorizaron su lógica de `Item::Enum`/`Item::Type` (antes inline dentro del loop) a funciones reusables (`enum_openapi_schema`/`struct_openapi_schema`, `emit_enum_zod`/`emit_struct_zod`) para poder aplicarla también sobre los tres ADTs sin duplicar el cuerpo.
+
+**Verificado**: reproducido contra el binario real (`linkc build` sobre el programa de arriba) antes del fix -- `contract.d.ts` referenciaba sin declarar, `openapi.json` tenía `components.schemas` vacío, `schemas.ts` solo tenía el import. Después del fix, los tres artefactos declaran/refieren correctamente (incluida la referencia interna `ExcelSheet.rows: ExcelCell[][]` -- un `$ref`/nombre de schema real, no colgante). 4 tests de regresión nuevos (uno por emisor más uno confirmando que se declaran incluso en un programa que nunca usa `pdf`/`excel`). `examples/taskboard/frontend/src/gen/*` y `examples/users.link.snap` regenerados. Suite completa sin regresiones.
+
+### 3.205 Colisión de nombres de tool MCP (`resolve_tool_name`) — RESUELTO
+
+Mismo fork de auditoría, segundo hallazgo. `tools/list`/`tools/call` (§3.203, Pieza B) aplanan `(service, rpc)` a un único nombre de tool `"{service}_{rpc}"` -- MCP exige un espacio de nombres PLANO de un solo string, sin ningún separador estructurado real (a diferencia de la ruta REST `/{service}/{rpc}`, donde `/` nunca puede aparecer dentro de un identificador). Como un nombre de `service`/`rpc` puede tener guiones bajos propios, dos pares **distintos** pueden generar el MISMO string combinado:
+
+```
+service A_B { rpc c() -> Int { 1 } }   // "A_B_c"
+service A   { rpc B_c() -> Int { 2 } } // también "A_B_c"
+```
+
+Antes del fix, `resolve_tool_name` hacía un primer-match lineal sobre `program.items` -- una colisión así enrutaba `tools/call` SILENCIOSAMENTE al primer `(service, rpc)` en orden de declaración, nunca al que el cliente MCP realmente nombró. Riesgo real, no solo cosmético: el `rpc` "robado" por la colisión puede tener un `@requires` distinto del que el nombre del tool sugería -- un cliente MCP que cree estar llamando a un `rpc` público podría terminar invocando (u ocultando) uno protegido, dependiendo únicamente del orden de declaración en el `.link`.
+
+**Fix**: `runtime::mcp::validate_tool_names(program)` recorre los mismos `(service, rpc)` que `tools_list`/`resolve_tool_name` ya recorren y falla FUERTE, una única vez, si dos pares distintos generarían el mismo nombre de tool -- nombrando ambos en el mensaje de error. Se corre al arrancar `--mcp-jwt-secret`/`LINK_MCP_JWT_SECRET` (`linkc serve` y `linkc serve-all`, uno por archivo `.link` en este último -- cada archivo corre su propio `/mcp` independiente, así que la colisión solo importa dentro de un mismo archivo), ANTES de abrir el puerto -- un error de configuración detectable en build/arranque, no una ambigüedad silenciosa que solo se nota si alguien manda el nombre "equivocado" y por casualidad se da cuenta.
+
+**Verificado**: reproducido contra el binario real (`linkc serve --mcp-jwt-secret ...` sobre el programa de arriba) antes del fix -- confirmado el mensaje de error exacto y que el puerto nunca se abre. 2 tests de integración nuevos en `cli_mcp.rs`: uno confirma el rechazo (proceso sale con error, puerto nunca escucha, el mensaje nombra ambos `service.rpc` en colisión) sin usar el helper `Serve::start` habitual (que esperaría a que el puerto abra y haría panic si nunca lo hace -- acá se prueba justo lo contrario); otro confirma que nombres parecidos pero NO colisionantes arrancan sin problema (sin falso positivo). Suite completa sin regresiones.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

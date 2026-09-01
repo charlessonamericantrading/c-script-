@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.163.0] - 2026-09-01
+
+### 🐛 Arreglado
+**Auditoría del lenguaje: `PdfBlock`/`ExcelCell`/`ExcelSheet` (§3.201/§3.202) rompían `contract.d.ts`/`openapi.json`/`schemas.ts` cuando un `rpc` los usaba como tipo de parámetro/retorno.** Los tres son ADTs reservados por el compilador, pre-registrados directo en `checker.enums`/`checker.types` -- nunca aparecen en `program.items`. `ts_emit.rs`/`openapi_emit.rs`/`zod_emit.rs` descubren qué tipos declarar iterando `program.items`, así que nunca los veían: `contract.d.ts` referenciaba `PdfBlock` sin declararlo (`Cannot find name 'PdfBlock'` en `tsc` real), `openapi.json` tenía un `$ref` colgante con `components.schemas` vacío, y `schemas.ts` salía completamente vacío para cualquier programa que usara `pdf`/`excel`. Los tres confirmados a mano contra el binario real antes del fix. Se declaran ahora incondicionalmente en los tres emisores, mismo criterio que `Result<T,E>`/`Patch<T>`, reusando las mismas funciones constructoras que el checker ya usa para pre-registrarlos (nunca pueden divergir). 4 tests de regresión nuevos. Ver GRAMMAR.md §3.204.
+
+**Auditoría del lenguaje: colisión silenciosa de nombres de tool MCP.** `tools/list`/`tools/call` (§3.203) aplanan `(service, rpc)` a `"{service}_{rpc}"` -- un espacio de nombres plano sin separador real, así que dos pares distintos con guiones bajos propios pueden generar el mismo string (`service A_B { rpc c() }` y `service A { rpc B_c() }` ambos dan `"A_B_c"`). `resolve_tool_name` hacía un primer-match lineal, así que una colisión enrutaba `tools/call` SILENCIOSAMENTE al primer `rpc` en orden de declaración -- riesgo real si el `rpc` "robado" tiene un `@requires` distinto del que el nombre del tool sugería. `linkc serve --mcp-jwt-secret`/`linkc serve-all` ahora rechazan arrancar, nombrando los dos `service.rpc` en colisión, antes de abrir el puerto. 2 tests de integración nuevos contra el binario real. Ver GRAMMAR.md §3.205.
+
 ## [1.162.0] - 2026-09-01
 
 ### 🐛 Arreglado

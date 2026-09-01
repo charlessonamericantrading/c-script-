@@ -1784,6 +1784,17 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
 
+    // GRAMMAR.md §3.204: falla fuerte UNA vez al arrancar si dos (service,
+    // rpc) distintos generarían el mismo nombre de tool MCP -- mejor que la
+    // ambigüedad silenciosa de `resolve_tool_name` enrutando al primero que
+    // matchee, request tras request.
+    if mcp_secret.is_some() {
+        if let Err(msg) = runtime::mcp::validate_tool_names(&program) {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let attempt = || {
         runtime::server::serve(
             &program,
@@ -2250,6 +2261,19 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             Err(code) => return code,
         };
         services.push((path.clone(), *port, program));
+    }
+
+    // GRAMMAR.md §3.204: mismo chequeo que `linkc serve --mcp-jwt-secret`,
+    // uno por archivo -- cada `.link` de `serve-all` corre su propio `/mcp`
+    // independiente, así que la colisión de nombres de tool solo importa
+    // DENTRO de un mismo archivo, nunca entre dos archivos distintos.
+    if mcp_secret.is_some() {
+        for (path, _, program) in &services {
+            if let Err(msg) = runtime::mcp::validate_tool_names(program) {
+                eprintln!("{}: {msg}", path.display());
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     println!("linkc serve-all: {} servicio(s) en un proceso (datos en SQLite separado por servicio)", services.len());

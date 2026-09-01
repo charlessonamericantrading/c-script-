@@ -36,6 +36,111 @@
         ],
         "type": "string"
       },
+      "ExcelCell": {
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "const": "Text"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "Number"
+              },
+              "value": {
+                "format": "decimal",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "Date"
+              },
+              "value": {
+                "format": "date-time",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "Bool"
+              },
+              "value": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "Empty"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ExcelSheet": {
+        "properties": {
+          "headers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "rows": {
+            "items": {
+              "items": {
+                "$ref": "#/components/schemas/ExcelCell"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "headers",
+          "rows"
+        ],
+        "type": "object"
+      },
       "NewTask": {
         "properties": {
           "assigneeEmail": {
@@ -76,6 +181,62 @@
           "assigneeEmail"
         ],
         "type": "object"
+      },
+      "PdfBlock": {
+        "oneOf": [
+          {
+            "properties": {
+              "bold": {
+                "type": "boolean"
+              },
+              "content": {
+                "type": "string"
+              },
+              "size": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "const": "Text"
+              }
+            },
+            "required": [
+              "type",
+              "content",
+              "bold",
+              "size"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "headers": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "rows": {
+                "items": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": "array"
+              },
+              "type": {
+                "const": "Table"
+              }
+            },
+            "required": [
+              "type",
+              "headers",
+              "rows"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "Priority": {
         "enum": [
@@ -485,5 +646,5 @@
       }
     }
   },
-  "x-generated-by": "linkc v1.162.0"
+  "x-generated-by": "linkc v1.163.0"
 }

@@ -27,6 +27,21 @@ pub fn emit_contract(program: &Program) -> Result<String, String> {
     // falta un mapped type a mano.
     out.push_str("export type Patch<T> = Partial<T>;\n\n");
 
+    // `PdfBlock`/`ExcelCell`/`ExcelSheet` (GRAMMAR.md §3.201/§3.202) son ADTs
+    // reservados por el compilador -- pre-registrados en `checker.enums`/
+    // `checker.types` por `Checker::build_symbols`, NUNCA en `program.items`
+    // (no hay texto fuente que parsear para ellos). El loop de abajo, que
+    // declara cualquier `Item::Type`/`Item::Enum` del programa, nunca los ve
+    // -- así que un `rpc` que usara `PdfBlock` como tipo de retorno generaba
+    // un `contract.d.ts` que REFERENCIA `PdfBlock` sin declararlo nunca
+    // (`Cannot find name 'PdfBlock'` en `tsc` real, confirmado). Se declaran
+    // acá, incondicionalmente, con el mismo criterio que `Result<T,E>`/
+    // `Patch<T>` arriba -- ADTs siempre disponibles del lenguaje, no
+    // condicionados a si ESTE programa en particular los usa.
+    emit_enum_decl(&mut out, &crate::checker::pdf_block_enum_decl(), &checker)?;
+    emit_enum_decl(&mut out, &crate::checker::excel_cell_enum_decl(), &checker)?;
+    emit_type_decl(&mut out, &crate::checker::excel_sheet_type_decl(), &checker)?;
+
     for item in &program.items {
         match item {
             Item::Type(t) => emit_type_decl(&mut out, t, &checker)?,
@@ -2789,5 +2804,27 @@ type User = { id: Int, name: String }
         let (contract, _) = emit_both(src);
         assert!(contract.contains("status: string;"), "{contract}");
         assert!(!contract.contains("status?:"), "{contract}");
+    }
+
+    /// Auditoría del lenguaje (2026-09-01), GRAMMAR.md §3.204: `PdfBlock`/
+    /// `ExcelCell`/`ExcelSheet` (§3.201/§3.202) son ADTs reservados por el
+    /// compilador, pre-registrados en `checker.enums`/`checker.types` --
+    /// NUNCA aparecen en `program.items`, así que el loop de `emit_contract`
+    /// que declara cualquier `Item::Enum`/`Item::Type` del programa nunca
+    /// los veía. Un `rpc` cuyo tipo de retorno fuera `PdfBlock` generaba un
+    /// `contract.d.ts` que REFERENCIA `PdfBlock` sin declararlo nunca
+    /// (`Cannot find name 'PdfBlock'` en `tsc` real, confirmado antes del
+    /// fix). Se declaran incondicionalmente, igual que `Result<T,E>`/
+    /// `Patch<T>` -- ADTs siempre disponibles, sin importar si este programa
+    /// en particular los usa.
+    #[test]
+    fn pdf_and_excel_reserved_types_are_always_declared_in_the_contract() {
+        let (contract, _) = emit_both("type Item = { id: Int }");
+        assert!(contract.contains("export type PdfBlock ="), "{contract}");
+        assert!(contract.contains("export type ExcelCell ="), "{contract}");
+        assert!(contract.contains("export interface ExcelSheet {"), "{contract}");
+        // `ExcelSheet.rows: ExcelCell[][]` referencia `ExcelCell` por
+        // nombre, no como un `any`/objeto suelto.
+        assert!(contract.contains("rows: ExcelCell[][];"), "{contract}");
     }
 }

@@ -500,3 +500,68 @@ fn mcp_sample_that_never_gets_a_response_times_out_cleanly() {
     assert!(elapsed >= Duration::from_secs(29), "cortó demasiado rápido ({elapsed:?}) -- ¿el timeout dejó de aplicar?");
     assert!(elapsed < Duration::from_secs(45), "tardó demasiado ({elapsed:?}) -- ¿quedó colgado en vez de cortar al timeout?");
 }
+
+/// Auditoría del lenguaje (2026-09-01), GRAMMAR.md §3.204: `tools/list`
+/// aplana `(service, rpc)` a `"{service}_{rpc}"` -- un espacio de nombres
+/// plano exigido por MCP, sin separador real. Dos pares distintos con
+/// guiones bajos propios pueden generar el MISMO nombre de tool
+/// (`service A_B { rpc c() }` y `service A { rpc B_c() }` ambos dan
+/// `"A_B_c"`) -- antes de este fix, `resolve_tool_name` enrutaba
+/// SILENCIOSAMENTE al primero en orden de declaración, sin importar cuál el
+/// cliente MCP realmente pretendía. Ahora `--mcp-jwt-secret` rechaza
+/// arrancar, nombrando los dos service/rpc en colisión -- no usa `Serve::
+/// start` (que espera a que el puerto abra y hace panic si no) porque acá
+/// se prueba justamente que el puerto NUNCA abre.
+#[test]
+fn mcp_startup_rejects_two_service_rpc_pairs_that_collide_on_the_same_tool_name() {
+    let temp = TempDir::new("tool-collision");
+    let src = temp.write(
+        "app.link",
+        r#"
+        service A_B {
+            rpc c() -> Int { 1 }
+        }
+        service A {
+            rpc B_c() -> Int { 2 }
+        }
+        "#,
+    );
+    let port = free_port();
+    let output = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("serve")
+        .arg(&src)
+        .arg(port.to_string())
+        .arg("--mcp-jwt-secret")
+        .arg("mcp-s3cr3t")
+        .output()
+        .expect("ejecutar 'linkc serve'");
+    assert!(!output.status.success(), "debería salir con error, no arrancar el servidor");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("A_B.c"), "{stderr}");
+    assert!(stderr.contains("A.B_c"), "{stderr}");
+    assert!(stderr.contains("A_B_c"), "{stderr}");
+    assert!(TcpStream::connect(("127.0.0.1", port)).is_err(), "el puerto no debería haber quedado abierto");
+}
+
+/// Mismo chequeo, pero confirma que NO hay falso positivo: dos service/rpc
+/// con nombres parecidos pero que NO colisionan arrancan sin problema.
+#[test]
+fn mcp_startup_allows_similar_but_non_colliding_service_rpc_names() {
+    let temp = TempDir::new("no-collision");
+    let src = temp.write(
+        "app.link",
+        r#"
+        service A {
+            rpc b() -> Int { 1 }
+        }
+        service A_b {
+            rpc c() -> Int { 2 }
+        }
+        "#,
+    );
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+    let (status, _, body) = server.request("POST", "/mcp", r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#, &[]);
+    // Sin token todavía -- solo confirma que el servidor arrancó de verdad
+    // (rechazo de auth, no un 404 de "el puerto nunca abrió").
+    assert_ne!(status, 0, "body: {body}");
+}

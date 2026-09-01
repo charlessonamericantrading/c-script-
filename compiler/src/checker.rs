@@ -600,7 +600,7 @@ pub struct Checker {
 /// pre-registrado en `checker.enums` por `build_symbols` (ver el comentario
 /// ahí). `Span::new(0, 0, 0, 0)` en todos lados: ningún nodo de este
 /// `EnumDecl` corresponde a una posición real del archivo del usuario.
-fn pdf_block_enum_decl() -> EnumDecl {
+pub(crate) fn pdf_block_enum_decl() -> EnumDecl {
     let dummy = Span::new(0, 0, 0, 0);
     let named = |name: &str| TypeExpr::Named(name.to_string(), vec![], dummy);
     let field = |name: &str, ty: TypeExpr| Field {
@@ -646,7 +646,7 @@ fn pdf_block_enum_decl() -> EnumDecl {
 /// `runtime/excel.rs`, nunca se expone un `Float` acá. `Empty` es una
 /// variante unitaria (`fields: None`), igual que `Role.Admin` -- se
 /// construye igual, `ExcelCell.Empty {}` con llaves (CLAUDE.md/AGENTS.md).
-fn excel_cell_enum_decl() -> EnumDecl {
+pub(crate) fn excel_cell_enum_decl() -> EnumDecl {
     let dummy = Span::new(0, 0, 0, 0);
     let named = |name: &str| TypeExpr::Named(name.to_string(), vec![], dummy);
     let field = |name: &str, ty: TypeExpr| Field {
@@ -680,7 +680,7 @@ fn excel_cell_enum_decl() -> EnumDecl {
 /// de corrección: cualquier struct de OTRO nombre con la misma forma ya
 /// tipa igual de bien contra `excel.build`/`excel.parse` sin este
 /// pre-registro, por subtipado estructural puro.
-fn excel_sheet_type_decl() -> TypeDecl {
+pub(crate) fn excel_sheet_type_decl() -> TypeDecl {
     let dummy = Span::new(0, 0, 0, 0);
     let named = |name: &str| TypeExpr::Named(name.to_string(), vec![], dummy);
     let field = |name: &str, ty: TypeExpr| Field {

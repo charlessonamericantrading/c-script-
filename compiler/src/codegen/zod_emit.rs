@@ -1,7 +1,7 @@
 //! Generador de esquemas Zod (schemas.ts) a partir de tipos Link.
 //! Permite validación de formularios en React y runtime type safety con Zod.
 
-use crate::ast::{FieldValidator, Item, Program, TypeExpr};
+use crate::ast::{EnumDecl, FieldValidator, Item, Program, TypeDecl, TypeExpr};
 use crate::checker::Checker;
 use crate::types::Type;
 
@@ -107,6 +107,96 @@ fn render_zod_type_for_field(ty: &Type, validator: Option<&FieldValidator>) -> S
     }
 }
 
+// Bug real, misma familia que el de `Result<T,E>` (GRAMMAR.md §3.131/
+// §3.132): esto SIEMPRE emitía `z.enum([...])` -- una unión de strings
+// LITERALES -- sin importar si el enum era un ADT con datos por variante
+// (`ValidationError { InvalidEmail { field: String }, ... }`, tal cual en
+// `examples/users.link`). El wire real de un ADT (`emit_enum_decl`,
+// ts_emit.rs) es un objeto con tag `type` más los campos de la variante,
+// NUNCA un string pelado -- `z.enum(["InvalidEmail", "TooShort"])` rechaza
+// CUALQUIER `ValidationError` real (`{ type: "InvalidEmail", field: "..." }`
+// no es el string `"InvalidEmail"`). Mismo criterio `all_unit` que
+// `emit_enum_decl` ya usa para decidir entre las dos formas.
+fn emit_enum_zod(out: &mut String, e: &EnumDecl, checker: &Checker) -> Result<(), String> {
+    let all_unit = e.variants.iter().all(|v| v.fields.is_none());
+    if all_unit {
+        let variants: Vec<String> = e.variants.iter().map(|v| format!("\"{}\"", v.name)).collect();
+        out.push_str(&format!("export const {}Schema = z.enum([{}]);\n", e.name, variants.join(", ")));
+    } else {
+        out.push_str(&format!("export const {}Schema = z.discriminatedUnion(\"type\", [\n", e.name));
+        let mut variant_schemas = Vec::new();
+        for v in &e.variants {
+            let mut parts = vec![format!("type: z.literal(\"{}\")", v.name)];
+            if let Some(fields) = &v.fields {
+                for f in fields {
+                    // Un ADT genérico (`enum Result<T, E> { Ok { value: T },
+                    // ... }`, GRAMMAR.md §2.2 -- distinto del `Result<T,E>`
+                    // builtin del lenguaje) tiene campos de variante que
+                    // referencian su propio parámetro de tipo (`T`) --
+                    // `resolve_type` a secas lo rechaza ("tipo desconocido:
+                    // 'T'"), regresión real encontrada por `docs_examples.rs`
+                    // al agregar este camino. `resolve_type_abstract` (mismo
+                    // criterio que `resolve_field_ty` en ts_emit.rs) deja
+                    // `T` como `Type::TypeParam` en vez de fallar --
+                    // `render_zod_type` ya tiene un catch-all (`z.unknown()`)
+                    // para cualquier tipo sin forma Zod razonable, así que no
+                    // hace falta un caso especial acá: Zod no tiene generics
+                    // reales como TS, un parámetro de tipo sin instanciar no
+                    // tiene schema propio posible.
+                    let ty = if e.type_params.is_empty() {
+                        checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
+                    } else {
+                        checker.resolve_type_abstract(&f.ty, &e.type_params).map_err(|e| e.to_string())?
+                    };
+                    let zod_ty = render_zod_type_for_field(&ty, f.validator());
+                    let optional_suffix = if f.optional || f.default.is_some() { ".optional()" } else { "" };
+                    parts.push(format!("{}: {}{}", f.name, zod_ty, optional_suffix));
+                }
+            }
+            variant_schemas.push(format!("  z.object({{ {} }})", parts.join(", ")));
+        }
+        out.push_str(&variant_schemas.join(",\n"));
+        out.push_str("\n]);\n");
+    }
+    out.push_str(&format!("export type {} = z.infer<typeof {}Schema>;\n\n", e.name, e.name));
+    Ok(())
+}
+
+/// No escribe nada si `t.ty` no es un `TypeExpr::Struct` (un alias, por
+/// ejemplo) -- mismo `if let` que el llamador original tenía inline, ahora
+/// factorizado para poder reusarse sobre `ExcelSheet`
+/// (`checker::excel_sheet_type_decl()`, siempre un struct) sin duplicar el
+/// cuerpo.
+fn emit_struct_zod(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(), String> {
+    let TypeExpr::Struct(fields) = &t.ty else { return Ok(()) };
+    out.push_str(&format!("export const {}Schema = z.object({{\n", t.name));
+    for f in fields {
+        // Mismo bug/fix que el de los ADT genéricos arriba (GRAMMAR.md
+        // §3.132) -- confirmado a mano contra el binario real: un `type
+        // Box<T> = { value: T }` rompía `linkc build` ENTERO ("tipo
+        // desconocido: 'T'") con `resolve_type` a secas. `resolve_type_abstract`
+        // deja `T` como `Type::TypeParam`, que cae al `z.unknown()`
+        // catch-all de `render_zod_type` en vez de fallar.
+        let ty = if t.type_params.is_empty() {
+            checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
+        } else {
+            checker.resolve_type_abstract(&f.ty, &t.type_params).map_err(|e| e.to_string())?
+        };
+        let zod_ty = render_zod_type_for_field(&ty, f.validator());
+        // Un campo con `= default` (GRAMMAR.md §3.74) puede omitirse igual
+        // que uno `?:` -- `.optional()` nada más, no `.default(...)`: el
+        // default es una expresión c-script arbitraria (puede ser
+        // `crypto.uuid()`), no algo traducible a JS sin evaluarla, así que
+        // quien construye el objeto en TS simplemente no manda la clave y
+        // el SERVIDOR es quien la completa (ver runtime/mod.rs::Expr::StructLit).
+        let optional_suffix = if f.optional || f.default.is_some() { ".optional()" } else { "" };
+        out.push_str(&format!("  {}: {}{},\n", f.name, zod_ty, optional_suffix));
+    }
+    out.push_str("});\n");
+    out.push_str(&format!("export type {} = z.infer<typeof {}Schema>;\n\n", t.name, t.name));
+    Ok(())
+}
+
 pub fn emit_zod_schemas(program: &Program) -> Result<String, String> {
     let (checker, errors) = Checker::build_symbols(program);
     if let Some(e) = errors.into_iter().next() {
@@ -117,101 +207,25 @@ pub fn emit_zod_schemas(program: &Program) -> Result<String, String> {
     out.push_str(&format!("// Generado automáticamente por linkc v{} — no editar a mano.\n\n", crate::VERSION));
     out.push_str("import { z } from \"zod\";\n\n");
 
+    // `PdfBlock`/`ExcelCell`/`ExcelSheet` (GRAMMAR.md §3.201/§3.202) son ADTs
+    // reservados por el compilador -- pre-registrados en `checker.enums`/
+    // `checker.types` por `Checker::build_symbols`, NUNCA en `program.items`
+    // (no hay texto fuente que parsear para ellos). El loop de abajo, que
+    // emite el schema de cualquier `Item::Enum`/`Item::Type` del programa,
+    // nunca los ve -- así que `schemas.ts` salía SIN NADA para un programa
+    // que solo usaba `pdf`/`excel` (confirmado: archivo vacío salvo el
+    // import de `zod`). Se emiten acá, incondicionalmente, antes de iterar
+    // `program.items` -- mismo criterio "ADT siempre disponible" que
+    // `ts_emit.rs::emit_contract`/`openapi_emit.rs::emit_openapi_json` ya
+    // aplican para estos tres tipos.
+    emit_enum_zod(&mut out, &crate::checker::pdf_block_enum_decl(), &checker)?;
+    emit_enum_zod(&mut out, &crate::checker::excel_cell_enum_decl(), &checker)?;
+    emit_struct_zod(&mut out, &crate::checker::excel_sheet_type_decl(), &checker)?;
+
     for item in &program.items {
         match item {
-            Item::Enum(e) => {
-                // Bug real, misma familia que el de `Result<T,E>` arriba
-                // (GRAMMAR.md §3.131/§3.132): esto SIEMPRE emitía
-                // `z.enum([...])` -- una unión de strings LITERALES -- sin
-                // importar si el enum era un ADT con datos por variante
-                // (`ValidationError { InvalidEmail { field: String }, ...
-                // }`, tal cual en `examples/users.link`). El wire real de
-                // un ADT (`emit_enum_decl`, ts_emit.rs) es un objeto con tag
-                // `type` más los campos de la variante, NUNCA un string
-                // pelado -- `z.enum(["InvalidEmail", "TooShort"])` rechaza
-                // CUALQUIER `ValidationError` real (`{ type: "InvalidEmail",
-                // field: "..." }` no es el string `"InvalidEmail"`). Mismo
-                // criterio `all_unit` que `emit_enum_decl` ya usa para
-                // decidir entre las dos formas.
-                let all_unit = e.variants.iter().all(|v| v.fields.is_none());
-                if all_unit {
-                    let variants: Vec<String> = e.variants.iter().map(|v| format!("\"{}\"", v.name)).collect();
-                    out.push_str(&format!("export const {}Schema = z.enum([{}]);\n", e.name, variants.join(", ")));
-                } else {
-                    out.push_str(&format!("export const {}Schema = z.discriminatedUnion(\"type\", [\n", e.name));
-                    let mut variant_schemas = Vec::new();
-                    for v in &e.variants {
-                        let mut parts = vec![format!("type: z.literal(\"{}\")", v.name)];
-                        if let Some(fields) = &v.fields {
-                            for f in fields {
-                                // Un ADT genérico (`enum Result<T, E> { Ok {
-                                // value: T }, ... }`, GRAMMAR.md §2.2 --
-                                // distinto del `Result<T,E>` builtin del
-                                // lenguaje) tiene campos de variante que
-                                // referencian su propio parámetro de tipo
-                                // (`T`) -- `resolve_type` a secas lo rechaza
-                                // ("tipo desconocido: 'T'"), regresión real
-                                // encontrada por `docs_examples.rs` al
-                                // agregar este camino. `resolve_type_abstract`
-                                // (mismo criterio que `resolve_field_ty` en
-                                // ts_emit.rs) deja `T` como `Type::TypeParam`
-                                // en vez de fallar -- `render_zod_type` ya
-                                // tiene un catch-all (`z.unknown()`) para
-                                // cualquier tipo sin forma Zod razonable, así
-                                // que no hace falta un caso especial acá:
-                                // Zod no tiene generics reales como TS, un
-                                // parámetro de tipo sin instanciar no tiene
-                                // schema propio posible.
-                                let ty = if e.type_params.is_empty() {
-                                    checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
-                                } else {
-                                    checker.resolve_type_abstract(&f.ty, &e.type_params).map_err(|e| e.to_string())?
-                                };
-                                let zod_ty = render_zod_type_for_field(&ty, f.validator());
-                                let optional_suffix = if f.optional || f.default.is_some() { ".optional()" } else { "" };
-                                parts.push(format!("{}: {}{}", f.name, zod_ty, optional_suffix));
-                            }
-                        }
-                        variant_schemas.push(format!("  z.object({{ {} }})", parts.join(", ")));
-                    }
-                    out.push_str(&variant_schemas.join(",\n"));
-                    out.push_str("\n]);\n");
-                }
-                out.push_str(&format!("export type {} = z.infer<typeof {}Schema>;\n\n", e.name, e.name));
-            }
-            Item::Type(t) => {
-                if let TypeExpr::Struct(fields) = &t.ty {
-                    out.push_str(&format!("export const {}Schema = z.object({{\n", t.name));
-                    for f in fields {
-                        // Mismo bug/fix que el de los ADT genéricos arriba
-                        // (GRAMMAR.md §3.132) -- confirmado a mano contra el
-                        // binario real: un `type Box<T> = { value: T }`
-                        // rompía `linkc build` ENTERO ("tipo desconocido:
-                        // 'T'") con `resolve_type` a secas.
-                        // `resolve_type_abstract` deja `T` como
-                        // `Type::TypeParam`, que cae al `z.unknown()`
-                        // catch-all de `render_zod_type` en vez de fallar.
-                        let ty = if t.type_params.is_empty() {
-                            checker.resolve_type(&f.ty).map_err(|e| e.to_string())?
-                        } else {
-                            checker.resolve_type_abstract(&f.ty, &t.type_params).map_err(|e| e.to_string())?
-                        };
-                        let zod_ty = render_zod_type_for_field(&ty, f.validator());
-                        // Un campo con `= default` (GRAMMAR.md §3.74) puede
-                        // omitirse igual que uno `?:` -- `.optional()` nada
-                        // más, no `.default(...)`: el default es una
-                        // expresión c-script arbitraria (puede ser
-                        // `crypto.uuid()`), no algo traducible a JS sin
-                        // evaluarla, así que quien construye el objeto en TS
-                        // simplemente no manda la clave y el SERVIDOR es
-                        // quien la completa (ver runtime/mod.rs::Expr::StructLit).
-                        let optional_suffix = if f.optional || f.default.is_some() { ".optional()" } else { "" };
-                        out.push_str(&format!("  {}: {}{},\n", f.name, zod_ty, optional_suffix));
-                    }
-                    out.push_str("});\n");
-                    out.push_str(&format!("export type {} = z.infer<typeof {}Schema>;\n\n", t.name, t.name));
-                }
-            }
+            Item::Enum(e) => emit_enum_zod(&mut out, e, &checker)?,
+            Item::Type(t) => emit_struct_zod(&mut out, t, &checker)?,
             _ => {}
         }
     }
@@ -420,5 +434,25 @@ mod tests {
         let zod_out = emit_zod_schemas(&program).unwrap();
         assert!(zod_out.contains("title: z.string(),"), "{zod_out}");
         assert!(zod_out.contains("status: z.string().optional(),"), "{zod_out}");
+    }
+
+    /// Auditoría del lenguaje (2026-09-01), GRAMMAR.md §3.204: `PdfBlock`/
+    /// `ExcelCell`/`ExcelSheet` (§3.201/§3.202) son ADTs reservados por el
+    /// compilador, pre-registrados en `checker.enums`/`checker.types` --
+    /// NUNCA aparecen en `program.items`, así que el loop de
+    /// `emit_zod_schemas` que emite el schema de cualquier `Item::Enum`/
+    /// `Item::Type` nunca los veía. `schemas.ts` salía COMPLETAMENTE VACÍO
+    /// (solo el import de `zod`) para un programa que usaba `pdf`/`excel`,
+    /// confirmado antes del fix contra el binario real.
+    #[test]
+    fn pdf_and_excel_reserved_types_always_get_a_zod_schema() {
+        let program = parser::parse(lexer::tokenize("type Item = { id: Int }").unwrap()).unwrap();
+        let zod_out = emit_zod_schemas(&program).unwrap();
+        assert!(zod_out.contains("export const PdfBlockSchema = z.discriminatedUnion(\"type\", ["), "{zod_out}");
+        assert!(zod_out.contains("export const ExcelCellSchema = z.discriminatedUnion(\"type\", ["), "{zod_out}");
+        assert!(zod_out.contains("export const ExcelSheetSchema = z.object({"), "{zod_out}");
+        // `ExcelSheet.rows: ExcelCell[][]` referencia el schema de
+        // `ExcelCell` por nombre, no `z.unknown()`.
+        assert!(zod_out.contains("rows: z.array(z.array(ExcelCellSchema)),"), "{zod_out}");
     }
 }

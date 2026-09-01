@@ -221,6 +221,44 @@ fn handle_initialize(sessions: &SessionStore, bearer_token: Option<&str>, reques
     (200, ok_response(request_id, result), Some(mcp_session_id))
 }
 
+/// Auditoría del lenguaje (2026-09-01), GRAMMAR.md §3.204: `tools/list`
+/// aplana `(service, rpc)` a un único string `"{service}_{rpc}"` -- un
+/// espacio de nombres plano exigido por el protocolo MCP, sin ningún
+/// separador real. Como un nombre de `service`/`rpc` puede tener guiones
+/// bajos propios, dos pares DISTINTOS pueden generar el MISMO nombre de tool
+/// (`service A_B { rpc c() }` y `service A { rpc B_c() }` ambos dan
+/// `"A_B_c"`) -- `resolve_tool_name` hacía un primer-match lineal sobre
+/// `program.items`, así que una colisión así enrutaba SILENCIOSAMENTE
+/// `tools/call` al primer `rpc` en orden de declaración, nunca al que el
+/// nombre del tool realmente identificaba (riesgo real: el rpc "robado" por
+/// la colisión puede tener un `@requires` distinto -- ver GRAMMAR.md §3.203
+/// -- del que el cliente MCP pretendía invocar). En vez de una ambigüedad
+/// silenciosa por request, esto falla FUERTE una única vez al arrancar
+/// `--mcp`, nombrando los dos `(service, rpc)` en colisión.
+pub fn validate_tool_names(program: &Program) -> Result<(), String> {
+    let mut seen: HashMap<String, (String, String)> = HashMap::new();
+    for item in &program.items {
+        let Item::Service(service) = item else { continue };
+        for member in &service.members {
+            let Member::Rpc(rpc) = member else { continue };
+            if rpc.cron().is_some() {
+                continue;
+            }
+            let name = format!("{}_{}", service.name, rpc.name);
+            if let Some((prev_service, prev_rpc)) = seen.get(&name) {
+                return Err(format!(
+                    "--mcp: '{prev_service}.{prev_rpc}' y '{}.{}' generan el mismo nombre de tool MCP ('{name}') -- \
+                     los tools de MCP son un espacio de nombres plano ('{{service}}_{{rpc}}', sin separador real), \
+                     así que dos service/rpc distintos con ese mismo texto combinado colisionan; renombrá uno de los dos",
+                    service.name, rpc.name
+                ));
+            }
+            seen.insert(name, (service.name.clone(), rpc.name.clone()));
+        }
+    }
+    Ok(())
+}
+
 /// `method: "tools/list"` -- todo `rpc` no-stream y no-`@cron` de toda
 /// `service`, mismo filtro que `openapi_emit.rs::emit_openapi_json`
 /// (`Member::Rpc(r) if r.cron().is_none()`, excluye `Member::Stream`).
