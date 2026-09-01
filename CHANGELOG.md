@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.165.0] - 2026-09-01
+
+### 📝 Documentación
+**Compatibilidad con IA (PLAN.md §9.16 ítem 4): `linkc test <archivo>` (sin segundo argumento) ya era el camino rápido de "solo parsear y tipar" cuando el programa no tiene ningún bloque `test { }` -- no estaba documentado así en ningún lado.** Verificado leyendo `run_tests_core`: la conexión SQLite (`Db::new(":memory:")`) vive dentro del loop por-test, así que con cero tests ese loop nunca ejecuta -- ningún archivo escrito, ninguna base tocada. Confirmado contra el binario real: 37ms, `"running 0 tests"`. No hacía falta un subcomando nuevo -- `--help`, `AGENTS.md` y `llms.txt` ahora lo nombran explícitamente como la alternativa barata a `linkc build` cuando la única pregunta es "¿esto tipa?". Ver GRAMMAR.md §3.206.
+
 ## [1.164.0] - 2026-09-01
 
 ### 🐛 Arreglado

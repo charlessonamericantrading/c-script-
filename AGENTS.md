@@ -53,6 +53,14 @@ linkc test examples/users.link examples/users.link.snap --update  # regenerates 
 linkc serve examples/users.link 8787
 ```
 
+**`linkc test <file>` (no second argument) on a program with zero `test { }` blocks is the
+fast parse-and-typecheck-only path** — there is no separate `linkc check`. It writes no file
+and touches no database: `Db::new` only runs inside the per-test loop, which never executes
+when there are no `test` blocks to run, confirmed against the real binary (37ms, "running 0
+tests", no `.sqlite` file). Prefer this over a full `linkc build` when the only question is
+"does this parse and type-check" — `build` always regenerates all 6+ output files, which is
+real I/O this doesn't need to pay for on every edit-check cycle.
+
 `linkc test <file>` and `linkc test <file> <file>.snap [--update]` are two different
 checks sharing one subcommand — the snapshot form needs BOTH positional arguments. Running
 `linkc test <file> --update` (no `.snap` path) silently runs only the behavior tests and

@@ -7503,6 +7503,8 @@ Origen: `PLAN.md §9.16`, pedido explícito del usuario ("cómo hacer el lenguaj
 
 **Alcance de esta ronda, deliberadamente acotado**: esto es un mejor DIAGNÓSTICO, no un cambio de qué es válido -- `Role.Admin` sin llaves sigue sin ser una expresión válida, solo el mensaje mejora. Eliminar la asimetría de raíz (que `Role.Admin` sin llaves sea gramática válida también como expresión, no solo mejor diagnosticada) queda explícitamente fuera de esta ronda -- PLAN.md §9.16 ítem 1(b), pendiente de su propio discovery arquitectónico (el parser no tiene tabla de símbolos en tiempo de parseo para desambiguar `Ident.Ident` de un `Enum.Variante` sin mirar más adelante) y de decisión explícita del usuario, mismo criterio que cualquier otro cambio de gramática de este proyecto.
 
+**PLAN.md §9.16 ítem 4, mismo round -- `linkc test <archivo>` (sin segundo argumento) YA ERA el camino rápido de "solo parsear y tipar", sin que nada lo documentara así.** Verificado leyendo `run_tests_core` (`runtime/mod.rs`): `Db::new(":memory:")` vive DENTRO del `for test in &tests`, así que en un programa con cero bloques `test { }` ese loop nunca ejecuta ni una vuelta -- ninguna conexión SQLite, ningún archivo escrito. Confirmado contra el binario real (`linkc test` sobre un `.link` sin tests: 37ms, `"running 0 tests"`, sale limpio). No hacía falta un subcomando `linkc check` nuevo -- el camino ya existía, solo no estaba nombrado como tal en ningún lado. Fix puramente documental: `--help` (`main.rs`), `AGENTS.md` y `llms.txt` ahora lo dicen explícitamente. Sin tests nuevos (ningún cambio de comportamiento, solo de texto).
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
