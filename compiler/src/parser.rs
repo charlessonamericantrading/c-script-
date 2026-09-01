@@ -1778,6 +1778,18 @@ impl Parser {
                 "un closure necesita al menos 1 parámetro -- `||` (0 parámetros) no se soporta todavía (GRAMMAR.md §3.10)",
             ));
         }
+        // GRAMMAR.md §3.206: sin este chequeo, `-> Tipo` acá caía en el
+        // `expect(LBrace)` genérico de `parse_block` de la línea siguiente
+        // y daba "se esperaba LBrace, se encontró Arrow" -- nombres de
+        // variante de `TokenKind` internos del lexer, sin decir nunca cuál
+        // es el arreglo real. Un closure infiere su tipo de retorno del
+        // cuerpo o del `Type::Function` esperado (checker.rs) -- nunca
+        // lleva anotación propia, a diferencia de `fn`/`rpc`.
+        if self.check(&TokenKind::Arrow) {
+            return Err(self.error(
+                "un closure no lleva anotación de tipo de retorno -- quitá el '-> Tipo': se infiere del cuerpo o del contexto esperado, nunca se anota (GRAMMAR.md §3.10)",
+            ));
+        }
         let body = self.parse_block()?;
         let span = merge(start, self.prev_span());
         Ok(Spanned { node: Expr::Closure { params, body }, span })
@@ -2376,6 +2388,19 @@ mod tests {
     fn cache_annotation_requires_a_string_argument() {
         let tokens = tokenize("service S { @cache() rpc f() -> Int { 1 } }").unwrap();
         assert!(parse(tokens).is_err());
+    }
+
+    #[test]
+    fn closure_with_return_type_annotation_names_the_real_mistake() {
+        // GRAMMAR.md §3.206: antes de este fix, `-> Bool` acá caía en el
+        // `expect(LBrace)` genérico de `parse_block` y el mensaje era "se
+        // esperaba LBrace, se encontró Arrow" -- nombres de variante de
+        // `TokenKind` internos, sin decir nunca cuál es el arreglo real.
+        let tokens = tokenize("fn f(xs: Int[]) -> Bool { xs.find(|x: Int| -> Bool { x > 0 }).isSome() }").unwrap();
+        let err = parse(tokens).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("no lleva anotación de tipo de retorno"), "{msg}");
+        assert!(!msg.contains("LBrace") && !msg.contains("Arrow"), "no debería filtrar TokenKind interno: {msg}");
     }
 
     #[test]

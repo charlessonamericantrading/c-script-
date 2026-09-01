@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.164.0] - 2026-09-01
+
+### 🐛 Arreglado
+**Compatibilidad con IA (PLAN.md §9.16): dos de los "3 errores que rompen casi todo primer intento" ya documentados en `AGENTS.md`/`llms.txt` daban un mensaje engañoso o directamente ininteligible.** `role: Role.Admin` (una variante de enum usada como valor sin `{}`) daba `"variable no declarada: 'Role'"` -- engañoso, no solo impreciso, porque `Role` SÍ está declarado (como `enum`); ningún agente leyendo ese mensaje llegaría al arreglo real (`Role.Admin {}`) a partir de él. `|u: User| -> Bool { ... }` (un closure con tipo de retorno anotado, que este lenguaje infiere siempre, nunca se anota) daba `"se esperaba LBrace, se encontró Arrow"` -- nombres de variante del `TokenKind` interno del lexer, filtrados sin traducir. Los dos ahora nombran el problema real y muestran la forma correcta, sin cambio de gramática (`Role.Admin` sin llaves sigue sin ser una expresión válida -- solo el diagnóstico mejora). 3 tests de regresión nuevos, incluida una guarda de no-regresión para una variable local que sombree el nombre de un enum. Ver GRAMMAR.md §3.206.
+
 ## [1.163.0] - 2026-09-01
 
 ### 🐛 Arreglado

@@ -3832,6 +3832,34 @@ impl Checker {
                 }
             }
             Expr::FieldAccess { base, field } => {
+                // GRAMMAR.md §3.206: `Enum.Variante` sin `{}` en posición de
+                // EXPRESIÓN no es una variante válida -- el parser solo
+                // reconoce un literal de variante si ve `{` después (a
+                // propósito, no tiene tabla de símbolos para desambiguar
+                // antes). Sin este chequeo, `base` (el `Ident` del nombre
+                // del enum) caía en el brazo de arriba y daba "variable no
+                // declarada: 'Role'" -- activamente engañoso, porque `Role`
+                // SÍ está declarado (como enum), y el mensaje no menciona
+                // para nada el arreglo real. `!env.contains_key` primero:
+                // una variable local que sombree el nombre del enum sigue
+                // resolviendo como variable, igual que el chequeo de `db`
+                // de más abajo respeta esa misma prioridad.
+                if let Expr::Ident(base_name) = &base.node {
+                    if !env.contains_key(base_name) {
+                        if let Some(decl) = self.enums.get(base_name) {
+                            if let Some(variant) = decl.variants.iter().find(|v| &v.name == field) {
+                                let forma = if variant.fields.as_ref().is_some_and(|fs| !fs.is_empty()) {
+                                    format!("'{base_name}.{field} {{ ... }}'")
+                                } else {
+                                    format!("'{base_name}.{field} {{}}'")
+                                };
+                                return Err(err(format!(
+                                    "'{base_name}.{field}' es una variante de enum usada como valor -- como expresión necesita llaves: {forma}. Sin llaves, '{base_name}.{field}' solo es válido dentro de una anotación (@requires({base_name}.{field})) o de un patrón de 'match' ({base_name}.{field} => ...) -- GRAMMAR.md §3.206"
+                                )));
+                            }
+                        }
+                    }
+                }
                 let base_ty = self.synth_expr(base, env)?;
                 match base_ty {
                     Type::Dynamic => Ok(Type::Dynamic),
@@ -6463,6 +6491,38 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(src).is_ok());
+    }
+
+    #[test]
+    fn bare_enum_variant_used_as_a_value_names_the_real_mistake() {
+        // GRAMMAR.md §3.206: antes de este fix, esto daba "variable no
+        // declarada: 'Role'" -- activamente engañoso, porque `Role` SÍ
+        // está declarado (como enum); el mensaje no mencionaba para nada
+        // que el arreglo real es agregar `{}`.
+        let src = r#"
+            enum Role { Admin, Member }
+            type User = { id: Int, role: Role }
+            fn make() -> User { User { id: 1, role: Role.Admin } }
+        "#;
+        let errs = check_source(src).unwrap_err();
+        assert!(errs[0].message.contains("es una variante de enum usada como valor"), "{}", errs[0].message);
+        assert!(errs[0].message.contains("Role.Admin {}"), "{}", errs[0].message);
+        assert!(!errs[0].message.contains("variable no declarada"), "{}", errs[0].message);
+    }
+
+    #[test]
+    fn a_real_local_variable_shadowing_an_enum_name_still_resolves_field_access_normally() {
+        // Guarda de no-regresión del fix de arriba: `!env.contains_key`
+        // tiene que ganar ANTES del chequeo de enum, para no romper el
+        // caso (raro pero válido) de una variable local que sombree el
+        // nombre de un enum -- acá `Role` es un parámetro de tipo `Foo`,
+        // no el enum, y `Role.Admin` es un acceso a campo legítimo.
+        let src = r#"
+            enum Role { Admin, Member }
+            type Foo = { Admin: Int }
+            fn make(Role: Foo) -> Int { Role.Admin }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 
     #[test]
