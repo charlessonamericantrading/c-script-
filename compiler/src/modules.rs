@@ -53,8 +53,12 @@ pub enum LoadError {
     Other(String),
     /// Error léxico o de sintaxis en un archivo concreto del cierre
     /// transitivo. `path` es la ruta CANONICALIZADA (misma convención que
-    /// ya usan los demás mensajes de este archivo).
-    Syntax { path: PathBuf, errors: Vec<(Span, String)> },
+    /// ya usan los demás mensajes de este archivo). El tercer elemento de
+    /// cada tupla es el código estable (GRAMMAR.md §3.210, `None` para la
+    /// mayoría) -- un error léxico nunca tiene uno (`lexer.rs` no participa
+    /// de este mecanismo todavía), un error de sintaxis lo hereda de
+    /// `ParseError::code` si el sitio que lo generó lo tenía.
+    Syntax { path: PathBuf, errors: Vec<(Span, String, Option<&'static str>)> },
 }
 
 impl fmt::Display for LoadError {
@@ -62,11 +66,14 @@ impl fmt::Display for LoadError {
         match self {
             LoadError::Other(msg) => write!(f, "error de módulos: {msg}"),
             LoadError::Syntax { path, errors } => {
-                for (i, (span, message)) in errors.iter().enumerate() {
+                for (i, (span, message, code)) in errors.iter().enumerate() {
                     if i > 0 {
                         writeln!(f)?;
                     }
-                    write!(f, "error de módulos: '{}':{}:{}: {message}", display_path(path), span.line, span.col)?;
+                    match code {
+                        Some(c) => write!(f, "error de módulos: '{}':{}:{}: [{c}] {message}", display_path(path), span.line, span.col)?,
+                        None => write!(f, "error de módulos: '{}':{}:{}: {message}", display_path(path), span.line, span.col)?,
+                    }
                 }
                 Ok(())
             }
@@ -238,11 +245,11 @@ impl Loader<'_> {
         };
         let tokens = lexer::tokenize(&source).map_err(|e| LoadError::Syntax {
             path: canon.to_path_buf(),
-            errors: vec![(e.span, e.message)],
+            errors: vec![(e.span, e.message, None)],
         })?;
         let program = parser::parse(tokens).map_err(|errs| LoadError::Syntax {
             path: canon.to_path_buf(),
-            errors: errs.into_iter().map(|e| (e.span, e.message)).collect(),
+            errors: errs.into_iter().map(|e| (e.span, e.message, e.code)).collect(),
         })?;
         self.touched.push(canon.to_path_buf());
         self.native_items.insert(canon.to_path_buf(), program.items.clone());

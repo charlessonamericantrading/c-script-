@@ -1,5 +1,5 @@
 use linkc::ast::Program;
-use linkc::{checker, codegen, diagnostics, modules, runtime, scaffold};
+use linkc::{checker, codegen, diagnostics, error_codes, modules, runtime, scaffold};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -37,7 +37,7 @@ fn report_load_error(e: &modules::LoadError) {
     let modules::LoadError::Syntax { path, errors } = e else {
         if diagnostics_json_enabled() {
             print_diagnostics_json(&[serde_json::json!({
-                "file": null, "line": null, "column": null, "message": e.to_string(),
+                "file": null, "line": null, "column": null, "message": e.to_string(), "code": null,
             })]);
         } else {
             eprintln!("{e}");
@@ -48,8 +48,8 @@ fn report_load_error(e: &modules::LoadError) {
     if diagnostics_json_enabled() {
         let diags: Vec<serde_json::Value> = errors
             .iter()
-            .map(|(span, message)| serde_json::json!({
-                "file": file_label, "line": span.line, "column": span.col, "message": message,
+            .map(|(span, message, code)| serde_json::json!({
+                "file": file_label, "line": span.line, "column": span.col, "message": message, "code": code,
             }))
             .collect();
         print_diagnostics_json(&diags);
@@ -59,8 +59,8 @@ fn report_load_error(e: &modules::LoadError) {
         eprintln!("{e}");
         return;
     };
-    for (span, message) in errors {
-        eprintln!("{}", diagnostics::render_diagnostic(&source, &file_label, *span, message));
+    for (span, message, code) in errors {
+        eprintln!("{}", diagnostics::render_diagnostic(&source, &file_label, *span, message, *code));
     }
 }
 
@@ -99,6 +99,7 @@ fn report_check_errors(mut errors: Vec<checker::CheckError>) {
                 "line": e.span.map(|s| s.line),
                 "column": e.span.map(|s| s.col),
                 "message": e.message,
+                "code": e.code,
             }))
             .collect();
         print_diagnostics_json(&diags);
@@ -109,7 +110,7 @@ fn report_check_errors(mut errors: Vec<checker::CheckError>) {
         let rendered = match (&e.file, e.span) {
             (Some(path), Some(span)) => {
                 let source = source_cache.entry(path.clone()).or_insert_with(|| fs::read_to_string(path).ok());
-                source.as_ref().map(|src| diagnostics::render_diagnostic(src, &display_path(path), span, &e.message))
+                source.as_ref().map(|src| diagnostics::render_diagnostic(src, &display_path(path), span, &e.message, e.code))
             }
             _ => None,
         };
@@ -151,6 +152,7 @@ fn main() -> ExitCode {
         Some("systemd") => cmd_systemd(&args[2..]),
         Some("pm2-config") => cmd_pm2_config(&args[2..]),
         Some("introspect") => cmd_introspect(&args[2..]),
+        Some("explain") => cmd_explain(&args[2..]),
         // `--help` es una peticion valida, no un error: va a stdout y sale 0.
         // Sin este brazo caia en `cmd_check("--help")`, que respondia con un
         // mensaje sobre archivos .link inexistentes.
@@ -198,6 +200,7 @@ fn print_usage(to_stderr: bool) {
     out(&format!("     linkc systemd <archivo.link> <puerto> [outdir]   (genera una unidad systemd lista para /etc/systemd/system/)"));
     out(&format!("     linkc pm2-config <archivo.link> <puerto> [-o <archivo>]   (genera un ecosystem.json de PM2, default ./ecosystem.json)"));
     out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
+    out(&format!("     linkc explain <código>                 (explica un código de error estable, ej. 'linkc explain L0001' -- NO todo error tiene uno, GRAMMAR.md §3.210)"));
     out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
     out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'; con --target-url/LINK_DOCTOR_TARGET_URL, además compara la versión local contra la de un 'linkc serve' real corriendo ahí, vía /health)"));
     out(&format!("     linkc db inspect <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor'; --db-schema/LINK_DATABASE_SCHEMA solo Postgres)"));
@@ -1027,6 +1030,28 @@ fn cmd_check(path: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(code) => code,
+    }
+}
+
+/// GRAMMAR.md §3.210, PLAN.md §9.16 ítem 6 -- estilo `rustc --explain
+/// E0308`. `error_codes::CODES` es la única fuente de verdad, así que esto
+/// nunca puede desincronizarse del header `error[L0001]: ...` que ya
+/// imprime `report_check_errors`/`report_load_error`.
+fn cmd_explain(args: &[String]) -> ExitCode {
+    let Some(code) = args.first() else {
+        eprintln!("uso: linkc explain <código> (ej. 'linkc explain L0001')");
+        return ExitCode::FAILURE;
+    };
+    match error_codes::lookup(code) {
+        Some(entry) => {
+            println!("{} -- {}\n", entry.code, entry.summary);
+            println!("{}", entry.explanation);
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!("'{code}' no es un código de error conocido -- `linkc --help` no lista todos, pero GRAMMAR.md §3.210 sí");
+            ExitCode::FAILURE
+        }
     }
 }
 

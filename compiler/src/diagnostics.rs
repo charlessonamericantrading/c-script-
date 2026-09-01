@@ -22,7 +22,7 @@ const TAB_WIDTH: usize = 4;
 /// `lexer.rs`, que ancla el span en el delimitador de apertura en vez de en
 /// EOF) -- pero clampea `col`/el ancho del subrayado al largo real de la
 /// línea como defensa en profundidad, no como comportamiento esperado.
-pub fn render_diagnostic(source: &str, file_label: &str, span: Span, message: &str) -> String {
+pub fn render_diagnostic(source: &str, file_label: &str, span: Span, message: &str, code: Option<&str>) -> String {
     let line_text = source.lines().nth(span.line.saturating_sub(1)).unwrap_or("");
     let line_chars: Vec<char> = line_text.chars().collect();
 
@@ -43,8 +43,18 @@ pub fn render_diagnostic(source: &str, file_label: &str, span: Span, message: &s
     let gutter = span.line.to_string();
     let margin = " ".repeat(gutter.len());
 
+    // GRAMMAR.md §3.210: `error[L0001]: ...` en vez de `error: ...` cuando
+    // el error tiene un código estable -- mismo formato exacto que
+    // `rustc` usa para `error[E0308]: ...`, a propósito (un formato ya
+    // conocido por cualquiera que haya visto un error de Rust, humano o
+    // agente, en vez de inventar uno nuevo).
+    let header = match code {
+        Some(c) => format!("error[{c}]"),
+        None => "error".to_string(),
+    };
+
     format!(
-        "error: {message}\n  --> {file_label}:{}:{}\n{margin} |\n{gutter} | {rendered_line}\n{margin} | {padding}{caret}",
+        "{header}: {message}\n  --> {file_label}:{}:{}\n{margin} |\n{gutter} | {rendered_line}\n{margin} | {padding}{caret}",
         span.line, span.col
     )
 }
@@ -66,7 +76,7 @@ mod tests {
         // col 7 (1-based) de "rpc f(x Int) -> Int { x }" es la 'x' del
         // parámetro -- r=1,p=2,c=3,' '=4,f=5,(=6,x=7.
         let source = "type User = {\nrpc f(x Int) -> Int { x }\n}";
-        let out = render_diagnostic(source, "demo.link", span(4, 5, 2, 7), "se esperaba ':'");
+        let out = render_diagnostic(source, "demo.link", span(4, 5, 2, 7), "se esperaba ':'", None);
         assert!(out.contains("demo.link:2:7"), "{out}");
         let mut lines = out.lines();
         let source_line = lines.nth(3).unwrap(); // "2 | rpc f(x Int) -> Int { x }"
@@ -87,7 +97,7 @@ mod tests {
     #[test]
     fn tabs_before_the_span_are_expanded_consistently_in_both_lines() {
         let source = "\tbad";
-        let out = render_diagnostic(source, "demo.link", span(1, 2, 1, 2), "carácter inesperado");
+        let out = render_diagnostic(source, "demo.link", span(1, 2, 1, 2), "carácter inesperado", None);
         let mut lines = out.lines();
         let source_line = lines.nth(3).unwrap(); // "1 | <tab expandido>bad"
         let caret_line = lines.next().unwrap();
@@ -101,13 +111,23 @@ mod tests {
         // Defensa en profundidad -- no debería pasar en la práctica (el fix
         // de lexer.rs lo garantiza), pero el renderer no debería panicar si
         // algún caso futuro no respeta el invariante de una sola línea.
-        let out = render_diagnostic("x", "demo.link", span(0, 999, 1, 999), "mensaje");
+        let out = render_diagnostic("x", "demo.link", span(0, 999, 1, 999), "mensaje", None);
         assert!(out.contains("demo.link:1:999"));
     }
 
     #[test]
     fn missing_line_number_does_not_panic() {
-        let out = render_diagnostic("x", "demo.link", span(0, 1, 5, 1), "mensaje");
+        let out = render_diagnostic("x", "demo.link", span(0, 1, 5, 1), "mensaje", None);
         assert!(out.contains("demo.link:5:1"));
+    }
+
+    #[test]
+    fn a_coded_error_gets_the_rustc_style_error_bracket_code_header() {
+        // GRAMMAR.md §3.210: mismo formato exacto que `error[E0308]: ...`
+        // de rustc -- `None` (la mayoría de los errores) sigue sin bracket.
+        let coded = render_diagnostic("x", "demo.link", span(0, 1, 1, 1), "mensaje", Some("L0001"));
+        assert!(coded.starts_with("error[L0001]: mensaje\n"), "{coded}");
+        let uncoded = render_diagnostic("x", "demo.link", span(0, 1, 1, 1), "mensaje", None);
+        assert!(uncoded.starts_with("error: mensaje\n"), "{uncoded}");
     }
 }

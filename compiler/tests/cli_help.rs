@@ -15,7 +15,7 @@ fn help_lists_every_dispatched_subcommand() {
     let text = String::from_utf8_lossy(&out.stdout);
 
     for sub in [
-        "build", "test", "serve", "new", "dev", "lsp", "wasm", "fmt", "lint", "doc", "docker", "systemd", "pm2-config",
+        "build", "test", "serve", "new", "dev", "lsp", "wasm", "fmt", "lint", "doc", "docker", "systemd", "pm2-config", "explain",
     ] {
         assert!(
             text.contains(&format!("linkc {sub}")),
@@ -76,4 +76,36 @@ fn version_flag_prints_the_exact_crate_version_and_succeeds() {
         assert_eq!(stdout.trim(), format!("linkc {}", env!("CARGO_PKG_VERSION")), "'{flag}': {stdout}");
         assert!(String::from_utf8_lossy(&out.stderr).is_empty(), "'{flag}' escribió en stderr");
     }
+}
+
+// GRAMMAR.md §3.210, PLAN.md §9.16 ítem 6: `linkc explain <código>`.
+#[test]
+fn explain_prints_the_full_explanation_for_a_known_code_and_succeeds() {
+    let out = linkc().arg("explain").arg("L0001").output().expect("no se pudo ejecutar linkc");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("L0001"), "{stdout}");
+    assert!(stdout.contains("GRAMMAR.md §3.209"), "{stdout}");
+    assert!(String::from_utf8_lossy(&out.stderr).is_empty());
+}
+
+#[test]
+fn explain_is_case_insensitive() {
+    let out = linkc().arg("explain").arg("l0001").output().expect("no se pudo ejecutar linkc");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("L0001"));
+}
+
+#[test]
+fn explain_rejects_an_unknown_code_cleanly() {
+    let out = linkc().arg("explain").arg("L9999").output().expect("no se pudo ejecutar linkc");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no es un código de error conocido"));
+}
+
+#[test]
+fn explain_without_an_argument_is_a_clean_usage_error() {
+    let out = linkc().arg("explain").output().expect("no se pudo ejecutar linkc");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("uso: linkc explain"));
 }

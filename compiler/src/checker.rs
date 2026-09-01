@@ -22,21 +22,30 @@ use std::path::PathBuf;
 /// tiene identidad de archivo (todos los tests existentes, que construyen
 /// un `Program` a mano sin pasar por `modules.rs`), preservando su
 /// comportamiento exacto de antes.
+/// `code` (GRAMMAR.md §3.210): igual criterio que `span`/`file` arriba --
+/// `None` por defecto vía `err(...)`, estampado explícitamente solo en el
+/// puñado de sitios curados con su propia entrada en `error_codes::CODES`
+/// (`.with_code("L0001")`, ver ese módulo para la lista completa y por qué
+/// NO todo error tiene uno).
 #[derive(Debug)]
 pub struct CheckError {
     pub message: String,
     pub span: Option<Span>,
     pub file: Option<PathBuf>,
+    pub code: Option<&'static str>,
 }
 
 impl std::fmt::Display for CheckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "error de tipos: {}", self.message)
+        match self.code {
+            Some(c) => write!(f, "error de tipos [{c}]: {}", self.message),
+            None => write!(f, "error de tipos: {}", self.message),
+        }
     }
 }
 
 fn err(msg: impl Into<String>) -> CheckError {
-    CheckError { message: msg.into(), span: None, file: None }
+    CheckError { message: msg.into(), span: None, file: None, code: None }
 }
 
 /// Fast-path para un builtin CURADO nuevo (namespace.method) CON AL MENOS 1
@@ -252,6 +261,17 @@ impl CheckError {
     /// profundidad.
     fn with_file(mut self, file: PathBuf) -> Self {
         self.file = Some(file);
+        self
+    }
+
+    /// GRAMMAR.md §3.210: mismo criterio que `with_span` -- el primer stamp
+    /// gana, para que envolver un error de más abajo (ej. dentro de
+    /// `synth_expr_inner` re-entrando sobre sí mismo, como hace la sugar de
+    /// §3.209) nunca le pise el código más específico que ya tenía.
+    fn with_code(mut self, code: &'static str) -> Self {
+        if self.code.is_none() {
+            self.code = Some(code);
+        }
         self
     }
 }
@@ -3903,7 +3923,7 @@ impl Checker {
                                 Some(_) => {
                                     return Err(err(format!(
                                         "'{base_name}.{field}' es una variante de enum CON campos -- no se puede usar sin llaves, no hay de dónde inferir sus valores: escribí '{base_name}.{field} {{ ... }}' (GRAMMAR.md §3.209)"
-                                    )));
+                                    )).with_code("L0001"));
                                 }
                                 // `field` no nombra ninguna variante real de
                                 // este enum -- ya sabemos que `base_name` es
@@ -3915,8 +3935,9 @@ impl Checker {
                                     return Err(match find_best_suggestion(field, variant_names) {
                                         Some(sug) => err(format!(
                                             "'{base_name}' no tiene ninguna variante '{field}' -- ¿quisiste decir '{base_name}.{sug}'?"
-                                        )),
-                                        None => err(format!("'{base_name}' no tiene ninguna variante '{field}'")),
+                                        ))
+                                        .with_code("L0002"),
+                                        None => err(format!("'{base_name}' no tiene ninguna variante '{field}'")).with_code("L0002"),
                                     });
                                 }
                             }
@@ -3978,7 +3999,7 @@ impl Checker {
                     // o, si el caso es "dame un default", `x ?? default`.
                     Type::Optional(inner) => Err(err(format!(
                         "no se puede acceder al campo '{field}' sobre {inner}?: un valor nullable no se angosta con `if x != null` (GRAMMAR.md §3.4). Usá 'match' para desarmarlo de verdad -- `match x {{ v: {inner} => v.{field}, null => ... }}` (GRAMMAR.md §3.9) -- o devolvé el {inner}? tal cual y desarmalo del lado de TypeScript, que también angosta `{inner} | null`"
-                    ))),
+                    )).with_code("L0004")),
                     other => Err(err(format!("no se puede acceder al campo '{field}' sobre {other}"))),
                 }
             }

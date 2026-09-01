@@ -75,9 +75,14 @@ client against a real server.
 
 **`--diagnostics-json`** (global flag, any position — `linkc test x.link --diagnostics-json`
 or `linkc --diagnostics-json test x.link` both work) makes any subcommand that fails to load
-or type-check a program print `[{file, line, column, message}]` to stdout instead of the
+or type-check a program print `[{file, line, column, message, code}]` to stdout instead of the
 human-formatted text to stderr — parse this instead of scraping the `-->` snippet format
 when driving `linkc` programmatically. See GRAMMAR.md §3.208.
+
+A small, curated set of errors carry a stable code (`error[L0001]: ...`, same format as
+`rustc`'s `error[E0308]: ...`) — most don't, same pragmatic rule `rustc` itself follows.
+`linkc explain <code>` (e.g. `linkc explain L0001`) prints the full explanation. See
+GRAMMAR.md §3.210 for the current list.
 
 ## Rules of this codebase
 

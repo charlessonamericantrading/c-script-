@@ -6,15 +6,26 @@
 use crate::ast::*;
 use crate::token::{Span, Token, TokenKind};
 
+/// `code` (GRAMMAR.md §3.210): mismo criterio que `CheckError::code`
+/// (`checker.rs`) -- `None` por defecto, estampado solo en el puñado de
+/// sitios curados con entrada en `error_codes::CODES` vía `.with_code(...)`.
 #[derive(Debug)]
 pub struct ParseError {
     pub message: String,
     pub span: Span,
+    pub code: Option<&'static str>,
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "error de sintaxis en línea {}, columna {}: {}", self.span.line, self.span.col, self.message)
+    }
+}
+
+impl ParseError {
+    fn with_code(mut self, code: &'static str) -> Self {
+        self.code = Some(code);
+        self
     }
 }
 
@@ -185,6 +196,7 @@ impl Parser {
         ParseError {
             message: message.into(),
             span: self.span(),
+            code: None,
         }
     }
 
@@ -1749,6 +1761,21 @@ impl Parser {
                 Ok(Spanned { node: Expr::Ident(name), span: start })
             }
             TokenKind::Pipe => self.parse_closure_expr(),
+            // GRAMMAR.md §3.210: `||` (sin espacio) lexea como UN token
+            // `PipePipe` (el operador OR lógico) -- en posición de INICIO
+            // de expresión nunca puede ser el operador binario (ese
+            // siempre necesita un operando a la izquierda antes), así que
+            // acá solo puede significar "closure sin parámetros" intentado
+            // con la forma más común de escribirlo. Sin este brazo, esto
+            // caía en el `other =>` genérico de abajo ("se esperaba una
+            // expresión, se encontró PipePipe") -- el mismo error que
+            // `parse_closure_expr` ya da para `| |` (dos tokens `Pipe`
+            // separados) nunca se veía para la forma sin espacio, mucho
+            // más común.
+            TokenKind::PipePipe => {
+                self.advance();
+                Err(self.empty_closure_error())
+            }
             other => Err(self.error(format!("se esperaba una expresión, se encontró {other:?}"))),
         }
     }
@@ -1758,6 +1785,20 @@ impl Parser {
     /// `| |` (con espacio) sigue siendo dos `Pipe` separados, de ahí el
     /// chequeo explícito de "al menos 1 param" más abajo en vez de confiar
     /// en que el token ya lo descarta.
+    /// GRAMMAR.md §3.210: mensaje/código compartido entre acá (`|` + `|`,
+    /// dos tokens `Pipe` separados, ej. `| |` o `|,|`) y el lexer
+    /// reconociendo `||` como UN token `PipePipe` (ver el brazo dedicado en
+    /// el dispatch de expresión primaria, más abajo) -- las dos formas de
+    /// escribir "closure sin parámetros" tienen que dar el MISMO error, en
+    /// vez de que la forma más común (`||`, sin espacio) caiga en el
+    /// genérico "se esperaba una expresión" mientras solo la menos común
+    /// (`| |`, con espacio) diera el mensaje dirigido -- encontrado
+    /// verificando el repro real de L0005 antes de darlo por probado.
+    fn empty_closure_error(&self) -> ParseError {
+        self.error("un closure necesita al menos 1 parámetro -- `||` (0 parámetros) no se soporta todavía (GRAMMAR.md §3.10)")
+            .with_code("L0005")
+    }
+
     fn parse_closure_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {
         let start = self.span();
         self.eat(&TokenKind::Pipe)?;
@@ -1774,9 +1815,7 @@ impl Parser {
         }
         self.eat(&TokenKind::Pipe)?;
         if params.is_empty() {
-            return Err(self.error(
-                "un closure necesita al menos 1 parámetro -- `||` (0 parámetros) no se soporta todavía (GRAMMAR.md §3.10)",
-            ));
+            return Err(self.empty_closure_error());
         }
         // GRAMMAR.md §3.206: sin este chequeo, `-> Tipo` acá caía en el
         // `expect(LBrace)` genérico de `parse_block` de la línea siguiente
@@ -1786,9 +1825,9 @@ impl Parser {
         // cuerpo o del `Type::Function` esperado (checker.rs) -- nunca
         // lleva anotación propia, a diferencia de `fn`/`rpc`.
         if self.check(&TokenKind::Arrow) {
-            return Err(self.error(
-                "un closure no lleva anotación de tipo de retorno -- quitá el '-> Tipo': se infiere del cuerpo o del contexto esperado, nunca se anota (GRAMMAR.md §3.10)",
-            ));
+            return Err(self
+                .error("un closure no lleva anotación de tipo de retorno -- quitá el '-> Tipo': se infiere del cuerpo o del contexto esperado, nunca se anota (GRAMMAR.md §3.10)")
+                .with_code("L0003"));
         }
         let body = self.parse_block()?;
         let span = merge(start, self.prev_span());
@@ -2401,6 +2440,23 @@ mod tests {
         let msg = format!("{err:?}");
         assert!(msg.contains("no lleva anotación de tipo de retorno"), "{msg}");
         assert!(!msg.contains("LBrace") && !msg.contains("Arrow"), "no debería filtrar TokenKind interno: {msg}");
+    }
+
+    #[test]
+    fn literal_double_pipe_with_no_space_gives_the_same_empty_closure_message_as_with_a_space() {
+        // GRAMMAR.md §3.210: encontrado verificando el repro real de L0005
+        // -- `||` sin espacio lexea como UN token `PipePipe` (el operador
+        // OR lógico), así que antes de este fix caía en el "se esperaba
+        // una expresión, se encontró PipePipe" genérico del dispatch de
+        // expresión primaria, mientras que `| |` (dos tokens `Pipe`
+        // separados) SÍ daba el mensaje dirigido -- la forma más común de
+        // escribirlo era justamente la que no lo daba.
+        let with_space = format!("{:?}", parse(tokenize("fn f() -> Int { (| |{ 1 })() }").unwrap()).unwrap_err());
+        let without_space = format!("{:?}", parse(tokenize("fn f() -> Int { (||{ 1 })() }").unwrap()).unwrap_err());
+        for msg in [&with_space, &without_space] {
+            assert!(msg.contains("un closure necesita al menos 1 parámetro"), "{msg}");
+            assert!(!msg.contains("PipePipe"), "no debería filtrar TokenKind interno: {msg}");
+        }
     }
 
     #[test]

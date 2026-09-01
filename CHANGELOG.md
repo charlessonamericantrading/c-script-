@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.169.0] - 2026-09-01
+
+### ✨ Nuevo
+**Compatibilidad con IA (PLAN.md §9.16 ítem 6, último del plan): códigos de error estables (`error[L0001]: ...`, mismo formato que `error[E0308]: ...` de `rustc`) + `linkc explain <código>`.** Inspirado directamente por el `E0603` real que apareció en esta misma sesión implementando §3.204/§3.205 -- se resolvió rápido justamente porque `rustc` nombra sus errores con un código estable y documentado. Arranca con 5 códigos curados (`L0001`-`L0005`) sobre los errores que ya tenían su propia explicación extensa en GRAMMAR.md -- NO todo error tiene código, mismo criterio pragmático que `rustc`. `CheckError`/`ParseError` ganan un campo `code: Option<&'static str>` (mismo patrón que `span`/`file`); `--diagnostics-json` (§3.208) y el protocolo LSP (`Diagnostic.code`, un campo real de la spec) también lo exponen. `linkc explain L0001` imprime la explicación completa desde `error_codes::CODES`, la única fuente de verdad. Bug real encontrado verificando el repro de `L0005` antes de darlo por probado: `||` (sin espacio, la forma más común) lexeaba como un token `PipePipe` que el parser no reconocía como intento de closure vacío, así que el mensaje dirigido solo aparecía con `| |` (con espacio) -- cerrado con un brazo nuevo en el dispatch de expresión primaria. Con esto, PLAN.md §9.16 queda completo. Ver GRAMMAR.md §3.210.
+
 ## [1.168.0] - 2026-09-01
 
 ### ✨ Nuevo

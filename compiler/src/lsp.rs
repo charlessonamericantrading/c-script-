@@ -152,7 +152,7 @@ impl LspServer {
                     .unwrap_or_default();
                 errors
                     .into_iter()
-                    .map(|(span, message)| {
+                    .map(|(span, message, code)| {
                         // Un error de sintaxis en un archivo IMPORTADO ya
                         // tiene identidad de archivo real (a diferencia de
                         // un CheckError, ver abajo) -- se nombra en el
@@ -161,11 +161,16 @@ impl LspServer {
                         // documento actualmente abierto.
                         let message =
                             if path == entry_canon { message } else { format!("(en '{}') {message}", modules::display_path(&path)) };
+                        // GRAMMAR.md §3.210: `code` es un campo real del
+                        // protocolo LSP (Diagnostic.code) -- un editor que
+                        // ya sabe mostrarlo (VS Code, Cursor) lo hace solo,
+                        // sin cambio de UI de este lado.
                         json!({
                             "range": span_to_range(&source, span),
                             "severity": 1,
                             "source": "c-script",
                             "message": message,
+                            "code": code,
                         })
                     })
                     .collect()
@@ -201,7 +206,7 @@ impl LspServer {
                             (Some(file), false) => format!("(en '{}') {}", modules::display_path(file), e.message),
                             _ => e.message,
                         };
-                        json!({ "range": range, "severity": 1, "source": "c-script", "message": message })
+                        json!({ "range": range, "severity": 1, "source": "c-script", "message": message, "code": e.code })
                     })
                     .collect()
             }

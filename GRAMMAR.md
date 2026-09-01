@@ -231,6 +231,7 @@
   - [3.207 Dos allowlists sobre `Value` con `_ => false`/`other => Err(...)` convertidos a funciones exhaustivas sin `_` — RESUELTO](#3207-dos-allowlists-sobre-value-con--false-other--err-convertidos-a-funciones-exhaustivas-sin--resuelto)
   - [3.208 `--diagnostics-json`: diagnósticos de carga/tipos en JSON estructurado — RESUELTO](#3208---diagnostics-json-diagnósticos-de-cargatipos-en-json-estructurado--resuelto)
   - [3.209 `Enum.Variante` sin campos ya no necesita `{}` como expresión — RESUELTO](#3209-envariante-sin-campos-ya-no-necesita--como-expresión--resuelto)
+  - [3.210 Códigos de error estables + `linkc explain <código>` — RESUELTO](#3210-códigos-de-error-estables--linkc-explain-código--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7551,6 +7552,31 @@ Origen: `PLAN.md §9.16` ítem 1(b), la apuesta más grande e incierta del plan 
 **Por qué NO se atacó como un cambio del parser**: la alternativa (que el parser produjera un nodo AST ambiguo, resuelto después) habría sido un cambio mucho más grande e invasivo -- tocando el árbol que decenas de otras partes del compilador ya asumen. Resolverlo en el checker/runtime, reusando la construcción de `StructLit` que ya existía, fue estrictamente más chico y más seguro, con la MISMA garantía de que las dos formas nunca puedan divergir en comportamiento (es literalmente el mismo código).
 
 **Verificado contra el binario real**: el repro original de §3.206 (`role: Role.Admin` sin llaves) ahora tipa y corre limpio, con `Role.Admin == Role.Admin {}` confirmado como el mismo valor. Una variante CON campos sin llaves sigue siendo un error, con el mensaje nuevo. Una variante inexistente da la sugerencia correcta. El caso genérico (`Maybe.Nothing` sin llaves, con tipo esperado inferido del contexto) funciona igual que la forma con llaves. 5 tests de checker nuevos/reescritos (`checker.rs`) más los 2 ya existentes de shadowing/guardas de §3.206, todos verdes. Suite completa sin regresiones.
+
+### 3.210 Códigos de error estables + `linkc explain <código>` — RESUELTO, cierra PLAN.md §9.16 ítem 6 (y §9.16 completo)
+
+Origen: `PLAN.md §9.16` ítem 6, el último del plan, pedido explícito del usuario ("hazlo, creálo todo") junto con el ítem 1(b) (§3.209). Idea inspirada directamente por esta misma sesión: el `E0603` real de Rust (visibilidad de módulo) que apareció implementando GRAMMAR.md §3.204/§3.205 se resolvió rápido precisamente porque `rustc` nombra el error con un código estable y documentado -- un `.link` no tenía nada parecido, cada mensaje era prosa libre sin identidad más allá del texto exacto.
+
+**Taxonomía, la pregunta que el plan había dejado explícitamente abierta**: NO todo error tiene código, mismo criterio pragmático que `rustc` (la mayoría de sus miles de diagnósticos tampoco lo tienen). Asignar uno a los ~113 sitios `err(...)` de `checker.rs` sin evidencia de que cada uno lo necesita sería trabajo especulativo. Se arrancó con un set curado de 5 -- los errores que ya tenían su propia explicación extensa en GRAMMAR.md (§3.4/§3.9/§3.10/§3.206/§3.209) -- documentados en `compiler/src/error_codes.rs`, el módulo nuevo que es la única fuente de verdad tanto para `linkc explain` como para no desincronizarse nunca del texto real. Numeración SECUENCIAL (`L0001`, `L0002`, ...), no por categoría -- la alternativa (`L-TYPE-001`, etc.) es más diseño sin beneficio real, lo que importa es que el código sea ESTABLE (nunca se reasigna) y que `linkc explain` dé el detalle, no que el número cargue significado.
+
+**Los 5 códigos iniciales**:
+- `L0001` -- variante de enum CON campos usada sin llaves (§3.209).
+- `L0002` -- identificador después de un nombre de enum que no nombra ninguna variante real (§3.209).
+- `L0003` -- closure con anotación de tipo de retorno (§3.206/§3.10).
+- `L0004` -- `T?` accedido tras `if x != null` sin angostar de verdad (§3.4/§3.9).
+- `L0005` -- closure sin ningún parámetro (`||`) (§3.10).
+
+**Mecanismo**: `CheckError`/`ParseError` ganan un campo `code: Option<&'static str>` -- mismo patrón exacto que `span`/`file` ya usaban (`None` por defecto vía `err(...)`/`self.error(...)`, estampado explícitamente en los sitios curados vía un builder nuevo, `.with_code("L0001")`, "primer stamp gana" igual que `with_span`). El header humano pasa de `error: mensaje` a `error[L0001]: mensaje` cuando hay código -- el MISMO formato exacto que `error[E0308]: ...` de `rustc`, a propósito: un formato que cualquiera que haya visto un error de Rust (humano o agente) ya reconoce, en vez de inventar uno nuevo. `--diagnostics-json` (§3.208) gana un campo `"code"` (string o `null`) en cada entrada del array. El protocolo LSP también lo expone -- `Diagnostic.code` es un campo real de la spec, así que un editor que ya sabe mostrarlo (VS Code, Cursor) lo hace sin ningún cambio de UI de este lado.
+
+**`LoadError::Syntax` (`modules.rs`) tuvo que ensancharse** de `Vec<(Span, String)>` a `Vec<(Span, String, Option<&'static str>)>` para que un código asignado en el PARSER (`L0003`/`L0005`) sobreviva el viaje hasta `main.rs`/`lsp.rs` -- sin este cambio, el código se habría perdido en el medio (un error léxico nunca tiene uno, `lexer.rs` no participa de este mecanismo todavía).
+
+**Bug real encontrado verificando el repro de `L0005` antes de darlo por probado** (mismo criterio de siempre -- correr, no asumir): el mensaje ya documentaba `||` como el disparador ("`||` (0 parámetros) no se soporta todavía"), pero `||` SIN espacio lexea como un único token `PipePipe` (el operador OR lógico) -- el dispatch de expresión primaria no tenía ningún caso para eso, así que caía en el genérico "se esperaba una expresión, se encontró PipePipe". Solo `| |` (con espacio, dos tokens `Pipe` separados) daba el mensaje dirigido -- exactamente al revés de qué forma es más común escribir. Cerrado con un brazo nuevo (`TokenKind::PipePipe`) que redirige al mismo mensaje/código -- en posición de INICIO de expresión, `||` nunca puede ser el operador binario de verdad (ese siempre necesita un operando a la izquierda), así que la reinterpretación es inequívoca.
+
+**`linkc explain <código>`**: subcomando nuevo, estilo `rustc --explain E0308` -- imprime el resumen de una línea más la explicación completa (ejemplo de la forma que dispara el error, el arreglo real, la sección de GRAMMAR.md) desde `error_codes::CODES`, case-insensitive. Un código desconocido es un error limpio nombrando dónde buscar la lista completa (GRAMMAR.md §3.210, no `--help`, que no lista todos).
+
+**Verificado**: los 5 repros reales (uno por código) corridos contra el binario -- cada uno muestra `error[L000X]: ...` en texto humano, `"code":"L000X"` en `--diagnostics-json`, y `linkc explain L000X` imprime la explicación completa citando GRAMMAR.md. `linkc explain` case-insensitive y con error limpio para un código inexistente, confirmados. El fix de `PipePipe` verificado con las dos formas (`||` y `| |`) dando el mismo mensaje. Tests nuevos: 3 en `error_codes.rs` (formato de cada entrada, sin códigos repetidos, lookup case-insensitive), 4 en `cli_help.rs` (`linkc explain` end-to-end contra el binario real), 1 en `parser.rs` (`PipePipe`), más los tests de `diagnostics.rs`/`checker.rs`/`parser.rs` ya existentes actualizados para la nueva forma de `render_diagnostic`/`ParseError`. Suite completa sin regresiones (una falla aislada durante la verificación resultó ser contención de recursos por una invocación de `cargo test` concurrente propia, no un bug real -- confirmado corriendo el test solo, limpio, en 1.5s en vez de colgarse 400+).
+
+**Con esto, PLAN.md §9.16 queda completo** -- los 7 ítems (1a, 2, 3, 4, 5, 1b, 6) resueltos, v1.164.0 a v1.169.0.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
