@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.175.0"
+version = "1.176.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -133,3 +133,16 @@ pdf-writer = { version = "0.15", optional = true }
 # las excepciones anteriores.
 rust_xlsxwriter = { version = "0.99", optional = true }
 calamine = { version = "0.36", optional = true }
+
+# Benchmarks de humo (PLAN.md §9.18 Eje B ítem 1, GRAMMAR.md §3.217).
+# `criterion` es dependencia SOLO de desarrollo -- no entra al binario
+# `linkc`, así que no es una excepción a "cero dependencias nuevas" (esa
+# regla protege lo que se DISTRIBUYE). Sin `default-features` para no
+# arrastrar `rayon`/plots HTML que ningún benchmark de acá usa; el reporte
+# de texto con cambio relativo contra la corrida anterior es lo que importa.
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "smoke"
+harness = false

@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.176.0] - 2026-09-02
+
+### ✨ Añadido
+**Benchmarks de humo (PLAN.md §9.18 Eje B ítem 1, el gate de todo el eje de rendimiento): `cargo bench --bench smoke`.** Cinco casos sobre `criterion` (dependencia solo de desarrollo, sin `rayon`/plots): chequear `users.link` (~460 µs), un INSERT real vía `invoke_rpc` (~20 µs), leer 100 filas (~89 µs), un `findWhere` empujado a SQL (~17 µs), y un `while` puro de 1.000 iteraciones (~410 µs). Hallazgo de la primera corrida: el intérprete cuesta ~400 ns por iteración de loop -- 20 INSERTs por cada 1.000 vueltas --, así que NO es el cuello para rpcs que van a la base pero SÍ para cuerpos con cómputo real; eso reordena el Eje B (pool de conexiones primero, intérprete después, ambos ahora medibles). Los benches se compilan en CI vía `clippy --all-targets` pero no se corren ahí (ruido de runner compartido). Ver GRAMMAR.md §3.217.
+
 ## [1.175.0] - 2026-09-02
 
 ### 🔧 Interno

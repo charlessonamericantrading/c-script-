@@ -238,6 +238,7 @@
   - [3.214 `pdf.build`/`excel.build`/`excel.parse` cubiertos end-to-end contra el binario real — RESUELTO](#3214-pdfbuildexcelbuildexcelparse-cubiertos-end-to-end-contra-el-binario-real--resuelto)
   - [3.215 El ritual de release mecanizado + drift-check completo de artefactos generados — RESUELTO](#3215-el-ritual-de-release-mecanizado--drift-check-completo-de-artefactos-generados--resuelto)
   - [3.216 Cero warnings de clippy, `-D warnings` en CI, y `ServeConfig` — RESUELTO](#3216-cero-warnings-de-clippy--d-warnings-en-ci-y-serveconfig--resuelto)
+  - [3.217 Benchmarks de humo (`cargo bench --bench smoke`) — RESUELTO](#3217-benchmarks-de-humo-cargo-bench---bench-smoke--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7736,6 +7737,27 @@ Origen: `PLAN.md §9.17` ítem 9 (Bloque C), último del bloque. `cargo clippy` 
 
 **Verificado**: `cargo clippy --all-targets` con CERO warnings en los dos perfiles (release y debug -- el que usa CI); build limpio tras el refactor de `ServeConfig`; suite completa sin regresiones (el refactor toca el arranque de TODO servidor, así que los ~47 archivos de tests de integración que spawnnean `linkc serve` real son la verificación que importa).
 
+### 3.217 Benchmarks de humo (`cargo bench --bench smoke`) — RESUELTO, cierra PLAN.md §9.18 Eje B ítem 1 (y §9.17 ítem 16)
+
+Origen: `PLAN.md §9.18` Eje B ítem 1, el gate de todo el eje de rendimiento. Hasta v1.175.0 el proyecto no tenía NINGUNA medición (grep de `req/s`/`p99`/`ms por request` en GRAMMAR.md/README/PLAN.md: cero; §9.17 ítem 16 ya lo había anotado sin atacarlo). Sin baseline, cualquier optimización del intérprete o del servidor es una apuesta que no se puede verificar -- exactamente lo contrario de la regla de este repo ("correlo, no lo razones").
+
+**Qué hay (v1.176.0)**: `compiler/benches/smoke.rs`, sobre `criterion` como dependencia SOLO de desarrollo (`[dev-dependencies]`, `default-features = false` -- sin `rayon` ni plots HTML; NO es una excepción a "cero dependencias nuevas": esa regla protege el binario que se distribuye, y `criterion` nunca entra en él). Cinco casos, cada uno elegido por lo que aísla, no por cobertura:
+
+| Benchmark | Qué mide | Máquina de desarrollo (Windows 11, `--release`) |
+|---|---|---|
+| `check/users.link` | cargar + parsear + tipar el programa de referencia (195 líneas) -- lo que paga cada `linkc test <archivo>` y cada iteración de un agente | ~460 µs |
+| `rpc/create` | un INSERT real en SQLite `:memory:` vía `invoke_rpc` (intérprete + `db.rs` + JSON) | ~20 µs |
+| `rpc/read/list_100` | `all()` sobre 100 filas: SELECT + decodificar fila→`Value` + `Value`→JSON | ~89 µs (~0,9 µs/fila) |
+| `rpc/read/findWhere_pushdown` | `findWhere(\|n\| n.pinned)` empujado a SQL (§3.95) sobre las mismas 100 filas | ~17 µs |
+| `interp/while_1000` | un rpc PURO (`while` de 1.000 iteraciones, 3 operaciones por vuelta, sin base) -- aísla `eval_expr` | ~410 µs (~410 ns/iteración) |
+
+Los números son orientativos (una máquina, un día), no un SLA -- lo que importa es el **cambio relativo** entre corridas, que criterion reporta solo contra `target/criterion/` de la corrida anterior.
+
+**El hallazgo real de la primera corrida, que reordena el Eje B**: un loop de 1.000 iteraciones cuesta 20 veces más que un INSERT real. O sea: para un rpc que va a la base (la enorme mayoría), el intérprete NO es el cuello -- la base y la serialización lo son, y ahí es donde el pool de conexiones (Eje B ítem 3) va a pesar. Pero para un cuerpo con cómputo real (un loop sobre una lista de mil elementos, un cálculo de precios), ~400 ns por iteración de un `while` de tres operaciones ES el cuello, y el ítem 6 (slots de campo, `Rc<str>`, menos clones de `Value`) deja de ser especulativo. Ninguna de las dos cosas se sabía antes de medir.
+
+**Lo que NO mide, a propósito**: `linkc serve` bajo carga concurrente. Un pool de hilos/conexiones (Eje B ítems 2 y 3) se mide con un cliente externo contra un servidor real, no dentro de criterion -- ese harness llega con esa ronda. El programa del benchmark se tipa con el checker REAL antes de medir (no con el harness `program_from` de los tests unitarios, que lo saltea, §3.204): un benchmark sobre un programa que no compila mediría basura.
+
+**CI**: `cargo clippy --all-targets` (§3.216) ya compila los benches en cada push -- un bench que no compila rompe CI. No se CORREN en CI a propósito: un runner compartido da números con ruido de ±30% y una regresión "detectada" ahí sería falsa la mitad de las veces. Correr `cargo bench --bench smoke` antes y después en el mismo commit es responsabilidad de quien toca `runtime/mod.rs`/`db.rs`/`server.rs`, y el CHANGELOG de ese cambio lleva los dos números.
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

@@ -43,6 +43,7 @@ is `linkc`. They are one project.
 cd compiler
 cargo build --release        # produces target/release/linkc
 cargo test                   # unit + integration; spawns real LSP and HTTP subprocesses
+cargo bench --bench smoke    # 5 smoke benchmarks (GRAMMAR.md §3.217); run before/after touching runtime/, db.rs or server.rs
 ```
 
 ```bash
