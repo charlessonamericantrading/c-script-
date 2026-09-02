@@ -56,7 +56,7 @@ maxRow/minRow/sumBy/countBy/avgBy/maxBy/minBy` §3.18/§3.48/§3.61/§3.75/§3.7
 §3.95/§3.108/§3.109/§3.170/§3.171/§3.145. Schema annotations: `@index`/`@unique` (single,
 composite, conditional `where`) §3.80/§3.155/§3.174, `@check(min/max/range/minLength/
 maxLength)` and `@check(<expr>)` §3.96/§3.146/§3.173, `@validate(email|regex)` §3.73,
-`@softDelete` §3.78, `@autoUpdate` §3.77, `@encrypted` (AES-GCM at rest) §3.191, `id: Uuid` PK
+`@softDelete` §3.78, `@autoUpdate` §3.77, `@encrypted` (AES-GCM at rest) §3.191, `@hidden` (kept in the DB and readable inside the rpc, stripped from rpc/stream/MCP JSON and absent from the generated contract; never on `id`, never in a param type) §3.232, `id: Uuid` PK
 §3.177, native Postgres `uuid/inet/cidr/json/jsonb/date/timestamp/timestamptz/numeric`
 columns §3.179/§3.187/§3.91/§3.182/§3.103, native `integer[]`/`text[]`/`boolean[]`/`double precision[]` arrays as `Int[]`/`String[]`/`Bool[]`/`Float[]` §3.228, `--db-schema` §3.193, `--adopt-existing` §3.67,
 `db.vacuum()`/`db.tableStats()` §3.151. Tooling: `linkc introspect` (Postgres → starting

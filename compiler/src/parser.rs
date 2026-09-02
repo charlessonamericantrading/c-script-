@@ -641,9 +641,16 @@ impl Parser {
                     }
                     annotations.push(FieldAnnotation::Encrypted);
                 }
+                // Sin paréntesis, mismo criterio (GRAMMAR.md §3.232).
+                "hidden" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::Hidden)) {
+                        return Err(self.error("'@hidden' repetido sobre el mismo campo".to_string()));
+                    }
+                    annotations.push(FieldAnnotation::Hidden);
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)' o '@encrypted')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)', '@encrypted' o '@hidden')"
                     )))
                 }
             }

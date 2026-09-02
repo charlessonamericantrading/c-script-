@@ -564,6 +564,10 @@ fn shallow_tag_conflict(a: &Type, b: &Type) -> bool {
 
 pub struct Checker {
     pub(crate) types: HashMap<String, TypeDecl>,
+    /// GRAMMAR.md §3.232: nombre de `type` -> sus campos `@hidden`. Solo
+    /// los types que tienen alguno; consultado por el runtime al serializar
+    /// un resultado (`strip_hidden_json`) y por el codegen de validadores.
+    pub(crate) hidden_fields: HashMap<String, HashSet<String>>,
     pub(crate) enums: HashMap<String, EnumDecl>,
     fns: HashMap<String, (Vec<Type>, Type)>,
     pub(crate) services: HashMap<String, HashMap<String, (Vec<Type>, Type)>>,
@@ -774,6 +778,7 @@ impl Checker {
     pub(crate) fn build_symbols(program: &Program) -> (Self, Vec<CheckError>) {
         let mut checker = Checker {
             types: HashMap::new(),
+            hidden_fields: HashMap::new(),
             enums: HashMap::new(),
             fns: HashMap::new(),
             services: HashMap::new(),
@@ -822,6 +827,12 @@ impl Checker {
                     errors.push(err(format!("'{}' ya está declarado (type duplicado)", t.name)).with_span(t.span));
                 }
                 Item::Type(t) => {
+                    if let TypeExpr::Struct(fields) = &t.ty {
+                        let hidden: HashSet<String> = fields.iter().filter(|f| f.hidden()).map(|f| f.name.clone()).collect();
+                        if !hidden.is_empty() {
+                            checker.hidden_fields.insert(t.name.clone(), hidden);
+                        }
+                    }
                     checker.types.insert(t.name.clone(), t.clone());
                 }
                 Item::Enum(e) if checker.enums.contains_key(&e.name) => {
@@ -1183,6 +1194,7 @@ impl Checker {
                                 .chain(checker.check_field_auto_update(fields, &t.type_params))
                                 .chain(checker.check_field_soft_delete(fields, &t.type_params))
                                 .chain(checker.check_field_encrypted(fields, &t.type_params))
+                                .chain(checker.check_field_hidden(fields))
                                 .chain(checker.check_field_checks(fields, &t.type_params)),
                         );
                     }
@@ -1593,6 +1605,17 @@ impl Checker {
         let mut env = Env::new();
         for p in &r.params {
             let pty = self.resolve_type(&p.ty)?;
+            // GRAMMAR.md §3.232: el contrato generado emite un type con
+            // campos `@hidden` SIN esos campos, así que ningún cliente
+            // podría mandarlos -- como parámetro sería una firma imposible
+            // de cumplir. Mismo criterio que `NewX` para `insert`: un type
+            // de entrada aparte.
+            if let Some(offender) = self.type_mentions_hidden(&pty) {
+                return Err(err(format!(
+                    "el parámetro '{}' de '{}' es (o contiene) '{offender}', un type con campos '@hidden' -- el contrato generado lo emite sin esos campos, así que ningún cliente podría mandarlos; declará un type de entrada aparte, sin '@hidden' (GRAMMAR.md §3.232)",
+                    p.name, r.name
+                )));
+            }
             if let Some(default) = &p.default {
                 self.check_expr(default, &pty, &Env::new())?;
             }
@@ -2489,6 +2512,57 @@ impl Checker {
             }
         }
         errors
+    }
+
+    /// `@hidden` (GRAMMAR.md §3.232): nunca sobre `id` -- todo el runtime
+    /// y el cliente generado lo necesitan en el JSON (`find`, `applyPatch`,
+    /// cursores, `pageAfter`); ocultarlo dejaría un contrato sin forma de
+    /// referirse a una fila.
+    fn check_field_hidden(&self, fields: &[Field]) -> Vec<CheckError> {
+        fields
+            .iter()
+            .filter(|f| f.hidden() && f.name == "id")
+            .map(|f| {
+                err("'@hidden' sobre 'id': el id tiene que viajar en el JSON (find, applyPatch, pageAfter, el cliente generado) -- no se puede ocultar (GRAMMAR.md §3.232)")
+                    .with_span(f.name_span)
+            })
+            .collect()
+    }
+
+    /// GRAMMAR.md §3.232: ¿`ty` es, o contiene en cualquier nivel, un type
+    /// con campos `@hidden`? Devuelve el nombre del primero que encuentra
+    /// (para el mensaje). `seen` corta los types recursivos.
+    pub(crate) fn type_mentions_hidden(&self, ty: &Type) -> Option<String> {
+        self.type_mentions_hidden_inner(ty, &mut Vec::new())
+    }
+
+    fn type_mentions_hidden_inner(&self, ty: &Type, seen: &mut Vec<String>) -> Option<String> {
+        match ty {
+            Type::Struct { name, fields } => {
+                if let Some(n) = name {
+                    if self.hidden_fields.contains_key(n) {
+                        return Some(n.clone());
+                    }
+                    if seen.contains(n) {
+                        return None;
+                    }
+                    seen.push(n.clone());
+                }
+                fields.iter().find_map(|f| self.type_mentions_hidden_inner(&f.ty, seen))
+            }
+            Type::Optional(t) | Type::List(t) | Type::PatchOf(t) => self.type_mentions_hidden_inner(t, seen),
+            Type::Tuple(items) | Type::Union(items) => items.iter().find_map(|t| self.type_mentions_hidden_inner(t, seen)),
+            Type::MapOf(k, v) | Type::ResultOf(k, v) => {
+                self.type_mentions_hidden_inner(k, seen).or_else(|| self.type_mentions_hidden_inner(v, seen))
+            }
+            Type::Generic(name, args) => {
+                if self.hidden_fields.contains_key(name) {
+                    return Some(name.clone());
+                }
+                args.iter().find_map(|t| self.type_mentions_hidden_inner(t, seen))
+            }
+            _ => None,
+        }
     }
 
     /// `@encrypted` (GRAMMAR.md §3.191) solo sobre `String`/`String?` --
@@ -11268,5 +11342,52 @@ mod order_by_tests {
     fn sort_by_needs_a_totally_ordered_key() {
         let msg = first_error("rpc bad() -> Event[] { db.events.all().sortBy(|e: Event| { e.tags }) }");
         assert!(msg.contains("la clave de orden es"), "{msg}");
+    }
+}
+
+/// GRAMMAR.md §3.232 (PLAN.md §9.19 ítem 7): `@hidden`.
+#[cfg(test)]
+mod hidden_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+
+    fn check(src: &str) -> Result<Checker, String> {
+        let tokens = tokenize(src).map_err(|e| format!("{e}"))?;
+        let program = parse(tokens).map_err(|e| format!("{e:?}"))?;
+        Checker::check_program(&program).map_err(|e| format!("{e:?}"))?;
+        Ok(Checker::build_symbols(&program).0)
+    }
+
+    #[test]
+    fn hidden_fields_are_indexed_and_readable_inside_an_rpc() {
+        let checker = check(
+            "type User = { id: Int, email: String, @hidden passwordHash: String }
+             type NewUser = { email: String, passwordHash: String }
+             db { users: User[] }
+             service S {
+               rpc create(email: String, hash: String) -> User { db.users.insert(NewUser { email: email, passwordHash: hash }) }
+               rpc withHash(h: String) -> User[] { db.users.all().filter(|u: User| { u.passwordHash == h }) }
+               stream live() -> User { while true { db.users.subscribe() } }
+             }",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert!(checker.hidden_fields["User"].contains("passwordHash"));
+        assert!(!checker.hidden_fields.contains_key("NewUser"));
+    }
+
+    #[test]
+    fn hidden_id_and_hidden_types_as_params_are_rejected() {
+        let msg = check("type User = { @hidden id: Int, email: String }\ndb { users: User[] }").err().expect("tenía que fallar");
+        assert!(msg.contains("'@hidden' sobre 'id'"), "{msg}");
+        let msg = check(
+            "type User = { id: Int, @hidden passwordHash: String }
+             type Wrapper = { users: User[] }
+             service S { rpc bad(w: Wrapper) -> Int { 1 } }",
+        )
+        .err().expect("tenía que fallar");
+        assert!(msg.contains("'User', un type con campos '@hidden'") && msg.contains("'w'"), "{msg}");
+        let msg = check("type User = { id: Int, @hidden @hidden x: Int }").err().expect("tenía que fallar");
+        assert!(msg.contains("repetido"), "{msg}");
     }
 }

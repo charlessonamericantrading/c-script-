@@ -1369,6 +1369,81 @@ fn div_or_rem_overflow_message(verb: &str, a: i64, b: i64) -> RuntimeError {
     }
 }
 
+/// GRAMMAR.md §3.232: quita los campos `@hidden` del JSON que sale del
+/// proceso, guiado por el TIPO declarado (un `Value::Struct` no lleva el
+/// nombre de su type). Único punto para rpc, stream y MCP (todos pasan por
+/// `invoke_rpc_with_sessions`) y para las filas en vivo
+/// (`Db::deliver_local`/`subscribe`). Un array bajo un tipo que no es lista
+/// se recorre elemento a elemento: un `stream` declara `T` y devuelve
+/// `T[]` (§3.16). Una unión elige el primer miembro struct cuyos campos
+/// requeridos visibles están todos presentes; un enum con datos no se
+/// recorre (límite documentado en §3.232).
+pub(crate) fn strip_hidden_json(json: serde_json::Value, ty: &crate::types::Type, checker: &Checker) -> serde_json::Value {
+    use crate::types::Type;
+    use serde_json::Value as J;
+    match (json, ty) {
+        (J::Null, _) => J::Null,
+        (j, Type::Optional(inner)) => strip_hidden_json(j, inner, checker),
+        (J::Array(items), Type::List(inner)) => J::Array(items.into_iter().map(|i| strip_hidden_json(i, inner, checker)).collect()),
+        (J::Array(items), Type::Tuple(parts)) => J::Array(
+            items
+                .into_iter()
+                .zip(parts.iter().chain(std::iter::repeat(&Type::Dynamic)))
+                .map(|(i, t)| strip_hidden_json(i, t, checker))
+                .collect(),
+        ),
+        (J::Array(items), ty) => J::Array(items.into_iter().map(|i| strip_hidden_json(i, ty, checker)).collect()),
+        (J::Object(map), Type::Struct { name, fields }) => strip_hidden_struct(map, name.as_deref(), fields, checker),
+        (J::Object(map), Type::Generic(name, args)) => match checker.expand_generic_struct(name, args) {
+            Ok(fields) => strip_hidden_struct(map, Some(name), &fields, checker),
+            Err(_) => J::Object(map),
+        },
+        (J::Object(map), Type::MapOf(_, v)) => {
+            J::Object(map.into_iter().map(|(k, j)| (k, strip_hidden_json(j, v, checker))).collect())
+        }
+        (J::Object(map), Type::Union(members)) => {
+            let pick = members.iter().find(|m| match m {
+                Type::Struct { name, fields } => fields
+                    .iter()
+                    .filter(|f| !f.optional && !field_is_hidden(checker, name.as_deref(), &f.name))
+                    .all(|f| map.contains_key(&f.name)),
+                _ => false,
+            });
+            match pick {
+                Some(m) => strip_hidden_json(J::Object(map), m, checker),
+                None => J::Object(map),
+            }
+        }
+        (j, _) => j,
+    }
+}
+
+fn field_is_hidden(checker: &Checker, type_name: Option<&str>, field: &str) -> bool {
+    type_name.and_then(|n| checker.hidden_fields.get(n)).is_some_and(|set| set.contains(field))
+}
+
+fn strip_hidden_struct(
+    mut map: serde_json::Map<String, serde_json::Value>,
+    name: Option<&str>,
+    fields: &[crate::types::FieldType],
+    checker: &Checker,
+) -> serde_json::Value {
+    if let Some(set) = name.and_then(|n| checker.hidden_fields.get(n)) {
+        for hidden in set {
+            map.remove(hidden);
+        }
+    }
+    // `get_mut` + reemplazo, no remove+insert: con `preserve_order` eso
+    // movería la clave al final y cambiaría el orden del JSON.
+    for f in fields {
+        if let Some(slot) = map.get_mut(&f.name) {
+            let taken = std::mem::take(slot);
+            *slot = strip_hidden_json(taken, &f.ty, checker);
+        }
+    }
+    serde_json::Value::Object(map)
+}
+
 /// GRAMMAR.md §3.230: la consulta ordenada que `db.<c>.orderBy(...)`
 /// devuelve -- ver `Value::DbQuery`.
 #[derive(Debug, Clone, PartialEq)]
@@ -4257,7 +4332,15 @@ pub fn invoke_rpc_with_sessions(
 
     let result = eval_block(&rpc.body, &env, db, &fns, &checker, sessions, current_token, &step_budget)?;
     let simple_enums = simple_enum_names(program);
-    Ok(value_to_json(&result, &simple_enums))
+    // GRAMMAR.md §3.232: los campos `@hidden` se quitan ACÁ, en el único
+    // borde por el que sale un resultado (rpc, stream y MCP pasan todos por
+    // esta función) -- guiado por el tipo de retorno DECLARADO, porque un
+    // `Value::Struct` no lleva el nombre de su type.
+    let json = value_to_json(&result, &simple_enums);
+    Ok(match checker.resolve_type(&rpc.return_type) {
+        Ok(ret_ty) if !checker.hidden_fields.is_empty() => strip_hidden_json(json, &ret_ty, &checker),
+        _ => json,
+    })
 }
 
 /// Convierte el JSON que llegó por el wire al `Value` interno que
@@ -11238,5 +11321,60 @@ mod order_by_tests {
         assert_eq!(call("memDesc", json!({})), vec![3, 2, 1, 5], "sortByDesc = mismo orden que orderByDesc");
         assert_eq!(call("memAsc", json!({})), vec![1, 2, 3, 5], "sortBy = mismo orden que orderBy");
         assert_eq!(call("memStr", json!({})), vec![1, 3, 2, 5], "sortBy estable: los 'a' conservan su orden por id");
+    }
+}
+
+/// GRAMMAR.md §3.232 (PLAN.md §9.19 ítem 7): `@hidden` se quita en el
+/// borde JSON de un rpc (también anidado en listas y structs) y en las
+/// filas en vivo de `subscribe`, mientras el cuerpo del rpc lo sigue
+/// leyendo. El harness saltea el checker; `checker.rs::hidden_tests` y
+/// `tests/cli_hidden.rs` cubren la parte de tipos y el codegen.
+#[cfg(test)]
+mod hidden_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+    use serde_json::json;
+
+    #[test]
+    fn hidden_fields_never_leave_the_process_but_stay_readable_inside() {
+        let src = r#"
+            type User = { id: Int, email: String, @hidden passwordHash: String }
+            type NewUser = { email: String, passwordHash: String }
+            type Report = { owner: User, n: Int }
+            db { users: User[] }
+            service S {
+                rpc create(email: String, hash: String) -> User { db.users.insert(NewUser { email: email, passwordHash: hash }) }
+                rpc all() -> User[] { db.users.all() }
+                rpc report() -> Report[] { db.users.all().map(|u: User| { Report { owner: u, n: 1 } }) }
+                rpc countWithHash(h: String) -> Int { db.users.all().filter(|u: User| { u.passwordHash == h }).length() }
+            }
+        "#;
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let (snapshot_before, rx) = db.subscribe("users").unwrap();
+        assert!(snapshot_before.is_empty());
+
+        let created = invoke_rpc(&program, "S", "create", &json!({"email": "a@x", "hash": "h1"}), &db).unwrap();
+        assert_eq!(created["email"], "a@x");
+        assert!(created.get("passwordHash").is_none(), "{created}");
+
+        let all = invoke_rpc(&program, "S", "all", &json!({}), &db).unwrap();
+        assert!(all[0].get("passwordHash").is_none(), "{all}");
+        let report = invoke_rpc(&program, "S", "report", &json!({}), &db).unwrap();
+        assert_eq!(report[0]["n"], 1);
+        assert!(report[0]["owner"].get("passwordHash").is_none(), "anidado en un struct: {report}");
+        assert_eq!(report[0]["owner"]["email"], "a@x");
+
+        // Dentro del proceso el campo sigue ahí.
+        assert_eq!(invoke_rpc(&program, "S", "countWithHash", &json!({"h": "h1"}), &db).unwrap(), json!(1));
+
+        // Fila en vivo y snapshot de `subscribe`: sin el campo.
+        let live = rx.try_recv().expect("la inserción publica una fila en vivo");
+        assert!(live.get("passwordHash").is_none(), "{live}");
+        assert_eq!(live["email"], "a@x");
+        let (snapshot, _rx2) = db.subscribe("users").unwrap();
+        assert!(snapshot[0].get("passwordHash").is_none(), "{snapshot:?}");
     }
 }

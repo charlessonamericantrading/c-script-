@@ -170,7 +170,8 @@ fn emit_enum_zod(out: &mut String, e: &EnumDecl, checker: &Checker) -> Result<()
 fn emit_struct_zod(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(), String> {
     let TypeExpr::Struct(fields) = &t.ty else { return Ok(()) };
     out.push_str(&format!("export const {}Schema = z.object({{\n", t.name));
-    for f in fields {
+    // GRAMMAR.md §3.232: un campo `@hidden` nunca llega al cliente.
+    for f in fields.iter().filter(|f| !f.hidden()) {
         // Mismo bug/fix que el de los ADT genéricos arriba (GRAMMAR.md
         // §3.132) -- confirmado a mano contra el binario real: un `type
         // Box<T> = { value: T }` rompía `linkc build` ENTERO ("tipo

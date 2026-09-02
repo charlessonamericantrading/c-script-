@@ -2155,6 +2155,17 @@ db { users: User[] }
     /// próxima publicación a esa colección, así que este conteo puede
     /// sobre-reportar temporalmente hasta esa próxima escritura; no hay
     /// forma de saber que un cliente se fue sin intentar escribirle.
+    /// GRAMMAR.md §3.232: la fila de `collection` sin sus campos `@hidden`
+    /// (`None` si el programa no declara ninguno -- el camino normal no
+    /// clona nada).
+    fn strip_hidden_row(&self, collection: &str, json: &serde_json::Value) -> Option<serde_json::Value> {
+        if self.checker.hidden_fields.is_empty() {
+            return None;
+        }
+        let elem_ty = self.checker.db_collections().get(collection)?;
+        Some(super::strip_hidden_json(json.clone(), elem_ty, &self.checker))
+    }
+
     pub fn subscriber_counts(&self) -> Vec<(String, usize)> {
         self.subscribers.lock().iter().map(|(collection, txs)| (collection.clone(), txs.len())).collect()
     }
@@ -2516,8 +2527,14 @@ db { users: User[] }
         // Si esto falla, el sender ya registrado queda huérfano en el mapa
         // -- inofensivo: `deliver_local` poda cualquier sender desconectado
         // de forma perezosa, en la próxima publicación a esta colección.
-        let snapshot: Vec<serde_json::Value> =
-            self.select_rows(collection, columns, None)?.iter().map(|v| value_to_json(v, &self.simple_enums)).collect();
+        let snapshot: Vec<serde_json::Value> = self
+            .select_rows(collection, columns, None)?
+            .iter()
+            .map(|v| {
+                let json = value_to_json(v, &self.simple_enums);
+                self.strip_hidden_row(collection, &json).unwrap_or(json)
+            })
+            .collect();
         Ok((snapshot, rx))
     }
 
@@ -2700,6 +2717,12 @@ db { users: User[] }
     /// soltar el candado de la conexión (ver el comentario de
     /// `commit_transaction` arriba para el porqué exacto).
     pub(crate) fn deliver_local(&self, collection: &str, json: &serde_json::Value) {
+        // GRAMMAR.md §3.232: las filas en vivo salen por acá (publish,
+        // remotas, externas por trigger) -- un solo punto para quitar los
+        // campos `@hidden` de la colección antes de que lleguen a un
+        // suscriptor.
+        let stripped = self.strip_hidden_row(collection, json);
+        let json = stripped.as_ref().unwrap_or(json);
         let mut subs = self.subscribers.lock();
         if let Some(list) = subs.get_mut(collection) {
             // `try_send` -- NUNCA bloqueante: publicar no puede colgar el

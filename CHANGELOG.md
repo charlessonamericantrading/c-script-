@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.190.0] - 2026-09-02
+
+### ✨ Añadido
+**`@hidden` sobre un campo: existe en la colección y es legible dentro del rpc, pero nunca sale del proceso (PLAN.md §9.19 ítem 7)**: se quita del JSON de rpc, stream y MCP (un solo borde, `invoke_rpc_with_sessions`, guiado por el tipo de retorno declarado, también anidado en listas/structs/tuplas/Map/genéricos/uniones) y de las filas en vivo (`Db::deliver_local` + snapshot de `subscribe`), y no aparece en `contract.d.ts`, `schemas.ts`, `openapi.json` ni los revivers de `validators.ts`. El checker rechaza `@hidden` sobre `id` y un type con campos `@hidden` como parámetro de rpc (el contrato no podría mandarlos). Caso real: `secret_key`/`auth_config`/`password_hash` del CRM viajando por un stream que §3.16 obliga a devolver la fila entera. Ver GRAMMAR.md §3.232.
+
 ## [1.189.0] - 2026-09-02
 
 ### ✨ Añadido

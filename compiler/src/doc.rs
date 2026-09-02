@@ -267,7 +267,13 @@ fn render_type_decl(t: &TypeDecl) -> String {
     if let TypeExpr::Struct(fields) = &t.ty {
         fields_table.push_str(r#"<table class="params-table"><thead><tr><th>Campo</th><th>Tipo</th><th>Requerido</th></tr></thead><tbody>"#);
         for f in fields {
-            let req = if f.optional { "Opcional" } else { "Requerido" };
+            let req = if f.hidden() {
+                "@hidden (no sale en el JSON)"
+            } else if f.optional {
+                "Opcional"
+            } else {
+                "Requerido"
+            };
             let ty_str = format!("{:?}", f.ty);
             fields_table.push_str(&format!(
                 r#"<tr><td><code>{}</code></td><td><span class="type-pill">{}</span></td><td>{}</td></tr>"#,

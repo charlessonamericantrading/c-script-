@@ -204,7 +204,8 @@ fn struct_openapi_schema(t: &TypeDecl, checker: &Checker) -> Result<Option<Value
     let TypeExpr::Struct(fields) = &t.ty else { return Ok(None) };
     let mut props = json!({});
     let mut required = Vec::new();
-    for f in fields {
+    // GRAMMAR.md §3.232: un campo `@hidden` nunca llega al cliente.
+    for f in fields.iter().filter(|f| !f.hidden()) {
         // Mismo bug/fix que en `zod_emit.rs` (GRAMMAR.md §3.132): un `type
         // Box<T> = { value: T }` rompía `linkc build` ENTERO ("tipo
         // desconocido: 'T'") con `resolve_type` a secas -- confirmado a mano

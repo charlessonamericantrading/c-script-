@@ -725,7 +725,17 @@ fn render_revive(
             body.push_str(&format!("return ({expr} as any);\n"));
             format!("((): any => {{\n{body}}})()")
         }
-        Type::Struct { fields, .. } => render_struct_revive(fields, expr, checker, worklist, seen)?,
+        // GRAMMAR.md §3.232: un campo `@hidden` no viene en el JSON, así
+        // que no hay nada que revivir ahí (y su reviver lo daría por
+        // presente).
+        Type::Struct { name, fields } => {
+            let visible: Vec<FieldType> = fields
+                .iter()
+                .filter(|f| !name.as_deref().and_then(|n| checker.hidden_fields.get(n)).is_some_and(|set| set.contains(&f.name)))
+                .cloned()
+                .collect();
+            render_struct_revive(&visible, expr, checker, worklist, seen)?
+        }
         _ => unreachable!("cubierto por reviver_fn_name o contains_int64 = false"),
     }))
 }

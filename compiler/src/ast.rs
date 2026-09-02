@@ -319,6 +319,14 @@ impl Field {
     pub fn encrypted(&self) -> bool {
         self.annotations.iter().any(|a| matches!(a, FieldAnnotation::Encrypted))
     }
+
+    /// ¿Lleva `@hidden`? (GRAMMAR.md §3.232) -- el campo existe en la
+    /// colección y es legible dentro del cuerpo de un rpc, pero nunca sale
+    /// del proceso: se quita del JSON de rpc/stream/MCP y no aparece en el
+    /// contrato generado.
+    pub fn hidden(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, FieldAnnotation::Hidden))
+    }
 }
 
 impl PartialEq for Field {
@@ -368,6 +376,13 @@ pub enum FieldAnnotation {
     /// constraint SQL sobre esa columna sería siempre "único", incluso para
     /// el mismo valor en texto plano -- una garantía falsa, no una real).
     Encrypted,
+    /// `@hidden` (sin paréntesis) -- GRAMMAR.md §3.232. Solo sobre campos
+    /// de un `type` (nunca `id`): el campo se guarda y se lee como
+    /// cualquier otro, pero `invoke_rpc_with_sessions`/`Db::deliver_local`
+    /// lo quitan del JSON que sale del proceso, y `ts_emit`/`zod_emit`/
+    /// `openapi_emit` lo omiten del contrato. Un type con campos `@hidden`
+    /// no puede ser parámetro de rpc (el checker lo rechaza).
+    Hidden,
 }
 
 /// Las tres formas de `@check(...)` (GRAMMAR.md §3.96) -- mismo criterio de

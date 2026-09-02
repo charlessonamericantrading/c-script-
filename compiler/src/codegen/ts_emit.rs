@@ -1397,7 +1397,8 @@ fn emit_type_decl(out: &mut String, t: &TypeDecl, checker: &Checker) -> Result<(
     match &t.ty {
         TypeExpr::Struct(fields) => {
             out.push_str(&format!("export interface {}{} {{\n", t.name, generics));
-            for f in fields {
+            // GRAMMAR.md §3.232: un campo `@hidden` nunca llega al cliente.
+            for f in fields.iter().filter(|f| !f.hidden()) {
                 let ty = resolve_field_ty(checker, &f.ty, &t.type_params)?;
                 push_field_jsdoc(out, f.deprecated(), f.validator());
                 out.push_str(&format!(

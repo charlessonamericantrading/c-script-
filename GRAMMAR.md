@@ -253,6 +253,7 @@
   - [3.229 `doctor`, `db inspect` y `migrate --dry-run` avisan de una columna con tipo incompatible ANTES de leer una fila — RESUELTO](#3229-doctor-db-inspect-y-migrate---dry-run-avisan-de-una-columna-con-tipo-incompatible-antes-de-leer-una-fila--resuelto)
   - [3.230 `db.<c>.orderBy(...)`/`orderByDesc(...)` encadenados con `.all()`/`.page()`/`.findWhere()` (ORDER BY en SQL) + `List<T>.sortBy`/`sortByDesc` en memoria — RESUELTO](#3230-dbcorderbyorderbydesc-encadenados-con-allpagefindwhere-order-by-en-sql--listtsortbysortbydesc-en-memoria--resuelto)
   - [3.231 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` con clave de agrupación nullable (`T?`): el grupo `null` es un grupo más — RESUELTO](#3231-sumbycountbyavgbymaxbyminby-con-clave-de-agrupación-nullable-t-el-grupo-null-es-un-grupo-más--resuelto)
+  - [3.232 `@hidden` sobre un campo: existe en la colección y dentro del rpc, pero nunca sale del proceso — RESUELTO](#3232-hidden-sobre-un-campo-existe-en-la-colección-y-dentro-del-rpc-pero-nunca-sale-del-proceso--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8056,6 +8057,35 @@ La forma **opcional por clave** (`campo?: T`) sigue rechazada, con un mensaje di
 **Verificado**: checker (la clave nullable tipa con `key: T?`; `campo?: T` rechazado con "opcional por clave"), `tests/cli_group_by_nullable.rs` contra el binario con `linkc test` (`sumBy`/`countBy` con `channel: String?`: tres grupos, y el grupo `null` suma solo sus filas), y `pg_integration.rs` contra Postgres REAL en CI (la decodificación del `NULL` de la clave pasa por `postgres_cell`, no por SQLite).
 
 **Límite honesto**: `null` es un grupo, no "sin grupo" -- si el desglose no debe contarlas, filtralas con `.filter(|g| g.key != null)` después. El orden de los grupos sigue sin estar definido (el del motor); para un orden estable usá `.sortBy(|g: ByChannel| { g.value })` (§3.230), que pone los `null` al final.
+
+### 3.232 `@hidden` sobre un campo: existe en la colección y dentro del rpc, pero nunca sale del proceso — RESUELTO, cierra PLAN.md §9.19 ítem 7
+
+Origen: `PLAN.md §9.19` ítem 7. §3.16 obliga a que un `stream` devuelva la fila entera, así que en el CRM Nexus `secret_key`, `auth_config` y `password_hash` viajaban por el stream de cada tabla que los tenía (mitigado por localhost y la sesión de Express, pero viajaban). Y no había forma de decir "esta columna es del servidor": o el campo estaba en el `type` (y salía por todos lados) o no estaba (y el rpc no podía leerlo).
+
+**Qué hay (v1.190.0)**: una anotación de campo, sin paréntesis, mismo criterio que `@encrypted` (§3.191):
+
+<!-- linkc:check -->
+```rust
+type Account = { id: Int, name: String, @hidden secretKey: String, @hidden authConfig: String? }
+type NewAccount = { name: String, secretKey: String, authConfig: String? }
+db { accounts: Account[] }
+service Accounts {
+  rpc create(name: String, key: String) -> Account { db.accounts.insert(NewAccount { name: name, secretKey: key, authConfig: null }) }
+  rpc keyMatches(id: Int, key: String) -> Bool {
+    db.accounts.all().filter(|a: Account| { a.id == id && a.secretKey == key }).length() == 1
+  }
+  stream live() -> Account { while true { db.accounts.subscribe() } }
+}
+```
+
+- **Dentro del proceso no cambia nada**: la columna se crea, se escribe y se lee como cualquier otra; `a.secretKey` en el cuerpo de un rpc es el `String` de siempre. Se combina con `@encrypted`, `@index`, `@validate`, etc.
+- **Un solo borde de salida**: `invoke_rpc_with_sessions` (por donde pasan rpc, stream y MCP) quita los campos `@hidden` del JSON guiado por el tipo de retorno DECLARADO -- también anidados en listas, structs, tuplas, `Map`, genéricos y uniones (para una unión, el primer miembro struct cuyos campos requeridos visibles están todos presentes). Las filas en vivo (`subscribe`, el snapshot inicial, los cambios remotos de otra instancia y los de un trigger externo, §3.225) pasan todas por `Db::deliver_local`, el otro único punto. Un `Value::Struct` no lleva el nombre de su type, por eso el recorte es por TIPO y no por valor.
+- **El contrato generado no lo conoce**: `contract.d.ts`, `schemas.ts` (Zod), `openapi.json` y los revivers de `validators.ts` omiten el campo del type. `linkc doc` lo marca como `@hidden (no sale en el JSON)`. Un type SIN la anotación (el `NewAccount` de entrada) sigue emitiéndose entero, como siempre.
+- **Dos rechazos del checker**: `@hidden` sobre `id` (todo el runtime y el cliente lo necesitan: `find`, `applyPatch`, `pageAfter`) y un type con campos `@hidden` como PARÁMETRO de rpc/stream, directo o anidado -- el contrato lo emitiría sin esos campos, así que ningún cliente podría mandarlos: una firma imposible de cumplir. Mismo criterio que `NewX` para `insert`: un type de entrada aparte.
+
+**Verificado**: checker (índice de campos ocultos por type; `@hidden id`, `@hidden` repetido y un `Wrapper { users: User[] }` como parámetro rechazados con el mensaje exacto), runtime contra SQLite real (el JSON de `create`/`all` sale sin el campo, un `Report { owner: User }` anidado también, `countWithHash` lo sigue leyendo adentro, y tanto la fila en vivo como el snapshot de `subscribe` salen sin él), y `tests/cli_hidden.rs` contra el binario: `linkc build` genera `contract.d.ts`/`schemas.ts`/`openapi.json` con `Account` sin `secretKey`/`authConfig` y `NewAccount` intacto, y `linkc test` compara la clave adentro del rpc.
+
+**Límite honesto**: el recorte sigue el tipo declarado -- un campo `@hidden` dentro de una variante de enum con datos, o dentro de un `Result<T, E>`/`Patch<T>`, no se recorre (el checker no lo prohíbe; documentado, no atacado). `@hidden` no es cifrado ni control de acceso: el valor sigue en la base en claro salvo que además lleve `@encrypted`, y cualquier rpc puede devolverlo a propósito copiándolo a otro campo visible.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
