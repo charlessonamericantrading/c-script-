@@ -2153,6 +2153,29 @@ fn error_json(message: &str) -> String {
 
 const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
+/// ETag débil de un body (GRAMMAR.md §3.221): `W/"<32 hex>"`, la mitad de
+/// un SHA-256 del body sin comprimir. Determinista (mismo body → mismo
+/// tag, sin reloj ni nonce) y suficiente contra colisiones accidentales --
+/// no es una firma, un cliente no gana nada forjándolo.
+fn weak_etag(body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(body.as_bytes());
+    let hex: String = digest.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    format!("W/\"{hex}\"")
+}
+
+/// `If-None-Match` contra el ETag calculado, con comparación DÉBIL (RFC
+/// 9110 §8.8.3.2): `W/"x"` y `"x"` son el mismo recurso. Acepta la lista
+/// separada por comas y el comodín `*`. Nunca falla: un header malformado
+/// simplemente no coincide y el cliente recibe el 200 completo.
+fn if_none_match_matches(request: &tiny_http::Request, etag: &str) -> bool {
+    let wanted = etag.trim_start_matches("W/").trim_matches('"');
+    request.headers().iter().filter(|h| h.field.as_str().as_str().eq_ignore_ascii_case("If-None-Match")).any(|h| {
+        let value = h.value.as_str();
+        value.trim() == "*" || value.split(',').any(|candidate| candidate.trim().trim_start_matches("W/").trim_matches('"') == wanted)
+    })
+}
+
 /// `true` si la request declaró soportar `gzip` en `Accept-Encoding` (RFC
 /// 9110 §12.5.3) -- mismo patrón de lectura de headers que ya usa este
 /// archivo para `Origin`/`X-Service-Api-Key` más arriba. Un cliente que no
@@ -2234,14 +2257,39 @@ fn cors_response_with_type(
     // MISMO tipo (`Response<Cursor<Vec<u8>>>`) -- por eso las dos ramas
     // (comprimida/sin comprimir) pueden convivir en una sola variable
     // `response` sin duplicar el resto de esta función más abajo.
-    let mut response = match maybe_gzip(&body, accepts_gzip(request)) {
-        Some(gzipped) => {
-            let response = tiny_http::Response::from_data(gzipped).with_status_code(status).with_header(content_type);
-            let encoding = tiny_http::Header::from_bytes(&b"Content-Encoding"[..], &b"gzip"[..]).unwrap();
-            response.with_header(encoding)
+    // ETag débil + `If-None-Match` → 304 (GRAMMAR.md §3.221). Solo sobre un
+    // 200 a un GET: un POST (todo rpc normal) no es cacheable por definición
+    // y un error nunca debe revalidarse como "sin cambios". Débil (`W/`) a
+    // propósito: se calcula sobre el body SIN comprimir, así el mismo
+    // recurso tiene el mismo tag con o sin gzip (un ETag fuerte tendría que
+    // diferir por representación, RFC 9110 §8.8.3) -- y la comparación es
+    // débil en las dos direcciones (`W/"x"` y `"x"` coinciden).
+    let etag = if status == 200 && *request.method() == tiny_http::Method::Get { Some(weak_etag(&body)) } else { None };
+    let not_modified = etag.as_deref().is_some_and(|tag| if_none_match_matches(request, tag));
+    // `Vary: Accept-Encoding` en cuanto el body ES candidato a gzip, no solo
+    // cuando se comprimió: la respuesta a este mismo path VARÍA según lo que
+    // el cliente declare, y una caché intermedia tiene que saberlo también
+    // en la variante sin comprimir (RFC 9110 §12.5.5).
+    let varies_by_encoding = body.len() >= GZIP_MIN_BODY_BYTES;
+    let mut response = if not_modified {
+        // tiny_http omite el body y el Content-Length para un 304 por su
+        // cuenta (`raw_print`, "1xx, 204 and 304 MUST not include a body").
+        tiny_http::Response::from_data(Vec::new()).with_status_code(304)
+    } else {
+        match maybe_gzip(&body, accepts_gzip(request)) {
+            Some(gzipped) => {
+                let response = tiny_http::Response::from_data(gzipped).with_status_code(status).with_header(content_type);
+                let encoding = tiny_http::Header::from_bytes(&b"Content-Encoding"[..], &b"gzip"[..]).unwrap();
+                response.with_header(encoding)
+            }
+            None => tiny_http::Response::from_string(body).with_status_code(status).with_header(content_type),
         }
-        None => tiny_http::Response::from_string(body).with_status_code(status).with_header(content_type),
     };
+    if let Some(tag) = &etag {
+        if let Ok(etag_header) = tiny_http::Header::from_bytes(&b"ETag"[..], tag.as_bytes()) {
+            response = response.with_header(etag_header);
+        }
+    }
     if let Some(url) = location {
         if let Ok(location_header) = tiny_http::Header::from_bytes(&b"Location"[..], url.as_bytes()) {
             response = response.with_header(location_header);
@@ -2274,11 +2322,21 @@ fn cors_response_with_type(
                 tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, Authorization"[..])
                     .unwrap();
             response = response.with_header(allow_methods).with_header(allow_headers);
-            if cors.vary_origin {
-                let vary = tiny_http::Header::from_bytes(&b"Vary"[..], &b"Origin"[..]).unwrap();
-                response = response.with_header(vary);
-            }
         }
+    }
+    // Un solo `Vary` con cada dimensión que aplique (GRAMMAR.md §3.41 para
+    // `Origin`, §3.221 para `Accept-Encoding`): dos headers `Vary` separados
+    // son válidos por RFC pero varios proxies solo leen el primero.
+    let mut vary: Vec<&str> = Vec::new();
+    if cors.allow_origin.is_some() && cors.vary_origin {
+        vary.push("Origin");
+    }
+    if varies_by_encoding {
+        vary.push("Accept-Encoding");
+    }
+    if !vary.is_empty() {
+        let vary_header = tiny_http::Header::from_bytes(&b"Vary"[..], vary.join(", ").as_bytes()).unwrap();
+        response = response.with_header(vary_header);
     }
 
     // Headers de seguridad fijos (GRAMMAR.md §3.41) -- en TODA respuesta,

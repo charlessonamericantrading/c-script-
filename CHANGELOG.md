@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.180.0] - 2026-09-02
+
+### ✨ Añadido
+**`ETag` débil + `If-None-Match` → `304`, y `Vary: Accept-Encoding` (PLAN.md §9.18 Eje B ítem 4)**: toda respuesta 200 a un GET (`@route`s, `/health`, `/live`, `/ready`, `/metrics`) lleva `ETag: W/"<sha256/2>"` del body sin comprimir -- mismo tag con o sin gzip --, y un `If-None-Match` que coincida (comparación débil, lista, `*`) recibe un `304` sin body conservando `Cache-Control`. Nunca en un POST ni en un error. Gzip ahora emite `Vary: Accept-Encoding` en cuanto el body supera el umbral, en un solo header junto a `Origin`. Ver GRAMMAR.md §3.221.
+
 ## [1.179.0] - 2026-09-02
 
 ### ✨ Añadido

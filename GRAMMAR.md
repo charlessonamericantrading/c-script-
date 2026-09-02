@@ -242,6 +242,7 @@
   - [3.218 Test de deriva mecánica de la documentación para agentes (`docs_drift.rs`) — RESUELTO](#3218-test-de-deriva-mecánica-de-la-documentación-para-agentes-docs_driftrs--resuelto)
   - [3.219 `llms.txt` como índice y `llms-full.txt` como detalle — RESUELTO](#3219-llmstxt-como-índice-y-llms-fulltxt-como-detalle--resuelto)
   - [3.220 `/live` y `/ready`: liveness y readiness separados — RESUELTO](#3220-live-y-ready-liveness-y-readiness-separados--resuelto)
+  - [3.221 `ETag` débil + `If-None-Match` → `304`, y `Vary: Accept-Encoding` — RESUELTO](#3221-etag-débil--if-none-match--304-y-vary-accept-encoding--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7801,6 +7802,21 @@ Origen: `PLAN.md §9.18` Eje E ítem 2, la pieza previa al drenado gracioso (ít
 **Cómo usarlo**: Kubernetes → `livenessProbe: /live`, `readinessProbe: /ready`; nginx/HAProxy → el `check` del upstream contra `/ready`; `linkc doctor --target-url` (§3.176) sigue leyendo `/health` (necesita la versión, que los tres devuelven).
 
 **Verificado**: `tests/cli_ready.rs`, 3 tests contra un `linkc serve` real por socket crudo: la forma exacta del JSON de `/live` (y que NO tenga `database`/`checks`), la de `/ready` con `checks.database == "ok"`, y que los dos queden exentos de `--service-api-key` mientras `/metrics` sigue dando 401 sin el header. El camino `503` (base caída) se cubre por construcción con el mismo `health_check()` que `/health` ya prueba contra Postgres real en `pg_integration.rs`.
+### 3.221 `ETag` débil + `If-None-Match` → `304`, y `Vary: Accept-Encoding` — RESUELTO, cierra PLAN.md §9.18 Eje B ítem 4 (y el cruce del Eje D ítem 3)
+
+Origen: `PLAN.md §9.18` Eje B ítem 4. Verificado antes de tocar nada: grep de `etag`/`if-none-match` en `server.rs`, cero; y gzip (§3.180) comprimía sin emitir `Vary: Accept-Encoding` (solo existía `Vary: Origin` para CORS, §3.41). Consecuencia: un `@route` HTML con `@cache_control("public, max-age=3600")` (§3.113) obligaba al navegador a bajar el body ENTERO de nuevo al vencer el TTL aunque no hubiera cambiado, y una caché intermedia podía servir la variante gzip a un cliente que no la aceptaba.
+
+**Qué hay (v1.180.0)**, en `cors_response_with_type` (o sea, en TODA respuesta que no sea un `stream`):
+- **`ETag: W/"<32 hex>"`** en cada respuesta `200` a un **GET** -- `@route`s, `/health`/`/live`/`/ready`, `/metrics`. Nunca en un POST (todo rpc normal: no es cacheable por definición) ni en un error (un 500 no debe revalidarse como "sin cambios"). La mitad de un SHA-256 del body SIN comprimir: determinista (mismo body → mismo tag, sin reloj ni nonce), y no es una firma -- un cliente no gana nada forjándolo.
+- **Débil (`W/`) a propósito**: como se calcula sobre el body sin comprimir, el mismo recurso tiene el MISMO tag con o sin gzip. Un ETag fuerte tendría que diferir por representación (RFC 9110 §8.8.3), lo que rompería la revalidación de un cliente que a veces manda `Accept-Encoding` y a veces no.
+- **`If-None-Match`** con comparación débil en las dos direcciones (`W/"x"` y `"x"` coinciden, RFC 9110 §8.8.3.2), lista separada por comas y comodín `*`. Si coincide → **`304` sin body** (tiny_http omite body y `Content-Length` para 304 por su cuenta), repitiendo `ETag`, `Cache-Control` de `@cache_control`, CORS y los headers fijos. Un header malformado simplemente no coincide: 200 completo, nunca un error.
+- **`Vary: Accept-Encoding`** en cuanto el body es CANDIDATO a gzip (≥ 1024 bytes, el mismo umbral de §3.180), no solo cuando se comprimió -- la respuesta a ese path varía según lo que el cliente declare, y una caché intermedia tiene que saberlo también en la variante sin comprimir (RFC 9110 §12.5.5). Un solo header `Vary` con cada dimensión que aplique (`Origin, Accept-Encoding`): dos headers separados son válidos por RFC pero varios proxies solo leen el primero.
+
+**Costo**: un SHA-256 del body por GET 200. Contra los números de §3.217 (un rpc completo cuesta ~20-90 µs) es despreciable, y solo en GET.
+
+**Verificado**: `tests/cli_etag.rs`, 3 tests por socket crudo contra un `linkc serve` real: ETag presente y determinista en un `@route`, `304` sin body con el tag exacto y con la forma fuerte del mismo valor, 200 con un tag ajeno, `Cache-Control` conservado en el 304; un POST sin ETag e ignorando `If-None-Match: *`; y un body de 3.000 bytes con `Vary: Accept-Encoding` en las dos variantes, MISMO ETag comprimido o no, `304` aunque el cliente acepte gzip, y un body chico (bajo el umbral) sin `Vary: Accept-Encoding`. Los tests existentes de CORS (`Vary: Origin`) y gzip siguen en verde.
+
+**Límite honesto**: sin `Last-Modified`/`If-Modified-Since` (no hay una fecha de modificación real que reportar: un rpc calcula su body cada vez) y sin `If-Match` en escrituras (concurrencia optimista es un diseño propio, no un header). El 304 ahorra el BODY en el wire, no el cómputo: el rpc corre igual para calcular el ETag -- combinarlo con `@cache` (§3.144) es lo que ahorra las dos cosas.
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

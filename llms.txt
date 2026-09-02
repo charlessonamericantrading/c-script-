@@ -68,7 +68,7 @@ JSON body §3.12; `stream` = real SSE, `while true { db.<c>.subscribe() }` pushe
 changes, cross-instance via Postgres LISTEN/NOTIFY §3.13/§3.16/§3.44/§3.150; `@route("/blog/
 :slug")` with multiple params, catch-all `:rest*` and query params §3.37/§3.42/§3.57/§3.62;
 `@content_type` §3.35; `response.setStatus`/`response.redirect` §3.46/§3.111;
-`@cache_control` §3.113; server-side `@cache("60s")` (TTL only) §3.144; `@rate_limit("20/1m")`
+`@cache_control` §3.113; weak `ETag` + `If-None-Match` → `304` on every GET 200, `Vary: Accept-Encoding` §3.221; server-side `@cache("60s")` (TTL only) §3.144; `@rate_limit("20/1m")`
 (+ `key:` param, `--trust-proxy` takes the LAST `X-Forwarded-For`, distributed via Postgres)
 §3.39/§3.142/§3.211/§3.178; `@idempotent` §3.140/§3.167; `@cors` per rpc §3.147; `@deprecated`
 §3.71; `@example` typed into `openapi.json` §3.119; `@cron` §3.159; `@infinite` §3.134; gzip
