@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.186.1] - 2026-09-02
+
+### 🔧 Interno
+**Diagnóstico del test de arrays contra Postgres real**: el `insert` con arrays nativos devolvió 500 en CI (el resto del test -- lectura de la fila externa con los cuatro arrays -- pasó); el test ahora reporta el cuerpo del error y el stderr del servidor. Solo cambia el test; el fix real llega con ese dato.
+
 ## [1.186.0] - 2026-09-02
 
 ### ✨ Añadido

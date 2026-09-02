@@ -4957,7 +4957,12 @@ service Customers {{
     // Escritura desde linkc: la lista se bindea como el array nativo que la
     // columna pide (`integer[]` → Vec<i32>, `text[]` → Vec<String>), y
     // `flags: null` contra una columna nullable queda NULL.
-    let created = instance.rpc("Customers/create", r#"{"name":"desde-linkc","ids":[1,2,3],"tags":["x"]}"#);
+    let created = match instance.try_rpc("Customers/create", r#"{"name":"desde-linkc","ids":[1,2,3],"tags":["x"]}"#) {
+        Ok(v) => v,
+        Err(e) => panic!("create falló: {e}
+--- stderr del servidor ---
+{}", std::fs::read_to_string(&instance.err_path).unwrap_or_default()),
+    };
     assert_eq!(created["product_ids"], serde_json::json!([1, 2, 3]), "{created}");
     assert_eq!(created["tags"], serde_json::json!(["x"]), "{created}");
     assert_eq!(created["flags"], serde_json::Value::Null, "{created}");
