@@ -84,6 +84,14 @@ A small, curated set of errors carry a stable code (`error[L0001]: ...`, same fo
 `linkc explain <code>` (e.g. `linkc explain L0001`) prints the full explanation. See
 GRAMMAR.md §3.210 for the current list.
 
+**Releasing a version**: run `scripts/release.sh "commit message"` after editing
+`compiler/Cargo.toml` (new version), `CHANGELOG.md` and `GRAMMAR.md`. It mechanizes the
+whole ritual — build, snapshot regen, taskboard regen, full suite, commit, tag, push —
+and refuses to start if the CHANGELOG entry or version bump is missing. Two releases
+have shipped with red CI from skipping one of these steps by hand (GRAMMAR.md §3.215);
+don't do the ritual manually anymore. Verifying CI afterwards (`gh run view
+--exit-status`, both CI and Release Binaries) is still on you.
+
 ## Rules of this codebase
 
 - **Run it; do not reason about it.** This project's real bugs have consistently been

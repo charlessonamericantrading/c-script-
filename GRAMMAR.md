@@ -236,6 +236,7 @@
   - [3.212 La entrega de una respuesta correlacionada MCP exige la sesión dueña — RESUELTO](#3212-la-entrega-de-una-respuesta-correlacionada-mcp-exige-la-sesión-dueña--resuelto)
   - [3.213 Una cerca sin lenguaje en la documentación es un error del test de ejemplos — RESUELTO](#3213-una-cerca-sin-lenguaje-en-la-documentación-es-un-error-del-test-de-ejemplos--resuelto)
   - [3.214 `pdf.build`/`excel.build`/`excel.parse` cubiertos end-to-end contra el binario real — RESUELTO](#3214-pdfbuildexcelbuildexcelparse-cubiertos-end-to-end-contra-el-binario-real--resuelto)
+  - [3.215 El ritual de release mecanizado + drift-check completo de artefactos generados — RESUELTO](#3215-el-ritual-de-release-mecanizado--drift-check-completo-de-artefactos-generados--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7710,6 +7711,16 @@ Origen: `PLAN.md §9.17` ítem 7 (Bloque B), auditoría del 02/09/2026. `pdf.bui
 **Límite honesto**: esto cubre el camino compilado+interpretado completo, pero no reemplaza la verificación con herramientas EXTERNAS (el `openpyxl` de la verificación manual de §3.202) -- un `.xlsx` que este proyecto escribe Y lee bien podría, en teoría, tener un defecto que solo otro lector note. Esa verificación externa quedó hecha una vez en §3.202; este test garantiza que el camino no se ROMPA de ahí en más, que es lo que faltaba.
 
 **Verificado**: los 3 tests verdes contra el binario real a la primera; suite completa sin regresiones.
+
+### 3.215 El ritual de release mecanizado + drift-check completo de artefactos generados — RESUELTO, cierra PLAN.md §9.17 ítems 10 y 11
+
+Origen: `PLAN.md §9.17` ítems 10 y 11 (Bloque C), auditoría del 02/09/2026 -- dos mitades del mismo problema de proceso, cerradas juntas.
+
+**Ítem 10 -- el drift-check de CI cubría solo la mitad de los artefactos generados commiteados.** El paso de `ci.yml` que regenera y compara contra el árbol cubría únicamente `examples/users.link.snap`; los 9 artefactos de `examples/taskboard/frontend/src/gen/*` (client.ts, contract.d.ts, openapi.json, schema.postgres.sql, schemas.ts, validators.ts, hooks.ts, llms.txt, llms-full.txt) no se regeneraban ni comparaban NUNCA en CI -- un cambio de codegen podía derivarlos en silencio indefinidamente. Paso nuevo en `ci.yml`: regenerar con el binario recién compilado y exigir `git diff --exit-code` sobre ese directorio, con un mensaje de error que dice exactamente cómo corregir. **Solo en el runner de Linux, a propósito**: git en el runner de Windows puede reescribir line endings en el checkout (autocrlf), y un diff byte-estricto fallaría por CRLF, no por deriva real -- un solo OS alcanza para detectar deriva de CONTENIDO. Verificado localmente simulando el paso exacto (binario debug + `git diff --exit-code`) antes de tocar el yml.
+
+**Ítem 11 -- el ritual de release era 100% memoria.** Bump de versión → build → regenerar snapshot → regenerar taskboard → suite completa → commit → tag → push: siete pasos a mano por versión, y este proyecto ya shipeó DOS veces una versión con CI en rojo por saltear uno (v1.130.0 y v1.165.0, ambas por el snapshot sin regenerar). **`scripts/release.sh`** (primer habitante de `scripts/`) mecaniza la secuencia entera, cortando al primer fallo, con dos guardas ANTES de construir nada: la versión de `Cargo.toml` tiene que tener su entrada `## [X.Y.Z]` en CHANGELOG.md, y el tag `vX.Y.Z` no puede existir todavía (atrapa el "olvidé subir la versión"). `--skip-suite` existe para cuando la suite completa YA corrió verde sobre el mismo árbol -- el flag queda logueado en la salida, no es un atajo silencioso. **Lo que NO hace, a propósito: verificar CI.** `gh run view --exit-status` sigue siendo el último paso manual -- un push verde local nunca prueba CI verde, y automatizar esa espera dentro del script lo volvería un proceso colgado de minutos en vez de un comando que termina.
+
+**Verificado**: los dos guardas probados contra el repo real (tag existente → corta con el mensaje correcto; CHANGELOG sin la entrada → corta con el mensaje correcto), y el script entero dogfooded en su propia release -- esta misma versión (v1.174.0) se shipeó CORRIENDO `scripts/release.sh`, no siguiendo el ritual a mano.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

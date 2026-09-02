@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.174.0] - 2026-09-02
+
+### 🔧 Interno
+**Proceso (PLAN.md §9.17 ítems 10+11): el ritual de release mecanizado en `scripts/release.sh`, y el drift-check de CI extendido a los artefactos del taskboard.** El drift-check cubría solo `users.link.snap`; los 9 artefactos commiteados de `examples/taskboard/frontend/src/gen/*` nunca se comparaban en CI -- ahora se regeneran y se exige diff vacío (solo en Linux, para no confundir CRLF del checkout de Windows con deriva real). Y el ritual de siete pasos que ya produjo dos CI rojos por un paso salteado a mano (v1.130.0, v1.165.0 -- ambas el snapshot sin regenerar) es ahora un script con guardas (entrada de CHANGELOG obligatoria, tag inexistente) que corta al primer fallo. Dogfooded: esta misma versión se shipeó corriendo el script. Ver GRAMMAR.md §3.215.
+
 ## [1.173.0] - 2026-09-02
 
 ### 🔧 Interno

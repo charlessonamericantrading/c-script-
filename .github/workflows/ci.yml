@@ -81,6 +81,24 @@ jobs:
           [ "$RUNNER_OS" = "Windows" ] && BIN="${BIN}.exe"
           "$BIN" test examples/users.link examples/users.link.snap
 
+      - name: Artefactos generados del taskboard sin deriva (GRAMMAR.md §3.215)
+        # Auditoría del 02/09/2026 (PLAN.md §9.17 ítem 10): el chequeo de
+        # arriba cubría SOLO users.link.snap -- los 9 artefactos commiteados
+        # en examples/taskboard/frontend/src/gen/* nunca se regeneraban ni
+        # comparaban, así que un cambio de codegen podía derivarlos en
+        # silencio (y de hecho la deriva de versión-stamp de v1.165.0 solo
+        # se detectó por el snapshot, no por estos). Regenerar y exigir
+        # diff vacío cierra eso. Solo en Linux a propósito: git en el
+        # runner de Windows puede reescribir los line endings del checkout
+        # (autocrlf), y un `git diff --exit-code` byte-estricto fallaría
+        # por CRLF, no por deriva real -- un solo OS alcanza para detectar
+        # deriva de contenido.
+        if: runner.os == 'Linux'
+        run: |
+          compiler/target/debug/linkc build examples/taskboard/backend/taskboard.link examples/taskboard/frontend/src/gen
+          git diff --exit-code -- examples/taskboard/frontend/src/gen \
+            || { echo "::error::los artefactos generados del taskboard derivaron -- regenerá con 'linkc build examples/taskboard/backend/taskboard.link examples/taskboard/frontend/src/gen' y commitealos"; exit 1; }
+
       - name: Confirmar que el frontend tipa limpio contra el contrato generado
         working-directory: frontend
         run: npx tsc --noEmit
