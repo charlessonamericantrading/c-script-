@@ -3,6 +3,14 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.177.0] - 2026-09-02
+
+### 🐛 Corregido
+**Deriva real en la documentación para agentes (PLAN.md §9.18 Eje C ítem 2)**: `README.md`/`README.es.md`/`llms.txt` decían que `--trust-proxy` usa el PRIMER `X-Forwarded-For` (es el ÚLTIMO desde v1.170.0, §3.211) y que `link-lang` "no está en npm" (publicado desde el 30/08/2026); `linkc --help` omitía cuatro flags reales (`--template`, `--port-registry`, `--service-api-key-exempt`, `--mcp-jwt-secret`). Todo corregido.
+
+### ✨ Añadido
+**`compiler/tests/docs_drift.rs`**: dos tests que atrapan la deriva MECÁNICA de la prosa que lee un agente -- toda cita `§3.N` existe en GRAMMAR.md, y todo `--flag` nombrado junto a `linkc` está en la salida real de `linkc --help` (en las dos direcciones: flag fantasma en la doc, o flag real que `--help` olvidó). Ver GRAMMAR.md §3.218.
+
 ## [1.176.0] - 2026-09-02
 
 ### ✨ Añadido

@@ -55,7 +55,7 @@ this section wins. Verified on 2026-08-24 by running the compiler, not by readin
 - `dateFromParts(year, month, day, hour, minute, second) -> Timestamp` builds an arbitrary `Timestamp` from calendar parts — `now()` only ever gave the *current* instant, so computing something like a quarter's start date entirely inside an rpc was impossible before this. An invalid date (month 13, February 30) is a 400 naming the bad field, never a panic
 - A `Timestamp` field now reads AND writes native PostgreSQL `date`/`timestamp`/`timestamptz` columns, not just the `BIGINT`-milliseconds convention `linkc build` generates — the common case when adopting an existing table, where date columns are almost always the Postgres-native type. Encoded/decoded by hand against Postgres's raw binary wire format (no new `chrono` dependency); `linkc introspect` now recommends `Timestamp` with no warning for these columns instead of a `String` mapping that, in practice, didn't work either. Writing was the more dangerous half of this gap: before the fix, `insert`/`applyPatch` against a native column silently stored the wrong calendar date (both values are 8-byte binary, so Postgres accepted them without error) instead of failing loudly
 - A `Float` field now decodes native PostgreSQL `numeric`/`decimal` columns too, not just `float4`/`float8` — the common case for a money column on an adopted table, since `numeric` is precisely what avoids the binary rounding error `float8` has. Decoded by hand against the wire format (no new dependency), same spirit as the `Timestamp` fix above. Read-only for now. Separately, writing an `Int` against an adopted table whose `id` (or any other `Int` column) is physically `SERIAL`/`SMALLINT` rather than `BIGINT` is now fixed too — the write path was silently corrupting the wire protocol by always encoding 8 bytes regardless of the column's real width
-- `--trust-proxy`/`LINK_TRUST_PROXY` for `linkc serve`: makes `@rate_limit` identify the client by the first `X-Forwarded-For` value instead of `remote_addr()` — off by default, since `remote_addr()` is always the proxy's own IP behind a real reverse proxy/load balancer (confirmed as a real production blocker: the IgnisLove adoption runs entirely behind nginx), sharing the limit across every real user at once. Explicit opt-in on purpose — turning it on without an actual trusted proxy in front lets any direct client dodge the limit by sending a different header on each request. v0 trusts the whole header once enabled, no "N trusted hops" or CIDR-range mechanism yet
+- `--trust-proxy`/`LINK_TRUST_PROXY` for `linkc serve`: makes `@rate_limit` identify the client by the LAST `X-Forwarded-For` value (the one appended by your own proxy -- never the first, which the client itself controls; v1.170.0, GRAMMAR.md §3.211) instead of `remote_addr()` — off by default, since `remote_addr()` is always the proxy's own IP behind a real reverse proxy/load balancer (confirmed as a real production blocker: the IgnisLove adoption runs entirely behind nginx), sharing the limit across every real user at once. Explicit opt-in on purpose — turning it on without an actual trusted proxy in front lets any direct client dodge the limit by sending a different header on each request. v0 trusts the whole header once enabled, no "N trusted hops" or CIDR-range mechanism yet
 - `linkc lint` flags `==`/`!=` on anything named like a secret (`token`, `password`, `apiKey`, ...) with `timing-unsafe-secret-comparison`, recommending `crypto.timingSafeEqual` instead — a plain `==` on a `String` short-circuits at the first differing byte, leaking how much of it a guesser got right. Comparing against `null` (a presence check) is deliberately exempt. Walks the whole body at any nesting depth (`if`/`match`/`while`/closures); purely informational, `linkc lint` still exits 0
 - `linkc lint` also flags a top-level `const` whose literal value looks like a connection URL with embedded credentials, or whose name suggests a secret with a non-empty literal value — `hardcoded-secret-literal`. The message recommends reading the value with `env.get("...")` at the point of use instead, since a `const` in c-script can only hold a literal (a call like `env.get(...)` there is a separate compile error, never a valid replacement for the const's value)
 - `/health` (`/`, `/status`) checks real database connectivity — a `SELECT 1` on every request, no caching. Until now it always returned a fixed `200`, useless for any orchestrator (Kubernetes, a load balancer) deciding whether to restart the process: it could be alive and yet unable to serve any real rpc because the database was down, and `/health` would still report everything fine. Returns `503` with `"status":"error"` and the real failure in a new `"database"` field when the check fails; on Postgres it goes through the same connection auto-repair as any other query, so a transient drop heals itself right there
@@ -119,7 +119,6 @@ this section wins. Verified on 2026-08-24 by running the compiler, not by readin
 | Full user struct is not auto-loaded into session | `auth.currentRole()` and `auth.currentUserId()` expose the authenticated role and numeric user id, but loading the full `User` struct into memory is done explicitly via `db.users.find(uid)`. |
 | Aggregation (`sumBy`/etc.) has no date bucketing | Can't `GROUP BY` a truncated date (monthly cohorts, for example) — grouping by a bare `Timestamp` field isn't accepted, and there's no truncation method to bucket one first. `Int64` support landed — see Works today. |
 | Cross-instance `stream` push (LISTEN/NOTIFY) has real limits | A changed row over 8000 bytes (Postgres's own NOTIFY payload cap) doesn't propagate to other instances — it still publishes locally where it was written. NOTIFY is best-effort with no retry queue; an idle server can take up to 200ms to notice a remote change; each instance opens one extra Postgres connection just for LISTEN; SQLite doesn't participate at all. |
-| No npm package | `link-lang` is not on the npm registry yet. GitHub releases work — see Installation below. |
 | `linkc wasm` | Deliberately frozen at integer/boolean scalar functions; the production path is `wasm32-wasip1`. |
 | The web playground compiles one file only | Runs the real lexer/parser/checker/codegen (compiled to `wasm32-unknown-unknown`), but bypasses the module loader: no `import` across files, and no `test` execution (that needs the native interpreter). |
 
@@ -139,10 +138,16 @@ irm https://raw.githubusercontent.com/charlessonamericantrading/c-script-/master
 
 #### 🌐 via NPM / npx
 
-> **Not published yet.** `link-lang` is not on the npm registry. Use one of the installers
-> above (they download the real prebuilt binary from
-> [GitHub Releases](https://github.com/charlessonamericantrading/c-script-/releases)), or
-> build from source:
+```bash
+npx linkc --version          # one-off, no install
+npm install -g link-lang     # global `linkc` command
+```
+
+`link-lang` is a thin installer, not the compiler itself: on first run it downloads the
+prebuilt `linkc` for your platform from the latest
+[GitHub Release](https://github.com/charlessonamericantrading/c-script-/releases), verifies
+it against the published `SHA256SUMS.txt`, and caches it in `~/.c-script/bin`. Windows x64,
+Linux x64, macOS Intel and Apple Silicon. Or build from source:
 
 ```bash
 git clone https://github.com/charlessonamericantrading/c-script-.git
@@ -319,6 +324,11 @@ example published in this repository's documentation:
 cd compiler
 cargo test
 ```
+
+Performance has a baseline too: `cargo bench --bench smoke` measures type-checking the
+reference program, a real INSERT and two reads through the interpreter, and a pure
+1,000-iteration loop (GRAMMAR.md §3.217 has the numbers and what they mean). Run it before
+and after any change to the runtime and put both numbers in the CHANGELOG.
 
 ---
 

@@ -239,6 +239,7 @@
   - [3.215 El ritual de release mecanizado + drift-check completo de artefactos generados — RESUELTO](#3215-el-ritual-de-release-mecanizado--drift-check-completo-de-artefactos-generados--resuelto)
   - [3.216 Cero warnings de clippy, `-D warnings` en CI, y `ServeConfig` — RESUELTO](#3216-cero-warnings-de-clippy--d-warnings-en-ci-y-serveconfig--resuelto)
   - [3.217 Benchmarks de humo (`cargo bench --bench smoke`) — RESUELTO](#3217-benchmarks-de-humo-cargo-bench---bench-smoke--resuelto)
+  - [3.218 Test de deriva mecánica de la documentación para agentes (`docs_drift.rs`) — RESUELTO](#3218-test-de-deriva-mecánica-de-la-documentación-para-agentes-docs_driftrs--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7758,6 +7759,21 @@ Los números son orientativos (una máquina, un día), no un SLA -- lo que impor
 **Lo que NO mide, a propósito**: `linkc serve` bajo carga concurrente. Un pool de hilos/conexiones (Eje B ítems 2 y 3) se mide con un cliente externo contra un servidor real, no dentro de criterion -- ese harness llega con esa ronda. El programa del benchmark se tipa con el checker REAL antes de medir (no con el harness `program_from` de los tests unitarios, que lo saltea, §3.204): un benchmark sobre un programa que no compila mediría basura.
 
 **CI**: `cargo clippy --all-targets` (§3.216) ya compila los benches en cada push -- un bench que no compila rompe CI. No se CORREN en CI a propósito: un runner compartido da números con ruido de ±30% y una regresión "detectada" ahí sería falsa la mitad de las veces. Correr `cargo bench --bench smoke` antes y después en el mismo commit es responsabilidad de quien toca `runtime/mod.rs`/`db.rs`/`server.rs`, y el CHANGELOG de ese cambio lleva los dos números.
+### 3.218 Test de deriva mecánica de la documentación para agentes (`docs_drift.rs`) — RESUELTO, cierra PLAN.md §9.18 Eje C ítem 2
+
+Origen: `PLAN.md §9.18` Eje C ítem 2. `docs_examples.rs` (§3.213) garantiza que el CÓDIGO publicado compila; nada garantizaba que la PROSA que un agente lee para decidir qué comando correr o qué sección abrir siga siendo cierta. Y no lo era -- todo lo de abajo se encontró contra el binario real en la auditoría del 02/09/2026, no por hipótesis:
+
+- `README.md`, `README.es.md` y `llms.txt` decían que `--trust-proxy` identifica al cliente por el PRIMER valor de `X-Forwarded-For`. v1.170.0 (§3.211) lo cambió al ÚLTIMO por seguridad (el primero lo escribe el cliente), y nadie tocó los tres archivos: un agente que leyera eso razonaría sobre el comportamiento inseguro viejo.
+- `README.md`, `README.es.md` y `llms.txt` decían que `link-lang` "no está en npm todavía" (en dos lugares cada uno: la tabla de "lo que no funciona" y la sección de instalación). Está publicado desde el 30/08/2026 (PLAN.md §8.1.1, `npx linkc`/`npm install -g link-lang` reales, versión 1.150.3 en el registro; el instalador baja SIEMPRE el último release de GitHub, así que la versión del paquete npm no pinea la del binario).
+- `linkc --help` omitía cuatro flags REALES que la documentación sí nombra: `--template` de `linkc new` (§8.1), `--port-registry` (§3.153) y `--service-api-key-exempt` (§3.93) de `serve-all`, y `--mcp-jwt-secret` (§3.203) de `serve`. Un agente que use `--help` como fuente de verdad (lo razonable) los daría por inexistentes. Los cuatro estaban en el mensaje de "uso:" del propio subcomando -- en la misma función, a 100 líneas del listado general que nadie actualizó.
+
+**Qué hay (v1.177.0)**: `compiler/tests/docs_drift.rs`, dos tests sobre la misma lista de archivos que `docs_examples.rs` (README en ambos idiomas, `llms.txt`/`llms-full.txt`, los cuatro archivos de reglas para agentes, `docs/*.md`, `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING.md`):
+1. **Toda cita `§3.N` existe como `### 3.N` en GRAMMAR.md.** Una cita a una sección renumerada o inexistente manda al lector a la nada. (`PLAN.md §3.N` se excluye: sería una sección de PLAN.md.)
+2. **Todo `--flag` en una línea que menciona `linkc` está en la salida real de `linkc --help`** del binario que el test compila (`CARGO_BIN_EXE_linkc`). En las DOS direcciones: un flag inventado por la documentación falla, y un flag real que `--help` olvidó listar también -- ese fue el caso de los cuatro de arriba. Se descartan los destinos de links Markdown (un anchor de GitHub convierte `-D warnings` en `--d-warnings`) y dos flags que aparecen junto a `linkc` sin ser suyos (`cargo build --release`, `linkc --help`).
+
+Los seis textos derivados quedaron corregidos en la misma versión (el test 2 no hubiera pasado sin arreglar `--help`; los de X-Forwarded-For y npm son deriva SEMÁNTICA, que ningún test mecánico atrapa -- se arreglaron leyendo, y quedan acá como registro de que pasa de verdad y de qué forma toma).
+
+**Límite honesto**: esto atrapa la deriva MECÁNICA (referencias rotas, flags fantasma), que es la mayoría por volumen, no la semántica ("primer" vs. "último"). Lo segundo solo lo cubre la disciplina de que un cambio de comportamiento toque la documentación en el mismo commit -- este test hace que al menos la parte verificable no dependa de esa disciplina.
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
