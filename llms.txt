@@ -296,6 +296,7 @@ difference between code that compiles and code that does not.
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
 `orderBy(|x: T| x.field)` / `orderByDesc(...)` then `.all()` / `.page(limit, offset)` / `.findWhere(...)` -- ORDER BY (NULLS LAST, "id" tiebreak) pushed into the SQL; chain a second orderBy* for a secondary key; only reads, never pageAfter/insert (§3.230)
 `List<T>.sortBy(|x: T| key)` / `sortByDesc(...)` -- in-memory, same rules as SQL (nulls last, stable) (§3.230)
+`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` accept a nullable group key (`field: T?`): the NULL rows are one more group, result key types `T?` (§3.231)
 `page(limit: Int, offset: Int) -> T[]` (LIMIT/OFFSET pushed to real SQL, not `all().take(n)`
 — see GRAMMAR.md §3.48), `insert(Omit<T,"id">) -> T`, `insertMany(items) -> T[]` (GRAMMAR.md
 §3.76), `applyPatch(id, patch) -> T`, `delete(id) -> Bool`, `deleteWhere(pred) -> Int`,

@@ -252,6 +252,7 @@
   - [3.228 Columnas `ARRAY` nativas de PostgreSQL como `Int[]`/`String[]`/`Bool[]`/`Float[]`, y `linkc triggers --only-streams` — RESUELTO](#3228-columnas-array-nativas-de-postgresql-como-intstringboolfloat-y-linkc-triggers---only-streams--resuelto)
   - [3.229 `doctor`, `db inspect` y `migrate --dry-run` avisan de una columna con tipo incompatible ANTES de leer una fila — RESUELTO](#3229-doctor-db-inspect-y-migrate---dry-run-avisan-de-una-columna-con-tipo-incompatible-antes-de-leer-una-fila--resuelto)
   - [3.230 `db.<c>.orderBy(...)`/`orderByDesc(...)` encadenados con `.all()`/`.page()`/`.findWhere()` (ORDER BY en SQL) + `List<T>.sortBy`/`sortByDesc` en memoria — RESUELTO](#3230-dbcorderbyorderbydesc-encadenados-con-allpagefindwhere-order-by-en-sql--listtsortbysortbydesc-en-memoria--resuelto)
+  - [3.231 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` con clave de agrupación nullable (`T?`): el grupo `null` es un grupo más — RESUELTO](#3231-sumbycountbyavgbymaxbyminby-con-clave-de-agrupación-nullable-t-el-grupo-null-es-un-grupo-más--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -3187,8 +3188,9 @@ variante real comparable con `==` -- `compiler/tests/pg_integration.rs`
 repite `sumBy`/`countBy` contra un PostgreSQL real en CI. Más 8 tests de
 compilación (`checker.rs`) para cada camino de rechazo: selector
 derivado, tipo de agrupación inválido, tipo de valor inválido, campo
-opcional (las dos formas), aridad de argumentos, y que agrupar por un
-enum tipa con el enum real como key.
+opcional (las dos formas -- desde §3.231 la forma nullable `T?` SÍ
+agrupa, y el test pasó a probar solo la forma por clave), aridad de
+argumentos, y que agrupar por un enum tipa con el enum real como key.
 
 ### 3.53 `auth.createSessionWithId()` y `auth.currentUserId()`: asociar e inspeccionar el id del caller — RESUELTO
 
@@ -8018,7 +8020,7 @@ service Events {
 ```
 
 - **`db.<c>.orderBy(|item: T| item.campo)` / `orderByDesc(...)`** no consultan nada todavía: devuelven una *consulta ordenada* (tipo interno `Type::DbQuery`), y es el `all()`, `page(limit, offset)` o `findWhere(...)` que venga después el que lleva el `ORDER BY` DENTRO de su SQL -- para "los 50 más nuevos de 15.000" viajan 50 filas, no 15.000. Encadenar otro `orderBy*` agrega una clave secundaria. `findWhere` sigue empujando el predicado cuando tiene la forma de §3.95/§3.108/§3.109/§3.170/§3.171 (`WHERE ... ORDER BY ...` en una sola query); con un predicado no empujable, el `ORDER BY` igual viaja en SQL y el filtro corre en memoria conservando ese orden.
-- **Selector**: la misma forma exacta que `maxRow`/`minRow` (`|item: T| item.campo`, `recognize_field_selector`); cualquier expresión derivada es un error de compilación que sugiere `sortBy`. Campos válidos: `Int`, `Int64`, `Float`, `Decimal`, `String`, `Bool`, `Timestamp`, `Uuid`, o su versión nullable `T?`. Una lista, un struct, un `Map`, un enum o un campo opcional por clave (`campo?: T`) se guardan como JSON y no tienen un orden SQL real: error del checker con el motivo. Un campo `@encrypted` se rechaza en runtime (el checker no ve la anotación desde `Type::Struct`; el ciphertext AES-GCM con nonce aleatorio no tiene ningún orden útil, §3.191).
+- **Selector**: la misma forma exacta que `maxRow`/`minRow` (`|item: T| item.campo`, `recognize_field_selector`); cualquier expresión derivada es un error de compilación que sugiere `sortBy`. Campos válidos: `Int`, `Int64`, `Float`, `Decimal`, `String`, `Bool`, `Timestamp`, `Uuid`, o su versión nullable `T?`. Una lista, un struct, un `Map`, un enum o un campo opcional por clave (`campo?: T`) se guardan como JSON y no tienen un orden SQL real: error del checker con el motivo. Un campo `@encrypted` también es error del checker desde v1.189.0 (`field_is_encrypted`, el mismo que usa `GROUP BY`; en v1.188.0 solo lo rechazaba el runtime): el ciphertext AES-GCM con nonce aleatorio no tiene ningún orden útil (§3.191).
 - **`NULLS LAST` explícito en las dos direcciones y en los dos motores**: por defecto Postgres pone los `NULL` PRIMERO en `DESC` y SQLite los pone primero en `ASC` -- sin esto, "los más nuevos primero" empezaría por las filas sin fecha en uno de los dos backends. Y `"id"` cierra siempre la lista como desempate, para que dos filas con la misma clave salgan en el mismo orden en cada llamada (la misma garantía de determinismo que `page` promete desde §3.48).
 - **Solo lecturas sobre la consulta ordenada**: `insert`/`delete`/`applyPatch`/`subscribe` etc. son un error del checker ("no existe sobre una consulta ordenada"). `pageAfter` (§3.61) también, a propósito: su cursor es una posición en el orden por `id`, que un `ORDER BY` distinto rompería en silencio -- usá `page(limit, offset)`. Y la consulta en sí nunca es un valor de rpc: sin `.all()`/`.page()`/`.findWhere()` no tipa.
 - **`List<T>.sortBy(|item: T| clave)` / `sortByDesc(...)`**: el complemento en memoria, para lo que no es una columna (una lista ya filtrada, una clave calculada, el resultado de un `map`). La clave puede ser cualquier expresión, del mismo conjunto de tipos que arriba (o nullable). Mismas reglas que SQL, a propósito: `null` al final en las dos direcciones, orden ESTABLE (dos elementos con la misma clave conservan su orden relativo). La clave se evalúa una vez por elemento, no O(n log n) veces. Ni `Decimal` ni `Struct`/`Variant` como clave entran esta ronda.
@@ -8026,6 +8028,34 @@ service Events {
 **Verificado**: checker (6 formas válidas; `tags: String[]`, `note?: String`, `e.amount + 1`, `pageAfter`, `insert` sobre la consulta y la consulta como valor de rpc rechazados con el mensaje exacto), runtime contra SQLite real (DESC/ASC con `NULL` al final, `WHERE` empujado + `ORDER BY`, predicado no empujable conservando el orden, clave secundaria, `sortBy`/`sortByDesc` dando el MISMO orden que SQL y estable), `tests/cli_order_by.rs` contra el binario con `linkc test`, y `pg_integration.rs` contra Postgres REAL en CI (la parte que más importa: el `NULLS LAST` en `DESC`, donde el defecto de Postgres es el contrario).
 
 **Límite honesto**: el `ORDER BY` no usa ningún índice que el programa no haya declarado (`@index`, §3.5) -- sobre 15.000 filas Postgres ordena en memoria igual, rápido; sobre millones conviene un `@index` en el campo de orden. `orderBy` no se combina con `countWhere`/`deleteWhere`/agregaciones (no tienen orden que llevar). No hay `skip(n)` separado: `page(limit, offset)` ya es `LIMIT`/`OFFSET`.
+
+### 3.231 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` con clave de agrupación nullable (`T?`): el grupo `null` es un grupo más — RESUELTO, cierra PLAN.md §9.19 ítem 6
+
+Origen: `PLAN.md §9.19` ítem 6. §3.52 rechazaba explícitamente agrupar por un campo opcional, en sus dos formas. El caso real: `analytics.link` del CRM Nexus renunció al desglose por canal y por negocio porque las columnas reales (`channel`, `business_id`) son nullable -- y en una base adoptada (§3.176) eso no se elige.
+
+**Qué hay (v1.189.0)**: la forma **nullable** (`campo: T?`) se acepta como clave de agrupación, con los mismos tipos base que antes (`String`, `Int`, `Int64`, `Bool`, enum simple, o `Timestamp` truncado con `.truncateToDay/Month/Year()`). El grupo de las filas con `NULL` es un grupo más -- `GROUP BY` ya lo hace así en los dos motores, no hubo que inventar nada -- y sale con `key: null`. El tipo de la clave en el resultado es `T?`, así que el `.link` que lo consume tiene que tratar ese `null`:
+
+<!-- linkc:check -->
+```rust
+type Sale = { id: Int, channel: String?, cents: Int }
+type ByChannel = { key: String?, value: Int }
+db { sales: Sale[] }
+service Analytics {
+  rpc byChannel() -> ByChannel[] { db.sales.sumBy(|s: Sale| { s.channel }, |s: Sale| { s.cents }) }
+  rpc unattributed() -> Int {
+    db.sales.sumBy(|s: Sale| { s.channel }, |s: Sale| { s.cents })
+      .filter(|g: ByChannel| { g.key == null })
+      .map(|g: ByChannel| { g.value })
+      .sum()
+  }
+}
+```
+
+La forma **opcional por clave** (`campo?: T`) sigue rechazada, con un mensaje distinto que ahora lo dice: se guarda como JSON (§3.17), sin una columna nativa por la que agrupar -- declaralo `campo: T?` si puede faltar. El selector de VALOR (`|s| s.cents`) no cambia: sigue exigiendo un campo requerido (`SUM` sobre una columna nullable ignora los `NULL` en SQL, pero un valor `T?` en el resultado de `maxBy`/`minBy` sería otra ronda).
+
+**Verificado**: checker (la clave nullable tipa con `key: T?`; `campo?: T` rechazado con "opcional por clave"), `tests/cli_group_by_nullable.rs` contra el binario con `linkc test` (`sumBy`/`countBy` con `channel: String?`: tres grupos, y el grupo `null` suma solo sus filas), y `pg_integration.rs` contra Postgres REAL en CI (la decodificación del `NULL` de la clave pasa por `postgres_cell`, no por SQLite).
+
+**Límite honesto**: `null` es un grupo, no "sin grupo" -- si el desglose no debe contarlas, filtralas con `.filter(|g| g.key != null)` después. El orden de los grupos sigue sin estar definido (el del motor); para un orden estable usá `.sortBy(|g: ByChannel| { g.value })` (§3.230), que pone los `null` al final.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

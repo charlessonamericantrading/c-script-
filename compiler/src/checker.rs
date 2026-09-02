@@ -5419,7 +5419,7 @@ impl Checker {
         element_ty: &Type,
         arg: &Spanned<Expr>,
         method: &str,
-    ) -> Result<(String, Type, Option<crate::ast::TimeGranularity>), CheckError> {
+    ) -> Result<(String, Type, Option<crate::ast::TimeGranularity>, bool), CheckError> {
         let shape_err = || {
             err(format!(
                 "'{method}' espera un selector de agrupación de la forma `|item: T| item.campo` (o `|item: T| item.campo.truncateToDay/Month/Year()` sobre un Timestamp) -- un acceso de campo simple, sin otras expresiones derivadas ni llamadas a método (no hay forma de traducir eso a una columna SQL real)"
@@ -5438,12 +5438,21 @@ impl Checker {
         let Some(field) = fields.iter().find(|f| f.name == field_name) else {
             return Err(err(format!("'{method}': '{field_name}' no es un campo de este struct")));
         };
-        if field.optional || matches!(field.ty, Type::Optional(_)) {
+        // GRAMMAR.md §3.231: la forma NULLABLE (`campo: T?`) sí agrupa --
+        // el grupo de los NULL es un grupo más, `GROUP BY` ya lo hace en
+        // SQL -- y el tipo base se valida abajo como siempre; la clave del
+        // resultado sale `T?`. La forma por CLAVE (`campo?: T`) sigue
+        // afuera: se guarda como JSON, sin una columna nativa que agrupar.
+        if field.optional {
             return Err(err(format!(
-                "'{method}': el campo de agrupación '{field_name}' es opcional -- agrupar por un campo que puede faltar (por clave, `campo?: T`, o nullable, `campo: T?`) todavía no está soportado"
+                "'{method}': el campo de agrupación '{field_name}' es opcional por clave (`campo?: T`) -- se guarda como JSON, sin una columna nativa por la que agrupar; declaralo nullable (`campo: T?`) si puede faltar (GRAMMAR.md §3.231)"
             )));
         }
-        Ok((field_name.to_string(), field.ty.clone(), granularity))
+        let (base_ty, nullable) = match &field.ty {
+            Type::Optional(inner) => ((**inner).clone(), true),
+            other => (other.clone(), false),
+        };
+        Ok((field_name.to_string(), base_ty, granularity, nullable))
     }
 
     /// ¿El campo `field_name` de `element_ty` (un `Type::Struct` ya
@@ -5479,7 +5488,7 @@ impl Checker {
             return Err(err(format!("'{method}' toma exactamente {expected} argumento(s) {shape}")));
         }
 
-        let (key_field, key_ty, granularity) = self.group_key_selector(element_ty, &args[0], method)?;
+        let (key_field, key_ty, granularity, key_nullable) = self.group_key_selector(element_ty, &args[0], method)?;
         // GRAMMAR.md §3.191: `GROUP BY` sobre una columna `@encrypted` (a
         // diferencia de `findWhere`/`countWhere`/`deleteWhere`, que
         // simplemente NO empujan un predicado sobre esa columna a SQL y
@@ -5548,7 +5557,9 @@ impl Checker {
         Ok(Type::List(Box::new(Type::Struct {
             name: None,
             fields: vec![
-                FieldType { name: "key".to_string(), optional: false, ty: key_ty },
+                // GRAMMAR.md §3.231: clave nullable -> `key: T?`, el `null`
+                // del grupo de los NULL viaja como cualquier otro `T?`.
+                FieldType { name: "key".to_string(), optional: false, ty: if key_nullable { Type::Optional(Box::new(key_ty)) } else { key_ty } },
                 FieldType { name: "value".to_string(), optional: false, ty: result_ty },
             ],
         })))
@@ -5615,6 +5626,14 @@ impl Checker {
         if field.optional {
             return Err(err(format!(
                 "'{method}': el campo de orden '{field_name}' es opcional por clave (`campo?: T`) -- se guarda como JSON, sin una columna nativa que ordenar; declaralo nullable (`campo: T?`) si puede faltar"
+            )));
+        }
+        // GRAMMAR.md §3.191: mismo motivo que el GROUP BY de
+        // `check_aggregate_by` -- ordenar por ciphertext (distinto en cada
+        // escritura, nonce aleatorio) daría un orden aleatorio en silencio.
+        if self.field_is_encrypted(element_ty, field_name) {
+            return Err(err(format!(
+                "'{method}': no se puede ordenar por '{field_name}' -- es un campo '@encrypted', y el ciphertext no tiene ningún orden útil (GRAMMAR.md §3.191/§3.230)"
             )));
         }
         let base = match &field.ty {
@@ -10292,9 +10311,10 @@ type T = { id: Int, s: Status }")
     }
 
     #[test]
-    fn aggregate_by_rejects_an_optional_field_as_selector() {
+    fn aggregate_by_rejects_a_key_optional_field_but_accepts_a_nullable_one() {
+        // GRAMMAR.md §3.231: `planId?: String` (JSON) sigue rechazado...
         let src = r#"
-            type Order = { id: Int, planId: String?, amountCents: Int }
+            type Order = { id: Int, planId?: String, amountCents: Int }
             db { orders: Order[] }
             fn f() -> Int {
                 let rows = db.orders.sumBy(|o: Order| { o.planId }, |o: Order| { o.amountCents });
@@ -10302,7 +10322,24 @@ type T = { id: Int, s: Status }")
             }
         "#;
         let msg = format!("{:?}", check_source(src).unwrap_err());
-        assert!(msg.contains("es opcional"), "{msg}");
+        assert!(msg.contains("opcional por clave"), "{msg}");
+        // ...y `planId: String?` agrupa, con la clave del resultado `String?`
+        // (por eso `ByPlan` la declara así -- con `key: String` no tiparía).
+        let src = r#"
+            type Order = { id: Int, planId: String?, amountCents: Int }
+            type ByPlan = { key: String?, value: Int }
+            db { orders: Order[] }
+            fn f() -> ByPlan[] { db.orders.sumBy(|o: Order| { o.planId }, |o: Order| { o.amountCents }) }
+            fn g() -> Int { db.orders.countBy(|o: Order| { o.planId }).filter(|r: ByPlan| { r.key == null }).length() }
+        "#;
+        check_source(src).unwrap_or_else(|e| panic!("{e:?}"));
+        let src = r#"
+            type Order = { id: Int, planId: String?, amountCents: Int }
+            type ByPlan = { key: String, value: Int }
+            db { orders: Order[] }
+            fn f() -> ByPlan[] { db.orders.sumBy(|o: Order| { o.planId }, |o: Order| { o.amountCents }) }
+        "#;
+        assert!(check_source(src).is_err(), "la clave nullable no puede tipar como String pelado");
     }
 
     #[test]
@@ -11216,6 +11253,15 @@ mod order_by_tests {
         assert!(msg.contains("no existe sobre una consulta ordenada"), "{msg}");
         // La consulta en sí nunca es un valor de rpc: sin `.all()` no tipa.
         assert!(check("rpc bad() -> Event[] { db.events.orderBy(|e: Event| { e.amount }) }").is_err());
+    }
+
+    #[test]
+    fn ordering_by_an_encrypted_field_is_a_compile_error() {
+        let src = "type Person = { id: Int, @encrypted ssn: String }\ndb { people: Person[] }\nservice S { rpc bad() -> Person[] { db.people.orderBy(|p: Person| { p.ssn }).all() } }";
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        let msg = Checker::check_program(&program).expect_err("tenía que fallar").iter().map(|e| format!("{e:?}")).collect::<Vec<_>>().join("\n");
+        assert!(msg.contains("@encrypted") && msg.contains("ordenar"), "{msg}");
     }
 
     #[test]

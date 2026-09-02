@@ -3,6 +3,14 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.189.0] - 2026-09-02
+
+### ✨ Añadido
+**`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` aceptan una clave de agrupación nullable (`campo: T?`): el grupo `null` es un grupo más (PLAN.md §9.19 ítem 6)**: §3.52 rechazaba agrupar por un campo opcional en sus dos formas, y `analytics.link` del CRM había renunciado al desglose por canal/negocio porque las columnas adoptadas son nullable. La clave del resultado tipa `T?` (`{ key: String?, value: Int }`); la forma por clave (`campo?: T`, JSON) sigue rechazada con un mensaje que nombra el arreglo. Verificado en checker, binario real (`linkc test`) y Postgres real en CI. Ver GRAMMAR.md §3.231.
+
+### 🐛 Corregido
+**`orderBy`/`orderByDesc` sobre un campo `@encrypted` es ahora error del checker** (en v1.188.0 solo lo rechazaba el runtime): el checker sí ve la anotación vía `field_is_encrypted`, el mismo camino que ya usaba `GROUP BY`.
+
 ## [1.188.0] - 2026-09-02
 
 ### ✨ Añadido

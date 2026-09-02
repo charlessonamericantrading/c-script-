@@ -3372,7 +3372,7 @@ db { users: User[] }
         rows.iter()
             .map(|cells| {
                 Ok(Value::Struct(vec![
-                    ("key".to_string(), scalar_cell_to_value(collection, &key_ty, &cells[0])?),
+                    ("key".to_string(), group_key_value(collection, &key_ty, &cells[0])?),
                     ("value".to_string(), scalar_cell_to_value(collection, &value_ty, &cells[1])?),
                 ]))
             })
@@ -3825,11 +3825,6 @@ impl Db {
     }
 }
 
-/// Extrae el nombre de campo de un argumento `sumBy`/`countBy`/`avgBy`/
-/// `maxBy`/`minBy` (GRAMMAR.md §3.52) -- defensivo, no un caso esperado en
-/// la práctica: el checker ya garantizó en compilación que cada argumento
-/// es exactamente `|item: T| item.campo` (mismo criterio que el
-/// `unwrap_or_else` de `@content_type` en `server.rs`).
 /// GRAMMAR.md §3.230: una clave de `db.<c>.orderBy(...)`/`orderByDesc(...)`
 /// -- el nombre del campo (ya validado como columna real por
 /// `order_by_sql`) y la dirección.
@@ -3839,6 +3834,23 @@ pub struct OrderKey {
     pub desc: bool,
 }
 
+/// GRAMMAR.md §3.231: la clave de agrupación puede ser `T?` -- el grupo de
+/// los NULL es un grupo más (`GROUP BY` ya lo hace en SQL) y sale como
+/// `null`, en vez del error "fila con NULL" de `scalar_cell_to_value`, que
+/// sigue siendo el correcto para una clave declarada requerida.
+fn group_key_value(collection: &str, key_ty: &Type, cell: &Cell) -> Result<Value, RuntimeError> {
+    match (key_ty, cell) {
+        (Type::Optional(_), Cell::Null) => Ok(Value::Null),
+        (Type::Optional(inner), cell) => scalar_cell_to_value(collection, inner, cell),
+        (ty, cell) => scalar_cell_to_value(collection, ty, cell),
+    }
+}
+
+/// Extrae el nombre de campo de un argumento `sumBy`/`countBy`/`avgBy`//// Extrae el nombre de campo de un argumento `sumBy`/`countBy`/`avgBy`/
+/// `maxBy`/`minBy` (GRAMMAR.md §3.52) -- defensivo, no un caso esperado en
+/// la práctica: el checker ya garantizó en compilación que cada argumento
+/// es exactamente `|item: T| item.campo` (mismo criterio que el
+/// `unwrap_or_else` de `@content_type` en `server.rs`).
 pub(crate) fn closure_field_name(arg: Option<&Value>, role: &str) -> Result<String, RuntimeError> {
     let Some(Value::Closure(params, body, _)) = arg else {
         return Err(RuntimeError::new(format!("selector {role} inválido: se esperaba un closure")));

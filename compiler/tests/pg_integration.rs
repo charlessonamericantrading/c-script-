@@ -5108,3 +5108,44 @@ service Hooks {{
     assert_eq!(amounts(&server.rpc("Hooks/oldest", "{}")), vec![1, 2, 3, 5], "ASC con el NULL al final");
     assert_eq!(amounts(&server.rpc("Hooks/ofKind", r#"{"k":"a"}"#)), vec![3, 2, 1], "WHERE empujado + ORDER BY desc");
 }
+
+// GRAMMAR.md §3.231 (PLAN.md §9.19 ítem 6): clave de agrupación nullable
+// contra Postgres REAL -- la decodificación del NULL de la clave pasa por
+// `postgres_cell`, no por SQLite, y el caso real del CRM (desglose por
+// canal sobre una columna nullable adoptada) corre sobre Postgres.
+#[test]
+fn a_nullable_group_key_groups_the_null_rows_together_against_real_postgres() {
+    const COLLECTION: &str = "sales_by_channel";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let program = format!(
+        r#"
+type Sale = {{ id: Int, channel: String?, cents: Int }}
+type NewSale = {{ channel: String?, cents: Int }}
+type ByChannel = {{ key: String?, value: Int }}
+db {{ {COLLECTION}: Sale[] }}
+service S {{
+  rpc add(channel: String?, cents: Int) -> Sale {{ db.{COLLECTION}.insert(NewSale {{ channel: channel, cents: cents }}) }}
+  rpc totals() -> ByChannel[] {{ db.{COLLECTION}.sumBy(|s: Sale| {{ s.channel }}, |s: Sale| {{ s.cents }}) }}
+}}
+"#
+    );
+    let temp = TempDir::new("group-null");
+    let src = temp.write("app.link", &program);
+    let server = Serve::start(&src, &url);
+    server.rpc("S/add", r#"{"channel":"web","cents":100}"#);
+    server.rpc("S/add", r#"{"channel":null,"cents":30}"#);
+    server.rpc("S/add", r#"{"channel":"web","cents":50}"#);
+    server.rpc("S/add", r#"{"channel":null,"cents":20}"#);
+    let totals = server.rpc("S/totals", "{}");
+    let groups = totals.as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{totals}");
+    let null_group = groups.iter().find(|g| g["key"].is_null()).unwrap_or_else(|| panic!("falta el grupo null: {totals}"));
+    assert_eq!(null_group["value"].as_i64(), Some(50), "{totals}");
+    let web = groups.iter().find(|g| g["key"] == "web").unwrap();
+    assert_eq!(web["value"].as_i64(), Some(150), "{totals}");
+}
