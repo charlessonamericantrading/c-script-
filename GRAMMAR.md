@@ -245,6 +245,7 @@
   - [3.221 `ETag` débil + `If-None-Match` → `304`, y `Vary: Accept-Encoding` — RESUELTO](#3221-etag-débil--if-none-match--304-y-vary-accept-encoding--resuelto)
   - [3.222 `staticRoutes(baseUrl)`, `hreflangLinks(alternates)` y `routes.json` — RESUELTO](#3222-staticroutesbaseurl-hreflanglinksalternates-y-routesjson--resuelto)
   - [3.223 `linkc_http_outbound_*`: latencia y tasa de error de las llamadas `http.*` salientes en `/metrics` — RESUELTO](#3223-linkc_http_outbound_-latencia-y-tasa-de-error-de-las-llamadas-http-salientes-en-metrics--resuelto)
+  - [3.224 `linkc lint --diagnostics-json` — RESUELTO](#3224-linkc-lint---diagnostics-json--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7884,6 +7885,15 @@ El estado vive en `Db` (no en `MetricsStore`) por la misma razón que `subscribe
 **Verificado**: `tests/cli_outbound_metrics.rs` contra un `linkc serve` real hablándole a un upstream de mentira real por socket: dos `http.get` a `/ok` (200), un `getWithStatus` a `/fail` (500 como dato) y un `http.get` a `/fail` (500 → error del rpc, que igual cuenta) dan exactamente `2xx = 2` y `5xx = 2` para ese `host:puerto`, con una suma de duración real positiva; y un programa que nunca llama afuera no muestra ninguna de las dos series. Los 7 tests previos de `/metrics` siguen en verde.
 
 **Límite honesto**: sin histograma con buckets (p50/p99 exactos) -- mismo criterio que las requests entrantes; un `linkc serve-all` (§3.92) expone cada servicio en su propio puerto con su propio `Db`, así que las series son por servicio, no del proceso. El helper toma el tiempo alrededor de la llamada completa incluido leer el body (lo que el rpc de verdad esperó), no el time-to-first-byte.
+### 3.224 `linkc lint --diagnostics-json` — RESUELTO, cierra PLAN.md §9.18 Eje C ítem 5 (y la Ronda 1 de §9.18 completa)
+
+Origen: `PLAN.md §9.18` Eje C ítem 5. `--diagnostics-json` (§3.208) cubría los errores de carga y de tipos de cualquier subcomando, pero `linkc lint` imprimía sus advertencias solo como texto (`[unused-var] app.link:3:7: la variable ...`) -- un agente que ya parsea el JSON de `linkc test --diagnostics-json` tenía que scrapear un segundo formato para el linter, y las advertencias de lint son justamente lo que un agente corrige mecánicamente (variable sin uso, `mut` de más).
+
+**Qué hay (v1.183.0)**: con el flag global prendido (`linkc lint app.link --diagnostics-json` o `linkc --diagnostics-json lint app.link`, cualquier posición como siempre), `lint` imprime a stdout un array con la MISMA forma que §3.208 -- `[{file, line, column, message, code}]` -- donde `code` es el nombre de la regla (`unused-var`, `unused-mut`, `empty-test`, `mixed-service-auth`, `manual-role-check-without-requires`, `hardcoded-secret-literal`, ...), y nada más a stdout ni a stderr. Sin advertencias: `[]`. El código de salida no cambia (0 con o sin advertencias, igual que el texto humano). `--fix` se aplica igual que sin el flag; el JSON describe lo que se ENCONTRÓ, no lo que quedó después del fix (mismo criterio que el texto). Un programa que no tipa nunca llega al linter: el flag global ya reporta ese error con la misma forma (§3.208), así que un agente ve un solo formato en los dos casos.
+
+**Verificado**: `tests/cli_lint_json.rs`, 3 tests contra el binario real -- dos advertencias reales (`unused-var` con `file`/`line`/`column`/`message` correctos, código 0, stderr vacío, sin texto humano mezclado), `[]` sobre un programa limpio con el flag ANTES del subcomando, y un error de tipos con `lint` reportado con la forma de §3.208.
+
+**Límite honesto**: las advertencias no tienen código `L####` estable (§3.210) -- `code` es el nombre de la regla, que es estable por convención pero no está en `linkc explain`. Si alguna regla llega a merecer una explicación larga, ese es el paso siguiente, no este.
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

@@ -109,7 +109,7 @@ boolean scalar functions only) §3.20. Contract diff for PR review: `linkc build
 with zero `test` blocks it is the fast parse+typecheck path) §3.82/§3.99, `serve`, `serve-all`
 §3.92/§3.107/§3.153, `dev` (hot reload) §3.27, `fmt`, `lint --fix`, `doc`, `docker`, `systemd`,
 `pm2-config` §3.120/§3.121, `doctor` (+ `--target-url`) §3.100/§3.176, `explain L####` (stable
-error codes) §3.210, `--diagnostics-json` on any subcommand §3.208, `lsp` §3.19-§3.25, git
+error codes) §3.210, `--diagnostics-json` on any subcommand (lint warnings too, `code` = rule) §3.208/§3.224, `lsp` §3.19-§3.25, git
 dependencies pinned by `link.lock` §3.183, VS Code extension, web playground, GitHub Action
 `charlessonamericantrading/setup-linkc@v1`, npm installer `link-lang`.
 

@@ -3,6 +3,14 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.183.0] - 2026-09-02
+
+### ✨ Añadido
+**`linkc lint --diagnostics-json` (PLAN.md §9.18 Eje C ítem 5, cierra la Ronda 1 de §9.18)**: las advertencias de lint con la misma forma JSON que los errores de carga/tipos de §3.208 (`[{file, line, column, message, code}]`, `code` = la regla), `[]` sin advertencias, nada humano mezclado; `--fix` se aplica igual. Un agente parsea un solo formato para `test`, `build` y `lint`. Ver GRAMMAR.md §3.224.
+
+### 📋 Plan
+**PLAN.md §9.19**: reporte de adopción del CRM Nexus (11 servicios `.link`, 9 en producción) -- nueve pedidos verificados como inexistentes hoy, ordenados por valor: triggers para escrituras externas, bcrypt en `verifyPassword`, columnas `ARRAY`, avisos de tipo no soportado en `doctor`/`migrate`/`db inspect`, `orderBy`/`skip` empujados a SQL, agregación por clave opcional, `@hidden`, `serve-all --db`, `@tenant`. Se ejecuta antes de la Ronda 2 de §9.18.
+
 ## [1.182.0] - 2026-09-02
 
 ### ✨ Añadido

@@ -194,7 +194,7 @@ fn print_usage(to_stderr: bool) {
     out("     linkc test <archivo.link> [--filter <nombre>] [--db <url-postgres>]  (ejecuta pruebas de comportamiento integradas; --filter acota a las que CONTIENEN ese substring en el nombre; --db/LINK_TEST_DB corre contra PostgreSQL real en vez de SQLite :memory:, sin aislamiento entre tests -- solo contra una base de test dedicada, nunca producción; sin ningún bloque 'test { }' en el programa, ESTE es el camino rápido de 'solo parsear y tipar' -- no escribe ningún archivo, no toca ninguna base, sale en milisegundos, GRAMMAR.md §3.206)");
     out("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)");
     out("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)");
-    out("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)");
+    out("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso; con --diagnostics-json, las advertencias salen como JSON [{file, line, column, message, code}], GRAMMAR.md §3.224)");
     out("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)");
     out("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)");
     out("     linkc systemd <archivo.link> <puerto> [outdir]   (genera una unidad systemd lista para /etc/systemd/system/)");
@@ -268,6 +268,32 @@ fn cmd_lint(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
     let warnings = linkc::lint::lint_program(&program);
+    // GRAMMAR.md §3.224: con `--diagnostics-json`, las advertencias salen
+    // con la MISMA forma que los errores de carga/tipos de §3.208
+    // (`[{file, line, column, message, code}]`, `code` = la regla), y nada
+    // más a stdout -- un agente que ya parsea `linkc test
+    // --diagnostics-json` no necesita un segundo formato. `--fix` se
+    // aplica igual que sin el flag; el JSON describe lo que se ENCONTRÓ,
+    // no lo que quedó después del fix (mismo criterio que el texto humano).
+    if diagnostics_json_enabled() {
+        if fix_mode {
+            if let Ok(content) = fs::read_to_string(path) {
+                let fixed = linkc::lint::fix_source(&content, &warnings);
+                if fixed != content {
+                    let _ = fs::write(path, fixed);
+                }
+            }
+        }
+        let file_label = display_path(Path::new(path));
+        let diags: Vec<serde_json::Value> = warnings
+            .iter()
+            .map(|w| serde_json::json!({
+                "file": file_label, "line": w.line, "column": w.col, "message": w.message, "code": w.rule,
+            }))
+            .collect();
+        print_diagnostics_json(&diags);
+        return ExitCode::SUCCESS;
+    }
     if warnings.is_empty() {
         println!("OK: {path} pasó el análisis de lint sin advertencias");
         ExitCode::SUCCESS
