@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.170.0] - 2026-09-02
+
+### 🐛 Arreglado
+**Seguridad (PLAN.md §9.17 ítem 1, hallazgo ALTO de la auditoría del 02/09/2026): `--trust-proxy` toma el ÚLTIMO valor de `X-Forwarded-For`, no el primero -- el rate limiter deja de ser evadible detrás de un proxy que appendea.** La semántica de §3.89 (primer elemento, "el más cercano al cliente original") era correcta sobre qué representa cada posición del header pero al revés sobre cuál es confiable: el default de nginx (`proxy_add_x_forwarded_for`) APPENDEA al header que llega, así que todo lo anterior al último elemento lo controla el cliente -- un atacante rotando `X-Forwarded-For: <aleatorio>` por request abría un bucket nuevo de `@rate_limit` cada vez y el límite quedaba inerte (brute-force de login sin freno). Ahora se toma el único elemento que escribió el proxy de confianza propio: con un solo proxy delante (el caso real que motivó el flag) es la IP del cliente; con una cadena de proxies confiables es la IP del proxy externo -- bucket compartido, más restrictivo de la cuenta pero nunca evadible, misma semántica que `trust proxy: 1` de Express. El test de cadena se reescribió con la semántica nueva y se agregó un test que reproduce el ataque exacto (prefijo falsificado rotando con último elemento fijo → 429 en la 4ta request). Ver GRAMMAR.md §3.211.
+
 ## [1.169.0] - 2026-09-01
 
 ### ✨ Nuevo

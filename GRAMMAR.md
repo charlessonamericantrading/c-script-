@@ -232,6 +232,7 @@
   - [3.208 `--diagnostics-json`: diagnósticos de carga/tipos en JSON estructurado — RESUELTO](#3208---diagnostics-json-diagnósticos-de-cargatipos-en-json-estructurado--resuelto)
   - [3.209 `Enum.Variante` sin campos ya no necesita `{}` como expresión — RESUELTO](#3209-envariante-sin-campos-ya-no-necesita--como-expresión--resuelto)
   - [3.210 Códigos de error estables + `linkc explain <código>` — RESUELTO](#3210-códigos-de-error-estables--linkc-explain-código--resuelto)
+  - [3.211 `--trust-proxy` toma el ÚLTIMO valor de `X-Forwarded-For`, no el primero — RESUELTO](#3211---trust-proxy-toma-el-último-valor-de-x-forwarded-for-no-el-primero--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -4405,7 +4406,7 @@ linkc serve app.link 8787 --trust-proxy
 LINK_TRUST_PROXY=1 linkc serve app.link 8787   # equivalente
 ```
 
-**`--trust-proxy`/`LINK_TRUST_PROXY`, apagado por default -- mismo criterio de flag booleano de presencia que `--adopt-existing`.** Prendido, `@rate_limit` usa el PRIMER valor de `X-Forwarded-For` (`cliente, proxy1, proxy2, ...` -- el primero es el más cercano al cliente original) en vez de `remote_addr()`. Sin el header presente (incluso con el flag prendido), cae de vuelta a `remote_addr()` tal cual -- no hay motivo para tratar eso como "cliente desconocido".
+**`--trust-proxy`/`LINK_TRUST_PROXY`, apagado por default -- mismo criterio de flag booleano de presencia que `--adopt-existing`.** Prendido, `@rate_limit` usa el ÚLTIMO valor de `X-Forwarded-For` (el único que escribió el proxy de confianza propio -- desde v1.170.0, ver §3.211: hasta v1.169.0 se tomaba el PRIMERO, que es exactamente el que el cliente controla cuando el proxy appendea) en vez de `remote_addr()`. Sin el header presente (incluso con el flag prendido), cae de vuelta a `remote_addr()` tal cual -- no hay motivo para tratar eso como "cliente desconocido".
 
 **Es un opt-in explícito a propósito -- prenderlo sin tener de verdad un proxy de confianza delante deja que cualquier cliente directo evada el límite por completo**, mandando un `X-Forwarded-For` distinto en cada request. La responsabilidad de que el header LLEGUE confiable (que el proxy real lo sobreescriba, en vez de dejar pasar el que mandó el cliente original) es de la configuración de ESE proxy, no de `linkc`.
 
@@ -4413,7 +4414,7 @@ LINK_TRUST_PROXY=1 linkc serve app.link 8787   # equivalente
 - **Sin validación de CUÁNTOS proxies hay en el medio, ni de qué IP vienen.** No hay un mecanismo más fino de "confío en estos N saltos" o "confío en este rango CIDR" (lo que Express llama `trust proxy: n` o una lista de IPs) -- v0 confía en el header COMPLETO en cuanto el flag está prendido. Suficiente para el caso real que motivó esto (un solo proxy de confianza justo delante), no para una cadena de proxies con distintos niveles de confianza.
 - **Solo afecta a `@rate_limit`.** `request.header("X-Forwarded-For")` (GRAMMAR.md §3.38) sigue devolviendo el header CRUDO tal cual llegó, sin ningún procesamiento -- este flag no cambia nada de lo que un cuerpo de rpc puede leer directamente.
 
-**Verificado**: `cli_rate_limit.rs` con el binario real como subproceso (5 tests nuevos, sobre 3 que ya existían) -- sin `--trust-proxy`, `X-Forwarded-For` con valores distintos NO separa el balde (todo cuenta contra el mismo límite, probando que el header se ignora); con `--trust-proxy`, cada IP reenviada distinta tiene su propio balde, y el PRIMER hop de una cadena `cliente, proxy1, proxy2` es el que se usa; con `--trust-proxy` pero SIN el header, cae de vuelta a `remote_addr()` sin romper nada; y `LINK_TRUST_PROXY` funciona igual que el flag.
+**Verificado**: `cli_rate_limit.rs` con el binario real como subproceso (5 tests nuevos, sobre 3 que ya existían) -- sin `--trust-proxy`, `X-Forwarded-For` con valores distintos NO separa el balde (todo cuenta contra el mismo límite, probando que el header se ignora); con `--trust-proxy`, cada IP reenviada distinta tiene su propio balde, y el ÚLTIMO hop de la cadena es el que se usa (desde v1.170.0 -- el test original de "primer hop" se reescribió con la semántica nueva, §3.211); con `--trust-proxy` pero SIN el header, cae de vuelta a `remote_addr()` sin romper nada; y `LINK_TRUST_PROXY` funciona igual que el flag.
 
 ---
 
@@ -7577,6 +7578,21 @@ Origen: `PLAN.md §9.16` ítem 6, el último del plan, pedido explícito del usu
 **Verificado**: los 5 repros reales (uno por código) corridos contra el binario -- cada uno muestra `error[L000X]: ...` en texto humano, `"code":"L000X"` en `--diagnostics-json`, y `linkc explain L000X` imprime la explicación completa citando GRAMMAR.md. `linkc explain` case-insensitive y con error limpio para un código inexistente, confirmados. El fix de `PipePipe` verificado con las dos formas (`||` y `| |`) dando el mismo mensaje. Tests nuevos: 3 en `error_codes.rs` (formato de cada entrada, sin códigos repetidos, lookup case-insensitive), 4 en `cli_help.rs` (`linkc explain` end-to-end contra el binario real), 1 en `parser.rs` (`PipePipe`), más los tests de `diagnostics.rs`/`checker.rs`/`parser.rs` ya existentes actualizados para la nueva forma de `render_diagnostic`/`ParseError`. Suite completa sin regresiones (una falla aislada durante la verificación resultó ser contención de recursos por una invocación de `cargo test` concurrente propia, no un bug real -- confirmado corriendo el test solo, limpio, en 1.5s en vez de colgarse 400+).
 
 **Con esto, PLAN.md §9.16 queda completo** -- los 7 ítems (1a, 2, 3, 4, 5, 1b, 6) resueltos, v1.164.0 a v1.169.0.
+
+### 3.211 `--trust-proxy` toma el ÚLTIMO valor de `X-Forwarded-For`, no el primero — RESUELTO, fix de seguridad de PLAN.md §9.17 ítem 1
+
+Origen: `PLAN.md §9.17` ítem 1 (Bloque A), el hallazgo ALTO de la auditoría de seguridad del 02/09/2026. `§3.89` introdujo `--trust-proxy` tomando el PRIMER valor de `X-Forwarded-For`, con el razonamiento "el primero es el más cercano al cliente original, así que es el que corresponde tomar" -- razonamiento que es correcto sobre QUÉ REPRESENTA cada posición del header, pero exactamente al revés sobre CUÁL ES CONFIABLE.
+
+**El problema**: el default de nginx (`proxy_add_x_forwarded_for`) -- y el comportamiento estándar de casi cualquier proxy -- es APPENDEAR al header que llega, no sobreescribirlo. El header que recibe `linkc serve` detrás de un nginx así es `<lo que mandó el cliente...>, <IP que nginx vio en la conexión>`: todo lo anterior al último elemento lo eligió el cliente. Con la semántica vieja, un atacante mandaba `X-Forwarded-For: <aleatorio>` distinto en cada request → cada request caía en un bucket nuevo de `@rate_limit` → el límite quedaba completamente inerte, brute-force de login sin freno (el lockout por identifier de §3.152 mitiga solo si el `.link` lo usa, y el atacante también puede rotar identifiers). Estaba anotado como advertencia en §3.89 ("la responsabilidad de que el header llegue confiable es del proxy"), pero esa responsabilidad es imposible de cumplir con la configuración DEFAULT de nginx -- el caso real documentado que motivó el flag (IgnisLove detrás de nginx) era vulnerable tal cual estaba desplegado.
+
+**El fix (v1.170.0)**: `client_ip_for_rate_limit` (`runtime/server.rs`) toma el ÚLTIMO elemento -- el único que escribió el proxy de confianza propio, el único que el cliente no puede falsificar. Con un solo proxy de confianza justo delante (el caso real que motivó el flag), el último elemento ES la IP del cliente. Con una cadena de varios proxies confiables, es la IP del proxy más externo -- bucket compartido entre los usuarios detrás de ese proxy: más restrictivo de la cuenta, pero NUNCA evadible; el lado seguro del trade-off. Es la misma semántica que `trust proxy: 1` de Express.
+
+**Límites honestos (heredados de §3.89, sin cambio):**
+- **Sigue sin mecanismo fino de "confío en N saltos"/CIDR.** Con 2+ proxies de confianza encadenados, el bucket es por proxy externo, no por usuario final -- para separar por usuario en esa topología haría falta el equivalente a `trust proxy: n`, fuera de alcance hasta que exista un despliegue real que lo necesite.
+- **Prender `--trust-proxy` SIN un proxy delante sigue siendo evadible** -- un cliente directo controla el header entero, incluido el último elemento. La advertencia de §3.89 sobre el opt-in no cambia; lo que cambia es que ahora la configuración default de un proxy real es segura, en vez de vulnerable.
+- **Solo afecta a `@rate_limit`** -- `request.header("X-Forwarded-For")` sigue devolviendo el header crudo, igual que siempre.
+
+**Verificado**: `cli_rate_limit.rs` contra el binario real -- el test de cadena reescrito con la semántica nueva (el último hop comparte balde aunque el prefijo difiera), más un test nuevo que reproduce el ataque exacto (prefijo falsificado rotando en cada request con el último elemento fijo: con la semántica vieja cada request abría un bucket nuevo; con la nueva, la 4ta request da 429). Los otros 6 tests de §3.89 (spoof sin flag ignorado, buckets separados por IP, fallback sin header, env var) pasan sin cambios.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

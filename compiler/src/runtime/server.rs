@@ -1419,17 +1419,25 @@ fn parse_query_string(qs: &str) -> std::collections::HashMap<String, String> {
         .collect()
 }
 
-/// Identificador de cliente que usa `@rate_limit` (GRAMMAR.md §3.39/§3.89)
-/// para agrupar requests -- `remote_addr()` (la conexión TCP real) por
-/// default, o el PRIMER valor de `X-Forwarded-For` cuando `trust_proxy` es
-/// `true` Y el header está presente. `X-Forwarded-For` es una lista
-/// separada por comas que cada proxy en la cadena va extendiendo
-/// (`cliente, proxy1, proxy2, ...`) -- el primer valor es el más cercano al
-/// cliente original, así que es el que corresponde tomar. Alcance v0
-/// deliberado: no valida CUÁNTOS proxies hay en el medio ni de qué IP
-/// vienen -- confía en el valor completo del header en cuanto
-/// `trust_proxy` está prendido, sin un mecanismo más fino de "proxy de
-/// confianza por IP/CIDR" (ver GRAMMAR.md §3.89, "Límites honestos").
+/// Identificador de cliente que usa `@rate_limit` (GRAMMAR.md §3.39/§3.89/
+/// §3.211) para agrupar requests -- `remote_addr()` (la conexión TCP real)
+/// por default, o el ÚLTIMO valor de `X-Forwarded-For` cuando `trust_proxy`
+/// es `true` Y el header está presente. `X-Forwarded-For` es una lista
+/// separada por comas que cada proxy en la cadena va EXTENDIENDO (el
+/// default de nginx, `proxy_add_x_forwarded_for`, appendea -- no
+/// sobreescribe): `<lo que mandó el cliente...>, <IP que el proxy vio>`.
+/// Eso hace que el último elemento sea EL ÚNICO que escribió nuestro proxy
+/// de confianza -- todo lo anterior lo controla el cliente, que puede
+/// mandar `X-Forwarded-For: <aleatorio>` distinto en cada request. Tomar
+/// el primero (el comportamiento hasta v1.169.0) dejaba `@rate_limit`
+/// completamente evadible detrás de un proxy que appendea: bucket nuevo
+/// por request, brute-force de login sin freno (GRAMMAR.md §3.211). Con un
+/// solo proxy de confianza justo delante -- el caso real que motivó el
+/// flag -- el último elemento ES la IP del cliente; con una cadena de
+/// varios proxies confiables, es la IP del proxy externo (bucket
+/// compartido: más restrictivo de la cuenta, nunca evadible -- el lado
+/// seguro del trade-off; el mecanismo fino "confío en N saltos"/CIDR sigue
+/// fuera de alcance, ver §3.89 "Límites honestos").
 /// `X-Forwarded-For` ausente (incluso con `trust_proxy` prendido) cae de
 /// vuelta a `remote_addr()` -- no hay motivo para tratar eso como "cliente
 /// desconocido" cuando la conexión TCP real sigue siendo una IP perfectamente
@@ -1438,10 +1446,10 @@ fn client_ip_for_rate_limit(request: &tiny_http::Request, trust_proxy: bool) -> 
     if trust_proxy {
         let forwarded = request.headers().iter().find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("X-Forwarded-For"));
         if let Some(header) = forwarded {
-            if let Some(first) = header.value.as_str().split(',').next() {
-                let first = first.trim();
-                if !first.is_empty() {
-                    return first.to_string();
+            if let Some(last) = header.value.as_str().rsplit(',').next() {
+                let last = last.trim();
+                if !last.is_empty() {
+                    return last.to_string();
                 }
             }
         }

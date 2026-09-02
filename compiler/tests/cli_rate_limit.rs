@@ -257,9 +257,12 @@ fn with_trust_proxy_each_forwarded_ip_gets_its_own_bucket() {
 }
 
 #[test]
-fn with_trust_proxy_the_first_hop_in_a_forwarding_chain_is_used() {
-    // "cliente, proxy1, proxy2" -- el primero (más cercano al cliente
-    // original) es el que corresponde tomar, no el último.
+fn with_trust_proxy_the_last_hop_in_a_forwarding_chain_is_used() {
+    // "<lo que mandó el cliente...>, <IP que agregó nuestro proxy>" -- el
+    // ÚLTIMO elemento es el único que escribió el proxy de confianza (el
+    // default de nginx APPENDEA, no sobreescribe), así que es el único que
+    // el cliente no controla. GRAMMAR.md §3.211 -- hasta v1.169.0 se tomaba
+    // el primero, que es exactamente el que el atacante elige.
     let temp = TempDir::new("trust-proxy-chain");
     let out = build(&temp, PROGRAM);
     assert!(out.status.success());
@@ -267,11 +270,33 @@ fn with_trust_proxy_the_first_hop_in_a_forwarding_chain_is_used() {
 
     for i in 1..=3 {
         let (status, body) =
-            server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "5.5.5.5, 10.0.0.1, 10.0.0.2")]);
+            server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "5.5.5.5, 10.0.0.1, 20.0.0.7")]);
         assert_eq!(status, 200, "request {i}: {body:?}");
     }
-    let (status, _) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "5.5.5.5, 10.0.0.9")]);
-    assert_eq!(status, 429, "mismo primer hop (5.5.5.5) que antes -- debe compartir el balde ya agotado");
+    let (status, _) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "6.6.6.6, 20.0.0.7")]);
+    assert_eq!(status, 429, "mismo último hop (20.0.0.7) que antes -- debe compartir el balde ya agotado");
+}
+
+#[test]
+fn with_trust_proxy_a_rotating_spoofed_prefix_cannot_evade_the_limit() {
+    // El ataque que motivó el cambio de semántica (GRAMMAR.md §3.211): el
+    // cliente manda un X-Forwarded-For distinto en cada request y el proxy
+    // que appendea le agrega la IP real al final. Con la semántica vieja
+    // (primer elemento) cada request caía en un bucket nuevo y @rate_limit
+    // quedaba inerte; con la nueva (último elemento) el prefijo falsificado
+    // es irrelevante y el balde real se agota igual.
+    let temp = TempDir::new("trust-proxy-spoof");
+    let out = build(&temp, PROGRAM);
+    assert!(out.status.success());
+    let server = Serve::start_with_args(&temp.0.join("app.link"), &["--trust-proxy"]);
+
+    for (i, spoofed) in ["1.1.1.1", "2.2.2.2", "3.3.3.3"].iter().enumerate() {
+        let forwarded = format!("{spoofed}, 20.0.0.7");
+        let (status, body) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", &forwarded)]);
+        assert_eq!(status, 200, "request {}: {body:?}", i + 1);
+    }
+    let (status, body) = server.post_with_headers("/Sys/ping", &json!({}), None, &[("X-Forwarded-For", "4.4.4.4, 20.0.0.7")]);
+    assert_eq!(status, 429, "rotar el prefijo falsificado no debe abrir un bucket nuevo: {body:?}");
 }
 
 #[test]
