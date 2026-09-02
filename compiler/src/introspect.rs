@@ -31,6 +31,10 @@ use crate::runtime::db::connect_postgres_client;
 struct Column {
     name: String,
     pg_type: String,
+    /// `udt_name` de information_schema -- para un `data_type = 'ARRAY'` es
+    /// lo único que dice el tipo del elemento (`_int4`, `_text`, ...),
+    /// GRAMMAR.md §3.228.
+    udt_name: String,
     nullable: bool,
 }
 
@@ -46,8 +50,26 @@ struct TableIntrospection {
 /// minúsculas, la forma que Postgres ya normaliza) al tipo c-script más
 /// cercano -- `(tipo, advertencia)`. `advertencia` es `Some` cuando el mapeo
 /// es un placeholder que hay que revisar a mano, nunca cuando es exacto.
-fn map_pg_type(pg_type: &str, column_name: &str) -> (&'static str, Option<String>) {
+fn map_pg_type(pg_type: &str, udt_name: &str, column_name: &str) -> (&'static str, Option<String>) {
     match pg_type {
+        // GRAMMAR.md §3.228: un ARRAY nativo se lee y escribe como la lista
+        // del tipo de su elemento (`runtime/store.rs`, `postgres_array_cell`/
+        // `json_array_to_pg`). `information_schema.data_type` dice solo
+        // "ARRAY"; el elemento vive en `udt_name` con `_` adelante.
+        "ARRAY" => match udt_name {
+            "_int2" | "_int4" | "_int8" => ("Int[]", None),
+            "_text" | "_varchar" | "_bpchar" | "_citext" => ("String[]", None),
+            "_bool" => ("Bool[]", None),
+            "_float4" | "_float8" => ("Float[]", None),
+            other => (
+                "String[]",
+                Some(format!(
+                    "'{column_name}' es un array de '{}' -- c-script solo lee/escribe arrays de enteros, texto, booleanos y \
+                     flotantes (GRAMMAR.md §3.228); esta columna va a fallar al leer una fila real, declarala a mano o dejala fuera",
+                    other.trim_start_matches('_')
+                )),
+            ),
+        },
         "bigint" | "integer" | "smallint" => ("Int", None),
         "boolean" => ("Bool", None),
         "double precision" | "real" => ("Float", None),
@@ -147,7 +169,7 @@ fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableI
 
     let col_rows = client
         .query(
-            "SELECT column_name, data_type, is_nullable \
+            "SELECT column_name, data_type, is_nullable, udt_name \
              FROM information_schema.columns \
              WHERE table_schema = ANY(current_schemas(false)) AND table_name = $1 \
              ORDER BY ordinal_position",
@@ -160,6 +182,7 @@ fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableI
             name: r.get::<_, String>(0),
             pg_type: r.get::<_, String>(1),
             nullable: r.get::<_, String>(2) == "YES",
+            udt_name: r.get::<_, String>(3),
         })
         .collect();
 
@@ -207,7 +230,7 @@ fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableI
         if col.name == "id" {
             continue; // ya emitido arriba, siempre primero
         }
-        let (base_ty, warning) = map_pg_type(&col.pg_type, &col.name);
+        let (base_ty, warning) = map_pg_type(&col.pg_type, &col.udt_name, &col.name);
         if let Some(w) = warning {
             warnings.push(w);
         }
@@ -270,27 +293,42 @@ pub fn generate_link_from_postgres(url: &str) -> Result<(String, Vec<String>), S
 mod tests {
     use super::*;
 
+    // GRAMMAR.md §3.228: ARRAY nativo → lista del tipo del elemento (que
+    // solo `udt_name` conoce); un elemento sin soporte avisa.
+    #[test]
+    fn array_columns_map_to_typed_lists_by_udt_name() {
+        assert_eq!(map_pg_type("ARRAY", "_int4", "product_ids"), ("Int[]", None));
+        assert_eq!(map_pg_type("ARRAY", "_int8", "ids"), ("Int[]", None));
+        assert_eq!(map_pg_type("ARRAY", "_text", "tags"), ("String[]", None));
+        assert_eq!(map_pg_type("ARRAY", "_varchar", "tags"), ("String[]", None));
+        assert_eq!(map_pg_type("ARRAY", "_bool", "flags"), ("Bool[]", None));
+        assert_eq!(map_pg_type("ARRAY", "_float8", "xs"), ("Float[]", None));
+        let (ty, warning) = map_pg_type("ARRAY", "_uuid", "refs");
+        assert_eq!(ty, "String[]");
+        assert!(warning.as_deref().unwrap_or("").contains("array de 'uuid'"), "{warning:?}");
+    }
+
     #[test]
     fn map_pg_type_covers_the_common_scalar_types_without_a_warning() {
-        assert_eq!(map_pg_type("bigint", "x").0, "Int");
-        assert_eq!(map_pg_type("integer", "x").0, "Int");
-        assert_eq!(map_pg_type("smallint", "x").0, "Int");
-        assert_eq!(map_pg_type("boolean", "x").0, "Bool");
-        assert_eq!(map_pg_type("double precision", "x").0, "Float");
-        assert_eq!(map_pg_type("numeric", "x").0, "Decimal");
-        assert_eq!(map_pg_type("text", "x").0, "String");
-        assert_eq!(map_pg_type("character varying", "x").0, "String");
+        assert_eq!(map_pg_type("bigint", "", "x").0, "Int");
+        assert_eq!(map_pg_type("integer", "", "x").0, "Int");
+        assert_eq!(map_pg_type("smallint", "", "x").0, "Int");
+        assert_eq!(map_pg_type("boolean", "", "x").0, "Bool");
+        assert_eq!(map_pg_type("double precision", "", "x").0, "Float");
+        assert_eq!(map_pg_type("numeric", "", "x").0, "Decimal");
+        assert_eq!(map_pg_type("text", "", "x").0, "String");
+        assert_eq!(map_pg_type("character varying", "", "x").0, "String");
         for ty in ["bigint", "integer", "smallint", "boolean", "double precision", "numeric", "text", "character varying"] {
-            assert!(map_pg_type(ty, "x").1.is_none(), "'{ty}' no debería generar advertencia");
+            assert!(map_pg_type(ty, "", "x").1.is_none(), "'{ty}' no debería generar advertencia");
         }
     }
 
     #[test]
     fn map_pg_type_flags_jsonb_with_a_warning() {
-        assert!(map_pg_type("jsonb", "meta").1.is_some());
+        assert!(map_pg_type("jsonb", "", "meta").1.is_some());
         // Sigue dando un tipo VÁLIDO (String) -- nunca se omite la columna
         // del .link generado, aunque necesite revisión.
-        assert_eq!(map_pg_type("jsonb", "meta").0, "String");
+        assert_eq!(map_pg_type("jsonb", "", "meta").0, "String");
     }
 
     /// GRAMMAR.md §3.179: `uuid`/`inet`/`cidr` NATIVOS de Postgres
@@ -303,11 +341,11 @@ mod tests {
     /// skynet-43) confirmó el gap y motivó el fix.
     #[test]
     fn map_pg_type_maps_native_uuid_inet_and_cidr_without_a_warning() {
-        let (mapped, warning) = map_pg_type("uuid", "external_id");
+        let (mapped, warning) = map_pg_type("uuid", "", "external_id");
         assert_eq!(mapped, "Uuid");
         assert!(warning.is_none(), "{warning:?}");
         for ty in ["inet", "cidr"] {
-            let (mapped, warning) = map_pg_type(ty, "source_ip");
+            let (mapped, warning) = map_pg_type(ty, "", "source_ip");
             assert_eq!(mapped, "String", "'{ty}'");
             assert!(warning.is_none(), "'{ty}' no debería generar advertencia: {warning:?}");
         }
@@ -322,7 +360,7 @@ mod tests {
     #[test]
     fn map_pg_type_maps_native_date_and_timestamp_to_timestamp_without_a_warning() {
         for ty in ["date", "timestamp without time zone", "timestamp with time zone"] {
-            let (mapped, warning) = map_pg_type(ty, "created_at");
+            let (mapped, warning) = map_pg_type(ty, "", "created_at");
             assert_eq!(mapped, "Timestamp", "'{ty}'");
             assert!(warning.is_none(), "'{ty}' no debería generar advertencia: {warning:?}");
         }
@@ -333,7 +371,7 @@ mod tests {
     /// cabe una hora suelta.
     #[test]
     fn map_pg_type_still_warns_on_a_bare_time_without_a_date() {
-        let (mapped, warning) = map_pg_type("time without time zone", "hora_apertura");
+        let (mapped, warning) = map_pg_type("time without time zone", "", "hora_apertura");
         assert_eq!(mapped, "String");
         assert!(warning.is_some());
     }
@@ -344,7 +382,7 @@ mod tests {
         // ser un mapeo exacto sin advertencia (ver
         // map_pg_type_maps_native_uuid_inet_and_cidr_without_a_warning).
         // "macaddr" sigue sin ningún mapeo dedicado.
-        let (ty, warning) = map_pg_type("macaddr", "mac_address");
+        let (ty, warning) = map_pg_type("macaddr", "", "mac_address");
         assert_eq!(ty, "String");
         assert!(warning.is_some());
     }

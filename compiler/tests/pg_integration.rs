@@ -4884,3 +4884,102 @@ fn an_external_insert_update_and_delete_push_to_a_stream_once_the_triggers_are_i
     watcher.reader.get_mut().set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
     assert!(watcher.next_event().is_none(), "una escritura propia no debe llegar dos veces con los triggers instalados");
 }
+
+// GRAMMAR.md §3.228 (PLAN.md §9.19 ítem 3): columnas ARRAY nativas de
+// PostgreSQL (`integer[]`, `text[]`, `boolean[]`, `bigint[]`) adoptadas como
+// `Int[]`/`String[]`/`Bool[]` -- las tres tablas reales del CRM
+// (`customers.product_ids`, `conversations.tag_ids`,
+// `invoices.selected_payment_method_ids`) tienen exactamente esta forma,
+// con NOT NULL, y hasta esta ronda declararlas rompía al leer una fila.
+#[test]
+fn native_array_columns_round_trip_as_lists_and_read_what_another_system_wrote() {
+    const COLLECTION: &str = "customers_with_arrays";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    // La tabla la crea "el sistema viejo", con los tipos reales del CRM.
+    let mut external = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    external
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                id BIGSERIAL PRIMARY KEY, \
+                name TEXT NOT NULL, \
+                product_ids integer[] NOT NULL DEFAULT '{{}}', \
+                tags text[] NOT NULL DEFAULT '{{}}', \
+                flags boolean[], \
+                big_ids bigint[] NOT NULL DEFAULT '{{}}'\
+            )"
+        ))
+        .expect("crear la tabla con arrays");
+    external
+        .execute(
+            &format!("INSERT INTO \"{COLLECTION}\" (name, product_ids, tags, flags, big_ids) VALUES ($1, $2, $3, $4, $5)"),
+            &[&"externo", &vec![7i32, 8, 9], &vec!["a".to_string(), "b".to_string()], &vec![true, false], &vec![9_000_000_000i64]],
+        )
+        .expect("insertar desde fuera");
+
+    let program = format!(
+        r#"
+type Customer = {{ id: Int, name: String, product_ids: Int[], tags: String[], flags: Bool[]?, big_ids: Int[] }}
+type NewCustomer = {{ name: String, product_ids: Int[], tags: String[], flags: Bool[]?, big_ids: Int[] }}
+
+db {{ {COLLECTION}: Customer[] }}
+
+service Customers {{
+  rpc all() -> Customer[] {{ db.{COLLECTION}.all() }}
+  rpc create(name: String, ids: Int[], tags: String[]) -> Customer {{
+    db.{COLLECTION}.insert(NewCustomer {{ name: name, product_ids: ids, tags: tags, flags: null, big_ids: [1, 2] }})
+  }}
+  rpc withProduct(p: Int) -> Customer[] {{
+    db.{COLLECTION}.all().filter(|c: Customer| {{ c.product_ids.contains(p) }})
+  }}
+}}
+"#
+    );
+    let temp = TempDir::new("arrays");
+    let src = temp.write("app.link", &program);
+    let instance = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+
+    // Lectura de la fila que escribió el sistema viejo: cada array llega
+    // como la lista del tipo declarado, no como error de deserialización.
+    let all = instance.rpc("Customers/all", "{}");
+    let rows = all.as_array().expect("lista");
+    assert_eq!(rows.len(), 1, "{all}");
+    assert_eq!(rows[0]["product_ids"], serde_json::json!([7, 8, 9]), "{all}");
+    assert_eq!(rows[0]["tags"], serde_json::json!(["a", "b"]), "{all}");
+    assert_eq!(rows[0]["flags"], serde_json::json!([true, false]), "{all}");
+    assert_eq!(rows[0]["big_ids"], serde_json::json!([9_000_000_000i64]), "{all}");
+
+    // Escritura desde linkc: la lista se bindea como el array nativo que la
+    // columna pide (`integer[]` → Vec<i32>, `text[]` → Vec<String>), y
+    // `flags: null` contra una columna nullable queda NULL.
+    let created = instance.rpc("Customers/create", r#"{"name":"desde-linkc","ids":[1,2,3],"tags":["x"]}"#);
+    assert_eq!(created["product_ids"], serde_json::json!([1, 2, 3]), "{created}");
+    assert_eq!(created["tags"], serde_json::json!(["x"]), "{created}");
+    assert_eq!(created["flags"], serde_json::Value::Null, "{created}");
+    assert_eq!(created["big_ids"], serde_json::json!([1, 2]), "{created}");
+
+    // Y lo que linkc escribió es un array de verdad para Postgres -- el
+    // sistema viejo lo lee con su tipo nativo, sin JSON de por medio.
+    let row = external
+        .query_one(&format!("SELECT product_ids, tags, flags, big_ids FROM \"{COLLECTION}\" WHERE name = 'desde-linkc'"), &[])
+        .expect("leer desde fuera");
+    assert_eq!(row.get::<_, Vec<i32>>(0), vec![1, 2, 3]);
+    assert_eq!(row.get::<_, Vec<String>>(1), vec!["x".to_string()]);
+    assert_eq!(row.get::<_, Option<Vec<bool>>>(2), None);
+    assert_eq!(row.get::<_, Vec<i64>>(3), vec![1, 2]);
+
+    // Un filtro en memoria sobre la lista funciona como con cualquier List.
+    let with7 = instance.rpc("Customers/withProduct", r#"{"p":7}"#);
+    assert_eq!(with7.as_array().map(|a| a.len()), Some(1), "{with7}");
+
+    // Un elemento que no calza con el tipo de la columna es un error limpio
+    // del rpc (400/500 con mensaje), nunca un panic del proceso.
+    let bad = instance.try_rpc("Customers/create", r#"{"name":"mal","ids":[99999999999],"tags":[]}"#);
+    assert!(bad.is_err(), "99999999999 no entra en integer[] (32 bits): {bad:?}");
+    assert_eq!(instance.rpc("Customers/all", "{}").as_array().map(|a| a.len()), Some(2), "el proceso sigue vivo y sin la fila mala");
+}

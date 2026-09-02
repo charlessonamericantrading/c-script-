@@ -53,7 +53,29 @@ pub const CHANNEL: &str = "link_stream_changes";
 pub const MAX_PAYLOAD_BYTES: usize = 7900;
 const _: () = assert!(MAX_PAYLOAD_BYTES < 8000, "el payload tiene que caber en el límite duro de NOTIFY");
 
-/// Todas las colecciones declaradas en `db { ... }` del programa (fusión de
+/// Solo las colecciones que algún `stream` observa con `db.<c>.subscribe()`
+/// (la forma exacta que §3.16 reconoce, `ast::recognize_live_subscribe`) --
+/// `--only-streams`, pedido del CRM Nexus: de 24 tablas declaradas solo 9
+/// tenían un stream, y las de más escritura (sync de pedidos, imports) no
+/// necesitan un trigger disparando en cada fila para nadie. Orden de
+/// aparición, sin duplicados.
+pub fn stream_collections(program: &Program) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in &program.items {
+        let Item::Service(s) = item else { continue };
+        for m in &s.members {
+            let crate::ast::Member::Stream(r) = m else { continue };
+            if let Some(c) = crate::ast::recognize_live_subscribe(&r.body) {
+                if !out.iter().any(|x| x == c) {
+                    out.push(c.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Todas las colecciones declaradas en `db { ... }` del programa (fusión de/// Todas las colecciones declaradas en `db { ... }` del programa (fusión de
 /// varios bloques incluida, GRAMMAR.md §3.172), en orden de declaración.
 pub fn collection_names(program: &Program) -> Vec<String> {
     let mut out = Vec::new();
@@ -80,7 +102,13 @@ fn qualified(schema: Option<&str>, name: &str) -> String {
 /// colección. `schema` es el de `--db-schema` (GRAMMAR.md §3.193); sin él,
 /// todo va sin calificar (el `public` de siempre, vía `search_path`).
 pub fn external_change_triggers_sql(program: &Program, schema: Option<&str>) -> String {
-    let collections = collection_names(program);
+    external_change_triggers_sql_for(program, schema, &collection_names(program))
+}
+
+/// Igual que `external_change_triggers_sql` pero para una lista explícita de
+/// colecciones (la de `stream_collections` con `--only-streams`).
+pub fn external_change_triggers_sql_for(program: &Program, schema: Option<&str>, collections: &[String]) -> String {
+    let _ = program;
     let function = qualified(schema, TRIGGER_FUNCTION);
     let mut out = String::new();
     out.push_str("-- 'linkc triggers' (GRAMMAR.md §3.225): hace que un `stream` de `linkc serve` reaccione a\n");
@@ -111,7 +139,7 @@ BEGIN\n\
 END;\n\
 $link$;\n\n"
     ));
-    for name in &collections {
+    for name in collections {
         let table = qualified(schema, name);
         let trigger = format!("link_notify_{name}");
         out.push_str(&format!("DROP TRIGGER IF EXISTS \"{trigger}\" ON {table};\n"));
@@ -120,7 +148,7 @@ $link$;\n\n"
         ));
     }
     if collections.is_empty() {
-        out.push_str("-- El programa no declara ninguna colección en `db { }`: no hay tablas a las que enganchar.\n");
+        out.push_str("-- Ninguna colección a la que enganchar: el programa no declara ninguna en `db { }` (o, con --only-streams, ningún `stream` observa una con db.<c>.subscribe()).\n");
     }
     out
 }
@@ -158,10 +186,23 @@ mod tests {
     }
 
     #[test]
+    fn stream_collections_lists_only_what_a_live_stream_subscribes_to() {
+        let p = program(
+            "type A = { id: Int }\ntype B = { id: Int }\ntype C = { id: Int }\ndb { as: A[], bs: B[], cs: C[] }\n\
+             service S {\n  stream wa() -> A { while true { db.as.subscribe() } }\n  stream wc() -> C { while true { db.cs.subscribe() } }\n  stream wa2() -> A { while true { db.as.subscribe() } }\n  rpc all() -> B[] { db.bs.all() }\n}\n",
+        );
+        assert_eq!(stream_collections(&p), vec!["as".to_string(), "cs".to_string()]);
+        let sql = external_change_triggers_sql_for(&p, None, &stream_collections(&p));
+        assert!(sql.contains("ON \"as\""), "{sql}");
+        assert!(sql.contains("ON \"cs\""), "{sql}");
+        assert!(!sql.contains("ON \"bs\""), "sin stream, sin trigger: {sql}");
+    }
+
+    #[test]
     fn a_program_without_collections_says_so_instead_of_emitting_nothing() {
         let p = program("fn f() -> Int { 1 }\n");
         let sql = external_change_triggers_sql(&p, None);
-        assert!(sql.contains("no declara ninguna colección"), "{sql}");
+        assert!(sql.contains("no declara ninguna en `db { }`"), "{sql}");
         assert!(!sql.contains("CREATE TRIGGER"));
     }
 

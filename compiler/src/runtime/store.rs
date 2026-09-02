@@ -936,13 +936,90 @@ fn postgres_cell(row: &postgres::Row, i: usize, kind: ColumnKind) -> Result<Cell
             Some(b) => Cell::Bool(b),
             None => Cell::Null,
         },
-        ColumnKind::Json => {
-            match row.try_get::<_, Option<serde_json::Value>>(i).map_err(|e| e.to_string())? {
-                Some(v) => Cell::Json(v),
-                None => Cell::Null,
-            }
-        }
+        ColumnKind::Json => match row.try_get::<_, Option<serde_json::Value>>(i) {
+            Ok(Some(v)) => Cell::Json(v),
+            Ok(None) => Cell::Null,
+            // GRAMMAR.md §3.228: la columna no es json/jsonb -- si es un
+            // ARRAY nativo (`integer[]`, `text[]`, ...), se lee como la
+            // lista que el campo `Int[]`/`String[]` declara. Mismo patrón
+            // que uuid/inet/timestamp nativos (§3.179/§3.182): el error
+            // original solo sale si tampoco es un array soportado.
+            Err(json_err) => match postgres_array_cell(row, i) {
+                Some(cell) => cell,
+                None => return Err(json_err.to_string()),
+            },
+        },
     })
+}
+
+/// GRAMMAR.md §3.228: una columna ARRAY nativa de Postgres como
+/// `Cell::Json(Value::Array)` -- exactamente lo que el campo `T[]`
+/// correspondiente guarda en SQLite (JSON en TEXT) y lo que `value_to_json`
+/// espera, así que ningún otro punto del runtime distingue "array nativo"
+/// de "lista guardada como JSON". Se prueban los tipos de elemento en
+/// orden; `try_get` rechaza por tipo ANTES de mirar el valor, así que un
+/// `NULL` de `int4[]` cae en `Vec<i32>` como `None` → `Cell::Null`. `None`
+/// (de esta función) = ningún tipo soportado: el caller devuelve el error
+/// original de JSON, no uno inventado.
+fn postgres_array_cell(row: &postgres::Row, i: usize) -> Option<Cell> {
+    macro_rules! try_array {
+        ($t:ty, $conv:expr) => {
+            if let Ok(v) = row.try_get::<_, Option<Vec<$t>>>(i) {
+                return Some(match v {
+                    Some(items) => Cell::Json(serde_json::Value::Array(items.into_iter().map($conv).collect())),
+                    None => Cell::Null,
+                });
+            }
+        };
+    }
+    try_array!(i64, |n: i64| serde_json::json!(n));
+    try_array!(i32, |n: i32| serde_json::json!(n));
+    try_array!(i16, |n: i16| serde_json::json!(n));
+    try_array!(String, serde_json::Value::String);
+    try_array!(bool, serde_json::Value::Bool);
+    try_array!(f64, |f: f64| serde_json::json!(f));
+    try_array!(f32, |f: f32| serde_json::json!(f));
+    None
+}
+
+/// GRAMMAR.md §3.228: la mitad de ESCRITURA -- una lista JSON (lo que un
+/// campo `T[]` lleva en `Cell::Json`) bindeada contra una columna ARRAY
+/// nativa. El tipo de elemento lo dice la columna real (`ty`), no el
+/// programa: `Int[]` contra `integer[]` va como `Vec<i32>`, contra
+/// `bigint[]` como `Vec<i64>` -- mismo criterio que `Cell::Int` contra
+/// INT2/INT4 arriba. Un elemento que no calza (un string donde la columna
+/// pide enteros) es un error limpio con la posición, nunca un 500 del
+/// motor.
+fn json_array_to_pg(
+    v: &serde_json::Value,
+    elem: &postgres::types::Type,
+    ty: &postgres::types::Type,
+    out: &mut postgres::types::private::BytesMut,
+) -> Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
+    use postgres::types::{ToSql, Type};
+    let Some(items) = v.as_array() else {
+        return Err(format!("la columna '{ty}' es un array nativo de PostgreSQL y el valor no es una lista").into());
+    };
+    fn each<T>(items: &[serde_json::Value], ty: &Type, f: impl Fn(&serde_json::Value) -> Option<T>, what: &str) -> Result<Vec<T>, Box<dyn std::error::Error + Sync + Send>> {
+        items
+            .iter()
+            .enumerate()
+            .map(|(j, item)| f(item).ok_or_else(|| format!("el elemento {j} de la lista no es {what} (columna '{ty}')").into()))
+            .collect()
+    }
+    match *elem {
+        Type::INT8 => each(items, ty, |x| x.as_i64(), "un entero")?.to_sql(ty, out),
+        Type::INT4 => each(items, ty, |x| x.as_i64().and_then(|n| i32::try_from(n).ok()), "un entero de 32 bits")?.to_sql(ty, out),
+        Type::INT2 => each(items, ty, |x| x.as_i64().and_then(|n| i16::try_from(n).ok()), "un entero de 16 bits")?.to_sql(ty, out),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR => each(items, ty, |x| x.as_str().map(str::to_string), "un String")?.to_sql(ty, out),
+        Type::BOOL => each(items, ty, |x| x.as_bool(), "un Bool")?.to_sql(ty, out),
+        Type::FLOAT8 => each(items, ty, |x| x.as_f64(), "un Float")?.to_sql(ty, out),
+        Type::FLOAT4 => each(items, ty, |x| x.as_f64().map(|f| f as f32), "un Float")?.to_sql(ty, out),
+        _ => Err(format!(
+            "la columna '{ty}' es un array de '{elem}', que c-script no sabe escribir -- soportados: integer[]/bigint[]/smallint[]/text[]/varchar[]/boolean[]/double precision[]/real[] (GRAMMAR.md §3.228)"
+        )
+        .into()),
+    }
 }
 
 impl rusqlite::ToSql for Cell {
@@ -1095,7 +1172,12 @@ impl postgres::types::ToSql for Cell {
             }
             Cell::Text(s) => s.to_sql(ty, out),
             Cell::Bool(b) => b.to_sql(ty, out),
-            Cell::Json(v) => v.to_sql(ty, out),
+            // GRAMMAR.md §3.228: contra una columna ARRAY nativa, la lista
+            // JSON se bindea como el array de Postgres que la columna pide.
+            Cell::Json(v) => match ty.kind() {
+                postgres::types::Kind::Array(elem) => json_array_to_pg(v, elem, ty, out),
+                _ => v.to_sql(ty, out),
+            },
         }
     }
 

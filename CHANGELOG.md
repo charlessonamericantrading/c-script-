@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.186.0] - 2026-09-02
+
+### ✨ Añadido
+**Columnas `ARRAY` nativas de PostgreSQL (`integer[]`, `bigint[]`, `text[]`, `boolean[]`, `double precision[]`) como `Int[]`/`String[]`/`Bool[]`/`Float[]` en lectura, escritura e `introspect` (PLAN.md §9.19 ítem 3)**: las tres tablas del CRM con arrays `NOT NULL` que no se podían declarar ahora se adoptan tal cual; lo que c-script escribe es un array de verdad para el sistema viejo. Mismo patrón que uuid/inet/timestamp nativos: la columna real decide. Verificado contra Postgres real en CI. **`linkc triggers --only-streams`** (pedido del CRM): DDL solo para las colecciones que algún `stream` observa. Ver GRAMMAR.md §3.228.
+
 ## [1.185.1] - 2026-09-02
 
 ### 🐛 Corregido

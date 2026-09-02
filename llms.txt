@@ -58,9 +58,9 @@ composite, conditional `where`) §3.80/§3.155/§3.174, `@check(min/max/range/mi
 maxLength)` and `@check(<expr>)` §3.96/§3.146/§3.173, `@validate(email|regex)` §3.73,
 `@softDelete` §3.78, `@autoUpdate` §3.77, `@encrypted` (AES-GCM at rest) §3.191, `id: Uuid` PK
 §3.177, native Postgres `uuid/inet/cidr/json/jsonb/date/timestamp/timestamptz/numeric`
-columns §3.179/§3.187/§3.91/§3.182/§3.103, `--db-schema` §3.193, `--adopt-existing` §3.67,
+columns §3.179/§3.187/§3.91/§3.182/§3.103, native `integer[]`/`text[]`/`boolean[]`/`double precision[]` arrays as `Int[]`/`String[]`/`Bool[]`/`Float[]` §3.228, `--db-schema` §3.193, `--adopt-existing` §3.67,
 `db.vacuum()`/`db.tableStats()` §3.151. Tooling: `linkc introspect` (Postgres → starting
-`.link`; columns + PK only) §3.66, `linkc migrate --dry-run` §3.97, `linkc triggers` (Postgres DDL so streams see external writes) §3.225, `linkc db inspect/export/
+`.link`; columns + PK only) §3.66, `linkc migrate --dry-run` §3.97, `linkc triggers [--only-streams]` (Postgres DDL so streams see external writes) §3.225/§3.228, `linkc db inspect/export/
 import/shell` §3.175/§3.185/§3.189.
 
 **Services and HTTP** — `service X { rpc f(a: T) -> U { } }` served as `POST /X/f` with a

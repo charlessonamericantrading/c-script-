@@ -98,3 +98,17 @@ fn a_program_that_does_not_type_check_fails_like_every_other_subcommand() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).is_empty(), "sin DDL parcial para un programa roto");
 }
+
+#[test]
+fn only_streams_limits_the_ddl_to_collections_a_live_stream_observes() {
+    let temp = TempDir::new("only-streams");
+    let src = temp.write("app.link", PROGRAM);
+    let out = run(&["triggers", src.to_str().unwrap(), "--only-streams"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // Solo `messages` tiene un `stream` con `db.messages.subscribe()`;
+    // `conversations` se declara pero nadie la observa.
+    assert!(stdout.contains("CREATE TRIGGER \"link_notify_messages\""), "{stdout}");
+    assert!(!stdout.contains("link_notify_conversations"), "sin stream, sin trigger: {stdout}");
+    assert_eq!(stdout.matches("CREATE TRIGGER").count(), 1, "{stdout}");
+}
