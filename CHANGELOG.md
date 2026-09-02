@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.178.0] - 2026-09-02
+
+### 🔧 Interno
+**`llms.txt` invertido a lo que la convención llmstxt.org define (PLAN.md §9.18 Eje C ítem 3)**: pasa de 104 KB de changelog cronológico a un ÍNDICE de 30 KB -- una línea por capacidad, 8 áreas, cada una con su `§3.N` (verificadas por `docs_drift.rs`); la lista cronológica completa se mueve verbatim a `llms-full.txt` (7 KB → 88 KB), que es la mitad "expandida" del spec. De paso, tres entradas de "Does NOT work" que ya eran falsas (status de `http.*` §3.60, identidad del caller §3.53/§3.197, rate limit distribuido §3.178) eliminadas, y tres límites reales que faltaban (sin relaciones/joins, una sola conexión a la base, `mcp.sample` de un turno) agregados. Ver GRAMMAR.md §3.219.
+
 ## [1.177.0] - 2026-09-02
 
 ### 🐛 Corregido

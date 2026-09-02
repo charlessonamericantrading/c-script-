@@ -240,6 +240,7 @@
   - [3.216 Cero warnings de clippy, `-D warnings` en CI, y `ServeConfig` — RESUELTO](#3216-cero-warnings-de-clippy--d-warnings-en-ci-y-serveconfig--resuelto)
   - [3.217 Benchmarks de humo (`cargo bench --bench smoke`) — RESUELTO](#3217-benchmarks-de-humo-cargo-bench---bench-smoke--resuelto)
   - [3.218 Test de deriva mecánica de la documentación para agentes (`docs_drift.rs`) — RESUELTO](#3218-test-de-deriva-mecánica-de-la-documentación-para-agentes-docs_driftrs--resuelto)
+  - [3.219 `llms.txt` como índice y `llms-full.txt` como detalle — RESUELTO](#3219-llmstxt-como-índice-y-llms-fulltxt-como-detalle--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7774,6 +7775,18 @@ Origen: `PLAN.md §9.18` Eje C ítem 2. `docs_examples.rs` (§3.213) garantiza q
 Los seis textos derivados quedaron corregidos en la misma versión (el test 2 no hubiera pasado sin arreglar `--help`; los de X-Forwarded-For y npm son deriva SEMÁNTICA, que ningún test mecánico atrapa -- se arreglaron leyendo, y quedan acá como registro de que pasa de verdad y de qué forma toma).
 
 **Límite honesto**: esto atrapa la deriva MECÁNICA (referencias rotas, flags fantasma), que es la mayoría por volumen, no la semántica ("primer" vs. "último"). Lo segundo solo lo cubre la disciplina de que un cambio de comportamiento toque la documentación en el mismo commit -- este test hace que al menos la parte verificable no dependa de esa disciplina.
+### 3.219 `llms.txt` como índice y `llms-full.txt` como detalle — RESUELTO, cierra PLAN.md §9.18 Eje C ítem 3
+
+Origen: `PLAN.md §9.18` Eje C ítem 3. Medido antes de tocar nada: el `llms.txt` del repo pesaba 104 KB (434 líneas) y `llms-full.txt` 7 KB -- exactamente al revés de la convención [llmstxt.org](https://llmstxt.org/) que `linkc build` YA aplica bien para los proyectos (§3.118/§3.139: `llms.txt` es el índice corto, `llms-full.txt` el contenido completo). La causa: la sección "What works today" de `llms.txt` era una lista CRONOLÓGICA de ~100 párrafos, uno por feature shippeada, cada uno de 300-900 caracteres -- un changelog, no un índice. Para un agente que "lee la referencia rápida" eran ~26.000 tokens de contexto, la mayoría dedicados al detalle de hooks de React de agosto, y desplazando lo que sí importa (los tres errores que rompen el primer intento, la CLI, el ejemplo verificado).
+
+**Qué cambió (v1.178.0)**:
+- **`llms.txt` (ahora 30 KB, 422 líneas)**: "What works today" es un ÍNDICE nuevo, escrito de cero -- una línea por capacidad, agrupado en 8 áreas (lenguaje y tipos, base de datos, servicios y HTTP, auth, integraciones, SEO, salida generada, tooling), cada capacidad con el `§3.N` de GRAMMAR.md donde está el contrato exacto y su límite honesto (`docs_drift.rs`, §3.218, verifica que las ~180 citas existan). Las reglas que un LLM se equivoca, la CLI y el ejemplo verificado quedan intactos.
+- **`llms-full.txt` (ahora 88 KB)**: conserva su contenido anterior y suma, como sección 7, la lista cronológica completa que vivía en `llms.txt`, verbatim -- nada se perdió, solo cambió de archivo. Es la mitad "expandida" del spec.
+- **Tres afirmaciones de la lista "Does NOT work" que ya eran FALSAS, eliminadas**: "`http.*` solo devuelve el body, sin status" (falso desde §3.60, `getWithStatus`/`postWithStatus`); "no hay identidad del caller más allá del rol" (falso desde §3.53/§3.197, `currentUserId`/`claim`); "`@rate_limit` es solo en memoria por proceso" (falso desde §3.178, store distribuido vía Postgres). La lista nueva de límites deliberados tiene solo los que siguen siendo ciertos hoy, con su sección -- incluidos tres que la vieja NO nombraba y que un agente necesita saber antes de diseñar (sin FKs/relaciones/joins ni alias campo↔columna §3.66; una sola conexión física a la base y sin drenado gracioso §3.158/§3.17; `mcp.sample` de un solo turno §3.203).
+
+**Verificado**: `docs_examples.rs` (los bloques de código con marcador siguen compilando en los dos archivos, 2 y 5 marcadores respectivamente, mismos que antes) y `docs_drift.rs` (todas las citas `§3.N` del índice nuevo existen; todo flag junto a `linkc` está en `--help`) en verde sobre los dos archivos reescritos.
+
+**Límite honesto**: el índice nuevo lo escribí a mano contra la tabla de contenidos de este documento -- es tan completo como esa tabla el 02/09/2026. Una feature nueva tiene que sumar su línea al índice, igual que hoy suma su párrafo a la lista cronológica; `docs_drift.rs` no detecta una capacidad AUSENTE del índice, solo una cita rota.
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
