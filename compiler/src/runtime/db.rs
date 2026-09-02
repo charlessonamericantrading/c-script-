@@ -1179,6 +1179,8 @@ pub struct Db {
     ai_timeout: parking_lot::RwLock<std::time::Duration>,
     /// GRAMMAR.md §3.235: una generación a la vez por programa.
     ai_lock: parking_lot::Mutex<()>,
+    /// GRAMMAR.md §3.237: contadores de `ai.*` por alias, para `/metrics`.
+    ai_stats: parking_lot::Mutex<HashMap<String, crate::metrics::AiStatsRow>>,
     /// Nombre de colección -> nombre del campo `@softDelete`, si esa
     /// colección tiene uno (GRAMMAR.md §3.78). Se calcula UNA vez al abrir
     /// la conexión (acá SÍ hay `Program`/`ast::Field` con anotaciones a
@@ -1674,6 +1676,7 @@ impl Db {
             ai_engine: parking_lot::RwLock::new(None),
             ai_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(60)),
             ai_lock: parking_lot::Mutex::new(()),
+            ai_stats: parking_lot::Mutex::new(HashMap::new()),
             soft_delete_fields,
             static_routes: crate::route::static_public_routes(program),
             outbound_http: parking_lot::Mutex::new(HashMap::new()),
@@ -1889,6 +1892,7 @@ impl Db {
                 ai_engine: parking_lot::RwLock::new(None),
                 ai_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(60)),
                 ai_lock: parking_lot::Mutex::new(()),
+                ai_stats: parking_lot::Mutex::new(HashMap::new()),
                 soft_delete_fields,
                 static_routes: crate::route::static_public_routes(program),
                 outbound_http: parking_lot::Mutex::new(HashMap::new()),
@@ -1960,6 +1964,36 @@ impl Db {
 
     pub fn ai_timeout(&self) -> std::time::Duration {
         *self.ai_timeout.read()
+    }
+
+    /// GRAMMAR.md §3.237: registra el resultado de una generación para
+    /// `/metrics` -- una fila por alias, mismo patrón que `record_outbound_http`.
+    #[cfg(feature = "inference")]
+    pub fn record_ai(&self, alias: &str, result: &Result<crate::inference::AiOutput, String>) {
+        let mut map = self.ai_stats.lock();
+        let row = map.entry(alias.to_string()).or_default();
+        match result {
+            Ok(out) => {
+                row.ok += 1;
+                row.prompt_tokens += out.prompt_tokens as u64;
+                row.generated_tokens += out.generated_tokens as u64;
+                row.prefill_secs += out.prefill.as_secs_f64();
+                row.decode_secs += out.decode.as_secs_f64();
+                if out.prefix_hit {
+                    row.prefix_hits += 1;
+                }
+            }
+            Err(_) => row.errors += 1,
+        }
+    }
+
+    /// GRAMMAR.md §3.237: `(alias, fila)` ordenado, para que `/metrics` sea
+    /// determinista entre scrapes.
+    pub fn ai_stats(&self) -> Vec<(String, crate::metrics::AiStatsRow)> {
+        let map = self.ai_stats.lock();
+        let mut rows: Vec<(String, crate::metrics::AiStatsRow)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
     }
 
     /// GRAMMAR.md §3.235: el candado "una generación a la vez".

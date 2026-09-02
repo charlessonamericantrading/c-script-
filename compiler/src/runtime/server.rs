@@ -1003,7 +1003,8 @@ fn handle_request(
         let size_bytes = db.size_bytes();
         let oversized_notify_drop_counts = db.oversized_notify_drop_counts();
         let outbound_http_stats = db.outbound_http_stats();
-        let metrics_text = metrics_store.lock().render_prometheus_text(&subscriber_counts, size_bytes, &oversized_notify_drop_counts, &outbound_http_stats);
+        let ai_stats = db.ai_stats();
+        let metrics_text = metrics_store.lock().render_prometheus_text(&subscriber_counts, size_bytes, &oversized_notify_drop_counts, &outbound_http_stats, &ai_stats);
         let resp = cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None, &request);
         let _ = request.respond(resp);
         log_done(log, req_id, Some("metrics"), 200, start, "");
@@ -1266,6 +1267,7 @@ fn handle_request(
             let outcome = crate::inference::generate_with(&engine, &spec.alias, spec.request, spec.max_tokens, db.ai_timeout(), &mut |tok| {
                 tx.send(serde_json::json!({ "token": tok, "done": false })).map_err(|_| "cliente desconectado".to_string())
             });
+            db.record_ai(&spec.alias, &outcome);
             let _ = match outcome {
                 Ok(_) => tx.send(serde_json::json!({ "token": "", "done": true })),
                 Err(e) => tx.send(serde_json::json!({ "token": "", "done": true, "error": e })),

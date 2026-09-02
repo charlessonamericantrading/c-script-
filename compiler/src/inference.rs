@@ -102,6 +102,12 @@ pub struct AiOutput {
     pub generated_tokens: usize,
     pub done_reason: &'static str,
     pub elapsed: std::time::Duration,
+    /// GRAMMAR.md §3.237: tiempo del prefill (el prompt entero de una vez).
+    pub prefill: std::time::Duration,
+    /// GRAMMAR.md §3.237: tiempo del decode (un token por paso).
+    pub decode: std::time::Duration,
+    /// GRAMMAR.md §3.237: ¿el prompt reusó KV de un prefijo reciente?
+    pub prefix_hit: bool,
 }
 
 /// GRAMMAR.md §3.235: el bucle de generación del motor (`routes.rs::
@@ -147,6 +153,7 @@ pub fn generate_with(
     let started = std::time::Instant::now();
     let (matched, cached) = state.prefix_cache.find_longest_prefix(alias, &prompt_ids);
     let safe = model_core::prefix_cache::safe_reuse_len(matched, prompt_ids.len());
+    let prefix_hit = safe > 0 && cached.is_some();
     let (mut cache, mut logits) = match cached {
         Some(mut cache) if safe > 0 => {
             cache.truncate(safe);
@@ -160,6 +167,8 @@ pub fn generate_with(
             (cache, logits)
         }
     };
+    let prefill = started.elapsed();
+    let decode_started = std::time::Instant::now();
     let max = max_tokens as usize;
     let mut generated: Vec<u32> = Vec::new();
     let mut done_reason = "length";
@@ -189,6 +198,9 @@ pub fn generate_with(
         generated_tokens: generated.len(),
         done_reason,
         elapsed: started.elapsed(),
+        prefill,
+        decode: decode_started.elapsed(),
+        prefix_hit,
     })
 }
 

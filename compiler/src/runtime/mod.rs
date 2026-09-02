@@ -3803,7 +3803,9 @@ fn call_method(
                     // §3.235, límite honesto): dos a la vez en una CPU de 4
                     // núcleos se pisan y las dos salen peor.
                     let _one_at_a_time = db.ai_lock();
-                    let out = crate::inference::generate(&engine, &model, request, max_tokens, db.ai_timeout()).map_err(err)?;
+                    let result = crate::inference::generate(&engine, &model, request, max_tokens, db.ai_timeout());
+                    db.record_ai(&model, &result);
+                    let out = result.map_err(err)?;
                     Ok(Value::Str(out.text))
                 }
                 #[cfg(not(feature = "inference"))]
@@ -3833,11 +3835,12 @@ fn call_method(
                     })?;
                     let _one_at_a_time = db.ai_lock();
                     let mut tokens = Vec::new();
-                    crate::inference::generate_with(&engine, &model, request, max_tokens, db.ai_timeout(), &mut |tok| {
+                    let result = crate::inference::generate_with(&engine, &model, request, max_tokens, db.ai_timeout(), &mut |tok| {
                         tokens.push(ai_token_value(tok, false));
                         Ok(())
-                    })
-                    .map_err(err)?;
+                    });
+                    db.record_ai(&model, &result);
+                    result.map_err(err)?;
                     tokens.push(ai_token_value("", true));
                     Ok(Value::List(tokens))
                 }

@@ -258,6 +258,7 @@
   - [3.234 El bloque `ai { alias: "spec", ... }` y `--models-dir`: los modelos locales del programa, resueltos al arrancar — RESUELTO](#3234-el-bloque-ai--alias-spec---y---models-dir-los-modelos-locales-del-programa-resueltos-al-arrancar--resuelto)
   - [3.235 `ai.generate` / `ai.chat` / `ai.models`: inferencia local síncrona con el motor embebido — RESUELTO](#3235-aigenerate--aichat--aimodels-inferencia-local-síncrona-con-el-motor-embebido--resuelto)
   - [3.236 `stream -> AiToken { ai.stream(model, messages, maxTokens) }`: un evento SSE por token — RESUELTO](#3236-stream---aitoken--aistreammodel-messages-maxtokens--un-evento-sse-por-token--resuelto)
+  - [3.237 `linkc_ai_*` en `/metrics`: tokens, tiempos de prefill/decode, errores y hits del prefix cache por modelo — RESUELTO](#3237-linkc_ai_-en-metrics-tokens-tiempos-de-prefilldecode-errores-y-hits-del-prefix-cache-por-modelo--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8186,6 +8187,31 @@ service Assistant {
 **Verificado**: checker (`stream reply(q) -> AiToken { ai.stream(...) }` tipa, `-> String` no, aridad), `ai_stream_member` reconoce el stream y no un rpc, y `tests/cli_ai_generate.rs` contra `qwen2.5:0.5b` REAL a través del binario: un `POST /Ai/reply` devuelve `>= 3` eventos `data:` (tokens con `done: false`, el último `done: true` sin `error`), el texto concatenado no está vacío, y `ai.stream("nadie", ...)` responde `400` con `'nadie'` y `[m]` sin abrir el SSE. Como los de Postgres, se salta sin `LINK_TEST_AI_MODEL`.
 
 **Límite honesto**: un token se decodifica solo (`decode(&[id])`), así que un carácter multibyte partido en dos tokens puede salir como `�` en un evento y correcto en el texto concatenado -- el motor de origen tiene el mismo comportamiento (`routes.rs`, `response` por token); un buffer UTF-8 por stream es una mejora pequeña pendiente. No hay `system` implícito ni historial: cada llamada lleva sus `messages` completos. El cliente generado (`hooks.ts`) consume el stream como cualquier `stream` de §3.16: la UI de Skynet tiene que concatenar `token` hasta `done`.
+
+### 3.237 `linkc_ai_*` en `/metrics`: tokens, tiempos de prefill/decode, errores y hits del prefix cache por modelo — RESUELTO, cierra PLAN.md §9.20 Eje G ítem 8
+
+Origen: `PLAN.md §9.20` Eje G ítem 8. Sin esto no había forma de comparar el motor embebido contra los números que `ROADMAP-PERF-WAVE3.md` de Skynet ya midió contra Ollama (3,19x en 0.5B / 2,04x en 7B), ni de ver en producción cuántos tokens cuesta cada rpc. Mismo patrón que `linkc_http_outbound_*` (§3.223): el `Db` acumula (`record_ai`, una fila por alias), `/metrics` lee (`ai_stats()`), texto Prometheus (§3.150).
+
+**Qué hay (v1.195.0)**, solo si hubo al menos una generación (sin series inventadas en 0, como el resto):
+
+```text
+linkc_ai_requests_total{model="router",result="ok"} 3
+linkc_ai_requests_total{model="router",result="error"} 1
+linkc_ai_tokens_total{model="router",kind="prompt"} 40
+linkc_ai_tokens_total{model="router",kind="generated"} 24
+linkc_ai_duration_seconds_sum{model="router",phase="prefill"} 0.5
+linkc_ai_duration_seconds_sum{model="router",phase="decode"} 1.25
+linkc_ai_prefix_cache_hits_total{model="router"} 2
+```
+
+- **Tokens/s de decode** = `linkc_ai_tokens_total{kind="generated"} / linkc_ai_duration_seconds_sum{phase="decode"}`; **de prefill** = `kind="prompt" / phase="prefill"`. Son las dos cifras del roadmap de origen, ahora desde el `.link` en producción, por alias (`model`).
+- `result="error"` cuenta alias desconocido, modelo que no carga, timeout de `--ai-timeout` y prompt vacío -- bajo el alias PEDIDO (un `ai.generate("nadie", ...)` aparece como `model="nadie"`), que es lo que se quiere ver.
+- `linkc_ai_prefix_cache_hits_total`: generaciones cuyo prompt reusó el KV de un prefijo reciente (§3.235) -- la señal de si el orden estable/volátil del system prompt está funcionando.
+- Cubre `ai.generate`, `ai.chat`, `ai.stream` en un rpc y el `stream -> AiToken` de §3.236 (el servidor registra al terminar, con o sin error).
+
+**Verificado**: unitario del renderer (sin generaciones no hay bloque; con una fila salen las cuatro series con sus valores exactos), y `tests/cli_ai_generate.rs` contra `qwen2.5:0.5b` REAL: tras `complete`, `chat` y un `bad` con alias desconocido, `/metrics` trae `requests_total{m,ok} = 2`, `requests_total{nadie,error} = 1`, tokens de prompt y generados `>= 2`, y segundos de decode `> 0`.
+
+**Límite honesto**: son contadores (sumas), no histogramas -- p50/p99 de latencia por generación queda para cuando haya un caso que lo pida (mismo criterio que `linkc_http_outbound_*`). Memoria de KV por modelo y cola del pool (que el ítem 8 del plan nombraba) no están: el motor no expone hoy el tamaño residente de su cache, y el pool acotado es Eje B ítem 2.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

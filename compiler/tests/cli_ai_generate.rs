@@ -154,6 +154,23 @@ service Ai {{
     // El proceso sigue vivo después del error.
     let (status, _) = server.request("POST", "/Ai/models", "{}").expect("models otra vez");
     assert_eq!(status, 200);
+
+    // GRAMMAR.md §3.237: /metrics trae las series del motor por alias --
+    // dos generaciones ok (`complete`, `chat`), un error (`bad`, alias
+    // desconocido, que se registra bajo el alias pedido).
+    let (status, metrics) = server.request("GET", "/metrics", "").expect("metrics");
+    assert_eq!(status, 200, "{metrics}");
+    let value = |name: &str, labels: &str| -> f64 {
+        metrics
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}{{{labels}}} ")).and_then(|v| v.trim().parse::<f64>().ok()))
+            .unwrap_or_else(|| panic!("falta {name}{{{labels}}} en:\n{metrics}"))
+    };
+    assert_eq!(value("linkc_ai_requests_total", "model=\"m\",result=\"ok\""), 2.0, "{metrics}");
+    assert_eq!(value("linkc_ai_requests_total", "model=\"nadie\",result=\"error\""), 1.0, "{metrics}");
+    assert!(value("linkc_ai_tokens_total", "model=\"m\",kind=\"generated\"") >= 2.0, "{metrics}");
+    assert!(value("linkc_ai_tokens_total", "model=\"m\",kind=\"prompt\"") >= 2.0, "{metrics}");
+    assert!(value("linkc_ai_duration_seconds_sum", "model=\"m\",phase=\"decode\"") > 0.0, "{metrics}");
 }
 
 /// Lee la respuesta SSE entera (Connection: close) y devuelve los JSON de

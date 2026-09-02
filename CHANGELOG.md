@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.195.0] - 2026-09-03
+
+### ✨ Añadido
+**`linkc_ai_requests_total{model,result}`, `linkc_ai_tokens_total{model,kind}`, `linkc_ai_duration_seconds_sum{model,phase}` y `linkc_ai_prefix_cache_hits_total{model}` en `GET /metrics` (PLAN.md §9.20 Eje G ítem 8)**: tokens/s de prefill y de decode por alias de `ai { }` (las dos cifras del roadmap de rendimiento del motor de origen), errores bajo el alias pedido, y hits del prefix cache; cubre `ai.generate`/`ai.chat`/`ai.stream` y el `stream -> AiToken`. Solo aparece si hubo alguna generación. Verificado contra un modelo real. Ver GRAMMAR.md §3.237.
+
 ## [1.194.0] - 2026-09-03
 
 ### ✨ Añadido
