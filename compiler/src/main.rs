@@ -190,7 +190,7 @@ fn print_usage(to_stderr: bool) {
     out("     --diagnostics-json (flag global, cualquier posición): en cualquier subcomando que falle por un error de carga o de tipos, imprime un array JSON [{file, line, column, message}] a stdout en vez del texto humano de siempre a stderr -- para un agente o integración externa parseando errores sin scrapear prosa, GRAMMAR.md §3.208");
     out("subcomandos conocidos:");
     out("     linkc new <nombre> [--template nextjs|vite|minimal]   (scaffoldea un proyecto nuevo; --template elige el frontend generado, default minimal)");
-    out("     linkc build <archivo.link> <outdir> [--diff <anterior>] [--update-deps]    (genera contratos TS, cliente, hooks, schemas Zod, OpenAPI, llms.txt y llms-full.txt; --diff compara el contract.d.ts nuevo contra uno guardado antes; --update-deps ignora el pin de link.lock y re-resuelve cada dependencia git contra su remoto real)");
+    out("     linkc build <archivo.link> <outdir> [--diff <anterior>] [--update-deps]    (genera contratos TS, cliente, hooks, schemas Zod, OpenAPI, llms.txt, llms-full.txt y routes.json; --diff compara el contract.d.ts nuevo contra uno guardado antes; --update-deps ignora el pin de link.lock y re-resuelve cada dependencia git contra su remoto real)");
     out("     linkc test <archivo.link> [--filter <nombre>] [--db <url-postgres>]  (ejecuta pruebas de comportamiento integradas; --filter acota a las que CONTIENEN ese substring en el nombre; --db/LINK_TEST_DB corre contra PostgreSQL real en vez de SQLite :memory:, sin aislamiento entre tests -- solo contra una base de test dedicada, nunca producción; sin ningún bloque 'test { }' en el programa, ESTE es el camino rápido de 'solo parsear y tipar' -- no escribe ningún archivo, no toca ninguna base, sale en milisegundos, GRAMMAR.md §3.206)");
     out("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)");
     out("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)");
@@ -1157,6 +1157,7 @@ fn build_once(path: &str, outdir: &str, update_deps: bool) -> BuildResult {
     let openapi_path = format!("{outdir}/openapi.json");
     let llms_txt_path = format!("{outdir}/llms.txt");
     let llms_txt_full_path = format!("{outdir}/llms-full.txt");
+    let routes_json_path = format!("{outdir}/routes.json");
     if let Err(e) = fs::write(&contract_path, contract) {
         eprintln!("no se pudo escribir {contract_path}: {e}");
         return BuildResult { ok: false, touched };
@@ -1183,6 +1184,37 @@ fn build_once(path: &str, outdir: &str, update_deps: bool) -> BuildResult {
     }
     if let Err(e) = fs::write(&llms_txt_path, llms_txt) {
         eprintln!("no se pudo escribir {llms_txt_path}: {e}");
+        return BuildResult { ok: false, touched };
+    }
+    // GRAMMAR.md §3.222: `routes.json` -- cada `@route` del programa con lo
+    // que un CDN/prerender/sitemap externo necesita saber sin parsear el
+    // `.link`. `static`/`public` calculados con el MISMO criterio que
+    // `staticRoutes()` en runtime (`route::static_public_routes`).
+    let routes_json = {
+        let public_static = linkc::route::static_public_routes(&program);
+        let mut entries = Vec::new();
+        for item in &program.items {
+            let linkc::ast::Item::Service(s) = item else { continue };
+            for m in &s.members {
+                let linkc::ast::Member::Rpc(r) = m else { continue };
+                let Some(raw) = r.route() else { continue };
+                entries.push(serde_json::json!({
+                    "path": raw,
+                    "service": s.name,
+                    "rpc": r.name,
+                    "method": "GET",
+                    "static": !raw.contains(':'),
+                    "public": r.auth().is_none(),
+                    "in_sitemap": public_static.iter().any(|p| p == raw),
+                    "content_type": r.content_type(),
+                    "cache_control": r.annotations.iter().find_map(|a| match a { linkc::ast::Annotation::CacheControl(v) => Some(v.as_str()), _ => None }),
+                }));
+            }
+        }
+        serde_json::to_string_pretty(&serde_json::Value::Array(entries)).unwrap_or_else(|_| "[]".to_string()) + "\n"
+    };
+    if let Err(e) = fs::write(&routes_json_path, routes_json) {
+        eprintln!("no se pudo escribir {routes_json_path}: {e}");
         return BuildResult { ok: false, touched };
     }
     if let Err(e) = fs::write(&llms_txt_full_path, llms_txt_full) {

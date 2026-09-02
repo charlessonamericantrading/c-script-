@@ -94,7 +94,7 @@ awsS3PresignedUploadUrl` §3.110/§3.194; OAuth2 client-credentials pattern with
 `rpc` exposed as an MCP tool (`--mcp-jwt-secret`, sessions, `tools/list`, `tools/call`,
 sampling via `mcp.sample`) §3.203.
 
-**SEO and discoverability** — `sitemapXml/robotsTxt` §3.116, `metaTags/openGraphTags/
+**SEO and discoverability** — `sitemapXml/robotsTxt` §3.116, `staticRoutes(baseUrl)` (every static public `@route`, feeds `sitemapXml` directly) and `hreflangLinks` §3.222, `metaTags/openGraphTags/
 canonicalLink/jsonLd` §3.117, per-project `llms.txt`/`llms-full.txt` emitted by `linkc build`
 §3.118/§3.139.
 
@@ -102,7 +102,7 @@ canonicalLink/jsonLd` §3.117, per-project `llms.txt`/`llms-full.txt` emitted by
 `LinkTransportError.status`, `isOk`/`isErr`) §3.126/§3.129/§3.131, `validators.ts` §3.11,
 `hooks.ts` (Query/Mutation/Infinite/stream hooks with shared cache, `@invalidates`,
 `optimisticData`, `loading` vs `isFetching`, `reconnect()`) §3.123-§3.138, `schemas.ts` (Zod)
-§3.132, `openapi.json` 3.1 §3.133, project `llms.txt`/`llms-full.txt`, `main.wasm` (integer/
+§3.132, `openapi.json` 3.1 §3.133, project `llms.txt`/`llms-full.txt`, `routes.json` (every `@route` with its flags) §3.222, `main.wasm` (integer/
 boolean scalar functions only) §3.20. Contract diff for PR review: `linkc build --diff` §3.79.
 
 **Tooling** — `linkc new --template nextjs|vite|minimal`, `build`, `test` (`--filter`, `--db`;

@@ -188,6 +188,31 @@ impl RoutePattern {
     }
 }
 
+/// Un `@route` es ESTÁTICO si su patrón no tiene ningún `:param` ni
+/// catch-all -- o sea, si nombra exactamente UNA URL -- y PÚBLICO si el rpc
+/// no lleva `@authenticated`/`@requires`. Solo esos pueden ir a un sitemap
+/// (GRAMMAR.md §3.222): una ruta con parámetro nombra infinitas URLs que
+/// solo el programa sabe cuáles existen, y una ruta con auth no debe
+/// anunciarse a un crawler que nunca va a poder verla. Orden de
+/// declaración. Compartida entre `Db` (para `staticRoutes()` en runtime) y
+/// `linkc build` (para `routes.json`), así las dos vistas coinciden.
+pub fn static_public_routes(program: &crate::ast::Program) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in &program.items {
+        let crate::ast::Item::Service(s) = item else { continue };
+        for m in &s.members {
+            let crate::ast::Member::Rpc(r) = m else { continue };
+            let Some(raw) = r.route() else { continue };
+            if raw.contains(':') || r.auth().is_some() {
+                continue;
+            }
+            out.push(raw.to_string());
+        }
+    }
+    out
+}
+
+
 /// Parsea el texto crudo de `@route("...")`. Reglas (todas producen un
 /// mensaje de error pensado para leerse tal cual, sin que el caller le
 /// agregue contexto):

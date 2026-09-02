@@ -243,6 +243,7 @@
   - [3.219 `llms.txt` como índice y `llms-full.txt` como detalle — RESUELTO](#3219-llmstxt-como-índice-y-llms-fulltxt-como-detalle--resuelto)
   - [3.220 `/live` y `/ready`: liveness y readiness separados — RESUELTO](#3220-live-y-ready-liveness-y-readiness-separados--resuelto)
   - [3.221 `ETag` débil + `If-None-Match` → `304`, y `Vary: Accept-Encoding` — RESUELTO](#3221-etag-débil--if-none-match--304-y-vary-accept-encoding--resuelto)
+  - [3.222 `staticRoutes(baseUrl)`, `hreflangLinks(alternates)` y `routes.json` — RESUELTO](#3222-staticroutesbaseurl-hreflanglinksalternates-y-routesjson--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7817,6 +7818,52 @@ Origen: `PLAN.md §9.18` Eje B ítem 4. Verificado antes de tocar nada: grep de 
 **Verificado**: `tests/cli_etag.rs`, 3 tests por socket crudo contra un `linkc serve` real: ETag presente y determinista en un `@route`, `304` sin body con el tag exacto y con la forma fuerte del mismo valor, 200 con un tag ajeno, `Cache-Control` conservado en el 304; un POST sin ETag e ignorando `If-None-Match: *`; y un body de 3.000 bytes con `Vary: Accept-Encoding` en las dos variantes, MISMO ETag comprimido o no, `304` aunque el cliente acepte gzip, y un body chico (bajo el umbral) sin `Vary: Accept-Encoding`. Los tests existentes de CORS (`Vary: Origin`) y gzip siguen en verde.
 
 **Límite honesto**: sin `Last-Modified`/`If-Modified-Since` (no hay una fecha de modificación real que reportar: un rpc calcula su body cada vez) y sin `If-Match` en escrituras (concurrencia optimista es un diseño propio, no un header). El 304 ahorra el BODY en el wire, no el cómputo: el rpc corre igual para calcular el ETag -- combinarlo con `@cache` (§3.144) es lo que ahorra las dos cosas.
+### 3.222 `staticRoutes(baseUrl)`, `hreflangLinks(alternates)` y `routes.json` — RESUELTO, cierra PLAN.md §9.18 Eje D ítems 1 y 2
+
+Origen: `PLAN.md §9.18` Eje D ítems 1 y 2, lo que §9.9 dejó manual. `sitemapXml` (§3.116) recibe la lista de URLs a mano aunque las rutas ESTÁTICAS del programa ya están en el AST -- cada `@route` nuevo era una línea más que alguien tenía que acordarse de sumar al sitemap. Y un sitio en dos idiomas (el caso real del ecosistema: español/inglés) no tenía forma declarativa de emitir los `<link rel="alternate" hreflang>` que Google exige para no indexar cada variante como contenido duplicado.
+
+**Qué hay (v1.181.0)**, tres piezas con UN solo criterio compartido (`route::static_public_routes`, usado por las tres):
+
+- **`staticRoutes(baseUrl: String) -> {loc: String}[]`**, builtin sin receptor (mismo patrón de 5 puntos de enganche que `sitemapXml`/`metaTags`): cada `@route` del programa que sea **estático** (sin `:param` ni catch-all -- nombra exactamente UNA URL) y **público** (sin `@authenticated`/`@requires` -- una página que un crawler nunca va a poder ver no debe anunciarse), como URL absoluta `baseUrl + path`, en orden de declaración. La forma `{loc}` es deliberadamente la MÍNIMA que `sitemapXml` acepta (`lastmod` es opcional ahí), así `sitemapXml(staticRoutes("https://x.com"))` tipa sin adaptador. Una barra final en `baseUrl` se tolera quitándola. La lista la calcula `Db::new` una sola vez desde el AST (`Db::static_routes`), mismo criterio que `soft_delete_fields`: el intérprete no tiene el `Program` a mano cuando corre.
+- **`hreflangLinks(alternates: {lang: String, href: String}[]) -> String`**: un `<link rel="alternate" hreflang="..." href="...">` por variante, uno por línea, con el mismo escape HTML de atributos que `canonicalLink` (§3.117). `lang` es lo que Google espera (`es`, `en-US`, `x-default`), sin validar su gramática -- mismo criterio que `@cache_control` con su valor.
+- **`routes.json`**, artefacto nuevo de `linkc build`: un array con TODAS las `@route` del programa (`path`, `service`, `rpc`, `method`, `static`, `public`, `in_sitemap`, `content_type`, `cache_control`) -- lo que un CDN, un prerender o un sitemap externo necesita saber sin parsear el `.link`. `in_sitemap` es exactamente el conjunto que `staticRoutes()` devuelve en runtime, por construcción (misma función).
+
+<!-- linkc:check -->
+```rust
+type Alt = { lang: String, href: String }
+
+service Site {
+  @route("/about")
+  @content_type("text/html; charset=utf-8")
+  rpc about() -> String { "<h1>about</h1>" }
+
+  @route("/blog/:slug")
+  @content_type("text/html; charset=utf-8")
+  rpc post(slug: String) -> String { "<h1>" + slug.escapeHtml() + "</h1>" }
+
+  @route("/sitemap.xml")
+  @content_type("application/xml")
+  @cache_control("public, max-age=3600")
+  rpc sitemap() -> String { sitemapXml(staticRoutes("https://example.com")) }
+
+  rpc head() -> String {
+    hreflangLinks([Alt { lang: "es", href: "https://example.com/es" }, Alt { lang: "x-default", href: "https://example.com/" }])
+  }
+}
+
+test "the sitemap lists the static public routes and nothing else" {
+  let s = Site.sitemap();
+  assert(s.contains("<loc>https://example.com/about</loc>"), "about is static and public");
+  assert(s.contains("<loc>https://example.com/sitemap.xml</loc>"), "the sitemap route itself is static too");
+  assert(!s.contains("blog"), "a :param route is not one URL");
+}
+```
+
+(Sí: `/sitemap.xml` aparece en su propio sitemap -- es una ruta estática pública. Si no se quiere, `staticRoutes(...).filter(|r: Loc| { r.loc != "..." })` con un `type Loc = { loc: String }` propio lo filtra; no hay una lista de exclusiones especial.)
+
+**Verificado**: `tests/cli_static_routes.rs` contra el binario real -- `linkc test` corre 3 bloques `test` (orden y unión exacta de `staticRoutes`, `sitemapXml(staticRoutes(...))` con seis rutas de las que solo dos califican: `:param`, catch-all, `@authenticated` y `@requires` excluidas; `hreflangLinks` con la salida exacta y el escape de `"`/`<`/`&`), y `linkc build` escribe un `routes.json` con las seis rutas en orden, los flags correctos por ruta, y `in_sitemap` en exactamente las mismas dos. Suite de la lib (1.205 tests) y `docs_examples`/`docs_drift` en verde.
+
+**Límite honesto**: `@route("/")` no existe como ruta (`/` es `/health`, §3.87), así que la home de un sitio c-script vive en `/home` o similar y el sitemap la lista ahí. Las rutas con parámetro siguen siendo del programa: solo él sabe qué slugs existen (`db.posts.all().map(...)` concatenado a `staticRoutes(...)` con `+`, §3.200). `routes.json` es un artefacto más de `build`, sin `--diff` propio (§3.79 compara `contract.d.ts`).
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

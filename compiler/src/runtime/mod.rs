@@ -592,6 +592,12 @@ pub(crate) fn eval_expr(
             if name == "jsonLd" {
                 return Ok(Value::FnRef("jsonLd".to_string()));
             }
+            if name == "staticRoutes" {
+                return Ok(Value::FnRef("staticRoutes".to_string()));
+            }
+            if name == "hreflangLinks" {
+                return Ok(Value::FnRef("hreflangLinks".to_string()));
+            }
             if name == "assert" {
                 return Ok(Value::FnRef("assert".to_string()));
             }
@@ -696,6 +702,14 @@ pub(crate) fn eval_expr(
                     if name == "jsonLd" {
                         let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
                         return call_json_ld(arg_vs);
+                    }
+                    if name == "staticRoutes" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_static_routes(arg_vs, db);
+                    }
+                    if name == "hreflangLinks" {
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_hreflang_links(arg_vs);
                     }
                     if name == "assert" {
                         let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
@@ -1742,6 +1756,12 @@ fn call_callable(
             if name == "jsonLd" && !fns.contains_key("jsonLd") {
                 return call_json_ld(arg_vs);
             }
+            if name == "staticRoutes" && !fns.contains_key("staticRoutes") {
+                return call_static_routes(arg_vs, db);
+            }
+            if name == "hreflangLinks" && !fns.contains_key("hreflangLinks") {
+                return call_hreflang_links(arg_vs);
+            }
             if name == "assert" && !fns.contains_key("assert") {
                 let cond = match arg_vs.first() {
                     Some(Value::Bool(b)) => *b,
@@ -2362,6 +2382,55 @@ fn call_canonical_link(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
 /// un JSON válido nunca depende de un `<` literal fuera de un string (no es
 /// un delimitador de la gramática JSON), así que el reemplazo no rompe el
 /// parseo del lado del navegador.
+/// `staticRoutes(baseUrl: String) -> {loc: String}[]` (GRAMMAR.md §3.222):
+/// cada `@route` ESTÁTICO y PÚBLICO del programa (sin `:param`, sin
+/// catch-all, sin `@authenticated`/`@requires`) como URL absoluta. La lista
+/// la calcula `Db::new` una sola vez a partir del AST (`Db::static_routes`)
+/// -- el runtime no tiene el `Program` a mano en este punto, pero `Db` sí lo
+/// vio al construirse, mismo criterio que `soft_delete_fields`. `baseUrl`
+/// sin barra final; una ruta siempre empieza con `/`, así que se concatena
+/// tal cual (se tolera una barra final de más quitándola).
+fn call_static_routes(arg_vs: Vec<Value>, db: &Db) -> Result<Value, RuntimeError> {
+    let [base]: [Value; 1] = arg_vs.try_into().map_err(|_| err("'staticRoutes' requiere 1 argumento (baseUrl: String)"))?;
+    let Value::Str(base) = base else {
+        return Err(err("'staticRoutes' requiere un argumento String"));
+    };
+    let base = base.trim_end_matches('/');
+    let items = db
+        .static_routes()
+        .iter()
+        .map(|path| Value::Struct(vec![("loc".to_string(), Value::Str(format!("{base}{path}")))]))
+        .collect();
+    Ok(Value::List(items))
+}
+
+/// `hreflangLinks(alternates: {lang: String, href: String}[]) -> String`
+/// (GRAMMAR.md §3.222): un `<link rel="alternate" hreflang="..." href="...">`
+/// por variante de idioma, uno por línea -- lo que Google exige para que
+/// cada versión de una página multi-idioma se indexe como la misma página
+/// y no como contenido duplicado. Mismo escape que `canonicalLink`.
+fn call_hreflang_links(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
+    let [alts]: [Value; 1] =
+        arg_vs.try_into().map_err(|_| err("'hreflangLinks' requiere 1 argumento (alternates: {lang, href}[])"))?;
+    let Value::List(items) = alts else {
+        return Err(err("'hreflangLinks' requiere una lista de {lang, href}"));
+    };
+    let mut lines = Vec::with_capacity(items.len());
+    for item in items {
+        let Value::Struct(fields) = item else {
+            return Err(err("'hreflangLinks': cada entrada tiene que ser un struct con 'lang' y 'href'"));
+        };
+        let Some((_, Value::Str(lang))) = fields.iter().find(|(n, _)| n == "lang") else {
+            return Err(err("'hreflangLinks': falta el campo 'lang' o no es String"));
+        };
+        let Some((_, Value::Str(href))) = fields.iter().find(|(n, _)| n == "href") else {
+            return Err(err("'hreflangLinks': falta el campo 'href' o no es String"));
+        };
+        lines.push(format!("<link rel=\"alternate\" hreflang=\"{}\" href=\"{}\">", escape_html(lang), escape_html(href)));
+    }
+    Ok(Value::Str(lines.join("\n")))
+}
+
 fn call_json_ld(arg_vs: Vec<Value>) -> Result<Value, RuntimeError> {
     let [data]: [Value; 1] = arg_vs.try_into().map_err(|_| err("'jsonLd' requiere 1 argumento (data: Dynamic)"))?;
     let json_v = value_to_json(&data, &std::collections::HashSet::new());

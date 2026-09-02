@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.181.0] - 2026-09-02
+
+### ✨ Añadido
+**`staticRoutes(baseUrl)`, `hreflangLinks(alternates)` y `routes.json` (PLAN.md §9.18 Eje D ítems 1 y 2)**: `sitemapXml(staticRoutes("https://x.com"))` arma el sitemap con cada `@route` estático y público del programa sin listarlas a mano (con `:param`, catch-all, `@authenticated` y `@requires` excluidos por construcción); `hreflangLinks([{lang, href}])` emite los `<link rel="alternate" hreflang>` de un sitio multi-idioma con escape HTML; y `linkc build` escribe `routes.json` con todas las `@route` y sus flags (`static`, `public`, `in_sitemap`, `content_type`, `cache_control`) para un CDN/prerender externo. Un solo criterio compartido entre runtime y build (`route::static_public_routes`). Ver GRAMMAR.md §3.222.
+
 ## [1.180.0] - 2026-09-02
 
 ### ✨ Añadido

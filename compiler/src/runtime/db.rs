@@ -1061,6 +1061,12 @@ pub struct Db {
     /// `json_to_typed_value` (usado para decodificar una columna JSON de
     /// vuelta a un `Value` tipado) lo pide para resolver enums/genéricos.
     checker: Checker,
+    /// GRAMMAR.md §3.222: los paths de cada `@route` ESTÁTICO y PÚBLICO del
+    /// programa, calculados una vez acá porque el intérprete no tiene el
+    /// `Program` a mano cuando `staticRoutes()` corre -- mismo criterio que
+    /// `soft_delete_fields`. Orden de declaración, sin duplicados (el checker
+    /// ya rechaza dos `@route` iguales).
+    static_routes: Vec<String>,
     /// Para que un evento PUBLICADO (`publish`, más abajo) serialice
     /// EXACTAMENTE igual que cualquier respuesta normal del mismo programa
     /// (mismo `value_to_json` que usa `invoke_rpc_with_sessions`).
@@ -1439,6 +1445,11 @@ impl Db {
         Self::new_with_options(program, db_path, false)
     }
 
+    /// GRAMMAR.md §3.222: ver el campo `static_routes`.
+    pub fn static_routes(&self) -> &[String] {
+        &self.static_routes
+    }
+
     /// Igual que `new`, más `adopt_existing` (`--adopt-existing`/
     /// `LINK_ADOPT_EXISTING`, GRAMMAR.md §3.67): en vez de `CREATE TABLE IF
     /// NOT EXISTS` + `check_schema_matches` (que exige que la tabla física
@@ -1545,6 +1556,7 @@ impl Db {
             http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
             encryption_key: parking_lot::RwLock::new(None),
             soft_delete_fields,
+            static_routes: crate::route::static_public_routes(program),
             // GRAMMAR.md §3.178: rate limiting distribuido es un concepto
             // exclusivamente Postgres -- SQLite nunca lo necesita, un solo
             // proceso ya tiene el estado exacto en memoria.
@@ -1754,6 +1766,7 @@ impl Db {
                 http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
                 encryption_key: parking_lot::RwLock::new(None),
                 soft_delete_fields,
+                static_routes: crate::route::static_public_routes(program),
                 distributed_rate_limit,
             },
             remote_rx,

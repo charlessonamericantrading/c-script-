@@ -177,6 +177,27 @@ fn is_literal_expr(e: &Expr) -> bool {
 /// atributo `name`; Open Graph usa `property` en cambio, de ahí que sea un
 /// `type` estructural distinto (`open_graph_tag_type` abajo) y no el mismo
 /// reusado con un campo opcional.
+/// Lo que `staticRoutes(baseUrl)` (GRAMMAR.md §3.222) devuelve por
+/// elemento -- deliberadamente la forma MÍNIMA que `sitemapXml` acepta
+/// (`lastmod` es opcional ahí, §3.116), para que
+/// `sitemapXml(staticRoutes("https://x.com"))` tipe sin adaptador.
+fn static_route_type() -> Type {
+    Type::Struct { name: None, fields: vec![FieldType { name: "loc".to_string(), optional: false, ty: Type::String }] }
+}
+
+/// Lo que `hreflangLinks(alternates)` (GRAMMAR.md §3.222) espera por
+/// elemento: un código de idioma/región (`es`, `en-US`, `x-default`) y la
+/// URL absoluta de esa variante. Mismo criterio estructural que `metaTags`.
+fn hreflang_link_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "lang".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "href".to_string(), optional: false, ty: Type::String },
+        ],
+    }
+}
+
 fn meta_tag_type() -> Type {
     Type::Struct {
         name: None,
@@ -3855,6 +3876,16 @@ impl Checker {
                 if name == "jsonLd" {
                     return Ok(Type::Function(vec![Type::Dynamic], Box::new(Type::String)));
                 }
+                // GRAMMAR.md §3.222: las rutas ESTÁTICAS del propio programa
+                // (todo `@route` sin `:param` ni catch-all, sin auth) como
+                // `{loc}[]` listo para `sitemapXml`, y los `<link
+                // rel="alternate" hreflang>` de un sitio multi-idioma.
+                if name == "staticRoutes" {
+                    return Ok(Type::Function(vec![Type::String], Box::new(Type::List(Box::new(static_route_type())))));
+                }
+                if name == "hreflangLinks" {
+                    return Ok(Type::Function(vec![Type::List(Box::new(hreflang_link_type()))], Box::new(Type::String)));
+                }
                 if name == "assert" {
                     return Ok(Type::Function(vec![Type::Bool], Box::new(Type::Void)));
                 }
@@ -3874,7 +3905,7 @@ impl Checker {
                     return Ok(Type::Function(params.clone(), Box::new(ret.clone())));
                 }
                 let mut candidates: Vec<&str> =
-                    vec!["db", "auth", "now", "dateFromParts", "assert", "panic", "sitemapXml", "robotsTxt", "metaTags", "openGraphTags", "canonicalLink", "jsonLd"];
+                    vec!["db", "auth", "now", "dateFromParts", "assert", "panic", "sitemapXml", "robotsTxt", "metaTags", "openGraphTags", "canonicalLink", "jsonLd", "staticRoutes", "hreflangLinks"];
                 candidates.extend(env.keys().map(String::as_str));
                 candidates.extend(self.consts.keys().map(String::as_str));
                 candidates.extend(self.fns.keys().map(String::as_str));
