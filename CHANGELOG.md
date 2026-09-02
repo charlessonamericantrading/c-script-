@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.197.0] - 2026-09-03
+
+### ✨ Añadido
+**`@index(campo1, campo2, ...)` a nivel de `type`, opcionalmente `where <expr>` (PLAN.md §9.20 Eje H ítem 6, primera pieza)**: índice compuesto NO único, misma forma y reglas que `@unique(...)` (§3.155/§3.174), `CREATE INDEX IF NOT EXISTS "idx_<t>_multi_..."` en SQLite y Postgres, en `schema.postgres.sql` y `migrate --dry-run`; un `@index` redundante con un `@unique` igual es error. Caso real: `scheduled_tasks_active_next_idx` de Skynet. Ver GRAMMAR.md §3.239.
+
 ## [1.196.0] - 2026-09-03
 
 ### ✨ Añadido

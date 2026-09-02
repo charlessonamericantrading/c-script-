@@ -411,7 +411,7 @@ impl Parser {
             self.advance();
             let name = self.eat_ident()?;
             let annotation = match name.as_str() {
-                "unique" => {
+                "unique" | "index" => {
                     self.eat(&TokenKind::LParen)?;
                     let mut fields = vec![self.eat_ident()?];
                     while self.check(&TokenKind::Comma) {
@@ -432,7 +432,12 @@ impl Parser {
                     } else {
                         None
                     };
-                    TypeAnnotation::Unique(fields, condition)
+                    // GRAMMAR.md §3.239: misma forma, índice sin unicidad.
+                    if name == "index" {
+                        TypeAnnotation::Index(fields, condition)
+                    } else {
+                        TypeAnnotation::Unique(fields, condition)
+                    }
                 }
                 // `@check(<expr>)` (GRAMMAR.md §3.173) -- `parse_or_expr`
                 // directo, no `parse_expr`: excluye a propósito `match`/
@@ -449,7 +454,7 @@ impl Parser {
                 }
                 other => {
                     return Err(self.error(format!(
-                        "'@{other}' no es una anotación válida antes de 'type' -- las disponibles hoy son '@unique(campo1, campo2, ...)' y '@check(<expr>)'"
+                        "'@{other}' no es una anotación válida antes de 'type' -- las disponibles hoy son '@unique(campo1, campo2, ...)', '@index(campo1, campo2, ...)' y '@check(<expr>)'"
                     )))
                 }
             };

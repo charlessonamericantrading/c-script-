@@ -260,6 +260,7 @@
   - [3.236 `stream -> AiToken { ai.stream(model, messages, maxTokens) }`: un evento SSE por token — RESUELTO](#3236-stream---aitoken--aistreammodel-messages-maxtokens--un-evento-sse-por-token--resuelto)
   - [3.237 `linkc_ai_*` en `/metrics`: tokens, tiempos de prefill/decode, errores y hits del prefix cache por modelo — RESUELTO](#3237-linkc_ai_-en-metrics-tokens-tiempos-de-prefilldecode-errores-y-hits-del-prefix-cache-por-modelo--resuelto)
   - [3.238 `--fallback-upstream <url>`: el estrangulador a nivel de proceso — RESUELTO](#3238---fallback-upstream-url-el-estrangulador-a-nivel-de-proceso--resuelto)
+  - [3.239 `@index(campo1, campo2, ...)` a nivel de `type`: índice compuesto no único, opcionalmente parcial — RESUELTO](#3239-indexcampo1-campo2--a-nivel-de-type-índice-compuesto-no-único-opcionalmente-parcial--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8227,6 +8228,24 @@ Origen: `PLAN.md §9.18` Eje E ítem 3, subido a prerrequisito de la Ronda 1 de 
 **Alcance v1, a propósito** (el del plan): solo el camino "no es mío"; sin reescritura de paths, sin balanceo, sin reintentos -- eso sigue siendo del proxy de delante. `--service-api-key` (§3.117) se exige ANTES de decidir el destino, así que una request reenviada tiene que traer la clave igual: el backend viejo queda detrás del nuevo, no al lado. Un `@route` (§3.35) declarado nunca se reenvía aunque el viejo también lo sirviera: el `.link` gana. El body de ida y vuelta viaja como texto (JSON/HTML/texto plano); un binario (imagen, PDF del viejo) se corrompería -- documentado, no atacado.
 
 **Verificado**: `tests/cli_fallback_upstream.rs` contra un upstream falso en un puerto efímero: lo declarado se sirve local sin tocar el upstream; `POST /api/v1/users?page=2` con body y `X-Trace` llega al viejo con método, path con query, body y header intactos y vuelve con su `text/plain` y su body; `GET` sin body; `/Legacy/doThing` (forma correcta, no declarado) reenviado; un 503 del viejo vuelve como 503; `/live` y `/metrics` locales, con `linkc_http_outbound_total{host="127.0.0.1:N",status="2xx"}` contando el proxy; upstream caído = 502 con el motivo; sin el flag, `/old/report` y `/Legacy/doThing` dan 404; y tres URLs mal formadas rechazadas al arrancar con el nombre del flag.
+
+### 3.239 `@index(campo1, campo2, ...)` a nivel de `type`: índice compuesto no único, opcionalmente parcial — RESUELTO, primera pieza de PLAN.md §9.20 Eje H ítem 6
+
+Origen: `PLAN.md §9.20` Eje H ítem 6 (schema real de Skynet: `scheduled_tasks_active_next_idx` es un índice compuesto `(active, next_run)` sin unicidad, y `--adopt-existing` sobre las 22 tablas no tenía forma de declararlo). `@unique(a, b)` (§3.155) ya sabía crear un índice compuesto, pero solo prometiendo unicidad; `@index` de un campo (§3.80) no cubre dos.
+
+<!-- linkc:check -->
+```rust
+@index(active, nextRun)
+@index(kind, createdAt) where active == true
+type Task = { id: Int, active: Bool, nextRun: Int, kind: String, createdAt: Int }
+db { tasks: Task[] }
+```
+
+**Qué hay (v1.197.0)**: `@index(campo1, campo2, ...)` antes de un `type`, con `where <expr>` opcional (índice parcial, §3.174) -- exactamente la misma forma, el mismo parser y las mismas reglas del checker que `@unique(...)`: al menos 2 campos (para uno solo, `@index` sobre el campo), sin repetidos, campos reales, condición validada como un `@check` de nivel type. Un `@index` y un `@unique` con el mismo conjunto y la misma condición son redundantes (error: "un UNIQUE ya indexa"). DDL: `CREATE INDEX IF NOT EXISTS "idx_<t>_multi_<len$campo...>[_where_<hash>]" ON "<t>"(campos) [WHERE ...]`, en los dos backends, idempotente, con el mismo nombre determinístico y sin ambigüedad que el UNIQUE (`_multi_` en vez de `_uniq_`), y en `schema.postgres.sql`/`migrate --dry-run` por el mismo camino (`create_composite_unique_statements`, que ahora lleva la bandera `unique`).
+
+**Verificado**: checker (dos `@index` + un `@unique` sobre el mismo type, uno parcial; 1 campo, campo inexistente y `@index` redundante con `@unique` rechazados con el mensaje exacto) y SQLite real (el DDL exacto de los tres casos y el índice creado de verdad, leído de `sqlite_master`).
+
+**Límite honesto**: `findWhere`/`orderBy` no eligen el índice, lo elige el motor (SQLite/Postgres); `linkc introspect` todavía no lee índices existentes (siguiente pieza del ítem 6, junto con `@column` y la PK `varchar` con uuid). No hay `DROP INDEX`: quitar la anotación no borra el índice físico (mismo criterio que `@unique`, §3.155).
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

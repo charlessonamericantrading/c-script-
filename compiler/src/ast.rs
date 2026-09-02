@@ -162,6 +162,13 @@ pub enum TypeAnnotation {
     /// motivador: `@unique(userId, appointmentDate, startTime) where status
     /// != "cancelled"`, sin que `status` participe del conjunto).
     Unique(Vec<String>, Option<Spanned<Expr>>),
+    /// `@index(campo1, campo2, ...)` opcionalmente `where <expr>` (GRAMMAR.md
+    /// §3.239): índice COMPUESTO no único -- la misma forma y reglas que
+    /// `Unique` (al menos 2 campos, condición parcial opcional), pero un
+    /// `CREATE INDEX` a secas: acelera `findWhere`/`orderBy` sobre esos
+    /// campos sin prometer unicidad. Complementa el `@index` de un solo
+    /// campo (`FieldAnnotation::Index { unique: false }`, §3.80).
+    Index(Vec<String>, Option<Spanned<Expr>>),
     /// `@check(<expr>)` (GRAMMAR.md §3.173): la mitad "expresión booleana
     /// arbitraria" de `@check` que §3.96 había dejado pendiente --
     /// complementa, nunca reemplaza, el `@check(min/max/range/minLength/

@@ -323,7 +323,9 @@ pub(crate) fn create_index_statements(collection: &str, indexed: &[(String, bool
 /// Nombre de colección -> lista de `(campos, condición SQL opcional)` por
 /// cada `@unique(...)` COMPUESTO de su tipo de elemento (GRAMMAR.md §3.155/
 /// §3.174).
-pub(crate) type CompositeUniquesByCollection = HashMap<String, Vec<(Vec<String>, Option<String>)>>;
+/// `(campos, condición SQL, unique)` -- GRAMMAR.md §3.239: el tercer
+/// elemento distingue `@unique(...)` (true) de `@index(...)` (false).
+pub(crate) type CompositeUniquesByCollection = HashMap<String, Vec<(Vec<String>, Option<String>, bool)>>;
 
 /// Ver el alias de arriba para la forma del resultado -- mismo cruce
 /// `checker.db_collections()` + `program.items` que
@@ -341,12 +343,15 @@ pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checke
             if &t.name != type_name {
                 continue;
             }
-            let sets: Vec<(Vec<String>, Option<String>)> = t
+            let sets: Vec<(Vec<String>, Option<String>, bool)> = t
                 .annotations
                 .iter()
                 .filter_map(|a| match a {
                     TypeAnnotation::Unique(fields, condition) => {
-                        Some((fields.clone(), condition.as_ref().map(|c| type_check_expr_sql(&c.node))))
+                        Some((fields.clone(), condition.as_ref().map(|c| type_check_expr_sql(&c.node)), true))
+                    }
+                    TypeAnnotation::Index(fields, condition) => {
+                        Some((fields.clone(), condition.as_ref().map(|c| type_check_expr_sql(&c.node)), false))
                     }
                     TypeAnnotation::Check(_) => None,
                 })
@@ -379,7 +384,7 @@ pub(crate) fn type_checks_by_collection(program: &Program, checker: &Checker) ->
                 .iter()
                 .filter_map(|a| match a {
                     TypeAnnotation::Check(expr) => Some(type_check_expr_sql(&expr.node)),
-                    TypeAnnotation::Unique(..) => None,
+                    TypeAnnotation::Unique(..) | TypeAnnotation::Index(..) => None,
                 })
                 .collect();
             if !clauses.is_empty() {
@@ -478,15 +483,36 @@ pub(crate) fn type_check_expr_sql(expr: &crate::ast::Expr) -> String {
 /// nombre -- incluido el caso de dos `@unique` con EL MISMO conjunto de
 /// campos pero condiciones DISTINTAS, que sin esto generarían el mismo
 /// nombre de índice y la segunda sentencia sería un no-op silencioso.
-pub(crate) fn create_composite_unique_statements(collection: &str, sets: &[(Vec<String>, Option<String>)]) -> Vec<String> {
+pub(crate) fn create_composite_unique_statements(collection: &str, sets: &[(Vec<String>, Option<String>, bool)]) -> Vec<String> {
     sets.iter()
-        .map(|(fields, condition)| {
-            let idx_name = composite_unique_index_name(collection, fields, condition.as_deref());
+        .map(|(fields, condition, unique)| {
             let cols = fields.iter().map(|f| format!("\"{f}\"")).collect::<Vec<_>>().join(", ");
             let where_clause = condition.as_ref().map(|c| format!(" WHERE {c}")).unwrap_or_default();
-            format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{collection}\"({cols}){where_clause}")
+            if *unique {
+                let idx_name = composite_unique_index_name(collection, fields, condition.as_deref());
+                format!("CREATE UNIQUE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{collection}\"({cols}){where_clause}")
+            } else {
+                // GRAMMAR.md §3.239: mismo nombre determinístico y sin
+                // ambigüedad que el UNIQUE, con `_multi_` en vez de `_uniq_`
+                // para que un `@unique` y un `@index` sobre el mismo conjunto
+                // (el checker lo rechaza, pero dos archivos podrían) nunca
+                // se pisen de nombre.
+                let idx_name = composite_index_name(collection, fields, condition.as_deref());
+                format!("CREATE INDEX IF NOT EXISTS \"{idx_name}\" ON \"{collection}\"({cols}){where_clause}")
+            }
         })
         .collect()
+}
+
+/// GRAMMAR.md §3.239: el nombre de un `@index(...)` compuesto -- misma
+/// codificación `len$nombre` que `composite_unique_index_name`.
+pub(crate) fn composite_index_name(collection: &str, fields: &[String], condition: Option<&str>) -> String {
+    let encoded: String = fields.iter().map(|f| format!("{}${f}", f.len())).collect();
+    let where_suffix = match condition {
+        Some(c) => format!("_where_{}", &crate::lockfile::hash_source(c)[..16]),
+        None => String::new(),
+    };
+    format!("idx_{collection}_multi_{encoded}{where_suffix}")
 }
 
 /// Nombre determinístico del índice para un `@unique(...)` compuesto --
@@ -4711,5 +4737,42 @@ mod tests {
         assert_eq!(count, 0, "--adopt-existing nunca ejecuta DDL, ni siquiera para un índice declarado");
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// GRAMMAR.md §3.239: el `@index(...)` compuesto llega a SQLite real como un
+/// `CREATE INDEX` no único, con nombre determinístico distinto del UNIQUE.
+#[cfg(test)]
+mod composite_index_tests {
+    use super::*;
+
+    #[test]
+    fn composite_index_ddl_is_a_plain_index_with_its_own_name_and_is_created_for_real() {
+        let stmts = create_composite_unique_statements(
+            "tasks",
+            &[
+                (vec!["active".to_string(), "nextRun".to_string()], None, false),
+                (vec!["kind".to_string(), "slug".to_string()], None, true),
+                (vec!["kind".to_string(), "createdAt".to_string()], Some("(\"active\" = 1)".to_string()), false),
+            ],
+        );
+        assert_eq!(stmts[0], "CREATE INDEX IF NOT EXISTS \"idx_tasks_multi_6$active7$nextRun\" ON \"tasks\"(\"active\", \"nextRun\")");
+        assert!(stmts[1].starts_with("CREATE UNIQUE INDEX IF NOT EXISTS \"idx_tasks_uniq_"), "{}", stmts[1]);
+        assert!(stmts[2].starts_with("CREATE INDEX IF NOT EXISTS \"idx_tasks_multi_4$kind9$createdAt_where_") && stmts[2].ends_with(" WHERE (\"active\" = 1)"), "{}", stmts[2]);
+
+        let src = "@index(active, nextRun)\n type Task = { id: Int, active: Bool, nextRun: Int }\n db { tasks: Task[] }";
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        let names: Vec<String> = db
+            .backend
+            .query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'tasks'", &[], &[ColumnKind::Text])
+            .unwrap()
+            .into_iter()
+            .filter_map(|row| match row.into_iter().next() {
+                Some(Cell::Text(s)) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert!(names.iter().any(|n| n == "idx_tasks_multi_6$active7$nextRun"), "{names:?}");
     }
 }

@@ -2846,23 +2846,27 @@ impl Checker {
         let mut seen_sets: Vec<(std::collections::BTreeSet<String>, Option<Expr>)> = Vec::new();
         for ann in &t.annotations {
             match ann {
-                TypeAnnotation::Unique(names, condition) => {
+                // GRAMMAR.md §3.239: `@index(...)` comparte TODAS las reglas
+                // de `@unique(...)` (2+ campos, sin repetidos, campos reales,
+                // `where` validado, sin duplicados) -- solo cambia el DDL.
+                TypeAnnotation::Unique(names, condition) | TypeAnnotation::Index(names, condition) => {
+                    let kind = if matches!(ann, TypeAnnotation::Unique(..)) { "@unique" } else { "@index" };
                     if names.len() < 2 {
                         errors.push(err(format!(
-                            "'{}': '@unique(...)' a nivel de type necesita al menos 2 campos -- para uno solo, poné '@unique' directamente sobre ESE campo (GRAMMAR.md §3.80)",
+                            "'{}': '{kind}(...)' a nivel de type necesita al menos 2 campos -- para uno solo, poné '{kind}' directamente sobre ESE campo (GRAMMAR.md §3.80)",
                             t.name
                         )));
                         continue;
                     }
                     let set: std::collections::BTreeSet<String> = names.iter().cloned().collect();
                     if set.len() != names.len() {
-                        errors.push(err(format!("'{}': '@unique({})' repite el mismo campo más de una vez", t.name, names.join(", "))));
+                        errors.push(err(format!("'{}': '{kind}({})' repite el mismo campo más de una vez", t.name, names.join(", "))));
                         continue;
                     }
                     for name in names {
                         if !field_names.contains(name.as_str()) {
                             errors.push(err(format!(
-                                "'{}': '@unique(...)' nombra '{name}', que no es un campo declarado de este type",
+                                "'{}': '{kind}(...)' nombra '{name}', que no es un campo declarado de este type",
                                 t.name
                             )));
                         }
@@ -2879,7 +2883,7 @@ impl Checker {
                     let key = (set.clone(), condition.as_ref().map(|c| c.node.clone()));
                     if seen_sets.contains(&key) {
                         errors.push(err(format!(
-                            "'{}': '@unique({})' ya está declarado con la misma condición -- dos '@unique' con exactamente el mismo conjunto de campos Y la misma 'where <expr>' son redundantes",
+                            "'{}': '{kind}({})' ya está declarado con la misma condición -- dos anotaciones ('@unique' o '@index') con exactamente el mismo conjunto de campos Y la misma 'where <expr>' son redundantes (un UNIQUE ya indexa)",
                             t.name,
                             names.join(", ")
                         )));
@@ -11643,5 +11647,33 @@ mod ai_stream_tests {
         assert!(msg.contains("AiToken") || msg.contains("token"), "{msg}");
         let msg = check("ai { r: \"x\" } service S { stream reply() -> AiToken { ai.stream(\"r\", []) } }").expect_err("tenía que fallar");
         assert!(msg.contains("'ai.stream' toma exactamente 3 argumentos"), "{msg}");
+    }
+}
+
+/// GRAMMAR.md §3.239: `@index(campo1, campo2, ...)` compuesto a nivel de type.
+#[cfg(test)]
+mod composite_index_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+
+    fn check(src: &str) -> Result<(), String> {
+        let tokens = tokenize(src).map_err(|e| format!("{e}"))?;
+        let program = parse(tokens).map_err(|e| format!("{e:?}"))?;
+        Checker::check_program(&program).map_err(|e| format!("{e:?}"))
+    }
+
+    #[test]
+    fn composite_index_shares_the_unique_rules_and_can_be_partial() {
+        check(
+            "@index(active, nextRun)\n@index(kind, createdAt) where active == true\n@unique(kind, slug)\n type Task = { id: Int, active: Bool, nextRun: Int, kind: String, createdAt: Int, slug: String }\n db { tasks: Task[] }",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let msg = check("@index(active)\n type T = { id: Int, active: Bool }").expect_err("tenía que fallar");
+        assert!(msg.contains("'@index(...)' a nivel de type necesita al menos 2 campos"), "{msg}");
+        let msg = check("@index(active, nope)\n type T = { id: Int, active: Bool }").expect_err("tenía que fallar");
+        assert!(msg.contains("'@index(...)' nombra 'nope'"), "{msg}");
+        let msg = check("@unique(a, b)\n@index(a, b)\n type T = { id: Int, a: Int, b: Int }").expect_err("tenía que fallar");
+        assert!(msg.contains("redundantes") && msg.contains("un UNIQUE ya indexa"), "{msg}");
     }
 }
