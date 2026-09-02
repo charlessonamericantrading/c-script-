@@ -8,7 +8,7 @@
 
 use crate::lockfile::{hash_source, GitLockEntry};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -104,7 +104,22 @@ impl CacheLock {
                     let _ = write!(f, "{}", std::process::id());
                     return Ok(CacheLock { path: lock_path });
                 }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // CUALQUIER error al crear el archivo se trata como "lock
+                // ocupado, reintentar" hasta el timeout -- no solo
+                // `AlreadyExists` (GRAMMAR.md §3.227). En Windows, un lock que
+                // otro hilo/proceso acaba de `remove_file` queda un instante en
+                // "pending delete" y `create_new` sobre ese nombre devuelve
+                // ACCESS_DENIED o SHARING_VIOLATION (según la versión del SO y
+                // de la stdlib llegan como `PermissionDenied` o como
+                // `Uncategorized`), no "ya existe": el lock sigue OCUPADO (se
+                // está soltando), no roto. Sin esto, la carrera entre el `Drop`
+                // de un holder y el `acquire` del siguiente terminaba en un
+                // error DEFINITIVO en vez de un reintento -- visto en CI
+                // (windows-latest, v1.184.0) y reproducido en local (1 de 5
+                // corridas), nunca en Linux, donde unlink es atómico. Un error
+                // persistente (permisos de verdad, disco lleno) sigue saliendo:
+                // por el timeout de abajo, con el texto del último error.
+                Err(last_error) => {
                     if let Ok(meta) = fs::metadata(&lock_path) {
                         if let Ok(modified) = meta.modified() {
                             if let Ok(age) = modified.elapsed() {
@@ -117,15 +132,14 @@ impl CacheLock {
                     }
                     if start.elapsed() > CACHE_LOCK_WAIT_TIMEOUT {
                         return Err(format!(
-                            "no se pudo tomar el lock de caché '{}' tras {}s -- otro 'linkc' parece estar resolviendo \
-                             la misma dependencia; si no hay ningún otro proceso corriendo, borrá ese archivo a mano",
+                            "no se pudo tomar el lock de caché '{}' tras {}s (último error: {last_error}) -- otro 'linkc' parece \
+                             estar resolviendo la misma dependencia; si no hay ningún otro proceso corriendo, borrá ese archivo a mano",
                             lock_path.display(),
                             CACHE_LOCK_WAIT_TIMEOUT.as_secs()
                         ));
                     }
                     std::thread::sleep(CACHE_LOCK_POLL_INTERVAL);
                 }
-                Err(e) => return Err(format!("no se pudo crear el lock de caché '{}': {e}", lock_path.display())),
             }
         }
     }

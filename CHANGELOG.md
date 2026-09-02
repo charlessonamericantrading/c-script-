@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.185.1] - 2026-09-02
+
+### 🐛 Corregido
+**Flake real de Windows en el lock de caché de dependencias git**: `CacheLock::acquire` solo reintentaba ante `AlreadyExists`; en Windows un lock recién borrado por otro hilo devuelve `ACCESS_DENIED`/`SHARING_VIOLATION` durante un instante ("pending delete") y eso era un error definitivo -- falló en CI (v1.184.0, `windows-latest`) y 1 de 5 corridas en local. Ahora cualquier error de creación se reintenta hasta el timeout de 60 s, y el mensaje final incluye el último error de I/O. Ver GRAMMAR.md §3.227.
+
 ## [1.185.0] - 2026-09-02
 
 ### ✨ Añadido

@@ -248,6 +248,7 @@
   - [3.224 `linkc lint --diagnostics-json` — RESUELTO](#3224-linkc-lint---diagnostics-json--resuelto)
   - [3.225 `linkc triggers`: un `stream` reacciona a escrituras hechas por OTRO sistema — RESUELTO](#3225-linkc-triggers-un-stream-reacciona-a-escrituras-hechas-por-otro-sistema--resuelto)
   - [3.226 `crypto.verifyPassword` acepta hashes bcrypt (`$2a$`/`$2b$`/`$2y$`) y `isLegacyHash` los reporta como legado — RESUELTO](#3226-cryptoverifypassword-acepta-hashes-bcrypt-2a2b2y-y-islegacyhash-los-reporta-como-legado--resuelto)
+  - [3.227 `CacheLock` (dependencias git) reintenta ante CUALQUIER error de creación, no solo "ya existe" — RESUELTO](#3227-cachelock-dependencias-git-reintenta-ante-cualquier-error-de-creación-no-solo-ya-existe--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7941,6 +7942,15 @@ if (crypto.verifyPassword(pwd, user.passwordHash)) {
 **Verificado**: `tests/cli_bcrypt.rs` contra el binario real -- un hash generado con la crate real (costo 4) se inyecta en un `.link` que corre con `linkc test` (checker y runtime reales): los tres prefijos verifican la contraseña correcta y rechazan la incorrecta y la vacía; los tres se reportan legado y un Argon2id fresco no; `hashPassword` sigue emitiendo `$argon2id$` y ese re-hash verifica; un hash truncado y un `$2x$` dan `false` sin error. Los tests de Argon2id (`cli_argon2.rs`) siguen en verde.
 
 **Límite honesto**: interoperabilidad probada contra la crate `bcrypt` de Rust, no contra bcryptjs en el mismo test -- los dos implementan el mismo estándar (OpenBSD bcrypt, `$2b$`) y la crate se usa en producción con hashes de bcryptjs a diario, pero si el CRM ve un hash real que no verifica, ese hash es el primer dato a pedir. Sin soporte de `$2x$` ni de la versión pre-`$2a$` sin prefijo.
+### 3.227 `CacheLock` (dependencias git) reintenta ante CUALQUIER error de creación, no solo "ya existe" — RESUELTO, fix de un flake real de Windows
+
+Origen: CI de v1.184.0, job `windows-latest`: `gitdep::tests::cache_lock_serializes_concurrent_acquisitions` falló con `no se pudo crear el lock de caché` -- 8 hilos tomando y soltando el mismo lock de archivo (`create_new` + `remove_file`, §3.183). Reproducido en local (Windows 11): 1 de 5 corridas. Nunca en Linux.
+
+**Causa**: en Windows, un archivo que otro hilo/proceso acaba de borrar queda un instante en estado "pending delete", y `create_new` sobre ese nombre devuelve `ERROR_ACCESS_DENIED`/`ERROR_SHARING_VIOLATION` (que la stdlib reporta como `PermissionDenied` o `Uncategorized` según versión) -- NO `AlreadyExists`, que era el único `ErrorKind` que `CacheLock::acquire` trataba como "ocupado, reintentar". Cualquier otro error era definitivo: la carrera entre el `Drop` de un holder y el `acquire` del siguiente terminaba en error en vez de en un reintento 100 ms después. En Linux `unlink` es atómico y ese estado intermedio no existe.
+
+**Fix (v1.185.1)**: cualquier error al crear el archivo del lock se trata como "ocupado" -- se aplica la misma detección de lock abandonado (§3.183, 120 s) y el mismo timeout (60 s), y recién entonces se devuelve error, ahora con el texto del último error de I/O adentro. Un error persistente (permisos de verdad, disco lleno) sigue saliendo, solo que tras el timeout y explicado, en vez de inmediato y ambiguo. `linkc build` con dependencias git en Windows es el usuario real de esto: dos `linkc` resolviendo la misma dependencia a la vez (un `dev` con hot reload y un `build` a mano, por ejemplo).
+
+**Verificado**: el test de concurrencia 20 corridas seguidas en verde en Windows local con el fix (antes: 1 fallo cada ~5); CI verde en los tres SO.
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
