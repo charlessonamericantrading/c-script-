@@ -244,6 +244,7 @@
   - [3.220 `/live` y `/ready`: liveness y readiness separados — RESUELTO](#3220-live-y-ready-liveness-y-readiness-separados--resuelto)
   - [3.221 `ETag` débil + `If-None-Match` → `304`, y `Vary: Accept-Encoding` — RESUELTO](#3221-etag-débil--if-none-match--304-y-vary-accept-encoding--resuelto)
   - [3.222 `staticRoutes(baseUrl)`, `hreflangLinks(alternates)` y `routes.json` — RESUELTO](#3222-staticroutesbaseurl-hreflanglinksalternates-y-routesjson--resuelto)
+  - [3.223 `linkc_http_outbound_*`: latencia y tasa de error de las llamadas `http.*` salientes en `/metrics` — RESUELTO](#3223-linkc_http_outbound_-latencia-y-tasa-de-error-de-las-llamadas-http-salientes-en-metrics--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7864,6 +7865,25 @@ test "the sitemap lists the static public routes and nothing else" {
 **Verificado**: `tests/cli_static_routes.rs` contra el binario real -- `linkc test` corre 3 bloques `test` (orden y unión exacta de `staticRoutes`, `sitemapXml(staticRoutes(...))` con seis rutas de las que solo dos califican: `:param`, catch-all, `@authenticated` y `@requires` excluidas; `hreflangLinks` con la salida exacta y el escape de `"`/`<`/`&`), y `linkc build` escribe un `routes.json` con las seis rutas en orden, los flags correctos por ruta, y `in_sitemap` en exactamente las mismas dos. Suite de la lib (1.205 tests) y `docs_examples`/`docs_drift` en verde.
 
 **Límite honesto**: `@route("/")` no existe como ruta (`/` es `/health`, §3.87), así que la home de un sitio c-script vive en `/home` o similar y el sitemap la lista ahí. Las rutas con parámetro siguen siendo del programa: solo él sabe qué slugs existen (`db.posts.all().map(...)` concatenado a `staticRoutes(...)` con `+`, §3.200). `routes.json` es un artefacto más de `build`, sin `--diff` propio (§3.79 compara `contract.d.ts`).
+### 3.223 `linkc_http_outbound_*`: latencia y tasa de error de las llamadas `http.*` salientes en `/metrics` — RESUELTO, cierra PLAN.md §9.18 Eje F ítem 5
+
+Origen: `PLAN.md §9.18` Eje F ítem 5. `/metrics` (§3.149) veía solo las requests ENTRANTES; un producto que depende de un proveedor externo (un LLM, una pasarela de pago, un webhook de terceros) vive de la latencia y la tasa de error de ESE proveedor, y hasta ahora la única forma de verla era inferirla de la latencia total del rpc que lo llama -- imposible de separar del tiempo de base o del intérprete.
+
+**Qué hay (v1.182.0)**: dos series nuevas en `GET /metrics`, por `host` (la autoridad de la URL: `api.openai.com`, `127.0.0.1:8080`, sin credenciales ni path) y `status` (la CLASE: `2xx`/`3xx`/`4xx`/`5xx`, o `error` cuando no hubo respuesta HTTP -- DNS, conexión rechazada, timeout):
+
+```text
+linkc_http_outbound_total{host="api.stripe.com",status="2xx"} 41
+linkc_http_outbound_total{host="api.stripe.com",status="4xx"} 2
+linkc_http_outbound_duration_seconds_sum{host="api.stripe.com",status="2xx"} 12.7
+```
+
+Cubre las SIETE formas de llamar afuera (`http.get/post/getWithHeaders/postWithHeaders/getWithStatus/postWithStatus/postWithRetry` -- cada intento de `postWithRetry` cuenta por separado), envolviendo la llamada a `ureq` en un solo helper (`outbound_http`) que registra y devuelve el resultado INTACTO: cada arm sigue decidiendo qué hacer con un 4xx/5xx exactamente como antes (`get` lo trata como error del rpc, `getWithStatus` como dato). Clase de status y no código exacto a propósito: la cardinalidad de la serie queda acotada (un proveedor puede devolver decenas de códigos; lo que un operador mira es "¿cuántas fallan y cuánto tardan?"). `rate(sum)/rate(total)` da la latencia media por host y clase en Prometheus sin declarar buckets, mismo par conteo+suma que `linkc_http_request_duration_seconds_sum`.
+
+El estado vive en `Db` (no en `MetricsStore`) por la misma razón que `subscriber_counts`/`size_bytes`: el intérprete solo tiene `db` a mano cuando corre un `http.get`, y `MetricsStore` es del servidor; `/metrics` lo lee vía `Db::outbound_http_stats` fuera del candado de métricas, ordenado, para que el texto sea determinista entre scrapes. Solo aparece si hubo al menos una llamada (mismo criterio que `notify_latency`: sin series inventadas en `0`).
+
+**Verificado**: `tests/cli_outbound_metrics.rs` contra un `linkc serve` real hablándole a un upstream de mentira real por socket: dos `http.get` a `/ok` (200), un `getWithStatus` a `/fail` (500 como dato) y un `http.get` a `/fail` (500 → error del rpc, que igual cuenta) dan exactamente `2xx = 2` y `5xx = 2` para ese `host:puerto`, con una suma de duración real positiva; y un programa que nunca llama afuera no muestra ninguna de las dos series. Los 7 tests previos de `/metrics` siguen en verde.
+
+**Límite honesto**: sin histograma con buckets (p50/p99 exactos) -- mismo criterio que las requests entrantes; un `linkc serve-all` (§3.92) expone cada servicio en su propio puerto con su propio `Db`, así que las series son por servicio, no del proceso. El helper toma el tiempo alrededor de la llamada completa incluido leer el body (lo que el rpc de verdad esperó), no el time-to-first-byte.
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

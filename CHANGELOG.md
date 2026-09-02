@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.182.0] - 2026-09-02
+
+### ✨ Añadido
+**`linkc_http_outbound_total`/`linkc_http_outbound_duration_seconds_sum` en `GET /metrics` (PLAN.md §9.18 Eje F ítem 5)**: cada llamada `http.*` SALIENTE (las siete formas, cada intento de `postWithRetry` aparte) contada por `host` y clase de status (`2xx`..`5xx`/`error`) con su duración acumulada -- la latencia y la tasa de error del proveedor del que depende un rpc (un LLM, una pasarela de pago), hasta ahora invisible detrás de la latencia total del rpc. Un solo helper envuelve la llamada a `ureq` y devuelve el resultado intacto: ningún arm cambia de comportamiento. Ver GRAMMAR.md §3.223.
+
 ## [1.181.0] - 2026-09-02
 
 ### ✨ Añadido

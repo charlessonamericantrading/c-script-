@@ -99,6 +99,7 @@ impl MetricsStore {
         stream_subscribers: &[(String, usize)],
         db_size_bytes: Option<i64>,
         oversized_notify_drops: &[(String, u64)],
+        outbound_http: &[(String, String, u64, f64)],
     ) -> String {
         let mut out = String::new();
         out.push_str("# HELP linkc_http_requests_total Total de requests HTTP atendidas, por rpc.\n");
@@ -138,6 +139,23 @@ impl MetricsStore {
             out.push_str("# TYPE linkc_notify_oversized_dropped_total counter\n");
             for (collection, count) in oversized_notify_drops {
                 out.push_str(&format!("linkc_notify_oversized_dropped_total{{collection=\"{}\"}} {count}\n", escape_label(collection)));
+            }
+        }
+        // GRAMMAR.md §3.223: llamadas `http.*` SALIENTES, por host y clase
+        // de status -- la latencia y la tasa de error del proveedor del que
+        // depende un rpc (un LLM, un pasarela de pago, un webhook). Vienen
+        // de `Db` (lo único que las ve), mismo criterio que
+        // `stream_subscribers`. Solo si hubo al menos una, como el resto.
+        if !outbound_http.is_empty() {
+            out.push_str("# HELP linkc_http_outbound_total Llamadas http.* salientes, por host y clase de status (2xx/3xx/4xx/5xx/error).\n");
+            out.push_str("# TYPE linkc_http_outbound_total counter\n");
+            for (host, status, count, _) in outbound_http {
+                out.push_str(&format!("linkc_http_outbound_total{{host=\"{}\",status=\"{}\"}} {count}\n", escape_label(host), escape_label(status)));
+            }
+            out.push_str("# HELP linkc_http_outbound_duration_seconds_sum Tiempo total esperando llamadas http.* salientes, por host y clase de status.\n");
+            out.push_str("# TYPE linkc_http_outbound_duration_seconds_sum counter\n");
+            for (host, status, _, secs) in outbound_http {
+                out.push_str(&format!("linkc_http_outbound_duration_seconds_sum{{host=\"{}\",status=\"{}\"}} {secs}\n", escape_label(host), escape_label(status)));
             }
         }
         if !self.rate_limit_rejections.is_empty() {
@@ -192,7 +210,7 @@ mod tests {
     #[test]
     fn a_method_never_recorded_does_not_appear() {
         let store = MetricsStore::new();
-        let out = store.render_prometheus_text(&[], None, &[]);
+        let out = store.render_prometheus_text(&[], None, &[], &[]);
         assert!(!out.contains("linkc_http_requests_total{"));
     }
 
@@ -202,7 +220,7 @@ mod tests {
         store.record("Tasks.list", Duration::from_millis(100));
         store.record("Tasks.list", Duration::from_millis(200));
         store.record("Tasks.create", Duration::from_millis(50));
-        let out = store.render_prometheus_text(&[], None, &[]);
+        let out = store.render_prometheus_text(&[], None, &[], &[]);
         assert!(out.contains("linkc_http_requests_total{method=\"Tasks.list\"} 2"), "{out}");
         assert!(out.contains("linkc_http_requests_total{method=\"Tasks.create\"} 1"), "{out}");
         assert!(out.contains("linkc_http_request_duration_seconds_sum{method=\"Tasks.list\"} 0.3"), "{out}");
@@ -211,11 +229,11 @@ mod tests {
     #[test]
     fn stream_subscribers_and_db_size_appear_only_when_provided() {
         let store = MetricsStore::new();
-        let out = store.render_prometheus_text(&[("tasks".to_string(), 3)], Some(1024), &[]);
+        let out = store.render_prometheus_text(&[("tasks".to_string(), 3)], Some(1024), &[], &[]);
         assert!(out.contains("linkc_stream_subscribers{collection=\"tasks\"} 3"), "{out}");
         assert!(out.contains("linkc_db_size_bytes 1024"), "{out}");
 
-        let out_without = store.render_prometheus_text(&[], None, &[]);
+        let out_without = store.render_prometheus_text(&[], None, &[], &[]);
         assert!(!out_without.contains("linkc_stream_subscribers{"));
         assert!(!out_without.contains("linkc_db_size_bytes"));
     }
@@ -223,13 +241,13 @@ mod tests {
     #[test]
     fn rate_limit_rejections_accumulate_per_method_and_are_absent_until_recorded() {
         let mut store = MetricsStore::new();
-        let out = store.render_prometheus_text(&[], None, &[]);
+        let out = store.render_prometheus_text(&[], None, &[], &[]);
         assert!(!out.contains("linkc_rate_limit_rejections_total"), "{out}");
 
         store.record_rate_limit_rejection("Auth.login");
         store.record_rate_limit_rejection("Auth.login");
         store.record_rate_limit_rejection("Orders.create");
-        let out = store.render_prometheus_text(&[], None, &[]);
+        let out = store.render_prometheus_text(&[], None, &[], &[]);
         assert!(out.contains("linkc_rate_limit_rejections_total{method=\"Auth.login\"} 2"), "{out}");
         assert!(out.contains("linkc_rate_limit_rejections_total{method=\"Orders.create\"} 1"), "{out}");
     }
@@ -237,24 +255,24 @@ mod tests {
     #[test]
     fn oversized_notify_drops_appear_only_when_provided_and_are_per_collection() {
         let store = MetricsStore::new();
-        let out = store.render_prometheus_text(&[], None, &[("catalog_facets".to_string(), 3)]);
+        let out = store.render_prometheus_text(&[], None, &[("catalog_facets".to_string(), 3)], &[]);
         assert!(out.contains("linkc_notify_oversized_dropped_total{collection=\"catalog_facets\"} 3"), "{out}");
 
-        let out_without = store.render_prometheus_text(&[], None, &[]);
+        let out_without = store.render_prometheus_text(&[], None, &[], &[]);
         assert!(!out_without.contains("linkc_notify_oversized_dropped_total"));
     }
 
     #[test]
     fn cron_runs_accumulate_per_method_and_failures_only_appear_for_methods_that_actually_failed() {
         let mut store = MetricsStore::new();
-        let out = store.render_prometheus_text(&[], None, &[]);
+        let out = store.render_prometheus_text(&[], None, &[], &[]);
         assert!(!out.contains("linkc_cron_runs_total"), "{out}");
 
         store.record_cron_run("Jobs.sweep", true);
         store.record_cron_run("Jobs.sweep", true);
         store.record_cron_run("Jobs.sweep", false);
         store.record_cron_run("Jobs.reindex", true);
-        let out = store.render_prometheus_text(&[], None, &[]);
+        let out = store.render_prometheus_text(&[], None, &[], &[]);
         assert!(out.contains("linkc_cron_runs_total{method=\"Jobs.sweep\"} 2"), "{out}");
         assert!(out.contains("linkc_cron_runs_total{method=\"Jobs.reindex\"} 1"), "{out}");
         assert!(out.contains("linkc_cron_failures_total{method=\"Jobs.sweep\"} 1"), "{out}");

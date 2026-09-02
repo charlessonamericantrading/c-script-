@@ -959,7 +959,8 @@ fn handle_request(
         let subscriber_counts = db.subscriber_counts();
         let size_bytes = db.size_bytes();
         let oversized_notify_drop_counts = db.oversized_notify_drop_counts();
-        let metrics_text = metrics_store.lock().render_prometheus_text(&subscriber_counts, size_bytes, &oversized_notify_drop_counts);
+        let outbound_http_stats = db.outbound_http_stats();
+        let metrics_text = metrics_store.lock().render_prometheus_text(&subscriber_counts, size_bytes, &oversized_notify_drop_counts, &outbound_http_stats);
         let resp = cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None, &request);
         let _ = request.respond(resp);
         log_done(log, req_id, Some("metrics"), 200, start, "");

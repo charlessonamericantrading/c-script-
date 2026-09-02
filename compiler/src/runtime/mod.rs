@@ -1817,6 +1817,55 @@ fn escape_html(s: &str) -> String {
 /// de `ureq`, que TAMBIÉN trae la `Response` completa, no solo el código).
 /// Los headers se leen ANTES de `into_string()` porque esa llamada consume
 /// `resp`.
+/// GRAMMAR.md §3.223: envuelve UNA llamada `ureq` saliente para registrar
+/// host + clase de status + duración en `Db` (lo que `/metrics` expone
+/// como `linkc_http_outbound_*`). Devuelve el resultado INTACTO -- cada
+/// arm de `http.*` sigue decidiendo qué hacer con un 4xx/5xx exactamente
+/// como antes (`get` lo trata como error, `getWithStatus` como dato). Un
+/// `ureq::Error::Status` cuenta por su código real; cualquier otro error
+/// (DNS, conexión rechazada, timeout) cuenta como `error`.
+///
+/// `started` se toma en el call site (`Instant::now()` como argumento, que
+/// Rust evalúa antes que el `req.call()` que le sigue, de izquierda a
+/// derecha) en vez de recibir un closure: `ureq::Error` pesa ~272 bytes y
+/// clippy (`result_large_err`) rechaza un closure que lo devuelva. El
+/// `Result` es el de `ureq`, no nuestro, y boxearlo obligaría a reescribir
+/// los 7 arms que hacen match sobre `ureq::Error::Status` -- de ahí el
+/// `allow` acotado a esta única función.
+#[allow(clippy::result_large_err)]
+fn outbound_http(db: &Db, url: &str, started: std::time::Instant, result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response, ureq::Error> {
+    let status = match &result {
+        Ok(resp) => outbound_status_class(resp.status()),
+        Err(ureq::Error::Status(code, _)) => outbound_status_class(*code),
+        Err(_) => "error",
+    };
+    db.record_outbound_http(&outbound_host(url), status, started.elapsed());
+    result
+}
+
+/// `2xx`/`3xx`/`4xx`/`5xx` (o `other` para un código fuera de 200-599).
+fn outbound_status_class(code: u16) -> &'static str {
+    match code {
+        200..=299 => "2xx",
+        300..=399 => "3xx",
+        400..=499 => "4xx",
+        500..=599 => "5xx",
+        _ => "other",
+    }
+}
+
+/// La autoridad de una URL (`host` o `host:puerto`, sin credenciales, sin
+/// path ni query) -- la etiqueta `host` de `/metrics`. Sin crate de URLs
+/// (mismo criterio que `crypto.awsS3PresignedUrl`): el corte es textual y
+/// una URL malformada da su texto hasta la primera `/`, nunca un error --
+/// registrar la métrica jamás puede hacer fallar la llamada real.
+fn outbound_host(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    authority.to_ascii_lowercase()
+}
+
 fn ureq_response_to_value(resp: ureq::Response) -> Value {
     let status = resp.status() as i64;
     let headers: Vec<Value> = resp
@@ -3552,7 +3601,7 @@ fn call_method(
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("http.get requiere un argumento URL String")),
                 };
-                match ureq::get(url).timeout(db.http_timeout()).call() {
+                match outbound_http(db, url, std::time::Instant::now(), ureq::get(url).timeout(db.http_timeout()).call()) {
                     Ok(resp) => {
                         let text = resp.into_string().unwrap_or_default();
                         Ok(Value::Str(text))
@@ -3569,7 +3618,7 @@ fn call_method(
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("http.post requiere un argumento Body String")),
                 };
-                match ureq::post(url).timeout(db.http_timeout()).send_string(body) {
+                match outbound_http(db, url, std::time::Instant::now(), ureq::post(url).timeout(db.http_timeout()).send_string(body)) {
                     Ok(resp) => {
                         let text = resp.into_string().unwrap_or_default();
                         Ok(Value::Str(text))
@@ -3590,7 +3639,7 @@ fn call_method(
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
-                match req.call() {
+                match outbound_http(db, url, std::time::Instant::now(), req.call()) {
                     Ok(resp) => {
                         let text = resp.into_string().unwrap_or_default();
                         Ok(Value::Str(text))
@@ -3617,7 +3666,7 @@ fn call_method(
                 // `Response` completa (status + headers + body), no solo el
                 // código; solo un error de RED de verdad (DNS, conexión
                 // rechazada, timeout) sigue siendo `Err`.
-                match req.call() {
+                match outbound_http(db, url, std::time::Instant::now(), req.call()) {
                     Ok(resp) => Ok(ureq_response_to_value(resp)),
                     Err(ureq::Error::Status(_, resp)) => Ok(ureq_response_to_value(resp)),
                     Err(e) => Err(err(format!("error de red al hacer GET a {url}: {e}"))),
@@ -3640,7 +3689,7 @@ fn call_method(
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
-                match req.send_string(body) {
+                match outbound_http(db, url, std::time::Instant::now(), req.send_string(body)) {
                     Ok(resp) => Ok(ureq_response_to_value(resp)),
                     Err(ureq::Error::Status(_, resp)) => Ok(ureq_response_to_value(resp)),
                     Err(e) => Err(err(format!("error de red al hacer POST a {url}: {e}"))),
@@ -3663,7 +3712,7 @@ fn call_method(
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
-                match req.send_string(body) {
+                match outbound_http(db, url, std::time::Instant::now(), req.send_string(body)) {
                     Ok(resp) => {
                         let text = resp.into_string().unwrap_or_default();
                         Ok(Value::Str(text))
@@ -3702,7 +3751,7 @@ fn call_method(
                     for (name, value) in &headers {
                         req = req.set(name, value);
                     }
-                    match req.send_string(body) {
+                    match outbound_http(db, url, std::time::Instant::now(), req.send_string(body)) {
                         Ok(resp) => return Ok(Value::Str(resp.into_string().unwrap_or_default())),
                         Err(e) => last_error = e.to_string(),
                     }

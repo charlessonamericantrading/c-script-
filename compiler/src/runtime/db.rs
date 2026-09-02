@@ -1067,6 +1067,13 @@ pub struct Db {
     /// `soft_delete_fields`. Orden de declaración, sin duplicados (el checker
     /// ya rechaza dos `@route` iguales).
     static_routes: Vec<String>,
+    /// GRAMMAR.md §3.223: (host, clase de status) -> (conteo, suma de
+    /// segundos) de cada llamada `http.*` SALIENTE que hizo este programa.
+    /// Vive en `Db` y no en `MetricsStore` por la misma razón que
+    /// `subscriber_counts`/`size_bytes`: el intérprete solo tiene `db` a
+    /// mano cuando corre un `http.get`, y `MetricsStore` es del servidor.
+    /// `/metrics` lo lee vía `outbound_http_stats`, mismo patrón.
+    outbound_http: parking_lot::Mutex<HashMap<(String, String), (u64, f64)>>,
     /// Para que un evento PUBLICADO (`publish`, más abajo) serialice
     /// EXACTAMENTE igual que cualquier respuesta normal del mismo programa
     /// (mismo `value_to_json` que usa `invoke_rpc_with_sessions`).
@@ -1450,6 +1457,29 @@ impl Db {
         &self.static_routes
     }
 
+    /// GRAMMAR.md §3.223: registra UNA llamada `http.*` saliente. `status`
+    /// es la clase (`2xx`/`3xx`/`4xx`/`5xx`) o `error` (sin respuesta HTTP:
+    /// DNS, conexión rechazada, timeout) -- clase y no código exacto para
+    /// que la cardinalidad de la serie sea acotada (un proveedor puede
+    /// devolver decenas de códigos distintos; lo que un operador mira es
+    /// "¿cuántos fallan y cuánto tardan?", no el histograma de códigos).
+    pub fn record_outbound_http(&self, host: &str, status: &str, elapsed: std::time::Duration) {
+        let mut map = self.outbound_http.lock();
+        let entry = map.entry((host.to_string(), status.to_string())).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += elapsed.as_secs_f64();
+    }
+
+    /// GRAMMAR.md §3.223: `(host, status, conteo, segundos)` ordenado, para
+    /// que `/metrics` sea determinista entre scrapes.
+    pub fn outbound_http_stats(&self) -> Vec<(String, String, u64, f64)> {
+        let map = self.outbound_http.lock();
+        let mut rows: Vec<(String, String, u64, f64)> =
+            map.iter().map(|((host, status), (count, secs))| (host.clone(), status.clone(), *count, *secs)).collect();
+        rows.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        rows
+    }
+
     /// Igual que `new`, más `adopt_existing` (`--adopt-existing`/
     /// `LINK_ADOPT_EXISTING`, GRAMMAR.md §3.67): en vez de `CREATE TABLE IF
     /// NOT EXISTS` + `check_schema_matches` (que exige que la tabla física
@@ -1557,6 +1587,7 @@ impl Db {
             encryption_key: parking_lot::RwLock::new(None),
             soft_delete_fields,
             static_routes: crate::route::static_public_routes(program),
+            outbound_http: parking_lot::Mutex::new(HashMap::new()),
             // GRAMMAR.md §3.178: rate limiting distribuido es un concepto
             // exclusivamente Postgres -- SQLite nunca lo necesita, un solo
             // proceso ya tiene el estado exacto en memoria.
@@ -1767,6 +1798,7 @@ impl Db {
                 encryption_key: parking_lot::RwLock::new(None),
                 soft_delete_fields,
                 static_routes: crate::route::static_public_routes(program),
+                outbound_http: parking_lot::Mutex::new(HashMap::new()),
                 distributed_rate_limit,
             },
             remote_rx,
