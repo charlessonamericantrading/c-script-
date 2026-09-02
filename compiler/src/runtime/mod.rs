@@ -2081,7 +2081,7 @@ fn escape_html(s: &str) -> String {
 /// los 7 arms que hacen match sobre `ureq::Error::Status` -- de ahí el
 /// `allow` acotado a esta única función.
 #[allow(clippy::result_large_err)]
-fn outbound_http(db: &Db, url: &str, started: std::time::Instant, result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response, ureq::Error> {
+pub(crate) fn outbound_http(db: &Db, url: &str, started: std::time::Instant, result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response, ureq::Error> {
     let status = match &result {
         Ok(resp) => outbound_status_class(resp.status()),
         Err(ureq::Error::Status(code, _)) => outbound_status_class(*code),
@@ -5236,6 +5236,18 @@ fn describe_json(j: &serde_json::Value) -> &'static str {
 /// un único JSON o como una secuencia de eventos SSE?" -- eso se resuelve acá,
 /// sin forzar a los ~30 call sites de test existentes (todos `.unwrap()` un
 /// solo Value) a desestructurar una tupla que no les interesa.
+/// GRAMMAR.md §3.238: ¿`service_name.rpc_name` existe en el programa (rpc o
+/// stream)? Lo que `--fallback-upstream` usa para decidir "esto es mío" vs
+/// "esto todavía es del backend viejo".
+pub fn is_declared_member(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) if s.name == service_name => s.members.iter().any(|m| match m {
+            Member::Rpc(r) | Member::Stream(r) => r.name == rpc_name,
+        }),
+        _ => false,
+    })
+}
+
 pub fn is_stream_member(program: &Program, service_name: &str, rpc_name: &str) -> bool {
     program.items.iter().any(|i| match i {
         Item::Service(s) if s.name == service_name => s

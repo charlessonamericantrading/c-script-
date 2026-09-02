@@ -265,7 +265,11 @@ fn security_headers_are_present_on_error_responses_too() {
     let server = Serve::start(&src, &[], &[]);
 
     let (status, headers, _) = server.request("POST", "/Sys/doesNotExist", &[], "{}");
-    assert_eq!(status, 500, "un rpc inexistente en un servicio real da 500 (runtime error), no un 404 genérico");
+    // GRAMMAR.md §3.238: desde v1.196.0 un rpc inexistente es 404 (antes
+    // era el 500 de "rpc desconocido" del runtime) -- desde afuera no existe,
+    // como uno mal escrito. Lo que este test defiende no cambia: los
+    // headers de seguridad y de CORS van también en la respuesta de error.
+    assert_eq!(status, 404, "un rpc inexistente en un servicio real da 404 (GRAMMAR.md §3.238)");
     assert_security_headers(&headers);
     assert_eq!(Serve::header(&headers, "access-control-allow-origin"), Some("*"), "headers: {headers:?}");
 }

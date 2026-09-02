@@ -3,6 +3,14 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.196.0] - 2026-09-03
+
+### ✨ Añadido
+**`--fallback-upstream <url>`/`LINK_FALLBACK_UPSTREAM` para `serve`/`serve-all` (PLAN.md §9.18 Eje E ítem 3, prerrequisito del estrangulamiento de §9.20)**: toda request que el `.link` no declara (path sin forma `/Service/rpc`, o rpc inexistente) se reenvía tal cual al backend viejo (método, path con query, body, headers salvo los de salto, `X-Forwarded-For`) y vuelve con su status, `Content-Type` y body; upstream caído = 502 con el motivo; cuenta en `linkc_http_outbound_*` y el log dice `proxied=true`. URL validada al arrancar. Sin reescritura, balanceo ni reintentos (eso sigue siendo del proxy). Ver GRAMMAR.md §3.238.
+
+### 🐛 Corregido
+**Un `/Service/rpc` con la forma correcta pero que el programa no declara respondía `500`** ("rpc desconocido" era un error de runtime); ahora es `404 no existe ese rpc`, el mismo que un `@cron` por HTTP.
+
 ## [1.195.0] - 2026-09-03
 
 ### ✨ Añadido

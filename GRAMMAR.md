@@ -259,6 +259,7 @@
   - [3.235 `ai.generate` / `ai.chat` / `ai.models`: inferencia local síncrona con el motor embebido — RESUELTO](#3235-aigenerate--aichat--aimodels-inferencia-local-síncrona-con-el-motor-embebido--resuelto)
   - [3.236 `stream -> AiToken { ai.stream(model, messages, maxTokens) }`: un evento SSE por token — RESUELTO](#3236-stream---aitoken--aistreammodel-messages-maxtokens--un-evento-sse-por-token--resuelto)
   - [3.237 `linkc_ai_*` en `/metrics`: tokens, tiempos de prefill/decode, errores y hits del prefix cache por modelo — RESUELTO](#3237-linkc_ai_-en-metrics-tokens-tiempos-de-prefilldecode-errores-y-hits-del-prefix-cache-por-modelo--resuelto)
+  - [3.238 `--fallback-upstream <url>`: el estrangulador a nivel de proceso — RESUELTO](#3238---fallback-upstream-url-el-estrangulador-a-nivel-de-proceso--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8212,6 +8213,20 @@ linkc_ai_prefix_cache_hits_total{model="router"} 2
 **Verificado**: unitario del renderer (sin generaciones no hay bloque; con una fila salen las cuatro series con sus valores exactos), y `tests/cli_ai_generate.rs` contra `qwen2.5:0.5b` REAL: tras `complete`, `chat` y un `bad` con alias desconocido, `/metrics` trae `requests_total{m,ok} = 2`, `requests_total{nadie,error} = 1`, tokens de prompt y generados `>= 2`, y segundos de decode `> 0`.
 
 **Límite honesto**: son contadores (sumas), no histogramas -- p50/p99 de latencia por generación queda para cuando haya un caso que lo pida (mismo criterio que `linkc_http_outbound_*`). Memoria de KV por modelo y cola del pool (que el ítem 8 del plan nombraba) no están: el motor no expone hoy el tamaño residente de su cache, y el pool acotado es Eje B ítem 2.
+
+### 3.238 `--fallback-upstream <url>`: el estrangulador a nivel de proceso — RESUELTO, cierra PLAN.md §9.18 Eje E ítem 3 (prerrequisito de §9.20)
+
+Origen: `PLAN.md §9.18` Eje E ítem 3, subido a prerrequisito de la Ronda 1 de §9.20: sin esto no hay estrangulamiento subsistema a subsistema, hay big bang. Las tres adopciones reales están detrás de nginx, pero la fricción reportada era exactamente la config manual por ruta cada vez que un rpc cambiaba de lado. Con esto, "migrar un rpc por semana" es agregarlo al `.link` y redeployar.
+
+**Qué hay (v1.196.0)**: `linkc serve`/`serve-all` con `--fallback-upstream http://host:puerto` (o `LINK_FALLBACK_UPSTREAM`). Toda request que este `.link` NO declara se reenvía al backend viejo y se devuelve su respuesta:
+- **Qué se reenvía**: un path sin la forma `/Service/rpc` (`/api/v1/users?page=2`, `/old/report`) y un `/Service/rpc` con la forma correcta pero que el programa no declara (`/Legacy/doThing`). Lo que el `.link` sí declara se sirve local, siempre; `/health`, `/live`, `/ready`, `/metrics` y `/mcp` son de este proceso.
+- **Cómo**: mismo método, mismo path con query, mismo body, los mismos headers salvo los de salto y los que el cliente HTTP recalcula (`Host`, `Connection`, `Content-Length`, `Transfer-Encoding`, `Accept-Encoding`, `Keep-Alive`, `Upgrade`), más `X-Forwarded-For` con la IP del cliente. Vuelven el status tal cual (un 503 del viejo sigue siendo 503), el `Content-Type` y el body. Timeout: el de `--http-timeout` (§3.86). Un upstream que no responde es un **502** con el motivo (`--fallback-upstream: el backend viejo (host) no respondió: ...`), nunca un 500 mudo. En el log de cada request sale `proxied=true upstream=host`, y la llamada cuenta en `linkc_http_outbound_*{host}` (§3.223) como cualquier salida.
+- **Validado al arrancar**: solo `http://`/`https://` + host[:puerto], sin path ni query (el path lo pone cada request) -- un valor mal escrito no se descubre en el primer 404 en producción.
+- **Corregido de paso**: sin upstream, un `/Service/rpc` con la forma correcta que el programa no declara respondía `500` ("rpc desconocido" era un error de runtime). Ahora es `404 no existe ese rpc`, el mismo que ya daba un `@cron` por HTTP (§3.159): desde afuera ese rpc no existe, exactamente como uno mal escrito.
+
+**Alcance v1, a propósito** (el del plan): solo el camino "no es mío"; sin reescritura de paths, sin balanceo, sin reintentos -- eso sigue siendo del proxy de delante. `--service-api-key` (§3.117) se exige ANTES de decidir el destino, así que una request reenviada tiene que traer la clave igual: el backend viejo queda detrás del nuevo, no al lado. Un `@route` (§3.35) declarado nunca se reenvía aunque el viejo también lo sirviera: el `.link` gana. El body de ida y vuelta viaja como texto (JSON/HTML/texto plano); un binario (imagen, PDF del viejo) se corrompería -- documentado, no atacado.
+
+**Verificado**: `tests/cli_fallback_upstream.rs` contra un upstream falso en un puerto efímero: lo declarado se sirve local sin tocar el upstream; `POST /api/v1/users?page=2` con body y `X-Trace` llega al viejo con método, path con query, body y header intactos y vuelve con su `text/plain` y su body; `GET` sin body; `/Legacy/doThing` (forma correcta, no declarado) reenviado; un 503 del viejo vuelve como 503; `/live` y `/metrics` locales, con `linkc_http_outbound_total{host="127.0.0.1:N",status="2xx"}` contando el proxy; upstream caído = 502 con el motivo; sin el flag, `/old/report` y `/Legacy/doThing` dan 404; y tres URLs mal formadas rechazadas al arrancar con el nombre del flag.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

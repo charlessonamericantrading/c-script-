@@ -392,6 +392,9 @@ pub struct ServeConfig {
     pub ai_memory_budget_bytes: Option<u64>,
     /// GRAMMAR.md §3.235: `--ai-timeout`, tope de una sola generación.
     pub ai_timeout: Duration,
+    /// GRAMMAR.md §3.238: `--fallback-upstream`, el backend viejo al que va
+    /// toda request que este `.link` no declara.
+    pub fallback_upstream: Option<String>,
 }
 pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     let ServeConfig {
@@ -409,6 +412,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         models_dir,
         ai_memory_budget_bytes,
         ai_timeout,
+        fallback_upstream,
         http_timeout,
         trust_proxy,
         service_api_key,
@@ -665,6 +669,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
             let service_api_key = service_api_key.clone();
             let mcp_secret = mcp_secret.clone();
             let mcp_state = mcp_state.clone();
+            let fallback_upstream = fallback_upstream.clone();
             let request = $request;
             std::thread::spawn(move || {
                 handle_request(
@@ -684,6 +689,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                     log,
                     mcp_secret.as_deref(),
                     mcp_state,
+                    fallback_upstream.as_deref(),
                     request,
                 );
             });
@@ -775,6 +781,7 @@ fn handle_request(
     log: LogConfig,
     mcp_secret: Option<&str>,
     mcp_state: super::mcp::McpSharedState,
+    fallback_upstream: Option<&str>,
     mut request: tiny_http::Request,
 ) {
     // Resuelto UNA vez por request, antes de cualquier otra cosa --
@@ -1091,6 +1098,13 @@ fn handle_request(
     let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, route_table) {
         Ok(resolved) => resolved,
         Err(None) => {
+            // GRAMMAR.md §3.238: un path que no es de este `.link` va al
+            // backend viejo si hay `--fallback-upstream`; si no, el 404 de
+            // siempre.
+            if let Some(upstream) = fallback_upstream {
+                proxy_to_upstream(upstream, db, &path, &body, &cors_headers, request, req_id, start, log);
+                return;
+            }
             let resp = cors_response(404, error_json("URL debe tener la forma /Service/method"), &cors_headers, &request);
             let _ = request.respond(resp);
             log_done(log, req_id, None, 404, start, "");
@@ -1103,6 +1117,23 @@ fn handle_request(
             return;
         }
     };
+    // GRAMMAR.md §3.238: `/Algo/loQueSea` con la forma correcta pero que
+    // este `.link` NO declara -- el rpc que todavía vive en el backend
+    // viejo. Mismo criterio: proxy si hay upstream, 404 si no (más abajo,
+    // como siempre).
+    if !super::is_declared_member(program, service_name, rpc_name) {
+        if let Some(upstream) = fallback_upstream {
+            proxy_to_upstream(upstream, db, &path, &body, &cors_headers, request, req_id, start, log);
+            return;
+        }
+        // Sin upstream: 404, no el 500 de "rpc desconocido" que daba
+        // invoke_rpc_with_sessions -- desde afuera este rpc no existe,
+        // exactamente como uno mal escrito (mismo criterio que  abajo).
+        let resp = cors_response(404, error_json("no existe ese rpc"), &cors_headers, &request);
+        let _ = request.respond(resp);
+        log_done(log, req_id, None, 404, start, "");
+        return;
+    }
     let method = format!("{service_name}.{rpc_name}");
 
     // `@cron` (GRAMMAR.md §3.159): nunca alcanzable vía HTTP -- el checker
@@ -2000,6 +2031,76 @@ pub(crate) fn handle_rpc(
 /// backend se rompió cuando en realidad rechazó correctamente algo mal
 /// formado. Es la contraparte servidor del `LinkValidationError` que el
 /// cliente generado ya lanza para respuestas que no matchean.
+/// GRAMMAR.md §3.238 (PLAN.md §9.18 Eje E ítem 3, prerrequisito de §9.20):
+/// el estrangulador a nivel de proceso. Reenvía la request tal cual (mismo
+/// método, path con query, headers salvo los de salto y `Host`, mismo body)
+/// al backend viejo y devuelve su status, `Content-Type` y body. Sin
+/// reescritura de paths, sin balanceo, sin reintentos: eso sigue siendo del
+/// proxy de delante. Cuenta en `linkc_http_outbound_*` (§3.223) por el host
+/// del upstream, como cualquier llamada saliente, y en el log sale
+/// `proxied=true`. Un upstream caído es un 502 con el motivo, nunca un 500
+/// mudo. Límite v1: el body de ida y vuelta viaja como texto (`String`) --
+/// JSON/HTML/texto, no binarios.
+#[allow(clippy::too_many_arguments)]
+fn proxy_to_upstream(
+    upstream: &str,
+    db: &Db,
+    path: &str,
+    body: &str,
+    cors: &CorsHeaders,
+    request: tiny_http::Request,
+    req_id: u64,
+    start: std::time::Instant,
+    log: LogConfig,
+) {
+    let url = format!("{}{}", upstream.trim_end_matches('/'), path);
+    let method = request.method().as_str().to_uppercase();
+    let mut req = ureq::request(&method, &url).timeout(db.http_timeout());
+    for h in request.headers() {
+        let name = h.field.as_str().as_str();
+        let lower = name.to_ascii_lowercase();
+        // Hop-by-hop y los que ureq recalcula; `Accept-Encoding` fuera para
+        // que el upstream no comprima lo que acá se relee como texto.
+        if matches!(lower.as_str(), "host" | "connection" | "content-length" | "transfer-encoding" | "accept-encoding" | "keep-alive" | "upgrade") {
+            continue;
+        }
+        req = req.set(name, h.value.as_str());
+    }
+    if let Some(addr) = request.remote_addr() {
+        req = req.set("X-Forwarded-For", &addr.ip().to_string());
+    }
+    let started = std::time::Instant::now();
+    let result = if body.is_empty() && (method == "GET" || method == "HEAD" || method == "DELETE" || method == "OPTIONS") {
+        req.call()
+    } else {
+        req.send_string(body)
+    };
+    let (status, content_type, text) = match super::outbound_http(db, &url, started, result) {
+        Ok(resp) | Err(ureq::Error::Status(_, resp)) => {
+            let status = resp.status();
+            let content_type = resp.header("Content-Type").unwrap_or("application/octet-stream").to_string();
+            let mut buf = String::new();
+            let _ = std::io::Read::read_to_string(&mut resp.into_reader(), &mut buf);
+            (status, content_type, buf)
+        }
+        Err(e) => {
+            let msg = format!("--fallback-upstream: el backend viejo ({}) no respondió: {e}", outbound_host_for_log(&url));
+            let resp = cors_response(502, error_json(&msg), cors, &request);
+            let _ = request.respond(resp);
+            log_done(log, req_id, None, 502, start, &format!("proxied=true error={msg:?}"));
+            return;
+        }
+    };
+    let resp = cors_response_with_type(status, text, &content_type, cors, None, None, &request);
+    let _ = request.respond(resp);
+    log_done(log, req_id, None, status, start, &format!("proxied=true upstream={}", outbound_host_for_log(&url)));
+}
+
+/// Solo el host (sin credenciales ni path) para el log del proxy.
+fn outbound_host_for_log(url: &str) -> String {
+    url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").rsplit('@').next().unwrap_or("").to_string()
+}
+
 fn status_for(e: &super::RuntimeError) -> u16 {
     match e.kind {
         super::ErrorKind::BadRequest => 400,
