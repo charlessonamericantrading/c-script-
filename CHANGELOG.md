@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.171.0] - 2026-09-02
+
+### 🐛 Arreglado
+**Seguridad (PLAN.md §9.17 ítem 2, hallazgo MEDIO de la auditoría del 02/09/2026): la entrega de una respuesta correlacionada MCP exige la sesión dueña, y el id de correlación ya no puede degenerar en silencio.** Dos problemas del mismo camino (la Pieza C de §3.203, `mcp.sample`): (1) un `POST /mcp` con `id` y sin `method` entregaba la respuesta al `mcp.sample` bloqueado sin verificar `Mcp-Session-Id` ni nada -- la única barrera era adivinar el id de 128 bits; el propio test de round-trip entregaba con cero headers y pasaba. (2) `fresh_id` hacía `let _ = getrandom(...)`: si la fuente de aleatoriedad fallaba, el id quedaba en ceros predecibles -- la misma clase de bug que el hallazgo histórico de `RandomState` (§3.14). Ahora `fresh_id` corta el proceso si `getrandom` falla (mismo criterio que `session.rs::fresh_128_bits`), la tabla de pendientes guarda el `jti` de la sesión dueña, y la entrega exige un `Mcp-Session-Id` válido cuyo `jti` coincida -- sin header es 401, con una sesión válida pero ajena es el MISMO 404 que un id inexistente (anti-oráculo deliberado). Test nuevo con las tres entregas sobre un mismo sampling pendiente real. Ver GRAMMAR.md §3.212.
+
 ## [1.170.0] - 2026-09-02
 
 ### 🐛 Arreglado

@@ -233,6 +233,7 @@
   - [3.209 `Enum.Variante` sin campos ya no necesita `{}` como expresión — RESUELTO](#3209-envariante-sin-campos-ya-no-necesita--como-expresión--resuelto)
   - [3.210 Códigos de error estables + `linkc explain <código>` — RESUELTO](#3210-códigos-de-error-estables--linkc-explain-código--resuelto)
   - [3.211 `--trust-proxy` toma el ÚLTIMO valor de `X-Forwarded-For`, no el primero — RESUELTO](#3211---trust-proxy-toma-el-último-valor-de-x-forwarded-for-no-el-primero--resuelto)
+  - [3.212 La entrega de una respuesta correlacionada MCP exige la sesión dueña — RESUELTO](#3212-la-entrega-de-una-respuesta-correlacionada-mcp-exige-la-sesión-dueña--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7593,6 +7594,25 @@ Origen: `PLAN.md §9.17` ítem 1 (Bloque A), el hallazgo ALTO de la auditoría d
 - **Solo afecta a `@rate_limit`** -- `request.header("X-Forwarded-For")` sigue devolviendo el header crudo, igual que siempre.
 
 **Verificado**: `cli_rate_limit.rs` contra el binario real -- el test de cadena reescrito con la semántica nueva (el último hop comparte balde aunque el prefijo difiera), más un test nuevo que reproduce el ataque exacto (prefijo falsificado rotando en cada request con el último elemento fijo: con la semántica vieja cada request abría un bucket nuevo; con la nueva, la 4ta request da 429). Los otros 6 tests de §3.89 (spoof sin flag ignorado, buckets separados por IP, fallback sin header, env var) pasan sin cambios.
+
+### 3.212 La entrega de una respuesta correlacionada MCP exige la sesión dueña — RESUELTO, fix de seguridad de PLAN.md §9.17 ítem 2
+
+Origen: `PLAN.md §9.17` ítem 2 (Bloque A), hallazgo MEDIO de la auditoría de seguridad del 02/09/2026, sobre la Pieza C de §3.203 (`mcp.sample` y la correlación cross-hilo). Dos problemas del mismo camino, cerrados juntos:
+
+**1. La entrega no verificaba NADA.** Un `POST /mcp` con `id` y sin `method` (la forma JSON-RPC de una respuesta correlacionada) buscaba el `id` en la tabla de pendientes y entregaba el `result` al `mcp.sample` bloqueado -- sin exigir `Mcp-Session-Id`, sin exigir `Authorization`, sin exigir nada. La única barrera era adivinar el id de 128 bits. El propio test de round-trip lo documentaba sin querer: entregaba la respuesta con `&[]` como headers, y pasaba.
+
+**2. La entropía de ese id podía degradarse EN SILENCIO.** `fresh_id` hacía `let _ = getrandom::getrandom(&mut buf)` -- si la fuente de aleatoriedad del sistema fallaba, el buffer quedaba en ceros y el id era `"000...0"`, perfectamente predecible. Combinado con el punto 1: cualquiera inyectaba la "respuesta del LLM" que el `rpc` consume como si viniera del cliente MCP real. La clase de bug es exactamente la del hallazgo histórico de `RandomState` como fuente de entropía (§3.14 -- el nombre de la API prometía más de lo que daba): `session.rs::fresh_128_bits` ya hacía lo correcto (`expect`, corte duro); `mcp.rs` no lo había copiado.
+
+**El fix (v1.171.0)**:
+- `fresh_id` corta el proceso si `getrandom` falla (`expect`, mismo criterio que `session.rs`) -- un servidor sin fuente de aleatoriedad no puede generar credenciales, y un id de correlación ES una credencial de facto.
+- La tabla de pendientes guarda el `jti` de la sesión MCP **dueña** de cada request (`HashMap<id, (jti, Sender)>`), fijado por el propio `mcp.sample` al registrarse. La entrega exige un `Mcp-Session-Id` válido (verificado con `verify_mcp_session`, mismo camino que `tools/call`) Y que su `jti` sea el de la dueña -- el `sampling/createMessage` salió por la conexión `GET` de UNA sesión concreta; solo esa sesión tiene motivo legítimo para responder.
+- **Sin header es 401; con una sesión válida pero AJENA es el mismo 404 que un id inexistente** -- deliberadamente indistinguibles, para no confirmarle a una sesión ajena que el id existe (mismo criterio anti-oráculo que un login que no distingue "usuario inexistente" de "contraseña incorrecta").
+
+**Límites honestos:**
+- La dueña se identifica por `jti` de sesión MCP, no por usuario -- dos sesiones MCP del MISMO usuario siguen siendo mutuamente ajenas para este propósito. Es lo correcto (la respuesta tiene que venir del cliente MCP que recibió la pregunta por SU conexión GET), no una limitación.
+- El id de correlación sigue viajando en claro dentro del stream SSE de la sesión -- la confidencialidad de ese canal es del TLS de la capa de despliegue (§3.89/§3.41), igual que la de cualquier otro header o body.
+
+**Verificado**: `cli_mcp.rs` contra el binario real -- test nuevo con las TRES entregas sobre un mismo sampling pendiente real (anónima → 401; segunda sesión MCP real del mismo servidor pero ajena → 404 con el mismo mensaje que un id inexistente; la dueña → 200 y el `rpc` termina con el valor correcto, probando de paso que los dos rechazos no consumieron la entrada pendiente). El test de round-trip existente actualizado para entregar con el header (antes pasaba sin ninguno -- la demostración involuntaria del bug). Los 18 tests de `cli_mcp.rs` verdes.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

@@ -59,8 +59,12 @@ pub(crate) struct McpSharedState {
     /// La tabla de correlación en sí -- exactamente la forma validada por
     /// el spike aislado de PLAN.md §9.15 ítem 3 (`GET`/`POST` ->
     /// `recv_timeout` -> limpieza en timeout, candado tomado y soltado,
-    /// nunca sostenido durante el bloqueo).
-    pending: Arc<parking_lot::Mutex<HashMap<String, std::sync::mpsc::Sender<serde_json::Value>>>>,
+    /// nunca sostenido durante el bloqueo). El `String` extra es el `jti`
+    /// de la sesión MCP DUEÑA de la request pendiente (GRAMMAR.md §3.212):
+    /// solo esa sesión puede entregar la respuesta -- sin esto, cualquier
+    /// POST anónimo que adivinara (o predijera, ver `fresh_id`) el id
+    /// inyectaba la "respuesta del LLM" que consume el rpc.
+    pending: Arc<parking_lot::Mutex<HashMap<String, (String, std::sync::mpsc::Sender<serde_json::Value>)>>>,
 }
 
 impl McpSharedState {
@@ -93,9 +97,15 @@ fn current() -> Option<(String, McpSharedState)> {
     CURRENT_MCP.with(|c| c.borrow().clone())
 }
 
+/// El id de correlación es una credencial de facto (quien lo conoce puede
+/// entregar la "respuesta del LLM" que consume el rpc), así que su entropía
+/// no es negociable: si `getrandom` falla, cortar el proceso -- MISMO
+/// criterio exacto que `fresh_128_bits` en `session.rs` (GRAMMAR.md §3.212).
+/// El `let _ =` anterior dejaba el buffer EN CEROS ante un fallo -- un id
+/// `"000...0"` perfectamente predecible, silenciosamente.
 fn fresh_id() -> String {
     let mut buf = [0u8; 16];
-    let _ = getrandom::getrandom(&mut buf);
+    getrandom::getrandom(&mut buf).expect("getrandom falló: sin una fuente de aleatoriedad del sistema no se puede generar un id de correlación MCP seguro");
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -122,7 +132,7 @@ pub(crate) fn sample(prompt: &str) -> Result<String, String> {
 
     let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
     let id = fresh_id();
-    state.pending.lock().insert(id.clone(), tx);
+    state.pending.lock().insert(id.clone(), (jti.clone(), tx));
 
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -171,18 +181,40 @@ fn extract_sample_text(response: &serde_json::Value) -> Result<String, String> {
 /// después de entregar -- mismo criterio "remove antes de send" que el
 /// spike aislado confirmó necesario para que un timeout tardío no reciba
 /// una entrega fantasma).
-fn handle_correlated_response(state: &McpSharedState, parsed: &serde_json::Value) -> (u16, serde_json::Value) {
+///
+/// Exige un `Mcp-Session-Id` válido Y que sea el de la sesión DUEÑA de la
+/// request pendiente (GRAMMAR.md §3.212) -- hasta v1.170.0 este camino no
+/// verificaba NADA: cualquier POST anónimo con el id correcto inyectaba la
+/// "respuesta del LLM". El `sampling/createMessage` salió por la conexión
+/// GET de UNA sesión concreta; solo esa sesión tiene motivo legítimo para
+/// responder. Sesión válida pero ajena da el MISMO 404 que un id
+/// inexistente -- no confirmar a una sesión ajena que el id existe.
+fn handle_correlated_response(
+    state: &McpSharedState,
+    sessions: &SessionStore,
+    mcp_session_id: Option<&str>,
+    parsed: &serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let Some(token) = mcp_session_id else {
+        return (401, serde_json::json!({"error": "falta el header Mcp-Session-Id -- una respuesta correlacionada solo puede entregarla la sesión que recibió el sampling/createMessage"}));
+    };
+    let Some((_, _, responder_jti)) = sessions.verify_mcp_session(token) else {
+        return (401, serde_json::json!({"error": "Mcp-Session-Id inválido, expirado o revocado"}));
+    };
     let id = match parsed.get("id") {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Number(n)) => n.to_string(),
         _ => return (400, serde_json::json!({"error": "falta 'id'"})),
     };
-    match state.pending.lock().remove(&id) {
-        Some(tx) => {
+    let mut pending = state.pending.lock();
+    match pending.get(&id) {
+        Some((owner_jti, _)) if *owner_jti == responder_jti => {
+            let (_, tx) = pending.remove(&id).expect("la entrada existe: se leyó bajo el mismo candado");
+            drop(pending);
             let _ = tx.send(parsed.clone());
             (200, serde_json::json!({"delivered": true}))
         }
-        None => (404, serde_json::json!({"error": format!("no hay ninguna request pendiente con id '{id}'")})),
+        _ => (404, serde_json::json!({"error": format!("no hay ninguna request pendiente con id '{id}'")})),
     }
 }
 
@@ -421,7 +453,7 @@ pub(crate) fn handle_post(
     let method = parsed.get("method").and_then(|m| m.as_str());
 
     if method.is_none() && parsed.get("id").is_some() {
-        let (status, body) = handle_correlated_response(mcp_state, &parsed);
+        let (status, body) = handle_correlated_response(mcp_state, sessions, mcp_session_id, &parsed);
         return PostResult { status, body, new_session_id: None };
     }
 

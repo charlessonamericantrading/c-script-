@@ -464,13 +464,76 @@ fn mcp_sample_full_round_trip_over_a_real_get_connection_and_a_real_post_respons
             "result": { "content": [{ "type": "text", "text": "4" }] },
         })
         .to_string();
-        let (status, _, body) = server.request("POST", "/mcp", &response, &[]);
+        // La entrega exige el Mcp-Session-Id de la sesión dueña desde
+        // v1.171.0 (GRAMMAR.md §3.212) -- antes este mismo POST pasaba sin
+        // ningún header.
+        let (status, _, body) = server.request("POST", "/mcp", &response, &[("Mcp-Session-Id", &mcp_session_id)]);
         assert_eq!(status, 200, "entrega de la respuesta correlacionada: {body}");
 
         let (status, _, body) = call_thread.join().expect("el hilo de tools/call no debería panickear");
         assert_eq!(status, 200, "body: {body}");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("body debe ser JSON");
         assert_eq!(parsed["result"]["content"][0]["text"], "4", "body: {body}");
+    });
+}
+
+/// Fix de seguridad de la auditoría del 02/09/2026 (PLAN.md §9.17 ítem 2,
+/// GRAMMAR.md §3.212): hasta v1.170.0, la entrega de una respuesta
+/// correlacionada no verificaba NADA -- cualquier POST anónimo con el id
+/// correcto inyectaba la "respuesta del LLM" que consume el rpc. Ahora
+/// exige el Mcp-Session-Id de la sesión DUEÑA: sin header es 401, con una
+/// sesión válida pero AJENA es el mismo 404 que un id inexistente (no se
+/// le confirma a una sesión ajena que el id existe), y con la dueña es 200.
+/// Las tres entregas se prueban sobre UN MISMO sampling pendiente real.
+#[test]
+fn a_correlated_response_from_the_wrong_or_missing_session_is_rejected() {
+    let temp = TempDir::new("sample-wrong-session");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--mcp-jwt-secret", "mcp-s3cr3t"]);
+    let owner_session = login_and_initialize(&server);
+    // Segunda sesión MCP real, del mismo servidor -- válida, pero ajena al
+    // sampling que va a quedar pendiente.
+    let foreign_session = login_and_initialize(&server);
+
+    let mut stream_client = McpStreamClient::connect(server.port, &owner_session);
+
+    std::thread::scope(|scope| {
+        let call_thread = scope.spawn(|| {
+            server.request(
+                "POST",
+                "/mcp",
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"Calc_askLlm","arguments":{"prompt":"¿cuánto es 2+2?"}}}"#,
+                &[("Mcp-Session-Id", &owner_session)],
+            )
+        });
+
+        let event = stream_client.next_event().expect("tiene que llegar un evento sampling/createMessage");
+        let sample_id = event["id"].clone();
+        let response = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": sample_id,
+            "result": { "content": [{ "type": "text", "text": "4" }] },
+        })
+        .to_string();
+
+        // 1) Sin ningún header de sesión: 401, y el sampling sigue pendiente.
+        let (status, _, body) = server.request("POST", "/mcp", &response, &[]);
+        assert_eq!(status, 401, "una entrega anónima debe rechazarse: {body}");
+
+        // 2) Con una sesión válida pero ajena: el mismo 404 que un id
+        //    inexistente -- ni entrega, ni confirmación de que el id existe.
+        let (status, _, body) = server.request("POST", "/mcp", &response, &[("Mcp-Session-Id", &foreign_session)]);
+        assert_eq!(status, 404, "una sesión ajena no debe poder entregar: {body}");
+        assert!(body.contains("no hay ninguna request pendiente"), "debe ser indistinguible de un id inexistente: {body}");
+
+        // 3) Con la sesión dueña: entrega real, y el rpc termina con el valor.
+        let (status, _, body) = server.request("POST", "/mcp", &response, &[("Mcp-Session-Id", &owner_session)]);
+        assert_eq!(status, 200, "la dueña sí debe poder entregar: {body}");
+
+        let (status, _, body) = call_thread.join().expect("el hilo de tools/call no debería panickear");
+        assert_eq!(status, 200, "body: {body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body debe ser JSON");
+        assert_eq!(parsed["result"]["content"][0]["text"], "4", "las dos entregas rechazadas no deben haber tocado el resultado: {body}");
     });
 }
 
