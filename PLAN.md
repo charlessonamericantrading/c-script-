@@ -921,6 +921,108 @@ Lo que un producto de IA necesita del backend son cuatro cosas: llamar a un LLM 
 
 ---
 
+### 9.20 Skynet 100 % en c-script, motor de IA incluido -- plan de construcción (03/09/2026)
+
+**Estado: plan escrito, NO ejecutado.** Se ejecuta después de §9.19 (ítems 8 y 9 esperan decisión del usuario) y absorbe la Ronda 2 de §9.18: casi todo lo que Skynet necesita ya estaba ahí como ítem suelto; esta sección los ordena por lo que Skynet necesita PRIMERO y añade lo que faltaba (el motor de IA dentro del runtime).
+
+#### 0. Hechos medidos, no leídos de la documentación
+
+Inventario del 03/09/2026 sobre `C:\Users\repre\Documents\skynet` (dos pasadas independientes, con `wc -l` y grep sobre el código real; los docs `CORE-SUBSYSTEMS.md`/`ARCHITECTURE.md` describen `server/core/` pero el código vive en `server/domains/`, así que planificar desde los docs migraría subsistemas fantasma):
+
+| Pieza | Tamaño real | Qué es |
+|---|---|---|
+| `Agent-Platform/server/` | 476 `.ts`, **50.343 líneas**, ~326 endpoints Express, 22 tablas Postgres (VPS `localhost:5432`, Neon decomisionado el 28/08) | El backend. 8 dominios (`ai-orchestration` 8.940, `infra-control` 5.488, `productivity` 3.074, `agents` 1.957, `web-automation` 1.927, `messaging` 1.349, `files` 1.193, `data` 1.072) + `core/` 7.319 + `cluster/` 1.871 + `google/` 2.269 + `storage/` 1.548 |
+| Catálogo de tools | **315** en 16 categorías (`domains/*/index.ts`; el catálogo dice 313, el README 150+) | ~85 son HTTP/JSON/DB puro (27 %), ~60 son SaaS por HTTP (19 %), **~170 son de sistema operativo** (54 %: `execute_command`, Playwright, ffmpeg/sharp, git/docker/PM2, ratón/teclado, ficheros) |
+| `inference-engine/` | 91 `.rs`, **18.610 líneas**, 10 crates | **Motor de inferencia propio en Rust, sin dependencias**: parser GGUF, cuantización, matmul AVX2/FMA con intrínsecos propios, KV-cache, paged attention, prefix cache, forward de Llama 3.x / Gemma 4 / Qwen2.5 / Qwen3(+MoE) / Phi-3 / PhiMoE, servidor HTTP compatible con la API de Ollama (`/api/generate`, `/api/chat`, `/api/tags`, `/api/ps`, NDJSON chunked). Solo CPU (Vulkan evaluado y descartado). VIVO: lo arranca Electron (`inference-engine-runtime.cjs`) en `:11500`; Ollama quedó retirado del PC local, sobrevive solo en el satélite VPS para reformular Telegram |
+| Orquestación de IA | ~3.000 líneas TS | JARVIS router (243, heurístico determinista, sin LLM), orchestrator (238), `route-selector`/`model-registry`/`complexity-analyzer` (395), `local-ai-tools` (635), cliente Anthropic-shaped sobre el motor (538), `chat-stream` (435, SSE al navegador + NDJSON al motor), RAG (224, embeddings OpenAI + BM25 propio, índice en ficheros JSON), motor cognitivo (428, Postgres), gap-detector (200) |
+| Cliente | 298 ficheros, 25.948 líneas React + Vite | Habla REST `/api/*`, WebSocket en 4 sitios (`/ws`, chat, terminal, remote-desktop) y **ya consume un cliente generado por linkc** (`client/src/gen/`, 2.174 líneas) |
+| `link-backend/skynet.link` | 208 líneas, arranca en `:5080` | Piloto: 3 de 22 tablas, 0 de 326 endpoints, password en claro (`skynet.link:185`), y el único request del log es un 401 |
+| `mcp-server/` | 1.146 líneas | Proxy MCP (JSON-RPC + SSE) de 11 tools al gateway; marcado `DEPRECATED.md`. **El candidato más limpio para migrar primero** |
+| Modelos propios (`Desktop/Modelos de IA`) | Irene 1B (1,02B, Llama-style, GQA, SwiGLU, RoPE), Irene 250B, Irene 5T (MoE) | Arquitectura + pipeline de entrenamiento en PyTorch, **sin entrenar**. Irene 1B es una arquitectura que el crate `llama` del motor ya sabe ejecutar si se exporta a GGUF |
+
+#### 1. Qué significa "100 %" -- la decisión de arquitectura
+
+Skynet son tres cosas distintas y "100 % en c-script" significa algo distinto para cada una:
+
+1. **El backend y la orquestación de IA (≈ 35.000 de las 50.343 líneas)**: van al lenguaje, con las capacidades del Eje H de abajo. Es lo que el CRM Nexus, MyFinance e IgnisLove ya hicieron, a otra escala.
+2. **El motor de inferencia (18.610 líneas de Rust)**: NO se reescribe en `.link` -- un lenguaje sin FFI, sin ficheros y sin SIMD no puede leer un GGUF de 4 GB ni hacer un matmul cuantizado, y no debe poder. Pero el motor ya está escrito en **el mismo lenguaje que el compilador**, y `linkc` ya embebe crates de Rust como builtins curados (`pdf.build` §3.201, `excel.build` §3.202, bcrypt §3.226, Argon2, `ureq`). La decisión: **el motor entra en el runtime de `linkc` como los crates `inference-engine/crates/*`, y se expone como el módulo `ai.*`** (Eje G). El `.link` declara qué modelos usa y el runtime los carga; el programa nunca ve un fichero ni un hilo. Así el motor de IA queda "dentro del lenguaje" en el único sentido que es verdad: un `linkc serve` sin Ollama, sin Electron y sin ningún proceso externo sirve inferencia local, streaming y embeddings, y un `.link` de 40 líneas es un servidor de chat completo.
+3. **Las ~170 tools de sistema operativo** (54 % del catálogo: `claude -p` como subproceso, captura de pantalla, ratón/teclado, Playwright, terminal por WebSocket, ffmpeg/sharp, git/docker/PM2, `dynamic-loader` de `.cjs` desde disco): no entran en el lenguaje y no deben entrar. Quedan en un **satélite nativo mínimo** (el `local-agent-runtime.cjs` de Electron que ya existe, reducido a lo que es de sistema), invocado por el backend `.link` por HTTP con el mismo contrato `{tool, params} -> {ok, run_id, result}`. El 100 % es del backend, no del sistema operativo.
+
+**[decisión del usuario] Alternativa para el punto 3**: un modo `@native` (o `--allow-native`) que deje a un `.link` lanzar procesos y leer ficheros. Recomendación: **no**. Rompe la única garantía que hace a c-script distinto de Node ("un `.link` no puede hacer nada fuera de su base y su red"), y el satélite existe y funciona. Si se decide que sí, es una ronda propia con sandbox, allowlist y auditoría, no un flag.
+
+#### Eje G -- El motor de IA dentro del runtime (nuevo)
+
+Todo este eje es tooling del compilador y runtime, cero gramática nueva: `ai` es un módulo builtin más, como `crypto`, `http`, `pdf`. Mismo patrón de cinco puntos de anclaje que §3.222 (checker, candidatos, resolución FnRef, dispatch directo, `call_callable`).
+
+1. **Feature `inference` de Cargo: `linkc` compila con los crates `gguf`, `tensor-core`, `model-core`, `llama`, `gemma4`, `qwen2`, `qwen3`, `phi3`, `phimoe` de `inference-engine/` como dependencias por path (o como submódulo git).** Evidencia: `inference-engine/Cargo.toml` ya es un workspace con `default-members` limpios y sin dependencias externas; `vulkan-backend` queda fuera como hoy. Primer paso: `cargo build --features inference` compila y `linkc --version` reporta `inference: on`. Esfuerzo S (es plomería de Cargo) -- el riesgo es el tamaño del binario y el tiempo de CI, medir antes.
+2. **Declaración `ai { router: "qwen2.5:0.5b", ambient: "gemma4:e4b", coder: "qwen2.5-coder:7b" }` en el `.link` + `linkc serve --models-dir <dir>` (o `LINK_MODELS_DIR`).** El runtime resuelve cada alias a un GGUF con el mismo `ollama_resolve.rs` que hoy lee los manifests/blobs de Ollama en disco, o a un fichero directo. Un modelo declarado que no está en disco es un error al ARRANCAR (`linkc serve` se niega, como con `@encrypted` sin clave), no en el primer request. `linkc doctor` lo comprueba. **[decisión del usuario]**: es la única sintaxis nueva del eje (un bloque `ai { }` al lado de `db { }`); la alternativa sin gramática es `--model router=qwen2.5:0.5b` por flag, más incómodo pero cero parser. Esfuerzo S.
+3. **`ai.generate(model: String, prompt: String) -> String`, `ai.chat(model, messages: AiMessage[]) -> String`** (`AiMessage = { role: String, content: String }`, pre-sembrado como `PdfBlock`, §3.201). Síncronos, greedy (lo único que el motor sampling hoy, `routes.rs:12-14`), con `--ai-timeout` (como `--http-timeout`, §3.86) y el `max_tokens` del motor (512/140, `routes.rs:495`) como opción explícita en vez de un techo escondido. Cada llamada corre en el pool de hilos del motor, NUNCA en el hilo de la request (Eje B ítem 2, `--max-concurrency`, pasa a ser prerrequisito real). Esfuerzo M.
+4. **`ai.stream(model, messages)` como cuerpo de un `stream`: el `stream` emite un evento por token (`{ token: String, done: Bool }`) por SSE.** Es exactamente `chat-stream.ts` (435 líneas) y `stream-routes.ts` (112) hechos builtin: el motor ya produce NDJSON chunked; acá se conecta a la salida SSE que `stream` ya tiene (§3.16). Esfuerzo M. Depende de 3.
+5. **`ai.embed(model, text: String) -> Vector<N>`**: el motor NO tiene embeddings hoy (el RAG de Skynet los pide a OpenAI por HTTP, `rag-engine.ts`); añadirlos al motor es un forward sin cabeza LM + mean-pooling sobre el último hidden state, que los crates ya calculan. Sale junto con Eje F ítem 2 (`Vector<N>` + pgvector + `db.<c>.nearest`), y para SQLite un coseno en proceso (las tablas de Skynet son chicas: 293 filas en `skynet_knowledge`). Esfuerzo M-L. Con esto el RAG entero (chunking 600/100, coseno, fallback BM25) es `.link` puro y el índice deja de vivir en ficheros JSON.
+6. **`ai.tools(model, messages, tools: AiTool[]) -> AiToolCall[]`: tool-calling parseado por el runtime.** El motor no soporta `tools` (`routes.rs:4`) y hoy el cliente TS parsea llamadas inline del texto (`native-engine-client.ts`, 538 líneas). El parser se mueve al runtime, con el formato de cada chat-template (Qwen/Gemma) donde el motor ya sabe cuál es. Sin esto, el bucle de agente (`local-ai-agent.ts`, 204) no migra. Esfuerzo M. Depende de 3.
+7. **Irene como modelo del motor**: `Irene 1B` es Llama-style (GQA 4:1, SwiGLU, RMSNorm, RoPE, embeddings atados) -- el crate `llama` lo ejecuta si se exporta a GGUF. Falta: (a) un `scripts/export_gguf.py` en el proyecto Irene (PyTorch -> GGUF, ~150 líneas, fuera de este repo), (b) que el motor acepte `vocab_size` 32000 con tokenizer BPE propio embebido en el GGUF (el parser ya lee el tokenizer del GGUF). El entrenamiento (1B: 1 GPU; 250B: ~47 H100; 5T: miles) NO es de este plan ni de este lenguaje: PyTorch, fuera. Cuando haya un checkpoint entrenado, `ai { router: "irene-1b" }` es una línea. Esfuerzo S en este repo (solo el tokenizer), L fuera.
+8. **`/metrics` del motor**: tokens/s, tiempo de prefill, hits del prefix cache, memoria de KV por modelo, cola del pool -- en el mismo texto Prometheus de §3.223. Sin esto no hay forma de comparar contra los 3,19x/2,04x que `ROADMAP-PERF-WAVE3.md` ya midió contra Ollama. Esfuerzo S. Depende de 3.
+
+**Límite honesto del eje**: sampling greedy (el motor no muestrea con temperatura; `options.temperature` se acepta y se ignora), solo CPU AVX2/FMA (un VPS sin AVX2 no arranca el feature: `linkc doctor` lo dice), y un modelo de 7B en un VPS de 4 GB no cabe -- el `.link` que declara `coder: "qwen2.5-coder:7b"` corre en el PC MSI (32 GB), no en Hostinger. El bloque `ai { }` documenta el hardware mínimo por modelo y `doctor` mide la RAM libre antes de decir OK.
+
+#### Eje H -- Lo que Skynet necesita del lenguaje (y no es el motor)
+
+Mapa contra lo que ya existe en §9.18. Un ítem aquí que ya estaba allí NO se duplica: se cita y se sube de prioridad.
+
+1. **Cliente HTTP con streaming (`http.postStream`) = §9.18 Eje F ítem 1.** Lo necesitan las llamadas a `api.anthropic.com`/`api.openai.com` con streaming (Claude Vision para el screen-watcher, el tier `cc` cuando se rediseñe como API en vez de subproceso) aunque el motor local esté embebido. Esfuerzo M.
+2. **`Vector<N>` + pgvector + `nearest` = §9.18 Eje F ítem 2.** Prerrequisito del Eje G ítem 5. Esfuerzo L.
+3. **`@background` = §9.18 Eje F ítem 3.** Las `tasks`/`sub_tasks`/`swarm_executions` de Skynet (crews en paralelo con `p-limit`, empleados digitales con cron) son exactamente "un rpc que devuelve un id y corre después" + una tabla de jobs con estado. Sin esto el 40 % de `core/` no migra. Esfuerzo M.
+4. **Pool de hilos acotado + pool de conexiones = §9.18 Eje B ítems 2 y 3.** Con el motor en proceso, un request que dispara inferencia de 60 s en el hilo de la request bloquea la única conexión a la base. Pasan de "rendimiento" a "corrección". Esfuerzo M + M.
+5. **`for` e interpolación de strings = §9.18 Eje A ítem 6 [decisión del usuario].** Portar 35.000 líneas sin `for` ni `"Hola ${name}"` multiplica el tamaño y los errores del port. Es la fricción número uno medida en los tres adoptantes. Sigue siendo cambio de gramática: luz verde antes de la Ronda 1 de este plan.
+6. **`@ref(<colección>)` con `ON DELETE CASCADE` = §9.18 Eje A ítem 2 [decisión del usuario] + `@column("nombre_sql")` = Eje A ítem 3 + `introspect` completo = Eje A ítem 1.** El schema real de Skynet tiene FKs con cascade (`task_logs -> tasks`, `messages -> conversations`), PKs `varchar` con `gen_random_uuid()` (hoy `id: Uuid` §3.177 es `uuid` nativo, no `varchar`: hay que aceptar `varchar` que contenga un uuid, mismo caso que §3.179 al revés), 6 columnas `jsonb` (§3.187 ya), índices compuestos (`@index(a, b)`, hoy solo `@unique(a, b)` §3.155) y columnas `snake_case` contra campos `camelCase`. Sin estos tres, `--adopt-existing` sobre las 22 tablas falla en la primera. Esfuerzo M + S + M.
+7. **`Map<String, fn(Json) -> Json>` como registro de tools.** Una `fn` de nivel superior ya es un valor de primera clase (GRAMMAR §2, `FnRef`); falta verificar que un `Map` con valores de tipo función tipe y se despache (`registry.get(name)?.call(params)`). Es como se migra el gateway (`POST /gateway/invoke {tool, params}` -> `{ok, run_id, result, tokens_used}`, contrato congelado por terceros según `TOOL-CATALOG.md:509`) sin un `match` de 315 brazos. Si no tipa hoy, es un ítem S del checker.
+8. **Streams con eventos tipados distintos de la fila entera.** §3.16 obliga a que un `stream` devuelva `T[]` de una colección; Skynet emite 19 tipos de evento por WebSocket (`task_update`, `approval_request`, `crew_update`...). Un `stream events() -> SkynetEvent` alimentado por una tabla `skynet_events` con `subscribe()` YA funciona (§3.16 + §3.225); lo que falta es documentar el patrón "el WebSocket se reemplaza por una tabla de eventos + un stream por suscriptor" y medir latencia (target: < 100 ms local, el `LIVE_STREAM_BUFFER` actual alcanza). Esfuerzo S (docs + un test de latencia).
+9. **Approvals sin WebSocket**: `approval-manager.ts` (70 líneas) bloquea una tool esperando un `approval_request` por WS. Rediseño: la tool encola (`@background`, ítem 3), un `stream approvals()` avisa a la UI, un rpc `Approvals.decide(id, ok)` desbloquea. Cero capacidades nuevas, un patrón documentado en la guía de migración (Eje A ítem 5). Esfuerzo S.
+10. **Observabilidad**: `/metrics` Prometheus ya existe (§3.223); falta `/openapi.json` servido por `linkc serve` (el fichero ya lo genera `build`) y propagación de `traceparent` (W3C) en `http.*` salientes + un `X-Request-Id` estable en logs, para que el OTel que hoy auto-instrumenta Express siga correlacionando cuando Skynet sea `.link`. Esfuerzo S + S.
+11. **`linkc import openapi.json` = §9.18 Eje A ítem 4.** Skynet publica OpenAPI 3.1 de 76 endpoints (`lib/openapi.ts`): el esqueleto de los 8 dominios sale de ahí en un comando. Esfuerzo M.
+12. **JWT con refresh**: `auth.claim` (§3.197) + `--mcp-jwt-secret` cubren el access token; falta un patrón `.link` para refresh tokens en tabla (`refresh_tokens`, 7 días) y RBAC `admin/operator/viewer` con `@requires(Role.X)` (ya existe). El token estático en `.session-token` (fichero, `middleware/auth.ts:47-77`) desaparece: pasa a `env` (`LINK_SESSION_TOKEN`) en la flota de 13 proyectos y el bot de Telegram. Esfuerzo S (docs + un ejemplo compilado por CI).
+
+#### 2. Estrangulamiento por subsistema (orden de migración del código de Skynet)
+
+Regla: cada subsistema migra completo, con sus tablas, detrás del `--fallback-upstream` de §9.18 Eje E ítem 3 (que pasa a ser prerrequisito de la Ronda 1); el Express viejo sigue sirviendo lo que el `.link` todavía no tiene. Sin ese flag no hay strangler, hay big bang.
+
+| Orden | Subsistema | Líneas TS | Depende de | Por qué en ese lugar |
+|---|---|---|---|---|
+| 1 | `mcp-server/` (11 tools, JSON-RPC + SSE) | 1.146 | nada (§3.203 ya) | Ya está deprecado, contrato cerrado, cero OS. Primera victoria y primer `.link` real en PM2 24 |
+| 2 | `safety/` (regex sobre JSON de entrada) | 311 | nada | Inviolable y puro; se vuelve una `fn` que TODO rpc del gateway llama primero |
+| 3 | `project-registry` + `scheduler` + `memory` + `gap-detector` + `cognitive-engine` | ~2.900 | H6 (schema), §3.159 cron | Clase A pura, 10 de las 22 tablas |
+| 4 | Auth + gateway (`/gateway/invoke`, health, session) | ~800 | H7, H12 | El contrato de 315 tools con el registro `Map<String, fn>`; las tools OS se despachan al satélite por `http.post` |
+| 5 | Tools HTTP/JSON puras (~85) + SaaS (~60: Google OAuth2, Telegram, Meta, Hostinger, GitHub, S3 con `crypto.awsS3PresignedUrl` §3.110/§3.194) | ~4.500 | H1 para las que hacen streaming | Es donde vive el volumen; van en lotes por categoría, cada lote con su test contra la API real en CI (como `pg_integration.rs`) |
+| 6 | JARVIS router + orchestrator + model-routing | ~1.100 | G3 | Determinista, sin LLM: es `match` sobre regex y longitud; el tier `cc_subprocess` se reencamina a G3 (ya lo hace `orchestrator.ts` desde 07/2026) |
+| 7 | Chat + agent loop + RAG | ~1.700 | G4, G5, G6, H2 | Lo que hoy es `chat-stream.ts` + `local-ai-agent.ts` + `rag-engine.ts` |
+| 8 | Crews / swarm / empleados digitales / approvals | ~2.300 | H3, H8, H9 | Todo sobre `@background` + tabla de jobs + streams de eventos |
+| 9 | `cluster/` (1.871) | -- | G1-G4 | **No migra: se elimina.** Con el motor dentro de `linkc serve`, el router de workers Ollama por WebSocket no tiene razón de ser |
+| 10 | Satélite nativo | ~1.500 (lo que quede de `local-agent-runtime.cjs` + `claude-code.ts` + captura de pantalla) | -- | Se reduce, no se migra. Contrato: `POST /native/invoke {tool, params}` desde el `.link` |
+
+Fuera del plan, con nombre y motivo: `web-automation/` (Playwright, 1.927), `computer-use/` + `remote-desktop/` (787), terminal por WS, `video/` y `media` (ffmpeg/sharp), `deploy/`/git/docker/PM2 tools, `dynamic-loader.ts` (cargar `.cjs` de disco), la app Electron y la UI React (que no cambia: consume el cliente generado, ya lo hace en `link-projects-widget.tsx`). Y el entrenamiento de Irene.
+
+#### 3. Datos: las 22 tablas
+
+Ninguna es grande (`skynet_knowledge` 293 filas, `messages` 162, el resto < 100): el riesgo es el schema, no el volumen. Antes de la primera tabla: `linkc introspect` sobre la base real (con H6 ya hecho) y `linkc doctor --db` (§3.229) sobre el `.link` resultante; el criterio de "listo para migrar la tabla N" es `doctor` en verde y `migrate --dry-run` diciendo "nada que migrar". Las PKs siguen siendo los mismos uuid en `varchar` -- `mcp-server`, la memoria de Claude y los clientes externos los conocen (`TOOL-CATALOG.md:509`): no se renumera nada.
+
+#### 4. Rondas
+
+- **Ronda 0 (decisiones, 0 código)**: `for` + interpolación (H5), `@ref` (H6), bloque `ai { }` (G2), modo `@native` (no recomendado). Cuatro respuestas del usuario.
+- **Ronda 1 (cimientos, todo S/M, ~2 semanas de sesiones)**: G1 (feature `inference` compila), Eje B ítems 2-3 (pools), Eje E ítem 3 (`--fallback-upstream`), H6 (schema: `@column`, `@index` compuesto, `varchar` uuid, `introspect` completo), H7 (registro de tools tipado), H10 (`/openapi.json`, `traceparent`). Al final: `mcp-server` migrado (orden 1) y en PM2.
+- **Ronda 2 (el motor, M/L)**: G2, G3, G4, G8, H1, H3. Al final: un `.link` de chat con streaming sirviendo el modelo local sin Ollama ni Electron, medido en `/metrics` contra los números de `ROADMAP-PERF-WAVE3.md`. Subsistemas 2-4 migrados.
+- **Ronda 3 (agentes y memoria, M/L)**: G5, G6, H2, H8, H9, H11. Subsistemas 5-8 migrados; `cluster/` eliminado.
+- **Ronda 4 (cierre)**: satélite reducido a su contrato mínimo, Irene exportable (G7), corte de tráfico con `--record`/`replay` (§9.18 Eje E ítem 4), Express apagado en VPS PM2 40/41.
+
+#### 5. Métricas de éxito (medibles, no opiniones)
+
+- Líneas de TypeScript en `Agent-Platform/server/` que siguen vivas: de 50.343 a < 1.500 (el satélite).
+- Procesos en el PC nativo: de 4 (Electron, backend, motor, satélite) a 2 (`linkc serve`, satélite).
+- Tokens/s del chat local con el motor embebido >= los del motor standalone hoy (`/metrics`, G8); latencia de un evento de tabla a la UI por stream < 100 ms.
+- Los 315 ids de tool responden con el mismo contrato desde el `.link` (test de contrato contra `TOOL-CATALOG.md`, en CI).
+- `linkc doctor --db` en verde sobre las 22 tablas y `migrate --dry-run` vacío antes de cada corte.
+
+---
+
 ### Sobre el nombre
 
 Decidido: **c-script**, en minúsculas. La extensión de archivo (`.link`) y el nombre del binario del compilador (`linkc`) se mantienen como está — no hace falta que deletreen la marca, igual que `.rs` no dice "rust". Ver [GRAMMAR.md](GRAMMAR.md) para el resto de las convenciones de nomenclatura.
