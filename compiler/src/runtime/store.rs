@@ -980,7 +980,14 @@ fn postgres_array_cell(row: &postgres::Row, i: usize) -> Option<Cell> {
             if let Ok(v) = row.try_get::<_, Option<Vec<$t>>>(i) {
                 return Some(match v {
                     Some(items) => Cell::Json(serde_json::Value::Array(items.into_iter().map($conv).collect())),
-                    None => Cell::Null,
+                    // En una columna `json`/`jsonb` un NULL de SQL significa
+                    // "clave ausente" (`decode_row` lo rechaza salvo `x?: T`);
+                    // en un ARRAY nativo es la ÚNICA representación posible
+                    // de `null`, así que acá es el JSON `null` -- lo que
+                    // `json_array_to_pg` escribe para un `T[]?` en null.
+                    // Sin esto, leer de vuelta la fila recién insertada
+                    // fallaba con "fila con NULL en 'flags'" (CI, v1.187.0).
+                    None => Cell::Json(serde_json::Value::Null),
                 });
             }
         };

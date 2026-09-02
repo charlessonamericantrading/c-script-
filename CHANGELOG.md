@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.187.1] - 2026-09-02
+
+### 🐛 Corregido
+**Arrays nativos (§3.228), lado de LECTURA: un `T[]?` en NULL se leía como "clave ausente" y `decode_row` rechazaba la fila entera** (`fila (id=2) con NULL en 'flags', pero el programa actual declara ese campo requerido`) -- el fix de v1.187.0 dejó el `insert` bien, y el mismo test de CI encontró que la vuelta fallaba. Un NULL de una columna ARRAY nativa es ahora el JSON `null` (la única representación posible ahí), simétrico con lo que se escribe. Solo puede verificarse contra Postgres real (el `Row` del driver no se construye a mano): CI.
+
 ## [1.187.0] - 2026-09-02
 
 ### ✨ Añadido
