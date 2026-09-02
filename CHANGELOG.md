@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.173.0] - 2026-09-02
+
+### 🔧 Interno
+**Red de tests (PLAN.md §9.17 ítem 7): `pdf.build` y `excel.build`/`excel.parse` cubiertos end-to-end contra el binario real por primera vez.** Eran los dos únicos builtins de documento sin ningún test que pasara por checker Y runtime del binario de verdad -- sus tests de runtime usan el harness que no corre el checker, y sus ejemplos de la spec son `linkc:fragment`; exactamente el agujero por donde ya pasó el bug §3.204. `cli_pdf_excel.rs` nuevo: `pdf.build` produce un PDF real (base64 con prefijo `JVBERi` = bytes `%PDF`), round-trip `excel.build`→`excel.parse` con las 4 variantes de celda asertado desde `.link` (Decimal exacto, fecha que vuelve como `Date`, UTF-8 intacto, `match` sobre el `ExcelCell` de vuelta -- el enum pre-sembrado se consume, no solo se construye), y el camino de error (fila desalineada) fallando limpio con el problema nombrado. Ver GRAMMAR.md §3.214.
+
 ## [1.172.0] - 2026-09-02
 
 ### 🔧 Interno

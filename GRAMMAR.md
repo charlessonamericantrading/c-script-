@@ -235,6 +235,7 @@
   - [3.211 `--trust-proxy` toma el ÚLTIMO valor de `X-Forwarded-For`, no el primero — RESUELTO](#3211---trust-proxy-toma-el-último-valor-de-x-forwarded-for-no-el-primero--resuelto)
   - [3.212 La entrega de una respuesta correlacionada MCP exige la sesión dueña — RESUELTO](#3212-la-entrega-de-una-respuesta-correlacionada-mcp-exige-la-sesión-dueña--resuelto)
   - [3.213 Una cerca sin lenguaje en la documentación es un error del test de ejemplos — RESUELTO](#3213-una-cerca-sin-lenguaje-en-la-documentación-es-un-error-del-test-de-ejemplos--resuelto)
+  - [3.214 `pdf.build`/`excel.build`/`excel.parse` cubiertos end-to-end contra el binario real — RESUELTO](#3214-pdfbuildexcelbuildexcelparse-cubiertos-end-to-end-contra-el-binario-real--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7695,6 +7696,20 @@ Origen: `PLAN.md §9.17` ítem 6 (Bloque B), hallazgo de la auditoría del 02/09
 - La clasificación automática `text` vs `rust`+`fragment` para recortes chicos sin palabras clave de Link (una firma de API suelta, una llamada de método aislada) fue heurística -- un recorte tipado `text` que en verdad es Link no rompe nada, solo queda fuera de la red igual que antes; retipearlo es un cambio de una línea cuando alguien lo note.
 
 **Verificado**: `docs_examples.rs` verde con las 100 cercas tipadas (los 18 bloques nuevos de GRAMMAR.md compilan de verdad en el test); una cerca pelada agregada a mano hace fallar el test con el mensaje nuevo, confirmado antes de commitear.
+
+### 3.214 `pdf.build`/`excel.build`/`excel.parse` cubiertos end-to-end contra el binario real — RESUELTO, cierra PLAN.md §9.17 ítem 7
+
+Origen: `PLAN.md §9.17` ítem 7 (Bloque B), auditoría del 02/09/2026. `pdf.build` (§3.201) y `excel.build`/`excel.parse` (§3.202) eran los dos únicos builtins de documento shipeados sin NINGÚN test que pasara por el checker Y el runtime del binario real a la vez: sus tests de runtime usan el harness `program_from()` que NO corre el checker, sus tests de checker no ejecutan nada, y sus ejemplos publicados en la spec son `linkc:fragment` (§3.213 los hizo visibles como no-verificados, no verificados). Es exactamente la clase de agujero por donde ya pasó el bug real de §3.204 -- `PdfBlock`/`ExcelCell` tipaban limpio pero el codegen no los conocía, y ningún test lo atrapó.
+
+**El fix (v1.173.0): `compiler/tests/cli_pdf_excel.rs`**, 3 tests que spawnnean `linkc test` como subproceso (compilación completa, checker incluido, más ejecución de los bloques `test "..."` en el intérprete real -- el mismo camino que recorre un usuario):
+
+1. **`pdf.build` produce un PDF real**: el assert clave es `b64.startsWith("JVBERi")` -- base64 de bytes que empiezan con `%PDF` es siempre ese prefijo, así que un `.link` puede verificar "es un PDF de verdad" sin decodificar base64 (que el lenguaje no tiene como builtin).
+2. **Round-trip `excel.build` → `excel.parse` con las 4 variantes de celda con valor**: el nombre de hoja, los encabezados, el texto UTF-8 con acentos, el `Decimal` EXACTO (`"1234.5678"`, no aproximado por el `f64` interno del formato) y la fecha reconocible como `ExcelCell.Date` (el bug real de `write_datetime` que §3.202 atrapó) -- todo asertado DESDE `.link`, con `match` sobre el `ExcelCell` de vuelta, probando de paso que el enum pre-sembrado se puede consumir desde el lenguaje, no solo construir. La firma ZIP en base64 (`UEsDB`) confirma que es un `.xlsx` real.
+3. **El camino de error**: una fila con distinta cantidad de columnas que `headers` hace fallar `linkc test` con un error que nombra el problema de columnas -- nunca un panic del proceso ni un `.xlsx` corrupto en silencio.
+
+**Límite honesto**: esto cubre el camino compilado+interpretado completo, pero no reemplaza la verificación con herramientas EXTERNAS (el `openpyxl` de la verificación manual de §3.202) -- un `.xlsx` que este proyecto escribe Y lee bien podría, en teoría, tener un defecto que solo otro lector note. Esa verificación externa quedó hecha una vez en §3.202; este test garantiza que el camino no se ROMPA de ahí en más, que es lo que faltaba.
+
+**Verificado**: los 3 tests verdes contra el binario real a la primera; suite completa sin regresiones.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
