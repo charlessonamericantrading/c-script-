@@ -784,6 +784,38 @@ pub(crate) fn ai_message_type_decl() -> TypeDecl {
     }
 }
 
+/// GRAMMAR.md §3.236: `AiToken = { token: String, done: Bool }`, el elemento
+/// de `ai.stream`. Pre-sembrado y estructural como `AiMessage`.
+pub(crate) fn ai_token_type_decl() -> TypeDecl {
+    let dummy = Span::new(0, 0, 0, 0);
+    let named = |name: &str| TypeExpr::Named(name.to_string(), vec![], dummy);
+    let field = |name: &str, ty: TypeExpr| Field {
+        name: name.to_string(),
+        optional: false,
+        ty,
+        name_span: dummy,
+        annotations: vec![],
+        default: None,
+    };
+    TypeDecl {
+        name: "AiToken".to_string(),
+        type_params: vec![],
+        ty: TypeExpr::Struct(vec![field("token", named("String")), field("done", named("Bool"))]),
+        span: dummy,
+        annotations: vec![],
+    }
+}
+
+fn ai_token_struct_type() -> Type {
+    Type::Struct {
+        name: Some("AiToken".to_string()),
+        fields: vec![
+            FieldType { name: "token".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "done".to_string(), optional: false, ty: Type::Bool },
+        ],
+    }
+}
+
 fn ai_message_struct_type() -> Type {
     Type::Struct {
         name: Some("AiMessage".to_string()),
@@ -851,6 +883,7 @@ impl Checker {
         checker.types.insert("ExcelSheet".to_string(), excel_sheet_type_decl());
         // GRAMMAR.md §3.235: `AiMessage`, mismo criterio que `ExcelSheet`.
         checker.types.insert("AiMessage".to_string(), ai_message_type_decl());
+        checker.types.insert("AiToken".to_string(), ai_token_type_decl());
         let mut errors = Vec::new();
 
         for item in &program.items {
@@ -5054,6 +5087,13 @@ impl Checker {
                 self.expect_no_args(args, "ai.models")?;
                 Some(Type::List(Box::new(Type::String)))
             }
+            // GRAMMAR.md §3.236: tipa como `AiToken[]` -- como cuerpo completo
+            // de un `stream -> AiToken` el servidor lo emite token a token;
+            // en cualquier otra posición devuelve la lista entera.
+            (Type::Ai, "stream") => builtin_args!(
+                self, args, env, "ai.stream",
+                [(model, "model: String", Type::String), (messages, "messages: AiMessage[]", Type::List(Box::new(ai_message_struct_type()))), (max_tokens, "maxTokens: Int", Type::Int)] -> Type::List(Box::new(ai_token_struct_type()))
+            ),
             (Type::Mcp, "sample") => builtin_args!(
                 self, args, env, "mcp.sample",
                 [(prompt, "prompt: String", Type::String)] -> Type::String
@@ -11568,5 +11608,40 @@ mod ai_builtin_tests {
         assert!(msg.contains("AiMessage") || msg.contains("role"), "{msg}");
         let msg = check("service S { rpc a() -> Int { ai.generate(\"r\", \"p\", 8) } }").expect_err("tenía que fallar");
         assert!(msg.contains("String") && msg.contains("Int"), "{msg}");
+    }
+}
+
+/// GRAMMAR.md §3.236: `ai.stream` como cuerpo de un `stream -> AiToken`.
+#[cfg(test)]
+mod ai_stream_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+
+    fn check(src: &str) -> Result<(), String> {
+        let tokens = tokenize(src).map_err(|e| format!("{e}"))?;
+        let program = parse(tokens).map_err(|e| format!("{e:?}"))?;
+        Checker::check_program(&program).map_err(|e| format!("{e:?}"))
+    }
+
+    #[test]
+    fn ai_stream_types_as_a_token_stream_and_is_recognized_as_the_whole_body() {
+        let src = "ai { router: \"qwen2.5:0.5b\" }
+             service S {
+               stream reply(q: String) -> AiToken { ai.stream(\"router\", [AiMessage { role: \"user\", content: q }], 64) }
+               rpc all(q: String) -> AiToken[] { ai.stream(\"router\", [AiMessage { role: \"user\", content: q }], 8) }
+             }";
+        check(src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokenize(src).unwrap()).unwrap();
+        assert!(crate::runtime::ai_stream_member(&program, "S", "reply"));
+        assert!(!crate::runtime::ai_stream_member(&program, "S", "all"), "un rpc no es un stream");
+    }
+
+    #[test]
+    fn ai_stream_needs_the_token_shape_and_three_arguments() {
+        let msg = check("ai { r: \"x\" } service S { stream reply() -> String { ai.stream(\"r\", [], 8) } }").expect_err("tenía que fallar");
+        assert!(msg.contains("AiToken") || msg.contains("token"), "{msg}");
+        let msg = check("ai { r: \"x\" } service S { stream reply() -> AiToken { ai.stream(\"r\", []) } }").expect_err("tenía que fallar");
+        assert!(msg.contains("'ai.stream' toma exactamente 3 argumentos"), "{msg}");
     }
 }

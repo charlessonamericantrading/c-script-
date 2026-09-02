@@ -1156,6 +1156,27 @@ pub struct FieldPattern {
 /// `runtime::live_subscribe_collection` (sibling de `is_stream_member`)
 /// lo usa para que `server.rs` decida el routing ANTES de invocar
 /// `invoke_rpc_with_sessions` -- ese cuerpo nunca llega a `eval_block`.
+/// GRAMMAR.md §3.236: reconoce `ai.stream(model, messages, maxTokens)` como
+/// cuerpo COMPLETO de un `stream` -- ahí, y solo ahí, `linkc serve` emite
+/// cada token por SSE a medida que sale del motor en vez de esperar la
+/// lista entera. Mismo espíritu que `recognize_live_subscribe`: sintáctico,
+/// nunca evalúa nada. En cualquier otra posición `ai.stream(...)` es una
+/// llamada normal que devuelve la lista completa de tokens.
+pub fn recognize_ai_stream(body: &Block) -> Option<&[Spanned<Expr>]> {
+    if !body.stmts.is_empty() {
+        return None;
+    }
+    let Expr::Call { callee, args } = &body.tail.as_ref()?.node else { return None };
+    if args.len() != 3 {
+        return None;
+    }
+    let Expr::FieldAccess { base, field } = &callee.node else { return None };
+    if field != "stream" {
+        return None;
+    }
+    matches!(&base.node, Expr::Ident(n) if n == "ai").then(|| args.as_slice())
+}
+
 pub fn recognize_live_subscribe(body: &Block) -> Option<&str> {
     let [stmt] = body.stmts.as_slice() else { return None };
     if body.tail.is_some() {

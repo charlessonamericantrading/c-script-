@@ -65,6 +65,25 @@ pub fn resolve_declared_models(
     }
 }
 
+/// GRAMMAR.md §3.235/§3.236: el modelo residente para `alias`, cargándolo si
+/// es su primer uso -- con los dos errores que un `.link` puede ver: alias
+/// no declarado (con la lista de los declarados) y GGUF que no carga.
+/// Separado de `generate_with` para que un `stream` lo compruebe ANTES de
+/// mandar los headers 200.
+pub fn ensure_loaded(state: &ServerState, alias: &str) -> Result<std::sync::Arc<ModelEntry>, String> {
+    state.get_or_load(alias).map_err(|e| match e {
+        ModelLookupError::NotFound(_) => {
+            let declared: Vec<String> = state
+                .tags_json()
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect();
+            format!("ai: el alias '{alias}' no está declarado en 'ai {{ }}' -- declarados: [{}]", declared.join(", "))
+        }
+        ModelLookupError::LoadFailed(msg) => format!("ai: no se pudo cargar el modelo '{alias}': {msg}"),
+    })
+}
+
 /// GRAMMAR.md §3.235: qué se le pide al modelo. `Raw` es el prompt tal
 /// cual (sin chat template, como `/api/generate` con `raw: true`); `Chat`
 /// pasa por el chat template propio de cada arquitectura
@@ -98,21 +117,26 @@ pub fn generate(
     max_tokens: i64,
     timeout: std::time::Duration,
 ) -> Result<AiOutput, String> {
+    generate_with(state, alias, request, max_tokens, timeout, &mut |_| Ok(()))
+}
+
+/// GRAMMAR.md §3.236: como `generate`, pero `on_token` recibe cada token
+/// decodificado en cuanto sale del motor -- es lo que `stream -> AiToken`
+/// escribe por SSE. Si `on_token` devuelve un error (el cliente se fue), la
+/// generación para ahí mismo: no se gasta CPU en tokens que nadie va a leer.
+pub fn generate_with(
+    state: &ServerState,
+    alias: &str,
+    request: AiRequest,
+    max_tokens: i64,
+    timeout: std::time::Duration,
+    on_token: &mut dyn FnMut(&str) -> Result<(), String>,
+) -> Result<AiOutput, String> {
     use model_core::{argmax, KvCache};
     if max_tokens <= 0 {
         return Err(format!("ai: maxTokens tiene que ser > 0, se recibió {max_tokens}"));
     }
-    let entry = state.get_or_load(alias).map_err(|e| match e {
-        ModelLookupError::NotFound(_) => {
-            let declared: Vec<String> = state
-                .tags_json()
-                .iter()
-                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
-                .collect();
-            format!("ai: el alias '{alias}' no está declarado en 'ai {{ }}' -- declarados: [{}]", declared.join(", "))
-        }
-        ModelLookupError::LoadFailed(msg) => format!("ai: no se pudo cargar el modelo '{alias}': {msg}"),
-    })?;
+    let entry = ensure_loaded(state, alias)?;
     let prompt_ids = match &request {
         AiRequest::Raw(p) => entry.tokenizer.encode(p),
         AiRequest::Chat(messages) => entry.tokenizer.render_prompt_ids(messages),
@@ -153,6 +177,7 @@ pub fn generate(
             break;
         }
         generated.push(next);
+        on_token(&entry.tokenizer.decode(&[next]))?;
         if step + 1 == max {
             break;
         }

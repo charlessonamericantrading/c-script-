@@ -306,6 +306,9 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
     if let Some(schema) = struct_openapi_schema(&crate::checker::ai_message_type_decl(), &checker)? {
         schemas.insert("AiMessage".to_string(), schema);
     }
+    if let Some(schema) = struct_openapi_schema(&crate::checker::ai_token_type_decl(), &checker)? {
+        schemas.insert("AiToken".to_string(), schema);
+    }
 
     for item in &program.items {
         match item {

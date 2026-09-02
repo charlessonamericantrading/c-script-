@@ -257,6 +257,7 @@
   - [3.233 El motor de inferencia de Skynet embebido en `linkc` (feature `inference`) — RESUELTO](#3233-el-motor-de-inferencia-de-skynet-embebido-en-linkc-feature-inference--resuelto)
   - [3.234 El bloque `ai { alias: "spec", ... }` y `--models-dir`: los modelos locales del programa, resueltos al arrancar — RESUELTO](#3234-el-bloque-ai--alias-spec---y---models-dir-los-modelos-locales-del-programa-resueltos-al-arrancar--resuelto)
   - [3.235 `ai.generate` / `ai.chat` / `ai.models`: inferencia local síncrona con el motor embebido — RESUELTO](#3235-aigenerate--aichat--aimodels-inferencia-local-síncrona-con-el-motor-embebido--resuelto)
+  - [3.236 `stream -> AiToken { ai.stream(model, messages, maxTokens) }`: un evento SSE por token — RESUELTO](#3236-stream---aitoken--aistreammodel-messages-maxtokens--un-evento-sse-por-token--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8161,6 +8162,30 @@ service Assistant {
 **Verificado**: checker (las tres firmas, `AiMessage` sembrado y un struct propio estructural, aridad y tipos de retorno mal), runtime sin motor (`ai.models()` da los alias, `ai.generate` explica el motivo), `inference.rs` (`maxTokens` inválido, alias desconocido con la lista, modelo que no carga), y `tests/cli_ai_generate.rs` contra un MODELO REAL a través del binario y de HTTP -- `LINK_TEST_AI_MODEL=qwen2.5:0.5b` en el MSI: carga en 0,6 s desde el almacén de Ollama, `ai.generate("m", "1, 2, 3,", 12)` devuelve un texto con `4`, `ai.chat` responde, el alias desconocido es un error con `[m]` y el proceso sigue vivo; 3,4 s el test entero. Como los de Postgres, se salta sin la variable: CI no tiene ningún GGUF.
 
 **Límite honesto**: síncrono (el `stream` token a token es el ítem 4), greedy (el motor no muestrea con temperatura), CPU AVX2/FMA, sin tool-calling (ítem 6), sin embeddings (ítem 5). La generación corre en el hilo de la request: una respuesta de 128 tokens con un 7B en CPU bloquea ESE hilo decenas de segundos (los demás siguen); el pool acotado de §9.18 Eje B ítem 2 es lo que lo convierte en backpressure real. `ai.chat` no fija ningún `system` por su cuenta: si el modelo lo necesita, va como primer `AiMessage { role: "system", ... }`.
+
+### 3.236 `stream -> AiToken { ai.stream(model, messages, maxTokens) }`: un evento SSE por token — RESUELTO, cierra PLAN.md §9.20 Eje G ítem 4
+
+Origen: `PLAN.md §9.20` Eje G ítem 4. Es `chat-stream.ts` (435 líneas) + `stream-routes.ts` (112) de Skynet -- el chat del dashboard, SSE al navegador y NDJSON al motor -- hecho builtin: el motor ya producía los tokens uno a uno (§3.233), `stream` ya sabía escribir SSE (§3.16); faltaba juntarlos sin esperar la lista entera.
+
+<!-- linkc:check -->
+```rust
+ai { router: "qwen2.5:0.5b" }
+service Assistant {
+  stream reply(question: String) -> AiToken {
+    ai.stream("router", [AiMessage { role: "user", content: question }], 256)
+  }
+}
+```
+
+**Qué hay (v1.194.0)**:
+- **`ai.stream(model: String, messages: AiMessage[], maxTokens: Int) -> AiToken[]`**, con **`AiToken = { token: String, done: Bool }`** pre-sembrado y estructural como `AiMessage` (§3.235), presente en `contract.d.ts`/`schemas.ts`/`openapi.json`. Tipa como `AiToken[]`, así que un `stream -> AiToken` lo acepta como cuerpo por la regla de siempre (§3.16: un stream declara `T` y devuelve `T[]`).
+- **Como cuerpo COMPLETO de un `stream`** (`ast::recognize_ai_stream`, sintáctico, mismo espíritu que `subscribe()`), `linkc serve` no espera la lista: bindea los parámetros del stream como cualquier rpc, evalúa los tres argumentos, comprueba el alias y carga el modelo si es su primer uso (un alias desconocido o un GGUF que no carga es una respuesta de error normal, `400`, ANTES de los headers), y recién entonces abre el SSE: cada token cruza por un canal al mismo hilo escritor que usa `subscribe()` (`write_live_stream`, con la foto inicial vacía) y sale como `data: {"token":"...","done":false}`; al final `{"token":"","done":true}`. Un error DESPUÉS del primer token (timeout de `--ai-timeout`) llega como último evento con `error` y `done: true`, porque los headers ya salieron. Si el cliente se desconecta, el `send` falla y la generación para ahí mismo: no se gasta CPU en tokens que nadie va a leer.
+- **En cualquier otra posición** (`rpc all() -> AiToken[] { ai.stream(...) }`, dentro de un `let`, en un `stream` con más sentencias) es una llamada normal que devuelve la lista entera al terminar -- mismo motor, mismos errores, sin streaming.
+- El motor corre en el hilo de la request (como cualquier rpc); el `--ai-timeout`, el candado "una generación a la vez" y `maxTokens` explícito son los de §3.235.
+
+**Verificado**: checker (`stream reply(q) -> AiToken { ai.stream(...) }` tipa, `-> String` no, aridad), `ai_stream_member` reconoce el stream y no un rpc, y `tests/cli_ai_generate.rs` contra `qwen2.5:0.5b` REAL a través del binario: un `POST /Ai/reply` devuelve `>= 3` eventos `data:` (tokens con `done: false`, el último `done: true` sin `error`), el texto concatenado no está vacío, y `ai.stream("nadie", ...)` responde `400` con `'nadie'` y `[m]` sin abrir el SSE. Como los de Postgres, se salta sin `LINK_TEST_AI_MODEL`.
+
+**Límite honesto**: un token se decodifica solo (`decode(&[id])`), así que un carácter multibyte partido en dos tokens puede salir como `�` en un evento y correcto en el texto concatenado -- el motor de origen tiene el mismo comportamiento (`routes.rs`, `response` por token); un buffer UTF-8 por stream es una mejora pequeña pendiente. No hay `system` implícito ni historial: cada llamada lleva sus `messages` completos. El cliente generado (`hooks.ts`) consume el stream como cualquier `stream` de §3.16: la UI de Skynet tiene que concatenar `token` hasta `done`.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

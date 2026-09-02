@@ -223,6 +223,7 @@ pub fn emit_zod_schemas(program: &Program) -> Result<String, String> {
     emit_enum_zod(&mut out, &crate::checker::excel_cell_enum_decl(), &checker)?;
     emit_struct_zod(&mut out, &crate::checker::excel_sheet_type_decl(), &checker)?;
     emit_struct_zod(&mut out, &crate::checker::ai_message_type_decl(), &checker)?;
+    emit_struct_zod(&mut out, &crate::checker::ai_token_type_decl(), &checker)?;
 
     for item in &program.items {
         match item {

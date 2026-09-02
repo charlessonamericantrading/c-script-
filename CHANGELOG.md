@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.194.0] - 2026-09-03
+
+### ✨ Añadido
+**`ai.stream(model, messages, maxTokens) -> AiToken[]` y, como cuerpo completo de un `stream -> AiToken`, un evento SSE por token a medida que sale del motor (PLAN.md §9.20 Eje G ítem 4)**: `AiToken = { token, done }` pre-sembrado; el servidor bindea los parámetros, evalúa los argumentos, comprueba el alias y carga el modelo ANTES de los headers (alias desconocido = `400` normal), y luego escribe cada token por el mismo escritor SSE de `subscribe()`; un error posterior llega como último evento con `error` y `done: true`; si el cliente se va, la generación para. En cualquier otra posición devuelve la lista entera. Verificado contra `qwen2.5:0.5b` real. Ver GRAMMAR.md §3.236.
+
 ## [1.193.0] - 2026-09-03
 
 ### ✨ Añadido

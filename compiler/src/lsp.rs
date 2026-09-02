@@ -1548,6 +1548,7 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             method("generate(model, prompt, maxTokens)", "Run the local model on a raw prompt (no chat template) and return the generated text"),
             method("chat(model, messages, maxTokens)", "Run the local model on AiMessage[] through its chat template and return the reply"),
             method("models()", "The aliases declared in ai { }"),
+            method("stream(model, messages, maxTokens)", "As the whole body of a stream -> AiToken, emits one SSE event per token as the model produces it"),
         ]),
         Type::Excel => Some(vec![
             method("build(sheets)", "Build an .xlsx workbook from a list of ExcelSheet, returned as a base64-encoded String"),

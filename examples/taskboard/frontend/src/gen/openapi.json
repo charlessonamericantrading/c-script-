@@ -16,6 +16,21 @@
         ],
         "type": "object"
       },
+      "AiToken": {
+        "properties": {
+          "done": {
+            "type": "boolean"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "done"
+        ],
+        "type": "object"
+      },
       "BoardStats": {
         "properties": {
           "doneCount": {
@@ -661,5 +676,5 @@
       }
     }
   },
-  "x-generated-by": "linkc v1.193.0"
+  "x-generated-by": "linkc v1.194.0"
 }

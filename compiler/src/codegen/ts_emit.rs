@@ -42,6 +42,7 @@ pub fn emit_contract(program: &Program) -> Result<String, String> {
     emit_enum_decl(&mut out, &crate::checker::excel_cell_enum_decl(), &checker)?;
     emit_type_decl(&mut out, &crate::checker::excel_sheet_type_decl(), &checker)?;
     emit_type_decl(&mut out, &crate::checker::ai_message_type_decl(), &checker)?;
+    emit_type_decl(&mut out, &crate::checker::ai_token_type_decl(), &checker)?;
 
     for item in &program.items {
         match item {

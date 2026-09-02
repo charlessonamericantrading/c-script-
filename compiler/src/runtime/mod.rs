@@ -1452,6 +1452,105 @@ fn strip_hidden_struct(
     serde_json::Value::Object(map)
 }
 
+/// GRAMMAR.md §3.236: un `AiToken { token, done }` como `Value`.
+pub(crate) fn ai_token_value(token: &str, done: bool) -> Value {
+    Value::Struct(vec![("token".to_string(), Value::Str(token.to_string())), ("done".to_string(), Value::Bool(done))])
+}
+
+/// GRAMMAR.md §3.236: lo que un `stream` cuyo cuerpo es exactamente
+/// `ai.stream(model, messages, maxTokens)` le pide al motor, con los
+/// argumentos ya EVALUADOS contra los parámetros de la request.
+#[cfg(feature = "inference")]
+pub struct AiStreamSpec {
+    pub alias: String,
+    pub request: crate::inference::AiRequest,
+    pub max_tokens: i64,
+}
+
+/// GRAMMAR.md §3.236: ¿el cuerpo de este `stream` es `ai.stream(...)`?
+pub fn ai_stream_member(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) if s.name == service_name => s.members.iter().any(|m| match m {
+            Member::Stream(r) if r.name == rpc_name => crate::ast::recognize_ai_stream(&r.body).is_some(),
+            _ => false,
+        }),
+        _ => false,
+    })
+}
+
+/// GRAMMAR.md §3.236: bindea los parámetros del `stream` como
+/// `invoke_rpc_with_sessions` y evalúa los tres argumentos de
+/// `ai.stream(...)` -- sin generar nada: el servidor es el que corre el
+/// motor, escribiendo cada token por SSE.
+#[cfg(feature = "inference")]
+pub fn eval_ai_stream_request(
+    program: &Program,
+    service_name: &str,
+    rpc_name: &str,
+    args_json: &serde_json::Value,
+    db: &Db,
+    sessions: &SessionStore,
+    current_token: Option<&str>,
+) -> Result<AiStreamSpec, RuntimeError> {
+    let rpc = program
+        .items
+        .iter()
+        .find_map(|i| match i {
+            Item::Service(s) if s.name == service_name => s.members.iter().find_map(|m| match m {
+                Member::Stream(r) if r.name == rpc_name => Some(r),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .ok_or_else(|| err(format!("stream desconocido: '{service_name}.{rpc_name}'")))?;
+    let arg_exprs = crate::ast::recognize_ai_stream(&rpc.body).ok_or_else(|| err("el cuerpo del stream no es ai.stream(...)"))?;
+    let fns: Fns = program
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Fn(f) => Some((f.name.clone(), f)),
+            _ => None,
+        })
+        .collect();
+    let (checker, symbol_errors) = crate::checker::Checker::build_symbols(program);
+    if let Some(e) = symbol_errors.into_iter().next() {
+        return Err(err(format!("programa inválido: {e}")));
+    }
+    let empty = serde_json::Map::new();
+    let args_obj = args_json.as_object().unwrap_or(&empty);
+    let step_budget = Cell::new(0u64);
+    let mut env = Env::new();
+    for p in &rpc.params {
+        let declared = checker
+            .resolve_type(&p.ty)
+            .map_err(|e| err(format!("no se pudo resolver el tipo del parámetro '{}': {e}", p.name)))?;
+        let v = match args_obj.get(&p.name) {
+            Some(j) => json_to_typed_value(j, &declared, &checker, &p.name)?,
+            None => match &p.default {
+                Some(default_expr) => eval_expr(default_expr, &Env::new(), db, &fns, &checker, sessions, current_token, &step_budget)?,
+                None if matches!(declared, crate::types::Type::Optional(_)) => Value::Null,
+                None => return Err(bad_req(format!("falta el parámetro requerido '{}' (se esperaba {})", p.name, describe_type(&declared)))),
+            },
+        };
+        env.insert(p.name.clone(), cell(v));
+    }
+    let mut values = Vec::with_capacity(3);
+    for e in arg_exprs {
+        values.push(eval_expr(e, &env, db, &fns, &checker, sessions, current_token, &step_budget)?);
+    }
+    let mut it = values.into_iter();
+    let alias = match it.next() {
+        Some(Value::Str(s)) => s,
+        _ => return Err(err("ai.stream: el modelo tiene que ser un String")),
+    };
+    let Some(Value::List(items)) = it.next() else {
+        return Err(err("ai.stream: messages tiene que ser AiMessage[]"));
+    };
+    let max_tokens = as_int(&it.next().ok_or_else(|| err("ai.stream requiere 3 argumentos"))?)?;
+    let request = crate::inference::AiRequest::Chat(items.iter().map(ai_message_from_value).collect::<Result<Vec<_>, _>>()?);
+    Ok(AiStreamSpec { alias, request, max_tokens })
+}
+
 /// GRAMMAR.md §3.235: un `AiMessage` (o cualquier struct con `role` y
 /// `content`, subtipado estructural) -> el `ChatMessage` del motor.
 #[cfg(feature = "inference")]
@@ -3711,6 +3810,41 @@ fn call_method(
                 {
                     let _ = args;
                     Err(err(format!("ai.{method}: este binario se compiló sin el feature 'inference' (GRAMMAR.md §3.233)")))
+                }
+            }
+            // GRAMMAR.md §3.236: fuera de un `stream` reconocido, `ai.stream`
+            // devuelve la lista entera de tokens (mismo motor, mismos
+            // errores) -- el servidor es el que lo vuelve incremental.
+            "stream" => {
+                #[cfg(feature = "inference")]
+                {
+                    let mut it = args.into_iter();
+                    let model = match it.next() {
+                        Some(Value::Str(s)) => s,
+                        _ => return Err(err("ai.stream requiere un alias de modelo (String) como primer argumento")),
+                    };
+                    let Some(Value::List(items)) = it.next() else {
+                        return Err(err("ai.stream: messages tiene que ser AiMessage[]"));
+                    };
+                    let max_tokens = as_int(&it.next().ok_or_else(|| err("ai.stream requiere 3 argumentos (model, messages, maxTokens)"))?)?;
+                    let request = crate::inference::AiRequest::Chat(items.iter().map(ai_message_from_value).collect::<Result<Vec<_>, _>>()?);
+                    let engine = db.ai_engine().ok_or_else(|| {
+                        err("ai.stream: este proceso no tiene el motor resuelto -- hace falta un bloque 'ai { }' y un 'linkc serve' (linkc test y el harness no cargan modelos, GRAMMAR.md §3.235)")
+                    })?;
+                    let _one_at_a_time = db.ai_lock();
+                    let mut tokens = Vec::new();
+                    crate::inference::generate_with(&engine, &model, request, max_tokens, db.ai_timeout(), &mut |tok| {
+                        tokens.push(ai_token_value(tok, false));
+                        Ok(())
+                    })
+                    .map_err(err)?;
+                    tokens.push(ai_token_value("", true));
+                    Ok(Value::List(tokens))
+                }
+                #[cfg(not(feature = "inference"))]
+                {
+                    let _ = args;
+                    Err(err("ai.stream: este binario se compiló sin el feature 'inference' (GRAMMAR.md §3.233)"))
                 }
             }
             other => Err(err(format!("método desconocido sobre ai: '{other}'"))),

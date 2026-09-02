@@ -37,7 +37,7 @@ use super::db::{encrypted_fields_by_collection, now_ms, Db};
 use super::encryption;
 use super::session::SessionStore;
 use super::{
-    invoke_rpc_with_sessions, is_cron_member, is_stream_member, live_subscribe_collection, required_auth, required_cache,
+    ai_stream_member, invoke_rpc_with_sessions, is_cron_member, is_stream_member, live_subscribe_collection, required_auth, required_cache,
     required_cors, required_idempotent, required_rate_limit,
 };
 use crate::ast::{Annotation, Item, Member};
@@ -1217,6 +1217,59 @@ fn handle_request(
                     log_done_with_audit(log, req_id, Some(&method), status, start, &format!("error={msg:?}"), auth_audit.as_ref());
                 }
             }
+            return;
+        }
+
+        // GRAMMAR.md §3.236: un `stream` cuyo cuerpo es exactamente
+        // `ai.stream(model, messages, maxTokens)` se emite token a token:
+        // los argumentos se evalúan ACÁ (mismo bindeo de parámetros que
+        // `invoke_rpc_with_sessions`), el motor corre en ESTE hilo (como
+        // cualquier rpc) y cada token cruza por un canal al hilo escritor
+        // de `write_live_stream` -- el mismo escritor SSE que `subscribe()`,
+        // con la foto inicial vacía. Un error ANTES del primer token es una
+        // respuesta de error normal; DESPUÉS, un último evento con `error`
+        // y `done: true` (los headers ya salieron). Si el cliente se va, el
+        // `send` falla y la generación para ahí mismo.
+        #[cfg(feature = "inference")]
+        if ai_stream_member(program, service_name, rpc_name) {
+            let spec = match super::eval_ai_stream_request(program, service_name, rpc_name, &args_json, db, sessions, token.as_deref()) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    let status = status_for(&e);
+                    let msg = e.to_string();
+                    let resp = cors_response(status, error_json(&msg), &cors_headers, &request);
+                    let _ = request.respond(resp);
+                    log_done_with_audit(log, req_id, Some(&method), status, start, &format!("error={msg:?}"), auth_audit.as_ref());
+                    return;
+                }
+            };
+            let Some(engine) = db.ai_engine() else {
+                let msg = "ai.stream: este proceso no tiene el motor resuelto (GRAMMAR.md §3.235)".to_string();
+                let resp = cors_response(500, error_json(&msg), &cors_headers, &request);
+                let _ = request.respond(resp);
+                log_done_with_audit(log, req_id, Some(&method), 500, start, &format!("error={msg:?}"), auth_audit.as_ref());
+                return;
+            };
+            // Alias desconocido o GGUF que no carga: error normal, antes de
+            // los headers 200 (cargar el modelo en su primer uso también
+            // pasa acá, en este hilo).
+            if let Err(e) = crate::inference::ensure_loaded(&engine, &spec.alias) {
+                let resp = cors_response(400, error_json(&e), &cors_headers, &request);
+                let _ = request.respond(resp);
+                log_done_with_audit(log, req_id, Some(&method), 400, start, &format!("error={e:?}"), auth_audit.as_ref());
+                return;
+            }
+            let (tx, rx) = std::sync::mpsc::sync_channel::<serde_json::Value>(256);
+            let cors_for_writer = cors_headers.clone();
+            std::thread::spawn(move || write_live_stream(request, Vec::new(), rx, cors_for_writer, req_id, method, start, log));
+            let _one_at_a_time = db.ai_lock();
+            let outcome = crate::inference::generate_with(&engine, &spec.alias, spec.request, spec.max_tokens, db.ai_timeout(), &mut |tok| {
+                tx.send(serde_json::json!({ "token": tok, "done": false })).map_err(|_| "cliente desconectado".to_string())
+            });
+            let _ = match outcome {
+                Ok(_) => tx.send(serde_json::json!({ "token": "", "done": true })),
+                Err(e) => tx.send(serde_json::json!({ "token": "", "done": true, "error": e })),
+            };
             return;
         }
 

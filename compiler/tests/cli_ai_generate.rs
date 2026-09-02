@@ -155,3 +155,63 @@ service Ai {{
     let (status, _) = server.request("POST", "/Ai/models", "{}").expect("models otra vez");
     assert_eq!(status, 200);
 }
+
+/// Lee la respuesta SSE entera (Connection: close) y devuelve los JSON de
+/// cada línea `data: ...`, ignorando el framing chunked (las líneas de
+/// tamaño en hex nunca empiezan por `data:`).
+fn read_sse(port: u16, path: &str, body: &str) -> Vec<serde_json::Value> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("conectar");
+    stream.set_read_timeout(Some(Duration::from_secs(180))).unwrap();
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    text.lines().filter_map(|l| l.strip_prefix("data: ")).map(|j| serde_json::from_str(j).expect("JSON por evento")).collect()
+}
+
+#[test]
+fn a_stream_whose_body_is_ai_stream_emits_one_sse_event_per_token_from_a_real_model() {
+    let Ok(spec) = std::env::var("LINK_TEST_AI_MODEL") else {
+        eprintln!("saltado: LINK_TEST_AI_MODEL no está definida (ej. qwen2.5:0.5b)");
+        return;
+    };
+    let program = format!(
+        r#"
+ai {{ m: "{spec}" }}
+service Ai {{
+  stream reply(q: String) -> AiToken {{ ai.stream("m", [AiMessage {{ role: "user", content: q }}], 16) }}
+  stream broken(q: String) -> AiToken {{ ai.stream("nadie", [AiMessage {{ role: "user", content: q }}], 4) }}
+}}
+"#
+    );
+    let temp = TempDir::new("stream");
+    let src = temp.write("app.link", &program);
+    let server = Serve::start(&src);
+
+    let events = read_sse(server.port, "/Ai/reply", r#"{"q":"Count from one to five."}"#);
+    assert!(events.len() >= 3, "al menos dos tokens y el cierre: {events:?}");
+    let last = events.last().unwrap();
+    assert_eq!(last["done"], true, "{events:?}");
+    assert!(last.get("error").is_none(), "{events:?}");
+    assert!(events[..events.len() - 1].iter().all(|e| e["done"] == false && e["token"].is_string()), "{events:?}");
+    let text: String = events.iter().filter_map(|e| e["token"].as_str()).collect();
+    assert!(!text.trim().is_empty(), "{events:?}");
+
+    // Un alias desconocido: el error llega ANTES del primer token, como
+    // respuesta de error normal (no un 200 con evento de error).
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    let body = r#"{"q":"x"}"#;
+    stream
+        .write_all(format!("POST /Ai/broken HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+        .unwrap();
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+    assert!(text.contains("\"error\"") && text.contains("'nadie'") && text.contains("[m]"), "{text}");
+}

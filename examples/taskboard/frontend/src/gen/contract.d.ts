@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.193.0 — no editar a mano.
+// Generado automáticamente por linkc v1.194.0 — no editar a mano.
 
 export type Result<T, E> = { type: "Ok"; value: T } | { type: "Err"; error: E };
 export type Patch<T> = Partial<T>;
@@ -25,6 +25,11 @@ export interface ExcelSheet {
 export interface AiMessage {
   role: string;
   content: string;
+}
+
+export interface AiToken {
+  token: string;
+  done: boolean;
 }
 
 export type Role = "Admin" | "Member" | "Guest";

@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.193.0 — no editar a mano.
+// Generado automáticamente por linkc v1.194.0 — no editar a mano.
 
 import { z } from "zod";
 
@@ -29,6 +29,12 @@ export const AiMessageSchema = z.object({
   content: z.string(),
 });
 export type AiMessage = z.infer<typeof AiMessageSchema>;
+
+export const AiTokenSchema = z.object({
+  token: z.string(),
+  done: z.boolean(),
+});
+export type AiToken = z.infer<typeof AiTokenSchema>;
 
 export const RoleSchema = z.enum(["Admin", "Member", "Guest"]);
 export type Role = z.infer<typeof RoleSchema>;
