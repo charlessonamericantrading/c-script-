@@ -1,0 +1,14 @@
+# Workspace del motor de inferencia VENDORIZADO desde
+# github.com/charlessonamericantrading/skynet (`inference-engine/crates/`),
+# GRAMMAR.md §3.233 / PLAN.md §9.20 Eje G. No se edita a mano: se resincroniza
+# con `scripts/sync-inference-engine.sh` (ver VENDORED.md para el commit de
+# origen). Es un workspace propio para que las claves `edition.workspace`/
+# `license.workspace` de cada crate resuelvan; `compiler/Cargo.toml` los
+# consume como dependencias por path, no como miembros.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"

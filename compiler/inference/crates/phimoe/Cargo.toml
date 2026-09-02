@@ -1,0 +1,15 @@
+[package]
+name = "phimoe"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "phimoe-generate"
+path = "src/bin/generate.rs"
+
+[dependencies]
+gguf = { path = "../gguf" }
+tensor-core = { path = "../tensor-core" }
+model-core = { path = "../model-core" }
+phi3 = { path = "../phi3" }

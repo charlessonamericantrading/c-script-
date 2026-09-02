@@ -31,6 +31,7 @@ is `linkc`. They are one project.
 | `compiler/src/runtime/` | Interpreter (`mod.rs`), HTTP server, database layer (`db.rs` + `store.rs`, SQLite and PostgreSQL), sessions |
 | `compiler/src/lsp.rs` | Language server (`linkc lsp`) |
 | `compiler/tests/` | Integration tests that spawn the real binary as a subprocess |
+| `compiler/inference/` | Skynet's inference engine, VENDORED (GRAMMAR.md §3.233) -- never edit here; resync with `scripts/sync-inference-engine.sh` |
 | `examples/users.link` | The reference program. CI compiles it, snapshots its contract, serves it and drives it from a real client |
 | `GRAMMAR.md` | The specification, and the honest limits of every feature. Has a table of contents |
 | `llms.txt` | Condensed language reference plus the mistakes LLMs make. Read it before writing `.link` code |

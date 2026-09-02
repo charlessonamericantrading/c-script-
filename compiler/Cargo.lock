@@ -671,6 +671,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gemma4"
+version = "0.1.0"
+dependencies = [
+ "gguf",
+ "model-core",
+ "tensor-core",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -702,6 +711,10 @@ dependencies = [
  "r-efi",
  "rand_core 0.10.1",
 ]
+
+[[package]]
+name = "gguf"
+version = "0.1.0"
 
 [[package]]
 name = "ghash"
@@ -1028,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "linkc"
-version = "1.190.0"
+version = "1.191.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -1040,6 +1053,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hmac 0.12.1",
  "lettre",
+ "model-core",
  "parking_lot",
  "pdf-writer",
  "postgres",
@@ -1049,6 +1063,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "server",
  "sha2 0.10.9",
  "subtle",
  "tiny_http",
@@ -1062,6 +1077,15 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
+
+[[package]]
+name = "llama"
+version = "0.1.0"
+dependencies = [
+ "gguf",
+ "model-core",
+ "tensor-core",
+]
 
 [[package]]
 name = "lock_api"
@@ -1119,6 +1143,13 @@ dependencies = [
  "libc",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "model-core"
+version = "0.1.0"
+dependencies = [
+ "tensor-core",
 ]
 
 [[package]]
@@ -1247,6 +1278,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "phi3"
+version = "0.1.0"
+dependencies = [
+ "gguf",
+ "model-core",
+ "tensor-core",
+]
+
+[[package]]
+name = "phimoe"
+version = "0.1.0"
+dependencies = [
+ "gguf",
+ "model-core",
+ "phi3",
+ "tensor-core",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1357,6 +1407,25 @@ name = "quoted_printable"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "478e0585659a122aa407eb7e3c0e1fa51b1d8a870038bd29f0cf4a8551eea972"
+
+[[package]]
+name = "qwen2"
+version = "0.1.0"
+dependencies = [
+ "gguf",
+ "model-core",
+ "tensor-core",
+]
+
+[[package]]
+name = "qwen3"
+version = "0.1.0"
+dependencies = [
+ "gguf",
+ "model-core",
+ "qwen2",
+ "tensor-core",
+]
 
 [[package]]
 name = "r-efi"
@@ -1582,6 +1651,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "server"
+version = "0.1.0"
+dependencies = [
+ "gemma4",
+ "gguf",
+ "llama",
+ "model-core",
+ "phi3",
+ "phimoe",
+ "qwen2",
+ "qwen3",
+ "tensor-core",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1719,6 +1803,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tensor-core"
+version = "0.1.0"
+dependencies = [
+ "gguf",
 ]
 
 [[package]]

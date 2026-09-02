@@ -167,6 +167,9 @@ fn main() -> ExitCode {
         // entre sí.
         Some("--version") | Some("-v") | Some("version") => {
             println!("linkc {}", linkc::VERSION);
+            // GRAMMAR.md §3.233: segunda línea, para que un script que lee
+            // la primera (`linkc <versión>`) no cambie.
+            println!("{}", inference_status_line());
             ExitCode::SUCCESS
         }
         Some(path) => cmd_check(path), // `linkc <archivo.link>` -- solo lex+parse+check
@@ -174,6 +177,18 @@ fn main() -> ExitCode {
             print_usage(true);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// GRAMMAR.md §3.233: segunda línea de `linkc --version`.
+fn inference_status_line() -> String {
+    #[cfg(feature = "inference")]
+    {
+        linkc::inference::describe()
+    }
+    #[cfg(not(feature = "inference"))]
+    {
+        "inference: off".to_string()
     }
 }
 
@@ -600,6 +615,24 @@ fn cmd_doctor(args: &[String]) -> ExitCode {
     let mut err_count = 0usize;
 
     println!("[OK]    versión de linkc: {}", linkc::VERSION);
+    // GRAMMAR.md §3.233: el motor embebido y con qué kernels va a correr
+    // ACÁ -- un servidor sin AVX2/FMA usa el camino escalar (decenas de
+    // veces más lento), mejor saberlo antes del primer `ai.*`.
+    #[cfg(feature = "inference")]
+    {
+        if linkc::inference::cpu_has_avx2_fma() {
+            println!("[OK]    motor de inferencia: embebido, kernels avx2+fma");
+            ok_count += 1;
+        } else {
+            println!("[WARN]  motor de inferencia: embebido, pero esta CPU no tiene AVX2+FMA -- la inferencia local correrá por el camino escalar (inservible para un modelo real)");
+            ok_count += 1;
+        }
+    }
+    #[cfg(not(feature = "inference"))]
+    {
+        println!("[WARN]  motor de inferencia: este binario se compiló sin el feature 'inference' -- ningún builtin ai.* va a funcionar");
+        ok_count += 1;
+    }
     ok_count += 1;
 
     let program = match load_and_check(path) {

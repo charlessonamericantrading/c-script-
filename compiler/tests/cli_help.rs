@@ -73,7 +73,11 @@ fn version_flag_prints_the_exact_crate_version_and_succeeds() {
         let out = linkc().arg(flag).output().expect("no se pudo ejecutar linkc");
         assert!(out.status.success(), "'{flag}' debería salir con código 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(stdout.trim(), format!("linkc {}", env!("CARGO_PKG_VERSION")), "'{flag}': {stdout}");
+        // GRAMMAR.md §3.233: la PRIMERA línea es exactamente `linkc <versión>`
+        // (lo que cualquier script parsea); la segunda reporta el motor.
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next().unwrap_or("").trim(), format!("linkc {}", env!("CARGO_PKG_VERSION")), "'{flag}': {stdout}");
+        assert!(lines.next().unwrap_or("").starts_with("inference: "), "'{flag}': {stdout}");
         assert!(String::from_utf8_lossy(&out.stderr).is_empty(), "'{flag}' escribió en stderr");
     }
 }

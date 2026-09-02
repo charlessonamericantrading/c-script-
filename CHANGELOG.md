@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.191.0] - 2026-09-03
+
+### ✨ Añadido
+**El motor de inferencia de Skynet embebido en `linkc` (feature `inference`, PLAN.md §9.20 Eje G ítem 1)**: los diez crates del motor propio de Skynet (Rust puro, cero dependencias: GGUF, kernels AVX2/FMA con camino escalar, KV-cache, Llama/Gemma 4/Qwen2.5/Qwen3/Phi-3/PhiMoE) vendorizados en `compiler/inference/crates/` (commit de origen en `VENDORED.md`, `scripts/sync-inference-engine.sh` para resincronizar, regla de no editar ahí) y compilados dentro del binario por defecto. `linkc --version` imprime una segunda línea `inference: on (avx2+fma|scalar)`; `linkc doctor` avisa si la CPU no tiene AVX2+FMA o si el binario se compiló sin el feature. Solo plomería: ningún builtin `ai.*` todavía. Ver GRAMMAR.md §3.233.
+
 ## [1.190.0] - 2026-09-02
 
 ### ✨ Añadido

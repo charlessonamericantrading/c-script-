@@ -1,0 +1,22 @@
+[package]
+name = "qwen2"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "qwen2-generate"
+path = "src/bin/generate.rs"
+
+[[bin]]
+name = "qwen2-bench-batch"
+path = "src/bin/bench_batch.rs"
+
+[[bin]]
+name = "qwen2-bench-prefill"
+path = "src/bin/bench_prefill.rs"
+
+[dependencies]
+gguf = { path = "../gguf" }
+tensor-core = { path = "../tensor-core" }
+model-core = { path = "../model-core" }

@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.190.0"
+version = "1.191.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -17,7 +17,7 @@ name = "wasm_demo"
 path = "src/bin/wasm_demo.rs"
 
 [features]
-default = ["runtime"]
+default = ["runtime", "inference"]
 # Todas las dependencias nativas del intérprete/servidor (sockets, SQLite en C,
 # TLS, RNG del sistema) viven detrás de este feature. Apagarlo (--no-default-features)
 # deja compilar lexer/parser/checker/codegen a wasm32-unknown-unknown.
@@ -42,6 +42,12 @@ runtime = [
     "dep:rust_xlsxwriter",
     "dep:calamine",
 ]
+# GRAMMAR.md §3.233 / PLAN.md §9.20 Eje G: el motor de inferencia de Skynet
+# (Rust puro, cero dependencias externas, vendorizado en `inference/crates/`,
+# ver `inference/VENDORED.md`) embebido en el binario. Implica `runtime`
+# porque los builtins `ai.*` viven en el intérprete. Apagable con
+# `--no-default-features --features runtime` para un binario sin motor.
+inference = ["runtime", "dep:inference-server", "dep:model-core"]
 
 [dependencies]
 tiny_http = { version = "0.12", optional = true }
@@ -140,6 +146,12 @@ pdf-writer = { version = "0.15", optional = true }
 # contra el mismo criterio de licencia/mantenimiento/tamaño de árbol que
 # las excepciones anteriores.
 rust_xlsxwriter = { version = "0.99", optional = true }
+# GRAMMAR.md §3.233: el motor de inferencia vendorizado (feature `inference`).
+# `server` es el crate que junta cargador GGUF, cache de modelos residentes y
+# resolución de alias de Ollama; `model-core` trae los traits
+# `LanguageModel`/`ModelTokenizer` que el runtime necesita nombrar.
+inference-server = { package = "server", path = "inference/crates/server", version = "0.1.0", optional = true }
+model-core = { path = "inference/crates/model-core", version = "0.1.0", optional = true }
 calamine = { version = "0.36", optional = true }
 
 # Benchmarks de humo (PLAN.md §9.18 Eje B ítem 1, GRAMMAR.md §3.217).

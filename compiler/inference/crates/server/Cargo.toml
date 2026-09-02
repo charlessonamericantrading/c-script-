@@ -1,0 +1,20 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "inference-server"
+path = "src/bin/server.rs"
+
+[dependencies]
+gguf = { path = "../gguf" }
+tensor-core = { path = "../tensor-core" }
+model-core = { path = "../model-core" }
+qwen2 = { path = "../qwen2" }
+llama = { path = "../llama" }
+gemma4 = { path = "../gemma4" }
+phi3 = { path = "../phi3" }
+qwen3 = { path = "../qwen3" }
+phimoe = { path = "../phimoe" }

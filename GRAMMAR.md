@@ -254,6 +254,7 @@
   - [3.230 `db.<c>.orderBy(...)`/`orderByDesc(...)` encadenados con `.all()`/`.page()`/`.findWhere()` (ORDER BY en SQL) + `List<T>.sortBy`/`sortByDesc` en memoria — RESUELTO](#3230-dbcorderbyorderbydesc-encadenados-con-allpagefindwhere-order-by-en-sql--listtsortbysortbydesc-en-memoria--resuelto)
   - [3.231 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` con clave de agrupación nullable (`T?`): el grupo `null` es un grupo más — RESUELTO](#3231-sumbycountbyavgbymaxbyminby-con-clave-de-agrupación-nullable-t-el-grupo-null-es-un-grupo-más--resuelto)
   - [3.232 `@hidden` sobre un campo: existe en la colección y dentro del rpc, pero nunca sale del proceso — RESUELTO](#3232-hidden-sobre-un-campo-existe-en-la-colección-y-dentro-del-rpc-pero-nunca-sale-del-proceso--resuelto)
+  - [3.233 El motor de inferencia de Skynet embebido en `linkc` (feature `inference`) — RESUELTO](#3233-el-motor-de-inferencia-de-skynet-embebido-en-linkc-feature-inference--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8086,6 +8087,24 @@ service Accounts {
 **Verificado**: checker (índice de campos ocultos por type; `@hidden id`, `@hidden` repetido y un `Wrapper { users: User[] }` como parámetro rechazados con el mensaje exacto), runtime contra SQLite real (el JSON de `create`/`all` sale sin el campo, un `Report { owner: User }` anidado también, `countWithHash` lo sigue leyendo adentro, y tanto la fila en vivo como el snapshot de `subscribe` salen sin él), y `tests/cli_hidden.rs` contra el binario: `linkc build` genera `contract.d.ts`/`schemas.ts`/`openapi.json` con `Account` sin `secretKey`/`authConfig` y `NewAccount` intacto, y `linkc test` compara la clave adentro del rpc.
 
 **Límite honesto**: el recorte sigue el tipo declarado -- un campo `@hidden` dentro de una variante de enum con datos, o dentro de un `Result<T, E>`/`Patch<T>`, no se recorre (el checker no lo prohíbe; documentado, no atacado). `@hidden` no es cifrado ni control de acceso: el valor sigue en la base en claro salvo que además lleve `@encrypted`, y cualquier rpc puede devolverlo a propósito copiándolo a otro campo visible.
+
+### 3.233 El motor de inferencia de Skynet embebido en `linkc` (feature `inference`) — RESUELTO, cierra PLAN.md §9.20 Eje G ítem 1
+
+Origen: `PLAN.md §9.20` Eje G ítem 1, el cimiento del "motor de IA dentro del lenguaje". Skynet tiene un motor de inferencia propio escrito en Rust (`inference-engine/`: 91 archivos, ~18.000 líneas, cero dependencias externas -- parser GGUF, kernels cuantizados AVX2/FMA con camino escalar, KV-cache, paged attention, prefix cache, forward de Llama / Gemma 4 / Qwen2.5 / Qwen3 / Phi-3 / PhiMoE, servidor HTTP compatible con la API de Ollama). Reescribir eso en `.link` no es posible ni deseable (un `.link` no puede leer un GGUF de 4 GB ni hacer SIMD, y no debe poder); pero está escrito en el mismo lenguaje que el compilador, así que entra como entraron `pdf.build` (§3.201), `excel.build` (§3.202) o bcrypt (§3.226): un builtin curado del que el runtime es el único dueño de ficheros e hilos.
+
+**Qué hay (v1.191.0)**: solo la plomería, a propósito -- compila, se enlaza, se reporta. Ningún builtin `ai.*` todavía (Eje G ítems 2-6, cada uno en su ronda).
+
+- **`compiler/inference/crates/`**: copia literal de los diez crates del motor (`gguf`, `tensor-core`, `model-core`, `llama`, `gemma4`, `qwen2`, `qwen3`, `phi3`, `phimoe`, `server`; `vulkan-backend` fuera, necesita `glslc` y la GPU se descartó en origen), con su propio `Cargo.toml` de workspace (las claves `edition.workspace` de cada crate necesitan uno). `inference/VENDORED.md` guarda el commit de origen; `scripts/sync-inference-engine.sh [ruta-skynet]` resincroniza. **Regla: no se edita nada ahí** -- un cambio que el motor necesite se hace en el repo de origen y se vuelve a sincronizar, para que el motor siga teniendo una sola fuente de verdad.
+- **Feature `inference`** (`compiler/Cargo.toml`), en `default` junto a `runtime`, que implica: el binario normal lleva el motor; `cargo build --no-default-features --features runtime` da uno sin él. Dependencias por path: `inference-server` (= el crate `server`, que junta cargador GGUF, cache de modelos residentes con presupuesto de memoria y resolución de alias de Ollama) y `model-core` (los traits `LanguageModel`/`ModelTokenizer`).
+- **`linkc::INFERENCE`** (`bool`) y **`src/inference.rs`**: re-exporta `load_model`, `resolve_blob_path`, `ServerState`/`ModelEntry`/`ModelLookupError`, `ChatMessage`/`LanguageModel`/`ModelTokenizer`, más `cpu_has_avx2_fma()` y `describe()`.
+- **`linkc --version`** imprime una SEGUNDA línea: `inference: on (avx2+fma)` / `inference: on (scalar)` / `inference: off`. La primera sigue siendo exactamente `linkc <versión>` (lo que cualquier script parsea).
+- **`linkc doctor`** añade `[OK]    motor de inferencia: embebido, kernels avx2+fma`, o un `[WARN]` si la CPU no tiene AVX2+FMA (el camino escalar existe pero es decenas de veces más lento: inservible para un modelo real) o si el binario se compiló sin el feature.
+
+**Medido**: el motor solo, en release con LTO, es un binario de 1,2 MB y compila en segundos; `linkc` completo con el motor compila desde cero en 57 s en el MSI (i7-1355U) y el `.exe` queda en 25 MB. El SIMD está acotado con `#[cfg(target_arch = "x86_64")]` en los dos únicos sitios que importan `std::arch` -- el build de `aarch64-apple-darwin` de CI usa el camino escalar, y por eso `doctor` avisa en vez de fallar.
+
+**Verificado**: test unitario de que la plomería entera enlaza sin ningún modelo en disco (un `ServerState` vacío, un alias de Ollama inexistente da un error limpio y no un panic, `describe()`), `tests/cli_help.rs` contra el binario (primera línea exacta, segunda `inference: ...`), clippy `-D warnings` (los crates vendorizados son dependencias: clippy no los lintea, y no deben tocarse).
+
+**Límite honesto**: nada de esto sirve inferencia todavía. Es el ítem 1 de 8 del Eje G; el siguiente (ítem 2, el bloque `ai { }` y `--models-dir`) es el que decide QUÉ modelos carga el runtime y cuándo. Sampling greedy y solo CPU son límites del motor de origen, no de esta integración.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

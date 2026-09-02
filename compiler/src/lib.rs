@@ -15,6 +15,13 @@
 /// dado, cuando conviven varias versiones en el tiempo (PLAN.md §9.7).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// GRAMMAR.md §3.233: ¿este binario lleva el motor de inferencia embebido?
+/// `true` en el binario por defecto; `false` si se compiló con
+/// `--no-default-features --features runtime`.
+pub const INFERENCE: bool = cfg!(feature = "inference");
+#[cfg(feature = "inference")]
+pub mod inference;
+
 pub mod ast;
 pub mod checker;
 pub mod codegen;

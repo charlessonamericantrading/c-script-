@@ -92,7 +92,7 @@ postWithStatus/postWithRetry` §3.47/§3.60/§3.160; `env.get` §3.38; `request.
 awsS3PresignedUploadUrl` §3.110/§3.194; OAuth2 client-credentials pattern with what exists
 §3.114; `json.parse/stringify`; `pdf.build` §3.201; `excel.build/parse` §3.202; every
 `rpc` exposed as an MCP tool (`--mcp-jwt-secret`, sessions, `tools/list`, `tools/call`,
-sampling via `mcp.sample`) §3.203.
+sampling via `mcp.sample`) §3.203. The Skynet inference engine (pure-Rust GGUF runtime: Llama/Gemma 4/Qwen2.5/Qwen3/Phi-3/PhiMoE, AVX2/FMA) is embedded in the `linkc` binary behind the default feature `inference` -- `linkc --version` second line and `linkc doctor` report it; no `ai.*` builtins yet §3.233.
 
 **SEO and discoverability** — `sitemapXml/robotsTxt` §3.116, `staticRoutes(baseUrl)` (every static public `@route`, feeds `sitemapXml` directly) and `hreflangLinks` §3.222, `metaTags/openGraphTags/
 canonicalLink/jsonLd` §3.117, per-project `llms.txt`/`llms-full.txt` emitted by `linkc build`
