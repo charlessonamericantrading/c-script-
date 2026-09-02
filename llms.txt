@@ -82,7 +82,7 @@ createSessionWithId/currentRole/currentUserId/claim/destroySession/destroyAllSes
 `--session-ttl` §3.14/§3.53/§3.51/§3.197/§3.84/§3.50; external HS256 JWT bridge
 `--jwt-secret` §3.64; `--service-api-key` (+ `--service-api-key-exempt`) §3.93; login lockout
 `auth.recordFailedLogin/failedLoginCount` §3.152; `crypto.hashPassword/verifyPassword`
-(Argon2id, configurable cost) §3.34/§3.58, `crypto.hmacSha256/randomInt/timingSafeEqual/uuid`
+(Argon2id, configurable cost; `verifyPassword` also accepts bcrypt `$2a$`/`$2b$`/`$2y$` hashes from another app, reported legacy by `isLegacyHash` for lazy re-hashing) §3.34/§3.58/§3.226, `crypto.hmacSha256/randomInt/timingSafeEqual/uuid`
 §3.38/§3.54; lints for `==` on a secret and hard-coded secrets §3.88/§3.98/§3.188.
 
 **Integrations** — `http.get/post/getWithHeaders/postWithHeaders/getWithStatus/

@@ -247,6 +247,7 @@
   - [3.223 `linkc_http_outbound_*`: latencia y tasa de error de las llamadas `http.*` salientes en `/metrics` — RESUELTO](#3223-linkc_http_outbound_-latencia-y-tasa-de-error-de-las-llamadas-http-salientes-en-metrics--resuelto)
   - [3.224 `linkc lint --diagnostics-json` — RESUELTO](#3224-linkc-lint---diagnostics-json--resuelto)
   - [3.225 `linkc triggers`: un `stream` reacciona a escrituras hechas por OTRO sistema — RESUELTO](#3225-linkc-triggers-un-stream-reacciona-a-escrituras-hechas-por-otro-sistema--resuelto)
+  - [3.226 `crypto.verifyPassword` acepta hashes bcrypt (`$2a$`/`$2b$`/`$2y$`) y `isLegacyHash` los reporta como legado — RESUELTO](#3226-cryptoverifypassword-acepta-hashes-bcrypt-2a2b2y-y-islegacyhash-los-reporta-como-legado--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7915,6 +7916,31 @@ psql "$DATABASE_URL" -1 -f triggers.sql          # aplicar (o con tu herramienta
 **Verificado**: 4 tests unitarios del generador (una función, un trigger por colección, schema calificado, programa sin colecciones), 3 del parser de notificaciones (payload externo → relectura, `row` de un delete conservada, payload de un linkc -- propio u otro -- descartado), `tests/cli_triggers.rs` (3 tests contra el binario: DDL completo sin tocar disco, `--db-schema`, programa roto sin DDL parcial), y `pg_integration.rs` contra Postgres REAL en CI: un `postgres::Client` directo (el papel de Drizzle) aplica el DDL DOS veces, hace INSERT → el `stream` recibe la fila releída; UPDATE → la recibe con el valor nuevo; DELETE → recibe el `row_to_json(OLD)`; y una escritura hecha por el propio linkc llega UNA sola vez (timeout corto probando la ausencia del segundo evento).
 
 **Fuera de alcance, a propósito**: aplicar el DDL desde `linkc serve`/`migrate` (una decisión de quien administra la base, y el CRM la ensaya en transacción antes); SQLite (sin NOTIFY, y un solo proceso ya ve todo); un evento `delete` con la forma canónica (necesitaría re-decodificar `row_to_json` vía el tipo de la colección -- posible, discovery propio si hace falta).
+### 3.226 `crypto.verifyPassword` acepta hashes bcrypt (`$2a$`/`$2b$`/`$2y$`) y `isLegacyHash` los reporta como legado — RESUELTO, cierra PLAN.md §9.19 ítem 2
+
+Origen: `PLAN.md §9.19` ítem 2, el único bloqueo real de `auth.link` en el CRM Nexus: la app hashea con bcryptjs (`$2b$10$...`) y conectar el login de c-script rompería el acceso de todos los usuarios ya registrados. El patrón de migración que §3.58 documenta (verificar el hash viejo, re-hashear a Argon2id en el próximo login correcto) existía solo para el formato `sha256$<sal>$<hex>` de la primera versión de este mismo proyecto -- ninguna app real llega con ese formato; llegan con bcrypt (bcryptjs, PHP `password_hash`, Spring Security, Devise, Django con el hasher bcrypt).
+
+**Qué hay (v1.185.0)**:
+- **`crypto.verifyPassword(pwd, hash)`** verifica un hash con prefijo `$2a$` (el original), `$2b$` (el actual: bcryptjs 3.x, OpenBSD) o `$2y$` (PHP/crypt_blowfish) -- los tres son el mismo algoritmo con otra etiqueta, y así conviven en cualquier base con más de una generación de usuarios. Costo (`$2b$10$`) el que traiga el hash. Un hash malformado, truncado o con un prefijo que no se reconoce da `false`, nunca un error de runtime. `$2x$` (la variante con el bug histórico de crypt_blowfish) queda afuera a propósito: ninguna app moderna lo emite, y aceptarlo sería verificar contra un algoritmo deliberadamente incorrecto.
+- **`crypto.isLegacyHash(hash)`** devuelve `true` para los tres prefijos, igual que para `sha256$`, así el programa aplica el re-hasheo perezoso sin distinguir generaciones:
+
+<!-- linkc:fragment -->
+```rust
+if (crypto.verifyPassword(pwd, user.passwordHash)) {
+  if (crypto.isLegacyHash(user.passwordHash)) {
+    db.users.applyPatch(user.id, UserPatch { passwordHash: crypto.hashPassword(pwd) });
+  }
+  auth.createSessionWithId(user.role, user.id)
+}
+```
+
+- **`crypto.hashPassword` NO cambia**: sigue emitiendo únicamente Argon2id (§3.34/§3.58). bcrypt entra solo para LEER, para migrar -- no hay forma de que un programa c-script produzca un hash bcrypt nuevo.
+
+**Dependencia**: crate `bcrypt` (0.19, Rust puro: Blowfish + su base64 propio, sin C), opcional detrás del feature `runtime` como `argon2`. Misma justificación que `argon2`/`aes-gcm`: un hash de contraseñas nunca se hand-rollea, y "cero dependencias nuevas" cede exactamente en los casos donde equivocarse en silencio es peor que una dependencia madura.
+
+**Verificado**: `tests/cli_bcrypt.rs` contra el binario real -- un hash generado con la crate real (costo 4) se inyecta en un `.link` que corre con `linkc test` (checker y runtime reales): los tres prefijos verifican la contraseña correcta y rechazan la incorrecta y la vacía; los tres se reportan legado y un Argon2id fresco no; `hashPassword` sigue emitiendo `$argon2id$` y ese re-hash verifica; un hash truncado y un `$2x$` dan `false` sin error. Los tests de Argon2id (`cli_argon2.rs`) siguen en verde.
+
+**Límite honesto**: interoperabilidad probada contra la crate `bcrypt` de Rust, no contra bcryptjs en el mismo test -- los dos implementan el mismo estándar (OpenBSD bcrypt, `$2b$`) y la crate se usa en producción con hashes de bcryptjs a diario, pero si el CRM ve un hash real que no verifica, ese hash es el primer dato a pedir. Sin soporte de `$2x$` ni de la versión pre-`$2a$` sin prefijo.
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

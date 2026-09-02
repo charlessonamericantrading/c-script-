@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.185.0] - 2026-09-02
+
+### ✨ Añadido
+**`crypto.verifyPassword` acepta hashes bcrypt (`$2a$`/`$2b$`/`$2y$`) y `crypto.isLegacyHash` los reporta como legado (PLAN.md §9.19 ítem 2, el bloqueo de `auth.link` en el CRM)**: una app que migra desde bcryptjs/PHP/Spring/Devise conecta su login sin romper el acceso de nadie y re-hashea a Argon2id en el próximo login correcto (§3.58). `hashPassword` sigue emitiendo solo Argon2id; bcrypt es de lectura. Crate `bcrypt` (Rust puro) opcional bajo `runtime`, misma justificación que `argon2`. Ver GRAMMAR.md §3.226.
+
 ## [1.184.0] - 2026-09-02
 
 ### ✨ Añadido

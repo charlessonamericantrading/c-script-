@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.184.0"
+version = "1.185.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -27,6 +27,7 @@ runtime = [
     "dep:ureq",
     "dep:base64",
     "dep:argon2",
+    "dep:bcrypt",
     "dep:getrandom",
     "dep:subtle",
     "dep:postgres",
@@ -62,6 +63,13 @@ sha2 = "0.10"
 ureq = { version = "2.9", default-features = false, optional = true }
 base64 = { version = "0.22", optional = true }
 argon2 = { version = "0.5", optional = true }
+# GRAMMAR.md §3.226: bcrypt SOLO para VERIFICAR (migrar) hashes que otra app
+# ya emitió (`$2a$`/`$2b$`/`$2y$` -- bcryptjs, PHP password_hash, Spring
+# Security, Devise). `hashPassword` sigue emitiendo únicamente Argon2id.
+# Misma justificación que `argon2`/`aes-gcm`: un hash de contraseñas nunca
+# se hand-rollea. RustCrypto-adyacente, Rust puro (blowfish + base64 propio),
+# sin dependencias C.
+bcrypt = { version = "0.19", optional = true }
 getrandom = { version = "0.2", optional = true }
 subtle = { version = "2", optional = true }
 postgres = { version = "0.19", features = ["with-serde_json-1"], optional = true }

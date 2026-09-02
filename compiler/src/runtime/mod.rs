@@ -2150,7 +2150,17 @@ fn aws_uri_encode(s: &str, encode_slash: bool) -> String {
 }
 
 /// HMAC-SHA256 devolviendo los 32 bytes CRUDOS del digest, no su hex --
-/// `crypto.hmacSha256` (GRAMMAR.md §3.38) siempre devuelve `String`
+/// GRAMMAR.md §3.226: los tres prefijos de bcrypt que existen en la
+/// práctica (`$2a$` original, `$2b$` el actual -- bcryptjs 3.x, OpenBSD --,
+/// `$2y$` el de PHP `password_hash`/crypt_blowfish). `$2x$` (la variante
+/// con el bug histórico de crypt_blowfish) queda afuera a propósito: no
+/// hay ninguna app moderna emitiéndolo, y aceptarlo sería verificar contra
+/// un algoritmo deliberadamente incorrecto.
+fn is_bcrypt_hash(hash: &str) -> bool {
+    hash.starts_with("$2a$") || hash.starts_with("$2b$") || hash.starts_with("$2y$")
+}
+
+/// `crypto.hmacSha256` (GRAMMAR.md §3.38) siempre devuelve `String`/// `crypto.hmacSha256` (GRAMMAR.md §3.38) siempre devuelve `String`
 /// (hex), lo que alcanza para verificar la firma de un webhook pero NO
 /// para encadenar HMACs usando el resultado de uno como clave del
 /// siguiente (AWS Signature V4 necesita exactamente eso -- ver
@@ -3312,6 +3322,17 @@ fn call_method(
                     )));
                 }
 
+                // GRAMMAR.md §3.226: un hash bcrypt (`$2a$`/`$2b$`/`$2y$`) de
+                // una app que migra desde bcryptjs/PHP/Spring/Devise -- se
+                // VERIFICA para que el login siga funcionando el día del
+                // corte, y `isLegacyHash` lo reporta como legado para que el
+                // programa lo re-hashee a Argon2id en el próximo login
+                // correcto (§3.58). La crate rechaza sola un hash malformado
+                // o con un prefijo que no reconoce → `false`, nunca un error.
+                if is_bcrypt_hash(stored) {
+                    return Ok(Value::Bool(bcrypt::verify(pwd.as_bytes(), stored).unwrap_or(false)));
+                }
+
                 use argon2::password_hash::{PasswordHash, PasswordVerifier};
                 use argon2::Argon2;
                 let Ok(parsed) = PasswordHash::new(stored) else {
@@ -3329,11 +3350,12 @@ fn call_method(
                     _ => return Err(err("crypto.isLegacyHash requiere un argumento String")),
                 };
                 // "Legado" es exactamente lo que `verifyPassword` sigue
-                // aceptando por compatibilidad (`sha256$<sal>$<hex>`, §3.34)
-                // -- cualquier otra cosa que no sea un hash Argon2id de
-                // verdad tampoco cuenta como "legado migrable": es un valor
-                // que ni siquiera `verifyPassword` va a reconocer.
-                Ok(Value::Bool(hash.starts_with("sha256$")))
+                // aceptando por compatibilidad (`sha256$<sal>$<hex>`, §3.34,
+                // y bcrypt `$2a$`/`$2b$`/`$2y$`, §3.226) -- cualquier otra
+                // cosa que no sea un hash Argon2id de verdad tampoco cuenta
+                // como "legado migrable": es un valor que ni siquiera
+                // `verifyPassword` va a reconocer.
+                Ok(Value::Bool(hash.starts_with("sha256$") || is_bcrypt_hash(hash)))
             }
             "uuid" => Ok(Value::Uuid(generate_uuid_v4()?)),
             "randomInt" => {
