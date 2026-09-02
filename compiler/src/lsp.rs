@@ -966,7 +966,7 @@ fn find_named_type_in_program(program: &Program, offset: usize) -> Option<(Strin
                 .or_else(|| find_named_type_at(&f.return_type, offset)),
             Item::Const(c) => find_named_type_at(&c.ty, offset),
             Item::Db(d) => d.collections.iter().find_map(|f| find_named_type_at(&f.ty, offset)),
-            Item::Import(_) | Item::Test(_) => None,
+            Item::Import(_) | Item::Test(_) | Item::Ai(_) => None,
         };
         if found.is_some() {
             return found;
@@ -1028,7 +1028,7 @@ fn is_field_or_param_name_at(program: &Program, offset: usize) -> bool {
         }
         Item::Const(c) => field_name_at_in_type(&c.ty, offset),
         Item::Db(d) => d.collections.iter().any(|f| in_span(f.name_span) || field_name_at_in_type(&f.ty, offset)),
-        Item::Import(_) | Item::Test(_) => false,
+        Item::Import(_) | Item::Test(_) | Item::Ai(_) => false,
     })
 }
 
@@ -1136,7 +1136,7 @@ fn get_definition_inner(
                 }
                 continue;
             }
-            Item::Import(_) | Item::Test(_) => continue,
+            Item::Import(_) | Item::Test(_) | Item::Ai(_) => continue,
         };
 
         if name == &word {

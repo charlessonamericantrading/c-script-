@@ -44,6 +44,29 @@ pub enum Item {
     Fn(FnDecl),
     Db(DbDecl),
     Test(TestDecl),
+    /// `ai { alias: "spec", ... }` (GRAMMAR.md §3.234).
+    Ai(AiDecl),
+}
+
+/// `ai { router: "qwen2.5:0.5b", coder: "./qwen2.5-coder-7b.gguf" }`
+/// (GRAMMAR.md §3.234, PLAN.md §9.20 Eje G ítem 2): los modelos de
+/// inferencia LOCAL que el programa usa, por alias. Como `db`, `ai` NO es
+/// palabra reservada -- se reconoce por texto en posición de ítem seguido
+/// de `{`. Una spec es un nombre de Ollama (`nombre:tag`, resuelto contra el
+/// almacén de Ollama en disco) o una ruta a un `.gguf` (relativa a
+/// `--models-dir`). El runtime resuelve cada alias ANTES de aceptar la
+/// primera request y se niega a arrancar si falta alguno.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiDecl {
+    pub models: Vec<AiModel>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiModel {
+    pub alias: String,
+    pub spec: String,
+    pub span: Span,
 }
 
 /// Bloque de test integrado `test "nombre" { ... }` (PLAN.md §5, Eje 2)

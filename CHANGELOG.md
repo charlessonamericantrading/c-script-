@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.192.0] - 2026-09-03
+
+### ✨ Añadido
+**Bloque `ai { alias: "spec", ... }` + `--models-dir`/`--ai-memory-budget-mb` (PLAN.md §9.20 Eje G ítem 2)**: el `.link` declara los modelos locales que usa (nombre de Ollama ya descargado, o ruta a un `.gguf` relativa a `--models-dir`/`LINK_MODELS_DIR`); `linkc serve`/`serve-all` los resuelven ANTES de aceptar la primera request y se niegan a arrancar listando TODOS los que faltan; `linkc doctor` los reporta por alias. `ai` no es palabra reservada (mismo criterio que `db`). El motor resuelto vive en el `Db` de cada programa (`serve-all` corre varios en un proceso). Cargar el GGUF sigue siendo perezoso, en el primer uso. Ningún `ai.*` todavía. Ver GRAMMAR.md §3.234.
+
 ## [1.191.0] - 2026-09-03
 
 ### ✨ Añadido

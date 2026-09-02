@@ -255,6 +255,7 @@
   - [3.231 `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` con clave de agrupación nullable (`T?`): el grupo `null` es un grupo más — RESUELTO](#3231-sumbycountbyavgbymaxbyminby-con-clave-de-agrupación-nullable-t-el-grupo-null-es-un-grupo-más--resuelto)
   - [3.232 `@hidden` sobre un campo: existe en la colección y dentro del rpc, pero nunca sale del proceso — RESUELTO](#3232-hidden-sobre-un-campo-existe-en-la-colección-y-dentro-del-rpc-pero-nunca-sale-del-proceso--resuelto)
   - [3.233 El motor de inferencia de Skynet embebido en `linkc` (feature `inference`) — RESUELTO](#3233-el-motor-de-inferencia-de-skynet-embebido-en-linkc-feature-inference--resuelto)
+  - [3.234 El bloque `ai { alias: "spec", ... }` y `--models-dir`: los modelos locales del programa, resueltos al arrancar — RESUELTO](#3234-el-bloque-ai--alias-spec---y---models-dir-los-modelos-locales-del-programa-resueltos-al-arrancar--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8105,6 +8106,31 @@ Origen: `PLAN.md §9.20` Eje G ítem 1, el cimiento del "motor de IA dentro del 
 **Verificado**: test unitario de que la plomería entera enlaza sin ningún modelo en disco (un `ServerState` vacío, un alias de Ollama inexistente da un error limpio y no un panic, `describe()`), `tests/cli_help.rs` contra el binario (primera línea exacta, segunda `inference: ...`), clippy `-D warnings` (los crates vendorizados son dependencias: clippy no los lintea, y no deben tocarse).
 
 **Límite honesto**: nada de esto sirve inferencia todavía. Es el ítem 1 de 8 del Eje G; el siguiente (ítem 2, el bloque `ai { }` y `--models-dir`) es el que decide QUÉ modelos carga el runtime y cuándo. Sampling greedy y solo CPU son límites del motor de origen, no de esta integración.
+
+### 3.234 El bloque `ai { alias: "spec", ... }` y `--models-dir`: los modelos locales del programa, resueltos al arrancar — RESUELTO, cierra PLAN.md §9.20 Eje G ítem 2
+
+Origen: `PLAN.md §9.20` Eje G ítem 2, la única sintaxis nueva del eje (decisión del usuario del 03/09/2026: bloque, no flag). Con el motor ya embebido (§3.233), faltaba que el `.link` dijera QUÉ modelos usa y que el runtime los resolviera ANTES de aceptar la primera request -- mismo criterio que `@encrypted` sin clave (§3.191): un modelo que no está en disco es un error al arrancar, con la lista completa de los que faltan, nunca un 500 en el primer `ai.*`.
+
+<!-- linkc:check -->
+```rust
+ai { router: "qwen2.5:0.5b", coder: "./qwen2.5-coder-7b.gguf" }
+type Note = { id: Int, text: String }
+db { notes: Note[] }
+service Notes {
+  rpc count() -> Int { db.notes.all().length() }
+}
+```
+
+**Qué hay (v1.192.0)**:
+- **Sintaxis**: `ai { alias: "spec", ... }` en posición de ítem de nivel superior, al lado de `db { }`. Como `db`, `ai` NO es palabra reservada: se reconoce por texto seguido de `{`, y en cualquier otra posición (`type Ai`, un campo `ai`, un rpc `ai(ai: String)`) sigue siendo un identificador. Cada entrada es `identificador: "string"`, separadas por coma, coma final opcional. El checker rechaza un alias repetido (dentro del mismo bloque o en otro archivo), una spec vacía y un lado derecho que no sea string.
+- **Spec**: un nombre de Ollama (`nombre:tag`, `latest` si no hay tag) o una ruta a un `.gguf`. Resolución (`inference::resolve_model_spec`): una spec con separador de ruta o extensión `.gguf` es un fichero, relativo a `--models-dir` si la ruta es relativa; cualquier otra se busca primero como `<models-dir>/<nombre-tag>.gguf` (así un servidor sin Ollama sirve el mismo `.link`) y después en el almacén de Ollama en disco (`OLLAMA_MODELS` o `~/.ollama/models`, leyendo su manifest -- solo lectura, nunca descarga). Solo se comprueba que el archivo EXISTA; cargarlo en memoria es perezoso, en el primer uso de cada alias (`ServerState::get_or_load`, con `--ai-memory-budget-mb` como tope LRU de modelos residentes).
+- **`linkc serve`/`serve-all`**: `--models-dir <dir>`/`LINK_MODELS_DIR` y `--ai-memory-budget-mb <N>`/`LINK_AI_MEMORY_BUDGET_MB`. Al arrancar, cada alias se resuelve y se imprime `[ai] modelo 'alias' -> ruta`; si falta alguno, el proceso no arranca (`modelos de 'ai { }' no encontrados en esta máquina: - alias ("spec"): motivo`, uno por línea, TODOS). El motor resuelto queda en el `Db` del programa (`Db::ai_engine`), por programa y no global, porque `serve-all` corre varios `.link` en un mismo proceso. Un binario compilado sin el feature `inference` se niega a servir un programa con `ai { }`.
+- **`linkc doctor`**: `[OK]    modelo 'alias': ruta` por cada uno, o `[ERROR]` con la misma lista que `serve`; acepta `--models-dir`.
+- **`linkc test`, `linkc build`, `linkc check`**: el bloque se parsea y se valida, y no hace nada más -- no hay `ai.*` que ejecutar todavía y el contrato generado no lo menciona.
+
+**Verificado**: checker (alias en orden, `ai` como identificador en type/campo/rpc/param/let, duplicado entre dos bloques, spec vacía, `router: 42`), `inference.rs` (ruta relativa contra `--models-dir`, alias contra `<dir>/<nombre-tag>.gguf`, error que lista todos los que faltan), `tests/cli_ai_block.rs` contra el binario (`serve` no arranca y lista `router` y `coder`; `doctor` da `[ERROR]` sin los archivos y `[OK]` por alias con `--models-dir`; un programa sin bloque no cambia), y a mano contra el almacén real de Ollama del MSI: `doctor` resuelve `qwen2.5:0.5b` y `gemma4:e4b` a sus blobs `sha256-...`.
+
+**Límite honesto**: ningún `ai.*` todavía (ítem 3). Un `.gguf` presente pero corrupto o de una arquitectura que el motor no conoce se descubre al CARGARLO (primer uso), no al arrancar -- cargar un 7B para validarlo costaría segundos y GB en cada arranque; `doctor` podría hacerlo con un flag explícito en una ronda futura. `serve-all` comparte `--models-dir` y el tope de memoria entre todos los servicios, pero cada uno tiene su propio motor y su propia cache de modelos: dos `.link` que declaran el mismo GGUF lo cargan dos veces (documentado, no atacado).
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

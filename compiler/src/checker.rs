@@ -568,6 +568,11 @@ pub struct Checker {
     /// los types que tienen alguno; consultado por el runtime al serializar
     /// un resultado (`strip_hidden_json`) y por el codegen de validadores.
     pub(crate) hidden_fields: HashMap<String, HashSet<String>>,
+    /// GRAMMAR.md §3.234: los modelos de `ai { }`, en orden de declaración
+    /// (todos los bloques, todos los archivos). `check_program` valida
+    /// alias únicos y specs no vacías; el runtime (`serve`) y `doctor` los
+    /// resuelven a un GGUF real.
+    pub(crate) ai_models: Vec<AiModel>,
     pub(crate) enums: HashMap<String, EnumDecl>,
     fns: HashMap<String, (Vec<Type>, Type)>,
     pub(crate) services: HashMap<String, HashMap<String, (Vec<Type>, Type)>>,
@@ -775,10 +780,11 @@ impl Checker {
     /// cuerpos de fn/rpc. Lo usa tanto `check_program` como el emisor de
     /// contrato (codegen/ts_emit.rs), que necesita `resolve_type` pero no
     /// quiere duplicar la lógica de resolución de nombres.
-    pub(crate) fn build_symbols(program: &Program) -> (Self, Vec<CheckError>) {
+    pub fn build_symbols(program: &Program) -> (Self, Vec<CheckError>) {
         let mut checker = Checker {
             types: HashMap::new(),
             hidden_fields: HashMap::new(),
+            ai_models: Vec::new(),
             enums: HashMap::new(),
             fns: HashMap::new(),
             services: HashMap::new(),
@@ -826,6 +832,7 @@ impl Checker {
                     // por error.
                     errors.push(err(format!("'{}' ya está declarado (type duplicado)", t.name)).with_span(t.span));
                 }
+                Item::Ai(ai) => checker.ai_models.extend(ai.models.iter().cloned()),
                 Item::Type(t) => {
                     if let TypeExpr::Struct(fields) = &t.ty {
                         let hidden: HashSet<String> = fields.iter().filter(|f| f.hidden()).map(|f| f.name.clone()).collect();
@@ -909,6 +916,39 @@ impl Checker {
         // DENTRO de un solo bloque se perdía en silencio (el `insert` de más
         // abajo simplemente pisaba la primera aparición sin ningún aviso) --
         // un gap preexistente cerrado de paso, no solo el caso nuevo.
+        // GRAMMAR.md §3.234: `ai { }` -- alias únicos en todos los bloques
+        // y archivos (mismo criterio que las colecciones de `db`), spec no
+        // vacía. Que el modelo EXISTA no se sabe acá: eso es del runtime
+        // (`serve` se niega a arrancar) y de `linkc doctor`.
+        let mut ai_alias_span: HashMap<String, Span> = HashMap::new();
+        for item in &program.items {
+            if let Item::Ai(ai) = item {
+                for m in &ai.models {
+                    if m.spec.trim().is_empty() {
+                        errors.push(
+                            err(format!(
+                                "el modelo '{}' de 'ai' tiene una spec vacía -- se esperaba un nombre de Ollama (\"qwen2.5:0.5b\") o una ruta a un .gguf (GRAMMAR.md §3.234)",
+                                m.alias
+                            ))
+                            .with_span(m.span),
+                        );
+                        continue;
+                    }
+                    if ai_alias_span.contains_key(&m.alias) {
+                        errors.push(
+                            err(format!(
+                                "el modelo '{}' de 'ai' ya está declarado -- un alias no puede repetirse, ni dentro del mismo 'ai {{ ... }}' ni en otro distinto",
+                                m.alias
+                            ))
+                            .with_span(m.span),
+                        );
+                        continue;
+                    }
+                    ai_alias_span.insert(m.alias.clone(), m.span);
+                }
+            }
+        }
+
         let mut collection_span: HashMap<String, Span> = HashMap::new();
         for item in &program.items {
             if let Item::Db(db) = item {
@@ -973,6 +1013,11 @@ impl Checker {
     /// `runtime::db::Db` para derivar el schema SQL de cada colección
     /// (GRAMMAR.md §3.17), sin duplicar la resolución de tipos que este
     /// `Checker` ya hizo al procesar `db { ... }`.
+    /// GRAMMAR.md §3.234: `(alias, spec)` de cada modelo de `ai { }`.
+    pub fn ai_models(&self) -> Vec<(String, String)> {
+        self.ai_models.iter().map(|m| (m.alias.clone(), m.spec.clone())).collect()
+    }
+
     pub(crate) fn db_collections(&self) -> &HashMap<String, Type> {
         &self.db_collections
     }
@@ -11389,5 +11434,45 @@ mod hidden_tests {
         assert!(msg.contains("'User', un type con campos '@hidden'") && msg.contains("'w'"), "{msg}");
         let msg = check("type User = { id: Int, @hidden @hidden x: Int }").err().expect("tenía que fallar");
         assert!(msg.contains("repetido"), "{msg}");
+    }
+}
+
+/// GRAMMAR.md §3.234 (PLAN.md §9.20 Eje G ítem 2): el bloque `ai { }`.
+#[cfg(test)]
+mod ai_block_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+
+    fn check(src: &str) -> Result<Checker, String> {
+        let tokens = tokenize(src).map_err(|e| format!("{e}"))?;
+        let program = parse(tokens).map_err(|e| format!("{e:?}"))?;
+        Checker::check_program(&program).map_err(|e| format!("{e:?}"))?;
+        Ok(Checker::build_symbols(&program).0)
+    }
+
+    #[test]
+    fn an_ai_block_declares_aliases_in_order_and_ai_stays_a_plain_identifier_elsewhere() {
+        let checker = check(
+            "ai { router: \"qwen2.5:0.5b\", coder: \"./qwen2.5-coder-7b.gguf\", }
+             type Note = { id: Int, ai: String }
+             db { notes: Note[] }
+             service S { rpc ai(ai: String) -> String { let ai2 = ai; ai2 } }",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            checker.ai_models(),
+            vec![("router".to_string(), "qwen2.5:0.5b".to_string()), ("coder".to_string(), "./qwen2.5-coder-7b.gguf".to_string())]
+        );
+    }
+
+    #[test]
+    fn duplicate_aliases_empty_specs_and_non_string_specs_are_rejected() {
+        let msg = check("ai { router: \"a:b\" }\nai { router: \"c:d\" }").err().expect("tenía que fallar");
+        assert!(msg.contains("ya está declarado"), "{msg}");
+        let msg = check("ai { router: \"  \" }").err().expect("tenía que fallar");
+        assert!(msg.contains("spec vacía"), "{msg}");
+        let msg = check("ai { router: 42 }").err().expect("tenía que fallar");
+        assert!(msg.contains("tiene que ser un string"), "{msg}");
     }
 }

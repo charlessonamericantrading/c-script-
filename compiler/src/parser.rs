@@ -290,8 +290,13 @@ impl Parser {
             TokenKind::Ident(name) if name == "db" && *self.peek_at(1) == TokenKind::LBrace => {
                 Ok(Item::Db(self.parse_db_decl()?))
             }
+            // GRAMMAR.md §3.234: `ai { ... }`, mismo criterio que `db` --
+            // reconocido por texto, nunca reservado.
+            TokenKind::Ident(name) if name == "ai" && *self.peek_at(1) == TokenKind::LBrace => {
+                Ok(Item::Ai(self.parse_ai_decl()?))
+            }
             other => Err(self.error(format!(
-                "se esperaba un ítem de nivel superior (import/type/enum/service/const/fn/db/test), se encontró {other:?}"
+                "se esperaba un ítem de nivel superior (import/type/enum/service/const/fn/db/ai/test), se encontró {other:?}"
             ))),
         }
     }
@@ -304,6 +309,36 @@ impl Parser {
         self.eat(&TokenKind::RBrace)?;
         let span = merge(start, self.prev_span());
         Ok(DbDecl { collections, span })
+    }
+
+    /// GRAMMAR.md §3.234: `ai { alias: "spec", ... }` -- cada entrada es
+    /// `identificador: "string"`, separadas por coma, coma final opcional.
+    /// No es `parse_field_list`: el lado derecho es un STRING, no un tipo.
+    fn parse_ai_decl(&mut self) -> Result<AiDecl, ParseError> {
+        let start = self.span();
+        self.advance(); // "ai"
+        self.eat(&TokenKind::LBrace)?;
+        let mut models = Vec::new();
+        while !self.check(&TokenKind::RBrace) {
+            let entry_start = self.span();
+            let alias = self.eat_ident()?;
+            self.eat(&TokenKind::Colon)?;
+            if !matches!(self.peek(), TokenKind::Str(_)) {
+                return Err(self.error(format!(
+                    "el modelo '{alias}' de 'ai' tiene que ser un string -- un nombre de Ollama (\"qwen2.5:0.5b\") o una ruta a un .gguf (GRAMMAR.md §3.234)"
+                )));
+            }
+            let spec = self.eat_string()?;
+            models.push(AiModel { alias, spec, span: merge(entry_start, self.prev_span()) });
+            if self.check(&TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.eat(&TokenKind::RBrace)?;
+        let span = merge(start, self.prev_span());
+        Ok(AiDecl { models, span })
     }
 
     fn parse_import_decl(&mut self) -> Result<ImportDecl, ParseError> {

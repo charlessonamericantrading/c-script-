@@ -384,6 +384,12 @@ pub struct ServeConfig {
     pub log: LogConfig,
     pub hsts: Option<String>,
     pub mcp_secret: Option<String>,
+    /// GRAMMAR.md §3.234: `--models-dir`/`LINK_MODELS_DIR`, base de las
+    /// rutas relativas de `ai { }`.
+    pub models_dir: Option<std::path::PathBuf>,
+    /// GRAMMAR.md §3.234: `--ai-memory-budget-mb`, tope de bytes de modelos
+    /// residentes a la vez (LRU); `None` = sin tope.
+    pub ai_memory_budget_bytes: Option<u64>,
 }
 pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     let ServeConfig {
@@ -398,6 +404,8 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         jwt_config,
         adopt_existing,
         max_body_bytes,
+        models_dir,
+        ai_memory_budget_bytes,
         http_timeout,
         trust_proxy,
         service_api_key,
@@ -459,6 +467,32 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         None => None,
     };
     db.set_encryption_key(encryption_key);
+    // GRAMMAR.md §3.234: los modelos de `ai { }` se resuelven ANTES de
+    // aceptar la primera request -- un alias que no está en disco es un
+    // error al ARRANCAR (mismo criterio que `@encrypted` sin clave, arriba),
+    // nunca un 500 en el primer `ai.*`. Cargar el GGUF en memoria sí es
+    // perezoso (`ServerState::get_or_load`, en el primer uso de cada
+    // alias): un modelo de 7B tarda segundos y no todos los rpc lo usan.
+    let declared_models = checker_for_encryption.ai_models();
+    #[cfg(feature = "inference")]
+    {
+        if !declared_models.is_empty() {
+            let known = crate::inference::resolve_declared_models(&declared_models, models_dir.as_deref())?;
+            for (alias, path) in &known {
+                eprintln!("[ai] modelo '{alias}' -> {path}");
+            }
+            db.set_ai_engine(std::sync::Arc::new(crate::inference::ServerState::new(known, ai_memory_budget_bytes)));
+        }
+    }
+    #[cfg(not(feature = "inference"))]
+    {
+        let _ = (models_dir, ai_memory_budget_bytes);
+        if !declared_models.is_empty() {
+            return Err(
+                "el programa declara un bloque 'ai { }' pero este binario se compiló sin el feature 'inference' (GRAMMAR.md §3.233/§3.234)".to_string(),
+            );
+        }
+    }
     // GRAMMAR.md §3.55: costo de `crypto.hashPassword` para lo que quede de
     // vida del proceso -- default de la crate si no se pasó ningún flag/env
     // var (ver `resolve_argon2_params` en `main.rs`).

@@ -1169,6 +1169,12 @@ pub struct Db {
     /// `write_param`/`decode_row` lo leen para cifrar/descifrar cada campo
     /// `ColumnPlan::encrypted`.
     encryption_key: parking_lot::RwLock<Option<[u8; encryption::KEY_LEN]>>,
+    /// GRAMMAR.md §3.234: el motor de inferencia de ESTE programa (sus
+    /// modelos de `ai { }` ya resueltos), fijado una vez por `serve` antes
+    /// de la primera request. Por programa y no global porque `serve-all`
+    /// corre varios `.link` en un mismo proceso.
+    #[cfg(feature = "inference")]
+    ai_engine: parking_lot::RwLock<Option<std::sync::Arc<crate::inference::ServerState>>>,
     /// Nombre de colección -> nombre del campo `@softDelete`, si esa
     /// colección tiene uno (GRAMMAR.md §3.78). Se calcula UNA vez al abrir
     /// la conexión (acá SÍ hay `Program`/`ast::Field` con anotaciones a
@@ -1660,6 +1666,8 @@ impl Db {
             argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
             http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
             encryption_key: parking_lot::RwLock::new(None),
+            #[cfg(feature = "inference")]
+            ai_engine: parking_lot::RwLock::new(None),
             soft_delete_fields,
             static_routes: crate::route::static_public_routes(program),
             outbound_http: parking_lot::Mutex::new(HashMap::new()),
@@ -1871,6 +1879,8 @@ impl Db {
                 argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
                 http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
                 encryption_key: parking_lot::RwLock::new(None),
+                #[cfg(feature = "inference")]
+                ai_engine: parking_lot::RwLock::new(None),
                 soft_delete_fields,
                 static_routes: crate::route::static_public_routes(program),
                 outbound_http: parking_lot::Mutex::new(HashMap::new()),
@@ -1929,6 +1939,19 @@ impl Db {
     /// `set_http_timeout`: `server.rs` lo llama UNA sola vez, antes de
     /// aceptar la primera request, después de confirmar (si hace falta) que
     /// hay una clave real configurada.
+    /// GRAMMAR.md §3.234: ver el campo `ai_engine`.
+    #[cfg(feature = "inference")]
+    pub fn set_ai_engine(&self, engine: std::sync::Arc<crate::inference::ServerState>) {
+        *self.ai_engine.write() = Some(engine);
+    }
+
+    /// GRAMMAR.md §3.234: `None` si el programa no declara `ai { }` (o el
+    /// `Db` no lo fijó -- `linkc test`, unit tests).
+    #[cfg(feature = "inference")]
+    pub fn ai_engine(&self) -> Option<std::sync::Arc<crate::inference::ServerState>> {
+        self.ai_engine.read().clone()
+    }
+
     pub(crate) fn set_encryption_key(&self, key: Option<[u8; encryption::KEY_LEN]>) {
         *self.encryption_key.write() = key;
     }
