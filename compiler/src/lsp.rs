@@ -1446,6 +1446,17 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             method("deleteWhere(fn)", "Delete records matching a predicate"),
             method("findWhere(fn)", "Find records matching a predicate"),
             method("subscribe()", "Subscribe to live changes in a stream"),
+            method("orderBy(fn)", "Order by a field, ascending (then .all()/.page()/.findWhere())"),
+            method("orderByDesc(fn)", "Order by a field, descending (then .all()/.page()/.findWhere())"),
+        ]),
+        // GRAMMAR.md §3.230: sobre una consulta ya ordenada solo las
+        // lecturas que llevan el ORDER BY dentro de su SQL.
+        Type::DbQuery(_) => Some(vec![
+            method("all()", "Run the ordered query and get every record"),
+            method("page(limit, offset)", "Run the ordered query with LIMIT/OFFSET"),
+            method("findWhere(fn)", "Run the ordered query filtered by a predicate"),
+            method("orderBy(fn)", "Add a secondary ascending key"),
+            method("orderByDesc(fn)", "Add a secondary descending key"),
         ]),
         // `sum()` (GRAMMAR.md §3.101) solo se ofrece para `List<Int>` -- a
         // diferencia de length/take/map/filter (válidos para cualquier `T`),
@@ -1464,6 +1475,8 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
                 method("filter(fn)", "Filter this list's items"),
                 method("join(sep)", "Join this list's items into a String"),
                 method("reverse()", "Reverse this list"),
+                method("sortBy(fn)", "Sort in memory by a key, ascending (nulls last)"),
+                method("sortByDesc(fn)", "Sort in memory by a key, descending (nulls last)"),
             ];
             if matches!(inner.as_ref(), Type::Int) {
                 methods.push(method("sum()", "Sum all elements of this List<Int>"));

@@ -5067,3 +5067,44 @@ service Settings {{
     assert!(ok, "{doctor}");
     assert!(doctor.contains("[OK]    tipos de columna: cada campo declarado es compatible"), "{doctor}");
 }
+
+// GRAMMAR.md §3.230 (PLAN.md §9.19 ítem 5): `orderByDesc(...).page(...)`
+// contra Postgres REAL -- lo que importa acá es el `NULLS LAST` explícito:
+// Postgres por defecto pone los NULL PRIMERO en DESC, así que sin él "los
+// más nuevos primero" empezaría por las filas sin fecha (SQLite tiene el
+// defecto opuesto, por eso la unidad en runtime/mod.rs no alcanza sola).
+#[test]
+fn order_by_pushes_order_by_with_nulls_last_to_real_postgres() {
+    const COLLECTION: &str = "webhooks_ordered";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let program = format!(
+        r#"
+type Hook = {{ id: Int, kind: String, amount: Int, at: Timestamp? }}
+type NewHook = {{ kind: String, amount: Int, at: Timestamp? }}
+db {{ {COLLECTION}: Hook[] }}
+service Hooks {{
+  rpc add(kind: String, amount: Int, at: Timestamp?) -> Hook {{ db.{COLLECTION}.insert(NewHook {{ kind: kind, amount: amount, at: at }}) }}
+  rpc newest(n: Int) -> Hook[] {{ db.{COLLECTION}.orderByDesc(|h: Hook| {{ h.at }}).page(n, 0) }}
+  rpc oldest() -> Hook[] {{ db.{COLLECTION}.orderBy(|h: Hook| {{ h.at }}).all() }}
+  rpc ofKind(k: String) -> Hook[] {{ db.{COLLECTION}.orderByDesc(|h: Hook| {{ h.amount }}).findWhere(|h: Hook| {{ h.kind == k }}) }}
+}}
+"#
+    );
+    let temp = TempDir::new("order-by");
+    let src = temp.write("app.link", &program);
+    let server = Serve::start(&src, &url);
+    server.rpc("Hooks/add", r#"{"kind":"a","amount":1,"at":"2026-01-01T00:00:00.000Z"}"#);
+    server.rpc("Hooks/add", r#"{"kind":"b","amount":5,"at":null}"#);
+    server.rpc("Hooks/add", r#"{"kind":"a","amount":3,"at":"2026-03-01T00:00:00.000Z"}"#);
+    server.rpc("Hooks/add", r#"{"kind":"a","amount":2,"at":"2026-02-01T00:00:00.000Z"}"#);
+    let amounts = |v: &serde_json::Value| -> Vec<i64> { v.as_array().unwrap().iter().map(|r| r["amount"].as_i64().unwrap()).collect() };
+    assert_eq!(amounts(&server.rpc("Hooks/newest", r#"{"n":2}"#)), vec![3, 2], "los dos más nuevos, el NULL nunca primero");
+    assert_eq!(amounts(&server.rpc("Hooks/newest", r#"{"n":10}"#)), vec![3, 2, 1, 5], "DESC con el NULL al final");
+    assert_eq!(amounts(&server.rpc("Hooks/oldest", "{}")), vec![1, 2, 3, 5], "ASC con el NULL al final");
+    assert_eq!(amounts(&server.rpc("Hooks/ofKind", r#"{"k":"a"}"#)), vec![3, 2, 1], "WHERE empujado + ORDER BY desc");
+}

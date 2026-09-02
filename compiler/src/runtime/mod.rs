@@ -86,6 +86,11 @@ pub enum Value {
     /// (`recv.metodo`) a la espera de ser invocado, ej. `db.users.find`.
     Db,
     DbCollection(String),
+    /// `db.<c>.orderBy(...)` ya aplicado (GRAMMAR.md §3.230): la colección
+    /// más sus claves de orden, a la espera del `all()`/`page()`/
+    /// `findWhere()` que las convierta en un ORDER BY real. Nunca es el
+    /// resultado de un rpc (el checker lo garantiza) ni cruza a JSON.
+    DbQuery(DbQuery),
     /// Marcador interno del identificador `auth` (GRAMMAR.md §3.14, auth
     /// v0) -- mismo trato que `Db`: nunca llega a `value_to_json`.
     Auth,
@@ -153,6 +158,7 @@ fn supports_bound_method_access(v: &Value) -> bool {
     match v {
         Value::Service(_)
         | Value::DbCollection(_)
+        | Value::DbQuery(_)
         | Value::List(_)
         | Value::Int(_)
         | Value::Int64(_)
@@ -233,6 +239,7 @@ fn is_marker_singleton(v: &Value) -> bool {
         | Value::List(_)
         | Value::Tuple(_)
         | Value::DbCollection(_)
+        | Value::DbQuery(_)
         | Value::Service(_)
         | Value::BoundMethod(_, _)
         | Value::FnRef(_)
@@ -261,6 +268,7 @@ impl PartialEq for Value {
             (List(a), List(b)) => a == b,
             (Tuple(a), Tuple(b)) => a == b,
             (DbCollection(a), DbCollection(b)) => a == b,
+            (DbQuery(a), DbQuery(b)) => a == b,
             (Service(a), Service(b)) => a == b,
             // Ver `is_marker_singleton` -- cualquiera de los 14 módulos
             // internos comparado consigo mismo da `true`, nunca entre sí.
@@ -300,6 +308,7 @@ impl std::fmt::Debug for Value {
             Value::Tuple(items) => f.debug_tuple("Tuple").field(items).finish(),
             Value::Db => write!(f, "Db"),
             Value::DbCollection(name) => f.debug_tuple("DbCollection").field(name).finish(),
+            Value::DbQuery(q) => f.debug_tuple("DbQuery").field(q).finish(),
             Value::Auth => write!(f, "Auth"),
             Value::Service(name) => f.debug_tuple("Service").field(name).finish(),
             Value::Math => write!(f, "Math"),
@@ -1358,6 +1367,47 @@ fn div_or_rem_overflow_message(verb: &str, a: i64, b: i64) -> RuntimeError {
     } else {
         err(format!("desborde aritmético al {verb} {a} por {b}"))
     }
+}
+
+/// GRAMMAR.md §3.230: la consulta ordenada que `db.<c>.orderBy(...)`
+/// devuelve -- ver `Value::DbQuery`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbQuery {
+    pub collection: String,
+    pub order: Vec<db::OrderKey>,
+}
+
+/// GRAMMAR.md §3.230: la clave de `orderBy`/`orderByDesc` a partir del
+/// closure selector -- misma forma reconocida que `maxRow`
+/// (`closure_field_name`); el checker ya garantizó la forma, esto solo la
+/// vuelve a leer del `Value::Closure` real.
+fn order_key(method: &str, args: &[Value]) -> Result<db::OrderKey, RuntimeError> {
+    let field = db::closure_field_name(args.first(), "de orden")?;
+    Ok(db::OrderKey { field, desc: method == "orderByDesc" })
+}
+
+/// GRAMMAR.md §3.230: orden total para `List<T>.sortBy`/`sortByDesc` --
+/// el espejo EN MEMORIA de `ORDER BY ... NULLS LAST`: `null` va siempre al
+/// final, en las dos direcciones (`desc` invierte solo la comparación entre
+/// dos valores presentes). Mismos tipos que `checker.rs::is_orderable_key`
+/// -- si un lado aprende un tipo, el otro tiene que aprenderlo el mismo día.
+fn order_cmp(a: &Value, b: &Value, desc: bool) -> Result<std::cmp::Ordering, RuntimeError> {
+    use std::cmp::Ordering;
+    let ordering = match (a, b) {
+        (Value::Null, Value::Null) => return Ok(Ordering::Equal),
+        (Value::Null, _) => return Ok(Ordering::Greater),
+        (_, Value::Null) => return Ok(Ordering::Less),
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
+        (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).ok_or_else(|| err("sortBy: clave de orden NaN"))?,
+        (Value::Str(x), Value::Str(y)) => x.cmp(y),
+        (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => return Err(err(format!("sortBy: claves de orden de tipos distintos o sin orden total: {a:?} y {b:?}"))),
+    };
+    Ok(if desc { ordering.reverse() } else { ordering })
 }
 
 fn compare(l: Value, r: Value, accept: impl Fn(std::cmp::Ordering) -> bool) -> Result<Value, RuntimeError> {
@@ -2671,7 +2721,52 @@ fn call_method(
     step_budget: &Cell<u64>,
 ) -> Result<Value, RuntimeError> {
     match receiver {
+        // GRAMMAR.md §3.230: una consulta ya ordenada -- solo lecturas, con
+        // el ORDER BY dentro del SQL. Los nombres de método repetidos con
+        // el brazo de `DbCollection` de abajo son deliberadamente los
+        // mismos (`page`, `findWhere`), con las mismas validaciones.
+        Value::DbQuery(mut query) => match method {
+            "orderBy" | "orderByDesc" => {
+                query.order.push(order_key(method, &args)?);
+                Ok(Value::DbQuery(query))
+            }
+            "all" => db.select_all_ordered(&query.collection, &query.order).map(Value::List),
+            "page" => {
+                let limit = as_int(args.first().ok_or_else(|| err("page requiere 2 argumentos (limit, offset)"))?)?;
+                let offset = as_int(args.get(1).ok_or_else(|| err("page requiere 2 argumentos (limit, offset)"))?)?;
+                if limit < 0 || offset < 0 {
+                    return Err(err(format!("db.<c>.orderBy(...).page({limit}, {offset}): limit y offset tienen que ser >= 0")));
+                }
+                db.select_page_ordered(&query.collection, &query.order, limit, offset).map(Value::List)
+            }
+            "findWhere" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'findWhere' requiere 1 argumento"))?;
+                if let Some(conditions) = recognize_pushable_predicate(&f) {
+                    if let Some(rows) = db.find_where_conjunction_ordered(&query.collection, &conditions, &query.order)? {
+                        return Ok(Value::List(rows));
+                    }
+                }
+                // Predicado no empujable: el ORDER BY igual viaja en SQL
+                // (`select_all_ordered`) y el filtro corre en memoria
+                // conservando ese orden.
+                let mut kept = Vec::new();
+                for item in db.select_all_ordered(&query.collection, &query.order)? {
+                    if as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)? {
+                        kept.push(item);
+                    }
+                }
+                Ok(Value::List(kept))
+            }
+            other => Err(err(format!(
+                "'{other}' no existe sobre una consulta ordenada (db.<c>.orderBy(...)) -- solo all/page/findWhere/orderBy/orderByDesc (GRAMMAR.md §3.230)"
+            ))),
+        },
         Value::DbCollection(coll) => match method {
+            // GRAMMAR.md §3.230: `orderBy`/`orderByDesc` no consultan nada
+            // todavía -- devuelven la consulta ORDENADA (`Value::DbQuery`),
+            // y es el `all()`/`page()`/`findWhere()` que venga después el
+            // que lleva el ORDER BY dentro de su SQL.
+            "orderBy" | "orderByDesc" => Ok(Value::DbQuery(DbQuery { collection: coll, order: vec![order_key(method, &args)?] })),
 
             // GRAMMAR.md §3.77: intercepta ACÁ (no en db.rs::Db::call) por
             // el mismo motivo que `findWhere`/`deleteWhere` -- necesita
@@ -2884,6 +2979,34 @@ fn call_method(
             "take" => {
                 let n = as_int(args.first().ok_or_else(|| err("take requiere 1 argumento"))?)? as usize;
                 Ok(Value::List(items.into_iter().take(n).collect()))
+            }
+            // GRAMMAR.md §3.230: orden en memoria por una clave derivada.
+            // Estable (`sort_by` de Rust): dos elementos con la misma clave
+            // conservan su orden relativo. Las claves se evalúan UNA vez por
+            // elemento, antes de ordenar -- un closure caro no se paga
+            // O(n log n) veces -- y un error de comparación (tipos
+            // mezclados, NaN) sale como RuntimeError limpio, nunca un panic
+            // dentro del comparador.
+            "sortBy" | "sortByDesc" => {
+                let f = args.into_iter().next().ok_or_else(|| err(format!("'{method}' requiere 1 argumento")))?;
+                let mut keyed = Vec::with_capacity(items.len());
+                for item in items {
+                    let key = call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?;
+                    keyed.push((key, item));
+                }
+                let desc = method == "sortByDesc";
+                let mut failure: Option<RuntimeError> = None;
+                keyed.sort_by(|(a, _), (b, _)| match order_cmp(a, b, desc) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        failure.get_or_insert(e);
+                        std::cmp::Ordering::Equal
+                    }
+                });
+                if let Some(e) = failure {
+                    return Err(e);
+                }
+                Ok(Value::List(keyed.into_iter().map(|(_, item)| item).collect()))
             }
             "length" => Ok(Value::Int(items.len() as i64)),
             // GRAMMAR.md §3.101: checker.rs ya garantizó que esto es
@@ -5009,7 +5132,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Mcp | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Mcp | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -11055,4 +11178,65 @@ mod tests {
         assert_eq!(ok.as_str().unwrap().chars().count(), 32);
     }
 
+}
+
+/// GRAMMAR.md §3.230 (PLAN.md §9.19 ítem 5) contra SQLite real: el ORDER BY
+/// (con `NULLS LAST` en las dos direcciones) viaja en el SQL de `all`/
+/// `page`/`findWhere`, la clave secundaria funciona, un predicado no
+/// empujable conserva el orden, y `sortBy`/`sortByDesc` en memoria dan el
+/// MISMO orden que SQL (null al final, orden estable). El harness saltea
+/// el checker a propósito -- la parte de tipos está en
+/// `checker.rs::order_by_tests`, y `tests/cli_order_by.rs` corre los dos.
+#[cfg(test)]
+mod order_by_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+    use serde_json::json;
+
+    fn amounts(v: &serde_json::Value) -> Vec<i64> {
+        v.as_array().unwrap().iter().map(|r| r["amount"].as_i64().unwrap()).collect()
+    }
+
+    #[test]
+    fn order_by_and_sort_by_agree_with_nulls_last_and_stable_ties() {
+        let src = r#"
+            type Event = { id: Int, kind: String, amount: Int, at: Timestamp? }
+            type NewEvent = { kind: String, amount: Int, at: Timestamp? }
+            db { events: Event[] }
+            service S {
+                rpc add(kind: String, amount: Int, at: Timestamp?) -> Event { db.events.insert(NewEvent { kind: kind, amount: amount, at: at }) }
+                rpc newest(n: Int) -> Event[] { db.events.orderByDesc(|e: Event| { e.at }).page(n, 0) }
+                rpc oldest() -> Event[] { db.events.orderBy(|e: Event| { e.at }).all() }
+                rpc ofKind(k: String) -> Event[] { db.events.orderByDesc(|e: Event| { e.amount }).findWhere(|e: Event| { e.kind == k }) }
+                rpc bigOnes() -> Event[] { db.events.orderByDesc(|e: Event| { e.amount }).findWhere(|e: Event| { e.amount + 0 > 1 }) }
+                rpc twoKeys() -> Event[] { db.events.orderBy(|e: Event| { e.kind }).orderByDesc(|e: Event| { e.amount }).all() }
+                rpc memDesc() -> Event[] { db.events.all().sortByDesc(|e: Event| { e.at }) }
+                rpc memAsc() -> Event[] { db.events.all().sortBy(|e: Event| { e.at }) }
+                rpc memStr() -> Event[] { db.events.all().sortBy(|e: Event| { e.kind }) }
+            }
+        "#;
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        for (kind, amount, at) in [
+            ("a", 1, json!("2026-01-01T00:00:00.000Z")),
+            ("b", 5, json!(null)),
+            ("a", 3, json!("2026-03-01T00:00:00.000Z")),
+            ("a", 2, json!("2026-02-01T00:00:00.000Z")),
+        ] {
+            invoke_rpc(&program, "S", "add", &json!({"kind": kind, "amount": amount, "at": at}), &db).unwrap();
+        }
+        let call = |name: &str, args: serde_json::Value| amounts(&invoke_rpc(&program, "S", name, &args, &db).unwrap());
+
+        assert_eq!(call("newest", json!({"n": 2})), vec![3, 2], "los dos más nuevos -- el NULL nunca primero en DESC");
+        assert_eq!(call("newest", json!({"n": 10})), vec![3, 2, 1, 5], "DESC con el NULL al final");
+        assert_eq!(call("oldest", json!({})), vec![1, 2, 3, 5], "ASC con el NULL al final");
+        assert_eq!(call("ofKind", json!({"k": "a"})), vec![3, 2, 1], "WHERE empujado + ORDER BY");
+        assert_eq!(call("bigOnes", json!({})), vec![5, 3, 2], "predicado no empujable: filtra en memoria conservando el orden SQL");
+        assert_eq!(call("twoKeys", json!({})), vec![3, 2, 1, 5], "clave secundaria: kind ASC, amount DESC");
+        assert_eq!(call("memDesc", json!({})), vec![3, 2, 1, 5], "sortByDesc = mismo orden que orderByDesc");
+        assert_eq!(call("memAsc", json!({})), vec![1, 2, 3, 5], "sortBy = mismo orden que orderBy");
+        assert_eq!(call("memStr", json!({})), vec![1, 3, 2, 5], "sortBy estable: los 'a' conservan su orden por id");
+    }
 }

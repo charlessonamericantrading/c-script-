@@ -118,6 +118,13 @@ pub enum Type {
     /// colección o de método desconocido ya es un error de tipos, no algo
     /// que se descubre recién en runtime.
     DbCollection(Box<Type>),
+    /// `db.<coleccion>.orderBy(...)`/`.orderByDesc(...)` ya aplicado
+    /// (GRAMMAR.md §3.230): una consulta ORDENADA sobre la colección, que
+    /// solo admite `all()`, `page(limit, offset)`, `findWhere(...)` y otro
+    /// `orderBy*` (clave secundaria). Distinto de `DbCollection` a
+    /// propósito: `insert`/`delete`/`pageAfter` no tienen sentido con un
+    /// orden encima y se rechazan en compilación, no en runtime.
+    DbQuery(Box<Type>),
     /// Tipo interno SOLO del identificador `auth` (GRAMMAR.md §3.14, auth v0)
     /// -- mismo trato que `Type::Db`: nunca aparece en una firma escrita por
     /// el usuario, ni cruza a `TypeExpr`, así que `check_wire_safe` no
@@ -227,6 +234,7 @@ impl std::fmt::Display for Type {
             // se nombran como el identificador que los produce.
             Type::Db => write!(f, "db"),
             Type::DbCollection(inner) => write!(f, "db.<colección de {inner}>"),
+            Type::DbQuery(inner) => write!(f, "db.<consulta ordenada de {inner}>"),
             Type::Auth => write!(f, "auth"),
             Type::Service(name) => write!(f, "service {name}"),
             Type::Math => write!(f, "math"),

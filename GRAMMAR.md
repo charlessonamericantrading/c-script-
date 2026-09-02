@@ -251,6 +251,7 @@
   - [3.227 `CacheLock` (dependencias git) reintenta ante CUALQUIER error de creación, no solo "ya existe" — RESUELTO](#3227-cachelock-dependencias-git-reintenta-ante-cualquier-error-de-creación-no-solo-ya-existe--resuelto)
   - [3.228 Columnas `ARRAY` nativas de PostgreSQL como `Int[]`/`String[]`/`Bool[]`/`Float[]`, y `linkc triggers --only-streams` — RESUELTO](#3228-columnas-array-nativas-de-postgresql-como-intstringboolfloat-y-linkc-triggers---only-streams--resuelto)
   - [3.229 `doctor`, `db inspect` y `migrate --dry-run` avisan de una columna con tipo incompatible ANTES de leer una fila — RESUELTO](#3229-doctor-db-inspect-y-migrate---dry-run-avisan-de-una-columna-con-tipo-incompatible-antes-de-leer-una-fila--resuelto)
+  - [3.230 `db.<c>.orderBy(...)`/`orderByDesc(...)` encadenados con `.all()`/`.page()`/`.findWhere()` (ORDER BY en SQL) + `List<T>.sortBy`/`sortByDesc` en memoria — RESUELTO](#3230-dbcorderbyorderbydesc-encadenados-con-allpagefindwhere-order-by-en-sql--listtsortbysortbydesc-en-memoria--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7997,6 +7998,35 @@ Solo PostgreSQL: SQLite tiene tipado dinámico y `check_schema_matches` (§3.17)
 **Verificado**: 4 tests unitarios de la tabla (escalares contra sus columnas y contra las ajenas, listas contra arrays soportados/no soportados/JSON, nullable-vs-requerido como aviso, `@encrypted` exige texto) y `pg_integration.rs` contra Postgres REAL: una tabla con `integer` declarado `Bool`, `uuid[]` declarado `String[]`, `text` nullable declarado `String` y `text[]` declarado `String[]` -- `doctor` falla con los dos errores exactos y el aviso, sin nombrar la columna compatible; `db inspect` muestra `3 problema(s) de tipo (2 error(es))`; `migrate --dry-run` lleva el bloque de comentarios; y un `.link` que calza del todo da `[OK]    tipos de columna` sin una sola línea más.
 
 **Límite honesto**: la tabla es la de HOY -- si `store.rs` aprende un tipo nuevo, esta tabla tiene que aprenderlo el mismo día (están una al lado de la otra a propósito). No valida `CHECK`/`UNIQUE`/defaults físicos (eso es `migrate`), ni la PK (ya lo hace `introspect`/adopción, §3.176/§3.177).
+### 3.230 `db.<c>.orderBy(...)`/`orderByDesc(...)` encadenados con `.all()`/`.page()`/`.findWhere()` (ORDER BY en SQL) + `List<T>.sortBy`/`sortByDesc` en memoria — RESUELTO, cierra PLAN.md §9.19 ítem 5
+
+Origen: `PLAN.md §9.19` ítem 5. Hasta acá no había NINGUNA forma de ordenar: `.all()` y `page` (§3.48) ordenan por `id` y punto, y `List<T>` tenía `take/filter/map/length/join/reverse/sum/contains` pero nada de orden. El síntoma real del CRM Nexus: `db.webhook_events.all().take(50)` sobre 15.000 filas devuelve los 50 más VIEJOS -- y trae los 15.000 a memoria para eso. `maxRow`/`minRow` (§3.102) ya hacían un `ORDER BY ... LIMIT 1`, pero solo una fila.
+
+**Qué hay (v1.188.0)**:
+
+<!-- linkc:check -->
+```rust
+type Event = { id: Int, kind: String, amount: Int, at: Timestamp? }
+db { events: Event[] }
+service Events {
+  rpc newest(n: Int) -> Event[] { db.events.orderByDesc(|e: Event| { e.at }).page(n, 0) }
+  rpc byKind(k: String) -> Event[] {
+    db.events.orderBy(|e: Event| { e.kind }).orderByDesc(|e: Event| { e.amount }).findWhere(|e: Event| { e.kind == k })
+  }
+  rpc topInMemory() -> Event[] { db.events.all().sortByDesc(|e: Event| { e.amount }) }
+}
+```
+
+- **`db.<c>.orderBy(|item: T| item.campo)` / `orderByDesc(...)`** no consultan nada todavía: devuelven una *consulta ordenada* (tipo interno `Type::DbQuery`), y es el `all()`, `page(limit, offset)` o `findWhere(...)` que venga después el que lleva el `ORDER BY` DENTRO de su SQL -- para "los 50 más nuevos de 15.000" viajan 50 filas, no 15.000. Encadenar otro `orderBy*` agrega una clave secundaria. `findWhere` sigue empujando el predicado cuando tiene la forma de §3.95/§3.108/§3.109/§3.170/§3.171 (`WHERE ... ORDER BY ...` en una sola query); con un predicado no empujable, el `ORDER BY` igual viaja en SQL y el filtro corre en memoria conservando ese orden.
+- **Selector**: la misma forma exacta que `maxRow`/`minRow` (`|item: T| item.campo`, `recognize_field_selector`); cualquier expresión derivada es un error de compilación que sugiere `sortBy`. Campos válidos: `Int`, `Int64`, `Float`, `Decimal`, `String`, `Bool`, `Timestamp`, `Uuid`, o su versión nullable `T?`. Una lista, un struct, un `Map`, un enum o un campo opcional por clave (`campo?: T`) se guardan como JSON y no tienen un orden SQL real: error del checker con el motivo. Un campo `@encrypted` se rechaza en runtime (el checker no ve la anotación desde `Type::Struct`; el ciphertext AES-GCM con nonce aleatorio no tiene ningún orden útil, §3.191).
+- **`NULLS LAST` explícito en las dos direcciones y en los dos motores**: por defecto Postgres pone los `NULL` PRIMERO en `DESC` y SQLite los pone primero en `ASC` -- sin esto, "los más nuevos primero" empezaría por las filas sin fecha en uno de los dos backends. Y `"id"` cierra siempre la lista como desempate, para que dos filas con la misma clave salgan en el mismo orden en cada llamada (la misma garantía de determinismo que `page` promete desde §3.48).
+- **Solo lecturas sobre la consulta ordenada**: `insert`/`delete`/`applyPatch`/`subscribe` etc. son un error del checker ("no existe sobre una consulta ordenada"). `pageAfter` (§3.61) también, a propósito: su cursor es una posición en el orden por `id`, que un `ORDER BY` distinto rompería en silencio -- usá `page(limit, offset)`. Y la consulta en sí nunca es un valor de rpc: sin `.all()`/`.page()`/`.findWhere()` no tipa.
+- **`List<T>.sortBy(|item: T| clave)` / `sortByDesc(...)`**: el complemento en memoria, para lo que no es una columna (una lista ya filtrada, una clave calculada, el resultado de un `map`). La clave puede ser cualquier expresión, del mismo conjunto de tipos que arriba (o nullable). Mismas reglas que SQL, a propósito: `null` al final en las dos direcciones, orden ESTABLE (dos elementos con la misma clave conservan su orden relativo). La clave se evalúa una vez por elemento, no O(n log n) veces. Ni `Decimal` ni `Struct`/`Variant` como clave entran esta ronda.
+
+**Verificado**: checker (6 formas válidas; `tags: String[]`, `note?: String`, `e.amount + 1`, `pageAfter`, `insert` sobre la consulta y la consulta como valor de rpc rechazados con el mensaje exacto), runtime contra SQLite real (DESC/ASC con `NULL` al final, `WHERE` empujado + `ORDER BY`, predicado no empujable conservando el orden, clave secundaria, `sortBy`/`sortByDesc` dando el MISMO orden que SQL y estable), `tests/cli_order_by.rs` contra el binario con `linkc test`, y `pg_integration.rs` contra Postgres REAL en CI (la parte que más importa: el `NULLS LAST` en `DESC`, donde el defecto de Postgres es el contrario).
+
+**Límite honesto**: el `ORDER BY` no usa ningún índice que el programa no haya declarado (`@index`, §3.5) -- sobre 15.000 filas Postgres ordena en memoria igual, rápido; sobre millones conviene un `@index` en el campo de orden. `orderBy` no se combina con `countWhere`/`deleteWhere`/agregaciones (no tienen orden que llevar). No hay `skip(n)` separado: `page(limit, offset)` ya es `LIMIT`/`OFFSET`.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

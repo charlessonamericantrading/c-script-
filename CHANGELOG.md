@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.188.0] - 2026-09-02
+
+### ✨ Añadido
+**`db.<c>.orderBy(|x| x.campo)` / `orderByDesc(...)` encadenados con `.all()` / `.page(limit, offset)` / `.findWhere(...)`, con el `ORDER BY` DENTRO del SQL, y `List<T>.sortBy` / `sortByDesc` en memoria (PLAN.md §9.19 ítem 5)**: hasta acá no había ninguna forma de ordenar -- "los 50 webhooks más nuevos de 15.000" era `.all().take(50)`, que devolvía los más viejos y traía los 15.000. `orderBy*` devuelve una consulta ordenada (tipo interno `DbQuery`) que solo admite lecturas: `insert`/`delete`/`pageAfter` son errores del checker. Campos ordenables: `Int`/`Int64`/`Float`/`Decimal`/`String`/`Bool`/`Timestamp`/`Uuid` o su `T?`; una lista/struct/Map/enum (JSON) es error de compilación. `NULLS LAST` explícito en las dos direcciones y los dos motores (Postgres y SQLite tienen defectos opuestos), `"id"` como desempate siempre. `sortBy`/`sortByDesc` dan el mismo orden que SQL (null al final, estable). Verificado en checker, SQLite, binario real (`linkc test`) y Postgres real en CI. Ver GRAMMAR.md §3.230.
+
 ## [1.187.1] - 2026-09-02
 
 ### 🐛 Corregido

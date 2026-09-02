@@ -37,7 +37,7 @@ limits. The full, chronological, paragraph-per-feature version lives in
 **Language and types** — `type` (structural), `enum` (nominal, ADT variants with fields,
 exhaustive `match` with or-patterns and guards §3.3), user generics §3.6, unions `A | B` with
 narrowing §3.9, `T?` narrowed by `match`/`??`/`.isSome()` — never by `if` §3.69, `Result<T,E>`
-§3.5, `Patch<T>` §3.166, `Map<K,V>`, `List<T>` with `.map/.filter/.length/.join/.reverse/.take/
+§3.5, `Patch<T>` §3.166, `Map<K,V>`, `List<T>` with `.map/.filter/.length/.join/.reverse/.take/.sortBy/.sortByDesc/
 .sum()/.contains()` and `+` concat §3.10/§3.101/§3.200, `Int`/`Int64` §3.30/§3.156, `Float`,
 `Decimal` (exact, 4 decimals) §3.184, `Bool`, `String` with `.substring/.replace/.split/
 .padStart/.padEnd/.escapeHtml/.toString()` §3.198/§3.45/§3.55, `Timestamp` (ms since epoch)
@@ -294,6 +294,8 @@ difference between code that compiles and code that does not.
     each gets its own index. See GRAMMAR.md §3.155.
 
 Collection methods, in full: `all()`, `count()`, `find(id) -> T?`, `findWhere(pred) -> T[]`,
+`orderBy(|x: T| x.field)` / `orderByDesc(...)` then `.all()` / `.page(limit, offset)` / `.findWhere(...)` -- ORDER BY (NULLS LAST, "id" tiebreak) pushed into the SQL; chain a second orderBy* for a secondary key; only reads, never pageAfter/insert (§3.230)
+`List<T>.sortBy(|x: T| key)` / `sortByDesc(...)` -- in-memory, same rules as SQL (nulls last, stable) (§3.230)
 `page(limit: Int, offset: Int) -> T[]` (LIMIT/OFFSET pushed to real SQL, not `all().take(n)`
 — see GRAMMAR.md §3.48), `insert(Omit<T,"id">) -> T`, `insertMany(items) -> T[]` (GRAMMAR.md
 §3.76), `applyPatch(id, patch) -> T`, `delete(id) -> Bool`, `deleteWhere(pred) -> Int`,

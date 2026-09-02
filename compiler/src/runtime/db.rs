@@ -3379,6 +3379,104 @@ db { users: User[] }
             .collect()
     }
 
+    /// `ORDER BY` de una consulta ordenada (GRAMMAR.md §3.230). Valida acá
+    /// también (no solo en el checker) que cada clave sea una columna real,
+    /// nativa (no JSON) y no cifrada -- un ciphertext AES-GCM con nonce
+    /// aleatorio no tiene ningún orden que valga la pena (§3.191), y el
+    /// checker no ve las anotaciones del AST desde `Type::Struct`. `"id"`
+    /// siempre cierra la lista como desempate, para que dos filas con la
+    /// misma clave salgan en el mismo orden en cada llamada (la misma
+    /// garantía que `page` promete desde §3.48). `NULLS LAST` explícito en
+    /// las dos direcciones y en los dos motores: por defecto Postgres pone
+    /// los NULL primero en DESC y SQLite los pone primero en ASC -- sin
+    /// esto, "los más nuevos primero" empezaría por las filas sin fecha en
+    /// uno de los dos backends.
+    fn order_by_sql(&self, collection: &str, columns: &[ColumnPlan], order: &[OrderKey]) -> Result<String, RuntimeError> {
+        let mut parts = Vec::with_capacity(order.len() + 1);
+        for key in order {
+            let Some(col) = columns.iter().find(|c| c.field.name == key.field) else {
+                return Err(RuntimeError::new(format!("orderBy: '{}' no es una columna real de '{collection}'", key.field)));
+            };
+            if col.json {
+                return Err(RuntimeError::new(format!(
+                    "orderBy: '{}' se guarda como JSON en '{collection}' -- no tiene un orden SQL real (GRAMMAR.md §3.230)",
+                    key.field
+                )));
+            }
+            if col.encrypted {
+                return Err(RuntimeError::new(format!(
+                    "orderBy: '{}' es '@encrypted' en '{collection}' -- el ciphertext no tiene ningún orden útil (GRAMMAR.md §3.191)",
+                    key.field
+                )));
+            }
+            parts.push(format!("\"{}\" {} NULLS LAST", key.field, if key.desc { "DESC" } else { "ASC" }));
+        }
+        parts.push("\"id\"".to_string());
+        Ok(format!("ORDER BY {}", parts.join(", ")))
+    }
+
+    /// `db.<c>.orderBy(...).all()` (GRAMMAR.md §3.230): `.all()` con el
+    /// `ORDER BY` de la consulta en vez del `"id"` implícito de `select_rows`.
+    pub(crate) fn select_all_ordered(&self, collection: &str, order: &[OrderKey]) -> Result<Vec<Value>, RuntimeError> {
+        let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let order_by = self.order_by_sql(collection, columns, order)?;
+        let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}{order_by}", Self::select_list(columns));
+        self.query_rows(collection, columns, &sql, &[])
+    }
+
+    /// `db.<c>.orderBy(...).page(limit, offset)` (GRAMMAR.md §3.230): como
+    /// `select_rows_page`, con el `ORDER BY` de la consulta -- el caso real
+    /// que lo motiva ("los 50 webhooks más NUEVOS de 15.000") era
+    /// exactamente lo que `page` solo, ordenado por id, no podía dar.
+    pub(crate) fn select_page_ordered(&self, collection: &str, order: &[OrderKey], limit: i64, offset: i64) -> Result<Vec<Value>, RuntimeError> {
+        let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let order_by = self.order_by_sql(collection, columns, order)?;
+        let sql = format!(
+            "SELECT {} FROM \"{collection}\" {where_clause}{order_by} LIMIT {} OFFSET {}",
+            Self::select_list(columns),
+            self.backend.placeholder(1),
+            self.backend.placeholder(2)
+        );
+        self.query_rows(collection, columns, &sql, &[Cell::Int(limit), Cell::Int(offset)])
+    }
+
+    /// `db.<c>.orderBy(...).findWhere(...)` (GRAMMAR.md §3.230): como
+    /// `find_where_conjunction`, con el `ORDER BY` de la consulta. Mismo
+    /// criterio de `None` (predicado no empujable -> el caller filtra en
+    /// memoria sobre `select_all_ordered`, que ya viene ordenado).
+    pub(crate) fn find_where_conjunction_ordered(&self, collection: &str, conditions: &ConditionExpr, order: &[OrderKey]) -> Result<Option<Vec<Value>>, RuntimeError> {
+        let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions) else {
+            return Ok(None);
+        };
+        let order_by = self.order_by_sql(collection, columns, order)?;
+        let sql = format!("SELECT {} FROM \"{collection}\" WHERE {where_clause} {order_by}", Self::select_list(columns));
+        self.query_rows(collection, columns, &sql, &cells).map(Some)
+    }
+
+    /// `"id", "campo1", ...` -- la lista de SELECT que comparten todas las
+    /// lecturas de fila completa (mismo orden que `kinds` en `query_rows`).
+    fn select_list(columns: &[ColumnPlan]) -> String {
+        let mut col_list = vec!["\"id\"".to_string()];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        col_list.join(", ")
+    }
+
+    /// Plomería común de las tres lecturas ordenadas: SELECT + decodificación
+    /// de cada fila con `row_to_fields` (el mismo decodificador que
+    /// `select_rows`/`find_where_conjunction`).
+    fn query_rows(&self, collection: &str, columns: &[ColumnPlan], sql: &str, params: &[Cell]) -> Result<Vec<Value>, RuntimeError> {
+        let mut kinds = vec![self.id_column_kind(collection)];
+        kinds.extend(columns.iter().map(ColumnPlan::kind));
+        let rows = self
+            .backend
+            .query(sql, params, &kinds)
+            .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+        rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
+    }
+
     /// `db.<c>.maxRow(selector)` / `db.<c>.minRow(selector)` (GRAMMAR.md
     /// §3.102): la fila COMPLETA con el valor máximo/mínimo de un campo --
     /// `SELECT ... ORDER BY "<campo>" {DESC|ASC} LIMIT 1`, a diferencia de
@@ -3732,7 +3830,16 @@ impl Db {
 /// la práctica: el checker ya garantizó en compilación que cada argumento
 /// es exactamente `|item: T| item.campo` (mismo criterio que el
 /// `unwrap_or_else` de `@content_type` en `server.rs`).
-fn closure_field_name(arg: Option<&Value>, role: &str) -> Result<String, RuntimeError> {
+/// GRAMMAR.md §3.230: una clave de `db.<c>.orderBy(...)`/`orderByDesc(...)`
+/// -- el nombre del campo (ya validado como columna real por
+/// `order_by_sql`) y la dirección.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderKey {
+    pub field: String,
+    pub desc: bool,
+}
+
+pub(crate) fn closure_field_name(arg: Option<&Value>, role: &str) -> Result<String, RuntimeError> {
     let Some(Value::Closure(params, body, _)) = arg else {
         return Err(RuntimeError::new(format!("selector {role} inválido: se esperaba un closure")));
     };

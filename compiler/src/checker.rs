@@ -434,7 +434,7 @@ fn expr_has_return(e: &Expr) -> bool {
 fn type_contains_function(ty: &Type) -> bool {
     match ty {
         Type::Function(..) => true,
-        Type::Optional(inner) | Type::List(inner) | Type::PatchOf(inner) | Type::DbCollection(inner) => {
+        Type::Optional(inner) | Type::List(inner) | Type::PatchOf(inner) | Type::DbCollection(inner) | Type::DbQuery(inner) => {
             type_contains_function(inner)
         }
         Type::Tuple(items) | Type::Union(items) => items.iter().any(type_contains_function),
@@ -4344,6 +4344,11 @@ impl Checker {
         if let Type::DbCollection(element_ty) = &base_ty {
             return self.check_db_method(element_ty, field, args, env).map(Some);
         }
+        // GRAMMAR.md §3.230: una consulta ya ordenada -- mismo criterio de
+        // "método desconocido = error acá" que la colección de arriba.
+        if let Type::DbQuery(element_ty) = &base_ty {
+            return self.check_db_query_method(element_ty, field, args, env).map(Some);
+        }
         // `auth.<metodo>(...)` (GRAMMAR.md §3.14, auth v0) -- mismo trato que
         // `db.<coleccion>.<metodo>`: un nombre de método desconocido acá es
         // siempre un error, nunca `Ok(None)`.
@@ -4898,6 +4903,28 @@ impl Checker {
                 self.check_expr(n_arg, &Type::Int, env)?;
                 Some(Type::List(inner.clone()))
             }
+            // GRAMMAR.md §3.230: orden EN MEMORIA por una clave derivada --
+            // el complemento de `db.<c>.orderBy` para lo que no es una
+            // columna (una lista ya filtrada, un campo calculado). La clave
+            // tiene que ser de un tipo con orden total real
+            // (`is_orderable_key`) o su versión nullable: los `null` van al
+            // final en las dos direcciones, igual que en SQL.
+            (Type::List(inner), "sortBy" | "sortByDesc") => {
+                let [f_arg] = args else {
+                    return Err(err(format!("'{field}' toma exactamente 1 argumento (clave: (T) -> K)")));
+                };
+                let key_ty = self.synth_callback_result(f_arg, inner, env)?;
+                let base = match &key_ty {
+                    Type::Optional(k) => k.as_ref(),
+                    other => other,
+                };
+                if !Self::is_orderable_key(base) {
+                    return Err(err(format!(
+                        "'{field}': la clave de orden es {key_ty} -- tiene que ser Int, Int64, Float, Decimal, String, Bool, Timestamp o Uuid (o su versión nullable), GRAMMAR.md §3.230"
+                    )));
+                }
+                Some(Type::List(inner.clone()))
+            }
             // Mismo nombre que String.length() (GRAMMAR.md §3.8) -- faltaba
             // por la misma razón que .take() faltó en su momento: nada lo
             // había necesitado todavía. Encontrado al escribir `login` para
@@ -5162,6 +5189,7 @@ impl Checker {
             }
             "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.check_aggregate_by(element_ty, method, args, env),
             "maxRow" | "minRow" => self.check_top_row(element_ty, method, args, env),
+            "orderBy" | "orderByDesc" => self.check_order_by(element_ty, method, args),
             "increment" => self.check_increment(element_ty, method, args, env),
 
             // GRAMMAR.md §3.75. `updateFn` devuelve `Omit<T,"id">` (un
@@ -5550,6 +5578,81 @@ impl Checker {
             )));
         }
         Ok(Type::Optional(Box::new(element_ty.clone())))
+    }
+
+    /// `db.<c>.orderBy(|item: T| item.campo)` / `orderByDesc(...)`
+    /// (GRAMMAR.md §3.230, PLAN.md §9.19 ítem 5): el resultado es una
+    /// consulta ORDENADA (`Type::DbQuery`), no una lista todavía -- el
+    /// `ORDER BY` viaja dentro del SQL del `all()`/`page()`/`findWhere()`
+    /// que venga después. Selector con la misma forma que `maxRow`
+    /// (`recognize_field_selector`), pero SIN la restricción de
+    /// `field_selector` sobre campos nullable: ordenar por un `T?` es válido
+    /// (los `null` van siempre al final, `NULLS LAST`, en los dos motores).
+    /// Un campo opcional por CLAVE (`campo?: T`) sí se rechaza: se guarda
+    /// como JSON, sin una columna nativa que ordenar.
+    fn check_order_by(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>]) -> Result<Type, CheckError> {
+        let [selector_arg] = args else {
+            return Err(err(format!("'{method}' toma exactamente 1 argumento (selector: |item: T| item.campo)")));
+        };
+        let shape_err = || {
+            err(format!(
+                "'{method}' espera un selector de campo de orden de la forma `|item: T| item.campo` -- un acceso de campo simple, sin expresiones derivadas ni llamadas a método (no hay forma de traducir eso a un ORDER BY real; para ordenar por una clave calculada usá `.all().sortBy(...)`, en memoria)"
+            ))
+        };
+        let Expr::Closure { params, body } = &selector_arg.node else {
+            return Err(shape_err());
+        };
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        let Some(field_name) = crate::ast::recognize_field_selector(&param_names, body) else {
+            return Err(shape_err());
+        };
+        let Type::Struct { fields, .. } = element_ty else {
+            return Err(err("una colección de 'db' debe resolver a un struct"));
+        };
+        let Some(field) = fields.iter().find(|f| f.name == field_name) else {
+            return Err(err(format!("'{method}': '{field_name}' no es un campo de este struct")));
+        };
+        if field.optional {
+            return Err(err(format!(
+                "'{method}': el campo de orden '{field_name}' es opcional por clave (`campo?: T`) -- se guarda como JSON, sin una columna nativa que ordenar; declaralo nullable (`campo: T?`) si puede faltar"
+            )));
+        }
+        let base = match &field.ty {
+            Type::Optional(inner) => inner.as_ref(),
+            other => other,
+        };
+        if !Self::is_orderable_key(base) {
+            return Err(err(format!(
+                "'{method}': el campo de orden '{field_name}' es {} -- solo se puede ordenar por Int, Int64, Float, Decimal, String, Bool, Timestamp o Uuid (o su versión nullable `T?`); una lista, un struct, un enum o un Map se guardan como JSON y no tienen un orden SQL real (GRAMMAR.md §3.230)",
+                field.ty
+            )));
+        }
+        Ok(Type::DbQuery(Box::new(element_ty.clone())))
+    }
+
+    /// Tipos con un orden total real tanto en SQL (`ORDER BY`) como en
+    /// memoria (`List<T>.sortBy`, runtime/mod.rs::order_cmp) -- los DOS
+    /// lados tienen que coincidir, por eso es una sola lista. Un enum
+    /// simple queda afuera a propósito: su "orden" sería el alfabético del
+    /// nombre de la variante, que ningún programa real quiere.
+    fn is_orderable_key(ty: &Type) -> bool {
+        matches!(ty, Type::Int | Type::Int64 | Type::Float | Type::Decimal | Type::String | Type::Bool | Type::Timestamp | Type::Uuid)
+    }
+
+    /// Métodos sobre una consulta ya ordenada (GRAMMAR.md §3.230): solo los
+    /// de LECTURA que pueden llevar el `ORDER BY` dentro de su SQL. Un
+    /// nombre desconocido acá es un error, nunca `Ok(None)`.
+    fn check_db_query_method(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
+        match method {
+            "orderBy" | "orderByDesc" => self.check_order_by(element_ty, method, args),
+            "all" | "page" | "findWhere" => self.check_db_method(element_ty, method, args, env),
+            "pageAfter" => Err(err(
+                "'pageAfter' no se puede combinar con 'orderBy'/'orderByDesc': su cursor es una posición en el orden por id (GRAMMAR.md §3.61), que un ORDER BY distinto rompería en silencio -- usá 'page(limit, offset)' sobre la consulta ordenada",
+            )),
+            other => Err(err(format!(
+                "'{other}' no existe sobre una consulta ordenada (db.<c>.orderBy(...)) -- solo all(), page(limit, offset), findWhere(...) y otro orderBy/orderByDesc como clave secundaria (GRAMMAR.md §3.230)"
+            ))),
+        }
     }
 
     /// `db.<c>.increment(id, selector, delta) -> T` (GRAMMAR.md §3.105):
@@ -11055,5 +11158,69 @@ type T = { id: Int, s: Status }")
             type T = { id: Int, a: Int, b: Int, status: String }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+}
+
+/// GRAMMAR.md §3.230 (PLAN.md §9.19 ítem 5): `db.<c>.orderBy`/`orderByDesc`
+/// devuelven una consulta ordenada que solo admite lecturas, y
+/// `List<T>.sortBy`/`sortByDesc` exigen una clave con orden total. Los
+/// errores se prueban por SUBSTRING del mensaje real, porque ese texto es
+/// lo único que un programador ve.
+#[cfg(test)]
+mod order_by_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+
+    const BASE: &str = "type Event = { id: Int, kind: String, amount: Int, at: Timestamp?, tags: String[], note?: String }\ntype NewEvent = { kind: String, amount: Int, at: Timestamp?, tags: String[] }\ndb { events: Event[] }\n";
+
+    fn check(body: &str) -> Result<(), Vec<CheckError>> {
+        let src = format!("{BASE}service S {{ {body} }}");
+        let tokens = tokenize(&src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        Checker::check_program(&program)
+    }
+
+    fn first_error(body: &str) -> String {
+        check(body).expect_err("tenía que fallar el checker").iter().map(|e| format!("{e:?}")).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn ordered_reads_and_in_memory_sorts_type_check() {
+        check(
+            "rpc newest(n: Int) -> Event[] { db.events.orderByDesc(|e: Event| { e.at }).page(n, 0) }
+             rpc byKind(k: String) -> Event[] { db.events.orderBy(|e: Event| { e.kind }).orderByDesc(|e: Event| { e.amount }).findWhere(|e: Event| { e.kind == k }) }
+             rpc everything() -> Event[] { db.events.orderBy(|e: Event| { e.amount }).all() }
+             rpc sorted() -> Event[] { db.events.all().sortBy(|e: Event| { e.amount }) }
+             rpc sortedNullable() -> Event[] { db.events.all().sortByDesc(|e: Event| { e.at }) }
+             rpc sortedStr() -> Event[] { db.events.all().sortBy(|e: Event| { e.kind }) }",
+        )
+        .unwrap_or_else(|errs| panic!("{errs:?}"));
+    }
+
+    #[test]
+    fn ordering_by_a_json_field_or_a_key_optional_field_is_rejected() {
+        let msg = first_error("rpc bad() -> Event[] { db.events.orderBy(|e: Event| { e.tags }).all() }");
+        assert!(msg.contains("solo se puede ordenar por") && msg.contains("'tags'"), "{msg}");
+        let msg = first_error("rpc bad() -> Event[] { db.events.orderBy(|e: Event| { e.note }).all() }");
+        assert!(msg.contains("opcional por clave"), "{msg}");
+        let msg = first_error("rpc bad() -> Event[] { db.events.orderBy(|e: Event| { e.amount + 1 }).all() }");
+        assert!(msg.contains("selector de campo de orden"), "{msg}");
+    }
+
+    #[test]
+    fn an_ordered_query_only_accepts_reads_and_never_page_after() {
+        let msg = first_error("rpc bad() -> Event[] { db.events.orderBy(|e: Event| { e.amount }).pageAfter(null, 5) }");
+        assert!(msg.contains("no se puede combinar con 'orderBy'"), "{msg}");
+        let msg = first_error("rpc bad() -> Event { db.events.orderBy(|e: Event| { e.amount }).insert(NewEvent { kind: \"a\", amount: 1, at: null, tags: [] }) }");
+        assert!(msg.contains("no existe sobre una consulta ordenada"), "{msg}");
+        // La consulta en sí nunca es un valor de rpc: sin `.all()` no tipa.
+        assert!(check("rpc bad() -> Event[] { db.events.orderBy(|e: Event| { e.amount }) }").is_err());
+    }
+
+    #[test]
+    fn sort_by_needs_a_totally_ordered_key() {
+        let msg = first_error("rpc bad() -> Event[] { db.events.all().sortBy(|e: Event| { e.tags }) }");
+        assert!(msg.contains("la clave de orden es"), "{msg}");
     }
 }
