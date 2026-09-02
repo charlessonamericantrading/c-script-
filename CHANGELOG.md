@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.172.0] - 2026-09-02
+
+### 🔧 Interno
+**Red de tests (PLAN.md §9.17 ítem 6): una cerca de código sin lenguaje en la documentación es ahora un error de `docs_examples.rs` -- y las 100 que ya existían quedaron clasificadas contra el binario real.** El test que garantiza "todo ejemplo publicado compila" solo miraba cercas ` ```rust `/` ```link `; una cerca pelada se saltaba en silencio como "otro lenguaje" -- GRAMMAR.md tenía 96, incluidos los ejemplos publicados de `pdf.build`, `excel.build/parse` y `mcp.sample`. Barrido completo: cada bloque pelado se probó compilar con `linkc test` -- 18 ejemplos nuevos entran a la red de CI como `linkc:check` (30→48 en GRAMMAR.md), 69 quedan `linkc:fragment` explícito, el resto tipado `bash`/`text`/`json`. La puerta queda cerrada: cualquier apertura pelada futura falla el test con un mensaje que dice exactamente qué poner. Bonus verificando el caso negativo: la regla nueva atrapó su propia documentación (una línea de prosa de AGENTS.md que empezaba con una cerca literal desincronizaba el parser) -- reescrita en palabras. Ver GRAMMAR.md §3.213.
+
 ## [1.171.0] - 2026-09-02
 
 ### 🐛 Arreglado

@@ -18,7 +18,7 @@
 
 Whenever you rename a field in your backend or database, your frontend shouldn't silently break in production. With **Link**, your frontend fails to compile (`tsc`) immediately during development.
 
-```
+```text
 ┌─────────────────┐       linkc build        ┌─────────────────────────────────────────┐
 │   main.link     │ ───────────────────────► │ 📄 contract.d.ts  (TypeScript types)     │
 │                 │                          │ 🔌 client.ts      (Type-safe RPC client) │

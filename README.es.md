@@ -18,7 +18,7 @@
 
 Cada vez que renombras un campo en el backend o en la base de datos, tu frontend no debería romperse silenciosamente en producción. Con **Link**, el frontend falla inmediatamente al compilar (`npx tsc --noEmit`) en tu entorno de desarrollo.
 
-```
+```text
 ┌─────────────────┐       linkc build        ┌─────────────────────────────────────────┐
 │   main.link     │ ───────────────────────► │ 📄 contract.d.ts  (Tipos TypeScript)     │
 │                 │                          │ 🔌 client.ts      (Cliente RPC tipado)   │

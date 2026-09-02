@@ -58,7 +58,7 @@ Todo lo que autentica una request -- una sesión nativa de Link
 [§3.64](../GRAMMAR.md#364-auth-externo-confiar-en-un-jwt-ya-emitido--resuelto-alcance-acotado-hs256))
 -- viaja en el MISMO header:
 
-```
+```text
 Authorization: Bearer <token>
 ```
 

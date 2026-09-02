@@ -115,6 +115,37 @@ fn is_link_fence(info: &str) -> bool {
     matches!(info.trim(), "rust" | "link")
 }
 
+/// Una cerca de APERTURA sin lenguaje (` ``` ` pelada) está prohibida en los
+/// archivos listados -- auditoría del 02/09/2026 (PLAN.md §9.17 ítem 6):
+/// GRAMMAR.md tenía 96 cercas peladas que este test saltaba EN SILENCIO,
+/// incluidos los ejemplos de `pdf.build`/`excel.build`/`mcp.sample` -- la
+/// garantía "todo ejemplo publicado compila" era falsa para la spec entera.
+/// Exigir un lenguaje explícito en TODA apertura hace la clasificación
+/// binaria y a prueba de futuro: `rust`/`link` entra a la red de
+/// verificación, cualquier otro lenguaje declarado (`text`, `bash`, `json`)
+/// queda explícitamente afuera -- pero nunca "afuera sin que nadie lo haya
+/// decidido".
+fn check_no_bare_fences(doc: &str, text: &str, failures: &mut Vec<String>) {
+    let mut in_fence = false;
+    for (n, line) in text.lines().enumerate() {
+        let Some(info) = fence_at(line) else { continue };
+        if in_fence {
+            in_fence = false;
+            continue;
+        }
+        in_fence = true;
+        if info.trim().is_empty() {
+            failures.push(format!(
+                "{doc}:{}: cerca de apertura sin lenguaje (``` pelada). Declarale uno: \
+                 ```rust si es código Link (y clasificalo con {CHECK}/{PART}/{FRAGMENT}), \
+                 o ```text/```bash/```json si no lo es -- sin esto, un ejemplo Link \
+                 nuevo puede publicarse fuera de la red de verificación sin que nadie lo note.",
+                n + 1
+            ));
+        }
+    }
+}
+
 fn fence_at(line: &str) -> Option<&str> {
     line.trim_start().strip_prefix("```")
 }
@@ -244,6 +275,8 @@ fn every_documented_example_compiles_and_runs() {
                 continue;
             }
         };
+
+        check_no_bare_fences(doc, &text, &mut failures);
 
         let blocks = collect_blocks(doc, &text);
         let slug = doc.replace(['/', '.', '\\'], "_");

@@ -21,4 +21,5 @@ Every c-script code block in this repository's documentation is compiled by
 the real binary in CI (`compiler/tests/docs_examples.rs`). If you add or edit
 one, mark it `<!-- linkc:check -->`, `<!-- linkc:part -->` or
 `<!-- linkc:fragment -->` — see AGENTS.md for what each means. An unmarked
-block fails the build on purpose.
+block fails the build on purpose, and so does a bare ``` fence with no
+language — open every fence with ```rust (c-script) or ```text/```bash/```json.

@@ -6,7 +6,7 @@ El compilador de `c-script` está desarrollado en **Rust** sin dependencias comp
 
 ## Pipeline del Compilador
 
-```
+```text
 código .link
    │
    ▼

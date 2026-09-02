@@ -94,11 +94,17 @@ GRAMMAR.md §3.210 for the current list.
   existing comments are long on purpose; match that, and update them when the code beneath
   them changes.
 - **Documentation examples are tests.** Every c-script block in `README.md`, `llms.txt`,
-  the agent rule files and this file is compiled by `compiler/tests/docs_examples.rs`
-  using the real binary. Mark any block you add with `<!-- linkc:check -->` (a complete
-  program), `<!-- linkc:part -->` (one chapter of a program the file builds up across
-  several blocks) or `<!-- linkc:fragment -->` (a snippet that cannot compile). An
-  unmarked block fails the test on purpose.
+  the agent rule files, `GRAMMAR.md` and this file is compiled by
+  `compiler/tests/docs_examples.rs` using the real binary. Mark any block you add with
+  `<!-- linkc:check -->` (a complete program), `<!-- linkc:part -->` (one chapter of a
+  program the file builds up across several blocks) or `<!-- linkc:fragment -->` (a
+  snippet that cannot compile). An unmarked block fails the test on purpose. **Bare
+  fences (three backticks with no language) are also rejected** in every listed file:
+  open every fence with an explicit language — "rust" for c-script (plus its marker),
+  or "text"/"bash"/"json" for anything else. (Spelled out in words here on purpose: a
+  prose line that STARTS with a literal fence desyncs the very parser that enforces
+  this — it caught this paragraph's own first draft.) Before this rule, 96 untyped
+  fences in GRAMMAR.md were silently skipped, examples included (GRAMMAR.md §3.213).
 - **Do not add a feature claim to the README without a test that exercises it.** Several
   claims in this repository's history turned out to be aspirational; that is the failure
   mode to avoid.

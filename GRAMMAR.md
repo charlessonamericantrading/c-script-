@@ -234,6 +234,7 @@
   - [3.210 Códigos de error estables + `linkc explain <código>` — RESUELTO](#3210-códigos-de-error-estables--linkc-explain-código--resuelto)
   - [3.211 `--trust-proxy` toma el ÚLTIMO valor de `X-Forwarded-For`, no el primero — RESUELTO](#3211---trust-proxy-toma-el-último-valor-de-x-forwarded-for-no-el-primero--resuelto)
   - [3.212 La entrega de una respuesta correlacionada MCP exige la sesión dueña — RESUELTO](#3212-la-entrega-de-una-respuesta-correlacionada-mcp-exige-la-sesión-dueña--resuelto)
+  - [3.213 Una cerca sin lenguaje en la documentación es un error del test de ejemplos — RESUELTO](#3213-una-cerca-sin-lenguaje-en-la-documentación-es-un-error-del-test-de-ejemplos--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -323,7 +324,8 @@ db_decl      = "db" , "{" , field_list , "}" ;   (* "db" NO es keyword -- ver §
 
 **`import_decl` — RESUELTO (multi-archivo + package manager mínimo, `compiler/src/modules.rs`).** `import { X, Y } from "./otro.link";` ya resuelve de verdad: cada `.link` alcanzado se lexea/parsea, y sus ítems (menos los `Item::Import` ya resueltos) se funden en un solo `Program` antes de llegar al checker — que sigue viendo un único árbol, sin ningún concepto nuevo de "archivo".
 
-```
+<!-- linkc:fragment -->
+```rust
 type Point = { x: Int, y: Int }        // b.link
 
 import { Point } from "./b.link";      // a.link
@@ -496,7 +498,7 @@ Dos juicios, como en Rust/TS/Swift modernos:
 
 La regla que conecta ambos mundos:
 
-```
+```text
 Γ ⊢ e ⇒ T'      T' <: T
 ─────────────────────────  (Subsunción)
 Γ ⊢ e ⇐ T
@@ -504,7 +506,7 @@ La regla que conecta ambos mundos:
 
 Reglas clave:
 
-```
+```text
 ─────────────────────────  (Lit-Int)
 Γ ⊢ n ⇒ Int
 
@@ -528,7 +530,7 @@ f : (T1, .., Tn) -> T ∈ Γ      Γ ⊢ eᵢ ⇐ Tᵢ  (para cada i)
 
 ### 3.2 Subtipado: estructural para `type`, nominal para `enum`
 
-```
+```text
 ∀ (k: Tₖ) ∈ campos(T')  ∃ (k: Sₖ) ∈ campos(S)     Sₖ <: Tₖ
 ─────────────────────────────────────────────────────────  (Struct-Width-Depth)
 S <: T'
@@ -541,7 +543,7 @@ S <: T'
 
 Algoritmo base sobre un scrutinee **enum** (incluye `Result<T,E>` y enums genéricos instanciados):
 
-```
+```text
 cubierto := ∅
 para cada arm SIN guard en match:      -- un arm CON guard nunca cuenta, ver más abajo
   si arm.pattern == "_" (o un bind con nombre):
@@ -556,14 +558,15 @@ Esto es lo que hace que el compilador de c-script, igual que Rust, **rechace un 
 
 **Extensión: `match` también acepta un scrutinee `Int`/`String`/`Bool`** (antes, `match` exigía un enum a secas — matchear un primitivo directamente no tenía ninguna forma de patrón que no fuera un bind, así que era, en los hechos, imposible de usar con más de un arm real). El algoritmo para este caso es distinto porque `Int`/`String` tienen un espacio de valores no enumerable:
 
-```
+```text
 error si NO hay un catch-all (bind sin guard) entre los arms
    Y  NO ( tipo == Bool  Y  'true' y 'false' están ambos cubiertos por un literal sin guard )
 ```
 
 `Bool` es, en los hechos, un enum de dos variantes — es el único tipo no-enum donde un conjunto de literales, sin catch-all, alcanza para ser exhaustivo. `Int`/`String` **siempre** necesitan un arm final sin guard (`_ => ...` o un bind con nombre) — ningún conjunto finito de literales agota sus valores posibles.
 
-```
+<!-- linkc:check -->
+```rust
 fn describe(n: Int) -> String {
   match n {
     1 | 2 => "bajo",     // or-pattern: aporta {1, 2} a la cobertura
@@ -575,7 +578,8 @@ fn describe(n: Int) -> String {
 
 **Guardas (`pattern if cond => body`) nunca descartan exhaustividad por sí solas.** La condición podría ser `false` en runtime, así que un arm con guard —aunque su patrón sería, sin el guard, un catch-all o cubriría el último variant que faltaba— **no cuenta** para el algoritmo de arriba: sigue habiendo que cubrir ese caso con algún otro arm sin guard. En runtime, si el patrón matchea pero el guard da `false`, la búsqueda **continúa con el siguiente arm** (igual que Rust), no se trata como "sin match":
 
-```
+<!-- linkc:check -->
+```rust
 fn classify(n: Int) -> String {
   match n {
     x if x > 100 => "grande",
@@ -589,7 +593,8 @@ El guard ve las variables que el propio patrón acaba de ligar — `Setting.Leve
 
 **Or-patterns (`p1 | p2 | ...`) — alcance v0: ninguna alternativa puede introducir bindings.** La regla completa de otros lenguajes (cada alternativa debe ligar exactamente las mismas variables, con el mismo tipo) es la parte cara de implementar or-patterns; acá se evita ese problema entero prohibiendo bindear del todo dentro de un `Or` — cubre el caso común (combinar variantes unitarias o literales que comparten cuerpo) sin esa complejidad:
 
-```
+<!-- linkc:fragment -->
+```rust
 enum Status { Active, Paused, Cancelled }
 match s {
   Status.Active | Status.Paused => "en curso",   // ok: ninguna alternativa liga nada
@@ -608,7 +613,7 @@ match sh {
 
 Regla de subtipado (se deriva de "opcional es más permisivo"):
 
-```
+```text
 S <: T
 ─────────────  (Optional-Widen)
 S <: T?
@@ -646,7 +651,8 @@ Esta convención sigue el mismo principio que **JSON Merge Patch (RFC 7386)** y 
 
 **Decisión:** `Result<T, E>`, con `E` siempre un `enum` (así la exhaustividad de `match`, §3.3, aplica también a los errores). Razón: TypeScript no tipa lo que se lanza (`catch (e)` siempre es `unknown`), así que una excepción rompe la tesis central del proyecto justo en el peor lugar. `Result<T,E>` es coherente con el resto del lenguaje (ya hay `enum` + `match` exhaustivo — un error no es más que otro ADT) y es la única opción que preserva "rompe en compilación" para errores, no solo para el happy path (comparativa completa con la alternativa de excepciones tipadas: ver `examples/decision-errors.ts`).
 
-```
+<!-- linkc:fragment -->
+```rust
 enum ValidationError {
   InvalidEmail { field: String },
   TooShort     { field: String, min: Int },
@@ -756,7 +762,7 @@ No hay coerción implícita en ningún operador (§3.7) — `.toFloat()`/`.toInt
 
 **Regla de subtipado — dos direcciones, no una:**
 
-```
+```text
 S <: Tᵢ   para algún i ∈ 1..n
 ──────────────────────────────  (Union-Intro, "a la derecha")
 S <: (T₁ | ... | Tₙ)
@@ -768,7 +774,8 @@ S <: (T₁ | ... | Tₙ)
 
 La primera es la que cubre el caso real más común: un valor concreto (`Int`) fluye hacia un parámetro/campo tipado como unión con solo encajar en UNO de los miembros. La segunda es la que hace que una unión sea, a su vez, subtipo de otra unión más ancha (`Int | String <: Int | String | Bool`) — cada miembro de la izquierda tiene que encajar en algo de la derecha.
 
-```
+<!-- linkc:check -->
+```rust
 type Event = { payload: Int | String }
 
 fn accept(x: Int | String) -> Void {}
@@ -791,7 +798,8 @@ export interface Event {
 
 #### Narrowing: `match` con patrones `nombre: Tipo`
 
-```
+<!-- linkc:fragment -->
+```rust
 type Query = Int | String
 
 fn findByIdOrEmail(query: Int | String) -> User[] {
@@ -816,7 +824,8 @@ fn findByIdOrEmail(query: Int | String) -> User[] {
 
 Una `fn` de nivel superior, referenciada por su nombre sin llamarla ahí mismo, es un valor de primera clase: se puede pasar como argumento, guardar en una variable, o recibir a través de un parámetro tipado `(A) -> B`. `Expr::Ident` para un nombre que no resuelve a una variable local cae al conjunto de `fn`s declaradas y sintetiza `Type::Function(params, ret)` (checker.rs) / produce un `Value::FnRef(nombre)` en runtime (runtime/mod.rs) — nunca captura nada, porque una `fn` de nivel superior no tiene ningún scope léxico exterior que capturar.
 
-```
+<!-- linkc:check -->
+```rust
 fn add_one(x: Int) -> Int { x + 1 }
 fn apply_twice(f: (Int) -> Int, x: Int) -> Int { f(f(x)) }
 
@@ -825,7 +834,7 @@ fn use_it() -> Int { apply_twice(add_one, 5) } // 7
 
 **Subtipado de tipos función — contravariante en parámetros, covariante en el retorno** (regla estándar): una función que acepta MENOS de lo estrictamente necesario (parámetro declarado más angosto) o devuelve MÁS de lo prometido (retorno más ancho) sirve donde se espera la firma original.
 
-```
+```text
 S <: T          (para cada parámetro, EN SENTIDO INVERSO: T_param <: S_param)
 S_ret <: T_ret  (el retorno, en el mismo sentido que todo lo demás)
 ──────────────────────────────────────────────────────────────────  (Function-Sub)
@@ -836,7 +845,7 @@ Esa comparación de params vive en su propia función con nombre (`types::params
 
 #### Closures: `|params| { block }`
 
-```
+```text
 list.filter(|u: User| { u.active })      // predicado -- siempre List<T>
 list.map(|u: User| { u.name })           // transforma -- puede cambiar List<T> a List<U>
 
@@ -899,7 +908,8 @@ async getById(id: number): Promise<User | null> {
 
 `db` dejó de ser `Type::Dynamic` (cualquier `db.lo-que-sea.como-sea(...)` tipaba, y solo fallaba en runtime). Un nuevo ítem de nivel superior declara la forma real:
 
-```
+<!-- linkc:fragment -->
+```rust
 db {
   users: User[],
   posts: Post[],
@@ -910,7 +920,8 @@ db {
 
 **Cada colección necesita un campo `id: Int`.** No es un capricho — es lo que hace posible que `insert` pida `Omit<T, "id">` (los campos de T menos `id`, un utility type nativo de TS, sin sintaxis nueva) en vez de T completo. Sin esta regla, `insert` habría exigido el struct entero — y **habría roto el propio demo insignia**, donde la forma de creación (`NewUser`) es deliberadamente un subconjunto de `User` (sin `id`, `role`, `deletedAt`). El checker lo exige al procesar `db { ... }`, con un error claro si falta.
 
-```
+<!-- linkc:fragment -->
+```rust
 type User = { id: Int, name: String, email: String, role: Role, bio?: String, deletedAt: String? }
 db { users: User[] }
 
@@ -935,7 +946,8 @@ Antes, `Member::Rpc`/`Member::Stream` se colapsaban a lo mismo en todo el pipeli
 
 **Alcance explícito, de entrada: repite una secuencia YA CALCULADA, no suscribe a eventos futuros.** El ejemplo de `PLAN.md` (`stream watch(id) -> User { db.users.subscribe(id) }`) implica suscribirse a cambios que todavía no pasaron — eso necesitaría una capa de pub-sub sobre `db` que no existe. Lo que sí es real y honesto: el cuerpo de un `stream` devuelve `List<T>` (una lista completa, ya en memoria) y el servidor la manda como eventos SSE genuinos en vez de un solo blob JSON — mejor time-to-first-byte del lado del cliente, y el wire protocol que `AsyncIterable<T>` promete de verdad. **Actualización: RESUELTO para un shape fijo.** El lenguaje ya tiene un constructo de loop (`while`, §3.15) y, sobre él, una capa real de pub-sub para `db` (§3.16) — un `stream` cuyo cuerpo es exactamente `while true { db.<coleccion>.subscribe() }` sí recibe eventos futuros de verdad, sin polling. Todo lo demás (un cuerpo con cualquier otra forma) sigue el camino `List<T>` descripto en esta sección, sin cambios.
 
-```
+<!-- linkc:fragment -->
+```rust
 // La firma declara el ELEMENTO (igual que un rpc normal) -- el cuerpo
 // tiene que devolver la secuencia completa (List<User>, no User suelto).
 stream watchAll() -> User {
@@ -963,7 +975,8 @@ stream watchAll() -> User {
 
 Hasta acá no existía NINGÚN mecanismo de guard/autorización en el lenguaje — cualquiera podía invocar cualquier `rpc`. Alcance elegido para v0, explícitamente: sesión opaca en memoria + roles, **sin JWT y sin ninguna dependencia nueva** (el proyecto sigue dependiendo solo de `tiny_http` + `serde_json`). Verificar contraseña/hash de credenciales queda **fuera de alcance a propósito** — es su propio problema de seguridad, no algo para meter de paso acá.
 
-```
+<!-- linkc:fragment -->
+```rust
 service Users {
   @authenticated
   rpc me() -> User { ... }
@@ -985,7 +998,8 @@ service Users {
 - `auth.createSession(role: R) -> String` — `R` debe sintetizar a un enum declarado; devuelve un token opaco.
 - `auth.destroySession() -> Void` — **CERO argumentos**, a propósito (ver "hallazgo de seguridad" más abajo).
 
-```
+<!-- linkc:fragment -->
+```rust
 rpc login(email: String) -> String? {
   let matches = db.users.all().filter(|u: User| { u.email == email });
   if matches.length() > 0 { auth.createSession(matches[0].role) } else { null }
@@ -1019,7 +1033,8 @@ rpc logout() -> Void { auth.destroySession() }
 
 Hasta acá el lenguaje no tenía NINGÚN constructo de loop — la única forma de repetir algo era recursión (una `fn` con nombre llamándose a sí misma, o un closure reasignado vía `mut` que se referencia a sí mismo, que además arma un ciclo real de `Rc`, ver §3.10). Elegido para v0, explícitamente: **`while` únicamente, `Stmt` (nunca `Expr`), sin `break`/`continue`, con una cota dura de iteraciones.**
 
-```
+<!-- linkc:check -->
+```rust
 fn sum(xs: Int[]) -> Int {
   let mut total = 0;
   let mut i = 0;
@@ -1049,7 +1064,8 @@ fn sum(xs: Int[]) -> Int {
 
 Con `while` ya resuelto (§3.15), el segundo bloqueo que §3.13 dejaba pendiente para push real era la falta total de una capa de pub-sub sobre `db`. Elegido para v0, explícitamente (vía pregunta directa, no un default silencioso): en vez de un mecanismo general de corutinas/`yield` para lógica arbitraria por evento, el diseño reconoce en tiempo de compilación UN ÚNICO shape sintáctico fijo como cuerpo de un `stream` "en vivo":
 
-```
+<!-- linkc:fragment -->
+```rust
 stream watchItems() -> Item {
   while true {
     db.items.subscribe()
@@ -1804,7 +1820,8 @@ cierra esa segunda mitad.
 
 **Lo que hay ahora:**
 
-```
+<!-- linkc:fragment -->
+```rust
 @content_type("text/html; charset=utf-8")
 @route("/blog/:slug")
 rpc page(slug: String) -> String { ... }
@@ -1928,7 +1945,8 @@ que confiar en el body sin verificar quién lo mandó.
 
 Combinadas, verifican un webhook así:
 
-```
+<!-- linkc:check -->
+```rust
 service Webhooks {
   rpc stripeEvent() -> String {
     let body = request.rawBody();
@@ -2014,7 +2032,8 @@ saliente) queda expuesta a que alguien la golpee sin límite — por accidente
 
 **Lo que hay ahora:**
 
-```
+<!-- linkc:fragment -->
+```rust
 @rate_limit("20/1m")
 rpc sendPasswordReset(email: String) -> Void { ... }
 ```
@@ -2307,7 +2326,8 @@ Auditoría del 20/08/2026: esa extensión.
 
 **Lo que hay ahora:**
 
-```
+<!-- linkc:fragment -->
+```rust
 @route("/blog/:categoria/:slug")
 rpc page(slug: String, categoria: String) -> String { ... }
 ```
@@ -2334,7 +2354,8 @@ las dos no). Con múltiples parámetros en distintas posiciones, dos rutas de
 forma DISTINTA pueden igual matchear el mismo path real sin que ninguna sea
 más específica:
 
-```
+<!-- linkc:fragment -->
+```rust
 @route("/blog/:categoria/latest")   // 1 literal (posición 1)
 @route("/blog/featured/:slug")      // 1 literal (posición 0)
 ```
@@ -2398,11 +2419,12 @@ c-script.
 
 **Lo que hay ahora:**
 
-```
+```text
 smtp.send(to: String, subject: String, body: String) -> Void
 ```
 
-```
+<!-- linkc:fragment -->
+```rust
 rpc register(email: String) -> Void {
   // ... crear el usuario ...
   smtp.send(email, "Bienvenido", "Gracias por registrarte.");
@@ -2574,7 +2596,8 @@ de templates real (Django, Rails ERB, JSX).
 
 **Lo que hay ahora:**
 
-```
+<!-- linkc:fragment -->
+```rust
 rpc page(comentario: String) -> String {
   "<p>" + comentario.escapeHtml() + "</p>"
 }
@@ -2656,7 +2679,8 @@ pieza que faltaba es que un rpc pueda elegir SU status en el camino de
 ÉXITO -- "no encontrado" no es un error de transporte, es una respuesta
 válida con otro status y un body distinto.
 
-```
+<!-- linkc:fragment -->
+```rust
 @route("/users/:id")
 @content_type("text/html")
 rpc userPage(id: Int) -> String {
@@ -2734,7 +2758,8 @@ siquiera. `env.get`/`crypto.hmacSha256` (§3.38) ya resolvían el lado
 ENTRANTE (verificar la firma de un webhook); este era el lado SALIENTE
 simétrico que quedaba pendiente.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Header = { name: String, value: String }
 
 rpc createCharge(amountCents: Int) -> String {
@@ -2808,7 +2833,8 @@ nota; para una con miles de filas, pedir "la página 400" seguía costando
 exactamente lo mismo que traer la tabla completa. `page` resuelve esto de
 la única forma real posible: `LIMIT`/`OFFSET` viajan DENTRO del SQL.
 
-```
+<!-- linkc:fragment -->
+```rust
 rpc listUsers(limit: Int, offset: Int) -> User[] {
   db.users.page(limit, offset)
 }
@@ -2872,7 +2898,8 @@ Agent, por ejemplo) no tenía forma de expresarse sin duplicar el rpc
 entero, uno por rol, o aflojar a `@authenticated` (cualquier rol, sin
 restricción real).
 
-```
+<!-- linkc:fragment -->
+```rust
 @requires(Role.Admin | Role.Agent)
 rpc sharedPanel() -> String { "panel compartido" }
 ```
@@ -2922,7 +2949,7 @@ de expresar "sesión válida 7 días", el patrón más común de cualquier
 sistema de auth real (cookies de sesión, tokens de acceso con expiración
 fija).
 
-```
+```bash
 linkc serve app.link 8787 --session-ttl 7d
 # o, para un contenedor (mismo criterio que --db/--cors-origin):
 LINK_SESSION_TTL=7d linkc serve app.link 8787
@@ -2991,7 +3018,8 @@ Role.Agent)` (§3.49) ya real, esto importaba de verdad: un endpoint
 compartido entre dos roles a menudo necesita comportarse DISTINTO según
 cuál de los dos es, no solo decidir "entra o no entra".
 
-```
+<!-- linkc:fragment -->
+```rust
 @requires(Role.Admin | Role.Agent)
 rpc sharedPanel() -> String {
   if auth.currentRole() == "Admin" {
@@ -3063,7 +3091,8 @@ esto es lo mismo pero para `GROUP BY` -- y acá SÍ hay una forma real de
 empujarlo a SQL, porque el shape que hace falta reconocer es mucho más
 chico que "un predicado cualquiera".
 
-```
+<!-- linkc:fragment -->
+```rust
 type RevenueByPlan = { key: String, value: Int }
 
 rpc revenueByPlan() -> RevenueByPlan[] {
@@ -3300,7 +3329,7 @@ Dos gaps de PLAN.md §8.4, cerrados en la misma ronda -- ambos documentados como
 
 **1. Costo de Argon2id configurable.** Antes de esta ronda, `crypto.hashPassword` siempre corría con el default de la crate (`m=19456` KiB, `t=2`) sin ninguna forma de subirlo. Como el costo es una decisión de POSTURA DE SEGURIDAD del despliegue -- no algo que varíe llamada por llamada dentro de un mismo programa -- se resolvió como flag de servidor, mismo criterio que `--session-ttl`/`--cors-origin`, no como parámetro nuevo de `hashPassword`:
 
-```
+```bash
 linkc serve app.link 8787 --argon2-memory-kib 65536 --argon2-iterations 3
 ```
 
@@ -3469,7 +3498,7 @@ service Orders {
 }
 ```
 
-```
+```bash
 linkc serve app.link 8787 --jwt-secret "$JWT_SIGNING_SECRET"
 ```
 
@@ -3523,7 +3552,7 @@ rpc totalByRegion() -> RegionTotal[] {
 
 Reporte real de adopción (app financiera "MyFinance" sobre una base Postgres ya existente): sin esto, adoptar Link dentro de un sistema con datos reales significaba escribir cada `type`/`db {...}` a mano, columna por columna, mirando el schema en otra ventana.
 
-```
+```bash
 linkc introspect postgres://usuario:clave@host/base > main.link
 ```
 
@@ -3556,7 +3585,7 @@ Hasta esta ronda, `linkc serve` SIEMPRE intentaba `CREATE TABLE IF NOT EXISTS` (
 1. **Un rol de base sin permiso de DDL.** Una restricción común en producción: la cuenta que usa la app tiene `SELECT`/`INSERT`/`UPDATE`/`DELETE`, pero no `CREATE`/`ALTER` -- y `linkc serve` ni siquiera arrancaba, aunque el schema ya matcheara exacto y no hiciera falta migrar nada de verdad.
 2. **Una tabla SQLite con columnas físicas que el `.link` no modela.** `check_schema_matches` exige coincidencia EXACTA entre lo declarado y lo que ya existe -- una tabla legacy con una columna de más (que el programa nunca va a leer) hacía panic al arrancar.
 
-```
+```bash
 linkc serve app.link 8787 --db postgres://usuario:clave@host/base --adopt-existing
 ```
 
@@ -3583,7 +3612,8 @@ Si falta una tabla entera, o falta una columna declarada, `linkc serve` no arran
 Auditando el comportamiento real de auto-migrate para PLAN.md §9.1.1 (matriz de comportamiento pedida en dos reportes de adopción reales) apareció un bug genuino, no solo un gap de documentación: `connect_postgres` (GRAMMAR.md §3.36) agrega SIEMPRE una columna nueva como `NULLABLE` -- nunca puede saber qué backfillear en filas ya existentes, sin importar si el campo es requerido en el `.link` actual. Una fila insertada ANTES de declarar ese campo requerido queda con `NULL` en esa columna. Hasta esta ronda, `row_to_fields` (`runtime/db.rs`) decodificaba ese `NULL` en silencio como `Value::Null` -- el cliente TypeScript recibía `null` en un campo que su propio contrato generado declara `string` (no `string | null`), sin ningún error en ningún lado. Exactamente la clase de "los dos extremos no están de acuerdo" que este proyecto viene evitando desde §3.9.
 
 <!-- linkc:check -->
-```
+<!-- linkc:check -->
+```rust
 type Item = { id: Int, name: String, note: String }
 db { items: Item[] }
 
@@ -4808,7 +4838,8 @@ linkc doctor backend.link --db postgres://user:pass@host/base   # o LINK_DATABAS
 
 PLAN.md §9.3, gap nuevo encontrado analizando "CRM" (Nexus, 11 `.link`, primer análisis de este adoptador esta sesión) -- con un bug de producción real como evidencia, no solo una preferencia de estilo. `List` solo tenía `.take`/`.filter`/`.map`/`.length`/`.join`/`.reverse` (§3.15), sin ninguna forma de sumar sin un `while` manual. `accounting.link`, `getAccountingSummary()`, necesitaba el total real de una lista de montos ya filtrada en memoria (`incomeTx`/`expenseTx`, resultado de `.all().filter(...)`) -- al no existir `.sum()`, el código terminó con un placeholder que multiplica la CANTIDAD de transacciones por una tarifa plana inventada (`incomeTx.length() * 1000`) en vez de sumar `t.amount` de verdad. Un reporte financiero mostrando cifras fabricadas, no aproximadas, en código que pasaba sus propios tests porque ninguno verificaba esos campos puntuales.
 
-```
+<!-- linkc:check -->
+```rust
 fn total(montos: Int[]) -> Int { montos.sum() }
 ```
 
@@ -4824,7 +4855,8 @@ fn total(montos: Int[]) -> Int { montos.sum() }
 
 PLAN.md §9.3, gap nuevo encontrado analizando IgnisLove en profundidad -- con un bug de producción real y confirmado como evidencia, no una preferencia de estilo. `bandit_rewards.link`, `getBestArm()`, hacía `db.arms.all()` y devolvía `allArms[0]` -- el orden de `all()` es por `"id"` (§3.48), NUNCA por el campo de recompensa, así que ese rpc JAMÁS devolvía el brazo con mejor `avgRewardTenths`, pese a su nombre: un algoritmo de optimización (bandit de recompensas) silenciosamente roto, sin ningún error que lo delatara. `maxBy`/`minBy` (§3.52) ya existían, pero solo agregan un VALOR agrupado (siempre `{key, value}[]`, incluso sin ningún campo de agrupación real) -- nunca la fila COMPLETA que alcanza ese máximo/mínimo.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Arm = { id: Int, name: String, avgRewardTenths: Int }
 
 service Bandit {
@@ -4876,7 +4908,8 @@ Encontrado auditando por qué CI llevaba varios pushes seguidos en rojo sin que 
 
 PLAN.md §9.3, gap nuevo encontrado analizando IgnisLove en profundidad, **con un riesgo de producción real y confirmado como evidencia (lost-update, no un bug ya materializado sino uno estructuralmente posible en la topología real de este adoptador)**. Sin una forma atómica de incrementar un campo, tres `.link` (`bandit_rewards`, `bot_defense`, `banners`) hacían read-then-write manual -- `upsert` con un `updateFn` que lee `existing.campo + 1` -- para contadores (`totalPulls`, `requestCount`, `impressionsCount`/`clicksCount`). En la topología real de este adoptador (varios procesos `linkc serve-all`/pm2 compartiendo un único Postgres, confirmado en `server/cscript-gateway.ts`), dos procesos pueden leer el mismo valor antes de que el otro escriba y perder un incremento -- el `updateFn` de `upsert` corre en el INTÉRPRETE, no dentro de una transacción SQL, así que no hay nada que lo proteja.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Counter = { id: Int, hits: Int }
 
 service Analytics {
@@ -4902,7 +4935,8 @@ service Analytics {
 
 PLAN.md §9.3, gap nuevo encontrado analizando IgnisLove en profundidad: varios `.link` del repo (`bandit_rewards`, `bot_defense`, `stock_cache`, `catalog_facets`, `seo_engine`, `rfm_scorer`) tienen un comentario propio explicando por qué migraron de "borrar e reinsertar" a `upsert`/`applyPatch` -- "delete+insert con autoincrement no reproduce el id". `banners.link` todavía no había migrado. El motivo real, no solo de estilo: `insert()` SIEMPRE asigna un id nuevo por autoincrement (§3.17) -- nunca respeta el valor que un literal declara para el campo `id`, así que `db.<c>.delete(x.id); db.<c>.insert(T { id: x.id, ... })` NO preserva la fila, aunque el código parezca intentarlo escribiendo `id: x.id` explícito. Cualquier referencia externa al id viejo (otra tabla, un cliente que guardó ese id) queda apuntando a una fila que ya no existe.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Banner = { id: Int, name: String, impressionsCount: Int }
 
 rpc bump(x: Banner) -> Void {
@@ -4941,7 +4975,8 @@ linkc serve-all ./services --port-base 3000 --port-map-out ./services/ports.json
 
 PLAN.md §9.3.1, reforzado por "CRM"/Nexus (analizado por primera vez en la ronda de IgnisLove/CRM/Glowapp): `countWhere`/`findWhere` (§3.95, v1.59.0) solo empujaban a SQL el caso `|x| x.campo == valor` -- cualquier otro operador caía al camino interpretado (traer la colección entera, filtrar en Rust). Tres casos reales de ALTA FRECUENCIA en CRM (llamados en cada carga de página, no en un backfill puntual) evidenciaron la falta: `notifications.link` (badge de notificaciones, `n.userId == uid && !n.read`), `inventory.link` (alerta de stock bajo, `p.stock <= 5 && p.stock > 0`), `chat.link` (contador de chats sin leer, `c.unreadCount > 0`).
 
-```
+<!-- linkc:fragment -->
+```rust
 type Chat = { id: Int, name: String, unreadCount: Int }
 
 rpc unreadChatCount() -> Int { db.chats.countWhere(|c: Chat| { c.unreadCount > 0 }) }
@@ -4961,7 +4996,8 @@ rpc unreadChatCount() -> Int { db.chats.countWhere(|c: Chat| { c.unreadCount > 0
 
 PLAN.md §9.3 ítem 1, reforzado por el pedido explícito del usuario tras confirmar que el pushdown de un solo operador (§3.108) todavía dejaba sin resolver dos de los tres casos reales de CRM que lo motivaron: `notifications.link` (`n.userId == uid && !n.read`) e `inventory.link` (`p.stock <= 5 && p.stock > 0`, el MISMO campo dos veces). Antes de esta ronda, cualquier `&&` en un predicado de `countWhere`/`findWhere` hacía fallar el reconocimiento de shape ENTERO -- una fila más de la tabla completa traída a memoria en cada llamada, exactamente el patrón que motivó todo §9.3.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Notification = { id: Int, userId: Int, read: Bool }
 
 rpc unreadFor(userId: Int) -> Int {
@@ -4983,7 +5019,7 @@ rpc unreadFor(userId: Int) -> Int {
 
 Gap NUEVO (24/08/2026), reportado por un adoptador real ("MyFinance"): `DocumentStorageService` necesitaba generar una URL firmada para compartir/descargar un documento desde S3, y terminó con una firma FALSA -- `?signature=hmac_verified`, un string LITERAL, no un HMAC de verdad -- porque `crypto.hmacSha256` (§3.38) no alcanzaba. El motivo no era negligencia: es una limitación real y verificable del primitivo existente. AWS Signature Version 4 deriva su clave de firma encadenando CUATRO HMAC-SHA256, donde el resultado CRUDO (los 32 bytes del digest) de cada paso es la CLAVE del siguiente:
 
-```
+```text
 kDate    = HMAC-SHA256("AWS4" + secretAccessKey, dateStamp)
 kRegion  = HMAC-SHA256(kDate,   region)
 kService = HMAC-SHA256(kRegion, "s3")
@@ -4993,7 +5029,8 @@ firma    = Hex(HMAC-SHA256(kSigning, stringToSign))
 
 `crypto.hmacSha256(secret: String, message: String) -> String` siempre toma y devuelve `String` -- su salida es la representación HEX del digest, no los bytes. Pasar esa hex de vuelta como `secret` del siguiente paso firma con la clave EQUIVOCADA (los bytes UTF-8 del texto hexadecimal, no los 32 bytes reales que representa) y produce una firma que no es la que AWS calcula. No hay forma de rodear esto desde c-script: el lenguaje no tiene (a propósito) un tipo de bytes crudos -- así que el encadenado tiene que resolverse DENTRO del runtime, en Rust, antes de que el resultado cruce a un `Value::Str`.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Factura = { id: Int, s3Key: String }
 
 rpc urlDeDescarga(f: Factura) -> String {
@@ -5023,7 +5060,8 @@ rpc urlDeDescarga(f: Factura) -> String {
 
 PLAN.md §9.9 ítem 6 (sección de SEO y descubribilidad para IA, abierta el 24/08/2026 a pedido explícito del usuario): un redirect 301/302 es una pieza básica de SEO clásico -- consolidar contenido duplicado, mandar una URL vieja a la nueva sin perder el "link juice" que un buscador le asignó -- pero `response.setStatus(code)` (§3.46) por sí solo no alcanza: fijar el status a 301/302 sin un header `Location` apuntando a algún lado no es un redirect, es un código de status sin sentido para el cliente.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Post = { id: Int, slug: String, oldSlug: String? }
 
 @route("/blog/:slug")
@@ -5057,7 +5095,8 @@ rpc post(slug: String) -> String {
 
 Auditoría del 25/08/2026, disparada por el pedido explícito del usuario de reducir la fricción de integrar terceros ("debemos dar soporte a la mayor cantidad de proveedores posibles"): investigando qué hacía falta para Twilio (autenticación HTTP Basic, `Authorization: Basic base64(accountSid:authToken)`) apareció que `base64.encode(data: String) -> String`/`base64.decode(base64Str: String) -> String` (RFC 4648 estándar con padding, crate `base64`) **ya existían en el checker y en el runtime desde antes** -- pero en NINGÚN lugar de GRAMMAR.md, README, o `llms.txt`, y sin un solo test que fijara su comportamiento. Exactamente el mismo patrón que llevó al incidente de la firma S3 falsa de MyFinance (§3.110): una capacidad real, invisible para cualquiera (persona o agente de IA) que necesitara encontrarla, así que en la práctica era como si no existiera.
 
-```
+<!-- linkc:fragment -->
+```rust
 rpc callTwilio(accountSid: String, authToken: String, body: String) -> String {
   let credentials = base64.encode(accountSid + ":" + authToken);
   http.postWithHeaders(
@@ -5087,7 +5126,8 @@ rpc callTwilio(accountSid: String, authToken: String, body: String) -> String {
 
 PLAN.md §9.9 ítem 6 (SEO y descubribilidad para IA): un CDN o un crawler de IA que respeta cachés necesita saber cuánto tiempo puede confiar en una respuesta sin volver a pedirla -- antes de esto, `linkc serve` no tenía forma de declarar ningún `Cache-Control`, así que toda respuesta salía sin ese header (equivalente a "no cachear nunca", el default más conservador y también el más caro para contenido que cambia poco, como un `sitemap.xml` o una página de blog).
 
-```
+<!-- linkc:fragment -->
+```rust
 @route("/sitemap.xml")
 @content_type("application/xml")
 @cache_control("public, max-age=86400")
@@ -5110,7 +5150,8 @@ rpc sitemap() -> String { sitemapXml(allUrls()) }
 
 PLAN.md §9.10, mismo pedido explícito del usuario de reducir fricción con la mayor cantidad de proveedores posible. Google APIs, Microsoft Graph, Salesforce, HubSpot y muchas otras APIs empresariales usan OAuth2 "client credentials" para autenticación SERVIDOR A SERVIDOR (sin login de usuario, distinto de OAuth2 "authorization code" -- ese sigue bloqueado, PLAN.md §9.12, porque verificarlo de punta a punta necesita un proveedor de identidad real con una app de prueba registrada). Auditando qué haría falta para esto aparecieron CERO gaps: las tres piezas ya existían.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Header = { name: String, value: String }
 
 rpc callProtectedApi(tokenUrl: String, clientId: String, clientSecret: String, apiUrl: String) -> String {
@@ -5135,7 +5176,8 @@ rpc callProtectedApi(tokenUrl: String, clientId: String, clientSecret: String, a
 
 **Issue #11**, reportado por IgnisLove con evidencia excepcional: 3 repros mínimos aislando la causa exacta más una tabla de 14 falsos positivos reales verificados a mano en 7 de los 17 `.link` de esa adopción (`bandit_rewards`, `banners`, `catalog_facets`, `irene_chat`, `reviews`, `rfm_scorer`, `seo_engine`). `linkc lint`'s `unused-var` marcaba como "no usada" una variable cuya ÚNICA aparición (o todas) caían dentro de (A) el `body` de una closure pasada como argumento a `.filter()`/`upsert`/`findWhere`, o (B) el valor de un campo de un struct-literal, cuando ese struct-literal era la expresión de cola del rpc (directa o como argumento de `insert(...)`/`upsert(...)`). Confirmado desde que el check existe (v1.62.0), no una regresión de una release puntual.
 
-```
+<!-- linkc:fragment -->
+```rust
 rpc queryFacetCounts(category: String) -> Int {
   let target = category.toLower();
   db.facets.all().filter(|f: FacetItem| {
@@ -5160,7 +5202,8 @@ Antes de esta ronda, `linkc lint` marcaba `target` como `unused-var` en este có
 
 PLAN.md §9.9 ítem 1 (SEO y descubribilidad para IA): antes de esta ronda, un `sitemap.xml`/`robots.txt` se escribía a mano armando el XML/texto como `String` (ver el ejemplo de §3.35) -- fácil de romper el formato (una etiqueta sin cerrar, un carácter especial sin escapar en una URL) sin que nada lo avisara hasta que un crawler real lo rechazara.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Page = { loc: String, lastmod?: Timestamp }
 type Rule = { userAgent: String, disallow?: String[], allow?: String[] }
 
@@ -5196,7 +5239,8 @@ rpc robots() -> String {
 
 Segundo ítem resuelto de PLAN.md §9.9 (SEO y descubribilidad para IA). Antes de esta ronda, meta tags/Open Graph/canonical URL/JSON-LD se escribían a mano concatenando `String` -- fácil de olvidar escapar un valor de usuario dentro de un atributo HTML, o de romper un bloque `<script type="application/ld+json">` si ese valor contenía literalmente `</script>`.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Meta = { name: String, content: String }
 type Og = { property: String, content: String }
 
@@ -5234,7 +5278,8 @@ rpc productPage(id: Uuid) -> String {
 
 Tercer y último ítem resuelto de PLAN.md §9.9. Convención [llmstxt.org](https://llmstxt.org/) -- **no confundir con el `llms.txt` de ESTE repo** (documenta el COMPILADOR c-script en sí, escrito a mano); este es el `llms.txt` que `linkc build` ahora emite para el proyecto DE QUIEN adopta el lenguaje, junto a `contract.d.ts`/`client.ts`/`validators.ts`/`hooks.ts`/`schemas.ts`/`openapi.json`. Antes de esta ronda, un agente de IA que llegaba a un proyecto c-script sin contexto previo tenía que leer el `.link` completo (o el `openapi.json` generado, mucho más verboso) para entender qué rpcs existen.
 
-```
+<!-- linkc:check -->
+```rust
 service Tasks {
   /// Lista todas las tareas pendientes, ordenadas por id.
   rpc list() -> Int { 1 }
@@ -5245,7 +5290,7 @@ service Tasks {
 
 `linkc build` de este programa emite, junto al resto de los archivos:
 
-```
+```bash
 # mi_app.link
 
 > API generada automáticamente por Link (c-script). Servicios y rpcs disponibles, cada uno con su firma y (si tiene) su docstring `///`.
@@ -5270,7 +5315,8 @@ service Tasks {
 
 Último ítem de PLAN.md §9.9 (SEO y descubribilidad para IA), y a diferencia de los ocho anteriores de la sección, este SÍ necesitaba gramática nueva: más allá de la descripción de `///` (§3.72), hacía falta una forma de declarar un ejemplo de request/response REAL, para que un agente que consume la API (o un humano generando código desde el contrato) entienda la forma exacta sin adivinar a partir del tipo solo.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Task = { id: Int, title: String }
 type CreateInput = { title: String }
 
@@ -5301,7 +5347,7 @@ service Tasks {
 
 PLAN.md §9.7 ítem 4: `linkc docker` (`docker.rs`) ya generaba `Dockerfile`/`docker-compose.yml`/`.dockerignore` para quien despliega en contenedores -- quien despliega contra una VM/bare metal con systemd no tenía el equivalente, y armar una unidad a mano significa adivinar las opciones de hardening correctas (`NoNewPrivileges`, `ProtectSystem`, ...) sin ninguna guía.
 
-```
+```bash
 linkc systemd main.link 4200 ./deploy
 # unidad systemd generada exitosamente: ./deploy/main.service
 ```
@@ -5320,7 +5366,7 @@ linkc systemd main.link 4200 ./deploy
 
 PLAN.md §9.7, el último ítem chico de esta subsección: mismo criterio que `linkc docker`/`linkc systemd` (§3.120), pero para quien ya usa PM2 como supervisor de procesos -- Node.js/PM2 siguen siendo comunes en el mismo tipo de VM/bare metal donde `linkc systemd` también aplica, y PM2 en particular ya aparece citado en PLAN.md §9.3 como topología real de un adoptador ("varios procesos `linkc serve-all`/pm2 compartiendo un único Postgres", el motivo detrás de `db.<c>.increment`, §3.105).
 
-```
+```bash
 linkc pm2-config main.link 4200 -o ecosystem.json
 # configuración PM2 generada exitosamente: ecosystem.json
 ```
@@ -5343,7 +5389,7 @@ linkc pm2-config main.link 4200 -o ecosystem.json
 
 PLAN.md §9.8, ítem 1: `linkc serve` ya dejaba una línea de log por request COMPLETADA, formato `clave=valor` (`log_done`, `runtime/server.rs`, greppable sin parsear JSON) -- lo que faltaba era (a) una forma de que un colector de logs real (CloudWatch, Datadog, `journald` con `-o json`) indexe los campos sin parsear texto libre, y (b) una forma de bajar el volumen en producción con tráfico real, donde una línea por cada request exitosa es demasiado ruido para mirar a mano.
 
-```
+```bash
 linkc serve app.link 3000 --log-format json --log-level warn
 ```
 
@@ -5365,7 +5411,7 @@ linkc serve app.link 3000 --log-format json --log-level warn
 
 PLAN.md §9.13: pedido explícito del usuario de mejorar cómo los hooks de React generados (`hooks.ts`) se integran con componentes reales. Auditando `codegen::ts_emit::emit_hooks` para eso apareció algo más urgente que ergonomía: **`use{Servicio}{Rpc}Query`/`use{Servicio}{Rpc}Mutation` no tenían ninguna protección contra una respuesta VIEJA resolviendo DESPUÉS de una más nueva** -- el caso real es un buscador que llama al hook de Query por cada letra tipeada (el `useEffect` interno re-dispara `refetch` en cada cambio de parámetros): si la request de la letra ANTERIOR es más lenta que la de la letra ACTUAL, puede resolver después y pisar `data` con un resultado ya desactualizado, en SILENCIO, sin ningún error visible. El hook de `stream` ya se protegía de esto con un `cancelled` booleano en su `useEffect`; los de Query/Mutation, agregados en una ronda anterior, no.
 
-```
+```text
 export function useUsersSearchQuery(client: UsersClient, term: string) { /* ... */ }
 
 function SearchBox() {
@@ -5394,7 +5440,7 @@ function SearchBox() {
 
 Mismo pedido del usuario que motivó §3.123 ("mejora las conexiones del backend con componentes"), continuado explícitamente ("avanza con el cache"): hoy, dos componentes que llaman al MISMO `use{Servicio}{Rpc}Query` con los MISMOS parámetros (ej. un `<Header>` y un `<Sidebar>` mostrando el mismo conteo de notificaciones) disparaban DOS fetches independientes y mantenían DOS copias de estado sin relación entre sí -- ni comparten el resultado, ni una que refresca actualiza a la otra. Es el problema clásico que react-query/SWR resuelven con un cache global; acá se resuelve DENTRO del propio `hooks.ts` generado, sin sumar ninguna de esas librerías como dependencia nueva.
 
-```
+```text
 function Header({ client }: { client: TasksClient }) {
   const { data } = useTasksListQuery(client); // dispara UNA request (o la comparte si ya hay una)
   return <span>{data?.length ?? 0} tareas</span>;
@@ -5426,7 +5472,8 @@ function Sidebar({ client }: { client: TasksClient }) {
 
 Mismo pedido del usuario, continuado explícitamente ("si, sigue con eso") tras el límite documentado en §3.124(2): hasta acá, `useUsersCreateMutation` no tenía forma de avisarle a `useUsersListQuery` que sus datos quedaron viejos -- cada componente era responsable de llamar a `refetch()` a mano tras una mutación exitosa, lo cual funciona pero es fácil de olvidar (y el compilador no puede avisar de un `refetch()` faltante en un componente que ni siquiera existe todavía). `@invalidates(rpc1, rpc2, ...)` cierra ese hueco de forma declarativa: se anota la Mutation, no cada Query que la consume.
 
-```
+<!-- linkc:fragment -->
+```rust
 service Tasks {
   rpc list() -> Task[] { db.tasks.all() }
   rpc stats() -> BoardStats { /* ... */ }
@@ -5712,7 +5759,8 @@ Continuación directa del mismo audit de §3.131/§3.132: `openapi_emit.rs` (`ty
 
 Vuelta a mejoras de TypeScript/React (no bugs) tras cerrar el audit de §3.131-§3.133: de los tres tipos de hook generado, `use{Servicio}{Rpc}Query` tiene `refetch()`, pero ninguno sabía manejar PAGINACIÓN -- un componente con scroll infinito tenía que gestionar el cursor a mano, llamando a `client.<rpc>(cursor, limit)` directo y concatenando páginas él mismo. `db.<c>.pageAfter(cursor: Int?, limit: Int)` (§3.61) ya es el único mecanismo de paginación por cursor del lenguaje -- este ítem le da un hook dedicado.
 
-```
+<!-- linkc:fragment -->
+```rust
 service Tasks {
   @infinite(cursor, limit)
   rpc listPaged(cursor: Int?, limit: Int) -> Task[] {
@@ -6002,7 +6050,8 @@ linkc serve-all ./services --port-base 3000 --port-registry ./services/ports.jso
 Pedido real de un adoptador en fase de discovery (vía otra sesión de Claude coordinando la migración -- IgnisLove, checkout/pedidos): "crear pedido + descontar stock + cerrar carrito, con rollback si falla algo" no tenía forma segura de expresarse en un `.link` -- cada `insert`/`applyPatch`/`delete`/`increment` es autocommit individual (GRAMMAR.md §3.17/§2.1), así que un fallo a mitad de una secuencia de escrituras relacionadas dejaba la base en un estado a medias, sin ningún mecanismo del lenguaje para deshacerlo. Era el ÚNICO bloqueo real (no de conveniencia) para migrar un flujo de checkout completo -- confirmado explícitamente en esa misma conversación: "es el único punto de vuestra lista que bloquea migración completa por diseño, no por falta de código".
 
 <!-- linkc:fragment -->
-```
+<!-- linkc:fragment -->
+```rust
 rpc checkout(productId: Int, qty: Int) -> Order {
   transaction {
     let matches = db.stock.findWhere(|s: Stock| { s.productId == productId });
@@ -6441,7 +6490,8 @@ Cierra los hallazgos #5-#10 de `AUDIT-2026-08-27.md` (severidad media), el paque
 
 §3.109 había dejado esto explícitamente como "alcance deliberado, queda para una ronda dedicada si aparece evidencia real" -- sin ningún reporte de adopción pidiéndolo puntualmente, pero con el hueco documentado desde el principio ("`||` necesitaría una cláusula `OR` separada en el SQL generado... una forma bastante más rica que agregar hojas a una lista plana"). Con la auditoría de `AUDIT-FIX-PLAN-2026-08-27.md` cerrada, este quedaba como el ítem "sin bloqueos" de mayor valor del backlog restante.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Ticket = { id: Int, status: String, priority: Int, assignee: String }
 
 rpc mineOrCritical(who: String) -> Ticket[] {
@@ -6465,7 +6515,8 @@ rpc mineOrCritical(who: String) -> Ticket[] {
 
 Último hueco documentado del pushdown de predicados: §3.170 había dejado explícito que "una comparación entre DOS campos del propio parámetro (`endDate > startDate`) sigue sin pushear -- sin forma de expresar 'columna vs. columna' en un valor bindeado". Caso motivador citado en el propio PLAN.md: filtrar rangos de fecha inválidos (`endDate <= startDay`) sin traer la tabla entera a memoria.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Booking = { id: Int, room: String, startDay: Int, endDay: Int }
 
 rpc invalidRanges() -> Booking[] {
@@ -6487,7 +6538,8 @@ rpc invalidRanges() -> Booking[] {
 
 §3.161 había dejado esto explícito como lo único que quedaba REALMENTE abierto del Pilar 3 (sistema de módulos) del roadmap de tres pilares que skynet-d3 relayó a nombre de Carlos: "un solo `db { ... }` por programa, sigue siendo un error duro... permitir varios `db {}` es una decisión de diseño con su propio peso (¿se fusionan las colecciones? ¿qué pasa con dos colecciones del mismo nombre en módulos distintos?)". Antes de esta ronda, el ÚNICO patrón que funcionaba era un `schema.link` central con el `db { ... }` que los módulos de servicio importaban -- cada módulo NO podía ser dueño de sus propias colecciones.
 
-```
+<!-- linkc:fragment -->
+```rust
 // billing.link
 type Invoice = { id: Int, amount: Int }
 db { invoices: Invoice[] }
@@ -6523,7 +6575,8 @@ import "./crm.link";
 
 §3.96 había dejado esto explícito en sus "Límites honestos": "solo rangos numéricos simples, ninguna expresión booleana arbitraria (comparar dos campos entre sí)". PLAN.md §9.3 ítem 3 lo repetía con el mismo ejemplo motivador: `endDate > startDate`.
 
-```
+<!-- linkc:check -->
+```rust
 @check(endDay > startDay)
 type Booking = { id: Int, room: String, startDay: Int, endDay: Int }
 ```
@@ -6550,7 +6603,8 @@ type Booking = { id: Int, room: String, startDay: Int, endDay: Int }
 
 §3.155 había dejado esto explícito como la mitad que quedaba afuera de su ronda: "sin evidencia de demanda propia todavía más allá del caso de Glowapp ya citado, y es una pieza de diseño separada (sintaxis para una expresión booleana en la anotación, no solo una lista de nombres de campo)". El caso citado, textual: el schema Drizzle de Glowapp declara `UNIQUE(userId, appointmentDate, startTime) WHERE status != 'cancelled'` -- permite reusar un horario una vez cancelado, sin acumular filas basura.
 
-```
+<!-- linkc:check -->
+```rust
 @unique(userId, appointmentDate, startTime) where status != "cancelled"
 type Appointment = { id: Int, userId: Int, appointmentDate: String, startTime: String, status: String }
 ```
@@ -6580,7 +6634,7 @@ db { items: Item[] }
 service Items { rpc add(name: String) -> Item { db.items.insert(Item { id: 0, name: name }) } }
 ```
 
-```
+```bash
 $ linkc db inspect app.link --db app.db
 linkc db inspect -- 'app.link' contra SQLite embebido en 'app.db'
 
@@ -6660,7 +6714,8 @@ service Leads {
 
 **Sin flag nuevo, sin cambio de sintaxis -- `@rate_limit("N/ventana")` es exactamente el mismo de siempre.** Lo que cambia es DÓNDE vive el estado del bucket: una tabla interna, `_linkc_internal_rate_limits` (prefijo reservado, nunca colisiona con una colección declarada por el usuario), creada automáticamente al conectar contra Postgres -- invisible para `db {}`, `linkc introspect`, `linkc migrate --dry-run`/`linkc db inspect` (ninguno de los tres la lista ni la toca, no es una colección del programa). SQLite sigue exactamente igual que siempre -- un solo archivo/proceso ya tiene el estado exacto en memoria, no hay nada que distribuir.
 
-```
+<!-- linkc:check -->
+```rust
 service Sys {
   @rate_limit("5/2s")
   rpc ping() -> String { "pong" }
@@ -6840,7 +6895,7 @@ service Items {
 }
 ```
 
-```
+```bash
 $ linkc db export app.link export.json --db app.db
 linkc db export -- 'app.link' contra SQLite embebido en 'app.db' -> 'export.json'
 
@@ -6888,7 +6943,7 @@ PLAN.md §9.2 ítem 2, "Pilar 2" del roadmap de concurrencia (propuesto por skyn
 
 **El problema real, medido**: cada builtin (`checker.rs::try_builtin_method`, ~74 arms entre `crypto`/`http`/`math`/`string`/`db`/`auth`/etc.) se define en DOS lugares que pueden desincronizarse a mano: un arm `(Type::X, "method") => {...}` en `checker.rs` (destructura N args exactos, un `check_expr` por cada uno, devuelve un `Type`) y un arm espejo `"method" => {...}` en `runtime/mod.rs::call_method` (la lógica real). El lado checker es **máximamente regular** -- los 51 arms de `crypto`/`http`/`math`/etc. siguen exactamente la misma forma, ninguno tiene aridad opcional/variable. El lado runtime NO es regular (20-30+ líneas de lógica real, llamadas a crates externos) -- no se puede generar, sigue escrito a mano.
 
-```
+```text
 macro_rules! builtin_args {
     ($self:ident, $args:ident, $env:ident, $qualified_name:literal, [$(($pname:ident, $pdesc:literal, $pty:expr)),+ $(,)?] -> $ret:expr) => {{
         let [$($pname),+] = $args else {
@@ -6905,7 +6960,7 @@ macro_rules! builtin_args {
 
 Uso -- reemplaza un arm de 5-7 líneas por 1:
 
-```
+```text
 (Type::Crypto, "hashPassword") => builtin_args!(
     self, args, env, "crypto.hashPassword",
     [(pwd, "password: String", Type::String)] -> Type::String
@@ -6957,7 +7012,7 @@ service Users {
 }
 ```
 
-```
+```bash
 $ linkc lint app.link
 lint: 1 advertencia(s) en app.link:
   [manual-role-check-without-requires] app.link:3:3: 'deleteUser' llama a auth.currentRole()/currentUserId() para hacer su propia verificación de rol, pero no tiene @requires/@authenticated -- un bug en esa lógica ad-hoc bypasea el chequeo entero en silencio; declará @requires(Role.X) o @authenticated en el rpc
@@ -6975,7 +7030,7 @@ lint: 1 advertencia(s) en app.link:
 
 Última pieza de la suite de administración de datos que §3.175 (`inspect`) y §3.185 (`export`/`import`) dejaron pendiente. Un REPL de solo lectura sobre stdin/stdout: una línea de entrada = una consulta SQL, ejecutada contra la base real del `.link` dado -- sin conocer de antemano qué SQL va a llegar, así que hace falta un camino de "SQL arbitrario, filas de tipo dinámico" que no existía en ningún lado de este proyecto hasta ahora (`Backend::query`, el camino que `db.<coll>.find/all/...` usa, exige `&[ColumnKind]` de antemano).
 
-```
+```bash
 $ linkc db shell app.link --db app.db
 db> SELECT id, name, price FROM items;
 id  name    price 
@@ -7078,7 +7133,7 @@ service Users {
 }
 ```
 
-```
+```bash
 $ linkc serve app.link 8787 --db app.db
 error: el programa declara al menos un campo '@encrypted', pero no se configuró --encryption-key/LINK_ENCRYPTION_KEY
 
@@ -7142,7 +7197,7 @@ service Items {
 }
 ```
 
-```
+```bash
 $ linkc serve app.link 8787 --db postgres://localhost/shared --db-schema tenant_a
 $ linkc serve app.link 8788 --db postgres://localhost/shared --db-schema tenant_b
 ```
@@ -7170,7 +7225,8 @@ Los dos procesos comparten la MISMA base `shared`, la MISMA colección `items` -
 
 §3.110 (`crypto.awsS3PresignedUrl`, solo `GET`) documentó desde el principio por qué la mitad de SUBIDA quedaba deliberadamente fuera de esa ronda: una URL presignada para `PUT` necesita, además, atar quién la usa a un `Content-Type` concreto -- un contrato más amplio entre quien genera la URL y quien la usa que el caso de descarga no tiene. PLAN.md §8.5.1 (barrido de higiene del backlog, 30/08/2026) confirmó que esa mitad seguía sin evidencia real de demanda pero tampoco bloqueada por nada -- alcance chico, mecanismo ya probado, sin necesitar diseño nuevo.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Documento = { id: Int, s3Key: String }
 
 rpc urlDeSubida(d: Documento) -> String {
@@ -7193,7 +7249,8 @@ Las dos funciones comparten toda la lógica de firma en un único helper privado
 
 Encontrado el 31/08/2026 validando el diseño de la ronda de PLAN.md §9.14 (no buscado a propósito) -- `impl PartialEq for Value` (`runtime/mod.rs`, escrito a mano en vez de derivado, por el ciclo que `Closure` introduciría) tenía arms para `Int`/`Int64`/`Timestamp`/`Float`/`Str`/`Uuid`/`Bool`/`Struct`/... pero **ningún arm para `(Decimal, Decimal)`** -- caía al `_ => false` genérico del `match`. `BinaryOp::Eq`/`NotEq` llaman `l == r` directo sobre `Value`, así que **toda comparación `Decimal == Decimal` en un programa `.link` corriendo daba `false`, y toda `!=` daba `true`, incluso comparando un valor contra sí mismo**.
 
-```
+<!-- linkc:check -->
+```rust
 service Money {
   rpc same(a: Decimal, b: Decimal) -> Bool { a == b }
 }
@@ -7211,7 +7268,8 @@ Antes del fix, `same(10.0000, 10.0000)` devolvía `false`. El checker dejaba pas
 
 PLAN.md §9.14 ítem 4 -- `Value::Timestamp` ya es milisegundos planos desde epoch (`i64`) internamente, no una fecha descompuesta en partes de calendario -- sumar/restar tiempo es aritmética entera pura, sin tocar el algoritmo de calendario de Hinnant que este proyecto ya tiene (§3.31, usado solo para `dateFromParts`/`toIsoString`/parseo, nunca para esto). Reporte real de un adoptador en producción (MyFinance): expiración de 5 minutos para un código OTP de 2FA era imposible de calcular ("ahora + N minutos" no existía en ningún punto del lenguaje) -- terminaron apoyándose solo en "de un solo uso" en vez de una expiración temporal real.
 
-```
+<!-- linkc:fragment -->
+```rust
 type Otp = { userId: Int, code: String, expiresAt: Timestamp }
 
 rpc issueOtp(userId: Int, code: String) -> Otp {
@@ -7237,7 +7295,8 @@ rpc verifyOtp(userId: Int, code: String) -> Bool {
 
 PLAN.md §9.14 ítem 3 -- hasta esta ronda, `--jwt-role-claim`/`--jwt-user-id-claim` (§3.64) eran los ÚNICOS dos claims de un JWT accesibles desde `.link`, cada uno fijado a un slot de significado fijo UNA vez al arrancar. Un adoptador real en producción (MyFinance) reportó un caso de seguridad genuino, no una molestia de ergonomía: su JWT real lleva un claim `tokenVersion` (para invalidar sesiones tras un reset de contraseña), pero ningún rpc podía leerlo -- un token técnicamente revocado seguía siendo válido hasta su expiración natural (15 minutos en su caso).
 
-```
+<!-- linkc:check -->
+```rust
 service Cuenta {
   @authenticated
   rpc revisarSesion(tokenVersionReal: Int) -> Bool {
@@ -7258,7 +7317,8 @@ service Cuenta {
 
 PLAN.md §9.14 ítem 1 -- superficie de `String` antes de esta ronda: `length`/`contains`/`startsWith`/`endsWith`/`trim`/`toUpper`/`toLower`/`escapeHtml` -- sin slicing, sin reemplazo, sin partir, sin relleno. Bloqueó de verdad, en producción, dos exports contables reales y ya auditados de un adoptador (MyFinance): formato A3 Contable (fixed-width, necesita `padStart`) y ContaPlus/XDIARIO (necesita sanear `;`/saltos de línea de un campo de texto libre con `.replace()` antes de unirlo con `;` -- un `;` suelto dentro de un concepto corrompería las columnas del software real de la gestoría).
 
-```
+<!-- linkc:fragment -->
+```rust
 type LineaContable = { concepto: String, importe: String }
 
 rpc exportarXdiario(lineas: LineaContable[]) -> String {
@@ -7286,7 +7346,8 @@ rpc exportarXdiario(lineas: LineaContable[]) -> String {
 
 Reportado el 31/08/2026 por la sesión `fix-myf-audit-findings` (adoptador MyFinance) inmediatamente después de actualizar a v1.152.0 para verificar el fix de §3.195 -- no era ese bug, era uno distinto y nuevo. El checker tipa `Decimal.toFloat()`/`Decimal.toString()` sin ningún problema (§3.184), y el `match method` que los implementa en `runtime/mod.rs` (`Value::Decimal(n) => { "toFloat" => ..., "toString" => ... }`) está correctamente escrito -- pero **nunca se llegaba a ejecutar**.
 
-```
+<!-- linkc:check -->
+```rust
 service Money {
   rpc probar() -> Float {
     let d = 123.45.toDecimal();
@@ -7307,7 +7368,8 @@ Antes del fix, esto compilaba limpio con `linkc build` pero fallaba en `linkc se
 
 PLAN.md §9.14 ítem 2 -- última pieza de la ronda MyFinance. `let mut`/reasignación YA existía y ya permitía acumular escalares en un `while` (`let mut total = 0; total = total + x;`); lo único que faltaba era que `+` aceptara `List<T>` -- con eso, el MISMO mecanismo ya existente resuelve "acumular una lista creciendo en un loop", sin ningún constructo de mutación nuevo. Bloqueó de verdad, en producción, marcar facturas ya conciliadas durante conciliación bancaria (para no cruzar el mismo movimiento contra dos facturas del mismo importe exacto) -- forzaba un workaround aceptado pero imperfecto.
 
-```
+<!-- linkc:check -->
+```rust
 service Conciliacion {
   rpc marcarUsadas(ids: Int[], nuevoId: Int) -> Int[] {
     ids + [nuevoId]
@@ -7330,7 +7392,8 @@ service Conciliacion {
 
 PLAN.md §9.15 ítem 1 -- primer ítem de la ronda posterior a §9.14, el "segundo reporte" de MyFinance: generar PDF real (facturas/presupuestos). Antes de esto, c-script no tenía ningún primitivo para producir bytes de PDF -- solo podía adjuntar a un email un blob YA generado en base64 (`smtp.sendMessage`, §3.141). Sin esto, facturación con PDF real no podía migrar nunca.
 
-```
+<!-- linkc:fragment -->
+```rust
 enum PdfBlock {
   Text  { content: String, bold: Bool, size: Int },
   Table { headers: String[], rows: String[][] },
@@ -7368,7 +7431,8 @@ rpc facturaPdf(cliente: String, lineas: String[][], total: String) -> String {
 
 PLAN.md §9.15 ítem 2, inmediatamente después de cerrar el ítem 1 (`pdf.build`, §3.201). Mismo origen que PDF (el "segundo reporte" de MyFinance, §9.14 ítem 5): MYF genera exports en `.xlsx` real y también PARSEA `.xlsx` para importar extractos bancarios y conciliar -- a diferencia de PDF, acá hacían falta las dos direcciones.
 
-```
+<!-- linkc:fragment -->
+```rust
 enum ExcelCell {
   Text   { value: String },
   Number { value: Decimal },
@@ -7418,7 +7482,8 @@ rpc importarExtracto(base64: String) -> ExcelSheet[] { excel.parse(base64) }
 
 PLAN.md §9.15 ítem 3, último de la ronda posterior a MyFinance (tras PDF §3.201, Excel §3.202). Origen: §9.14 ítem 6 -- MyFinance expone un servidor MCP real para claude.ai (`@modelcontextprotocol/sdk`, `StreamableHTTPServerTransport`) para que un LLM pueda invocar sus `rpc` como *tools* -- `stream`/`subscribe()` (§3.13/§3.16) es SSE unidireccional, sin sesión de conexión ni forma de que el servidor inicie una llamada hacia el cliente.
 
-```
+<!-- linkc:fragment -->
+```rust
 enum Role { Admin }
 
 service Auth {
@@ -7463,7 +7528,8 @@ Dos forks de research (arquitectura contra la spec pública de `Streamable HTTP 
 
 Auditoría del lenguaje pedida por el usuario ("has una auditoría en el lenguaje, por si encontrás algún error o bug", 01/09/2026), tras cerrar PLAN.md §9.15 entero (PDF §3.201, Excel §3.202, MCP §3.203). Un fork de investigación cruzó las tres piezas de esa ronda entre sí y encontró que un `rpc` cuyo tipo de parámetro/retorno fuera `PdfBlock`/`ExcelCell`/`ExcelSheet` generaba artefactos rotos:
 
-```
+<!-- linkc:check -->
+```rust
 service Docs {
   rpc makeBlock() -> PdfBlock { PdfBlock.Text { content: "hola", bold: true, size: 12 } }
   rpc importSheet(sheets: ExcelSheet[]) -> Bool { true }
@@ -7482,7 +7548,8 @@ Antes del fix: `contract.d.ts` **referenciaba** `PdfBlock`/`ExcelSheet` en la fi
 
 Mismo fork de auditoría, segundo hallazgo. `tools/list`/`tools/call` (§3.203, Pieza B) aplanan `(service, rpc)` a un único nombre de tool `"{service}_{rpc}"` -- MCP exige un espacio de nombres PLANO de un solo string, sin ningún separador estructurado real (a diferencia de la ruta REST `/{service}/{rpc}`, donde `/` nunca puede aparecer dentro de un identificador). Como un nombre de `service`/`rpc` puede tener guiones bajos propios, dos pares **distintos** pueden generar el MISMO string combinado:
 
-```
+<!-- linkc:check -->
+```rust
 service A_B { rpc c() -> Int { 1 } }   // "A_B_c"
 service A   { rpc B_c() -> Int { 2 } } // también "A_B_c"
 ```
@@ -7613,6 +7680,21 @@ Origen: `PLAN.md §9.17` ítem 2 (Bloque A), hallazgo MEDIO de la auditoría de 
 - El id de correlación sigue viajando en claro dentro del stream SSE de la sesión -- la confidencialidad de ese canal es del TLS de la capa de despliegue (§3.89/§3.41), igual que la de cualquier otro header o body.
 
 **Verificado**: `cli_mcp.rs` contra el binario real -- test nuevo con las TRES entregas sobre un mismo sampling pendiente real (anónima → 401; segunda sesión MCP real del mismo servidor pero ajena → 404 con el mismo mensaje que un id inexistente; la dueña → 200 y el `rpc` termina con el valor correcto, probando de paso que los dos rechazos no consumieron la entrada pendiente). El test de round-trip existente actualizado para entregar con el header (antes pasaba sin ninguno -- la demostración involuntaria del bug). Los 18 tests de `cli_mcp.rs` verdes.
+
+### 3.213 Una cerca sin lenguaje en la documentación es un error del test de ejemplos — RESUELTO, cierra PLAN.md §9.17 ítem 6
+
+Origen: `PLAN.md §9.17` ítem 6 (Bloque B), hallazgo de la auditoría del 02/09/2026 sobre la red de `docs_examples.rs`. El test que garantiza "todo ejemplo publicado compila" solo consideraba cercas abiertas con ` ```rust ` o ` ```link ` -- cualquier cerca PELADA (` ``` ` sin lenguaje) se saltaba entera, en silencio, como si fuera "otro lenguaje". GRAMMAR.md -- listado en `DOCS` desde el principio, con la nota "sus ejemplos no tienen por qué estar menos verificados que los del README" -- tenía **96 aperturas peladas**, incluidos los ejemplos publicados de `pdf.build` (§3.201), `excel.build`/`excel.parse` (§3.202) y `mcp.sample` (§3.203). El panic de "bloque sin clasificar" nunca se disparaba para ellas porque la clasificación ocurría DESPUÉS del filtro de lenguaje: la garantía era real para el README y falsa para la spec misma.
+
+**El fix (v1.172.0), en dos mitades:**
+
+1. **El barrido**: las 96 cercas de GRAMMAR.md (más 4 en README/README.es/docs) clasificadas una por una CONTRA EL BINARIO REAL, no a ojo -- un script probó compilar cada bloque con `linkc test` (el camino rápido de §3.206): los que compilan solos quedaron ` ```rust ` + `linkc:check` (18 ejemplos NUEVOS entran a la red de verificación de CI, 30→48), los que parecen Link pero no compilan aislados quedaron `linkc:fragment` (69 -- recortes de spec, y también lo que la spec documenta a propósito como RECHAZADO por el parser), y el resto quedó tipado explícito (` ```bash `/` ```text `/` ```json `).
+2. **La puerta cerrada**: `docs_examples.rs` ahora rechaza cualquier apertura pelada en los archivos listados, con un mensaje que dice exactamente qué poner. La clasificación pasa a ser binaria y a prueba de futuro: `rust`/`link` entra a la red; cualquier otro lenguaje declarado queda afuera -- pero nunca "afuera sin que nadie lo haya decidido", que era el agujero real.
+
+**Límites honestos:**
+- `linkc:fragment` sigue significando "no se verifica" -- el barrido no convierte los 69 fragments en ejemplos compilados, los hace VISIBLES como no-verificados. Los ejemplos de `pdf.build`/`excel.build` de la spec son fragments legítimos (usan tipos pre-sembrados en contexto parcial); su verificación real con el binario es el ítem 7 de PLAN.md §9.17 (`cli_pdf_excel.rs`), no este.
+- La clasificación automática `text` vs `rust`+`fragment` para recortes chicos sin palabras clave de Link (una firma de API suelta, una llamada de método aislada) fue heurística -- un recorte tipado `text` que en verdad es Link no rompe nada, solo queda fuera de la red igual que antes; retipearlo es un cambio de una línea cuando alguien lo note.
+
+**Verificado**: `docs_examples.rs` verde con las 100 cercas tipadas (los 18 bloques nuevos de GRAMMAR.md compilan de verdad en el test); una cerca pelada agregada a mano hace fallar el test con el mensaje nuevo, confirmado antes de commitear.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
