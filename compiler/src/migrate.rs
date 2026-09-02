@@ -122,6 +122,19 @@ pub fn dry_run_postgres(program: &Program, url: &str, schema: Option<&str>) -> R
         }
     }
 
+    // GRAMMAR.md §3.229: lo que NINGÚN DDL puede arreglar -- una columna
+    // que existe pero con un tipo que el runtime no va a poder leer o
+    // escribir. Como comentarios SQL, para que el archivo siga siendo
+    // ejecutable tal cual y el aviso no se pierda en un pipe.
+    let type_issues = crate::schema_check::check_program(program, &backend)?;
+    if !type_issues.is_empty() {
+        out.push_str("-- Problemas de TIPO entre lo declarado y las columnas reales (no los arregla ninguna migración\n");
+        out.push_str("-- automática -- hay que cambiar el .link o la columna a mano, GRAMMAR.md §3.229):\n");
+        for issue in &type_issues {
+            out.push_str(&format!("--   {}\n", issue.render()));
+        }
+        out.push('\n');
+    }
     if !any_change {
         out.push_str("-- Nada que migrar: el schema declarado ya coincide con lo que hay en la base.\n");
     }

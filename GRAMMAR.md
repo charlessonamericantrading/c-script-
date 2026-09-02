@@ -250,6 +250,7 @@
   - [3.226 `crypto.verifyPassword` acepta hashes bcrypt (`$2a$`/`$2b$`/`$2y$`) y `isLegacyHash` los reporta como legado — RESUELTO](#3226-cryptoverifypassword-acepta-hashes-bcrypt-2a2b2y-y-islegacyhash-los-reporta-como-legado--resuelto)
   - [3.227 `CacheLock` (dependencias git) reintenta ante CUALQUIER error de creación, no solo "ya existe" — RESUELTO](#3227-cachelock-dependencias-git-reintenta-ante-cualquier-error-de-creación-no-solo-ya-existe--resuelto)
   - [3.228 Columnas `ARRAY` nativas de PostgreSQL como `Int[]`/`String[]`/`Bool[]`/`Float[]`, y `linkc triggers --only-streams` — RESUELTO](#3228-columnas-array-nativas-de-postgresql-como-intstringboolfloat-y-linkc-triggers---only-streams--resuelto)
+  - [3.229 `doctor`, `db inspect` y `migrate --dry-run` avisan de una columna con tipo incompatible ANTES de leer una fila — RESUELTO](#3229-doctor-db-inspect-y-migrate---dry-run-avisan-de-una-columna-con-tipo-incompatible-antes-de-leer-una-fila--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7958,7 +7959,7 @@ Origen: `PLAN.md §9.19` ítem 3. Tres tablas reales del CRM Nexus (`customers.p
 
 **Qué hay (v1.186.0)**: la misma clase de fix que `uuid`/`inet`/`json`/`timestamp` nativos (§3.179/§3.187/§3.182) -- el tipo lo decide la columna real, no el programa, y ningún otro punto del runtime se entera:
 - **Lectura** (`store.rs::postgres_array_cell`): cuando una columna declarada como lista no es `json`/`jsonb`, se intenta como array nativo -- `bigint[]`/`integer[]`/`smallint[]` → `Int[]`, `text[]`/`varchar[]`/`char[]` → `String[]`, `boolean[]` → `Bool[]`, `double precision[]`/`real[]` → `Float[]`. Un `NULL` de una columna array nullable es `null`, como siempre. Si tampoco es un array soportado, sale el error original del driver (no uno inventado).
-- **Escritura** (`store.rs::json_array_to_pg`): contra una columna array, la lista se bindea como el array de Postgres que la columna pide -- `Int[]` contra `integer[]` va como enteros de 32 bits, contra `bigint[]` de 64 (mismo criterio que `Cell::Int` contra INT2/INT4). Un elemento que no calza (un `Int` que no entra en 32 bits, un string donde la columna pide enteros) es un error limpio del rpc con la posición del elemento, nunca un 500 del motor ni un panic. Lo que c-script escribe es un array de verdad: el sistema viejo lo lee con su tipo nativo, sin JSON de por medio.
+- **Escritura** (`store.rs::json_array_to_pg`): contra una columna array, la lista se bindea como el array de Postgres que la columna pide -- `Int[]` contra `integer[]` va como enteros de 32 bits, contra `bigint[]` de 64 (mismo criterio que `Cell::Int` contra INT2/INT4). Un elemento que no calza (un `Int` que no entra en 32 bits, un string donde la columna pide enteros) es un error limpio del rpc con la posición del elemento, nunca un 500 del motor ni un panic. Lo que c-script escribe es un array de verdad: el sistema viejo lo lee con su tipo nativo, sin JSON de por medio. Un campo `T[]?` en `null` va como NULL de SQL (v1.187.0 -- en v1.186.0 rompía el `insert` entero con `error serializing parameter N`: el JSON `null` llegaba a la rama de arrays, que exigía una lista; el test de CI lo encontró antes que ningún usuario). Y un error del driver del lado cliente muestra su causa interna, no solo el número del parámetro.
 - **`linkc introspect`** lee `udt_name` (lo único que dice el tipo del elemento cuando `data_type` es `ARRAY`) y emite `Int[]`/`String[]`/`Bool[]`/`Float[]` como mapeo EXACTO, sin advertencia. Un array de otro tipo (`uuid[]`, `timestamp[]`, `numeric[]`, `jsonb[]`) sale como `String[]` CON advertencia: va a fallar al leer una fila real, declaralo a mano o dejalo fuera.
 - **SQLite no cambia**: una lista sigue siendo JSON en `TEXT`. Postgres SIN adoptar tampoco: `linkc serve` sigue creando `jsonb` para un campo `T[]` -- el array nativo aparece solo cuando la tabla ya existía con ese tipo (`--adopt-existing`, o una migración externa).
 
@@ -7967,6 +7968,35 @@ Origen: `PLAN.md §9.19` ítem 3. Tres tablas reales del CRM Nexus (`customers.p
 **Verificado**: `pg_integration.rs` contra Postgres REAL en CI -- tabla creada por "el sistema viejo" con `integer[] NOT NULL`, `text[] NOT NULL`, `boolean[]` nullable y `bigint[]`, una fila insertada por un `postgres::Client` directo, adoptada con `--adopt-existing`: la lectura devuelve las cuatro listas con sus tipos; un `insert` de c-script escribe arrays nativos (verificado leyéndolos de vuelta con `Vec<i32>`/`Vec<String>`/`Vec<i64>` desde el cliente externo, y `null` → NULL); `.contains()` sobre la lista funciona; un elemento fuera de rango de 32 bits es un error limpio y el proceso sigue vivo. Unitarios: mapeo de `introspect` por `udt_name` (6 tipos + la advertencia), `stream_collections`, y `cli_triggers.rs` con `--only-streams` contra el binario.
 
 **Límite honesto**: arrays de `uuid`/`timestamp`/`numeric`/`jsonb` y arrays multidimensionales quedan fuera (fallan al leer con el error del driver, e `introspect` avisa); `findWhere` no empuja un predicado sobre una lista a SQL (`= ANY(...)`) -- el filtro corre en memoria como cualquier `List`.
+### 3.229 `doctor`, `db inspect` y `migrate --dry-run` avisan de una columna con tipo incompatible ANTES de leer una fila — RESUELTO, cierra PLAN.md §9.19 ítem 4
+
+Origen: `PLAN.md §9.19` ítem 4. Las tres herramientas de pre-despliegue miraban solo si la tabla y las columnas EXISTÍAN (`existing_columns`, `validate_columns_exist_for_adoption`), nunca de qué tipo eran. Una columna `uuid[]` declarada como `String[]`, o un `integer` declarado como `Bool`, pasaban `doctor` con "0 errores", `db inspect` con sus filas contadas y `migrate --dry-run` con "nada que migrar" -- y el fallo aparecía en producción, al leer la primera fila real. Así descubrió el CRM Nexus los arrays de §3.228, en dos servicios distintos.
+
+**Qué hay (v1.187.0)**: `schema_check.rs`, la tabla de compatibilidad de `runtime/store.rs` (lo que `postgres_cell` sabe leer y `Cell::to_sql` sabe escribir, por tipo de columna real) escrita UNA vez como dato, y consultada por las tres herramientas contra `information_schema.columns` (`data_type` + `udt_name` + `is_nullable`), de solo lectura, sin DDL:
+
+| Campo declarado | Columnas compatibles |
+|---|---|
+| `Int`/`Int64` | `bigint`, `integer`, `smallint` |
+| `Timestamp` | los tres enteros (ms), `timestamp`, `timestamptz`, `date` (§3.91/§3.182) |
+| `Float` | `double precision`, `real`, `numeric` |
+| `Decimal` | `numeric` (§3.184) |
+| `Bool` | `boolean` |
+| `String` / enum simple | `text`, `varchar`, `char`, `citext`, y `uuid`/`inet`/`cidr`/`json`/`jsonb` nativos (§3.179/§3.187) |
+| `Uuid` | `uuid`, texto |
+| `T[]`, struct, `Map` (JSON) | `jsonb`, `json`, texto; y un ARRAY nativo SOLO si el campo es una lista del elemento correspondiente (§3.228) |
+| `@encrypted` (cualquier tipo) | texto (`bytea` tolerado) -- viaja cifrado como texto |
+
+Dos severidades: **ERROR** (va a fallar al leer o escribir una fila real: tipo que el runtime no decodifica, array de un elemento sin soporte, array declarado como escalar) y **AVISO** (una columna nullable detrás de un campo requerido -- funciona, pero una fila con `NULL` da el error limpio por fila de §3.68; declaralo `T?` si puede faltar). Una tabla que todavía no existe no genera nada acá (ya lo dicen `migrate`/`inspect`); una columna física de más se ignora (mismo criterio que `--adopt-existing`).
+
+- **`linkc doctor --db <postgres>`**: tras probar la conectividad, una línea `[OK]    tipos de columna: ...` o una `[ERROR]`/`[WARN]` por problema; los errores cuentan en el total y hacen fallar el comando (exit 1), los avisos no.
+- **`linkc db inspect`**: cada colección con problemas suma `N problema(s) de tipo (M error(es))` a su línea y lista cada uno debajo.
+- **`linkc migrate --dry-run`**: un bloque de comentarios SQL al final (`-- Problemas de TIPO ...`, uno por línea) -- comentarios para que el archivo siga siendo ejecutable tal cual y el aviso no se pierda en un pipe; ninguna migración automática arregla un tipo, hay que cambiar el `.link` o la columna a mano.
+
+Solo PostgreSQL: SQLite tiene tipado dinámico y `check_schema_matches` (§3.17) ya compara el DDL exacto al conectar.
+
+**Verificado**: 4 tests unitarios de la tabla (escalares contra sus columnas y contra las ajenas, listas contra arrays soportados/no soportados/JSON, nullable-vs-requerido como aviso, `@encrypted` exige texto) y `pg_integration.rs` contra Postgres REAL: una tabla con `integer` declarado `Bool`, `uuid[]` declarado `String[]`, `text` nullable declarado `String` y `text[]` declarado `String[]` -- `doctor` falla con los dos errores exactos y el aviso, sin nombrar la columna compatible; `db inspect` muestra `3 problema(s) de tipo (2 error(es))`; `migrate --dry-run` lleva el bloque de comentarios; y un `.link` que calza del todo da `[OK]    tipos de columna` sin una sola línea más.
+
+**Límite honesto**: la tabla es la de HOY -- si `store.rs` aprende un tipo nuevo, esta tabla tiene que aprenderlo el mismo día (están una al lado de la otra a propósito). No valida `CHECK`/`UNIQUE`/defaults físicos (eso es `migrate`), ni la PK (ya lo hace `introspect`/adopción, §3.176/§3.177).
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

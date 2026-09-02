@@ -602,17 +602,18 @@ fn cmd_doctor(args: &[String]) -> ExitCode {
     println!("[OK]    versión de linkc: {}", linkc::VERSION);
     ok_count += 1;
 
-    match load_and_check(path) {
-        Ok(_) => {
+    let program = match load_and_check(path) {
+        Ok(p) => {
             println!("[OK]    '{path}' existe, resuelve sus imports, parsea y tipa correctamente");
             ok_count += 1;
+            Some(p)
         }
         Err(_) => {
             println!("[ERROR] '{path}' no se pudo cargar -- ver los errores impresos arriba");
             err_count += 1;
+            None
         }
-    }
-
+    };
     let check_dir = Path::new(path).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
     let probe = check_dir.join(".linkc_doctor_check");
     match fs::write(&probe, b"linkc doctor") {
@@ -654,6 +655,32 @@ fn cmd_doctor(args: &[String]) -> ExitCode {
                 Ok(()) => {
                     println!("[OK]    conectividad a PostgreSQL: conectó y respondió (solo lectura, no se tocó ningún schema)");
                     ok_count += 1;
+                    // GRAMMAR.md §3.229: con la conexión probada, los tipos
+                    // de cada columna declarada contra los reales -- lo que
+                    // hasta esta ronda solo se descubría leyendo una fila.
+                    match program.as_ref().map(|p| runtime::db::check_postgres_column_types(p, &url, db_schema.as_deref())).unwrap_or_else(|| Ok(Vec::new())) {
+                        Ok(issues) => {
+                            let errors = issues.iter().filter(|i| i.severity == linkc::schema_check::Severity::Error).count();
+                            if issues.is_empty() {
+                                println!("[OK]    tipos de columna: cada campo declarado es compatible con su columna real");
+                                ok_count += 1;
+                            } else {
+                                for issue in &issues {
+                                    let tag = if issue.severity == linkc::schema_check::Severity::Error { "[ERROR]" } else { "[WARN] " };
+                                    println!("{tag} tipo de columna {}.{}: {}", issue.collection, issue.column, issue.message);
+                                }
+                                if errors > 0 {
+                                    err_count += errors;
+                                } else {
+                                    ok_count += 1;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("[ERROR] tipos de columna: {e}");
+                            err_count += 1;
+                        }
+                    }
                 }
                 Err(e) => {
                     println!("[ERROR] conectividad a PostgreSQL: {e}");
@@ -817,7 +844,16 @@ fn cmd_db_inspect(args: &[String]) -> ExitCode {
                 "no existe todavía".to_string()
             }
         };
-        println!("  {:<name_width$}  {} columna(s) declaradas  {}", s.name, s.declared_columns, status);
+        let types = if s.type_issues.is_empty() {
+            String::new()
+        } else {
+            let errors = s.type_issues.iter().filter(|i| i.severity == linkc::schema_check::Severity::Error).count();
+            format!("  {} problema(s) de tipo ({errors} error(es))", s.type_issues.len())
+        };
+        println!("  {:<name_width$}  {} columna(s) declaradas  {}{types}", s.name, s.declared_columns, status);
+        for issue in &s.type_issues {
+            println!("      {}", issue.render());
+        }
     }
     println!("\n{} colección(es) declaradas, {} sin crear todavía, {total_rows} fila(s) en total", statuses.len(), missing);
     ExitCode::SUCCESS

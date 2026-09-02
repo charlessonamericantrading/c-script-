@@ -3,6 +3,14 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.187.0] - 2026-09-02
+
+### ✨ Añadido
+**`linkc doctor --db`, `linkc db inspect` y `linkc migrate --dry-run` avisan de una columna real con tipo incompatible ANTES de leer una fila (PLAN.md §9.19 ítem 4)**: la tabla de compatibilidad de `store.rs` (qué lee y escribe el runtime por tipo de columna) escrita una vez como dato (`schema_check.rs`) y consultada contra `information_schema` sin DDL. `[ERROR]` para lo que va a fallar (un `integer` declarado `Bool`, un `uuid[]` declarado `String[]`), `[WARN]` para una columna nullable detrás de un campo requerido. `doctor` falla con errores; `migrate` los emite como comentarios SQL. Verificado contra Postgres real. Ver GRAMMAR.md §3.229.
+
+### 🐛 Corregido
+**Arrays nativos (§3.228): un campo `T[]?` con valor `null` rompía el `insert` entero contra una columna ARRAY** -- el JSON `null` (el sentinel "presente pero null" de `write_param`) llegaba a la rama de arrays, que exigía una lista, y el rpc devolvía un 500 mudo (`insert falló: error serializing parameter 3`). Ahora `null` contra una columna array es el NULL de SQL, y un error del driver del lado cliente muestra su causa interna (`source()`), no solo el número del parámetro. Encontrado por el test de `pg_integration.rs` de v1.186.0 en CI; cubierto además con 3 tests unitarios de `Cell::to_sql` que no necesitan Postgres.
+
 ## [1.186.1] - 2026-09-02
 
 ### 🔧 Interno

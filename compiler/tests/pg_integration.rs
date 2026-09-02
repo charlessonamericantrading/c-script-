@@ -4988,3 +4988,82 @@ service Customers {{
     assert!(bad.is_err(), "99999999999 no entra en integer[] (32 bits): {bad:?}");
     assert_eq!(instance.rpc("Customers/all", "{}").as_array().map(|a| a.len()), Some(2), "el proceso sigue vivo y sin la fila mala");
 }
+
+// GRAMMAR.md §3.229 (PLAN.md §9.19 ítem 4): `doctor`, `db inspect` y
+// `migrate --dry-run` avisan de una columna real cuyo tipo el runtime no
+// va a poder leer o escribir -- ANTES de la primera fila, no en producción.
+#[test]
+fn doctor_inspect_and_migrate_report_column_type_mismatches_before_any_row_is_read() {
+    const COLLECTION: &str = "settings_with_bad_types";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut external = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    external
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                id BIGSERIAL PRIMARY KEY, \
+                enabled integer NOT NULL DEFAULT 0, \
+                refs uuid[] NOT NULL DEFAULT '{{}}', \
+                label text, \
+                tags text[] NOT NULL DEFAULT '{{}}'\
+            )"
+        ))
+        .expect("crear la tabla");
+
+    // `enabled: Bool` contra integer (error), `refs: String[]` contra uuid[]
+    // (error), `label: String` requerido contra una columna nullable
+    // (aviso), `tags: String[]` contra text[] (compatible, §3.228).
+    let program = format!(
+        r#"
+type Setting = {{ id: Int, enabled: Bool, refs: String[], label: String, tags: String[] }}
+db {{ {COLLECTION}: Setting[] }}
+service Settings {{
+  rpc all() -> Setting[] {{ db.{COLLECTION}.all() }}
+}}
+"#
+    );
+    let temp = TempDir::new("schema-check");
+    let src = temp.write("app.link", &program);
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_linkc")).args(args).output().expect("ejecutar linkc");
+        (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    };
+
+    let (ok, doctor) = run(&["doctor", src.to_str().unwrap(), "--db", &url]);
+    assert!(!ok, "doctor tiene que fallar con dos errores de tipo:\n{doctor}");
+    assert!(doctor.contains(&format!("[ERROR] tipo de columna {COLLECTION}.enabled: declarado como Bool")), "{doctor}");
+    assert!(doctor.contains(&format!("[ERROR] tipo de columna {COLLECTION}.refs: array nativo de 'uuid'")), "{doctor}");
+    assert!(doctor.contains(&format!("[WARN]  tipo de columna {COLLECTION}.label:")), "{doctor}");
+    assert!(!doctor.contains(&format!("{COLLECTION}.tags")), "text[] contra String[] es compatible: {doctor}");
+
+    let (ok, inspect) = run(&["db", "inspect", src.to_str().unwrap(), "--db", &url]);
+    assert!(ok, "{inspect}");
+    assert!(inspect.contains("3 problema(s) de tipo (2 error(es))"), "{inspect}");
+    assert!(inspect.contains(&format!("[ERROR] {COLLECTION}.enabled:")), "{inspect}");
+
+    let (ok, migrate) = run(&["migrate", src.to_str().unwrap(), "--db", &url, "--dry-run"]);
+    assert!(ok, "{migrate}");
+    assert!(migrate.contains("-- Problemas de TIPO entre lo declarado y las columnas reales"), "{migrate}");
+    assert!(migrate.contains(&format!("--   [ERROR] {COLLECTION}.refs:")), "{migrate}");
+    assert!(migrate.contains(&format!("--   [AVISO] {COLLECTION}.label:")), "{migrate}");
+
+    // Y una tabla que calza del todo no genera ni una línea.
+    let clean = format!(
+        r#"
+type Setting = {{ id: Int, enabled: Int, label: String?, tags: String[] }}
+db {{ {COLLECTION}: Setting[] }}
+service Settings {{
+  rpc all() -> Setting[] {{ db.{COLLECTION}.all() }}
+}}
+"#
+    );
+    let src_clean = temp.write("clean.link", &clean);
+    let (ok, doctor) = run(&["doctor", src_clean.to_str().unwrap(), "--db", &url]);
+    assert!(ok, "{doctor}");
+    assert!(doctor.contains("[OK]    tipos de columna: cada campo declarado es compatible"), "{doctor}");
+}

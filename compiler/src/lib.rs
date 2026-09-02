@@ -42,6 +42,10 @@ pub mod route;
 /// `stream` reaccione a escrituras externas. Solo texto -- no depende del
 /// feature `runtime`.
 pub mod triggers;
+/// GRAMMAR.md §3.229: compatibilidad de tipos entre lo declarado y una base
+/// PostgreSQL existente (`doctor`/`db inspect`/`migrate --dry-run`).
+#[cfg(feature = "runtime")]
+pub mod schema_check;
 // Detrás de un feature (default-on, así que `cargo build` normal no cambia)
 // porque es el único módulo con dependencias nativas (rusqlite/postgres/
 // tiny_http/argon2/lettre) -- excluirlo es lo que permite compilar

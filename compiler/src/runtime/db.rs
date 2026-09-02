@@ -1389,6 +1389,20 @@ pub fn check_postgres_connectivity(url: &str, schema: Option<&str>) -> Result<()
     Ok(())
 }
 
+/// GRAMMAR.md §3.229: los problemas de TIPO entre lo que `program` declara
+/// y las tablas que ya existen en la base -- `linkc doctor`, de solo
+/// lectura (solo `information_schema`), sin ningún DDL. Una tabla que no
+/// existe todavía no cuenta acá.
+pub fn check_postgres_column_types(program: &Program, url: &str, schema: Option<&str>) -> Result<Vec<crate::schema_check::ColumnIssue>, String> {
+    let client = connect_postgres_client(url, schema)?;
+    let backend = Backend::Postgres {
+        client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)),
+        url: url.to_string(),
+        schema: schema.map(str::to_string),
+    };
+    crate::schema_check::check_program(program, &backend)
+}
+
 /// Arranca el hilo de LISTEN dedicado (GRAMMAR.md §3.44) y devuelve el
 /// extremo lector del canal por el que manda cada `RemoteChange` que
 /// reconoce como AJENO (no su propio eco -- ver `parse_remote_notification`).

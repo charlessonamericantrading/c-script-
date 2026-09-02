@@ -25,6 +25,9 @@ pub struct CollectionStatus {
     pub declared_columns: usize,
     pub exists: bool,
     pub row_count: Option<i64>,
+    /// GRAMMAR.md §3.229: problemas de tipo entre lo declarado y la columna
+    /// real (solo PostgreSQL; SQLite ya compara el DDL exacto al conectar).
+    pub type_issues: Vec<crate::schema_check::ColumnIssue>,
 }
 
 /// Colecciones declaradas en `program`, ordenadas por nombre -- mismo
@@ -62,7 +65,7 @@ pub fn inspect_sqlite(program: &Program, db_path: &Path) -> Result<Vec<Collectio
     if !db_path.exists() {
         return Ok(collections
             .into_iter()
-            .map(|(name, declared_columns)| CollectionStatus { name, declared_columns, exists: false, row_count: None })
+            .map(|(name, declared_columns)| CollectionStatus { name, declared_columns, exists: false, row_count: None, type_issues: Vec::new() })
             .collect());
     }
     let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -79,7 +82,7 @@ pub fn inspect_sqlite(program: &Program, db_path: &Path) -> Result<Vec<Collectio
         } else {
             None
         };
-        out.push(CollectionStatus { name, declared_columns, exists, row_count });
+        out.push(CollectionStatus { name, declared_columns, exists, row_count, type_issues: Vec::new() });
     }
     Ok(out)
 }
@@ -97,9 +100,16 @@ pub fn inspect_postgres(program: &Program, url: &str, schema: Option<&str>) -> R
         url: url.to_string(),
         schema: schema.map(str::to_string),
     };
+    // GRAMMAR.md §3.229: una sola pasada de tipos para todo el programa,
+    // repartida por colección abajo.
+    let mut issues_by_collection: std::collections::HashMap<String, Vec<crate::schema_check::ColumnIssue>> = std::collections::HashMap::new();
+    for issue in crate::schema_check::check_program(program, &backend)? {
+        issues_by_collection.entry(issue.collection.clone()).or_default().push(issue);
+    }
     let mut out = Vec::with_capacity(collections.len());
     for (name, declared_columns) in collections {
         let exists = !crate::migrate::existing_columns(&backend, &name)?.is_empty();
+        let type_issues = issues_by_collection.remove(&name).unwrap_or_default();
         let row_count = if exists {
             let rows = backend.query(&format!("SELECT COUNT(*) FROM \"{name}\""), &[], &[ColumnKind::Int])?;
             match rows.first().and_then(|r| r.first()) {
@@ -109,7 +119,7 @@ pub fn inspect_postgres(program: &Program, url: &str, schema: Option<&str>) -> R
         } else {
             None
         };
-        out.push(CollectionStatus { name, declared_columns, exists, row_count });
+        out.push(CollectionStatus { name, declared_columns, exists, row_count, type_issues });
     }
     Ok(out)
 }

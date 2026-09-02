@@ -357,7 +357,20 @@ fn describe_postgres_error(e: &postgres::Error) -> String {
             postgres::error::SqlState::CHECK_VIOLATION => format!("violates check constraint -- {}", db_err.message()),
             _ => db_err.message().to_string(),
         },
-        None => e.to_string(),
+        // Un error del CLIENTE (ej. "error serializing parameter 3") lleva
+        // la causa real -- el mensaje de `Cell::to_sql` -- un nivel más
+        // adentro, en `source()`; sin desplegar la cadena, el rpc devuelve
+        // solo el número del parámetro y nada de por qué falló.
+        None => {
+            let mut msg = e.to_string();
+            let mut source = std::error::Error::source(e);
+            while let Some(cause) = source {
+                msg.push_str(": ");
+                msg.push_str(&cause.to_string());
+                source = cause.source();
+            }
+            msg
+        }
     }
 }
 
@@ -997,6 +1010,14 @@ fn json_array_to_pg(
     out: &mut postgres::types::private::BytesMut,
 ) -> Result<postgres::types::IsNull, Box<dyn std::error::Error + Sync + Send>> {
     use postgres::types::{ToSql, Type};
+    // Un campo `T[]?` con valor `null` llega como el JSON `null` (el
+    // sentinel "presente pero null" de `write_param`). Contra una columna
+    // ARRAY nativa no hay otra representación posible que el NULL de SQL
+    // -- sin esto, el `insert` de una fila con la lista opcional en null
+    // fallaba con "error serializing parameter N" (visto en CI, v1.186.0).
+    if v.is_null() {
+        return Ok(postgres::types::IsNull::Yes);
+    }
     let Some(items) = v.as_array() else {
         return Err(format!("la columna '{ty}' es un array nativo de PostgreSQL y el valor no es una lista").into());
     };
@@ -1218,6 +1239,55 @@ mod send_probe {
 /// de layout ACÁ, antes de pushear, es mucho más barato que encontrarlo en
 /// CI -- lección de esta misma ronda con el rate limiter distribuido
 /// (§3.178), donde la falta de Postgres local retrasó dos vueltas de CI.
+/// GRAMMAR.md §3.228: la serialización de una lista contra una columna
+/// ARRAY nativa es lógica PURA (`Cell::to_sql`) -- se prueba acá sin
+/// Postgres, igual que `inet_tests` abajo. El caso `null` fue un bug real
+/// encontrado por `pg_integration.rs` en CI (v1.186.0): un `Bool[]?` con
+/// `null` rompía el `insert` entero.
+#[cfg(test)]
+mod pg_array_write_tests {
+    use super::*;
+    use postgres::types::{IsNull, ToSql, Type};
+
+    fn bind(cell: &Cell, ty: &Type) -> Result<(bool, Vec<u8>), String> {
+        let mut out = postgres::types::private::BytesMut::new();
+        cell.to_sql_checked(ty, &mut out).map(|n| (matches!(n, IsNull::Yes), out.to_vec())).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn json_null_against_a_native_array_column_binds_sql_null() {
+        let (is_null, bytes) = bind(&Cell::Json(serde_json::Value::Null), &Type::BOOL_ARRAY).expect("null contra boolean[]");
+        assert!(is_null);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn lists_bind_as_the_array_the_column_asks_for() {
+        let ints = Cell::Json(serde_json::json!([1, 2, 3]));
+        let (_, as_int4) = bind(&ints, &Type::INT4_ARRAY).expect("integer[]");
+        let (_, as_int8) = bind(&ints, &Type::INT8_ARRAY).expect("bigint[]");
+        let mut expected = postgres::types::private::BytesMut::new();
+        vec![1i32, 2, 3].to_sql(&Type::INT4_ARRAY, &mut expected).unwrap();
+        assert_eq!(as_int4, expected.to_vec(), "misma codificación que Vec<i32>");
+        assert_ne!(as_int4, as_int8, "bigint[] ocupa 8 bytes por elemento");
+        bind(&Cell::Json(serde_json::json!(["a", "b"])), &Type::TEXT_ARRAY).expect("text[]");
+        bind(&Cell::Json(serde_json::json!([true, false])), &Type::BOOL_ARRAY).expect("boolean[]");
+        bind(&Cell::Json(serde_json::json!([])), &Type::INT4_ARRAY).expect("una lista vacía es un array vacío");
+    }
+
+    #[test]
+    fn element_mismatches_are_clean_errors_with_the_position() {
+        let err = bind(&Cell::Json(serde_json::json!([1, "x"])), &Type::INT4_ARRAY).unwrap_err();
+        assert!(err.contains("elemento 1") && err.contains("32 bits"), "{err}");
+        let err = bind(&Cell::Json(serde_json::json!([i64::MAX])), &Type::INT4_ARRAY).unwrap_err();
+        assert!(err.contains("elemento 0"), "{err}");
+        let err = bind(&Cell::Json(serde_json::json!({"a": 1})), &Type::INT4_ARRAY).unwrap_err();
+        assert!(err.contains("no es una lista"), "{err}");
+        let err = bind(&Cell::Json(serde_json::json!([1])), &Type::UUID_ARRAY).unwrap_err();
+        assert!(err.contains("§3.228"), "{err}");
+    }
+}
+
 #[cfg(test)]
 mod inet_tests {
     use super::*;
