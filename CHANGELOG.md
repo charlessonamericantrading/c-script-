@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.179.0] - 2026-09-02
+
+### ✨ Añadido
+**`GET /live` y `GET /ready` (PLAN.md §9.18 Eje E ítem 2)**: liveness y readiness como dos endpoints separados, como todo orquestador/proxy los pregunta. `/live` responde 200 sin tocar la base (un proceso vivo con la base caída NO debe reiniciarse en loop); `/ready` devuelve `checks: {database: ...}` con 200/503 -- el objeto `checks` es el enganche donde el drenado gracioso y la saturación del pool van a sumar su condición. Exentos de `--service-api-key` igual que `/health`, que sigue igual. Ver GRAMMAR.md §3.220.
+
 ## [1.178.0] - 2026-09-02
 
 ### 🔧 Interno

@@ -241,6 +241,7 @@
   - [3.217 Benchmarks de humo (`cargo bench --bench smoke`) — RESUELTO](#3217-benchmarks-de-humo-cargo-bench---bench-smoke--resuelto)
   - [3.218 Test de deriva mecánica de la documentación para agentes (`docs_drift.rs`) — RESUELTO](#3218-test-de-deriva-mecánica-de-la-documentación-para-agentes-docs_driftrs--resuelto)
   - [3.219 `llms.txt` como índice y `llms-full.txt` como detalle — RESUELTO](#3219-llmstxt-como-índice-y-llms-fulltxt-como-detalle--resuelto)
+  - [3.220 `/live` y `/ready`: liveness y readiness separados — RESUELTO](#3220-live-y-ready-liveness-y-readiness-separados--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7787,6 +7788,19 @@ Origen: `PLAN.md §9.18` Eje C ítem 3. Medido antes de tocar nada: el `llms.txt
 **Verificado**: `docs_examples.rs` (los bloques de código con marcador siguen compilando en los dos archivos, 2 y 5 marcadores respectivamente, mismos que antes) y `docs_drift.rs` (todas las citas `§3.N` del índice nuevo existen; todo flag junto a `linkc` está en `--help`) en verde sobre los dos archivos reescritos.
 
 **Límite honesto**: el índice nuevo lo escribí a mano contra la tabla de contenidos de este documento -- es tan completo como esa tabla el 02/09/2026. Una feature nueva tiene que sumar su línea al índice, igual que hoy suma su párrafo a la lista cronológica; `docs_drift.rs` no detecta una capacidad AUSENTE del índice, solo una cita rota.
+### 3.220 `/live` y `/ready`: liveness y readiness separados — RESUELTO, cierra PLAN.md §9.18 Eje E ítem 2
+
+Origen: `PLAN.md §9.18` Eje E ítem 2, la pieza previa al drenado gracioso (ítem 1). `/health` (§3.87) contesta una sola pregunta -- "¿vivo Y con base?" -- y todo orquestador o proxy real hace DOS preguntas distintas con dos consecuencias distintas: liveness ("¿responde el proceso?" → si no, REINICIARLO) y readiness ("¿puede atender tráfico AHORA?" → si no, SACARLO DE ROTACIÓN sin reiniciarlo). Mezclarlas tiene un modo de falla concreto durante un corte de tráfico: la base se cae, `/health` da 503, el orquestador interpreta "muerto" y reinicia el proceso en loop -- lo que no arregla la base y sí corta las conexiones SSE/MCP que estaban bien.
+
+**Qué hay (v1.179.0)**, en `linkc serve`/`serve-all`, GET, exentos de `--service-api-key` igual que `/health` (un probe no tiene por qué conocer el secreto del gateway), con CORS y los headers fijos de siempre:
+- **`GET /live`** → `200 {"status":"alive","engine":"c-script","version":"..."}` siempre que el accept loop llegue a atenderlo. **No toca la base a propósito**: un proceso vivo con la base caída se reporta vivo acá y no listo en `/ready`.
+- **`GET /ready`** → `200 {"status":"ready","engine","version","checks":{"database":"ok"}}` o `503 {"status":"not_ready",...,"checks":{"database":"<error>"}}`. Hoy la única condición es el mismo `SELECT 1` de `/health`; el objeto `checks` con una clave por condición es el contrato para que el drenado gracioso (`"draining"`, Eje E ítem 1) y la saturación del pool (`"capacity"`, Eje B ítem 2) sumen la suya sin cambiar la forma del endpoint.
+
+`/health`, `/` y `/status` siguen exactamente igual (compatibilidad: hay despliegues reales apuntando ahí). Un `@route("/live")`/`@route("/ready")` declarado por el programa nunca llega a atenderse -- estos dos se resuelven antes, mismo criterio que `/health`/`/metrics`.
+
+**Cómo usarlo**: Kubernetes → `livenessProbe: /live`, `readinessProbe: /ready`; nginx/HAProxy → el `check` del upstream contra `/ready`; `linkc doctor --target-url` (§3.176) sigue leyendo `/health` (necesita la versión, que los tres devuelven).
+
+**Verificado**: `tests/cli_ready.rs`, 3 tests contra un `linkc serve` real por socket crudo: la forma exacta del JSON de `/live` (y que NO tenga `database`/`checks`), la de `/ready` con `checks.database == "ok"`, y que los dos queden exentos de `--service-api-key` mientras `/metrics` sigue dando 401 sin el header. El camino `503` (base caída) se cubre por construcción con el mismo `health_check()` que `/health` ya prueba contra Postgres real en `pg_integration.rs`.
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

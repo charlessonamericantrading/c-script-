@@ -787,11 +787,11 @@ fn handle_request(
     // servidor-a-servidor, GRAMMAR.md §3.93), una capa distinta y ANTERIOR a
     // `@requires`/JWT (que autentican a un USUARIO final) -- corre antes de
     // leer el body siquiera, para rechazar rápido sin gastar memoria en un
-    // caller no autorizado. `/health`/`/`/`/status` quedan EXENTOS a
+    // caller no autorizado. `/health`/`/`/`/status` (y `/live`/`/ready`, §3.220) quedan EXENTOS a
     // propósito: un orquestador/load balancer que hace liveness probing no
     // tiene por qué conocer el secreto del gateway.
     if let Some(expected) = service_api_key {
-        if path != "/" && path != "/health" && path != "/status" {
+        if path != "/" && path != "/health" && path != "/status" && path != "/live" && path != "/ready" {
             let provided = request
                 .headers()
                 .iter()
@@ -852,6 +852,51 @@ fn handle_request(
     let headers: Vec<(String, String)> =
         request.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect();
     db.set_request_context(super::db::RequestContext { raw_body: body.clone(), headers });
+
+    // `/live` y `/ready` (GRAMMAR.md §3.220, PLAN.md §9.18 Eje E ítem 2):
+    // las DOS preguntas que `/health` (§3.87) contesta juntas, separadas
+    // como todo orquestador/proxy real las hace (Kubernetes liveness vs.
+    // readiness, el `check` de un upstream de nginx/HAProxy):
+    //  - `/live`: "¿el proceso responde?" -- 200 siempre que el accept loop
+    //    llegue acá. NO toca la base a propósito: un proceso vivo con la
+    //    base caída tiene que reportarse VIVO (reiniciarlo no arregla la
+    //    base, solo suma un restart loop) y NO LISTO.
+    //  - `/ready`: "¿puede atender tráfico AHORA?" -- hoy exactamente el
+    //    `SELECT 1` de `/health`, pero con un objeto `checks` por
+    //    condición, para que el drenado gracioso (Eje E ítem 1: `draining`)
+    //    y la saturación del pool (Eje B ítem 2: `capacity`) sumen su
+    //    clave sin cambiar el contrato de este endpoint.
+    // Mismo trato que `/health` en todo lo demás: exentos de
+    // `--service-api-key` (arriba), GET sin body, CORS + headers fijos.
+    if path == "/live" {
+        let body = serde_json::json!({
+            "status": "alive",
+            "engine": "c-script",
+            "version": crate::VERSION,
+        })
+        .to_string();
+        let resp = cors_response(200, body, &cors_headers, &request);
+        let _ = request.respond(resp);
+        log_done(log, req_id, Some("live"), 200, start, "");
+        return;
+    }
+    if path == "/ready" {
+        let (status, db_check) = match db.health_check() {
+            Ok(()) => (200, serde_json::json!("ok")),
+            Err(e) => (503, serde_json::json!(e)),
+        };
+        let body = serde_json::json!({
+            "status": if status == 200 { "ready" } else { "not_ready" },
+            "engine": "c-script",
+            "version": crate::VERSION,
+            "checks": { "database": db_check },
+        })
+        .to_string();
+        let resp = cors_response(status, body, &cors_headers, &request);
+        let _ = request.respond(resp);
+        log_done(log, req_id, Some("ready"), status, start, "");
+        return;
+    }
 
     if path == "/" || path == "/health" || path == "/status" {
         let services: Vec<String> = program
