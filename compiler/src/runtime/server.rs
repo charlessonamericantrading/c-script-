@@ -684,7 +684,12 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                     // sentido y solo ensuciaría el promedio.
                     let latency_ms = (now_ms() - change.sent_at_ms).max(0);
                     metrics_store.lock().record_notify_latency(std::time::Duration::from_millis(latency_ms as u64));
-                    db.publish_remote(&change.collection, change.event);
+                    match &change.external {
+                        // GRAMMAR.md §3.225: escritura de OTRO sistema,
+                        // anunciada por el trigger de `linkc triggers`.
+                        Some(external) => db.publish_external(&change.collection, external),
+                        None => db.publish_remote(&change.collection, change.event),
+                    }
                 }
                 // GRAMMAR.md §3.150: reintenta cualquier NOTIFY que haya
                 // fallado por una conexión caída transitoria -- mismo tick

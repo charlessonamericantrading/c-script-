@@ -1197,7 +1197,12 @@ pub struct Db {
 /// ESTA instancia también lo vea.
 pub(crate) struct RemoteChange {
     pub collection: String,
+    /// El evento completo (la fila, tal como `value_to_json` la serializa)
+    /// cuando lo mandó otra instancia de linkc; `Null` cuando viene de un
+    /// trigger externo (GRAMMAR.md §3.225) -- ahí `external` es `Some` y
+    /// el receptor relee la fila por id.
     pub event: serde_json::Value,
+    pub external: Option<ExternalChange>,
     /// Epoch ms de cuando la instancia ORIGEN mandó el `NOTIFY` (GRAMMAR.md
     /// §3.150) -- `runtime/server.rs` resta esto de "ahora" al drenar el
     /// canal para medir la latencia de propagación real, sin necesitar
@@ -1206,7 +1211,20 @@ pub(crate) struct RemoteChange {
     pub sent_at_ms: i64,
 }
 
-/// Un solo canal de Postgres para TODOS los cambios de TODAS las
+/// Un cambio anunciado por el trigger de `linkc triggers` (GRAMMAR.md
+/// §3.225): escritura hecha por OTRO sistema sobre la misma base. Payload
+/// mínimo a propósito -- `id` + `op` -- y la fila se relee acá (con las
+/// mismas columnas/decodificación que un `find`), salvo en `delete`, donde
+/// ya no hay nada que releer y el trigger manda `row_to_json(OLD)` si
+/// entra en el límite de NOTIFY.
+#[derive(Debug, Clone)]
+pub(crate) struct ExternalChange {
+    pub op: String,
+    pub id: serde_json::Value,
+    pub row: Option<serde_json::Value>,
+}
+
+/// Un solo canal de Postgres para TODOS los cambios de TODAS las/// Un solo canal de Postgres para TODOS los cambios de TODAS las
 /// colecciones -- el nombre de la colección va DENTRO del payload JSON, no
 /// en el nombre del canal, así que hace falta un solo `LISTEN` sin importar
 /// cuántas colecciones declare el programa (GRAMMAR.md §3.44).
@@ -1237,7 +1255,20 @@ const MAX_PENDING_NOTIFY_RETRIES: usize = 50;
 /// sin formatear como UUID porque nunca sale del proceso hacia un humano:
 /// es un tag interno para que el hilo de LISTEN de una instancia reconozca
 /// (y descarte) su propio `NOTIFY`.
+/// GRAMMAR.md §3.225: UN id por PROCESO (no por `Db`), porque tiene que ser
+/// el mismo valor que `connect_postgres_client` fija como `link.instance` en
+/// CADA conexión (incluidas las que `with_reconnect` reabre tras una caída,
+/// que no reciben ningún `Db` de contexto) -- el trigger de escrituras
+/// externas copia ese GUC al payload y el receptor lo compara con el suyo.
+/// Un proceso `serve-all` tiene varios `Db` (SQLite, uno por servicio) pero
+/// nunca más de una base Postgres (§3.92), así que compartir el id no
+/// confunde a nadie.
 fn random_instance_id() -> String {
+    static PROCESS_INSTANCE_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PROCESS_INSTANCE_ID.get_or_init(fresh_instance_id).clone()
+}
+
+fn fresh_instance_id() -> String {
     let mut buf = [0u8; 16];
     // Si el CSPRNG del sistema falla acá, algo más grave ya está roto (esta
     // misma llamada nunca falló en `crypto.randomToken`/`crypto.uuid`,
@@ -1331,6 +1362,15 @@ pub(crate) fn connect_postgres_client(url: &str, schema: Option<&str>) -> Result
             .batch_execute(&format!("SET search_path TO \"{schema}\""))
             .map_err(|e| format!("no se pudo fijar search_path a '{schema}': {e}"))?;
     }
+    // GRAMMAR.md §3.225: la firma de ESTE proceso, para que el trigger de
+    // escrituras externas (`linkc triggers`) pueda marcar en el payload
+    // quién escribió. Un GUC "placeholder" (nombre con punto) no necesita
+    // declararse en postgresql.conf; `SET` es por sesión, así que una
+    // reconexión (`with_reconnect`) lo vuelve a fijar sola al pasar por
+    // acá. El id es hex (`fresh_instance_id`), nunca necesita escape.
+    client
+        .batch_execute(&format!("SET link.instance = '{}'", random_instance_id()))
+        .map_err(|e| format!("no se pudo fijar link.instance: {e}"))?;
     Ok(client)
 }
 
@@ -1426,13 +1466,34 @@ fn parse_remote_notification(payload: &str, my_instance_id: &str) -> Option<Remo
         return None;
     }
     let collection = v.get("collection")?.as_str()?.to_string();
+    // GRAMMAR.md §3.225: payload de un trigger de `linkc triggers`. Si
+    // `instance` NO está vacío, lo escribió un linkc (este u otro) -- que ya
+    // mandó su propio NOTIFY con el evento completo, o lo publicó local si
+    // era este mismo proceso -- así que se descarta: sin esto, cada
+    // escritura propia llegaría DOS veces a los suscriptores de las demás
+    // instancias. Solo `instance` vacío (un ORM, psql) dispara la relectura.
+    if v.get("via").and_then(|x| x.as_str()) == Some("trigger") {
+        if !instance.is_empty() {
+            return None;
+        }
+        let op = v.get("op")?.as_str()?.to_string();
+        let id = v.get("id")?.clone();
+        let row = v.get("row").cloned();
+        let sent_at_ms = v.get("sent_at_ms").and_then(|v| v.as_i64()).unwrap_or_else(now_ms);
+        return Some(RemoteChange {
+            collection,
+            event: serde_json::Value::Null,
+            external: Some(ExternalChange { op, id, row }),
+            sent_at_ms,
+        });
+    }
     let event = v.get("event")?.clone();
     // `unwrap_or(now)` en vez de `?`: un payload de una instancia VIEJA (de
     // antes de GRAMMAR.md §3.150, sin este campo) sigue propagándose --
     // solo pierde la métrica de latencia para ESE evento puntual, nunca el
     // evento en sí.
     let sent_at_ms = v.get("sent_at_ms").and_then(|v| v.as_i64()).unwrap_or_else(now_ms);
-    Some(RemoteChange { collection, event, sent_at_ms })
+    Some(RemoteChange { collection, event, external: None, sent_at_ms })
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -2570,6 +2631,54 @@ db { users: User[] }
     /// parar nunca.
     pub(crate) fn publish_remote(&self, collection: &str, event: serde_json::Value) {
         self.deliver_local(collection, &event);
+    }
+
+    /// GRAMMAR.md §3.225: un cambio anunciado por el trigger de `linkc
+    /// triggers` (escritura de OTRO sistema). `insert`/`update`: se relee la
+    /// fila por id con las mismas columnas y la misma decodificación que un
+    /// `db.<c>.find(id)` -- el evento que ven los suscriptores es
+    /// byte-idéntico al de una escritura propia. `delete`: no hay nada que
+    /// releer; se entrega el `row_to_json(OLD)` que el trigger mandó (si
+    /// entró en el límite de NOTIFY), tal cual -- forma de Postgres, no la
+    /// de `value_to_json` (una columna `timestamptz` llega como texto ISO,
+    /// no como milisegundos), límite honesto documentado. Nunca hace NOTIFY
+    /// de vuelta (sería un eco infinito) ni falla: un id que ya no existe
+    /// (borrado entre el NOTIFY y la relectura) simplemente no publica nada.
+    pub(crate) fn publish_external(&self, collection: &str, change: &ExternalChange) {
+        let Some(columns) = self.columns.get(collection) else {
+            // Una tabla con trigger que este programa no declara -- otro
+            // `.link` sobre la misma base la declara; para este proceso no
+            // hay suscriptores posibles.
+            return;
+        };
+        if change.op == "delete" {
+            if let Some(row) = &change.row {
+                self.deliver_local(collection, row);
+            }
+            return;
+        }
+        let id_value = match (&change.id, self.id_kinds.get(collection).copied().unwrap_or(IdKind::Int)) {
+            (serde_json::Value::Number(n), IdKind::Int) => match n.as_i64() {
+                Some(i) => Value::Int(i),
+                None => return,
+            },
+            (serde_json::Value::String(s), IdKind::Uuid) => Value::Uuid(s.clone()),
+            (serde_json::Value::String(s), IdKind::Int) => match s.parse::<i64>() {
+                Ok(i) => Value::Int(i),
+                Err(_) => return,
+            },
+            _ => return,
+        };
+        let Ok((id_cell, _)) = self.id_cell_and_display(&id_value) else { return };
+        match self.select_rows(collection, columns, Some(id_cell)) {
+            Ok(rows) => {
+                if let Some(row) = rows.into_iter().next() {
+                    let json = value_to_json(&row, &self.simple_enums);
+                    self.deliver_local(collection, &json);
+                }
+            }
+            Err(e) => eprintln!("aviso: no se pudo releer '{collection}' id {} tras un cambio externo: {}", change.id, e.message),
+        }
     }
 
     /// `pub(crate)`, no privado -- desde GRAMMAR.md §3.158 (v1.114.0),
@@ -3786,6 +3895,39 @@ mod tests {
         let change = parse_remote_notification(&payload, "mi-instancia").expect("debió parsear");
         assert_eq!(change.collection, "items");
         assert_eq!(change.event, serde_json::json!({"id": 1, "name": "hola"}));
+    }
+
+    #[test]
+    fn parse_remote_notification_turns_a_trigger_payload_from_an_external_writer_into_a_reread_request() {
+        // GRAMMAR.md §3.225: `instance` vacío = lo escribió otro sistema.
+        let payload = r#"{"via":"trigger","instance":"","collection":"items","op":"update","id":7,"sent_at_ms":123}"#;
+        let change = parse_remote_notification(payload, "mi-instancia").expect("debió parsear");
+        assert_eq!(change.collection, "items");
+        assert!(change.event.is_null());
+        let ext = change.external.expect("es un cambio externo");
+        assert_eq!(ext.op, "update");
+        assert_eq!(ext.id, serde_json::json!(7));
+        assert!(ext.row.is_none());
+        assert_eq!(change.sent_at_ms, 123);
+    }
+
+    #[test]
+    fn parse_remote_notification_keeps_the_deleted_row_a_trigger_sends() {
+        let payload = r#"{"via":"trigger","instance":"","collection":"items","op":"delete","id":7,"row":{"id":7,"name":"x"}}"#;
+        let change = parse_remote_notification(payload, "mi-instancia").expect("debió parsear");
+        let ext = change.external.expect("externo");
+        assert_eq!(ext.op, "delete");
+        assert_eq!(ext.row, Some(serde_json::json!({"id":7,"name":"x"})));
+    }
+
+    #[test]
+    fn parse_remote_notification_discards_a_trigger_payload_written_by_any_linkc_instance() {
+        // Este proceso: eco propio. Otro proceso linkc: ya manda su NOTIFY
+        // completo. Ninguno de los dos debe releer -- llegaría dos veces.
+        let own = r#"{"via":"trigger","instance":"mi-instancia","collection":"items","op":"insert","id":1}"#;
+        assert!(parse_remote_notification(own, "mi-instancia").is_none());
+        let other = r#"{"via":"trigger","instance":"otra-instancia","collection":"items","op":"insert","id":1}"#;
+        assert!(parse_remote_notification(other, "mi-instancia").is_none());
     }
 
     #[test]

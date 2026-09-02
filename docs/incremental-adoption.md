@@ -83,6 +83,20 @@ por test) sirve para fijar el comportamiento ESPERADO del servicio nuevo de
 forma reproducible, pero no reemplaza comparar contra el sistema viejo con
 datos reales -- son dos capas de verificación distintas, ambas necesarias.
 
+
+## Escrituras que siguen haciéndose desde el backend viejo
+
+Mientras dura la migración, el backend viejo sigue escribiendo en las mismas
+tablas que un servicio `.link` sirve por `stream`. Sin nada más, esas
+escrituras son invisibles para `db.<c>.subscribe()`: LISTEN/NOTIFY
+(GRAMMAR.md §3.44) solo propaga lo que escribe otro `linkc serve`. No hagas
+un "republish" por HTTP desde el backend viejo tras cada escritura -- es la
+pieza más frágil que un reporte de adopción real llegó a construir. En su
+lugar, `linkc triggers app.link` imprime el DDL de PostgreSQL (idempotente,
+revisable, aplicable con tu herramienta de migraciones de siempre) que hace
+que cada escritura de cualquier origen -- un ORM, `psql`, un job -- llegue a
+los `stream` conectados, al COMMIT y sin tocar el código viejo. Ver
+GRAMMAR.md §3.225.
 ## Rollback: el proxy es el interruptor
 
 Como el backend viejo sigue existiendo mientras dura la migración, volver

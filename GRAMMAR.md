@@ -246,6 +246,7 @@
   - [3.222 `staticRoutes(baseUrl)`, `hreflangLinks(alternates)` y `routes.json` — RESUELTO](#3222-staticroutesbaseurl-hreflanglinksalternates-y-routesjson--resuelto)
   - [3.223 `linkc_http_outbound_*`: latencia y tasa de error de las llamadas `http.*` salientes en `/metrics` — RESUELTO](#3223-linkc_http_outbound_-latencia-y-tasa-de-error-de-las-llamadas-http-salientes-en-metrics--resuelto)
   - [3.224 `linkc lint --diagnostics-json` — RESUELTO](#3224-linkc-lint---diagnostics-json--resuelto)
+  - [3.225 `linkc triggers`: un `stream` reacciona a escrituras hechas por OTRO sistema — RESUELTO](#3225-linkc-triggers-un-stream-reacciona-a-escrituras-hechas-por-otro-sistema--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -7894,6 +7895,26 @@ Origen: `PLAN.md §9.18` Eje C ítem 5. `--diagnostics-json` (§3.208) cubría l
 **Verificado**: `tests/cli_lint_json.rs`, 3 tests contra el binario real -- dos advertencias reales (`unused-var` con `file`/`line`/`column`/`message` correctos, código 0, stderr vacío, sin texto humano mezclado), `[]` sobre un programa limpio con el flag ANTES del subcomando, y un error de tipos con `lint` reportado con la forma de §3.208.
 
 **Límite honesto**: las advertencias no tienen código `L####` estable (§3.210) -- `code` es el nombre de la regla, que es estable por convención pero no está en `linkc explain`. Si alguna regla llega a merecer una explicación larga, ese es el paso siguiente, no este.
+### 3.225 `linkc triggers`: un `stream` reacciona a escrituras hechas por OTRO sistema — RESUELTO, cierra PLAN.md §9.19 ítem 1
+
+Origen: `PLAN.md §9.19` ítem 1, el pedido de mayor valor del reporte del CRM Nexus (9 servicios `.link` en producción sobre Postgres real, detrás de Express+Drizzle que sigue siendo dueño de todas las escrituras). LISTEN/NOTIFY (§3.44) solo propagaba escrituras hechas por OTRA instancia de `linkc` -- el `NOTIFY` lo mandaba `Db::notify_remote` tras cada escritura propia. Una fila insertada por Drizzle era invisible para `db.<c>.subscribe()`, así que el backend viejo hacía un "republish" HTTP best-effort tras cada escritura (10 call sites): frágil (ya falló en producción: "republishConversation falló: aborted") y sin forma de avisar desde dentro de una transacción TS.
+
+**Qué hay (v1.184.0)**: la solución vive en la base, no en linkc.
+
+- **`linkc triggers <archivo.link> [--db-schema <nombre>]`** imprime a stdout DDL de PostgreSQL: una función `link_notify_change()` (una por schema) y, por cada colección de `db { }`, un `AFTER INSERT OR UPDATE OR DELETE ... FOR EACH ROW` que hace `pg_notify('link_stream_changes', ...)` -- el MISMO canal que ya escucha cada `linkc serve`. **Idempotente** (`CREATE OR REPLACE FUNCTION` + `DROP TRIGGER IF EXISTS` + `CREATE TRIGGER`): se aplica N veces, se ensaya con `BEGIN`/`ROLLBACK` (el protocolo de migraciones del CRM lo exige). **`linkc` nunca lo aplica solo**: no se conecta a nada; quien administra la base lo revisa y lo aplica con su mecanismo de migraciones (`psql -f`, Drizzle, lo que sea). Requiere columna `id` como PK (la que `db { }` declara).
+- **Payload mínimo**: `{via: "trigger", instance, collection, op, id, sent_at_ms}`. El receptor **relee la fila por id** con las mismas columnas y la misma decodificación que un `db.<c>.find(id)` -- el evento que ven los suscriptores es byte-idéntico al de una escritura propia -- y lo entrega local. Como el payload nunca lleva la fila, el límite de 8000 bytes de NOTIFY (§3.44) no aplica a `insert`/`update`. `NOTIFY` se entrega al COMMIT: una transacción externa avisa sola, exactamente cuando su efecto es visible.
+- **Sin doble evento cuando escribe el propio linkc**: cada conexión de `linkc serve` fija `SET link.instance = '<id del proceso>'` al conectar (`connect_postgres_client`, así una reconexión de §3.40 lo vuelve a fijar sola), y el trigger copia `current_setting('link.instance', true)` al payload. Un payload de trigger con `instance` NO vacío lo escribió un linkc -- este (ya publicó local) u otro (ya mandó su NOTIFY completo) -- y se descarta. Solo `instance` vacío (un ORM, psql, un job) dispara la relectura. El id de instancia pasó a ser por PROCESO (`random_instance_id`, `OnceLock`) para que el GUC y el filtro del receptor sean siempre el mismo valor.
+- **`delete`**: no hay fila que releer. El trigger manda `row_to_json(OLD)` si entra en 7.900 bytes; el receptor la entrega tal cual. **Límite honesto**: esa fila tiene la forma de Postgres, no la de `value_to_json` -- una columna `timestamptz` nativa (§3.182) llega como texto ISO, no como milisegundos; una columna `numeric` como número, no como el string de `Decimal`. Para `insert`/`update` no pasa (se relee vía linkc). Si la fila no entra, llega solo `{id, op}` y el suscriptor ve un evento sin la fila -- mismo criterio best-effort que el descarte por tamaño de §3.44.
+- Una tabla con trigger que ESTE programa no declara (otro `.link` sobre la misma base sí) se ignora en silencio: sin colección no hay suscriptores posibles. Un id que ya no existe al releer (borrado entre el NOTIFY y el SELECT) no publica nada. Nunca se hace NOTIFY de vuelta (sería un eco infinito).
+
+```bash
+linkc triggers app.link > triggers.sql          # revisar
+psql "$DATABASE_URL" -1 -f triggers.sql          # aplicar (o con tu herramienta de migraciones)
+```
+
+**Verificado**: 4 tests unitarios del generador (una función, un trigger por colección, schema calificado, programa sin colecciones), 3 del parser de notificaciones (payload externo → relectura, `row` de un delete conservada, payload de un linkc -- propio u otro -- descartado), `tests/cli_triggers.rs` (3 tests contra el binario: DDL completo sin tocar disco, `--db-schema`, programa roto sin DDL parcial), y `pg_integration.rs` contra Postgres REAL en CI: un `postgres::Client` directo (el papel de Drizzle) aplica el DDL DOS veces, hace INSERT → el `stream` recibe la fila releída; UPDATE → la recibe con el valor nuevo; DELETE → recibe el `row_to_json(OLD)`; y una escritura hecha por el propio linkc llega UNA sola vez (timeout corto probando la ausencia del segundo evento).
+
+**Fuera de alcance, a propósito**: aplicar el DDL desde `linkc serve`/`migrate` (una decisión de quien administra la base, y el CRM la ensaya en transacción antes); SQLite (sin NOTIFY, y un solo proceso ya ve todo); un evento `delete` con la forma canónica (necesitaría re-decodificar `row_to_json` vía el tipo de la colección -- posible, discovery propio si hace falta).
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

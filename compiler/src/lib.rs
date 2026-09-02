@@ -38,6 +38,10 @@ pub mod idempotency;
 pub mod metrics;
 pub mod rate_limit;
 pub mod route;
+/// `linkc triggers` (GRAMMAR.md §3.225): DDL de PostgreSQL para que un
+/// `stream` reaccione a escrituras externas. Solo texto -- no depende del
+/// feature `runtime`.
+pub mod triggers;
 // Detrás de un feature (default-on, así que `cargo build` normal no cambia)
 // porque es el único módulo con dependencias nativas (rusqlite/postgres/
 // tiny_http/argon2/lettre) -- excluirlo es lo que permite compilar

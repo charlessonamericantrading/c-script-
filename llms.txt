@@ -60,12 +60,12 @@ maxLength)` and `@check(<expr>)` §3.96/§3.146/§3.173, `@validate(email|regex)
 §3.177, native Postgres `uuid/inet/cidr/json/jsonb/date/timestamp/timestamptz/numeric`
 columns §3.179/§3.187/§3.91/§3.182/§3.103, `--db-schema` §3.193, `--adopt-existing` §3.67,
 `db.vacuum()`/`db.tableStats()` §3.151. Tooling: `linkc introspect` (Postgres → starting
-`.link`; columns + PK only) §3.66, `linkc migrate --dry-run` §3.97, `linkc db inspect/export/
+`.link`; columns + PK only) §3.66, `linkc migrate --dry-run` §3.97, `linkc triggers` (Postgres DDL so streams see external writes) §3.225, `linkc db inspect/export/
 import/shell` §3.175/§3.185/§3.189.
 
 **Services and HTTP** — `service X { rpc f(a: T) -> U { } }` served as `POST /X/f` with a
 JSON body §3.12; `stream` = real SSE, `while true { db.<c>.subscribe() }` pushes live
-changes, cross-instance via Postgres LISTEN/NOTIFY §3.13/§3.16/§3.44/§3.150; `@route("/blog/
+changes, cross-instance via Postgres LISTEN/NOTIFY §3.13/§3.16/§3.44/§3.150, and reacting to writes made by ANOTHER system once the DDL from `linkc triggers` is applied §3.225; `@route("/blog/
 :slug")` with multiple params, catch-all `:rest*` and query params §3.37/§3.42/§3.57/§3.62;
 `@content_type` §3.35; `response.setStatus`/`response.redirect` §3.46/§3.111;
 `@cache_control` §3.113; weak `ETag` + `If-None-Match` → `304` on every GET 200, `Vary: Accept-Encoding` §3.221; server-side `@cache("60s")` (TTL only) §3.144; `@rate_limit("20/1m")`

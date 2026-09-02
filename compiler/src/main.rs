@@ -139,6 +139,7 @@ fn main() -> ExitCode {
         Some("serve") => cmd_serve(&args[2..]),
         Some("serve-all") => cmd_serve_all(&args[2..]),
         Some("migrate") => cmd_migrate(&args[2..]),
+        Some("triggers") => cmd_triggers(&args[2..]),
         Some("db") => cmd_db(&args[2..]),
         Some("doctor") => cmd_doctor(&args[2..]),
         Some("new") => cmd_new(&args[2..]),
@@ -201,6 +202,7 @@ fn print_usage(to_stderr: bool) {
     out("     linkc pm2-config <archivo.link> <puerto> [-o <archivo>]   (genera un ecosystem.json de PM2, default ./ecosystem.json)");
     out("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)");
     out("     linkc explain <código>                 (explica un código de error estable, ej. 'linkc explain L0001' -- NO todo error tiene uno, GRAMMAR.md §3.210)");
+    out("     linkc triggers <archivo.link> [--db-schema <nombre>]   (imprime el DDL idempotente de PostgreSQL -- una función + un trigger AFTER INSERT/UPDATE/DELETE por colección -- que hace que un stream de 'linkc serve' reaccione a escrituras hechas por OTRO sistema sobre la misma base, vía el mismo canal LISTEN/NOTIFY; no se conecta a nada ni aplica nada, GRAMMAR.md §3.225)");
     out("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)");
     out("     linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'; con --target-url/LINK_DOCTOR_TARGET_URL, además compara la versión local contra la de un 'linkc serve' real corriendo ahí, vía /health)");
     out("     linkc db inspect <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor'; --db-schema/LINK_DATABASE_SCHEMA solo Postgres)");
@@ -255,6 +257,31 @@ fn cmd_fmt(args: &[String]) -> ExitCode {
         }
         ExitCode::SUCCESS
     }
+}
+
+/// `linkc triggers <archivo.link> [--db-schema <nombre>]` (GRAMMAR.md
+/// §3.225): imprime a stdout el DDL idempotente de PostgreSQL que hace que
+/// un `stream` reaccione a escrituras externas. Solo texto: no se conecta a
+/// ninguna base ni aplica nada -- quien administra la base lo revisa y lo
+/// aplica con su propio mecanismo de migraciones.
+fn cmd_triggers(args: &[String]) -> ExitCode {
+    let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
+        eprintln!("uso: linkc triggers <archivo.link> [--db-schema <nombre>]");
+        return ExitCode::FAILURE;
+    };
+    let schema = match read_flag_or_env(args, "--db-schema", "LINK_DATABASE_SCHEMA") {
+        Ok(v) => v.filter(|s| !s.trim().is_empty()),
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    print!("{}", linkc::triggers::external_change_triggers_sql(&program, schema.as_deref()));
+    ExitCode::SUCCESS
 }
 
 fn cmd_lint(args: &[String]) -> ExitCode {

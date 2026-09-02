@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.184.0] - 2026-09-02
+
+### ✨ Añadido
+**`linkc triggers <archivo.link> [--db-schema]`: un `stream` reacciona a escrituras hechas por OTRO sistema (PLAN.md §9.19 ítem 1, el pedido #1 del CRM Nexus)**. Imprime DDL idempotente de PostgreSQL -- una función + un trigger `AFTER INSERT/UPDATE/DELETE` por colección -- que hace `pg_notify` en el mismo canal que ya escucha `linkc serve`, con payload mínimo `{collection, op, id}`; el receptor relee la fila por id (evento byte-idéntico al de una escritura propia; sin límite de 8000 bytes). Cada conexión fija `SET link.instance` para que una escritura del propio linkc no llegue dos veces. `linkc` nunca aplica el DDL solo. Elimina el "republish" HTTP que el CRM hacía tras cada escritura de Drizzle. Verificado contra Postgres real en CI (insert/update/delete externos + ausencia de duplicado). Ver GRAMMAR.md §3.225.
+
 ## [1.183.0] - 2026-09-02
 
 ### ✨ Añadido

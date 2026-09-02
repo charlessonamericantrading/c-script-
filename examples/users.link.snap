@@ -1,5 +1,5 @@
 === contract.d.ts ===
-// Generado automáticamente por linkc v1.183.0 — no editar a mano.
+// Generado automáticamente por linkc v1.184.0 — no editar a mano.
 
 export type Result<T, E> = { type: "Ok"; value: T } | { type: "Err"; error: E };
 export type Patch<T> = Partial<T>;
@@ -77,7 +77,7 @@ export interface UsersClient {
 
 
 === client.ts ===
-// Generado automáticamente por linkc v1.183.0 — no editar a mano.
+// Generado automáticamente por linkc v1.184.0 — no editar a mano.
 
 import type { NewUser, Patch, Result, Role, User, UsersClient, ValidationError } from "./contract";
 import { isResult_User_ValidationError, isUser } from "./validators.ts";
@@ -285,7 +285,7 @@ export function createUsersClient(baseUrl: string): UsersClient {
 
 
 === validators.ts ===
-// Generado automáticamente por linkc v1.183.0 — no editar a mano.
+// Generado automáticamente por linkc v1.184.0 — no editar a mano.
 
 import type { NewUser, Patch, Result, Role, User, ValidationError } from "./contract";
 

@@ -4816,3 +4816,71 @@ fn adopt_existing_with_db_schema_never_creates_the_schema_and_fails_cleanly_if_m
         .get(0);
     assert_eq!(exists, 0, "--adopt-existing NUNCA debe crear el schema, ni siquiera al fallar");
 }
+
+// GRAMMAR.md §3.225 (PLAN.md §9.19 ítem 1): un `stream` reacciona a una
+// escritura hecha por OTRO sistema -- acá un `postgres::Client` directo, el
+// papel que en el CRM juega Express+Drizzle -- gracias al trigger que
+// `linkc triggers` imprime. Sin republish HTTP, sin que linkc escriba nada.
+#[test]
+fn an_external_insert_update_and_delete_push_to_a_stream_once_the_triggers_are_installed() {
+    const COLLECTION: &str = "items_external_trigger";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("external-trigger");
+    let src = temp.write("app.link", &PUSH_PROGRAM.replace("COLLECTION", COLLECTION));
+
+    // La instancia crea la tabla al conectar (sin --adopt-existing).
+    let instance = Serve::start(&src, &url);
+
+    // El DDL viene del binario real, y se aplica DOS veces a propósito:
+    // tiene que ser idempotente (el CRM lo ensaya con BEGIN/ROLLBACK).
+    let ddl = Command::new(env!("CARGO_BIN_EXE_linkc")).arg("triggers").arg(&src).output().expect("linkc triggers");
+    assert!(ddl.status.success(), "{}", String::from_utf8_lossy(&ddl.stderr));
+    let ddl = String::from_utf8_lossy(&ddl.stdout).to_string();
+    let mut external = postgres::Client::connect(&url, postgres::NoTls).expect("conectar como sistema externo");
+    external.batch_execute(&ddl).expect("aplicar el DDL de triggers");
+    external.batch_execute(&ddl).expect("aplicarlo de nuevo: idempotente");
+
+    let mut watcher = StreamClient::connect(instance.port, "/Items/watchAll");
+
+    // INSERT externo: sin `link.instance` en esta sesión, el trigger marca
+    // `instance` vacío y linkc relee la fila.
+    external
+        .execute(&format!("INSERT INTO \"{COLLECTION}\" (\"name\") VALUES ($1)"), &[&"desde-drizzle"])
+        .expect("insert externo");
+    let event = watcher.next_event().expect("el stream debió recibir el INSERT externo");
+    assert_eq!(event["name"], "desde-drizzle", "evento: {event:?}");
+    let id = event["id"].as_i64().expect("id entero");
+
+    // UPDATE externo: misma fila, releída con el valor nuevo.
+    external
+        .execute(&format!("UPDATE \"{COLLECTION}\" SET \"name\" = $1 WHERE \"id\" = $2"), &[&"editado-fuera", &id])
+        .expect("update externo");
+    let event = watcher.next_event().expect("el stream debió recibir el UPDATE externo");
+    assert_eq!(event["name"], "editado-fuera", "evento: {event:?}");
+    assert_eq!(event["id"], id);
+
+    // DELETE externo: ya no hay fila que releer -- llega el row_to_json(OLD)
+    // que mandó el trigger (forma de Postgres, límite honesto de §3.225).
+    external.execute(&format!("DELETE FROM \"{COLLECTION}\" WHERE \"id\" = $1"), &[&id]).expect("delete externo");
+    let event = watcher.next_event().expect("el stream debió recibir el DELETE externo");
+    assert_eq!(event["id"], id, "evento: {event:?}");
+    assert_eq!(event["name"], "editado-fuera", "evento: {event:?}");
+
+    // Y una escritura hecha por el PROPIO linkc llega UNA sola vez: el
+    // trigger también dispara para ella, pero con `instance` = la de este
+    // proceso, y el receptor la descarta (ya se publicó local).
+    let created = instance.rpc("Items/create", r#"{"name":"desde-linkc"}"#);
+    let event = watcher.next_event().expect("push propio");
+    assert_eq!(event["name"], "desde-linkc");
+    assert_eq!(event["id"], created["id"]);
+    // Timeout corto para probar la AUSENCIA del segundo evento sin esperar
+    // los 10s del read_timeout por defecto.
+    watcher.reader.get_mut().set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+    assert!(watcher.next_event().is_none(), "una escritura propia no debe llegar dos veces con los triggers instalados");
+}
