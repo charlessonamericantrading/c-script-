@@ -171,24 +171,24 @@ pub fn validate_check_expr_shape(expr: &Spanned<Expr>) -> Result<(), Span> {
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Ident(_) => Ok(()),
         Expr::Paren(inner) => validate_check_expr_shape(inner),
         Expr::Unary { op: UnaryOp::Not | UnaryOp::Neg, operand } => validate_check_expr_shape(operand),
-        Expr::Binary { op, left, right }
-            if matches!(
-                op,
+        Expr::Binary {
+            op:
                 BinaryOp::Eq
-                    | BinaryOp::NotEq
-                    | BinaryOp::Lt
-                    | BinaryOp::LtEq
-                    | BinaryOp::Gt
-                    | BinaryOp::GtEq
-                    | BinaryOp::And
-                    | BinaryOp::Or
-                    | BinaryOp::Add
-                    | BinaryOp::Sub
-                    | BinaryOp::Mul
-                    | BinaryOp::Div
-                    | BinaryOp::Rem
-            ) =>
-        {
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+                | BinaryOp::And
+                | BinaryOp::Or
+                | BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Rem,
+            left,
+            right,
+        } => {
             validate_check_expr_shape(left)?;
             validate_check_expr_shape(right)
         }
@@ -480,6 +480,10 @@ impl PartialEq for RpcDecl {
     }
 }
 
+/// Las dos mitades de un `@example(request: ..., response: ...)` (GRAMMAR.md
+/// §3.119): cada una `None` si no se declaró -- son independientes.
+pub type ExampleHalves<'a> = (Option<&'a Spanned<Expr>>, Option<&'a Spanned<Expr>>);
+
 impl RpcDecl {
     /// La anotación de auth, si hay (GRAMMAR.md §3.14). Sigue siendo a lo sumo
     /// UNA anotación de auth por rpc -- pero desde §3.49, `@requires` en sí
@@ -552,7 +556,7 @@ impl RpcDecl {
     /// El `@example(request: ..., response: ...)`, si hay (GRAMMAR.md
     /// §3.119) -- las dos mitades son independientes, `None` para la que no
     /// se declaró.
-    pub fn example(&self) -> Option<(Option<&Spanned<Expr>>, Option<&Spanned<Expr>>)> {
+    pub fn example(&self) -> Option<ExampleHalves<'_>> {
         self.annotations.iter().find_map(|a| match a {
             Annotation::Example { request, response } => Some((request.as_deref(), response.as_deref())),
             _ => None,

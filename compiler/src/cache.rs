@@ -83,6 +83,9 @@ impl CacheStore {
         Some((entry.status, entry.body.clone(), entry.content_type.clone()))
     }
 
+    // Una escritura plana de clave compuesta + entrada: los 8 argumentos SON
+    // los campos -- un struct intermedio duplicaría `Entry` sin sumar nada.
+    #[allow(clippy::too_many_arguments)]
     pub fn put(&mut self, service: &str, rpc: &str, args_key: &str, status: u16, body: String, content_type: String, ttl: Duration) {
         self.entries.insert(
             (service.to_string(), rpc.to_string(), args_key.to_string()),

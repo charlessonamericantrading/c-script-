@@ -32,9 +32,7 @@ pub fn format_source(src: &str) -> Result<String, String> {
 
         // Manejo de cierre de bloque: reducir indentación antes de imprimir
         if matches!(kind, TokenKind::RBrace) {
-            if indent_level > 0 {
-                indent_level -= 1;
-            }
+            indent_level = indent_level.saturating_sub(1);
             if !at_line_start {
                 out.push('\n');
                 at_line_start = true;

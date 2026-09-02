@@ -360,26 +360,52 @@ impl CorsConfig {
 /// proceso con código 1 (comportamiento idéntico al de siempre, solo que
 /// ahora vía un mensaje limpio en vez de un panic con backtrace), y
 /// `serve-all` nunca termina el proceso por un solo servicio caído.
-pub fn serve(
-    program: &Program,
-    host: &str,
-    port: u16,
-    source: DbSource,
-    db_schema: Option<String>,
-    cors: CorsConfig,
-    session_ttl: Option<Duration>,
-    argon2_params: argon2::Params,
-    encryption_key: Option<String>,
-    jwt_config: Option<(String, String, String)>,
-    adopt_existing: bool,
-    max_body_bytes: u64,
-    http_timeout: Duration,
-    trust_proxy: bool,
-    service_api_key: Option<String>,
-    log: LogConfig,
-    hsts: Option<String>,
-    mcp_secret: Option<String>,
-) -> Result<(), String> {
+///
+/// Toda la configuración viaja en `ServeConfig` (un struct, no 17
+/// parámetros posicionales -- llegó a 18 argumentos antes de la auditoría
+/// de PLAN.md §9.17): `Clone` a propósito, porque `run_serve_with_backoff`
+/// reintenta llamando a `serve` de nuevo con la MISMA configuración.
+#[derive(Clone)]
+pub struct ServeConfig {
+    pub host: String,
+    pub port: u16,
+    pub source: DbSource,
+    pub db_schema: Option<String>,
+    pub cors: CorsConfig,
+    pub session_ttl: Option<Duration>,
+    pub argon2_params: argon2::Params,
+    pub encryption_key: Option<String>,
+    pub jwt_config: Option<(String, String, String)>,
+    pub adopt_existing: bool,
+    pub max_body_bytes: u64,
+    pub http_timeout: Duration,
+    pub trust_proxy: bool,
+    pub service_api_key: Option<String>,
+    pub log: LogConfig,
+    pub hsts: Option<String>,
+    pub mcp_secret: Option<String>,
+}
+pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
+    let ServeConfig {
+        host,
+        port,
+        source,
+        db_schema,
+        cors,
+        session_ttl,
+        argon2_params,
+        encryption_key,
+        jwt_config,
+        adopt_existing,
+        max_body_bytes,
+        http_timeout,
+        trust_proxy,
+        service_api_key,
+        log,
+        hsts,
+        mcp_secret,
+    } = config;
+    let host = host.as_str();
     let server = tiny_http::Server::http((host, port)).map_err(|e| format!("no se pudo iniciar el servidor en {host}:{port}: {e}"))?;
     // Db::new(&program, &db_path), NO Db::seeded(): una colección real
     // (persistida en `db_path`, GRAMMAR.md §3.17) por cada una que el
@@ -466,7 +492,7 @@ pub fn serve(
     // `@route` (GRAMMAR.md §3.37): armada UNA vez al arrancar, nunca por
     // request -- el programa ya pasó el checker antes de llegar a `serve`,
     // así que build_route_table no puede encontrar nada inválido acá.
-    let route_table = build_route_table(&program);
+    let route_table = build_route_table(program);
     // `@rate_limit` (GRAMMAR.md §3.39): un solo `RateLimiter` para todo el
     // proceso, igual criterio que `route_table` de arriba.
     let rate_limiter = RateLimiter::new();
@@ -725,7 +751,7 @@ fn handle_request(
     // como a la respuesta real, o el browser nunca deja pasar la request
     // real para un origen que el override permite pero el CORS global no.
     let cors_override =
-        resolve_route(&path, "", route_table).ok().and_then(|(service_name, rpc_name, _)| required_cors(&program, service_name, rpc_name));
+        resolve_route(&path, "", route_table).ok().and_then(|(service_name, rpc_name, _)| required_cors(program, service_name, rpc_name));
     let effective_cors_config = cors_override.map(parse_cors_override);
     let cors: &CorsConfig = effective_cors_config.as_ref().unwrap_or(cors);
     let mut cors_headers = cors.headers_for(request_origin.as_deref());
@@ -901,8 +927,8 @@ fn handle_request(
     // otro path que no matchea nada -- MCP deshabilitado es indistinguible
     // de MCP inexistente, mismo criterio que el resto de los flags
     // opcionales de este servidor.
-    if mcp_secret.is_some() {
-        if path == "/mcp" {
+    if mcp_secret.is_some()
+        && path == "/mcp" {
             let mcp_session_id = request
                 .headers()
                 .iter()
@@ -911,9 +937,9 @@ fn handle_request(
             match *request.method() {
                 tiny_http::Method::Post => {
                     let result = super::mcp::handle_post(
-                        &program,
-                        &db,
-                        &sessions,
+                        program,
+                        db,
+                        sessions,
                         &mcp_state,
                         extract_bearer_token(&request).as_deref(),
                         mcp_session_id.as_deref(),
@@ -930,7 +956,7 @@ fn handle_request(
                     return;
                 }
                 tiny_http::Method::Delete => {
-                    let status = super::mcp::handle_delete_session(&sessions, mcp_session_id.as_deref());
+                    let status = super::mcp::handle_delete_session(sessions, mcp_session_id.as_deref());
                     let resp = cors_response(status, String::new(), &cors_headers, &request);
                     let _ = request.respond(resp);
                     log_done(log, req_id, Some("mcp"), status, start, "");
@@ -971,9 +997,8 @@ fn handle_request(
                 }
             }
         }
-    }
 
-    let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, &route_table) {
+    let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, route_table) {
         Ok(resolved) => resolved,
         Err(None) => {
             let resp = cors_response(404, error_json("URL debe tener la forma /Service/method"), &cors_headers, &request);
@@ -995,7 +1020,7 @@ fn handle_request(
     // defecto `POST /{Service}/{rpc}` de arriba encuentra cualquier rpc por
     // NOMBRE sin mirar sus anotaciones. 404, no 403 -- desde afuera, este
     // rpc "no existe" como endpoint, exactamente como uno mal escrito.
-    if is_cron_member(&program, service_name, rpc_name) {
+    if is_cron_member(program, service_name, rpc_name) {
         let resp = cors_response(404, error_json("no existe ese rpc"), &cors_headers, &request);
         let _ = request.respond(resp);
         log_done(log, req_id, Some(&method), 404, start, "");
@@ -1008,7 +1033,7 @@ fn handle_request(
     // sale de la conexión TCP real (`remote_addr`) por default, o de
     // `X-Forwarded-For` SOLO si `--trust-proxy`/`LINK_TRUST_PROXY` lo pide
     // explícitamente (GRAMMAR.md §3.89) -- ver `client_ip_for_rate_limit`.
-    if let Some((raw_spec, key_param)) = required_rate_limit(&program, service_name, rpc_name) {
+    if let Some((raw_spec, key_param)) = required_rate_limit(program, service_name, rpc_name) {
         let spec = RateLimitSpec::parse(raw_spec)
             .expect("check_rate_limit_annotation (checker.rs) ya validó este formato en compilación");
         let client_ip = client_ip_for_rate_limit(&request, trust_proxy);
@@ -1052,7 +1077,7 @@ fn handle_request(
     // parámetros a través de un 400 detallado antes de que el caller
     // pruebe estar autorizado (GRAMMAR.md §3.14).
     let token = extract_bearer_token(&request);
-    let auth_gate = check_auth_gate(&program, &sessions, token.as_deref(), service_name, rpc_name);
+    let auth_gate = check_auth_gate(program, sessions, token.as_deref(), service_name, rpc_name);
     if let Err((status, msg)) = auth_gate.outcome {
         let resp = cors_response(status, error_json(msg), &cors_headers, &request);
         let _ = request.respond(resp);
@@ -1069,9 +1094,9 @@ fn handle_request(
     // riesgo de fuga nueva. Streams quedan fuera de alcance v0 -- una
     // suscripción de larga vida re-chequeando dueño por evento es un
     // problema distinto (límite honesto documentado en GRAMMAR.md §3.190).
-    if !is_stream_member(&program, service_name, rpc_name) {
-        if let Some(Annotation::Requires { ownership: Some(clause), .. }) = required_auth(&program, service_name, rpc_name) {
-            let (checker, _) = crate::checker::Checker::build_symbols(&program);
+    if !is_stream_member(program, service_name, rpc_name) {
+        if let Some(Annotation::Requires { ownership: Some(clause), .. }) = required_auth(program, service_name, rpc_name) {
+            let (checker, _) = crate::checker::Checker::build_symbols(program);
             if let Err((status, msg)) = check_resource_ownership(clause, &args_json, &checker, db, sessions, token.as_deref()) {
                 let resp = cors_response(status, error_json(&msg), &cors_headers, &request);
                 let _ = request.respond(resp);
@@ -1081,7 +1106,7 @@ fn handle_request(
         }
     }
 
-    if is_stream_member(&program, service_name, rpc_name) {
+    if is_stream_member(program, service_name, rpc_name) {
         // Push real v0 (GRAMMAR.md §3.16): si el cuerpo matchea el
         // shape reconocido (`ast::recognize_live_subscribe`), esto NUNCA
         // llega a invocar `invoke_rpc_with_sessions` -- `Db::subscribe`
@@ -1089,7 +1114,7 @@ fn handle_request(
         // `Receiver` que el hilo escritor bloquea leyendo para siempre.
         // Cualquier otro stream sigue el camino de List<T> de siempre,
         // sin cambios, más abajo.
-        if let Some(collection) = live_subscribe_collection(&program, service_name, rpc_name) {
+        if let Some(collection) = live_subscribe_collection(program, service_name, rpc_name) {
             match db.subscribe(collection) {
                 Ok((snapshot, events)) => {
                     let cors_headers = cors_headers.clone();
@@ -1115,7 +1140,7 @@ fn handle_request(
         // ver el porqué en el comentario de arriba del módulo. Lo único
         // que cruza al hilo de escritura es `elements` (ya JSON puro) y
         // `request`.
-        let elements = match invoke_rpc_with_sessions(&program, service_name, rpc_name, &args_json, &db, &sessions, token.as_deref()) {
+        let elements = match invoke_rpc_with_sessions(program, service_name, rpc_name, &args_json, db, sessions, token.as_deref()) {
             Ok(json) => json.as_array().cloned().expect(
                 "check_rpc (checker.rs) exige que el cuerpo de un stream sea List<T> -- invoke_rpc no puede devolver otra cosa acá",
             ),
@@ -1138,7 +1163,7 @@ fn handle_request(
     // Corre DESPUÉS del gate de auth de arriba: repetir una respuesta
     // grabada sigue exigiendo estar autorizado para pedirla, mismo criterio
     // que el resto de la request.
-    let idempotency_key = if required_idempotent(&program, service_name, rpc_name) { extract_idempotency_key(&request) } else { None };
+    let idempotency_key = if required_idempotent(program, service_name, rpc_name) { extract_idempotency_key(&request) } else { None };
     if let Some(key) = &idempotency_key {
         let request_hash = hash_request_body(&body);
         // AUDIT-2026-08-27.md #4/GRAMMAR.md §3.166: `reserve` es una única
@@ -1187,7 +1212,7 @@ fn handle_request(
     // clave usa el JSON de `args_json` tal cual llegó (sin canonicalizar
     // orden de claves) -- mismo criterio ya aceptado del lado del cache de
     // Query en `hooks.ts` (`JSON.stringify(params)`, GRAMMAR.md §3.124).
-    let cache_ttl = required_cache(&program, service_name, rpc_name);
+    let cache_ttl = required_cache(program, service_name, rpc_name);
     let cache_key = cache_ttl.map(|_| args_json.to_string());
     if let (Some(_), Some(key)) = (cache_ttl, &cache_key) {
         if let Some((status, body, content_type)) = cache_store.lock().get(service_name, rpc_name, key) {
@@ -1200,7 +1225,7 @@ fn handle_request(
     }
 
     let (status, response_body, response_type, response_location, response_cache_control) =
-        handle_rpc(&program, &db, &sessions, token.as_deref(), service_name, rpc_name, args_json);
+        handle_rpc(program, db, sessions, token.as_deref(), service_name, rpc_name, args_json);
     // `@idempotent`: solo se graba un ÉXITO (2xx) -- un error no se graba,
     // para que el caller pueda corregir y reintentar con la MISMA clave
     // (GRAMMAR.md §3.140, mismo criterio que Stripe: la clave protege
@@ -1379,13 +1404,10 @@ fn percent_decode(segment: &str) -> String {
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
             let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok());
-            match hex {
-                Some(byte) => {
-                    out.push(byte);
-                    i += 3;
-                    continue;
-                }
-                None => {}
+            if let Some(byte) = hex {
+                out.push(byte);
+                i += 3;
+                continue;
             }
         }
         out.push(bytes[i]);
@@ -1980,6 +2002,10 @@ fn write_stream(
 /// en la PRÓXIMA publicación a `collection` es cuando `Db::publish` nota
 /// que el `SyncSender` pareja ya no tiene receptor y lo poda -- lazy, no
 /// eager (ver `Db::publish`).
+// Plomería de streaming: la conexión, el request-id, el log y los canales
+// viajan juntos a cada escritor de SSE -- misma decisión que `call_method`
+// (runtime/mod.rs): un struct solo movería la lista de lugar.
+#[allow(clippy::too_many_arguments)]
 fn write_live_stream(
     request: tiny_http::Request,
     snapshot: Vec<serde_json::Value>,
@@ -2031,6 +2057,10 @@ fn write_live_stream(
 /// desconectó, pero ANTES de una futura reconexión, tiene que enterarse de
 /// que no hay conexión abierta (error claro) en vez de mandar a un canal
 /// muerto en silencio.
+// Plomería de streaming: la conexión, el request-id, el log y los canales
+// viajan juntos a cada escritor de SSE -- misma decisión que `call_method`
+// (runtime/mod.rs): un struct solo movería la lista de lugar.
+#[allow(clippy::too_many_arguments)]
 fn write_mcp_stream(
     request: tiny_http::Request,
     events: Receiver<serde_json::Value>,

@@ -322,13 +322,17 @@ pub(crate) fn create_index_statements(collection: &str, indexed: &[(String, bool
 
 /// Nombre de colección -> lista de `(campos, condición SQL opcional)` por
 /// cada `@unique(...)` COMPUESTO de su tipo de elemento (GRAMMAR.md §3.155/
-/// §3.174) -- mismo cruce `checker.db_collections()` + `program.items` que
+/// §3.174).
+pub(crate) type CompositeUniquesByCollection = HashMap<String, Vec<(Vec<String>, Option<String>)>>;
+
+/// Ver el alias de arriba para la forma del resultado -- mismo cruce
+/// `checker.db_collections()` + `program.items` que
 /// `index_fields_by_collection` arriba, mismo motivo (la anotación vive en
 /// `ast::TypeDecl`, no en el `Type` ya resuelto). La condición (`where
 /// <expr>`, §3.174) ya viene TRADUCIDA a SQL (`type_check_expr_sql`, misma
 /// función que usa `@check` de tipo) -- el checker
 /// (`Checker::check_type_annotations`) ya validó su forma y su tipo.
-pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<(Vec<String>, Option<String>)>> {
+pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checker) -> CompositeUniquesByCollection {
     let mut result = HashMap::new();
     for (coll_name, element_ty) in checker.db_collections() {
         let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };

@@ -120,7 +120,7 @@ fn capitalize(s: &str) -> String {
 /// `snake_case`/`kebab-case` -> `PascalCase`, para el nombre del `type` --
 /// una tabla `blog_posts` da `type BlogPosts`, no `type Blog_posts`.
 fn to_pascal_case(table_name: &str) -> String {
-    table_name.split(|c| c == '_' || c == '-').filter(|s| !s.is_empty()).map(capitalize).collect()
+    table_name.split(['_', '-']).filter(|s| !s.is_empty()).map(capitalize).collect()
 }
 
 /// GRAMMAR.md §3.192: las tres consultas de este archivo (dos acá, una en

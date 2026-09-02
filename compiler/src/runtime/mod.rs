@@ -2060,6 +2060,11 @@ pub(crate) fn generate_uuid_v4() -> Result<String, RuntimeError> {
 /// preserva tal cual en el componente de path de la URI (`encode_slash:
 /// false`, para el nombre del objeto -- un "folder/archivo.pdf" real no
 /// debe convertirse en un solo segmento codificado).
+// Los dos primeros brazos del `if` hacen lo mismo (`push(c)`) por MOTIVOS
+// distintos documentados arriba -- colapsarlos en una sola condición
+// enterraría la distinción "sin reservar" vs "el caso especial de `/`" que
+// la spec de AWS trata por separado. Falso positivo deliberadamente.
+#[allow(clippy::if_same_then_else)]
 fn aws_uri_encode(s: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -2520,6 +2525,12 @@ fn excel_sheet_spec_to_value(spec: excel::ExcelSheetSpec) -> Value {
     ])
 }
 
+// Plomería del intérprete: el dispatch más caliente del runtime recibe el
+// contexto completo (db, checker, sesiones, token, presupuesto) porque
+// cualquier builtin puede necesitar cualquiera de ellos -- agruparlos en un
+// struct solo movería la misma lista a otro lado, con una indirección más
+// en cada uno de los ~96 brazos.
+#[allow(clippy::too_many_arguments)]
 fn call_method(
     receiver: Value,
     method: &str,
@@ -4293,28 +4304,26 @@ fn apply_field_validators(ast_fields: &[Field], value: &Value, path: &str) -> Re
             // Ausente (campo opcional que no vino) o presente pero `Null`:
             // nada que validar -- `@validate` no vuelve requerido un campo
             // opcional.
-            if let Some((_, v)) = entries.iter().find(|(n, _)| n == &af.name) {
-                if let Value::Str(s) = v {
-                    match validator {
-                        FieldValidator::Email => {
-                            if !is_plausible_email(s) {
-                                return Err(bad_req(format!(
-                                    "'{path}.{}': '{s}' no es un email válido (@validate(email))",
-                                    af.name
-                                )));
-                            }
+            if let Some((_, Value::Str(s))) = entries.iter().find(|(n, _)| n == &af.name) {
+                match validator {
+                    FieldValidator::Email => {
+                        if !is_plausible_email(s) {
+                            return Err(bad_req(format!(
+                                "'{path}.{}': '{s}' no es un email válido (@validate(email))",
+                                af.name
+                            )));
                         }
-                        FieldValidator::Regex(pattern) => {
-                            // El patrón ya se validó en `linkc build`
-                            // (checker::check_field_validators) -- si llegó
-                            // hasta acá, compilar de nuevo no puede fallar.
-                            let re = regex::Regex::new(pattern).expect("patrón de @validate ya validado en compilación");
-                            if !re.is_match(s) {
-                                return Err(bad_req(format!(
-                                    "'{path}.{}': '{s}' no matchea @validate(regex, \"{pattern}\")",
-                                    af.name
-                                )));
-                            }
+                    }
+                    FieldValidator::Regex(pattern) => {
+                        // El patrón ya se validó en `linkc build`
+                        // (checker::check_field_validators) -- si llegó
+                        // hasta acá, compilar de nuevo no puede fallar.
+                        let re = regex::Regex::new(pattern).expect("patrón de @validate ya validado en compilación");
+                        if !re.is_match(s) {
+                            return Err(bad_req(format!(
+                                "'{path}.{}': '{s}' no matchea @validate(regex, \"{pattern}\")",
+                                af.name
+                            )));
                         }
                     }
                 }

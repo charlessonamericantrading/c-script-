@@ -439,11 +439,10 @@ fn block_reassigns_ident(block: &Block, target: &str) -> bool {
     for stmt in &block.stmts {
         match &stmt.node {
             Stmt::Assign { name, .. } if name == target => return true,
-            Stmt::While { body, .. } => {
-                if block_reassigns_ident(body, target) {
+            Stmt::While { body, .. }
+                if block_reassigns_ident(body, target) => {
                     return true;
                 }
-            }
             _ => {}
         }
     }

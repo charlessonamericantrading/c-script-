@@ -281,11 +281,11 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     let b_chars: Vec<char> = b.chars().collect();
     let mut dp = vec![vec![0; b_chars.len() + 1]; a_chars.len() + 1];
 
-    for i in 0..=a_chars.len() {
-        dp[i][0] = i;
+    for (i, row) in dp.iter_mut().enumerate() {
+        row[0] = i;
     }
-    for j in 0..=b_chars.len() {
-        dp[0][j] = j;
+    for (j, cell) in dp[0].iter_mut().enumerate() {
+        *cell = j;
     }
 
     for (i, ca) in a_chars.iter().enumerate() {
@@ -2006,7 +2006,7 @@ impl Checker {
     /// desincronizado del contrato real es un error de compilación, no un
     /// dato que puede mentir en silencio en `openapi.json`.
     fn check_example_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
-        let examples: Vec<(Option<&Spanned<Expr>>, Option<&Spanned<Expr>>)> = r
+        let examples: Vec<crate::ast::ExampleHalves> = r
             .annotations
             .iter()
             .filter_map(|a| match a {
@@ -3204,7 +3204,7 @@ impl Checker {
             return false;
         }
         let Some(decl) = self.enums.get(base_name) else { return false };
-        decl.variants.iter().find(|v| &v.name == field).is_some_and(|v| v.fields.as_ref().is_none_or(|fs| fs.is_empty()))
+        decl.variants.iter().find(|v| v.name == field).is_some_and(|v| v.fields.as_ref().is_none_or(|fs| fs.is_empty()))
     }
 
     fn check_generic_struct_lit(

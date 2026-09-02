@@ -157,11 +157,17 @@ pub fn load_program_with_overlay(entry: &Path, overlay: &HashMap<PathBuf, String
 /// fuerza una resolución FRESCA de cada dependencia git, ignorando
 /// cualquier pin que ya exista en `link.lock` -- el único camino que
 /// avanza el pin a un commit más nuevo.
+///
+/// La tupla que devuelve `load_program_full`: (programa, archivos tocados,
+/// raíces de dependencias git, entradas de `link.lock` por nombre de
+/// dependencia) -- ver el doc de la función para qué es cada mitad.
+pub type FullyLoadedProgram = (Program, Vec<PathBuf>, Vec<PathBuf>, BTreeMap<String, crate::lockfile::GitLockEntry>);
+
 pub fn load_program_full(
     entry: &Path,
     overlay: &HashMap<PathBuf, String>,
     update_deps: bool,
-) -> Result<(Program, Vec<PathBuf>, Vec<PathBuf>, BTreeMap<String, crate::lockfile::GitLockEntry>), LoadError> {
+) -> Result<FullyLoadedProgram, LoadError> {
     let canon_entry = canonicalize(entry)?;
     let project_root = canon_entry.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
     let mut loader = Loader {

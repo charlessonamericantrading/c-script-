@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.175.0] - 2026-09-02
+
+### 🔧 Interno
+**Calidad (PLAN.md §9.17 ítem 9, cierra el Bloque C): cero warnings de clippy, `cargo clippy -D warnings` en CI, y `serve()` refactorizado de 18 parámetros posicionales a un struct `ServeConfig`.** 48 warnings acumulados limpiados: ~28 automáticos, fixes reales a mano (guard al patrón, if-let colapsado, `&Path`, DP idiomático, 6 alias de tipo con nombre), el refactor de `ServeConfig` (18 posicionales con cinco `Option<String>` era un error de transposición esperando a pasar), y `#[allow]` con comentario SOLO donde el warning está genuinamente equivocado (una instancia de `Backend` por proceso, los brazos deliberados de `aws_uri_encode`, la plomería de `call_method`). `cargo fmt --check` queda afuera a propósito -- 2.800+ diffs contra rustfmt: el formateo a mano es decisión de estilo y un reformateo masivo mataría `git blame` por valor cero. Ver GRAMMAR.md §3.216.
+
 ## [1.174.0] - 2026-09-02
 
 ### 🔧 Interno

@@ -47,6 +47,19 @@ jobs:
         with:
           workspaces: compiler
 
+      - name: cargo clippy (cero warnings, GRAMMAR.md §3.216)
+        working-directory: compiler
+        # Auditoría del 02/09/2026 (PLAN.md §9.17 ítem 9): había 48 warnings
+        # acumulados sin que nada los frenara. Limpiados una vez, este paso
+        # evita que vuelvan. Solo en Linux: los warnings de clippy no
+        # dependen del OS para este código, y correrlo dos veces solo
+        # duplicaría minutos de CI. `cargo fmt --check` queda AFUERA a
+        # propósito: el formateo a mano de este repo es una decisión de
+        # estilo (2.800+ diffs contra rustfmt), y un reformateo masivo
+        # destruiría el blame por valor cero -- ver §3.216.
+        if: runner.os == 'Linux'
+        run: cargo clippy --all-targets --locked -- -D warnings
+
       - name: cargo test (unitarios + subprocesos reales de LSP y servidor HTTP)
         working-directory: compiler
         # cargo test también compila target/debug/linkc como efecto

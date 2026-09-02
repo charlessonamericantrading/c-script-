@@ -93,6 +93,11 @@ pub(crate) enum ColumnKind {
 /// tomado. SQLite no lo necesita: los métodos de `rusqlite::Connection`
 /// (`execute`/`query`/`prepare`) ya toman `&self`, la mutabilidad interna
 /// la maneja la propia librería C de SQLite.
+// La diferencia de tamaño entre variantes no importa acá: hay UNA instancia
+// de `Backend` por base conectada (una o dos por proceso), nunca una
+// colección de ellas -- boxear la variante grande solo sumaría una
+// indirección sin ahorrar nada real.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Backend {
     Sqlite(parking_lot::ReentrantMutex<rusqlite::Connection>),
     Postgres {

@@ -186,32 +186,32 @@ fn print_usage(to_stderr: bool) {
             println!("{line}");
         }
     };
-    out(&format!("uso: linkc <subcomando> [opciones]"));
-    out(&format!("     --diagnostics-json (flag global, cualquier posición): en cualquier subcomando que falle por un error de carga o de tipos, imprime un array JSON [{{file, line, column, message}}] a stdout en vez del texto humano de siempre a stderr -- para un agente o integración externa parseando errores sin scrapear prosa, GRAMMAR.md §3.208"));
-    out(&format!("subcomandos conocidos:"));
-    out(&format!("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)"));
-    out(&format!("     linkc build <archivo.link> <outdir> [--diff <anterior>] [--update-deps]    (genera contratos TS, cliente, hooks, schemas Zod, OpenAPI, llms.txt y llms-full.txt; --diff compara el contract.d.ts nuevo contra uno guardado antes; --update-deps ignora el pin de link.lock y re-resuelve cada dependencia git contra su remoto real)"));
-    out(&format!("     linkc test <archivo.link> [--filter <nombre>] [--db <url-postgres>]  (ejecuta pruebas de comportamiento integradas; --filter acota a las que CONTIENEN ese substring en el nombre; --db/LINK_TEST_DB corre contra PostgreSQL real en vez de SQLite :memory:, sin aislamiento entre tests -- solo contra una base de test dedicada, nunca producción; sin ningún bloque 'test {{ }}' en el programa, ESTE es el camino rápido de 'solo parsear y tipar' -- no escribe ningún archivo, no toca ninguna base, sale en milisegundos, GRAMMAR.md §3.206)"));
-    out(&format!("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)"));
-    out(&format!("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)"));
-    out(&format!("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)"));
-    out(&format!("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)"));
-    out(&format!("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)"));
-    out(&format!("     linkc systemd <archivo.link> <puerto> [outdir]   (genera una unidad systemd lista para /etc/systemd/system/)"));
-    out(&format!("     linkc pm2-config <archivo.link> <puerto> [-o <archivo>]   (genera un ecosystem.json de PM2, default ./ecosystem.json)"));
-    out(&format!("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)"));
-    out(&format!("     linkc explain <código>                 (explica un código de error estable, ej. 'linkc explain L0001' -- NO todo error tiene uno, GRAMMAR.md §3.210)"));
-    out(&format!("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)"));
-    out(&format!("     linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'; con --target-url/LINK_DOCTOR_TARGET_URL, además compara la versión local contra la de un 'linkc serve' real corriendo ahí, vía /health)"));
-    out(&format!("     linkc db inspect <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor'; --db-schema/LINK_DATABASE_SCHEMA solo Postgres)"));
-    out(&format!("     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>] (vuelca cada colección declarada a un archivo JSON, byte-idéntico al wire real -- sin ejecutar ningún DDL)"));
-    out(&format!("     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>] (escribe las filas de un archivo de 'db export' contra un target, preservando el id original de cada fila -- un target vacío ES el caso 'seed')"));
-    out(&format!("     linkc db shell <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (REPL de solo lectura sobre stdin/stdout, una consulta SQL por línea -- SQLite abre de solo lectura, Postgres corre con default_transaction_read_only)"));
-    out(&format!("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)"));
-    out(&format!("     linkc serve <archivo.link> <puerto> [--db <url>] [--db-schema <nombre>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; sin schema propio por default (el 'public' de siempre), o namespacing vía --db-schema/LINK_DATABASE_SCHEMA (crea el schema si no existe, salvo --adopt-existing) para compartir una base entre varios .link sin colisión de nombre de tabla -- solo PostgreSQL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; clave de @encrypted vía --encryption-key/LINK_ENCRYPTION_KEY (32 bytes en base64), obligatoria si el programa declara algún campo @encrypted; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)"));
-    out(&format!("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {{\"nombre_archivo\": puerto, ...}} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)"));
-    out(&format!("     linkc lsp                              (inicia el servidor Language Server Protocol)"));
-    out(&format!("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)"));
+    out("uso: linkc <subcomando> [opciones]");
+    out("     --diagnostics-json (flag global, cualquier posición): en cualquier subcomando que falle por un error de carga o de tipos, imprime un array JSON [{file, line, column, message}] a stdout en vez del texto humano de siempre a stderr -- para un agente o integración externa parseando errores sin scrapear prosa, GRAMMAR.md §3.208");
+    out("subcomandos conocidos:");
+    out("     linkc new <nombre>                     (scaffoldea un proyecto nuevo)");
+    out("     linkc build <archivo.link> <outdir> [--diff <anterior>] [--update-deps]    (genera contratos TS, cliente, hooks, schemas Zod, OpenAPI, llms.txt y llms-full.txt; --diff compara el contract.d.ts nuevo contra uno guardado antes; --update-deps ignora el pin de link.lock y re-resuelve cada dependencia git contra su remoto real)");
+    out("     linkc test <archivo.link> [--filter <nombre>] [--db <url-postgres>]  (ejecuta pruebas de comportamiento integradas; --filter acota a las que CONTIENEN ese substring en el nombre; --db/LINK_TEST_DB corre contra PostgreSQL real en vez de SQLite :memory:, sin aislamiento entre tests -- solo contra una base de test dedicada, nunca producción; sin ningún bloque 'test { }' en el programa, ESTE es el camino rápido de 'solo parsear y tipar' -- no escribe ningún archivo, no toca ninguna base, sale en milisegundos, GRAMMAR.md §3.206)");
+    out("     linkc wasm <archivo.link> <out.wasm>   (compila a WebAssembly nativo)");
+    out("     linkc fmt <archivo.link> [--check]     (formatea el código fuente canónicamente)");
+    out("     linkc lint <archivo.link> [--fix]      (analiza calidad de código y detecta variables sin uso)");
+    out("     linkc doc <archivo.link> [outdir]      (genera documentación HTML estática interactiva)");
+    out("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)");
+    out("     linkc systemd <archivo.link> <puerto> [outdir]   (genera una unidad systemd lista para /etc/systemd/system/)");
+    out("     linkc pm2-config <archivo.link> <puerto> [-o <archivo>]   (genera un ecosystem.json de PM2, default ./ecosystem.json)");
+    out("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)");
+    out("     linkc explain <código>                 (explica un código de error estable, ej. 'linkc explain L0001' -- NO todo error tiene uno, GRAMMAR.md §3.210)");
+    out("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)");
+    out("     linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'; con --target-url/LINK_DOCTOR_TARGET_URL, además compara la versión local contra la de un 'linkc serve' real corriendo ahí, vía /health)");
+    out("     linkc db inspect <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor'; --db-schema/LINK_DATABASE_SCHEMA solo Postgres)");
+    out("     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>] (vuelca cada colección declarada a un archivo JSON, byte-idéntico al wire real -- sin ejecutar ningún DDL)");
+    out("     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>] (escribe las filas de un archivo de 'db export' contra un target, preservando el id original de cada fila -- un target vacío ES el caso 'seed')");
+    out("     linkc db shell <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (REPL de solo lectura sobre stdin/stdout, una consulta SQL por línea -- SQLite abre de solo lectura, Postgres corre con default_transaction_read_only)");
+    out("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)");
+    out("     linkc serve <archivo.link> <puerto> [--db <url>] [--db-schema <nombre>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>]  (servidor HTTP; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; sin schema propio por default (el 'public' de siempre), o namespacing vía --db-schema/LINK_DATABASE_SCHEMA (crea el schema si no existe, salvo --adopt-existing) para compartir una base entre varios .link sin colisión de nombre de tabla -- solo PostgreSQL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; clave de @encrypted vía --encryption-key/LINK_ENCRYPTION_KEY (32 bytes en base64), obligatoria si el programa declara algún campo @encrypted; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)");
+    out("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {\"nombre_archivo\": puerto, ...} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)");
+    out("     linkc lsp                              (inicia el servidor Language Server Protocol)");
+    out("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)");
 }
 
 
@@ -1878,28 +1878,26 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
     }
 
-    let attempt = || {
-        runtime::server::serve(
-            &program,
-            &host,
-            port,
-            source.clone(),
-            db_schema.clone(),
-            cors.clone(),
-            session_ttl,
-            argon2_params.clone(),
-            encryption_key.clone(),
-            jwt_config.clone(),
-            adopt_existing,
-            max_body_bytes,
-            http_timeout,
-            trust_proxy,
-            service_api_key.clone(),
-            log,
-            hsts.clone(),
-            mcp_secret.clone(),
-        )
+    let config = runtime::server::ServeConfig {
+        host: host.clone(),
+        port,
+        source,
+        db_schema,
+        cors,
+        session_ttl,
+        argon2_params,
+        encryption_key,
+        jwt_config,
+        adopt_existing,
+        max_body_bytes,
+        http_timeout,
+        trust_proxy,
+        service_api_key,
+        log,
+        hsts,
+        mcp_secret,
     };
+    let attempt = || runtime::server::serve(&program, config.clone());
     match run_serve_with_backoff(attempt, restart_backoff, path) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
@@ -2431,32 +2429,30 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             let label = path.to_string_lossy().to_string();
             std::thread::spawn(move || {
                 let source = runtime::server::DbSource::SqliteFile(path.with_extension("db"));
-                let attempt = || {
-                    runtime::server::serve(
-                        &program,
-                        &host,
-                        port,
-                        source.clone(),
-                        // `serve-all` nunca conecta a Postgres (cada servicio
-                        // usa su propio SQLite local, ver el rechazo de
-                        // --db-schema más arriba en cmd_serve_all) -- siempre
-                        // None acá, no hay ningún schema que aplicar.
-                        None,
-                        cors.clone(),
-                        session_ttl,
-                        argon2_params.clone(),
-                        encryption_key.clone(),
-                        jwt_config.clone(),
-                        adopt_existing,
-                        max_body_bytes,
-                        http_timeout,
-                        trust_proxy,
-                        service_api_key.clone(),
-                        log,
-                        hsts.clone(),
-                        mcp_secret.clone(),
-                    )
+                let config = runtime::server::ServeConfig {
+                    host: host.clone(),
+                    port,
+                    source,
+                    // `serve-all` nunca conecta a Postgres (cada servicio
+                    // usa su propio SQLite local, ver el rechazo de
+                    // --db-schema más arriba en cmd_serve_all) -- siempre
+                    // None acá, no hay ningún schema que aplicar.
+                    db_schema: None,
+                    cors,
+                    session_ttl,
+                    argon2_params,
+                    encryption_key,
+                    jwt_config,
+                    adopt_existing,
+                    max_body_bytes,
+                    http_timeout,
+                    trust_proxy,
+                    service_api_key,
+                    log,
+                    hsts,
+                    mcp_secret,
                 };
+                let attempt = || runtime::server::serve(&program, config.clone());
                 match run_serve_with_backoff(attempt, restart_backoff, &label) {
                     Ok(()) => true,
                     Err(msg) => {

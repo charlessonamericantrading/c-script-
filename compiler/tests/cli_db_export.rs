@@ -164,7 +164,7 @@ fn a_real_database_populated_by_linkc_serve_exports_real_rows_including_soft_del
     assert_eq!(items.len(), 2, "las dos filas, incluida la soft-deleted: {items:?}");
     assert!(items.iter().any(|r| r["name"] == "Widget" && r["price"] == "19.9900" && r["tag"] == "Vip"), "{items:?}");
     let gadget = items.iter().find(|r| r["name"] == "Gadget").expect("la fila soft-deleted sigue exportándose");
-    assert_eq!(gadget["deletedAt"].is_string(), true, "@softDelete real, con fecha puesta: {gadget}");
+    assert!(gadget["deletedAt"].is_string(), "@softDelete real, con fecha puesta: {gadget}");
 }
 
 /// Un `.link` con una colección (`orders`) que la base FÍSICA nunca creó

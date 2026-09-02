@@ -264,20 +264,17 @@ fn wrap_section(title: &str, content: &str) -> String {
 fn render_type_decl(t: &TypeDecl) -> String {
     let name = &t.name;
     let mut fields_table = String::new();
-    match &t.ty {
-        TypeExpr::Struct(fields) => {
-            fields_table.push_str(r#"<table class="params-table"><thead><tr><th>Campo</th><th>Tipo</th><th>Requerido</th></tr></thead><tbody>"#);
-            for f in fields {
-                let req = if f.optional { "Opcional" } else { "Requerido" };
-                let ty_str = format!("{:?}", f.ty);
-                fields_table.push_str(&format!(
-                    r#"<tr><td><code>{}</code></td><td><span class="type-pill">{}</span></td><td>{}</td></tr>"#,
-                    f.name, ty_str, req
-                ));
-            }
-            fields_table.push_str("</tbody></table>");
+    if let TypeExpr::Struct(fields) = &t.ty {
+        fields_table.push_str(r#"<table class="params-table"><thead><tr><th>Campo</th><th>Tipo</th><th>Requerido</th></tr></thead><tbody>"#);
+        for f in fields {
+            let req = if f.optional { "Opcional" } else { "Requerido" };
+            let ty_str = format!("{:?}", f.ty);
+            fields_table.push_str(&format!(
+                r#"<tr><td><code>{}</code></td><td><span class="type-pill">{}</span></td><td>{}</td></tr>"#,
+                f.name, ty_str, req
+            ));
         }
-        _ => {}
+        fields_table.push_str("</tbody></table>");
     }
     format!(
         r#"<div class="card" id="type-{name}">

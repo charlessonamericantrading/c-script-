@@ -59,13 +59,16 @@ pub(crate) struct McpSharedState {
     /// La tabla de correlación en sí -- exactamente la forma validada por
     /// el spike aislado de PLAN.md §9.15 ítem 3 (`GET`/`POST` ->
     /// `recv_timeout` -> limpieza en timeout, candado tomado y soltado,
-    /// nunca sostenido durante el bloqueo). El `String` extra es el `jti`
-    /// de la sesión MCP DUEÑA de la request pendiente (GRAMMAR.md §3.212):
-    /// solo esa sesión puede entregar la respuesta -- sin esto, cualquier
-    /// POST anónimo que adivinara (o predijera, ver `fresh_id`) el id
-    /// inyectaba la "respuesta del LLM" que consume el rpc.
-    pending: Arc<parking_lot::Mutex<HashMap<String, (String, std::sync::mpsc::Sender<serde_json::Value>)>>>,
+    /// nunca sostenido durante el bloqueo).
+    pending: Arc<parking_lot::Mutex<PendingResponses>>,
 }
+
+/// id de JSON-RPC -> (`jti` de la sesión MCP DUEÑA, el `Sender` del
+/// `mcp.sample` bloqueado esperando). El `jti` existe por GRAMMAR.md §3.212:
+/// solo la sesión dueña puede entregar la respuesta -- sin esto, cualquier
+/// POST anónimo que adivinara (o predijera, ver `fresh_id`) el id inyectaba
+/// la "respuesta del LLM" que consume el rpc.
+type PendingResponses = HashMap<String, (String, std::sync::mpsc::Sender<serde_json::Value>)>;
 
 impl McpSharedState {
     pub(crate) fn new() -> Self {

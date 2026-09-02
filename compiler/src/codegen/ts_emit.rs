@@ -150,7 +150,9 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
     // antes de esta ronda -- el helper de abajo (__int64SafeStringify) ni
     // se emite.
     let mut program_has_int64 = false;
-    let mut services: Vec<(&ServiceDecl, Vec<(&RpcDecl, bool, Vec<Type>, Type)>)> = Vec::new();
+    // (rpc, es_stream, tipos de parámetros resueltos, tipo de retorno resuelto)
+    type RpcSignature<'a> = (&'a RpcDecl, bool, Vec<Type>, Type);
+    let mut services: Vec<(&ServiceDecl, Vec<RpcSignature>)> = Vec::new();
     for item in &program.items {
         let Item::Service(service) = item else { continue };
         let mut resolved: Vec<(&RpcDecl, bool, Vec<Type>, Type)> = Vec::new();

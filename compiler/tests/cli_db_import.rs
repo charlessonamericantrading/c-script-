@@ -7,7 +7,7 @@
 
 use serde_json::Value;
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::Duration;
 
@@ -110,7 +110,7 @@ fn run(sub: &str, args: &[&str]) -> (bool, String, String) {
     (out.status.success(), String::from_utf8_lossy(&out.stdout).to_string(), String::from_utf8_lossy(&out.stderr).to_string())
 }
 
-fn export_from(src: &PathBuf, db_path: &PathBuf, out_path: &PathBuf) {
+fn export_from(src: &Path, db_path: &Path, out_path: &Path) {
     let (success, stdout, stderr) = run("export", &[src.to_str().unwrap(), out_path.to_str().unwrap(), "--db", db_path.to_str().unwrap()]);
     assert!(success, "export falló -- stdout: {stdout}\nstderr: {stderr}");
 }
