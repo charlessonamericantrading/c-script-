@@ -1544,6 +1544,11 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             "build(blocks)",
             "Build a PDF document from a list of PdfBlock, returned as a base64-encoded String",
         )]),
+        Type::Ai => Some(vec![
+            method("generate(model, prompt, maxTokens)", "Run the local model on a raw prompt (no chat template) and return the generated text"),
+            method("chat(model, messages, maxTokens)", "Run the local model on AiMessage[] through its chat template and return the reply"),
+            method("models()", "The aliases declared in ai { }"),
+        ]),
         Type::Excel => Some(vec![
             method("build(sheets)", "Build an .xlsx workbook from a list of ExcelSheet, returned as a base64-encoded String"),
             method("parse(base64)", "Parse a base64-encoded .xlsx workbook into a list of ExcelSheet"),

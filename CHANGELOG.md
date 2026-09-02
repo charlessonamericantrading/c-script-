@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.193.0] - 2026-09-03
+
+### ✨ Añadido
+**`ai.generate(model, prompt, maxTokens)`, `ai.chat(model, messages: AiMessage[], maxTokens)` y `ai.models()` (PLAN.md §9.20 Eje G ítem 3)**: la primera inferencia local servida por un `.link` sin Ollama ni ningún proceso externo -- el bucle de generación del motor embebido (prefix cache, prefill, decode greedy hasta EOS/`maxTokens`/`--ai-timeout`) sobre los modelos de `ai { }`, cargados perezosamente en el primer uso. `AiMessage = { role, content }` pre-sembrado (y estructural como argumento), presente en el contrato generado si un rpc lo usa. `--ai-timeout`/`LINK_AI_TIMEOUT` (60s): un timeout es un error, nunca texto a medias. Una generación a la vez por programa. Verificado contra un modelo REAL (`LINK_TEST_AI_MODEL=qwen2.5:0.5b`, 3,4 s el test entero); CI lo salta como a los de Postgres. Ver GRAMMAR.md §3.235.
+
 ## [1.192.0] - 2026-09-03
 
 ### ✨ Añadido

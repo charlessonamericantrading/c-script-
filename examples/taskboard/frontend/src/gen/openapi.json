@@ -1,6 +1,21 @@
 {
   "components": {
     "schemas": {
+      "AiMessage": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "role": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "type": "object"
+      },
       "BoardStats": {
         "properties": {
           "doneCount": {
@@ -646,5 +661,5 @@
       }
     }
   },
-  "x-generated-by": "linkc v1.192.0"
+  "x-generated-by": "linkc v1.193.0"
 }

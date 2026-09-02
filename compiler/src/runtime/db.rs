@@ -1175,6 +1175,10 @@ pub struct Db {
     /// corre varios `.link` en un mismo proceso.
     #[cfg(feature = "inference")]
     ai_engine: parking_lot::RwLock<Option<std::sync::Arc<crate::inference::ServerState>>>,
+    /// GRAMMAR.md §3.235: `--ai-timeout`, tope de una sola generación.
+    ai_timeout: parking_lot::RwLock<std::time::Duration>,
+    /// GRAMMAR.md §3.235: una generación a la vez por programa.
+    ai_lock: parking_lot::Mutex<()>,
     /// Nombre de colección -> nombre del campo `@softDelete`, si esa
     /// colección tiene uno (GRAMMAR.md §3.78). Se calcula UNA vez al abrir
     /// la conexión (acá SÍ hay `Program`/`ast::Field` con anotaciones a
@@ -1668,6 +1672,8 @@ impl Db {
             encryption_key: parking_lot::RwLock::new(None),
             #[cfg(feature = "inference")]
             ai_engine: parking_lot::RwLock::new(None),
+            ai_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(60)),
+            ai_lock: parking_lot::Mutex::new(()),
             soft_delete_fields,
             static_routes: crate::route::static_public_routes(program),
             outbound_http: parking_lot::Mutex::new(HashMap::new()),
@@ -1881,6 +1887,8 @@ impl Db {
                 encryption_key: parking_lot::RwLock::new(None),
                 #[cfg(feature = "inference")]
                 ai_engine: parking_lot::RwLock::new(None),
+                ai_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(60)),
+                ai_lock: parking_lot::Mutex::new(()),
                 soft_delete_fields,
                 static_routes: crate::route::static_public_routes(program),
                 outbound_http: parking_lot::Mutex::new(HashMap::new()),
@@ -1939,6 +1947,26 @@ impl Db {
     /// `set_http_timeout`: `server.rs` lo llama UNA sola vez, antes de
     /// aceptar la primera request, después de confirmar (si hace falta) que
     /// hay una clave real configurada.
+    /// GRAMMAR.md §3.235: los alias de `ai { }` en orden de declaración --
+    /// disponible aunque no haya motor (`linkc test`, harness).
+    pub fn ai_model_aliases(&self) -> Vec<String> {
+        self.checker.ai_models().into_iter().map(|(alias, _)| alias).collect()
+    }
+
+    /// GRAMMAR.md §3.235: `--ai-timeout`/`LINK_AI_TIMEOUT`.
+    pub fn set_ai_timeout(&self, timeout: std::time::Duration) {
+        *self.ai_timeout.write() = timeout;
+    }
+
+    pub fn ai_timeout(&self) -> std::time::Duration {
+        *self.ai_timeout.read()
+    }
+
+    /// GRAMMAR.md §3.235: el candado "una generación a la vez".
+    pub fn ai_lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.ai_lock.lock()
+    }
+
     /// GRAMMAR.md §3.234: ver el campo `ai_engine`.
     #[cfg(feature = "inference")]
     pub fn set_ai_engine(&self, engine: std::sync::Arc<crate::inference::ServerState>) {

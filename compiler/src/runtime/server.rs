@@ -390,6 +390,8 @@ pub struct ServeConfig {
     /// GRAMMAR.md §3.234: `--ai-memory-budget-mb`, tope de bytes de modelos
     /// residentes a la vez (LRU); `None` = sin tope.
     pub ai_memory_budget_bytes: Option<u64>,
+    /// GRAMMAR.md §3.235: `--ai-timeout`, tope de una sola generación.
+    pub ai_timeout: Duration,
 }
 pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     let ServeConfig {
@@ -406,6 +408,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         max_body_bytes,
         models_dir,
         ai_memory_budget_bytes,
+        ai_timeout,
         http_timeout,
         trust_proxy,
         service_api_key,
@@ -474,6 +477,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     // perezoso (`ServerState::get_or_load`, en el primer uso de cada
     // alias): un modelo de 7B tarda segundos y no todos los rpc lo usan.
     let declared_models = checker_for_encryption.ai_models();
+    db.set_ai_timeout(ai_timeout);
     #[cfg(feature = "inference")]
     {
         if !declared_models.is_empty() {

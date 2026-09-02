@@ -162,6 +162,10 @@ pub enum Type {
     /// Tipo interno para el módulo `excel` builtin (GRAMMAR.md §3.202) --
     /// generar y parsear bytes de `.xlsx` real.
     Excel,
+    /// Tipo interno para el módulo `ai` builtin (GRAMMAR.md §3.235) --
+    /// inferencia local con el motor embebido (§3.233) sobre los modelos
+    /// declarados en `ai { }` (§3.234).
+    Ai,
     /// Tipo interno para el módulo `mcp` builtin (GRAMMAR.md §3.203) --
     /// `mcp.sample`, streaming bidireccional real de MCP.
     Mcp,
@@ -248,6 +252,7 @@ impl std::fmt::Display for Type {
             Type::Response => write!(f, "response"),
             Type::Pdf => write!(f, "pdf"),
             Type::Excel => write!(f, "excel"),
+            Type::Ai => write!(f, "ai"),
             Type::Mcp => write!(f, "mcp"),
         }
     }

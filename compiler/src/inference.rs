@@ -65,6 +65,108 @@ pub fn resolve_declared_models(
     }
 }
 
+/// GRAMMAR.md §3.235: qué se le pide al modelo. `Raw` es el prompt tal
+/// cual (sin chat template, como `/api/generate` con `raw: true`); `Chat`
+/// pasa por el chat template propio de cada arquitectura
+/// (`ModelTokenizer::render_prompt_ids`).
+pub enum AiRequest {
+    Raw(String),
+    Chat(Vec<ChatMessage>),
+}
+
+/// GRAMMAR.md §3.235: el resultado de una generación, con las cuentas que
+/// `/metrics` (Eje G ítem 8) va a exportar.
+#[derive(Debug)]
+pub struct AiOutput {
+    pub text: String,
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub done_reason: &'static str,
+    pub elapsed: std::time::Duration,
+}
+
+/// GRAMMAR.md §3.235: el bucle de generación del motor (`routes.rs::
+/// handle_generate` de origen), sin el HTTP de por medio: tokenizar,
+/// reusar el prefix cache si el prompt comparte prefijo con uno reciente,
+/// prefill, y decodificar greedy hasta EOS, `max_tokens` o `timeout`. Un
+/// timeout es un ERROR (no un texto a medias devuelto en silencio): el
+/// caller decide si reintenta con menos tokens o con otro modelo.
+pub fn generate(
+    state: &ServerState,
+    alias: &str,
+    request: AiRequest,
+    max_tokens: i64,
+    timeout: std::time::Duration,
+) -> Result<AiOutput, String> {
+    use model_core::{argmax, KvCache};
+    if max_tokens <= 0 {
+        return Err(format!("ai: maxTokens tiene que ser > 0, se recibió {max_tokens}"));
+    }
+    let entry = state.get_or_load(alias).map_err(|e| match e {
+        ModelLookupError::NotFound(_) => {
+            let declared: Vec<String> = state
+                .tags_json()
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect();
+            format!("ai: el alias '{alias}' no está declarado en 'ai {{ }}' -- declarados: [{}]", declared.join(", "))
+        }
+        ModelLookupError::LoadFailed(msg) => format!("ai: no se pudo cargar el modelo '{alias}': {msg}"),
+    })?;
+    let prompt_ids = match &request {
+        AiRequest::Raw(p) => entry.tokenizer.encode(p),
+        AiRequest::Chat(messages) => entry.tokenizer.render_prompt_ids(messages),
+    };
+    if prompt_ids.is_empty() {
+        return Err("ai: el prompt está vacío".to_string());
+    }
+    let started = std::time::Instant::now();
+    let (matched, cached) = state.prefix_cache.find_longest_prefix(alias, &prompt_ids);
+    let safe = model_core::prefix_cache::safe_reuse_len(matched, prompt_ids.len());
+    let (mut cache, mut logits) = match cached {
+        Some(mut cache) if safe > 0 => {
+            cache.truncate(safe);
+            let logits = entry.model.forward_step(&mut cache, &prompt_ids[safe..]);
+            (cache, logits)
+        }
+        _ => {
+            let mut cache = KvCache::new(&entry.model.cache_shape());
+            let logits = entry.model.forward_step(&mut cache, &prompt_ids);
+            state.prefix_cache.insert_prefix(alias, prompt_ids.clone(), cache.clone());
+            (cache, logits)
+        }
+    };
+    let max = max_tokens as usize;
+    let mut generated: Vec<u32> = Vec::new();
+    let mut done_reason = "length";
+    for step in 0..max {
+        if started.elapsed() > timeout {
+            return Err(format!(
+                "ai: timeout tras {:.1}s con {} token(s) generados -- subí --ai-timeout/LINK_AI_TIMEOUT o bajá maxTokens (GRAMMAR.md §3.235)",
+                started.elapsed().as_secs_f64(),
+                generated.len()
+            ));
+        }
+        let next = argmax(&logits);
+        if Some(next) == entry.tokenizer.eos_token_id() {
+            done_reason = "stop";
+            break;
+        }
+        generated.push(next);
+        if step + 1 == max {
+            break;
+        }
+        logits = entry.model.forward_step(&mut cache, &[next]);
+    }
+    Ok(AiOutput {
+        text: entry.tokenizer.decode(&generated),
+        prompt_tokens: prompt_ids.len(),
+        generated_tokens: generated.len(),
+        done_reason,
+        elapsed: started.elapsed(),
+    })
+}
+
 /// ¿La CPU tiene AVX2 y FMA? El motor tiene un camino escalar de respaldo
 /// para cualquier arquitectura, pero sin estas dos instrucciones la
 /// inferencia real es inservible (decenas de veces más lenta) -- por eso
@@ -123,6 +225,18 @@ mod tests {
     /// La plomería entera enlaza: un `ServerState` vacío, la resolución de un
     /// alias de Ollama que no existe (error limpio, no panic), y la línea de
     /// descripción. Sin ningún modelo en disco.
+    /// GRAMMAR.md §3.235: los errores que no necesitan un modelo en disco.
+    #[test]
+    fn generate_rejects_a_bad_token_budget_and_an_undeclared_alias_with_the_declared_list() {
+        let state = ServerState::new(vec![("router".to_string(), "/no/existe.gguf".to_string())], None);
+        let err = generate(&state, "router", AiRequest::Raw("hola".into()), 0, std::time::Duration::from_secs(1)).unwrap_err();
+        assert!(err.contains("maxTokens"), "{err}");
+        let err = generate(&state, "nadie", AiRequest::Raw("hola".into()), 8, std::time::Duration::from_secs(1)).unwrap_err();
+        assert!(err.contains("'nadie'") && err.contains("[router]"), "{err}");
+        let err = generate(&state, "router", AiRequest::Raw("hola".into()), 8, std::time::Duration::from_secs(1)).unwrap_err();
+        assert!(err.contains("no se pudo cargar"), "{err}");
+    }
+
     #[test]
     fn the_embedded_engine_links_and_reports_itself() {
         let state = ServerState::new(Vec::new(), None);

@@ -110,6 +110,8 @@ pub enum Value {
     Pdf,
     /// Marcador interno para el módulo `excel` (GRAMMAR.md §3.202)
     Excel,
+    /// Marcador interno para el módulo `ai` (GRAMMAR.md §3.235)
+    Ai,
     /// Marcador interno para el módulo `mcp` (GRAMMAR.md §3.203)
     Mcp,
     /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
@@ -176,6 +178,7 @@ fn supports_bound_method_access(v: &Value) -> bool {
         | Value::Base64
         | Value::Pdf
         | Value::Excel
+        | Value::Ai
         | Value::Mcp
         | Value::Env
         | Value::Request
@@ -220,6 +223,7 @@ fn is_marker_singleton(v: &Value) -> bool {
         | Value::Base64
         | Value::Pdf
         | Value::Excel
+        | Value::Ai
         | Value::Mcp
         | Value::Env
         | Value::Request
@@ -318,6 +322,7 @@ impl std::fmt::Debug for Value {
             Value::Base64 => write!(f, "Base64"),
             Value::Pdf => write!(f, "Pdf"),
             Value::Excel => write!(f, "Excel"),
+            Value::Ai => write!(f, "Ai"),
             Value::Mcp => write!(f, "Mcp"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
@@ -548,6 +553,9 @@ pub(crate) fn eval_expr(
             }
             if name == "excel" {
                 return Ok(Value::Excel);
+            }
+            if name == "ai" {
+                return Ok(Value::Ai);
             }
             if name == "mcp" {
                 return Ok(Value::Mcp);
@@ -1442,6 +1450,22 @@ fn strip_hidden_struct(
         }
     }
     serde_json::Value::Object(map)
+}
+
+/// GRAMMAR.md §3.235: un `AiMessage` (o cualquier struct con `role` y
+/// `content`, subtipado estructural) -> el `ChatMessage` del motor.
+#[cfg(feature = "inference")]
+fn ai_message_from_value(v: &Value) -> Result<crate::inference::ChatMessage, RuntimeError> {
+    let Value::Struct(fields) = v else {
+        return Err(err("ai.chat: cada mensaje tiene que ser un AiMessage { role, content }"));
+    };
+    let get = |name: &str| -> Result<String, RuntimeError> {
+        match fields.iter().find(|(n, _)| n == name).map(|(_, v)| v) {
+            Some(Value::Str(s)) => Ok(s.clone()),
+            _ => Err(err(format!("ai.chat: el campo '{name}' de AiMessage tiene que ser un String"))),
+        }
+    };
+    Ok(crate::inference::ChatMessage { role: get("role")?, content: get("content")? })
 }
 
 /// GRAMMAR.md §3.230: la consulta ordenada que `db.<c>.orderBy(...)`
@@ -3643,6 +3667,54 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre base64: '{other}'"))),
         },
+        // GRAMMAR.md §3.235: inferencia local con el motor embebido (§3.233)
+        // sobre los modelos de `ai { }` (§3.234). `models()` funciona
+        // siempre (solo lee la declaración); `generate`/`chat` necesitan
+        // el motor que `serve` fijó en el `Db` -- `linkc test` y el harness
+        // no cargan modelos, y lo dicen.
+        Value::Ai => match method {
+            "models" => Ok(Value::List(db.ai_model_aliases().into_iter().map(Value::Str).collect())),
+            "generate" | "chat" => {
+                #[cfg(feature = "inference")]
+                {
+                    let mut it = args.into_iter();
+                    let model = match it.next() {
+                        Some(Value::Str(s)) => s,
+                        _ => return Err(err(format!("ai.{method} requiere un alias de modelo (String) como primer argumento"))),
+                    };
+                    let second = it.next().ok_or_else(|| err(format!("ai.{method} requiere 3 argumentos (model, {}, maxTokens)", if method == "generate" { "prompt" } else { "messages" })))?;
+                    let max_tokens = as_int(&it.next().ok_or_else(|| err(format!("ai.{method} requiere 3 argumentos")))?)?;
+                    let request = if method == "generate" {
+                        match second {
+                            Value::Str(p) => crate::inference::AiRequest::Raw(p),
+                            _ => return Err(err("ai.generate: el prompt tiene que ser un String")),
+                        }
+                    } else {
+                        let Value::List(items) = second else {
+                            return Err(err("ai.chat: messages tiene que ser AiMessage[]"));
+                        };
+                        crate::inference::AiRequest::Chat(items.iter().map(ai_message_from_value).collect::<Result<Vec<_>, _>>()?)
+                    };
+                    let engine = db.ai_engine().ok_or_else(|| {
+                        err(format!(
+                            "ai.{method}: este proceso no tiene el motor resuelto -- hace falta un bloque 'ai {{ }}' y un 'linkc serve' (linkc test y el harness no cargan modelos, GRAMMAR.md §3.235)"
+                        ))
+                    })?;
+                    // Una generación a la vez por programa (GRAMMAR.md
+                    // §3.235, límite honesto): dos a la vez en una CPU de 4
+                    // núcleos se pisan y las dos salen peor.
+                    let _one_at_a_time = db.ai_lock();
+                    let out = crate::inference::generate(&engine, &model, request, max_tokens, db.ai_timeout()).map_err(err)?;
+                    Ok(Value::Str(out.text))
+                }
+                #[cfg(not(feature = "inference"))]
+                {
+                    let _ = args;
+                    Err(err(format!("ai.{method}: este binario se compiló sin el feature 'inference' (GRAMMAR.md §3.233)")))
+                }
+            }
+            other => Err(err(format!("método desconocido sobre ai: '{other}'"))),
+        },
         Value::Pdf => match method {
             "build" => {
                 let blocks = match args.into_iter().next() {
@@ -5215,7 +5287,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Mcp | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -11376,5 +11448,33 @@ mod hidden_tests {
         assert_eq!(live["email"], "a@x");
         let (snapshot, _rx2) = db.subscribe("users").unwrap();
         assert!(snapshot[0].get("passwordHash").is_none(), "{snapshot:?}");
+    }
+}
+
+/// GRAMMAR.md §3.235: sin motor (harness, `linkc test`), `ai.models()` sigue
+/// funcionando y `ai.generate` explica por qué no.
+#[cfg(test)]
+mod ai_builtin_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+    use serde_json::json;
+
+    #[test]
+    fn models_lists_declared_aliases_and_generate_without_an_engine_is_a_clean_error() {
+        let src = r#"
+            ai { router: "qwen2.5:0.5b", coder: "./coder.gguf" }
+            service S {
+                rpc models() -> String[] { ai.models() }
+                rpc ask() -> String { ai.generate("router", "hola", 8) }
+            }
+        "#;
+        let tokens = tokenize(src).unwrap_or_else(|e| panic!("{e}"));
+        let program = parse(tokens).unwrap_or_else(|e| panic!("{e:?}"));
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+        assert_eq!(invoke_rpc(&program, "S", "models", &json!({}), &db).unwrap(), json!(["router", "coder"]));
+        let err = invoke_rpc(&program, "S", "ask", &json!({}), &db).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("§3.235"), "{msg}");
     }
 }

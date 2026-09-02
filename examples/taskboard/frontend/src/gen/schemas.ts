@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.192.0 — no editar a mano.
+// Generado automáticamente por linkc v1.193.0 — no editar a mano.
 
 import { z } from "zod";
 
@@ -23,6 +23,12 @@ export const ExcelSheetSchema = z.object({
   rows: z.array(z.array(ExcelCellSchema)),
 });
 export type ExcelSheet = z.infer<typeof ExcelSheetSchema>;
+
+export const AiMessageSchema = z.object({
+  role: z.string(),
+  content: z.string(),
+});
+export type AiMessage = z.infer<typeof AiMessageSchema>;
 
 export const RoleSchema = z.enum(["Admin", "Member", "Guest"]);
 export type Role = z.infer<typeof RoleSchema>;

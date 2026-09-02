@@ -256,6 +256,7 @@
   - [3.232 `@hidden` sobre un campo: existe en la colección y dentro del rpc, pero nunca sale del proceso — RESUELTO](#3232-hidden-sobre-un-campo-existe-en-la-colección-y-dentro-del-rpc-pero-nunca-sale-del-proceso--resuelto)
   - [3.233 El motor de inferencia de Skynet embebido en `linkc` (feature `inference`) — RESUELTO](#3233-el-motor-de-inferencia-de-skynet-embebido-en-linkc-feature-inference--resuelto)
   - [3.234 El bloque `ai { alias: "spec", ... }` y `--models-dir`: los modelos locales del programa, resueltos al arrancar — RESUELTO](#3234-el-bloque-ai--alias-spec---y---models-dir-los-modelos-locales-del-programa-resueltos-al-arrancar--resuelto)
+  - [3.235 `ai.generate` / `ai.chat` / `ai.models`: inferencia local síncrona con el motor embebido — RESUELTO](#3235-aigenerate--aichat--aimodels-inferencia-local-síncrona-con-el-motor-embebido--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8131,6 +8132,35 @@ service Notes {
 **Verificado**: checker (alias en orden, `ai` como identificador en type/campo/rpc/param/let, duplicado entre dos bloques, spec vacía, `router: 42`), `inference.rs` (ruta relativa contra `--models-dir`, alias contra `<dir>/<nombre-tag>.gguf`, error que lista todos los que faltan), `tests/cli_ai_block.rs` contra el binario (`serve` no arranca y lista `router` y `coder`; `doctor` da `[ERROR]` sin los archivos y `[OK]` por alias con `--models-dir`; un programa sin bloque no cambia), y a mano contra el almacén real de Ollama del MSI: `doctor` resuelve `qwen2.5:0.5b` y `gemma4:e4b` a sus blobs `sha256-...`.
 
 **Límite honesto**: ningún `ai.*` todavía (ítem 3). Un `.gguf` presente pero corrupto o de una arquitectura que el motor no conoce se descubre al CARGARLO (primer uso), no al arrancar -- cargar un 7B para validarlo costaría segundos y GB en cada arranque; `doctor` podría hacerlo con un flag explícito en una ronda futura. `serve-all` comparte `--models-dir` y el tope de memoria entre todos los servicios, pero cada uno tiene su propio motor y su propia cache de modelos: dos `.link` que declaran el mismo GGUF lo cargan dos veces (documentado, no atacado).
+
+### 3.235 `ai.generate` / `ai.chat` / `ai.models`: inferencia local síncrona con el motor embebido — RESUELTO, cierra PLAN.md §9.20 Eje G ítem 3
+
+Origen: `PLAN.md §9.20` Eje G ítem 3. Con el motor dentro del binario (§3.233) y los modelos declarados y resueltos al arrancar (§3.234), faltaba el builtin que los use. Es la primera vez que un `.link` sirve inferencia sin Ollama, sin Electron y sin ningún proceso externo: un `linkc serve` con un bloque `ai { }` es un servidor de chat completo.
+
+<!-- linkc:check -->
+```rust
+ai { router: "qwen2.5:0.5b" }
+service Assistant {
+  rpc complete(prompt: String) -> String { ai.generate("router", prompt, 64) }
+  rpc reply(question: String) -> String {
+    ai.chat("router", [AiMessage { role: "user", content: question }], 128)
+  }
+  rpc models() -> String[] { ai.models() }
+}
+```
+
+**Qué hay (v1.193.0)**:
+- **`ai.generate(model: String, prompt: String, maxTokens: Int) -> String`**: el prompt tal cual (sin chat template, como `/api/generate` con `raw: true` en el motor de origen). **`ai.chat(model, messages: AiMessage[], maxTokens) -> String`**: los turnos pasan por el chat template propio de cada arquitectura (`ModelTokenizer::render_prompt_ids`). **`ai.models() -> String[]`**: los alias declarados, en orden -- funciona siempre, con o sin motor.
+- **`AiMessage = { role: String, content: String }`**, pre-sembrado como `ExcelSheet` (§3.202) para poder escribir `AiMessage { ... }`, y estructural como argumento: cualquier struct del usuario con esos dos campos entra. Aparece en `contract.d.ts`/`schemas.ts`/`openapi.json` si un rpc lo usa en su firma, mismo mecanismo que `ExcelSheet` (§3.204).
+- **`maxTokens` es explícito a propósito**: el techo de tokens es la decisión de costo más importante de cada llamada, no un default escondido (el motor de origen tenía 512/140 fijos en `routes.rs:495`). `maxTokens <= 0` es un error.
+- **Bucle de generación** (`inference::generate`, el `handle_generate` del motor sin el HTTP de por medio): tokenizar, reusar el prefix cache si el prompt comparte prefijo con uno reciente (el `buildSystemPrompt` de Skynet ordena el prompt estable/volátil justo para esto), prefill, y decodificar greedy hasta EOS, `maxTokens` o `--ai-timeout`. Cargar el GGUF es perezoso, en el primer uso de cada alias (`ServerState::get_or_load`, con el tope LRU de `--ai-memory-budget-mb`).
+- **`--ai-timeout <duración>`/`LINK_AI_TIMEOUT`** (default 60s) para `serve`/`serve-all`: un timeout es un ERROR del rpc con cuántos tokens llevaba, nunca un texto a medias devuelto en silencio -- el caller decide si reintenta con menos tokens o con otro modelo.
+- **Errores limpios, proceso vivo**: alias no declarado (con la lista de los declarados), modelo que no carga, prompt vacío, `messages` que no son `AiMessage`, binario sin el feature, y `linkc test`/el harness sin motor (`ai.generate` explica que hace falta `ai { }` + `linkc serve`; `ai.models()` sigue funcionando ahí).
+- **Una generación a la vez por programa** (candado en el `Db`): dos a la vez en una CPU de 4 núcleos se pisan y las dos salen peor; los rpcs que no llaman `ai.*` no se ven afectados.
+
+**Verificado**: checker (las tres firmas, `AiMessage` sembrado y un struct propio estructural, aridad y tipos de retorno mal), runtime sin motor (`ai.models()` da los alias, `ai.generate` explica el motivo), `inference.rs` (`maxTokens` inválido, alias desconocido con la lista, modelo que no carga), y `tests/cli_ai_generate.rs` contra un MODELO REAL a través del binario y de HTTP -- `LINK_TEST_AI_MODEL=qwen2.5:0.5b` en el MSI: carga en 0,6 s desde el almacén de Ollama, `ai.generate("m", "1, 2, 3,", 12)` devuelve un texto con `4`, `ai.chat` responde, el alias desconocido es un error con `[m]` y el proceso sigue vivo; 3,4 s el test entero. Como los de Postgres, se salta sin la variable: CI no tiene ningún GGUF.
+
+**Límite honesto**: síncrono (el `stream` token a token es el ítem 4), greedy (el motor no muestrea con temperatura), CPU AVX2/FMA, sin tool-calling (ítem 6), sin embeddings (ítem 5). La generación corre en el hilo de la request: una respuesta de 128 tokens con un 7B en CPU bloquea ESE hilo decenas de segundos (los demás siguen); el pool acotado de §9.18 Eje B ítem 2 es lo que lo convierte en backpressure real. `ai.chat` no fija ningún `system` por su cuenta: si el modelo lo necesita, va como primer `AiMessage { role: "system", ... }`.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

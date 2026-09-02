@@ -760,6 +760,40 @@ pub(crate) fn excel_sheet_type_decl() -> TypeDecl {
 /// `resolve_named_type_subst` si un usuario escribiera el tipo por nombre
 /// -- así que un struct nombrado explícitamente O uno estructuralmente
 /// idéntico con otro nombre tipan igual acá (§3.2).
+/// GRAMMAR.md §3.235: `AiMessage = { role: String, content: String }`, el
+/// turno de `ai.chat`. Pre-sembrado en `checker.types` como `ExcelSheet`
+/// (para poder escribir `AiMessage { ... }`), y estructural como argumento
+/// (`ai_message_struct_type`): cualquier struct con esos dos campos entra.
+pub(crate) fn ai_message_type_decl() -> TypeDecl {
+    let dummy = Span::new(0, 0, 0, 0);
+    let named = |name: &str| TypeExpr::Named(name.to_string(), vec![], dummy);
+    let field = |name: &str, ty: TypeExpr| Field {
+        name: name.to_string(),
+        optional: false,
+        ty,
+        name_span: dummy,
+        annotations: vec![],
+        default: None,
+    };
+    TypeDecl {
+        name: "AiMessage".to_string(),
+        type_params: vec![],
+        ty: TypeExpr::Struct(vec![field("role", named("String")), field("content", named("String"))]),
+        span: dummy,
+        annotations: vec![],
+    }
+}
+
+fn ai_message_struct_type() -> Type {
+    Type::Struct {
+        name: Some("AiMessage".to_string()),
+        fields: vec![
+            FieldType { name: "role".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "content".to_string(), optional: false, ty: Type::String },
+        ],
+    }
+}
+
 fn excel_sheet_struct_type() -> Type {
     Type::Struct {
         name: Some("ExcelSheet".to_string()),
@@ -815,6 +849,8 @@ impl Checker {
         // falta para que el subtipado estructural funcione.
         checker.enums.insert("ExcelCell".to_string(), excel_cell_enum_decl());
         checker.types.insert("ExcelSheet".to_string(), excel_sheet_type_decl());
+        // GRAMMAR.md §3.235: `AiMessage`, mismo criterio que `ExcelSheet`.
+        checker.types.insert("AiMessage".to_string(), ai_message_type_decl());
         let mut errors = Vec::new();
 
         for item in &program.items {
@@ -3934,6 +3970,9 @@ impl Checker {
                 if name == "excel" {
                     return Ok(Type::Excel);
                 }
+                if name == "ai" {
+                    return Ok(Type::Ai);
+                }
                 if name == "mcp" {
                     return Ok(Type::Mcp);
                 }
@@ -5000,6 +5039,21 @@ impl Checker {
                 self, args, env, "excel.parse",
                 [(base64, "base64: String", Type::String)] -> Type::List(Box::new(excel_sheet_struct_type()))
             ),
+            // GRAMMAR.md §3.235: inferencia local. `maxTokens` es explícito a
+            // propósito -- el techo de tokens es la decisión de costo más
+            // importante de cada llamada, nunca un default escondido.
+            (Type::Ai, "generate") => builtin_args!(
+                self, args, env, "ai.generate",
+                [(model, "model: String", Type::String), (prompt, "prompt: String", Type::String), (max_tokens, "maxTokens: Int", Type::Int)] -> Type::String
+            ),
+            (Type::Ai, "chat") => builtin_args!(
+                self, args, env, "ai.chat",
+                [(model, "model: String", Type::String), (messages, "messages: AiMessage[]", Type::List(Box::new(ai_message_struct_type()))), (max_tokens, "maxTokens: Int", Type::Int)] -> Type::String
+            ),
+            (Type::Ai, "models") => {
+                self.expect_no_args(args, "ai.models")?;
+                Some(Type::List(Box::new(Type::String)))
+            }
             (Type::Mcp, "sample") => builtin_args!(
                 self, args, env, "mcp.sample",
                 [(prompt, "prompt: String", Type::String)] -> Type::String
@@ -11474,5 +11528,45 @@ mod ai_block_tests {
         assert!(msg.contains("spec vacía"), "{msg}");
         let msg = check("ai { router: 42 }").err().expect("tenía que fallar");
         assert!(msg.contains("tiene que ser un string"), "{msg}");
+    }
+}
+
+/// GRAMMAR.md §3.235 (PLAN.md §9.20 Eje G ítem 3): `ai.generate`/`ai.chat`/
+/// `ai.models` y el tipo pre-sembrado `AiMessage`.
+#[cfg(test)]
+mod ai_builtin_tests {
+    use super::*;
+    use crate::lexer::tokenize;
+    use crate::parser::parse;
+
+    fn check(src: &str) -> Result<(), String> {
+        let tokens = tokenize(src).map_err(|e| format!("{e}"))?;
+        let program = parse(tokens).map_err(|e| format!("{e:?}"))?;
+        Checker::check_program(&program).map_err(|e| format!("{e:?}"))
+    }
+
+    #[test]
+    fn ai_builtins_type_check_with_the_seeded_message_type_and_a_structural_one() {
+        check(
+            "ai { router: \"qwen2.5:0.5b\" }
+             type Turn = { role: String, content: String, extra: Int }
+             service S {
+               rpc ask(p: String) -> String { ai.generate(\"router\", p, 64) }
+               rpc chat(q: String) -> String { ai.chat(\"router\", [AiMessage { role: \"user\", content: q }], 32) }
+               rpc chat2(q: String) -> String { ai.chat(\"router\", [Turn { role: \"user\", content: q, extra: 1 }], 32) }
+               rpc models() -> String[] { ai.models() }
+             }",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn ai_builtins_reject_wrong_arity_and_types() {
+        let msg = check("service S { rpc a() -> String { ai.generate(\"r\", \"p\") } }").expect_err("tenía que fallar");
+        assert!(msg.contains("'ai.generate' toma exactamente 3 argumentos"), "{msg}");
+        let msg = check("service S { rpc a() -> String { ai.chat(\"r\", [\"hola\"], 8) } }").expect_err("tenía que fallar");
+        assert!(msg.contains("AiMessage") || msg.contains("role"), "{msg}");
+        let msg = check("service S { rpc a() -> Int { ai.generate(\"r\", \"p\", 8) } }").expect_err("tenía que fallar");
+        assert!(msg.contains("String") && msg.contains("Int"), "{msg}");
     }
 }

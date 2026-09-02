@@ -302,6 +302,10 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
     if let Some(schema) = struct_openapi_schema(&crate::checker::excel_sheet_type_decl(), &checker)? {
         schemas.insert("ExcelSheet".to_string(), schema);
     }
+    // GRAMMAR.md §3.235: `AiMessage`, mismo criterio que `ExcelSheet`.
+    if let Some(schema) = struct_openapi_schema(&crate::checker::ai_message_type_decl(), &checker)? {
+        schemas.insert("AiMessage".to_string(), schema);
+    }
 
     for item in &program.items {
         match item {
