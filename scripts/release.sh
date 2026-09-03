@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # El ritual de release mecanizado (GRAMMAR.md §3.215, PLAN.md §9.17 ítem 11).
 #
-# Este proyecto ya shipeó DOS veces una versión con CI en rojo por saltear a
-# mano un paso del ritual (v1.130.0 y v1.165.0, ambas por un snapshot sin
-# regenerar antes del commit). Cada paso de abajo existía ya como disciplina
-# documentada (AGENTS.md, CHANGELOG); lo único nuevo es que ahora es un
-# programa y no memoria.
+# Este proyecto ya shipeó TRES veces una versión con CI en rojo por saltear a
+# mano un paso del ritual (v1.130.0 y v1.165.0 por un snapshot sin regenerar
+# antes del commit; v1.200.0 porque el propio ritual mecanizado no corría
+# `cargo clippy` y CI sí lo exige con -D warnings, GRAMMAR.md §3.216). Cada
+# paso de abajo existía ya como disciplina documentada (AGENTS.md, CHANGELOG);
+# lo único nuevo es que ahora es un programa y no memoria.
 #
 # Uso, DESPUÉS de editar Cargo.toml (versión nueva) + CHANGELOG.md + GRAMMAR.md:
 #
@@ -16,10 +17,11 @@
 #   1. Lee la versión de compiler/Cargo.toml y verifica que CHANGELOG.md la nombra.
 #   2. Verifica que el tag vX.Y.Z no exista todavía.
 #   3. cargo build --release
-#   4. Regenera examples/users.link.snap (la causa raíz de los dos CI rojos).
-#   5. Regenera examples/taskboard/frontend/src/gen (la otra mitad, §9.17 ítem 10).
-#   6. Suite completa (--test-threads=4) salvo --skip-suite.
-#   7. Commit + tag vX.Y.Z + push de rama y tag.
+#   4. cargo clippy --all-targets -- -D warnings (la causa raíz del CI rojo de v1.200.0).
+#   5. Regenera examples/users.link.snap (la causa raíz de los otros dos CI rojos).
+#   6. Regenera examples/taskboard/frontend/src/gen (la otra mitad, §9.17 ítem 10).
+#   7. Suite completa (--test-threads=4) salvo --skip-suite.
+#   8. Commit + tag vX.Y.Z + push de rama y tag.
 #
 # Lo que NO hace a propósito: verificar CI. `gh run view --exit-status` sigue
 # siendo el último paso manual -- un push verde local nunca prueba CI verde.
@@ -57,6 +59,9 @@ fi
 
 echo "== cargo build --release =="
 (cd compiler && cargo build --release)
+
+echo "== cargo clippy --all-targets -- -D warnings (GRAMMAR.md §3.216) =="
+(cd compiler && cargo clippy --release --all-targets -- -D warnings)
 
 BIN=compiler/target/release/linkc
 [ -x "$BIN" ] || BIN="$BIN.exe"

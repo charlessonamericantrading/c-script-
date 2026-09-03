@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.200.1] - 2026-09-03
+
+### 🔧 Proceso
+**v1.200.0 quedó con CI en rojo** -- el ritual local (`scripts/release.sh`) corre `cargo build`/`cargo test` pero no `cargo clippy`, y CI sí lo exige con `-D warnings` (GRAMMAR.md §3.216). El lote de ocho ítems de §9.21 introdujo cinco warnings: una función con más de 7 argumentos (`string_match_condition_sql` en `db.rs`, resuelto con `#[allow(clippy::too_many_arguments)]` como en el resto del código), un `.into_iter()` redundante sobre un argumento que ya acepta `IntoIterator`, dos `if let Ok(_) = ...` que debían ser `.is_ok()`, y un `if let` anidado colapsable en un solo patrón (`introspect.rs`). Sin código nuevo, solo limpieza de clippy.
+
 ## [1.200.0] - 2026-09-03
 
 ### ✨ Añadido

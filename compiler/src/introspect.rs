@@ -562,10 +562,8 @@ fn introspect_sqlite_table(conn: &Connection, table: &str) -> Result<TableIntros
     // 4. CHECK constraints del DDL
     let mut checks = Vec::new();
     if let Ok(mut sql_stmt) = conn.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?") {
-        if let Ok(sql_opt) = sql_stmt.query_row([table], |r| r.get::<_, Option<String>>(0)) {
-            if let Some(table_sql) = sql_opt {
-                checks = extract_sqlite_checks(&table_sql);
-            }
+        if let Ok(Some(table_sql)) = sql_stmt.query_row([table], |r| r.get::<_, Option<String>>(0)) {
+            checks = extract_sqlite_checks(&table_sql);
         }
     }
 

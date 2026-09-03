@@ -3419,6 +3419,7 @@ fn escape_like_wildcards(s: &str) -> String {
         Some(format!("\"{sql_col}\" {not_kw}IN ({})", placeholders.join(", ")))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn string_match_condition_sql(
         &self,
         collection: &str,
@@ -3970,7 +3971,7 @@ fn escape_like_wildcards(s: &str) -> String {
                 let mut result = Vec::with_capacity(rows.len());
                 for cells in rows {
                     let mut struct_fields = Vec::with_capacity(fields.len());
-                    for (i, (f, cell)) in fields.iter().zip(cells.into_iter()).enumerate() {
+                    for (i, (f, cell)) in fields.iter().zip(cells).enumerate() {
                         let col_opt = col_plans[i];
                         match col_opt {
                             None => {

@@ -3189,11 +3189,11 @@ fn call_method(
                     if matches {
                         if let Value::Struct(fields) = &item {
                             if let Some((_, Value::Int(id))) = fields.iter().find(|(n, _)| n == "id") {
-                                if let Ok(_) = db.call(&coll, "applyPatch", vec![Value::Int(*id), patch.clone()]) {
+                                if db.call(&coll, "applyPatch", vec![Value::Int(*id), patch.clone()]).is_ok() {
                                     count += 1;
                                 }
                             } else if let Some((_, Value::Uuid(id))) = fields.iter().find(|(n, _)| n == "id") {
-                                if let Ok(_) = db.call(&coll, "applyPatch", vec![Value::Uuid(id.clone()), patch.clone()]) {
+                                if db.call(&coll, "applyPatch", vec![Value::Uuid(id.clone()), patch.clone()]).is_ok() {
                                     count += 1;
                                 }
                             }
