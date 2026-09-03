@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.198.0] - 2026-09-03
+
+### ✨ Añadido
+**`GET /openapi.json` servido por `linkc serve` (el mismo documento que `linkc build`, emitido por el proceso que lo cumple, detrás de `--service-api-key` y con ETag) y propagación de `traceparent`/`tracestate` de la request entrante a las siete llamadas `http.*` salientes (PLAN.md §9.20 Eje H ítem 10)**: lo que un Swagger UI/gateway y el OpenTelemetry que instrumenta al backend viejo de Skynet necesitan para seguir funcionando cuando un tramo pasa por un `.link`. Ver GRAMMAR.md §3.240.
+
 ## [1.197.0] - 2026-09-03
 
 ### ✨ Añadido

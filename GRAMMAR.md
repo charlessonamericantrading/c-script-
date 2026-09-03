@@ -261,6 +261,7 @@
   - [3.237 `linkc_ai_*` en `/metrics`: tokens, tiempos de prefill/decode, errores y hits del prefix cache por modelo — RESUELTO](#3237-linkc_ai_-en-metrics-tokens-tiempos-de-prefilldecode-errores-y-hits-del-prefix-cache-por-modelo--resuelto)
   - [3.238 `--fallback-upstream <url>`: el estrangulador a nivel de proceso — RESUELTO](#3238---fallback-upstream-url-el-estrangulador-a-nivel-de-proceso--resuelto)
   - [3.239 `@index(campo1, campo2, ...)` a nivel de `type`: índice compuesto no único, opcionalmente parcial — RESUELTO](#3239-indexcampo1-campo2--a-nivel-de-type-índice-compuesto-no-único-opcionalmente-parcial--resuelto)
+  - [3.240 `GET /openapi.json` servido por `linkc serve` y `traceparent` propagado a las llamadas `http.*` salientes — RESUELTO](#3240-get-openapijson-servido-por-linkc-serve-y-traceparent-propagado-a-las-llamadas-http-salientes--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8246,6 +8247,18 @@ db { tasks: Task[] }
 **Verificado**: checker (dos `@index` + un `@unique` sobre el mismo type, uno parcial; 1 campo, campo inexistente y `@index` redundante con `@unique` rechazados con el mensaje exacto) y SQLite real (el DDL exacto de los tres casos y el índice creado de verdad, leído de `sqlite_master`).
 
 **Límite honesto**: `findWhere`/`orderBy` no eligen el índice, lo elige el motor (SQLite/Postgres); `linkc introspect` todavía no lee índices existentes (siguiente pieza del ítem 6, junto con `@column` y la PK `varchar` con uuid). No hay `DROP INDEX`: quitar la anotación no borra el índice físico (mismo criterio que `@unique`, §3.155).
+
+### 3.240 `GET /openapi.json` servido por `linkc serve` y `traceparent` propagado a las llamadas `http.*` salientes — RESUELTO, cierra PLAN.md §9.20 Eje H ítem 10
+
+Origen: `PLAN.md §9.20` Eje H ítem 10. Skynet publica OpenAPI 3.1 de 76 endpoints con `swagger-ui-express` y auto-instrumenta Express con OpenTelemetry (`docs/HANDOVER.md:107-113`): al migrar un subsistema a `.link`, el gateway/Swagger tiene que poder seguir leyendo el contrato del servidor que lo cumple, y una traza que entra por el `.link` y sale hacia el backend viejo (o hacia una API externa) tiene que seguir siendo UNA traza.
+
+**Qué hay (v1.198.0)**:
+- **`GET /openapi.json`**: el mismo documento que `linkc build` escribe en `openapi.json` (§3.113), emitido por el proceso que lo sirve (`emit_openapi_json`, puro, por request; título `linkc serve`). Nunca puede quedar desfasado del binario que corre. Va detrás de `--service-api-key` como cualquier rpc (no es un probe de liveness: describe la superficie, no la salud) y con el ETag/304 de §3.221. Si hay `--fallback-upstream` (§3.238), sigue siendo local: se resuelve antes que cualquier proxy.
+- **`traceparent`/`tracestate`** (W3C Trace Context): si la request entrante los trae, TODA llamada `http.*` hecha mientras se la atiende (`get`, `post`, `getWithHeaders`, `postWithHeaders`, `getWithStatus`, `postWithStatus`, `postWithRetry`) los reenvía tal cual -- `with_trace` sobre los siete sitios de `ureq`, leyendo del contexto por request de §3.164 (`current_request_header`). Sin request (un `@cron`, `linkc test`) o sin header, no se agrega nada: el `.link` no inventa trazas, las continúa. El proxy de `--fallback-upstream` ya copiaba todos los headers, `traceparent` incluido.
+
+**Verificado**: `tests/cli_openapi_trace.rs` contra el binario: `/openapi.json` responde `application/json` con `openapi: 3.x`, el path `/Items/list` y el schema `Item`; con `--service-api-key` rechaza sin la clave y responde con ella; y un rpc que hace `http.get` contra un upstream falso que refleja el header recibe exactamente el `traceparent` de la request entrante, y `none` cuando no venía.
+
+**Límite honesto**: el `.link` propaga, no genera: no crea spans propios ni exporta a un collector OTLP (eso sería un exportador nuevo; queda para cuando un adoptante lo pida con un collector real delante). El título del documento es fijo (`linkc serve`), no el nombre del archivo como en `build`. No hay Swagger UI embebido: cualquier UI apunta a `/openapi.json`.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

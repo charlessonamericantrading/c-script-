@@ -948,6 +948,23 @@ fn handle_request(
         return;
     }
 
+    // GRAMMAR.md §3.240: el mismo `openapi.json` que emite `linkc build`,
+    // servido por el proceso que lo cumple -- así un Swagger UI, un
+    // gateway o un agente lo leen del servidor en vez de buscar el archivo
+    // generado, y nunca puede quedar desfasado del binario que corre. Se
+    // emite por request (el programa es chico y `emit_openapi_json` es puro);
+    // detrás de `--service-api-key` como cualquier rpc, con ETag (§3.221).
+    if path == "/openapi.json" {
+        let (status, body) = match crate::codegen::openapi_emit::emit_openapi_json(program, "linkc serve") {
+            Ok(json) => (200, json),
+            Err(e) => (500, error_json(&format!("no se pudo emitir openapi.json: {e}"))),
+        };
+        let resp = cors_response(status, body, &cors_headers, &request);
+        let _ = request.respond(resp);
+        log_done(log, req_id, Some("openapi"), status, start, "");
+        return;
+    }
+
     if path == "/" || path == "/health" || path == "/status" {
         let services: Vec<String> = program
             .items

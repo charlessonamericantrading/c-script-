@@ -2080,6 +2080,21 @@ fn escape_html(s: &str) -> String {
 /// `Result` es el de `ureq`, no nuestro, y boxearlo obligaría a reescribir
 /// los 7 arms que hacen match sobre `ureq::Error::Status` -- de ahí el
 /// `allow` acotado a esta única función.
+/// GRAMMAR.md §3.240: propaga `traceparent`/`tracestate` (W3C Trace Context)
+/// de la request ENTRANTE a cada llamada `http.*` saliente hecha mientras se
+/// atiende -- así el OTel/Jaeger/Tempo que ya instrumenta al backend viejo
+/// sigue correlacionando cuando un tramo pasa por un `.link`. Sin request
+/// (cron, `linkc test`) o sin header, no agrega nada.
+fn with_trace(req: ureq::Request, db: &Db) -> ureq::Request {
+    let mut req = req;
+    for name in ["traceparent", "tracestate"] {
+        if let Some(v) = db.current_request_header(name) {
+            req = req.set(name, &v);
+        }
+    }
+    req
+}
+
 #[allow(clippy::result_large_err)]
 pub(crate) fn outbound_http(db: &Db, url: &str, started: std::time::Instant, result: Result<ureq::Response, ureq::Error>) -> Result<ureq::Response, ureq::Error> {
     let status = match &result {
@@ -4030,7 +4045,7 @@ fn call_method(
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("http.get requiere un argumento URL String")),
                 };
-                match outbound_http(db, url, std::time::Instant::now(), ureq::get(url).timeout(db.http_timeout()).call()) {
+                match outbound_http(db, url, std::time::Instant::now(), with_trace(ureq::get(url).timeout(db.http_timeout()), db).call()) {
                     Ok(resp) => {
                         let text = resp.into_string().unwrap_or_default();
                         Ok(Value::Str(text))
@@ -4047,7 +4062,7 @@ fn call_method(
                     Some(Value::Str(s)) => s,
                     _ => return Err(err("http.post requiere un argumento Body String")),
                 };
-                match outbound_http(db, url, std::time::Instant::now(), ureq::post(url).timeout(db.http_timeout()).send_string(body)) {
+                match outbound_http(db, url, std::time::Instant::now(), with_trace(ureq::post(url).timeout(db.http_timeout()), db).send_string(body)) {
                     Ok(resp) => {
                         let text = resp.into_string().unwrap_or_default();
                         Ok(Value::Str(text))
@@ -4064,7 +4079,7 @@ fn call_method(
                     Some(Value::List(items)) => http_headers_from_value(items)?,
                     _ => return Err(err("http.getWithHeaders requiere una lista de headers como segundo argumento")),
                 };
-                let mut req = ureq::get(url).timeout(db.http_timeout());
+                let mut req = with_trace(ureq::get(url).timeout(db.http_timeout()), db);
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
@@ -4085,7 +4100,7 @@ fn call_method(
                     Some(Value::List(items)) => http_headers_from_value(items)?,
                     _ => return Err(err("http.getWithStatus requiere una lista de headers como segundo argumento")),
                 };
-                let mut req = ureq::get(url).timeout(db.http_timeout());
+                let mut req = with_trace(ureq::get(url).timeout(db.http_timeout()), db);
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
@@ -4114,7 +4129,7 @@ fn call_method(
                     Some(Value::List(items)) => http_headers_from_value(items)?,
                     _ => return Err(err("http.postWithStatus requiere una lista de headers como tercer argumento")),
                 };
-                let mut req = ureq::post(url).timeout(db.http_timeout());
+                let mut req = with_trace(ureq::post(url).timeout(db.http_timeout()), db);
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
@@ -4137,7 +4152,7 @@ fn call_method(
                     Some(Value::List(items)) => http_headers_from_value(items)?,
                     _ => return Err(err("http.postWithHeaders requiere una lista de headers como tercer argumento")),
                 };
-                let mut req = ureq::post(url).timeout(db.http_timeout());
+                let mut req = with_trace(ureq::post(url).timeout(db.http_timeout()), db);
                 for (name, value) in &headers {
                     req = req.set(name, value);
                 }
@@ -4176,7 +4191,7 @@ fn call_method(
                     if attempt > 0 {
                         std::thread::sleep(http_retry_backoff(attempt));
                     }
-                    let mut req = ureq::post(url).timeout(db.http_timeout());
+                    let mut req = with_trace(ureq::post(url).timeout(db.http_timeout()), db);
                     for (name, value) in &headers {
                         req = req.set(name, value);
                     }
