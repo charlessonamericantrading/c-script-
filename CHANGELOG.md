@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.200.5] - 2026-09-03
+
+### 🔧 Proceso
+**v1.200.4 quedó con CI en rojo** -- `introspect_still_warns_when_the_id_primary_key_is_neither_integer_nor_native_uuid` (`pg_integration.rs`) usaba una PK `TEXT` como fixture del caso "tipo no soportado, tiene que advertir" -- exactamente el tipo de columna que `id: String` (v1.200.4) ahora SÍ soporta sin warning, así que el test fallaba por diseño desde el momento en que se agregó la feature. Renombrado a `introspect_maps_a_text_primary_key_to_id_string_without_warning` con las aserciones invertidas (ahora exige `id: String` y CERO warning), y agregado `introspect_still_warns_when_the_id_primary_key_is_a_genuinely_unsupported_type` (fixture `BOOLEAN`) para seguir cubriendo el caso "tipo de verdad no soportado" que el test original quería probar. Sin código nuevo, solo el test estaba desactualizado. Postgres local con las credenciales de CI no estaba disponible para verificar antes de este push -- confirmado en CI.
+
 ## [1.200.4] - 2026-09-03
 
 ### ✨ Añadido

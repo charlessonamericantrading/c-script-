@@ -2274,12 +2274,14 @@ fn introspect_emits_id_uuid_for_a_native_uuid_primary_key_with_no_warning() {
 }
 
 #[test]
-fn introspect_still_warns_when_the_id_primary_key_is_neither_integer_nor_native_uuid() {
-    // Una PK "id" de un tipo que c-script no sabe adoptar como PK todavía
-    // (ni entero ni uuid nativo -- acá, TEXT, el caso de un backend legacy
-    // que guardaba un UUID como string plano) sigue emitiendo el placeholder
-    // `id: Int` de siempre, con una advertencia -- distinto del caso `uuid`
-    // nativo de arriba, que GRAMMAR.md §3.177 sí soporta de punta a punta.
+fn introspect_maps_a_text_primary_key_to_id_string_without_warning() {
+    // GRAMMAR.md §3.251: desde que `id: String` existe, una PK "id" de tipo
+    // TEXT (el caso de un backend legacy que guardaba un UUID como string
+    // plano -- ej. Skynet, `gen_random_uuid()::text`) mapea LIMPIO a
+    // `id: String`, sin warning -- ya NO cae al placeholder `id: Int` con
+    // advertencia que producía antes de esta versión (ver el test de abajo,
+    // `introspect_still_warns_when_the_id_primary_key_is_a_genuinely_unsupported_type`,
+    // para el caso que SÍ sigue sin soporte).
     const COLLECTION: &str = "legacy_orders";
     let Some(url) = pg_url() else {
         eprintln!("saltado: LINK_TEST_PG_URL no está definida");
@@ -2304,9 +2306,42 @@ fn introspect_still_warns_when_the_id_primary_key_is_neither_integer_nor_native_
     let generated = String::from_utf8_lossy(&output.stdout).to_string();
     let warnings = String::from_utf8_lossy(&output.stderr).to_string();
 
+    assert!(generated.contains("id: String,"), "{generated}");
+    assert!(!warnings.contains(COLLECTION), "una PK TEXT ya no debería generar warning: stderr: {warnings}");
+}
+
+#[test]
+fn introspect_still_warns_when_the_id_primary_key_is_a_genuinely_unsupported_type() {
+    // Una PK "id" de un tipo que c-script de verdad no sabe adoptar (ni
+    // entero, ni uuid nativo, ni texto plano -- acá, BOOLEAN) sigue
+    // emitiendo el placeholder `id: Int` de siempre, con una advertencia.
+    const COLLECTION: &str = "legacy_orders_bool_pk";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" BOOLEAN PRIMARY KEY, \
+                \"total\" BIGINT NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla con PK boolean a mano");
+
+    let output =
+        Command::new(env!("CARGO_BIN_EXE_linkc")).arg("introspect").arg(&url).output().expect("ejecutar linkc introspect");
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    let generated = String::from_utf8_lossy(&output.stdout).to_string();
+    let warnings = String::from_utf8_lossy(&output.stderr).to_string();
+
     assert!(generated.contains("id: Int,"), "{generated}");
     assert!(
-        warnings.contains(COLLECTION) && warnings.contains("\"id\"") && warnings.to_lowercase().contains("text"),
+        warnings.contains(COLLECTION) && warnings.contains("\"id\"") && warnings.to_lowercase().contains("boolean"),
         "stderr: {warnings}"
     );
 }
