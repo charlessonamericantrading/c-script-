@@ -106,14 +106,15 @@ fn declared_collection_plans(program: &Program) -> Result<(Checker, Vec<Collecti
     Ok((checker, out))
 }
 
-/// Tipo lógico de la columna `"id"` de una colección -- `Int` o `Uuid`
-/// (GRAMMAR.md §3.177), a partir de su `IdKind`. Necesario para decodificar
-/// el valor `"id"` de una fila del archivo de export con
+/// Tipo lógico de la columna `"id"` de una colección -- `Int`, `Uuid` o
+/// `String` (GRAMMAR.md §3.177/§3.251), a partir de su `IdKind`. Necesario
+/// para decodificar el valor `"id"` de una fila del archivo de export con
 /// `json_to_typed_value`, igual que cualquier otro campo.
 fn id_type(id_kind: IdKind) -> Type {
     match id_kind {
         IdKind::Int => Type::Int,
         IdKind::Uuid => Type::Uuid,
+        IdKind::String => Type::String,
     }
 }
 

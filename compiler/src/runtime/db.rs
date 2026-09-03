@@ -135,26 +135,38 @@ impl ColumnPlan {
     }
 }
 
-/// GRAMMAR.md §3.177: qué tipo es la PK de una colección -- deriva todo
-/// lo demás que cambia entre las dos formas: columna DDL INTEGER
-/// AUTOINCREMENT/BIGSERIAL vs TEXT/UUID, generación por autoincremento
-/// del motor vs generada del lado de la app antes del INSERT, y el
-/// `ColumnKind` con el que se lee/escribe la columna `"id"`
-/// (`ColumnKind::Uuid`, distinto de `Text`, solo para esta PK -- ver
-/// `store.rs::Cell::to_sql`/`postgres_cell` para el porqué).
+/// GRAMMAR.md §3.177/§3.251: qué tipo es la PK de una colección -- deriva
+/// todo lo demás que cambia entre las tres formas: columna DDL INTEGER
+/// AUTOINCREMENT/BIGSERIAL vs TEXT/UUID vs TEXT/VARCHAR, generación por
+/// autoincremento del motor vs generada del lado de la app antes del
+/// INSERT, y el `ColumnKind` con el que se lee/escribe la columna `"id"`
+/// (`ColumnKind::Uuid`, distinto de `Text`, SOLO para `IdKind::Uuid` -- ver
+/// `store.rs::Cell::to_sql`/`postgres_cell` para el porqué; `IdKind::String`
+/// usa `ColumnKind::Text` igual que cualquier columna de texto plano,
+/// justamente para NO asumir el formato binario `uuid` nativo de Postgres
+/// sobre una columna que puede ser una `VARCHAR` legacy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IdKind {
     Int,
     Uuid,
+    /// `id: String` (GRAMMAR.md §3.251, PLAN.md §9.21 Fase 3 ítem 11) --
+    /// generado del lado de la app igual que `Uuid` (mismo `generate_uuid_v4`),
+    /// pero mapeado a `VARCHAR`/`TEXT` en vez del tipo nativo `uuid` de
+    /// Postgres. Pensado para adoptar una tabla existente cuya PK es una
+    /// columna de texto plano (aunque guarde algo con forma de UUID) --
+    /// `id: Uuid` deliberadamente NO acepta esa columna (ver
+    /// `validate_existing_id_column`, más abajo).
+    String,
 }
 
 impl IdKind {
     /// `Checker::validate_db_element_type` ya garantizó que el campo
-    /// `id` de toda colección es `Int` o `Uuid` -- cualquier otro tipo
-    /// nunca llega hasta acá.
+    /// `id` de toda colección es `Int`, `Uuid` o `String` -- cualquier
+    /// otro tipo nunca llega hasta acá.
     pub(crate) fn from_field_type(ty: &Type) -> Self {
         match ty {
             Type::Uuid => IdKind::Uuid,
+            Type::String => IdKind::String,
             _ => IdKind::Int,
         }
     }
@@ -179,6 +191,12 @@ pub(crate) fn id_column_kind_for(id_kind: IdKind) -> ColumnKind {
         // lado de ESCRITURA del mismo problema.
         IdKind::Int => ColumnKind::Int,
         IdKind::Uuid => ColumnKind::Uuid,
+        // GRAMMAR.md §3.251: a propósito `Text`, no un `ColumnKind` propio
+        // -- una PK `id: String` es SIEMPRE texto plano (`VARCHAR`/`TEXT`),
+        // nunca el tipo nativo `uuid` de Postgres, así que no necesita
+        // ningún manejo binario especial -- mismo `ColumnKind` que
+        // cualquier campo `String`/`Uuid` NO-PK ya usa.
+        IdKind::String => ColumnKind::Text,
     }
 }
 
@@ -771,7 +789,11 @@ fn create_table_sql(
     // ninguna queja.
     let id_def = match id_kind {
         IdKind::Int => format!("\"{id_col}\" INTEGER PRIMARY KEY AUTOINCREMENT"),
-        IdKind::Uuid => format!("\"{id_col}\" TEXT PRIMARY KEY NOT NULL"),
+        // GRAMMAR.md §3.251: mismo DDL SQLite que `Uuid` -- SQLite no
+        // distingue "uuid" de "texto plano", la diferencia con Postgres
+        // (VARCHAR/TEXT en vez del tipo nativo uuid) solo importa del lado
+        // Postgres (ver `codegen::postgres_emit::create_postgres_table_sql`).
+        IdKind::Uuid | IdKind::String => format!("\"{id_col}\" TEXT PRIMARY KEY NOT NULL"),
     };
     let mut defs = vec![id_def];
 
@@ -849,7 +871,7 @@ fn check_schema_matches(
     // (ver `create_table_sql`), así que ahí notnull=1 es lo esperado.
     let id_expected = match id_kind {
         IdKind::Int => ("INTEGER".to_string(), false),
-        IdKind::Uuid => ("TEXT".to_string(), true),
+        IdKind::Uuid | IdKind::String => ("TEXT".to_string(), true),
     };
     expected.insert(id_col.to_string(), id_expected);
     for col in columns {
@@ -1062,14 +1084,16 @@ pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str, i
     // forma válida. Es un scope deliberado, no un descuido: el bind/la
     // lectura de esta columna (`Cell::to_sql`/`postgres_cell`, store.rs)
     // dan por sentado el formato BINARIO real de `uuid` (16 bytes), que
-    // solo es correcto contra una columna genuinamente `uuid`. Aceptar
-    // también `text` acá rompería esa lectura/escritura contra una
-    // columna que en realidad guarda texto plano, sin ningún caso real
-    // verificado que lo pida todavía (el motivador, iaacademy, tiene
-    // columnas genuinamente `uuid`).
+    // solo es correcto contra una columna genuinamente `uuid`. GRAMMAR.md
+    // §3.251: `id: String` es justamente la vía de escape para el caso que
+    // este scope deja afuera -- una columna `varchar`/`text` que guarda
+    // algo con forma de UUID, generado por la aplicación anterior o por un
+    // `DEFAULT` de la base (`gen_random_uuid()::text`, el caso real de
+    // Skynet) -- sin asumir NUNCA el formato binario nativo.
     let ok = match expected {
         IdKind::Int => matches!(data_type.as_str(), "bigint" | "integer" | "smallint"),
         IdKind::Uuid => data_type == "uuid",
+        IdKind::String => matches!(data_type.as_str(), "character varying" | "text" | "citext"),
     };
     if ok {
         return Ok(());
@@ -1082,6 +1106,10 @@ pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str, i
         IdKind::Uuid => (
             "una clave primaria 'uuid' nativa de PostgreSQL".to_string(),
             format!("agregá una columna \"{id_col}\" UUID nueva, o cambiá el tipo del campo 'id' del .link a Int si esta tabla ya usa un entero/otro formato"),
+        ),
+        IdKind::String => (
+            "una clave primaria de texto plano ('character varying'/'text')".to_string(),
+            format!("agregá una columna \"{id_col}\" VARCHAR/TEXT nueva, o cambiá el tipo del campo 'id' del .link a Int/Uuid si esta tabla ya usa otro formato"),
         ),
     };
     Err(format!(
@@ -2629,9 +2657,15 @@ db { users: User[] }
                 // hay riesgo de pisar un valor que el usuario haya
                 // intentado fijar.
                 let id_col = self.id_col(collection);
+                // GRAMMAR.md §3.251: `id: String` se genera EXACTAMENTE
+                // igual que `id: Uuid` -- mismo generador (`generate_uuid_v4`),
+                // mismo momento (antes del INSERT, del lado de la app) --
+                // la única diferencia entre los dos es el tipo de columna
+                // SQL (ver `create_postgres_table_sql`/`create_table_sql`),
+                // nunca el valor generado en sí.
                 let generated_uuid = match self.id_kind(collection) {
                     IdKind::Int => None,
-                    IdKind::Uuid => Some(generate_uuid_v4()?),
+                    IdKind::Uuid | IdKind::String => Some(generate_uuid_v4()?),
                 };
                 if let Some(uuid) = &generated_uuid {
                     col_names.push(format!("\"{id_col}\""));
@@ -3014,6 +3048,11 @@ db { users: User[] }
                 None => return,
             },
             (serde_json::Value::String(s), IdKind::Uuid) => Value::Uuid(s.clone()),
+            // GRAMMAR.md §3.251: mismo caso que `Uuid` arriba -- el id
+            // cruza el NOTIFY como string sin importar si es `Uuid` o
+            // `String`, la única diferencia es a qué variante de `Value`
+            // decodifica.
+            (serde_json::Value::String(s), IdKind::String) => Value::Str(s.clone()),
             (serde_json::Value::String(s), IdKind::Int) => match s.parse::<i64>() {
                 Ok(i) => Value::Int(i),
                 Err(_) => return,
@@ -3161,7 +3200,13 @@ db { users: User[] }
         match v {
             Value::Int(n) => Ok((Cell::Int(*n), n.to_string())),
             Value::Uuid(s) => Ok((Cell::Text(s.clone()), s.clone())),
-            other => Err(RuntimeError::new(format!("id inválido: se esperaba Int o Uuid, se encontró {other:?}"))),
+            // GRAMMAR.md §3.251: `id: String` (PLAN.md §9.21 Fase 3 ítem
+            // 11) -- el checker ya garantizó que esto solo llega para una
+            // colección cuya PK sea de verdad `String` (`db_id_type`), así
+            // que aceptar CUALQUIER `Value::Str` acá es seguro: nunca
+            // convive con una colección de otro tipo de PK.
+            Value::Str(s) => Ok((Cell::Text(s.clone()), s.clone())),
+            other => Err(RuntimeError::new(format!("id inválido: se esperaba Int, Uuid o String, se encontró {other:?}"))),
         }
     }
 
@@ -4126,6 +4171,11 @@ fn escape_like_wildcards(s: &str) -> String {
                         None => match (id_kind, cell) {
                             (IdKind::Int, Cell::Int(n)) => Value::Int(n),
                             (IdKind::Uuid, Cell::Text(s)) => Value::Uuid(s),
+                            // GRAMMAR.md §3.251: `select(|x| x.id)` sobre
+                            // una colección con `id: String` -- mismo Cell
+                            // físico que `Uuid` (TEXT), pero decodifica a
+                            // `Value::Str`, no `Value::Uuid`.
+                            (IdKind::String, Cell::Text(s)) => Value::Str(s),
                             _ => Value::Null,
                         },
                         Some(col) => match decode_column_cell(collection, col, &cell, "projection", &self.checker, key.as_ref())? {
@@ -4176,6 +4226,10 @@ fn escape_like_wildcards(s: &str) -> String {
                                 let id_val = match (id_kind, cell) {
                                     (IdKind::Int, Cell::Int(n)) => Value::Int(n),
                                     (IdKind::Uuid, Cell::Text(s)) => Value::Uuid(s),
+                                    // GRAMMAR.md §3.251: ver el comentario del
+                                    // caso análogo en la proyección escalar,
+                                    // arriba en este mismo archivo.
+                                    (IdKind::String, Cell::Text(s)) => Value::Str(s),
                                     _ => Value::Null,
                                 };
                                 struct_fields.push((f.target.clone(), id_val));
@@ -4454,6 +4508,11 @@ pub(crate) fn decode_row(
     let (id_field, id_display) = match (id_kind, cells.first()) {
         (IdKind::Int, Some(Cell::Int(n))) => (Value::Int(*n), n.to_string()),
         (IdKind::Uuid, Some(Cell::Text(s))) => (Value::Uuid(s.clone()), s.clone()),
+        // GRAMMAR.md §3.251: `id: String` decodifica a `Value::Str`, no
+        // `Value::Uuid` -- mismo `Cell::Text` físico que `Uuid` (ver
+        // `id_column_kind_for`), pero el tipo lógico que ve el programa
+        // c-script es un `String` común, sin validación de forma UUID.
+        (IdKind::String, Some(Cell::Text(s))) => (Value::Str(s.clone()), s.clone()),
         _ => panic!("la columna 'id' de '{collection}' no matchea su IdKind ({id_kind:?}): llegó {:?}", cells.first()),
     };
     out.push(("id".to_string(), id_field));

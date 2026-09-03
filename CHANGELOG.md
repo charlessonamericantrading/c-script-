@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.200.4] - 2026-09-03
+
+### ✨ Añadido
+**`id: String` -- tercera forma de PK, para adoptar una tabla con columna de texto plano (PLAN.md §9.21 Fase 3 ítem 11, parcial)**: junto a `Int`/`Uuid`, un campo `id: String` requerido genera un UUID v4 del lado de la aplicación en cada `insert` (mismo generador que `id: Uuid`) pero mapea a `VARCHAR`/`TEXT` en PostgreSQL -- nunca al tipo nativo `uuid` -- para poder adoptar una tabla existente cuya PK es texto plano (el schema real de producción de Skynet, `id VARCHAR DEFAULT gen_random_uuid()::text`, que `id: Uuid` deliberadamente rechaza). `linkc introspect` reconoce sola una PK `character varying`/`text` (Postgres) o de afinidad de texto (SQLite) y emite `id: String` sin warning. `pageAfter` la rechaza por el mismo motivo que ya rechaza `Uuid` (sin orden de inserción real). Las claves primarias COMPUESTAS (`@primaryKey(...)`) quedan fuera de esta ronda -- cambian la forma de casi todo el runtime, ronda propia. Ver GRAMMAR.md §3.251.
+
 ## [1.200.3] - 2026-09-03
 
 ### ✨ Añadido

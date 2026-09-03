@@ -378,12 +378,17 @@ fn introspect_table(client: &mut postgres::Client, table: &str) -> Result<TableI
         match id_pg_type {
             Some("uuid") => fields.push("  id: Uuid,".to_string()),
             Some("bigint" | "integer" | "smallint") | None => fields.push("  id: Int,".to_string()),
+            // GRAMMAR.md §3.251: una PK de texto plano (típicamente un UUID
+            // guardado como `varchar`/`text` en vez del tipo nativo `uuid`
+            // -- `gen_random_uuid()::text`, el caso real de Skynet) mapea a
+            // `id: String`, no a un warning + `Int` a mano como antes.
+            Some("character varying" | "text" | "citext") => fields.push("  id: String,".to_string()),
             Some(other) => {
                 warnings.push(format!(
                     "la clave primaria de '{table}' se llama \"id\" pero en PostgreSQL es '{other}' -- c-script solo \
-                     soporta 'id: Int' (BIGSERIAL/INTEGER/SMALLSERIAL) o 'id: Uuid' (columna 'uuid' nativa) como PK; \
-                     esta tabla no se puede adoptar tal cual con esta PK, 'linkc serve'/'linkc migrate --dry-run' \
-                     la van a rechazar al conectar"
+                     soporta 'id: Int' (BIGSERIAL/INTEGER/SMALLSERIAL), 'id: Uuid' (columna 'uuid' nativa) o \
+                     'id: String' (columna de texto plano) como PK; esta tabla no se puede adoptar tal cual con esta \
+                     PK, 'linkc serve'/'linkc migrate --dry-run' la van a rechazar al conectar"
                 ));
                 fields.push("  id: Int,".to_string());
             }
@@ -576,9 +581,15 @@ fn introspect_sqlite_table(conn: &Connection, table: &str) -> Result<TableIntros
             fields.push("  id: Int,".to_string());
         } else if upper_ty == "UUID" {
             fields.push("  id: Uuid,".to_string());
+        // GRAMMAR.md §3.251: afinidad de texto de SQLite (CHAR/CLOB/TEXT/
+        // VARCHAR, misma regla que el motor usa para decidir el storage
+        // class) -- una PK así declarada mapea a `id: String`, mismo caso
+        // que `character varying`/`text` del lado Postgres arriba.
+        } else if upper_ty.contains("TEXT") || upper_ty.contains("CHAR") || upper_ty.contains("CLOB") {
+            fields.push("  id: String,".to_string());
         } else {
             warnings.push(format!(
-                "la clave primaria de '{table}' se llama \"id\" pero en SQLite es '{upper_ty}' -- c-script solo soporta 'id: Int' o 'id: Uuid'; revisar a mano"
+                "la clave primaria de '{table}' se llama \"id\" pero en SQLite es '{upper_ty}' -- c-script solo soporta 'id: Int', 'id: Uuid' o 'id: String'; revisar a mano"
             ));
             fields.push("  id: Int,".to_string());
         }

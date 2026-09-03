@@ -8806,6 +8806,60 @@ test "with carga la relacion sin N+1" {
 
 **Verificado**: `compiler/tests/cli_with_relation.rs` (8 tests: ciclo completo vía `linkc test`, `@ref` opcional con `related: null` cuando el FK es null, cuatro rechazos del checker -- campo sin `@ref`, selector con expresión derivada, campo inexistente, más de un argumento --, el contrato TypeScript emitiendo el wrapper inline `{ row: Post; related: Author }`, y un servidor real sobre SQLite confirmando la forma exacta sobre HTTP); `compiler/tests/pg_integration.rs` (`with_loads_the_related_row_without_n_plus_one_against_real_postgres`) validando el join en memoria contra PostgreSQL real con tres posts y dos autores.
 
+### 3.251 `id: String`: tercera forma de PK, para adoptar una tabla con columna de texto plano — RESUELTO, cierra la primera mitad de PLAN.md §9.21 Fase 3 (ítem 11)
+
+Origen: `PLAN.md §9.21` Fase 3 ítem 11 (solo la mitad de "PKs flexibles" -- ver el límite de abajo). `id: Uuid` (§3.177) deliberadamente solo acepta la columna NATIVA `uuid` de PostgreSQL -- nunca `varchar`/`text`, aunque guarden un UUID con forma válida -- porque el bind/la lectura de esa columna (`Cell::to_sql`/`postgres_cell`) dan por sentado el formato binario real (16 bytes). El schema real de producción de Skynet usa `id VARCHAR PRIMARY KEY DEFAULT gen_random_uuid()::text` -- exactamente el caso que ese scope deja afuera -- y `--adopt-existing` rechazaba esa tabla al conectar.
+
+**Qué hay (v1.200.4)**:
+- **`id: String`** como tercera forma válida de PK (junto a `Int`/`Uuid`, GRAMMAR.md §3.177) -- un campo `id: String` requerido (no opcional, no nullable) en el tipo de elemento de una colección.
+- **Generación**: igual que `id: Uuid` -- un UUID v4 generado del lado de la aplicación en cada `insert` (mismo `generate_uuid_v4`), nunca depende de un `DEFAULT` de columna. La diferencia es puramente de tipo de columna, nunca del valor generado.
+- **DDL**: `VARCHAR PRIMARY KEY` en PostgreSQL (nunca el tipo nativo `UUID`), `TEXT PRIMARY KEY NOT NULL` en SQLite (mismo DDL que `Uuid` -- SQLite no distingue).
+- **`linkc introspect`** mapea una PK `character varying`/`text`/`citext` (Postgres) o de afinidad de texto (`TEXT`/`CHAR`/`CLOB`/`VARCHAR`, SQLite) a `id: String` automáticamente, sin warning -- antes producía un warning + `id: Int` a mano.
+- **`pageAfter` la rechaza**, mismo motivo que ya rechaza `Uuid`: un id generado del lado de la app no tiene el orden de inserción que esa paginación necesita para su garantía de "nunca se salta una fila".
+- **Límite v1, documentado a propósito**: PLAN.md §9.21 ítem 11 también incluía claves primarias COMPUESTAS (`@primaryKey(tenantId, id)`) -- deliberadamente FUERA de esta ronda. A diferencia de agregar una tercera forma de PK escalar (un cambio mecánico, guiado por la exhaustividad de `match IdKind` del propio compilador), una PK compuesta cambia la FORMA de la firma de `find`/`delete`/`applyPatch`/`increment`/`pageAfter` en cada capa (checker, runtime, DDL, `Omit<T,"id">` del contrato TS) -- una ronda propia, no una extensión de esta.
+
+<!-- linkc:check -->
+```rust
+type Session = {
+  id: String,
+  token: String,
+}
+
+db {
+  sessions: Session[],
+}
+
+service Auth {
+  rpc create(token: String) -> Session {
+    db.sessions.insert(Session { id: "unused", token: token })
+  }
+
+  rpc byId(id: String) -> Session? {
+    db.sessions.find(id)
+  }
+
+  rpc remove(id: String) -> Bool {
+    db.sessions.delete(id)
+  }
+}
+
+test "id: String genera un uuid y funciona en el ciclo completo" {
+  let s1 = Auth.create("tok-a");
+  let s2 = Auth.create("tok-b");
+  assert(s1.id != s2.id, "ids distintos generados");
+  assert(s1.id.length() == 36, "forma de uuid (36 caracteres)");
+
+  let found = Auth.byId(s1.id);
+  assert(found.isSome(), "encontrado por id string");
+
+  let removed = Auth.remove(s1.id);
+  assert(removed, "borrado exitoso");
+  assert(Auth.byId(s1.id).isNone(), "ya no existe");
+}
+```
+
+**Verificado**: `compiler/tests/cli_string_pk.rs` (5 tests: ciclo CRUD completo vía `linkc test`, rechazo de `pageAfter`, el DDL estático de `linkc build` emitiendo `VARCHAR` -- nunca `UUID` nativo --, `linkc introspect` mapeando una columna SQLite real `VARCHAR` a `id: String`, y `--adopt-existing` leyendo una fila preexistente de una tabla SQLite real con PK `VARCHAR`); `compiler/tests/pg_integration.rs` (`string_pk_collection_supports_the_full_crud_cycle_against_a_fresh_postgres_table` confirmando la columna real como `character varying`, y `adopt_existing_varchar_pk_table_with_gen_random_uuid_default_supports_the_full_crud_cycle_against_a_real_postgres_table` -- el caso real de Skynet, tabla preexistente con `DEFAULT gen_random_uuid()::text`).
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

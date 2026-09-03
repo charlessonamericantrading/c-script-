@@ -1355,6 +1355,119 @@ fn adopt_existing_uuid_pk_table_supports_the_full_crud_cycle_against_a_real_post
     assert_eq!(removed, true);
 }
 
+fn string_pk_link_source(collection: &str) -> String {
+    format!(
+        r#"
+type Lead = {{ id: String, email: String, score: Int }}
+type NewLead = {{ email: String, score: Int }}
+db {{ {collection}: Lead[] }}
+service Leads {{
+  rpc create(email: String, score: Int) -> Lead {{ db.{collection}.insert(NewLead {{ email: email, score: score }}) }}
+  rpc get(id: String) -> Lead? {{ db.{collection}.find(id) }}
+  rpc list() -> Lead[] {{ db.{collection}.all() }}
+  rpc update(id: String, patch: Patch<Lead>) -> Lead {{ db.{collection}.applyPatch(id, patch) }}
+  rpc remove(id: String) -> Bool {{ db.{collection}.delete(id) }}
+}}
+"#
+    )
+}
+
+#[test]
+fn string_pk_collection_supports_the_full_crud_cycle_against_a_fresh_postgres_table() {
+    // GRAMMAR.md §3.251, camino NO adoptado: `linkc serve` crea la tabla
+    // con VARCHAR (no el tipo nativo UUID) para "id" -- confirma que el
+    // ciclo completo funciona igual que `id: Uuid`, solo que la columna
+    // física es texto plano.
+    const COLLECTION: &str = "leads_string_pk_fresh";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("string-pk-fresh");
+    let src = temp.write("app.link", &string_pk_link_source(COLLECTION));
+    let server = Serve::start(&src, &url);
+
+    let created = server.rpc("Leads/create", r#"{"email":"a@example.com","score":3}"#);
+    let id = created["id"].as_str().expect("insert devuelve un id String real").to_string();
+    assert_eq!(id.len(), 36, "generado con el mismo formato uuid v4 que 'id: Uuid': {created:?}");
+
+    let mut check_client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar de nuevo, por fuera de c-script");
+    let col_type: String = check_client
+        .query_one(
+            "SELECT data_type FROM information_schema.columns WHERE table_name = $1 AND column_name = 'id'",
+            &[&COLLECTION],
+        )
+        .expect("leer el tipo real de la columna id")
+        .get(0);
+    assert_eq!(col_type, "character varying", "id: String tiene que crear una columna VARCHAR, nunca el tipo nativo uuid");
+
+    let fetched = server.rpc("Leads/get", &format!(r#"{{"id":"{id}"}}"#));
+    assert_eq!(fetched["email"], "a@example.com");
+
+    let updated = server.rpc("Leads/update", &format!(r#"{{"id":"{id}","patch":{{"score":9}}}}"#));
+    assert_eq!(updated["score"], 9);
+
+    let removed = server.rpc("Leads/remove", &format!(r#"{{"id":"{id}"}}"#));
+    assert_eq!(removed, true);
+}
+
+#[test]
+fn adopt_existing_varchar_pk_table_with_gen_random_uuid_default_supports_the_full_crud_cycle_against_a_real_postgres_table() {
+    // El caso REAL que motiva GRAMMAR.md §3.251 -- el schema de producción
+    // de Skynet (PLAN.md §9.21 ítem 6): tablas con "id VARCHAR PRIMARY KEY
+    // DEFAULT gen_random_uuid()::text", que ANTES de `id: String` no había
+    // forma de adoptar (`id: Uuid` rechaza cualquier columna que no sea el
+    // tipo nativo `uuid`, aunque guarde algo con forma de UUID -- ver
+    // `validate_existing_id_column`). Mismo patrón que
+    // `adopt_existing_uuid_pk_table_supports_the_full_crud_cycle_against_a_real_postgres_table`,
+    // con VARCHAR en vez de UUID nativo.
+    const COLLECTION: &str = "leads_varchar_pk_adopted";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE \"{COLLECTION}\" (\
+                \"id\" VARCHAR PRIMARY KEY DEFAULT gen_random_uuid()::text, \
+                \"email\" TEXT NOT NULL, \
+                \"score\" BIGINT NOT NULL\
+            )"
+        ))
+        .expect("crear la tabla preexistente con id varchar + DEFAULT gen_random_uuid()::text, como el schema real de Skynet");
+
+    let temp = TempDir::new("varchar-pk-adopted");
+    let src = temp.write("app.link", &string_pk_link_source(COLLECTION));
+    let server = Serve::start_with_args(&src, &url, &["--adopt-existing"]);
+
+    let created = server.rpc("Leads/create", r#"{"email":"b@example.com","score":1}"#);
+    let id = created["id"].as_str().expect("insert devuelve un id String real contra la tabla adoptada").to_string();
+    assert_eq!(id.len(), 36, "{created:?}");
+
+    let fetched = server.rpc("Leads/get", &format!(r#"{{"id":"{id}"}}"#));
+    assert_eq!(fetched["email"], "b@example.com");
+
+    // Confirma en SQL crudo que el id que c-script generó -- NO el DEFAULT
+    // de la columna, que nunca se ejercita en este camino -- es el que de
+    // verdad quedó en la fila.
+    let mut check_client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar de nuevo, por fuera de c-script");
+    let row = check_client
+        .query_one(&format!("SELECT \"id\", \"email\" FROM \"{COLLECTION}\""), &[])
+        .expect("leer la fila insertada con SQL crudo");
+    let raw_id: String = row.get(0);
+    assert_eq!(raw_id, id, "el id que insertó c-script es el que de verdad quedó en la columna varchar");
+
+    let removed = server.rpc("Leads/remove", &format!(r#"{{"id":"{id}"}}"#));
+    assert_eq!(removed, true);
+}
+
 #[test]
 fn migrate_dry_run_reports_no_changes_for_an_existing_native_uuid_pk_table() {
     // Antes de GRAMMAR.md §3.177, esta misma tabla hacía que `migrate

@@ -91,6 +91,13 @@ pub fn create_postgres_table_sql(
     let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
     let id_def = match id_field_ty {
         Type::Uuid => format!("\"{id_col}\" UUID PRIMARY KEY"),
+        // GRAMMAR.md §3.251: `id: String` -- VARCHAR de texto plano, NUNCA
+        // el tipo nativo `uuid` (ese es justo el punto: adoptar una tabla
+        // cuya PK es una columna de texto, aunque guarde algo con forma de
+        // UUID). Sin `DEFAULT` acá tampoco -- mismo motivo que `Uuid`
+        // arriba, c-script genera el valor del lado de la app en cada
+        // insert.
+        Type::String => format!("\"{id_col}\" VARCHAR PRIMARY KEY"),
         _ => format!("\"{id_col}\" BIGSERIAL PRIMARY KEY"),
     };
     let mut cols = vec![id_def];

@@ -1143,21 +1143,29 @@ impl Checker {
                 "el tipo de elemento de una colección de 'db' tiene que ser un struct, se encontró {element_ty:?}"
             )));
         };
-        let id_ok = fields.iter().any(|f| f.name == "id" && !f.optional && matches!(f.ty, Type::Int | Type::Uuid));
+        // GRAMMAR.md §3.251: `id: String` (PLAN.md §9.21 Fase 3 ítem 11) --
+        // tercera forma de PK, junto a `Int`/`Uuid`. Pensada para adoptar
+        // una tabla existente cuya columna `id` es `VARCHAR`/`TEXT` (no el
+        // tipo nativo `uuid` de Postgres) aunque guarde un UUID con forma
+        // válida -- el caso real de Skynet (`gen_random_uuid()::text`) que
+        // `id: Uuid` deliberadamente NO cubre (ver el comentario de
+        // `validate_existing_id_column`, runtime/db.rs).
+        let id_ok = fields.iter().any(|f| f.name == "id" && !f.optional && matches!(f.ty, Type::Int | Type::Uuid | Type::String));
         if !id_ok {
             return Err(err(
-                "toda colección de 'db' necesita un campo 'id: Int' o 'id: Uuid' requerido (no opcional, no nullable)",
+                "toda colección de 'db' necesita un campo 'id: Int', 'id: Uuid' o 'id: String' requerido (no opcional, no nullable)",
             ));
         }
         Ok(())
     }
 
     /// El tipo REAL del campo `id` de una colección ya validada por
-    /// `validate_db_element_type` -- `Int` (autoincremento) o `Uuid`
-    /// (generado del lado de la aplicación, GRAMMAR.md §3.177).
-    /// `find`/`applyPatch`/`delete`/`increment`/`pageAfter` tipan su
-    /// argumento/cursor de id contra ESTE tipo en vez de un `Type::Int`
-    /// fijo, para aceptar los dos casos con el mismo código.
+    /// `validate_db_element_type` -- `Int` (autoincremento), `Uuid` o
+    /// `String` (los dos últimos generados del lado de la aplicación,
+    /// GRAMMAR.md §3.177/§3.251). `find`/`applyPatch`/`delete`/`increment`/
+    /// `pageAfter` tipan su argumento/cursor de id contra ESTE tipo en vez
+    /// de un `Type::Int` fijo, para aceptar los tres casos con el mismo
+    /// código.
     pub(crate) fn db_id_type(element_ty: &Type) -> Type {
         let Type::Struct { fields, .. } = element_ty else {
             unreachable!("validate_db_element_type ya garantizó que element_ty sea un struct");
@@ -5522,26 +5530,28 @@ impl Checker {
                 let [cursor_arg, limit_arg] = args else {
                     return Err(err("'pageAfter' toma exactamente 2 argumentos (cursor: Int?, limit: Int)"));
                 };
-                // GRAMMAR.md §3.177: rechazado a propósito sobre una PK
-                // Uuid, no solo "todavía no soportado". La garantía real
-                // de pageAfter ("nunca se salta una fila insertada
-                // durante la paginación") depende de que el id crezca EN
-                // EL MISMO ORDEN que la inserción -- cierto para un
-                // autoincremento, falso para un Uuid aleatorio: una fila
-                // insertada concurrentemente con id menor al cursor
-                // actual quedaría afuera de TODA página futura de ese
-                // pase, sin ningún error que lo señale. Dejarlo pasar con
-                // orden lexicográfico habría sido "compila y corre" con
-                // una garantía documentada rota en silencio.
-                if Self::db_id_type(element_ty) == Type::Uuid {
-                    return Err(err(
-                        "'pageAfter' no está soportado sobre una colección con 'id: Uuid' -- su garantía de que \
+                // GRAMMAR.md §3.177/§3.251: rechazado a propósito sobre una
+                // PK Uuid O String, no solo "todavía no soportado". La
+                // garantía real de pageAfter ("nunca se salta una fila
+                // insertada durante la paginación") depende de que el id
+                // crezca EN EL MISMO ORDEN que la inserción -- cierto para
+                // un autoincremento, falso para un Uuid/String generado del
+                // lado de la app (ambos sin orden real): una fila insertada
+                // concurrentemente con id menor al cursor actual quedaría
+                // afuera de TODA página futura de ese pase, sin ningún
+                // error que lo señale. Dejarlo pasar con orden lexicográfico
+                // habría sido "compila y corre" con una garantía documentada
+                // rota en silencio.
+                let id_ty = Self::db_id_type(element_ty);
+                if id_ty == Type::Uuid || id_ty == Type::String {
+                    return Err(err(format!(
+                        "'pageAfter' no está soportado sobre una colección con 'id: {id_ty}' -- su garantía de que \
                          nunca se salta una fila insertada durante la paginación depende de que el id crezca en \
-                         el mismo orden que la inserción (autoincremento); un Uuid aleatorio no tiene ese orden, \
-                         así que una fila insertada concurrentemente con id menor al cursor actual quedaría \
-                         afuera de toda página futura, en silencio. Usá 'page' (offset), que no depende de ese \
-                         orden, o un campo propio de fecha/secuencia para paginación estable",
-                    ));
+                         el mismo orden que la inserción (autoincremento); un {id_ty} generado del lado de la \
+                         aplicación no tiene ese orden, así que una fila insertada concurrentemente con id menor al \
+                         cursor actual quedaría afuera de toda página futura, en silencio. Usá 'page' (offset), que \
+                         no depende de ese orden, o un campo propio de fecha/secuencia para paginación estable",
+                    )));
                 }
                 self.check_expr(cursor_arg, &Type::Optional(Box::new(Type::Int)), env)?;
                 self.check_expr(limit_arg, &Type::Int, env)?;
