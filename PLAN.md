@@ -1025,7 +1025,7 @@ Ninguna es grande (`skynet_knowledge` 293 filas, `messages` 162, el resto < 100)
 
 ### 9.21 Evolución y modernización integral de la capa de Base de Datos (03/09/2026)
 
-**Estado: Fase 1 y Fase 2 HECHAS (03/09/2026, v1.200.0, ítems 1-8); Fase 3 ítem 9 HECHO (03/09/2026, v1.200.2); ítems 10-11 y Fase 4 sin ejecutar.** Origen: pedido explícito del usuario para estructurar las mejoras del subsistema de persistencia (`db { ... }`). Detalla los cuellos de botella de concurrencia física, la falta de relaciones formales (N+1 forzado), la rigidez de nombres de columna y los límites actuales de pushdown SQL.
+**Estado: Fase 1 y Fase 2 HECHAS (03/09/2026, v1.200.0, ítems 1-8); Fase 3 ítems 9-10 HECHOS (03/09/2026, v1.200.2/v1.200.3); ítem 11 y Fase 4 sin ejecutar.** Origen: pedido explícito del usuario para estructurar las mejoras del subsistema de persistencia (`db { ... }`). Detalla los cuellos de botella de concurrencia física, la falta de relaciones formales (N+1 forzado), la rigidez de nombres de columna y los límites actuales de pushdown SQL.
 
 #### 1. Fricciones y límites medidos en el código actual
 - **Conexión física única en PostgreSQL y SQLite**: `store.rs:78-95` encapsula la conexión Postgres en un `ReentrantMutex`. Toda request concurrente en `linkc serve` se encola detrás de este mutex. En SQLite no hay separación WAL de lectores paralelos.
@@ -1050,7 +1050,7 @@ Ninguna es grande (`skynet_knowledge` 293 filas, `messages` 162, el resto < 100)
 
 ##### Fase 3 -- Relaciones tipadas de primera clase [decisión del usuario]
 9. ~~**Foreign Keys declarativas `@ref(Coleccion, onDelete: ...)`**~~ **HECHO (03/09/2026, v1.200.2, GRAMMAR.md §3.249)**: `@ref(coleccion)` sobre un campo `Int`/`Uuid` (o su forma `?`), validado por el checker contra el tipo de la PK destino (mismo criterio que `@requires(..., ownerOf: ...)`). `onDelete: Cascade`/`Restrict`/`SetNull`, default `NO ACTION`. DDL: `REFERENCES` inline en SQLite (`PRAGMA foreign_keys = ON` activado en el escritor), `ALTER TABLE ADD CONSTRAINT` idempotente (bloque `DO $$ ... IF NOT EXISTS`) como segunda pasada en PostgreSQL -- necesario porque Postgres exige que la tabla destino ya exista al crear el constraint, a diferencia de SQLite. `insert`/`applyPatch`/`delete` devuelven 400 (no 500) ante una violación. Texto original: Validadas por el checker contra la PK destino y emitidas como `REFERENCES` en DDL. Esfuerzo M.
-10. **Carga eagerly sin N+1 `.with(...)`**: `db.posts.with(|p| p.author)` resuelve en una o dos queries por lotes y emite el tipo compuesto a `contract.d.ts`. Esfuerzo L.
+10. ~~**Carga eagerly sin N+1 `.with(...)`**~~ **HECHO (03/09/2026, v1.200.3, GRAMMAR.md §3.250) [decisión del usuario: wrapper `{ row, related }`, no composite aplanado]**: `db.<c>.with(|item: T| item.campoRef)`, selector con la forma exacta `|x| x.campo` donde `campo` lleva `@ref(...)`, resuelve en DOS queries siempre (la base + un batch `IN (...)` de las relacionadas, join en memoria por id) y devuelve `List<{ row: T, related: R }>` (`R?` si el `@ref` es opcional). Sin encadenar con `findWhere`/`orderBy`/`select`, una sola relación por llamada -- límite v1 documentado. Texto original: `db.posts.with(|p| p.author)` resuelve en una o dos queries por lotes y emite el tipo compuesto a `contract.d.ts`. Esfuerzo L.
 11. **Primary Keys flexibles**: PKs de tipo `String` (`VARCHAR` con UUID v4/v7 o CUID) y claves primarias compuestas (`@primaryKey(tenantId, id)`). Esfuerzo M.
 
 ##### Fase 4 -- Seguridad SaaS, IA y control de esquemas
@@ -1061,7 +1061,7 @@ Ninguna es grande (`skynet_knowledge` 293 filas, `messages` 162, el resto < 100)
 #### 3. Orden recomendado de ejecución
 - **Ronda 1 (Inmediatos, sin cambio de sintaxis) -- HECHA v1.200.0**: 1 (Pool Postgres), 3 (`@column`), 5 (Pushdown `IN`), 6 (Texto `ILIKE`).
 - **Ronda 2 (Rendimiento y queries masivas) -- HECHA v1.200.0**: 2 (SQLite WAL), 7 (`.updateWhere`), 4 (`introspect` completo).
-- **Ronda 3 (Relaciones y tipos, con luz verde del usuario)**: 9 (`@ref`) -- HECHA v1.200.2, 10 (`.with` sin N+1), 11 (PKs flexibles).
+- **Ronda 3 (Relaciones y tipos, con luz verde del usuario)**: 9 (`@ref`) -- HECHA v1.200.2, 10 (`.with` sin N+1) -- HECHA v1.200.3, 11 (PKs flexibles).
 - **Ronda 4 (SaaS, IA y Migraciones)**: 12 (`@tenant`), 13 (`Vector<N>`), 14 (`migrate apply`).
 
 ---

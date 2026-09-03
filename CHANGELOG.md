@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.200.3] - 2026-09-03
+
+### ✨ Añadido
+**`db.<c>.with(selector)` -- carga eager de una relación `@ref` sin N+1 (PLAN.md §9.21 Fase 3 ítem 10)**: selector con la forma exacta `|item: T| item.campoRef` donde `campoRef` lleva `@ref(...)` (§3.249); devuelve `List<{ row: T, related: R }>` (`R?` si el `@ref` es opcional) siempre en DOS consultas SQL -- la colección base entera más un batch `WHERE "id" IN (...)` de las filas relacionadas, unidas en memoria por id -- sin importar cuántas filas haya. Decisión de diseño explícita del usuario: wrapper fijo `{ row, related }` en vez de un composite aplanado (evita retocar `@ref` con un nombre de relación virtual). Sin fallback interpretado -- una forma de selector no reconocida es error de compilación. Ver GRAMMAR.md §3.250.
+
 ## [1.200.2] - 2026-09-03
 
 ### ✨ Añadido

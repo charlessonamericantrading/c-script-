@@ -5587,6 +5587,8 @@ impl Checker {
                 Ok(Type::List(Box::new(result_ty)))
             }
 
+            "with" => self.check_with(element_ty, args),
+
             // Deliberadamente SIEMPRE un error acá, nunca una firma normal
             // y libremente componible como las de arriba (GRAMMAR.md
             // §3.16): la única forma de que `subscribe()` tipe en TODO el
@@ -5602,7 +5604,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/updateWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/increment/select/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/updateWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/increment/select/with/subscribe)"
             ))),
         }
     }
@@ -5839,6 +5841,21 @@ impl Checker {
         fields.iter().any(|f| f.name == field_name && f.encrypted())
     }
 
+    /// `(colección destino, onDelete)` de `@ref(...)` sobre `field_name`, si
+    /// lo tiene (GRAMMAR.md §3.249) -- mismo cruce que `field_is_encrypted`:
+    /// `element_ty` (resuelto) no conserva anotaciones, así que hay que
+    /// volver al `ast::Field` original vía `self.types`. Lo usa `check_with`
+    /// (`db.<c>.with(selector)`, GRAMMAR.md §3.250) para saber si el campo
+    /// que nombra el selector es una relación de verdad.
+    fn field_ref_target(&self, element_ty: &Type, field_name: &str) -> Option<(String, Option<OnDelete>)> {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { return None };
+        let decl = self.types.get(type_name)?;
+        let TypeExpr::Struct(fields) = &decl.ty else { return None };
+        let f = fields.iter().find(|f| f.name == field_name)?;
+        let (target, on_delete) = f.ref_target()?;
+        Some((target.to_string(), on_delete))
+    }
+
     /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.52):
     /// agregación con `GROUP BY` empujada a SQL de verdad -- a diferencia de
     /// `findWhere`/`deleteWhere` (predicado como closure, evaluado en el
@@ -6015,6 +6032,66 @@ impl Checker {
             )));
         }
         Ok(Type::DbQuery(Box::new(element_ty.clone())))
+    }
+
+    /// `db.<c>.with(selector)` (PLAN.md §9.21 Fase 3 ítem 10, GRAMMAR.md
+    /// §3.250): carga eager de una relación `@ref` sin N+1. El selector
+    /// tiene que ser EXACTAMENTE `|item: T| item.campo` -- mismo shape que
+    /// `check_order_by` reconoce (`recognize_field_selector`), pero acá
+    /// `campo` tiene que llevar `@ref(...)`, no ser un campo cualquiera. A
+    /// diferencia de `select` (que sintetiza el tipo de retorno A PARTIR de
+    /// lo que el closure devuelve), acá el closure NUNCA se ejecuta -- solo
+    /// nombra la relación -- así que el tipo de retorno se arma desde cero:
+    /// `List<{ row: T, related: R }>` (o `R?` si el campo `@ref` es
+    /// opcional). Deliberadamente SIN fallback interpretado (a diferencia
+    /// de `findWhere`/`select`): si el shape no matchea, es error de
+    /// compilación -- no hay forma sensata de "cargar una relación en
+    /// memoria" para un selector arbitrario sin conocer de antemano cuál
+    /// campo es la FK.
+    fn check_with(&self, element_ty: &Type, args: &[Spanned<Expr>]) -> Result<Type, CheckError> {
+        let [selector_arg] = args else {
+            return Err(err("'with' toma exactamente 1 argumento (selector: |item: T| item.campoRef)"));
+        };
+        let shape_err = || {
+            err(
+                "'with' espera un selector de la forma `|item: T| item.campo`, un acceso de campo simple sobre \
+                 el propio parámetro, donde 'campo' está anotado con '@ref(...)' (GRAMMAR.md §3.249/§3.250)",
+            )
+        };
+        let Expr::Closure { params, body } = &selector_arg.node else {
+            return Err(shape_err());
+        };
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        let Some(field_name) = crate::ast::recognize_field_selector(&param_names, body) else {
+            return Err(shape_err());
+        };
+        let Type::Struct { fields, .. } = element_ty else {
+            return Err(err("una colección de 'db' debe resolver a un struct"));
+        };
+        if !fields.iter().any(|f| f.name == field_name) {
+            return Err(err(format!("'with': '{field_name}' no es un campo de este struct")));
+        }
+        let Some((target, _on_delete)) = self.field_ref_target(element_ty, field_name) else {
+            return Err(err(format!(
+                "'with': '{field_name}' no tiene '@ref(...)' -- 'with' solo puede cargar una relación declarada, no un campo cualquiera (GRAMMAR.md §3.249/§3.250)"
+            )));
+        };
+        let Some(target_ty) = self.db_collections().get(&target) else {
+            return Err(err(format!(
+                "'with': la colección destino '{target}' de '@ref' en '{field_name}' no existe -- esto no debería pasar si el programa ya compiló '@ref' (GRAMMAR.md §3.249)"
+            )));
+        };
+        let field = fields.iter().find(|f| f.name == field_name).expect("ya validado arriba");
+        let field_is_optional = field.optional || matches!(&field.ty, Type::Optional(_));
+        let related_ty = if field_is_optional { Type::Optional(Box::new(target_ty.clone())) } else { target_ty.clone() };
+        let wrapper = Type::Struct {
+            name: None,
+            fields: vec![
+                FieldType { name: "row".to_string(), optional: false, ty: element_ty.clone() },
+                FieldType { name: "related".to_string(), optional: false, ty: related_ty },
+            ],
+        };
+        Ok(Type::List(Box::new(wrapper)))
     }
 
     /// Tipos con un orden total real tanto en SQL (`ORDER BY`) como en

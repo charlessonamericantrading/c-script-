@@ -1258,6 +1258,13 @@ pub struct Db {
     id_kinds: HashMap<String, IdKind>,
     /// Nombre de colección -> nombre físico de su columna id en SQL (GRAMMAR.md §3.242 / PLAN.md §9.21).
     id_columns: HashMap<String, String>,
+    /// Nombre de colección -> `{ columna_sql -> FkRef }` de cada `@ref(...)`
+    /// de su tipo de elemento (GRAMMAR.md §3.249). Ya se calculaba en los
+    /// dos constructores de abajo (SQLite y Postgres) SOLO para el DDL y se
+    /// descartaba -- `db.<c>.with(selector)` (GRAMMAR.md §3.250) lo
+    /// necesita en runtime para resolver la colección/columna destino sin
+    /// recalcular nada.
+    refs: HashMap<String, HashMap<String, FkRef>>,
     /// Suscriptores activos por colección, para push real (GRAMMAR.md
     /// §3.16). `Mutex`, no `RefCell` -- Pilar 1 del roadmap de concurrencia
     /// (26/08/2026): con un hilo por request (`runtime/server.rs`), dos
@@ -1848,6 +1855,7 @@ impl Db {
             columns,
             id_kinds,
             id_columns,
+            refs: refs_by_collection,
             subscribers: parking_lot::Mutex::new(HashMap::new()),
             pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
@@ -1933,6 +1941,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
         let empty_aliases: HashMap<String, String> = HashMap::new();
         let checks_by_collection = check_fields_by_collection(program, &checker);
         let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
+        let refs_by_collection = ref_fields_by_collection(program, &checker, &aliases_by_collection);
         let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let empty_type_checks: Vec<String> = Vec::new();
@@ -2040,8 +2049,8 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
             // SQLite) y de por qué cada sentencia es idempotente por sí
             // misma (sin eso, un restart con la tabla y el constraint ya
             // creados fallaría).
-            for (name, refs) in ref_fields_by_collection(program, &checker, &aliases_by_collection) {
-                for stmt in crate::codegen::postgres_emit::create_foreign_key_statements(&name, &refs) {
+            for (name, refs) in &refs_by_collection {
+                for stmt in crate::codegen::postgres_emit::create_foreign_key_statements(name, refs) {
                     backend.execute_ddl(&stmt).map_err(|e| format!("no se pudo crear una foreign key sobre '{name}': {e}"))?;
                 }
             }
@@ -2087,6 +2096,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 columns,
                 id_kinds,
                 id_columns,
+                refs: refs_by_collection,
                 subscribers: parking_lot::Mutex::new(HashMap::new()),
                 pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
                 oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
@@ -2593,6 +2603,10 @@ db { users: User[] }
             }
             "sumBy" | "countBy" | "avgBy" | "maxBy" | "minBy" => self.select_grouped(collection, columns, method, &args).map(Value::List),
             "maxRow" | "minRow" => self.top_row(collection, columns, method, &args),
+            "with" => {
+                let field = closure_field_name(args.first(), "de relación")?;
+                self.with_related(collection, columns, &field)
+            }
             "increment" => self.increment(collection, columns, args),
             "find" => {
                 let id_value = args.into_iter().next().ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?;
@@ -3305,6 +3319,101 @@ db { users: User[] }
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
+    }
+
+    /// `SELECT ... FROM "<coleccion>" WHERE "<id_col>" IN (?, ...)` -- batch
+    /// fetch por un conjunto de ids, usado por `db.<c>.with(selector)`
+    /// (GRAMMAR.md §3.250) para traer TODAS las filas relacionadas de una
+    /// sola consulta en vez de una por fila (evita N+1). Lista vacía de ids
+    /// -> lista vacía, sin tocar la base -- mismo caso borde que el
+    /// pushdown de `IN` de §3.243 (acá simplemente no hay nada que pedir).
+    fn select_rows_by_ids(&self, collection: &str, columns: &[ColumnPlan], ids: &[Cell]) -> Result<Vec<Value>, RuntimeError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let id_col = self.id_col(collection);
+        let mut col_list = vec![format!("\"{id_col}\"")];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| self.backend.placeholder(i)).collect();
+        let sql = format!("SELECT {} FROM \"{collection}\" WHERE \"{id_col}\" IN ({})", col_list.join(", "), placeholders.join(", "));
+        let mut kinds = vec![self.id_column_kind(collection)];
+        kinds.extend(columns.iter().map(ColumnPlan::kind));
+        let rows = self
+            .backend
+            .query(&sql, ids, &kinds)
+            .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+        rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
+    }
+
+    /// `db.<c>.with(selector)` (PLAN.md §9.21 Fase 3 ítem 10, GRAMMAR.md
+    /// §3.250): carga eager de una relación `@ref` sin N+1. Tres pasos --
+    /// (1) traer todas las filas base (`select_rows`, igual que `.all()`),
+    /// (2) juntar los valores DISTINTOS del campo FK entre esas filas y
+    /// traer las filas relacionadas en UNA sola consulta batch
+    /// (`select_rows_by_ids`), (3) unir en memoria por id. El checker
+    /// (`check_with`) ya garantizó que `field` existe y lleva `@ref(...)`,
+    /// así que `self.refs` siempre tiene la entrada -- el único motivo real
+    /// para que no esté es un programa que compiló con otra versión del
+    /// binario (defensa en profundidad, no un caso esperado).
+    fn with_related(&self, collection: &str, columns: &[ColumnPlan], field: &str) -> Result<Value, RuntimeError> {
+        let fk = self.refs.get(collection).and_then(|m| m.get(field)).cloned().ok_or_else(|| {
+            RuntimeError::new(format!(
+                "'with': '{field}' no tiene '@ref(...)' en '{collection}' -- esto no debería pasar si el programa ya compiló (GRAMMAR.md §3.249/§3.250)"
+            ))
+        })?;
+        let base_rows = self.select_rows(collection, columns, None)?;
+        let target_columns = self.columns.get(&fk.target_table).ok_or_else(|| {
+            RuntimeError::new(format!("'with': la colección destino '{}' de '@ref' no existe", fk.target_table))
+        })?;
+
+        // Ids DISTINTOS del campo FK entre las filas base -- una fila con
+        // `null` ahí (campo `@ref` opcional) simplemente no aporta ningún
+        // id a pedir; su `related` sale `null` más abajo sin necesitar una
+        // fila que buscar.
+        let mut seen = HashSet::new();
+        let mut ids: Vec<Cell> = Vec::new();
+        for row in &base_rows {
+            let Value::Struct(fs) = row else { continue };
+            let Some((_, v)) = fs.iter().find(|(n, _)| n == field) else { continue };
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            if let Ok((cell, key)) = self.id_cell_and_display(v) {
+                if seen.insert(key) {
+                    ids.push(cell);
+                }
+            }
+        }
+        let related_rows = self.select_rows_by_ids(&fk.target_table, target_columns, &ids)?;
+        let mut by_id: HashMap<String, Value> = HashMap::with_capacity(related_rows.len());
+        for r in related_rows {
+            if let Value::Struct(fs) = &r {
+                if let Some((_, Value::Int(n))) = fs.iter().find(|(n, _)| n == "id") {
+                    by_id.insert(n.to_string(), r);
+                    continue;
+                }
+                if let Some((_, Value::Uuid(u))) = fs.iter().find(|(n, _)| n == "id") {
+                    by_id.insert(u.clone(), r);
+                }
+            }
+        }
+
+        let wrapped: Vec<Value> = base_rows
+            .into_iter()
+            .map(|row| {
+                let related = match &row {
+                    Value::Struct(fs) => fs
+                        .iter()
+                        .find(|(n, _)| n == field)
+                        .and_then(|(_, v)| self.id_cell_and_display(v).ok())
+                        .and_then(|(_, key)| by_id.get(&key).cloned())
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+                Value::Struct(vec![("row".to_string(), row), ("related".to_string(), related)])
+            })
+            .collect();
+        Ok(Value::List(wrapped))
     }
 
     /// Cells bindeables + condición SQL `"{f1}" OP1 ? AND "{f2}" OP2 ? AND

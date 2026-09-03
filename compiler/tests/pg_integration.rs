@@ -5464,3 +5464,64 @@ service Blog {{
     let author = server.rpc("Blog/addAuthor", r#"{"name":"Grace"}"#);
     assert!(author["id"].as_i64().unwrap() > 0, "el server levanta de nuevo sin chocar con la FK ya creada");
 }
+
+/// `db.<c>.with(selector)` (GRAMMAR.md §3.250, PLAN.md §9.21 Fase 3 ítem 10)
+/// contra Postgres real: el join en memoria (una query para la base, una
+/// query batch `IN (...)` para las relacionadas) tiene que devolver la
+/// misma fila padre para cada hijo que la referencia -- no una query por
+/// fila, pero el resultado final es indistinguible de si lo fuera.
+#[test]
+fn with_loads_the_related_row_without_n_plus_one_against_real_postgres() {
+    const AUTHORS: &str = "pg_with_authors";
+    const POSTS: &str = "pg_with_posts";
+    let Ok(url) = std::env::var("LINK_TEST_PG_URL") else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, POSTS);
+    reset_schema(&url, AUTHORS);
+
+    let program = format!(
+        r#"
+type Author = {{ id: Int, name: String }}
+type NewAuthor = {{ name: String }}
+type Post = {{ id: Int, title: String, @ref({AUTHORS}) authorId: Int }}
+type NewPost = {{ title: String, authorId: Int }}
+db {{
+  {AUTHORS}: Author[],
+  {POSTS}: Post[],
+}}
+service Blog {{
+  rpc addAuthor(name: String) -> Author {{
+    db.{AUTHORS}.insert(NewAuthor {{ name: name }})
+  }}
+  rpc addPost(title: String, authorId: Int) -> Post {{
+    db.{POSTS}.insert(NewPost {{ title: title, authorId: authorId }})
+  }}
+  rpc listWithAuthor() -> {{ row: Post, related: Author }}[] {{
+    db.{POSTS}.with(|p: Post| {{ p.authorId }})
+  }}
+}}
+"#
+    );
+    let temp = TempDir::new("with-pg");
+    let src = temp.write("app.link", &program);
+    let server = Serve::start(&src, &url);
+
+    let ada = server.rpc("Blog/addAuthor", r#"{"name":"Ada"}"#);
+    let alan = server.rpc("Blog/addAuthor", r#"{"name":"Alan"}"#);
+    let ada_id = ada["id"].as_i64().unwrap();
+    let alan_id = alan["id"].as_i64().unwrap();
+    server.rpc("Blog/addPost", &format!(r#"{{"title":"Post 1","authorId":{ada_id}}}"#));
+    server.rpc("Blog/addPost", &format!(r#"{{"title":"Post 2","authorId":{ada_id}}}"#));
+    server.rpc("Blog/addPost", &format!(r#"{{"title":"Post 3","authorId":{alan_id}}}"#));
+
+    let joined = server.rpc("Blog/listWithAuthor", "{}");
+    let items = joined.as_array().unwrap();
+    assert_eq!(items.len(), 3, "tres posts con su autor: {joined}");
+    assert_eq!(items[0]["related"]["name"], "Ada");
+    assert_eq!(items[1]["related"]["name"], "Ada");
+    assert_eq!(items[2]["related"]["name"], "Alan");
+    assert_eq!(items[0]["row"]["title"], "Post 1");
+}

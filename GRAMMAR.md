@@ -8750,6 +8750,62 @@ test "onDelete: Cascade borra los posts dependientes junto con el autor" {
 
 **Verificado**: `compiler/tests/cli_ref_annotation.rs` (12 tests: ciclo CRUD completo con cascada vía `linkc test`, seis rechazos del checker/parser -- colección inexistente, tipo de campo incompatible con la PK destino, `Uuid` contra una PK `Int`, `SetNull` sin campo opcional, `@ref` repetido, `x?: T?`, `@ref` sobre una variante de enum --, el DDL estático de `linkc build` con la FK como segunda pasada idempotente, y tres tests de servidor real sobre SQLite -- insert con padre inexistente y delete bloqueado sin cascada, los dos 400 no 500, más `onDelete: SetNull` de verdad dejando `NULL`); `compiler/tests/pg_integration.rs` (`a_foreign_key_violation_is_a_400_not_a_500_against_real_postgres`, `on_delete_cascade_removes_dependent_rows_against_real_postgres_and_survives_a_restart` -- este último arranca el server DOS veces contra la misma base para probar que el `ALTER TABLE` idempotente no rompe un restart).
 
+### 3.250 `db.<c>.with(selector)`: carga eager de una relación `@ref` sin N+1 — RESUELTO, cierra PLAN.md §9.21 Fase 3 (ítem 10)
+
+Origen: `PLAN.md §9.21` Fase 3 ítem 10. Con `@ref` (§3.249) ya declarando la relación, seguía faltando cómo LEERLA sin el N+1 de siempre (`db.posts.all().map(|p| { row: p, author: db.authors.find(p.authorId) })`, una query por fila). **Decisión de diseño explícita del usuario** entre dos formas: un wrapper `{ row: T, related: R }` fijo (esta), o un composite aplanado `T & { <nombreVirtual>: R }` que hubiera necesitado retocar `@ref` con un nombre de relación nuevo (`as: ...`) y que el checker reconociera un campo virtual dentro del closure de `with`. Se eligió el wrapper por ser implementable con el riesgo más bajo -- reusa `Type::Struct { name: None, ... }` (la misma síntesis de struct anónimo que `.select()`, §3.248, ya probó en producción) sin tocar la anotación `@ref` ya shippeada.
+
+**Qué hay (v1.200.3)**:
+- **`db.<c>.with(selector)`**, selector con la forma EXACTA `|item: T| item.campo`, donde `campo` es un campo de `T` anotado con `@ref(...)` (§3.249) -- el mismo reconocimiento de forma que `sumBy`/`orderBy` ya usan (`ast::recognize_field_selector`), pero exigiendo que el campo tenga `@ref`, no cualquier campo. Cualquier otra forma (expresión derivada, campo sin `@ref`, más de un argumento) es error de COMPILACIÓN -- a diferencia de `findWhere`/`select`, `with` no tiene fallback interpretado: el closure nunca se ejecuta, solo nombra la relación.
+- **Tipo de retorno**: `List<{ row: T, related: R }>` si el campo `@ref` es requerido, `List<{ row: T, related: R? }>` si es opcional (`Int?`/`Uuid?`) -- `R` es el tipo de elemento de la colección destino de `@ref`. `related` es `null` para una fila cuyo campo `@ref` es `null` (nunca para una fila con FK no-null, gracias a la integridad que `@ref` ya garantiza).
+- **Sin N+1 de verdad**: dos consultas SQL sin importar cuántas filas haya -- una trae la colección base entera (igual que `.all()`), la otra trae TODAS las filas relacionadas de una sola vez con `WHERE "id" IN (...)` sobre los ids DISTINTOS del campo FK; el join final es en memoria, por id.
+- **Límite v1, documentado a propósito**: `with` es un método STANDALONE sobre `db.<c>` (mismo alcance que `.all()`) -- no se encadena con `.findWhere(...)`/`.orderBy(...)`/`.select(...)`, y solo carga UNA relación por llamada. Cargar una relación filtrada, ordenada, o más de una a la vez queda fuera de esta ronda.
+
+<!-- linkc:check -->
+```rust
+type Author = {
+  id: Int,
+  name: String,
+}
+
+type Post = {
+  id: Int,
+  title: String,
+  @ref(authors) authorId: Int,
+}
+
+db {
+  authors: Author[],
+  posts: Post[],
+}
+
+service Blog {
+  rpc addAuthor(name: String) -> Author {
+    db.authors.insert(Author { id: 0, name: name })
+  }
+
+  rpc addPost(title: String, authorId: Int) -> Post {
+    db.posts.insert(Post { id: 0, title: title, authorId: authorId })
+  }
+
+  rpc listWithAuthor() -> { row: Post, related: Author }[] {
+    db.posts.with(|p: Post| { p.authorId })
+  }
+}
+
+test "with carga la relacion sin N+1" {
+  let ada = Blog.addAuthor("Ada Lovelace");
+  Blog.addPost("Post 1", ada.id);
+  Blog.addPost("Post 2", ada.id);
+
+  let joined = Blog.listWithAuthor();
+  assert(joined.length() == 2, "dos posts con su autor");
+  assert(joined[0].row.title == "Post 1", "row es el Post real");
+  assert(joined[0].related.name == "Ada Lovelace", "related es el Author real");
+}
+```
+
+**Verificado**: `compiler/tests/cli_with_relation.rs` (8 tests: ciclo completo vía `linkc test`, `@ref` opcional con `related: null` cuando el FK es null, cuatro rechazos del checker -- campo sin `@ref`, selector con expresión derivada, campo inexistente, más de un argumento --, el contrato TypeScript emitiendo el wrapper inline `{ row: Post; related: Author }`, y un servidor real sobre SQLite confirmando la forma exacta sobre HTTP); `compiler/tests/pg_integration.rs` (`with_loads_the_related_row_without_n_plus_one_against_real_postgres`) validando el join en memoria contra PostgreSQL real con tres posts y dos autores.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
