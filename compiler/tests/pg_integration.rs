@@ -5339,3 +5339,128 @@ service Catalog {{
     assert_eq!(top_arr[1].get("title").unwrap().as_str(), Some("Keyboard"));
     assert_eq!(top_arr[2].get("title").unwrap().as_str(), Some("Mouse"));
 }
+
+/// `@ref(...)` (GRAMMAR.md §3.249, PLAN.md §9.21 Fase 3 ítem 9): las dos
+/// direcciones de violación de FK contra Postgres real -- un hijo que apunta
+/// a un padre inexistente (`insert`), y un padre que todavía tiene hijos
+/// apuntándolo sin `onDelete: Cascade`/`SetNull` (`delete`, default `NO
+/// ACTION`). Las dos tienen que ser 400, nunca el 500 que `describe_postgres_error`
+/// habría producido antes de agregar el brazo `FOREIGN_KEY_VIOLATION`
+/// (SQLSTATE 23503, `store.rs`).
+#[test]
+fn a_foreign_key_violation_is_a_400_not_a_500_against_real_postgres() {
+    const AUTHORS: &str = "pg_ref_authors";
+    const POSTS: &str = "pg_ref_posts";
+    let Ok(url) = std::env::var("LINK_TEST_PG_URL") else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, POSTS);
+    reset_schema(&url, AUTHORS);
+
+    let program = format!(
+        r#"
+type Author = {{ id: Int, name: String }}
+type NewAuthor = {{ name: String }}
+type Post = {{ id: Int, title: String, @ref({AUTHORS}) authorId: Int }}
+type NewPost = {{ title: String, authorId: Int }}
+db {{
+  {AUTHORS}: Author[],
+  {POSTS}: Post[],
+}}
+service Blog {{
+  rpc addAuthor(name: String) -> Author {{
+    db.{AUTHORS}.insert(NewAuthor {{ name: name }})
+  }}
+  rpc addPost(title: String, authorId: Int) -> Post {{
+    db.{POSTS}.insert(NewPost {{ title: title, authorId: authorId }})
+  }}
+  rpc removeAuthor(id: Int) -> Bool {{
+    db.{AUTHORS}.delete(id)
+  }}
+}}
+"#
+    );
+    let temp = TempDir::new("ref-fk-violation-pg");
+    let src = temp.write("app.link", &program);
+    let server = Serve::start(&src, &url);
+
+    let insert_err = server.try_rpc("Blog/addPost", r#"{"title":"orphan","authorId":999999}"#).expect_err("un authorId inexistente tiene que fallar");
+    assert!(insert_err.contains("400"), "tiene que ser 400, no 500: {insert_err}");
+    assert!(insert_err.contains("@ref"), "el mensaje tiene que mencionar @ref: {insert_err}");
+
+    let author = server.rpc("Blog/addAuthor", r#"{"name":"Ada"}"#);
+    let author_id = author["id"].as_i64().unwrap();
+    server.rpc("Blog/addPost", &format!(r#"{{"title":"real post","authorId":{author_id}}}"#));
+
+    let delete_err = server.try_rpc("Blog/removeAuthor", &format!(r#"{{"id":{author_id}}}"#)).expect_err("borrar un autor con posts dependientes tiene que fallar sin Cascade");
+    assert!(delete_err.contains("400"), "tiene que ser 400, no 500: {delete_err}");
+    assert!(delete_err.contains("@ref"), "el mensaje tiene que mencionar @ref: {delete_err}");
+}
+
+/// `onDelete: Cascade` (GRAMMAR.md §3.249) contra Postgres real, más una
+/// segunda conexión al mismo programa para probar que el `ALTER TABLE ADD
+/// CONSTRAINT` idempotente (`postgres_emit::create_foreign_key_statements`)
+/// no rompe un restart -- sin el bloque `DO $$ ... IF NOT EXISTS`, el
+/// segundo `Serve::start` fallaría con "constraint ... already exists".
+#[test]
+fn on_delete_cascade_removes_dependent_rows_against_real_postgres_and_survives_a_restart() {
+    const AUTHORS: &str = "pg_ref_cascade_authors";
+    const POSTS: &str = "pg_ref_cascade_posts";
+    let Ok(url) = std::env::var("LINK_TEST_PG_URL") else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, POSTS);
+    reset_schema(&url, AUTHORS);
+
+    let program = format!(
+        r#"
+type Author = {{ id: Int, name: String }}
+type NewAuthor = {{ name: String }}
+type Post = {{ id: Int, title: String, @ref({AUTHORS}, onDelete: Cascade) authorId: Int }}
+type NewPost = {{ title: String, authorId: Int }}
+db {{
+  {AUTHORS}: Author[],
+  {POSTS}: Post[],
+}}
+service Blog {{
+  rpc addAuthor(name: String) -> Author {{
+    db.{AUTHORS}.insert(NewAuthor {{ name: name }})
+  }}
+  rpc addPost(title: String, authorId: Int) -> Post {{
+    db.{POSTS}.insert(NewPost {{ title: title, authorId: authorId }})
+  }}
+  rpc listPosts() -> Post[] {{
+    db.{POSTS}.all()
+  }}
+  rpc removeAuthor(id: Int) -> Bool {{
+    db.{AUTHORS}.delete(id)
+  }}
+}}
+"#
+    );
+    let temp = TempDir::new("ref-cascade-pg");
+    let src = temp.write("app.link", &program);
+
+    {
+        let server = Serve::start(&src, &url);
+        let author = server.rpc("Blog/addAuthor", r#"{"name":"Ada"}"#);
+        let author_id = author["id"].as_i64().unwrap();
+        server.rpc("Blog/addPost", &format!(r#"{{"title":"x","authorId":{author_id}}}"#));
+        assert_eq!(server.rpc("Blog/listPosts", "{}").as_array().unwrap().len(), 1);
+
+        let removed = server.rpc("Blog/removeAuthor", &format!(r#"{{"id":{author_id}}}"#));
+        assert_eq!(removed.as_bool(), Some(true));
+        assert_eq!(server.rpc("Blog/listPosts", "{}").as_array().unwrap().len(), 0, "onDelete: Cascade borró el post dependiente");
+    }
+
+    // Segundo arranque: la tabla y el constraint ya existen -- el bloque `DO
+    // $$ ... IF NOT EXISTS` de la FK tiene que ser un no-op silencioso, no
+    // un error de arranque.
+    let server = Serve::start(&src, &url);
+    let author = server.rpc("Blog/addAuthor", r#"{"name":"Grace"}"#);
+    assert!(author["id"].as_i64().unwrap() > 0, "el server levanta de nuevo sin chocar con la FK ya creada");
+}

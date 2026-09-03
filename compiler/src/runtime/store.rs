@@ -283,6 +283,15 @@ impl SqlitePool {
     pub(crate) fn new(writer: rusqlite::Connection, path: Option<&std::path::Path>, max_readers: usize) -> Self {
         let _ = writer.pragma_update(None, "journal_mode", "WAL");
         let _ = writer.pragma_update(None, "synchronous", "NORMAL");
+        // GRAMMAR.md §3.249: SQLite trae la enforcement de `FOREIGN KEY`
+        // apagada por defecto, por CONEXIÓN -- sin este pragma, un `@ref(...)`
+        // se declararía en el DDL (`create_table_sql`) pero nunca se
+        // comprobaría de verdad contra SQLite. Solo el escritor lo necesita:
+        // todo INSERT/UPDATE/DELETE pasa por acá (`execute`/
+        // `insert_returning_id`/`with_exclusive`), nunca por las lectoras de
+        // `with_reader`. Sin `@ref` en el programa, esto es un no-op -- no
+        // hay ninguna columna con `REFERENCES` que el motor pueda comprobar.
+        let _ = writer.pragma_update(None, "foreign_keys", "ON");
 
         let db_path = path.and_then(|p| {
             let s = p.to_string_lossy();
@@ -552,6 +561,12 @@ fn describe_postgres_error(e: &postgres::Error) -> String {
                 format!("duplicate key value violates unique constraint -- {}", db_err.message())
             }
             postgres::error::SqlState::CHECK_VIOLATION => format!("violates check constraint -- {}", db_err.message()),
+            // GRAMMAR.md §3.249: mismo criterio que las dos de arriba --
+            // frase fija en inglés que `db::is_foreign_key_violation` busca,
+            // el mensaje real de Postgres (posiblemente localizado) al lado.
+            postgres::error::SqlState::FOREIGN_KEY_VIOLATION => {
+                format!("violates foreign key constraint -- {}", db_err.message())
+            }
             _ => db_err.message().to_string(),
         },
         // Un error del CLIENTE (ej. "error serializing parameter 3") lleva

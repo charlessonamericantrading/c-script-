@@ -8688,6 +8688,68 @@ test "proyecciones parciales select funcionan correctamente" {
 
 **Verificado**: `compiler/tests/cli_select_projection.rs` cubriendo: proyección escalar, proyección a struct DTO y anónimo, alias `@column`, `@softDelete`, ordenamiento con `orderByDesc`, renombramiento de claves destino y fallback interpretado en memoria para expresiones calculadas; y `compiler/tests/pg_integration.rs` (`select_pushes_partial_projection_to_real_postgres`) validando ejecución sobre PostgreSQL real con servidor HTTP.
 
+### 3.249 `@ref(Coleccion, onDelete: Cascade|Restrict|SetNull)`: foreign keys declarativas — RESUELTO, cierra PLAN.md §9.21 Fase 3 (ítem 9)
+
+Origen: `PLAN.md §9.21` Fase 3 ítem 9, y antes `PLAN.md §9.18` Eje A ítem 2. Hasta esta versión una relación entre dos colecciones era un escalar `Int`/`Uuid` suelto sin ninguna garantía a nivel de base: nada impedía insertar un `authorId` que no existiera, y borrar un `Author` con `Post` dependientes dejaba filas huérfanas en silencio. El "join" se modelaba a mano como un `find` dentro de un `map` (N+1 por construcción, §3.66 documentaba esto como límite honesto).
+
+**Qué hay (v1.200.2)**:
+- **`@ref(coleccion)`** sobre un campo `Int`/`Uuid` (o su forma `?` opcional): el checker exige que `coleccion` sea una colección real de `db { }` y que el tipo del campo coincida exactamente con el tipo de la PK de esa colección (mismo criterio que `@requires(..., ownerOf: ..., id: ..., field: ...)` ya usa para lo mismo). `Coleccion` es el NOMBRE DE LA COLECCIÓN (la clave dentro de `db { }`), no el nombre del `type`.
+- **`onDelete: Cascade`** — borrar la fila padre borra en cascada toda fila que la referencia. **`onDelete: Restrict`** — el motor rechaza el borrado si hay filas dependientes (redundante con el default, documentado para quien prefiere que la intención quede explícita en el `.link`). **`onDelete: SetNull`** — la columna del hijo pasa a `NULL`; el checker exige que el campo sea opcional (`Int?`/`Uuid?`). Sin `onDelete`, el DDL no lleva cláusula `ON DELETE` — el `NO ACTION` estándar de SQL, que bloquea el borrado exactamente igual que `Restrict`.
+- **DDL emitido**: en SQLite, `REFERENCES "tabla"("id") [ON DELETE ...]` inline en la definición de columna (SQLite no valida que la tabla destino exista al crear, así que el orden de creación de colecciones no importa). En PostgreSQL, una sentencia `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...` aparte, después de que TODAS las tablas ya existen (Postgres sí exige que la tabla destino exista), envuelta en un bloque `DO $$ ... IF NOT EXISTS (SELECT 1 FROM pg_constraint ...) ... $$` para ser idempotente en cada arranque -- Postgres no soporta `ADD CONSTRAINT IF NOT EXISTS`.
+- **`PRAGMA foreign_keys = ON`** ahora se activa en la conexión escritora de SQLite (antes apagado, el default del motor) -- sin programas que usen `@ref`, esto es un no-op: no hay ninguna columna con `REFERENCES` que comprobar.
+- **Error limpio, no 500**: un `insert`/`applyPatch` que apunta a un id que no existe en la colección destino, o un `delete` bloqueado porque todavía hay filas dependientes (sin `Cascade`/`SetNull`), devuelven `400` con un mensaje que menciona `@ref` -- nunca el 500 crudo del motor (`FOREIGN KEY constraint failed`/`violates foreign key constraint`, mismo criterio de reconocimiento por texto fijo que `@unique`/`@check` ya usan, §3.80/§3.96).
+- **Límite documentado**: sobre una tabla SQLite YA EXISTENTE (creada antes de agregar `@ref` al programa), la FK no se agrega retroactivamente -- SQLite no soporta `ALTER TABLE ADD CONSTRAINT`. Sobre PostgreSQL sí se agrega (el `ALTER TABLE` corre en cada arranque). Mismo límite que ya tenían `@check`/columnas requeridas nuevas del lado SQLite.
+
+<!-- linkc:check -->
+```rust
+type Author = {
+  id: Int,
+  name: String,
+}
+
+type Post = {
+  id: Int,
+  title: String,
+  @ref(authors, onDelete: Cascade) authorId: Int,
+}
+
+db {
+  authors: Author[],
+  posts: Post[],
+}
+
+service Blog {
+  rpc addAuthor(name: String) -> Author {
+    db.authors.insert(Author { id: 0, name: name })
+  }
+
+  rpc addPost(title: String, authorId: Int) -> Post {
+    db.posts.insert(Post { id: 0, title: title, authorId: authorId })
+  }
+
+  rpc listPosts() -> Post[] {
+    db.posts.all()
+  }
+
+  rpc removeAuthor(id: Int) -> Bool {
+    db.authors.delete(id)
+  }
+}
+
+test "onDelete: Cascade borra los posts dependientes junto con el autor" {
+  let author = Blog.addAuthor("Ada Lovelace");
+  let post = Blog.addPost("Notes on the Analytical Engine", author.id);
+  assert(post.authorId == author.id, "el post referencia el id real del autor");
+  assert(Blog.listPosts().length() == 1, "un post antes de borrar al autor");
+
+  let removed = Blog.removeAuthor(author.id);
+  assert(removed, "autor borrado");
+  assert(Blog.listPosts().length() == 0, "el post dependiente se borró en cascada");
+}
+```
+
+**Verificado**: `compiler/tests/cli_ref_annotation.rs` (12 tests: ciclo CRUD completo con cascada vía `linkc test`, seis rechazos del checker/parser -- colección inexistente, tipo de campo incompatible con la PK destino, `Uuid` contra una PK `Int`, `SetNull` sin campo opcional, `@ref` repetido, `x?: T?`, `@ref` sobre una variante de enum --, el DDL estático de `linkc build` con la FK como segunda pasada idempotente, y tres tests de servidor real sobre SQLite -- insert con padre inexistente y delete bloqueado sin cascada, los dos 400 no 500, más `onDelete: SetNull` de verdad dejando `NULL`); `compiler/tests/pg_integration.rs` (`a_foreign_key_violation_is_a_400_not_a_500_against_real_postgres`, `on_delete_cascade_removes_dependent_rows_against_real_postgres_and_survives_a_restart` -- este último arranca el server DOS veces contra la misma base para probar que el `ALTER TABLE` idempotente no rompe un restart).
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

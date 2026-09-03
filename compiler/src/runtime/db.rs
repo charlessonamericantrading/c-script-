@@ -10,7 +10,7 @@
 // de la misma fuente de verdad, cero duplicación manual).
 
 use super::{as_int, encryption, generate_uuid_v4, json_to_typed_value, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
-use crate::ast::{BinaryOp, FieldCheck, Item, Program, TimeGranularity, TypeAnnotation, TypeExpr};
+use crate::ast::{BinaryOp, FieldCheck, Item, OnDelete, Program, TimeGranularity, TypeAnnotation, TypeExpr};
 use crate::checker::Checker;
 use crate::rate_limit::RateLimitSpec;
 use crate::types::{FieldType, Type};
@@ -320,6 +320,52 @@ pub(crate) fn index_fields_by_collection(program: &Program, checker: &Checker) -
                 .collect();
             if !indexed.is_empty() {
                 result.insert(coll_name.clone(), indexed);
+            }
+        }
+    }
+    result
+}
+
+/// Una `@ref(...)` ya resuelta contra su colección destino (GRAMMAR.md
+/// §3.249): el nombre físico de la tabla destino y de su columna PK (usa el
+/// alias `@column` de esa PK si existe, igual que `id_col` en cualquier otro
+/// lugar de este archivo) más la acción `ON DELETE`, si se declaró.
+#[derive(Clone)]
+pub(crate) struct FkRef {
+    pub(crate) target_table: String,
+    pub(crate) target_id_col: String,
+    pub(crate) on_delete: Option<OnDelete>,
+}
+
+/// Nombre de colección -> mapa de `{ columna_sql -> FkRef }` para cada campo
+/// con `@ref(...)` de su tipo de elemento (GRAMMAR.md §3.249) -- mismo cruce
+/// `checker.db_collections()` + `program.items` que `index_fields_by_collection`,
+/// más una resolución EXTRA cruzando `aliases_by_collection` para encontrar
+/// el nombre físico real de la PK de la colección DESTINO (que puede tener
+/// su propio `@column("id", ...)`).
+pub(crate) fn ref_fields_by_collection(
+    program: &Program,
+    checker: &Checker,
+    aliases_by_collection: &HashMap<String, HashMap<String, String>>,
+) -> HashMap<String, HashMap<String, FkRef>> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let TypeExpr::Struct(fields) = &t.ty else { continue };
+            let mut refs = HashMap::new();
+            for f in fields {
+                let Some((target, on_delete)) = f.ref_target() else { continue };
+                let sql_col = f.column_name().unwrap_or(&f.name).to_string();
+                let target_id_col = aliases_by_collection.get(target).and_then(|m| m.get("id")).cloned().unwrap_or_else(|| "id".to_string());
+                refs.insert(sql_col, FkRef { target_table: target.to_string(), target_id_col, on_delete });
+            }
+            if !refs.is_empty() {
+                result.insert(coll_name.clone(), refs);
             }
         }
     }
@@ -650,16 +696,32 @@ fn is_check_violation(msg: &str) -> bool {
     msg.contains("CHECK constraint failed") || msg.contains("violates check constraint")
 }
 
-/// Envuelve el error de una escritura fallida (`insert`/`applyPatch`) --
-/// `RuntimeError::bad_request` (400) si es una violación de `@unique` (ver
-/// `is_unique_violation`) o de `@check` (ver `is_check_violation`),
-/// `RuntimeError::new` (500) para cualquier otra falla de SQL genuina
-/// (columna inexistente, base caída, etc.).
+/// ¿Es este el texto con el que SQLite o Postgres reportan una violación de
+/// `FOREIGN KEY`/`@ref` (GRAMMAR.md §3.249)? Mismo criterio que
+/// `is_unique_violation`/`is_check_violation` -- cubre las dos direcciones:
+/// un `insert`/`applyPatch` que apunta a un id que no existe en la colección
+/// destino, y un `delete` sobre una fila que todavía tiene hijos apuntándola
+/// (sin `onDelete: Cascade`/`SetNull`, el default `NO ACTION` bloquea el
+/// borrado).
+fn is_foreign_key_violation(msg: &str) -> bool {
+    msg.contains("FOREIGN KEY constraint failed") || msg.contains("violates foreign key constraint")
+}
+
+/// Envuelve el error de una escritura fallida (`insert`/`applyPatch`/
+/// `delete`) -- `RuntimeError::bad_request` (400) si es una violación de
+/// `@unique` (ver `is_unique_violation`), `@check` (ver `is_check_violation`)
+/// o `@ref` (ver `is_foreign_key_violation`), `RuntimeError::new` (500) para
+/// cualquier otra falla de SQL genuina (columna inexistente, base caída,
+/// etc.).
 fn write_error(action: &str, e: String) -> RuntimeError {
     if is_unique_violation(&e) {
         RuntimeError::bad_request(format!("ya existe una fila con ese valor único (@unique, GRAMMAR.md §3.80) -- {e}"))
     } else if is_check_violation(&e) {
         RuntimeError::bad_request(format!("un valor no cumple una restricción @check (GRAMMAR.md §3.96) -- {e}"))
+    } else if is_foreign_key_violation(&e) {
+        RuntimeError::bad_request(format!(
+            "una operación viola una relación @ref (GRAMMAR.md §3.249) -- el id referenciado no existe, o hay filas que todavía dependen de esta -- {e}"
+        ))
     } else {
         RuntimeError::new(format!("{action} falló: {e}"))
     }
@@ -693,6 +755,7 @@ fn create_table_sql(
     columns: &[ColumnPlan],
     checks: &[(String, FieldCheck)],
     type_checks: &[String],
+    refs: &HashMap<String, FkRef>,
 ) -> String {
     // GRAMMAR.md §3.177: una PK `Uuid` se genera del lado de la
     // aplicación (`crypto.uuid()`, `Db::call` "insert") ANTES de cada
@@ -718,7 +781,21 @@ fn create_table_sql(
             Some((_, c)) => format!(" {}", check_clause_sql(&col.sql_name, c)),
             None => String::new(),
         };
-        defs.push(format!("\"{}\" {}{}{}", col.sql_name, col.sql_type, not_null, check_clause));
+        // `@ref(...)` (GRAMMAR.md §3.249) -- SQLite, a diferencia de
+        // PostgreSQL, no valida que la tabla destino ya exista al parsear
+        // `REFERENCES` (la enforcement es diferida, recién al escribir), así
+        // que declarar la FK INLINE acá es seguro sin importar en qué orden
+        // este archivo cree las colecciones -- a diferencia del lado
+        // Postgres, que necesita una segunda pasada (ver
+        // `codegen::postgres_emit::create_foreign_key_statements`).
+        let ref_clause = match refs.get(&col.sql_name) {
+            Some(r) => {
+                let on_delete = r.on_delete.map(|a| format!(" ON DELETE {}", a.sql())).unwrap_or_default();
+                format!(" REFERENCES \"{}\"(\"{}\"){on_delete}", r.target_table, r.target_id_col)
+            }
+            None => String::new(),
+        };
+        defs.push(format!("\"{}\" {}{}{}{}", col.sql_name, col.sql_type, not_null, check_clause, ref_clause));
     }
     // `@check(<expr>)` de nivel `type` (GRAMMAR.md §3.173) -- constraint de
     // TABLA, no de columna (a diferencia del loop de arriba), mismo lugar
@@ -1699,6 +1776,8 @@ impl Db {
         let checks_by_collection = check_fields_by_collection(program, &checker);
         let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
         let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
+        let refs_by_collection = ref_fields_by_collection(program, &checker, &aliases_by_collection);
+        let empty_refs: HashMap<String, FkRef> = HashMap::new();
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let empty_type_checks: Vec<String> = Vec::new();
         let empty_encrypted: HashSet<String> = HashSet::new();
@@ -1733,8 +1812,9 @@ impl Db {
             } else {
                 let checks = checks_by_collection.get(name).unwrap_or(&empty_checks);
                 let type_checks = type_checks_by_collection_map.get(name).unwrap_or(&empty_type_checks);
+                let refs = refs_by_collection.get(name).unwrap_or(&empty_refs);
                 connection
-                    .execute(&create_table_sql(name, id_col, id_kind, &cols, checks, type_checks), [])
+                    .execute(&create_table_sql(name, id_col, id_kind, &cols, checks, type_checks, refs), [])
                     .unwrap_or_else(|e| panic!("no se pudo crear la tabla '{name}' en '{db_path_display}': {e}"));
                 check_schema_matches(&connection, name, id_col, id_kind, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             }
@@ -1950,6 +2030,19 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                     backend
                         .execute_ddl(&stmt)
                         .map_err(|e| format!("no se pudo crear un constraint UNIQUE compuesto sobre '{name}': {e}"))?;
+                }
+            }
+            // GRAMMAR.md §3.249: TERCERA pasada, después de que todas las
+            // tablas y sus columnas ya existen -- ver el comentario de
+            // `codegen::postgres_emit::create_foreign_key_statements` para
+            // el porqué de la segunda pasada (Postgres exige que la tabla
+            // destino ya exista al crear el constraint, a diferencia de
+            // SQLite) y de por qué cada sentencia es idempotente por sí
+            // misma (sin eso, un restart con la tabla y el constraint ya
+            // creados fallaría).
+            for (name, refs) in ref_fields_by_collection(program, &checker, &aliases_by_collection) {
+                for stmt in crate::codegen::postgres_emit::create_foreign_key_statements(&name, &refs) {
+                    backend.execute_ddl(&stmt).map_err(|e| format!("no se pudo crear una foreign key sobre '{name}': {e}"))?;
                 }
             }
         }
@@ -2635,15 +2728,11 @@ db { users: User[] }
                             self.backend.placeholder(1),
                             self.backend.placeholder(2)
                         );
-                        self.backend
-                            .execute(&sql, &[Cell::Int(now_ms), id_cell])
-                            .map_err(|e| RuntimeError::new(format!("delete (soft) falló: {e}")))?
+                        self.backend.execute(&sql, &[Cell::Int(now_ms), id_cell]).map_err(|e| write_error("delete (soft)", e))?
                     }
                     None => {
                         let sql = format!("DELETE FROM \"{collection}\" WHERE \"{id_col}\" = {}", self.backend.placeholder(1));
-                        self.backend
-                            .execute(&sql, &[id_cell])
-                            .map_err(|e| RuntimeError::new(format!("delete falló: {e}")))?
+                        self.backend.execute(&sql, &[id_cell]).map_err(|e| write_error("delete", e))?
                     }
                 };
                 if rows_affected > 0 {

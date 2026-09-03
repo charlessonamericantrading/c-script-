@@ -1310,7 +1310,8 @@ impl Checker {
                                 .chain(checker.check_field_encrypted(fields, &t.type_params))
                                 .chain(checker.check_field_hidden(fields))
                                 .chain(checker.check_field_checks(fields, &t.type_params))
-                                .chain(checker.check_field_columns(fields, &t.name)),
+                                .chain(checker.check_field_columns(fields, &t.name))
+                                .chain(checker.check_field_refs(fields, &t.type_params, &t.name)),
                         );
                     }
                     for e in item_errors {
@@ -1333,6 +1334,7 @@ impl Checker {
                                 .chain(checker.check_field_encrypted(fields, &en.type_params))
                                 .chain(checker.check_field_checks(fields, &en.type_params))
                                 .chain(checker.check_field_columns_enum(fields))
+                                .chain(checker.check_field_refs_enum(fields))
                             {
                                 let mut e = e;
                                 if let Some(file) = file_for(index) {
@@ -2682,6 +2684,92 @@ impl Checker {
             .filter_map(|f| {
                 if f.column_name().is_some() {
                     Some(err(format!("'@column' en el campo '{}': las variantes de enum se guardan como JSON, no son columnas SQL individuales", f.name)).with_span(f.name_span))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// `@ref(Coleccion, onDelete: ...)` (GRAMMAR.md §3.249 / PLAN.md §9.21
+    /// Fase 3 ítem 9): tres validaciones, mismo criterio que
+    /// `check_requires_ownership_clause` (la colección existe, el tipo del
+    /// campo coincide con la PK destino vía `db_id_type`) más una propia de
+    /// `@ref` (`onDelete: SetNull` exige que el campo sea opcional -- si no,
+    /// el propio `DELETE` en la base fallaría al intentar poner `NULL` en
+    /// una columna `NOT NULL`, mejor rechazarlo acá que en producción).
+    fn check_field_refs(&self, fields: &[Field], type_params: &[String], struct_name: &str) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        for f in fields {
+            let Some((target, on_delete)) = f.ref_target() else { continue };
+            let Some(target_ty) = self.db_collections().get(target) else {
+                errors.push(
+                    err(format!(
+                        "'@ref({target})' en el campo '{}' de '{struct_name}': '{target}' no es una colección declarada en 'db'",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+                continue;
+            };
+            let id_ty = Self::db_id_type(target_ty);
+            let ty = if type_params.is_empty() { self.resolve_type(&f.ty) } else { self.resolve_type_abstract(&f.ty, type_params) };
+            let ty = match ty {
+                Ok(ty) => ty,
+                Err(e) => {
+                    errors.push(e.with_span(f.name_span));
+                    continue;
+                }
+            };
+            // `x?: T?` (opcional-por-clave Y nullable-por-tipo, GRAMMAR.md
+            // §3.4) fuerza el envoltorio JSON en `ColumnPlan::for_field`
+            // así T sea `Int`/`Uuid` -- mismo motivo que `@encrypted`
+            // rechaza la misma combinación: una columna JSON no puede
+            // llevar un `REFERENCES` real.
+            if f.optional && matches!(f.ty, TypeExpr::Optional(_)) {
+                errors.push(
+                    err(format!(
+                        "'@ref({target})' en el campo '{}': no se puede combinar con 'x?: T?' (opcional por clave Y nullable a la vez) -- fuerza el envoltorio JSON internamente, incompatible con una columna SQL nativa con REFERENCES. Usá 'x: {id_ty}?' (nullable, requerido por clave) en su lugar",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+                continue;
+            }
+            let (base_ty, is_optional) = match &ty {
+                Type::Optional(inner) => ((**inner).clone(), true),
+                other => (other.clone(), f.optional),
+            };
+            if base_ty != id_ty {
+                errors.push(
+                    err(format!(
+                        "'@ref({target})' en el campo '{}': tiene que ser {id_ty} (la PK de '{target}'), es {base_ty}",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+                continue;
+            }
+            if on_delete == Some(OnDelete::SetNull) && !is_optional {
+                errors.push(
+                    err(format!(
+                        "'@ref({target}, onDelete: SetNull)' en el campo '{}': el campo tiene que ser opcional ('{id_ty}?') -- 'SetNull' necesita poder escribir NULL en esta columna cuando se borra la fila referenciada",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+            }
+        }
+        errors
+    }
+
+    /// `@ref` solo tiene sentido en structs que representen tablas SQL, nunca en variantes de enum.
+    fn check_field_refs_enum(&self, fields: &[Field]) -> Vec<CheckError> {
+        fields
+            .iter()
+            .filter_map(|f| {
+                if f.ref_target().is_some() {
+                    Some(err(format!("'@ref' en el campo '{}': las variantes de enum se guardan como JSON, no son columnas SQL individuales", f.name)).with_span(f.name_span))
                 } else {
                     None
                 }

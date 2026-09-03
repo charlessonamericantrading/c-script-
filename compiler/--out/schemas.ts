@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.200.2 — no editar a mano.
+// Generado automáticamente por linkc v1.200.1 — no editar a mano.
 
 import { z } from "zod";
 
@@ -36,40 +36,16 @@ export const AiTokenSchema = z.object({
 });
 export type AiToken = z.infer<typeof AiTokenSchema>;
 
-export const RoleSchema = z.enum(["Admin", "Member", "Guest"]);
-export type Role = z.infer<typeof RoleSchema>;
+export const AuthorSchema = z.object({
+  id: z.number().int(),
+  name: z.string(),
+});
+export type Author = z.infer<typeof AuthorSchema>;
 
-export const PrioritySchema = z.enum(["High", "Medium", "Low"]);
-export type Priority = z.infer<typeof PrioritySchema>;
-
-export const ColumnIdSchema = z.enum(["Todo", "InProgress", "Done"]);
-export type ColumnId = z.infer<typeof ColumnIdSchema>;
-
-export const TaskSchema = z.object({
+export const PostSchema = z.object({
   id: z.number().int(),
   title: z.string(),
-  description: z.string().nullable(),
-  priority: PrioritySchema,
-  column: ColumnIdSchema,
-  assigneeEmail: z.string().nullable(),
-  createdAt: z.string().datetime(),
+  authorId: z.number().int(),
 });
-export type Task = z.infer<typeof TaskSchema>;
-
-export const NewTaskSchema = z.object({
-  title: z.string(),
-  description: z.string().nullable(),
-  priority: PrioritySchema,
-  column: ColumnIdSchema,
-  assigneeEmail: z.string().nullable(),
-});
-export type NewTask = z.infer<typeof NewTaskSchema>;
-
-export const BoardStatsSchema = z.object({
-  total: z.number().int(),
-  todoCount: z.number().int(),
-  inProgressCount: z.number().int(),
-  doneCount: z.number().int(),
-});
-export type BoardStats = z.infer<typeof BoardStatsSchema>;
+export type Post = z.infer<typeof PostSchema>;
 

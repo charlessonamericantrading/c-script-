@@ -701,9 +701,48 @@ impl Parser {
                     }
                     annotations.push(FieldAnnotation::Column(col_name));
                 }
+                // `@ref(Coleccion)` o `@ref(Coleccion, onDelete: Cascade|Restrict|SetNull)`
+                // (GRAMMAR.md §3.249 / PLAN.md §9.21 Fase 3 ítem 9) -- mismo
+                // loop de coma con clave fija que `@example(request: ...)`,
+                // pero con una sola clave posible (`onDelete`) en vez de dos.
+                // `Coleccion` es un identificador suelto (nombre de tipo),
+                // mismo criterio que `collection` en la cláusula `ownerOf:`
+                // de `@requires` -- nunca un string ni `Enum.Variante`.
+                "ref" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::Ref(..))) {
+                        return Err(self.error("'@ref' repetido sobre el mismo campo: un campo tiene a lo sumo una referencia".to_string()));
+                    }
+                    self.eat(&TokenKind::LParen)?;
+                    let target = self.eat_ident()?;
+                    let on_delete = if self.check(&TokenKind::Comma) {
+                        self.advance();
+                        let kw = self.eat_ident()?;
+                        if kw != "onDelete" {
+                            return Err(self.error(format!(
+                                "'@ref({target}, ...)' solo acepta 'onDelete: Cascade|Restrict|SetNull' como argumento extra, no '{kw}'"
+                            )));
+                        }
+                        self.eat(&TokenKind::Colon)?;
+                        let action = self.eat_ident()?;
+                        Some(match action.as_str() {
+                            "Cascade" => OnDelete::Cascade,
+                            "Restrict" => OnDelete::Restrict,
+                            "SetNull" => OnDelete::SetNull,
+                            other => {
+                                return Err(self.error(format!(
+                                    "'@ref({target}, onDelete: {other})' desconocido -- se esperaba 'Cascade', 'Restrict' o 'SetNull'"
+                                )))
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    self.eat(&TokenKind::RParen)?;
+                    annotations.push(FieldAnnotation::Ref(target, on_delete));
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)', '@encrypted', '@hidden' o '@column(\"nombre\")')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)', '@encrypted', '@hidden', '@column(\"nombre\")' o '@ref(Coleccion)')"
                     )))
                 }
             }

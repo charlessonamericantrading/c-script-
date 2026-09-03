@@ -193,7 +193,54 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
         }
     }
 
+    // `@ref(...)` (GRAMMAR.md §3.249) -- SEGUNDA pasada, después de que
+    // TODAS las tablas ya existen: a diferencia de `CREATE TABLE`, Postgres
+    // sí valida que la tabla de un `REFERENCES` exista al momento de crear
+    // el constraint, y `checker.db_collections()` es un `HashMap` sin orden
+    // garantizado -- declarar la FK inline en `create_postgres_table_sql`
+    // rompería para cualquier colección que se cree ANTES que su destino.
+    // `ALTER TABLE ... ADD CONSTRAINT` después de que todo existe evita
+    // necesitar un orden topológico.
+    let aliases_by_collection = crate::runtime::db::column_aliases_by_collection(program, &checker);
+    for (coll_name, refs) in crate::runtime::db::ref_fields_by_collection(program, &checker, &aliases_by_collection) {
+        for stmt in create_foreign_key_statements(&coll_name, &refs) {
+            statements.push(stmt);
+        }
+    }
+
     Ok(statements.join("\n\n"))
+}
+
+/// `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY ...` idempotente para
+/// cada `@ref` de una colección (GRAMMAR.md §3.249). PostgreSQL, a
+/// diferencia de un índice, no soporta `ADD CONSTRAINT IF NOT EXISTS` (ni en
+/// la versión más reciente, PG 17) -- cada sentencia se envuelve en un
+/// bloque `DO $$ ... $$` que primero consulta `pg_constraint` por nombre,
+/// mismo resultado práctico que `CREATE INDEX IF NOT EXISTS` logra gratis
+/// para `@index`/`@unique`, expresado a mano porque acá el lenguaje no
+/// ofrece el atajo. Sin esto, el SEGUNDO arranque del server (la tabla ya
+/// existe, el constraint también) fallaría con "constraint ... already
+/// exists" -- rompería cualquier reinicio, no solo el primero. `fk_name`
+/// (`fk_<coleccion>_<columna>`) es inyectivo por construcción: el parser ya
+/// garantiza a lo sumo un `@ref` por campo, así que el par
+/// (colección, columna) nunca se repite -- a diferencia del nombre de un
+/// índice COMPUESTO (`composite_index_name`), acá no hace falta la
+/// codificación con hash.
+pub(crate) fn create_foreign_key_statements(collection: &str, refs: &HashMap<String, crate::runtime::db::FkRef>) -> Vec<String> {
+    let mut names: Vec<&String> = refs.keys().collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|sql_col| {
+            let r = &refs[sql_col];
+            let fk_name = format!("fk_{collection}_{sql_col}");
+            let on_delete = r.on_delete.map(|a| format!(" ON DELETE {}", a.sql())).unwrap_or_default();
+            format!(
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '{fk_name}') THEN ALTER TABLE \"{collection}\" ADD CONSTRAINT \"{fk_name}\" FOREIGN KEY (\"{sql_col}\") REFERENCES \"{}\"(\"{}\"){on_delete}; END IF; END $$;",
+                r.target_table, r.target_id_col
+            )
+        })
+        .collect()
 }
 
 /// Genera una sentencia `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` para auto-migración no destructiva en PostgreSQL.

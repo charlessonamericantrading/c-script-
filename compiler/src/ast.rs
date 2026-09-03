@@ -365,6 +365,16 @@ impl Field {
             _ => None,
         })
     }
+
+    /// `(colección destino, acción ON DELETE)` de un `@ref(...)`, si hay
+    /// (GRAMMAR.md §3.249). `on_delete` es `None` cuando la anotación no
+    /// declara `onDelete:` -- sin cláusula `ON DELETE` en el DDL.
+    pub fn ref_target(&self) -> Option<(&str, Option<OnDelete>)> {
+        self.annotations.iter().find_map(|a| match a {
+            FieldAnnotation::Ref(target, on_delete) => Some((target.as_str(), *on_delete)),
+            _ => None,
+        })
+    }
 }
 
 impl PartialEq for Field {
@@ -426,6 +436,35 @@ pub enum FieldAnnotation {
     /// nombre declarado en `.link` (`camelCase`), mientras que las consultas SQL
     /// usan el nombre físico (`snake_case`).
     Column(String),
+    /// `@ref(Coleccion)` o `@ref(Coleccion, onDelete: Cascade|Restrict|SetNull)`
+    /// -- clave foránea declarativa (GRAMMAR.md §3.249 / PLAN.md §9.21 Fase 3
+    /// ítem 9). Solo sobre un campo `Int`/`Uuid` (o su forma opcional) cuyo
+    /// tipo coincide con la PK de `Coleccion` -- el checker lo exige
+    /// (`Checker::check_field_refs`). Sin `onDelete`, el DDL no agrega
+    /// cláusula `ON DELETE` (comportamiento `NO ACTION` estándar de SQL).
+    Ref(String, Option<OnDelete>),
+}
+
+/// Acción de `ON DELETE` para un `@ref(...)` (GRAMMAR.md §3.249). Vocabulario
+/// cerrado del compilador -- se parsea como identificador suelto
+/// (`self.eat_ident()?` en `parse_field_annotations`), no como
+/// `Enum.Variante`: no hay ningún enum de usuario que representar acá.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnDelete {
+    Cascade,
+    Restrict,
+    SetNull,
+}
+
+impl OnDelete {
+    /// La palabra clave SQL exacta -- misma para PostgreSQL y SQLite.
+    pub fn sql(self) -> &'static str {
+        match self {
+            OnDelete::Cascade => "CASCADE",
+            OnDelete::Restrict => "RESTRICT",
+            OnDelete::SetNull => "SET NULL",
+        }
+    }
 }
 
 /// Las tres formas de `@check(...)` (GRAMMAR.md §3.96) -- mismo criterio de

@@ -1,0 +1,18 @@
+# C:/Users/repre/AppData/Local/Temp/claude/C--Users-repre-Desktop-c-script/466753d3-64bf-42ae-af8d-cc1fca3fa75f/scratchpad/ref_smoke.link
+
+> API generada automáticamente por Link (c-script). Versión expandida de llms.txt (convención llms-full.txt de llmstxt.org): cada rpc con su firma completa, su docstring `///` entero y su `@example`, si lo declaró.
+
+## Blog
+
+### rpc createAuthor(name: String) -> Author
+
+/Blog/createAuthor
+
+### rpc createPost(title: String, authorId: Int) -> Post
+
+/Blog/createPost
+
+### rpc deleteAuthor(id: Int) -> Bool
+
+/Blog/deleteAuthor
+

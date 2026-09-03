@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.200.2] - 2026-09-03
+
+### ✨ Añadido
+**`@ref(Coleccion, onDelete: Cascade|Restrict|SetNull)` -- foreign keys declarativas (PLAN.md §9.21 Fase 3 ítem 9)**: sobre un campo `Int`/`Uuid` (o su forma `?`), validado por el checker contra el tipo de la PK de la colección destino (mismo criterio que `@requires(..., ownerOf: ...)`). `onDelete: Cascade` borra en cascada, `SetNull` pone `NULL` (exige campo opcional), sin `onDelete` el default `NO ACTION` bloquea el borrado igual que `Restrict`. DDL: `REFERENCES` inline en SQLite (`PRAGMA foreign_keys = ON` activado en la conexión escritora) y `ALTER TABLE ADD CONSTRAINT` idempotente (`DO $$ ... IF NOT EXISTS`) como segunda pasada en PostgreSQL, después de que todas las tablas existen. `insert`/`applyPatch`/`delete` devuelven `400` ante una violación, nunca el 500 crudo del motor. Ver GRAMMAR.md §3.249.
+
 ## [1.200.1] - 2026-09-03
 
 ### 🔧 Proceso
