@@ -60,6 +60,10 @@ pub(crate) struct ColumnPlan {
     /// `write_param`/`decode_row` son los únicos dos puntos que miran este
     /// campo, para cifrar al escribir/descifrar al leer.
     pub(crate) encrypted: bool,
+    /// Nombre físico de la columna en la base de datos SQL (GRAMMAR.md §3.242 /
+    /// PLAN.md §9.21), si se sobreescribió con `@column("...")`. Si no, coincide
+    /// con `field.name`.
+    pub(crate) sql_name: String,
 }
 
 impl ColumnPlan {
@@ -75,16 +79,27 @@ impl ColumnPlan {
     /// `program.items`/`checker.db_collections()` que `soft_delete_fields_by_collection`
     /// ya usa) -- `FieldType` es estructural, sin anotaciones, así que el
     /// caller es quien la resuelve, no `for_field`.
-    pub(crate) fn for_field(field: FieldType, simple_enums: &HashSet<String>, encrypted: bool) -> Self {
+    pub(crate) fn for_field(
+        field: FieldType,
+        simple_enums: &HashSet<String>,
+        encrypted: bool,
+        sql_name: Option<String>,
+    ) -> Self {
+        let effective_sql_name = sql_name.unwrap_or_else(|| field.name.clone());
         let double_optional = field.optional && matches!(field.ty, Type::Optional(_));
         let effective_ty: &Type = match &field.ty {
             Type::Optional(inner) => inner.as_ref(),
             other => other,
         };
         match if double_optional { None } else { native_sql_type(effective_ty, simple_enums) } {
-            Some(sql_type) => ColumnPlan { field, sql_type, json: false, encrypted },
-            None => ColumnPlan { field, sql_type: "TEXT", json: true, encrypted },
+            Some(sql_type) => ColumnPlan { field, sql_name: effective_sql_name, sql_type, json: false, encrypted },
+            None => ColumnPlan { field, sql_name: effective_sql_name, sql_type: "TEXT", json: true, encrypted },
         }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn sql_name(&self) -> &str {
+        &self.sql_name
     }
 
     fn not_null(&self) -> bool {
@@ -253,11 +268,37 @@ pub(crate) fn encrypted_fields_by_collection(program: &Program, checker: &Checke
     result
 }
 
-/// Nombre de colección -> lista de `(campo, unique)` para cada campo con
+/// Nombre de colección -> mapa de `{ nombre_campo -> nombre_columna_sql }` para
+/// campos marcados con `@column("...")` (GRAMMAR.md §3.242 / PLAN.md §9.21).
+pub(crate) fn column_aliases_by_collection(program: &Program, checker: &Checker) -> HashMap<String, HashMap<String, String>> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let TypeExpr::Struct(fields) = &t.ty else { continue };
+            let mut aliases = HashMap::new();
+            for f in fields {
+                if let Some(alias) = f.column_name() {
+                    aliases.insert(f.name.clone(), alias.to_string());
+                }
+            }
+            if !aliases.is_empty() {
+                result.insert(coll_name.clone(), aliases);
+            }
+        }
+    }
+    result
+}
+
+/// Nombre de colección -> lista de `(columna_sql, unique)` para cada campo con
 /// `@index`/`@unique` de su tipo de elemento (GRAMMAR.md §3.80) -- mismo
 /// cruce `checker.db_collections()` + `program.items` que
 /// `soft_delete_fields_by_collection`, mismo motivo (las anotaciones viven
-/// en `ast::Field`, no en el `Type` ya resuelto).
+/// en `ast::Field`, no en el `Type` ya resuelto). Usa el alias `@column` si existe.
 pub(crate) fn index_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<(String, bool)>> {
     let mut result = HashMap::new();
     for (coll_name, element_ty) in checker.db_collections() {
@@ -268,8 +309,15 @@ pub(crate) fn index_fields_by_collection(program: &Program, checker: &Checker) -
                 continue;
             }
             let TypeExpr::Struct(fields) = &t.ty else { continue };
-            let indexed: Vec<(String, bool)> =
-                fields.iter().filter_map(|f| f.index().map(|unique| (f.name.clone(), unique))).collect();
+            let indexed: Vec<(String, bool)> = fields
+                .iter()
+                .filter_map(|f| {
+                    f.index().map(|unique| {
+                        let col_name = f.column_name().unwrap_or(&f.name);
+                        (col_name.to_string(), unique)
+                    })
+                })
+                .collect();
             if !indexed.is_empty() {
                 result.insert(coll_name.clone(), indexed);
             }
@@ -278,11 +326,11 @@ pub(crate) fn index_fields_by_collection(program: &Program, checker: &Checker) -
     result
 }
 
-/// Nombre de colección -> lista de `(campo, FieldCheck)` para cada campo con
+/// Nombre de colección -> lista de `(columna_sql, FieldCheck)` para cada campo con
 /// `@check` de su tipo de elemento (GRAMMAR.md §3.96) -- mismo cruce
 /// `checker.db_collections()` + `program.items` que `index_fields_by_collection`
 /// de abajo, mismo motivo: `ColumnPlan`/`Type::Struct` son estructurales,
-/// sin anotaciones -- solo el `ast::Field` original las tiene.
+/// sin anotaciones -- solo el `ast::Field` original las tiene. Usa el alias `@column` si existe.
 pub(crate) fn check_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<(String, FieldCheck)>> {
     let mut result = HashMap::new();
     for (coll_name, element_ty) in checker.db_collections() {
@@ -293,7 +341,15 @@ pub(crate) fn check_fields_by_collection(program: &Program, checker: &Checker) -
                 continue;
             }
             let TypeExpr::Struct(fields) = &t.ty else { continue };
-            let checks: Vec<(String, FieldCheck)> = fields.iter().filter_map(|f| f.check().map(|c| (f.name.clone(), c.clone()))).collect();
+            let checks: Vec<(String, FieldCheck)> = fields
+                .iter()
+                .filter_map(|f| {
+                    f.check().map(|c| {
+                        let col_name = f.column_name().unwrap_or(&f.name);
+                        (col_name.to_string(), c.clone())
+                    })
+                })
+                .collect();
             if !checks.is_empty() {
                 result.insert(coll_name.clone(), checks);
             }
@@ -343,15 +399,19 @@ pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checke
             if &t.name != type_name {
                 continue;
             }
+            let TypeExpr::Struct(ast_fields) = &t.ty else { continue };
+            let alias_map: HashMap<&str, &str> = ast_fields.iter().map(|f| (f.name.as_str(), f.column_name().unwrap_or(&f.name))).collect();
             let sets: Vec<(Vec<String>, Option<String>, bool)> = t
                 .annotations
                 .iter()
                 .filter_map(|a| match a {
                     TypeAnnotation::Unique(fields, condition) => {
-                        Some((fields.clone(), condition.as_ref().map(|c| type_check_expr_sql(&c.node)), true))
+                        let mapped = fields.iter().map(|f| alias_map.get(f.as_str()).copied().unwrap_or(f.as_str()).to_string()).collect();
+                        Some((mapped, condition.as_ref().map(|c| type_check_expr_sql(&c.node)), true))
                     }
                     TypeAnnotation::Index(fields, condition) => {
-                        Some((fields.clone(), condition.as_ref().map(|c| type_check_expr_sql(&c.node)), false))
+                        let mapped = fields.iter().map(|f| alias_map.get(f.as_str()).copied().unwrap_or(f.as_str()).to_string()).collect();
+                        Some((mapped, condition.as_ref().map(|c| type_check_expr_sql(&c.node)), false))
                     }
                     TypeAnnotation::Check(_) => None,
                 })
@@ -628,6 +688,7 @@ pub(crate) fn check_clause_sql(field: &str, check: &FieldCheck) -> String {
 
 fn create_table_sql(
     collection: &str,
+    id_col: &str,
     id_kind: IdKind,
     columns: &[ColumnPlan],
     checks: &[(String, FieldCheck)],
@@ -646,18 +707,18 @@ fn create_table_sql(
     // `id` NULL pasaría el `CREATE TABLE ... STRICT` de arriba sin
     // ninguna queja.
     let id_def = match id_kind {
-        IdKind::Int => "\"id\" INTEGER PRIMARY KEY AUTOINCREMENT".to_string(),
-        IdKind::Uuid => "\"id\" TEXT PRIMARY KEY NOT NULL".to_string(),
+        IdKind::Int => format!("\"{id_col}\" INTEGER PRIMARY KEY AUTOINCREMENT"),
+        IdKind::Uuid => format!("\"{id_col}\" TEXT PRIMARY KEY NOT NULL"),
     };
     let mut defs = vec![id_def];
 
     for col in columns {
         let not_null = if col.not_null() { " NOT NULL" } else { "" };
-        let check_clause = match checks.iter().find(|(name, _)| name == &col.field.name) {
-            Some((_, c)) => format!(" {}", check_clause_sql(&col.field.name, c)),
+        let check_clause = match checks.iter().find(|(name, _)| name == &col.field.name || name == &col.sql_name) {
+            Some((_, c)) => format!(" {}", check_clause_sql(&col.sql_name, c)),
             None => String::new(),
         };
-        defs.push(format!("\"{}\" {}{}{}", col.field.name, col.sql_type, not_null, check_clause));
+        defs.push(format!("\"{}\" {}{}{}", col.sql_name, col.sql_type, not_null, check_clause));
     }
     // `@check(<expr>)` de nivel `type` (GRAMMAR.md §3.173) -- constraint de
     // TABLA, no de columna (a diferencia del loop de arriba), mismo lugar
@@ -683,6 +744,7 @@ fn create_table_sql(
 fn check_schema_matches(
     connection: &Connection,
     collection: &str,
+    id_col: &str,
     id_kind: IdKind,
     columns: &[ColumnPlan],
     db_path: &str,
@@ -712,9 +774,9 @@ fn check_schema_matches(
         IdKind::Int => ("INTEGER".to_string(), false),
         IdKind::Uuid => ("TEXT".to_string(), true),
     };
-    expected.insert("id".to_string(), id_expected);
+    expected.insert(id_col.to_string(), id_expected);
     for col in columns {
-        expected.insert(col.field.name.clone(), (col.sql_type.to_string(), col.not_null()));
+        expected.insert(col.sql_name.clone(), (col.sql_type.to_string(), col.not_null()));
     }
     let mut actual: HashMap<String, (String, bool)> =
         existing.into_iter().map(|(name, decl_type, notnull)| (name, (decl_type.to_uppercase(), notnull))).collect();
@@ -726,10 +788,10 @@ fn check_schema_matches(
     // Auto-migración no destructiva (Link 1.0): si hay columnas esperadas que no existen en la tabla física
     // y son opcionales/nullable (no NOT NULL sin default), agregarlas con ALTER TABLE ADD COLUMN sin perder datos
     for col in columns {
-        if !actual.contains_key(&col.field.name) && !col.not_null() {
-            let alter_sql = format!("ALTER TABLE \"{collection}\" ADD COLUMN \"{}\" {}", col.field.name, col.sql_type);
+        if !actual.contains_key(&col.sql_name) && !col.not_null() {
+            let alter_sql = format!("ALTER TABLE \"{collection}\" ADD COLUMN \"{}\" {}", col.sql_name, col.sql_type);
             if connection.execute(&alter_sql, []).is_ok() {
-                actual.insert(col.field.name.clone(), (col.sql_type.to_string(), false));
+                actual.insert(col.sql_name.clone(), (col.sql_type.to_string(), false));
             }
         }
     }
@@ -819,7 +881,7 @@ fn postgres_table_exists(backend: &Backend, table: &str) -> Result<bool, String>
 /// no se valida acá (límite honesto, GRAMMAR.md §3.67): una fila vieja con
 /// NULL en un campo que el `.link` declara requerido recién falla en la
 /// lectura que la toque, con el error normal de decode -- no al conectar.
-fn check_schema_for_adoption(connection: &Connection, collection: &str, columns: &[ColumnPlan], db_path: &str) -> Result<(), RuntimeError> {
+fn check_schema_for_adoption(connection: &Connection, collection: &str, id_col: &str, columns: &[ColumnPlan], db_path: &str) -> Result<(), RuntimeError> {
     if !sqlite_table_exists(connection, collection) {
         return Err(RuntimeError::new(format!(
             "la colección '{collection}' no existe como tabla en '{db_path}', pero --adopt-existing/LINK_ADOPT_EXISTING \
@@ -839,11 +901,14 @@ fn check_schema_for_adoption(connection: &Connection, collection: &str, columns:
 
     let mut missing = Vec::new();
     let mut incompatible = Vec::new();
+    if !actual.contains_key(id_col) {
+        missing.push(id_col.to_string());
+    }
     for col in columns {
-        match actual.get(&col.field.name) {
-            None => missing.push(col.field.name.clone()),
+        match actual.get(&col.sql_name) {
+            None => missing.push(col.sql_name.clone()),
             Some(actual_type) if actual_type != col.sql_type => {
-                incompatible.push(format!("'{}' declarado {} pero la tabla tiene {}", col.field.name, col.sql_type, actual_type))
+                incompatible.push(format!("'{}' declarado {} pero la tabla tiene {}", col.sql_name, col.sql_type, actual_type))
             }
             Some(_) => {}
         }
@@ -890,7 +955,7 @@ fn check_schema_for_adoption(connection: &Connection, collection: &str, columns:
 /// devuelve un error limpio, NO un panic (el panic era específico de la
 /// variante `Row::get` sin chequear que usaba justo el fetch del id nuevo).
 /// "id" es el único caso donde ese error limpio no alcanzaba a tiempo.
-pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str, expected: IdKind) -> Result<(), String> {
+pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str, id_col: &str, expected: IdKind) -> Result<(), String> {
     // GRAMMAR.md §3.192: sin NINGÚN filtro de `table_schema` antes de esta
     // ronda -- con más de un schema visible en el `search_path` de la
     // sesión (o dos tablas del mismo nombre en schemas distintos), esto
@@ -898,11 +963,12 @@ pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str, e
     // fix que `postgres_table_exists`: filtrar por el `search_path`
     // EFECTIVO de la sesión, no una tabla-de-cualquier-schema-que-matchee.
     let sql = format!(
-        "SELECT data_type FROM information_schema.columns WHERE table_name = {} AND column_name = 'id' AND table_schema = ANY(current_schemas(false))",
-        backend.placeholder(1)
+        "SELECT data_type FROM information_schema.columns WHERE table_name = {} AND column_name = {} AND table_schema = ANY(current_schemas(false))",
+        backend.placeholder(1),
+        backend.placeholder(2)
     );
     let rows = backend
-        .query(&sql, &[Cell::Text(collection.to_string())], &[ColumnKind::Text])
+        .query(&sql, &[Cell::Text(collection.to_string()), Cell::Text(id_col.to_string())], &[ColumnKind::Text])
         .map_err(|e| format!("no se pudo verificar el esquema de '{collection}' en PostgreSQL: {e}"))?;
 
     // Sin fila: o la tabla se acaba de crear (su "id" siempre es BIGSERIAL/
@@ -934,15 +1000,15 @@ pub(crate) fn validate_existing_id_column(backend: &Backend, collection: &str, e
     let (required, hint) = match expected {
         IdKind::Int => (
             "una clave primaria entera autoincremental (BIGSERIAL)".to_string(),
-            "agregá una columna \"id\" BIGSERIAL nueva".to_string(),
+            format!("agregá una columna \"{id_col}\" BIGSERIAL nueva"),
         ),
         IdKind::Uuid => (
             "una clave primaria 'uuid' nativa de PostgreSQL".to_string(),
-            "agregá una columna \"id\" UUID nueva, o cambiá el tipo del campo 'id' del .link a Int si esta tabla ya usa un entero/otro formato".to_string(),
+            format!("agregá una columna \"{id_col}\" UUID nueva, o cambiá el tipo del campo 'id' del .link a Int si esta tabla ya usa un entero/otro formato"),
         ),
     };
     Err(format!(
-        "la tabla '{collection}' ya existe en PostgreSQL con \"id\" de tipo '{data_type}', pero c-script requiere {required} \
+        "la tabla '{collection}' ya existe en PostgreSQL con \"{id_col}\" de tipo '{data_type}', pero c-script requiere {required} \
          -- típico al migrar desde otro backend. No se puede usar esta tabla sin migrarla a mano: {hint}, o apuntá esta \
          colección a otro nombre de tabla."
     ))
@@ -1000,7 +1066,7 @@ fn warn_if_table_looks_unrelated(backend: &Backend, collection: &str, columns: &
         return;
     }
 
-    let declared: Vec<&str> = columns.iter().map(|c| c.field.name.as_str()).collect();
+    let declared: Vec<&str> = columns.iter().map(|c| c.sql_name.as_str()).collect();
 
     // GRAMMAR.md §3.94: nombres de convención de auditoría (`createdAt`/
     // `updatedAt`/`deletedAt` -- la misma terna que `@autoUpdate`/
@@ -1069,7 +1135,7 @@ fn validate_columns_exist_for_adoption(backend: &Backend, collection: &str, colu
     let actual: HashSet<String> =
         rows.into_iter().filter_map(|row| row.into_iter().next()).filter_map(|cell| if let Cell::Text(s) = cell { Some(s) } else { None }).collect();
 
-    let missing: Vec<&str> = columns.iter().map(|c| c.field.name.as_str()).filter(|name| !actual.contains(*name)).collect();
+    let missing: Vec<&str> = columns.iter().map(|c| c.sql_name.as_str()).filter(|name| !actual.contains(*name)).collect();
     if missing.is_empty() {
         return Ok(());
     }
@@ -1113,6 +1179,8 @@ pub struct Db {
     /// garantiza `id` en toda colección), pero el default barato evita un
     /// `unwrap`/panic en cualquier código que consulte esto.
     id_kinds: HashMap<String, IdKind>,
+    /// Nombre de colección -> nombre físico de su columna id en SQL (GRAMMAR.md §3.242 / PLAN.md §9.21).
+    id_columns: HashMap<String, String>,
     /// Suscriptores activos por colección, para push real (GRAMMAR.md
     /// §3.16). `Mutex`, no `RefCell` -- Pilar 1 del roadmap de concurrencia
     /// (26/08/2026): con un hilo por request (`runtime/server.rs`), dos
@@ -1433,11 +1501,7 @@ pub fn check_postgres_connectivity(url: &str, schema: Option<&str>) -> Result<()
 /// existe todavía no cuenta acá.
 pub fn check_postgres_column_types(program: &Program, url: &str, schema: Option<&str>) -> Result<Vec<crate::schema_check::ColumnIssue>, String> {
     let client = connect_postgres_client(url, schema)?;
-    let backend = Backend::Postgres {
-        client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)),
-        url: url.to_string(),
-        schema: schema.map(str::to_string),
-    };
+    let backend = Backend::postgres(client, url, schema, 1);
     crate::schema_check::check_program(program, &backend)
 }
 
@@ -1607,7 +1671,13 @@ impl Db {
     /// un parámetro más acá es barato. `new` sigue siendo la firma pública
     /// de siempre, ahora un envoltorio con `false` (convención del proyecto:
     /// método nuevo agregado, ninguna firma existente cambia).
+    pub const DEFAULT_SQLITE_READER_POOL_SIZE: usize = 10;
+
     pub fn new_with_options(program: &Program, db_path: &Path, adopt_existing: bool) -> Self {
+        Self::new_with_pool_options(program, db_path, adopt_existing, None)
+    }
+
+    pub fn new_with_pool_options(program: &Program, db_path: &Path, adopt_existing: bool, pool_size: Option<usize>) -> Self {
         let (checker, symbol_errors) = Checker::build_symbols(program);
         if let Some(e) = symbol_errors.into_iter().next() {
             panic!("programa inválido al abrir la base de datos: {e}");
@@ -1624,6 +1694,8 @@ impl Db {
         // mientras `linkc serve` sigue corriendo.
         let _ = connection.pragma_update(None, "journal_mode", "WAL");
 
+        let aliases_by_collection = column_aliases_by_collection(program, &checker);
+        let empty_aliases: HashMap<String, String> = HashMap::new();
         let checks_by_collection = check_fields_by_collection(program, &checker);
         let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
         let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
@@ -1632,6 +1704,7 @@ impl Db {
         let empty_encrypted: HashSet<String> = HashSet::new();
         let mut columns = HashMap::new();
         let mut id_kinds = HashMap::new();
+        let mut id_columns = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
                 unreachable!("Checker::validate_db_element_type ya garantizó que el elemento sea un struct");
@@ -1639,11 +1712,13 @@ impl Db {
             let id_kind = IdKind::from_field_type(
                 &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty,
             );
+            let aliases = aliases_by_collection.get(name).unwrap_or(&empty_aliases);
+            let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
             let encrypted_fields = encrypted_by_collection.get(name).unwrap_or(&empty_encrypted);
             let cols: Vec<ColumnPlan> = fields
                 .iter()
                 .filter(|f| f.name != "id")
-                .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_fields.contains(&f.name)))
+                .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_fields.contains(&f.name), aliases.get(&f.name).cloned()))
                 .collect();
             if adopt_existing {
                 // GRAMMAR.md §3.80/§3.96: `--adopt-existing` nunca ejecuta
@@ -1654,17 +1729,18 @@ impl Db {
                 // sigue aplicando del lado de la aplicación
                 // (`apply_field_validators`, `runtime/mod.rs`) sin importar
                 // este modo.
-                check_schema_for_adoption(&connection, name, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
+                check_schema_for_adoption(&connection, name, id_col, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             } else {
                 let checks = checks_by_collection.get(name).unwrap_or(&empty_checks);
                 let type_checks = type_checks_by_collection_map.get(name).unwrap_or(&empty_type_checks);
                 connection
-                    .execute(&create_table_sql(name, id_kind, &cols, checks, type_checks), [])
+                    .execute(&create_table_sql(name, id_col, id_kind, &cols, checks, type_checks), [])
                     .unwrap_or_else(|e| panic!("no se pudo crear la tabla '{name}' en '{db_path_display}': {e}"));
-                check_schema_matches(&connection, name, id_kind, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
+                check_schema_matches(&connection, name, id_col, id_kind, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             }
             columns.insert(name.clone(), cols);
             id_kinds.insert(name.clone(), id_kind);
+            id_columns.insert(name.clone(), id_col.to_string());
         }
         if !adopt_existing {
             for (name, indexed) in index_fields_by_collection(program, &checker) {
@@ -1683,13 +1759,15 @@ impl Db {
             }
         }
         let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
+        let pool_size = pool_size.unwrap_or(Self::DEFAULT_SQLITE_READER_POOL_SIZE);
 
         Db {
-            backend: Backend::Sqlite(parking_lot::ReentrantMutex::new(connection)),
+            backend: Backend::sqlite(connection, Some(db_path), pool_size),
             checker,
             simple_enums,
             columns,
             id_kinds,
+            id_columns,
             subscribers: parking_lot::Mutex::new(HashMap::new()),
             pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
@@ -1737,11 +1815,15 @@ impl Db {
     /// solo-lectura). El punto es poder adoptar una base donde el rol de la
     /// app no tiene permiso de crear/alterar tablas -- una restricción real y
     /// común en producción, no solo un gusto de organización del esquema.
+/// PLAN.md §9.20 Fase 1.1: Tamaño por default del pool de conexiones PostgreSQL.
+pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
+
     pub(crate) fn connect_postgres_with_options(
         program: &Program,
         url: &str,
         adopt_existing: bool,
         schema: Option<&str>,
+        pool_size: Option<usize>,
     ) -> Result<(Self, Receiver<RemoteChange>), String> {
         let (checker, symbol_errors) = Checker::build_symbols(program);
         if let Some(e) = symbol_errors.into_iter().next() {
@@ -1764,12 +1846,11 @@ impl Db {
                 .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
                 .map_err(|e| format!("no se pudo crear el schema '{schema}': {e}"))?;
         }
-        let backend = Backend::Postgres {
-            client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)),
-            url: url.to_string(),
-            schema: schema.map(str::to_string),
-        };
+        let pool_size = pool_size.unwrap_or(Self::DEFAULT_POSTGRES_POOL_SIZE);
+        let backend = Backend::postgres(client, url, schema, pool_size);
 
+        let aliases_by_collection = column_aliases_by_collection(program, &checker);
+        let empty_aliases: HashMap<String, String> = HashMap::new();
         let checks_by_collection = check_fields_by_collection(program, &checker);
         let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
         let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
@@ -1778,17 +1859,20 @@ impl Db {
         let empty_encrypted: HashSet<String> = HashSet::new();
         let mut columns = HashMap::new();
         let mut id_kinds = HashMap::new();
+        let mut id_columns = HashMap::new();
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
                 unreachable!("Checker::validate_db_element_type ya garantizó que el elemento sea un struct");
             };
             let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
             let id_kind = IdKind::from_field_type(id_field_ty);
+            let aliases = aliases_by_collection.get(name).unwrap_or(&empty_aliases);
+            let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
             let encrypted_fields = encrypted_by_collection.get(name).unwrap_or(&empty_encrypted);
             let cols: Vec<ColumnPlan> = fields
                 .iter()
                 .filter(|f| f.name != "id")
-                .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_fields.contains(&f.name)))
+                .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_fields.contains(&f.name), aliases.get(&f.name).cloned()))
                 .collect();
             let non_id: Vec<FieldType> = cols.iter().map(|c| c.field.clone()).collect();
 
@@ -1808,6 +1892,7 @@ impl Db {
                         &simple_enums,
                         checks,
                         type_checks,
+                        aliases,
                     ))
                     .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
             }
@@ -1822,7 +1907,7 @@ impl Db {
             // mismo momento y mismo criterio que `check_schema_matches` ya
             // aplica para SQLite, adaptado a que Postgres no recrea tablas.
             // Es un SELECT, no DDL, así que corre en los dos modos.
-            validate_existing_id_column(&backend, name, id_kind)?;
+            validate_existing_id_column(&backend, name, id_col, id_kind)?;
 
             if adopt_existing {
                 validate_columns_exist_for_adoption(&backend, name, &cols)?;
@@ -1842,14 +1927,15 @@ impl Db {
                 // stderr (nunca bloquea) si esta tabla no se parece a lo que
                 // el programa declara -- ver el comentario de la función.
                 warn_if_table_looks_unrelated(&backend, name, &cols);
-                for field in &non_id {
+                for col in &cols {
                     backend
-                        .execute_ddl(&crate::codegen::postgres_emit::alter_table_add_column_postgres(name, field, &simple_enums))
+                        .execute_ddl(&crate::codegen::postgres_emit::alter_table_add_column_postgres(name, &col.field, &simple_enums, Some(&col.sql_name)))
                         .map_err(|e| format!("no se pudo migrar la tabla '{name}': {e}"))?;
                 }
             }
             columns.insert(name.clone(), cols);
             id_kinds.insert(name.clone(), id_kind);
+            id_columns.insert(name.clone(), id_col.to_string());
         }
         if !adopt_existing {
             // Mismo criterio que el lado SQLite: `--adopt-existing` nunca
@@ -1884,17 +1970,18 @@ impl Db {
         // aborta el arranque del servidor: solo esta pieza se degrada,
         // con un aviso, nunca un servidor que no arranca por una tabla
         // que ni siquiera es del usuario.
-        let distributed_rate_limit = if adopt_existing {
-            postgres_table_exists(&backend, RATE_LIMIT_TABLE).unwrap_or(false)
-        } else {
-            match backend.execute_ddl(&create_rate_limit_table_sql()) {
-                Ok(()) => true,
-                Err(e) => {
+        let distributed_rate_limit = match adopt_existing {
+            true => postgres_table_exists(&backend, RATE_LIMIT_TABLE).unwrap_or(false),
+            false => {
+                let ddl = create_rate_limit_table_sql();
+                if let Err(e) = backend.execute_ddl(&ddl) {
                     eprintln!(
-                        "advertencia: no se pudo crear la tabla interna de rate limiting distribuido ({e}) -- \
-                         esta instancia usa el limitador en memoria de siempre (GRAMMAR.md §3.178)"
+                        "advertencia: no se pudo crear la tabla interna '{RATE_LIMIT_TABLE}' ({e}) -- \
+                         el rate limiting correrá en modo memoria local, no coordinado entre instancias"
                     );
                     false
+                } else {
+                    true
                 }
             }
         };
@@ -1906,6 +1993,7 @@ impl Db {
                 simple_enums,
                 columns,
                 id_kinds,
+                id_columns,
                 subscribers: parking_lot::Mutex::new(HashMap::new()),
                 pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
                 oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
@@ -1937,7 +2025,21 @@ impl Db {
     /// una corrida de una sola vez, sin ningún otro proceso escuchando
     /// cambios en vivo, así que no hace falta esa plomería acá.
     pub fn connect_postgres_for_testing(program: &Program, url: &str, adopt_existing: bool, schema: Option<&str>) -> Result<Self, String> {
-        Self::connect_postgres_with_options(program, url, adopt_existing, schema).map(|(db, _remote_rx)| db)
+        Self::connect_postgres_with_options(program, url, adopt_existing, schema, None).map(|(db, _remote_rx)| db)
+    }
+
+    /// PLAN.md §9.20 Fase 1.1: Conexión para tests especificando tamaño de pool exacto.
+    pub fn connect_postgres_for_testing_with_pool(program: &Program, url: &str, adopt_existing: bool, schema: Option<&str>, pool_size: usize) -> Result<Self, String> {
+        Self::connect_postgres_with_options(program, url, adopt_existing, schema, Some(pool_size)).map(|(db, _remote_rx)| db)
+    }
+
+    /// Información del pool (max_size, total_creadas, ociosas) si el backend es PostgreSQL.
+    pub fn postgres_pool_info(&self) -> Option<(usize, usize, usize)> {
+        self.backend.postgres_pool_info()
+    }
+
+    pub fn sqlite_pool_info(&self) -> Option<(usize, usize)> {
+        self.backend.sqlite_pool_info()
     }
 
     /// Fija el costo de `crypto.hashPassword` para lo que quede de vida del
@@ -2221,7 +2323,7 @@ db { users: User[] }
                 let Some(Cell::Int(ps)) = page_size.first().and_then(|r| r.first()) else { return None };
                 Some(pc * ps)
             }
-            Backend::Postgres { .. } => {
+            Backend::Postgres(..) => {
                 let rows = self.backend.query("SELECT pg_database_size(current_database())", &[], &[ColumnKind::Int]).ok()?;
                 match rows.first().and_then(|r| r.first()) {
                     Some(Cell::Int(n)) => Some(*n),
@@ -2419,17 +2521,18 @@ db { users: User[] }
                 // (`Omit<T,"id">`, checker.rs::omit_id_field), así que no
                 // hay riesgo de pisar un valor que el usuario haya
                 // intentado fijar.
+                let id_col = self.id_col(collection);
                 let generated_uuid = match self.id_kind(collection) {
                     IdKind::Int => None,
                     IdKind::Uuid => Some(generate_uuid_v4()?),
                 };
                 if let Some(uuid) = &generated_uuid {
-                    col_names.push("\"id\"".to_string());
+                    col_names.push(format!("\"{id_col}\""));
                     params.push(Cell::Text(uuid.clone()));
                 }
                 for col in columns {
                     let slot = fields.iter().find(|(n, _)| n == &col.field.name).map(|(_, v)| v);
-                    col_names.push(format!("\"{}\"", col.field.name));
+                    col_names.push(format!("\"{}\"", col.sql_name));
                     params.push(self.write_param(col, slot)?);
                 }
                 let sql = if col_names.is_empty() {
@@ -2444,7 +2547,7 @@ db { users: User[] }
                         (Cell::Text(uuid.clone()), uuid)
                     }
                     None => {
-                        let new_id = self.backend.insert_returning_id(&sql, &params).map_err(|e| write_error("insert", e))?;
+                        let new_id = self.backend.insert_returning_id(&sql, &params, id_col).map_err(|e| write_error("insert", e))?;
                         (Cell::Int(new_id), new_id.to_string())
                     }
                 };
@@ -2469,6 +2572,7 @@ db { users: User[] }
                 Ok(inserted)
             }
             "applyPatch" => {
+                let id_col = self.id_col(collection);
                 let mut it = args.into_iter();
                 let id_value = it.next().ok_or_else(|| RuntimeError::new("applyPatch requiere 2 argumentos"))?;
                 let (id_cell, id_display) = self.id_cell_and_display(&id_value)?;
@@ -2482,13 +2586,13 @@ db { users: User[] }
                     // "id" nunca es escribible -- mismo criterio que insert,
                     // que también lo excluye de lo que el caller puede fijar.
                     let Some(col) = columns.iter().find(|c| name == &c.field.name) else { continue };
-                    set_clauses.push(format!("\"{name}\" = {}", self.backend.placeholder(params.len() + 1)));
+                    set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend.placeholder(params.len() + 1)));
                     params.push(self.write_param(col, Some(value))?);
                 }
                 if !set_clauses.is_empty() {
                     let id_placeholder = self.backend.placeholder(params.len() + 1);
                     params.push(id_cell.clone());
-                    let sql = format!("UPDATE \"{collection}\" SET {} WHERE \"id\" = {id_placeholder}", set_clauses.join(", "));
+                    let sql = format!("UPDATE \"{collection}\" SET {} WHERE \"{id_col}\" = {id_placeholder}", set_clauses.join(", "));
                     self.backend.execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
                 }
                 // Reconsultar por id, tanto si hubo UPDATE como si el patch
@@ -2511,6 +2615,7 @@ db { users: User[] }
             // devuelve `false` (0 filas afectadas), igual que un `delete`
             // normal sobre un id que ya no existe.
             "delete" => {
+                let id_col = self.id_col(collection);
                 let id_value = args.into_iter().next().ok_or_else(|| RuntimeError::new("delete requiere 1 argumento"))?;
                 let (id_cell, _) = self.id_cell_and_display(&id_value)?;
                 // `select_rows(id: Some(_))` NUNCA filtra por soft-delete
@@ -2520,12 +2625,13 @@ db { users: User[] }
                 let existing = self.select_rows(collection, columns, Some(id_cell.clone()))?.into_iter().next();
                 let rows_affected = match self.soft_delete_fields.get(collection) {
                     Some(field) => {
+                        let soft_col = columns.iter().find(|c| &c.field.name == field).map(|c| c.sql_name.as_str()).unwrap_or(field.as_str());
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
                         let sql = format!(
-                            "UPDATE \"{collection}\" SET \"{field}\" = {} WHERE \"id\" = {} AND \"{field}\" IS NULL",
+                            "UPDATE \"{collection}\" SET \"{soft_col}\" = {} WHERE \"{id_col}\" = {} AND \"{soft_col}\" IS NULL",
                             self.backend.placeholder(1),
                             self.backend.placeholder(2)
                         );
@@ -2534,7 +2640,7 @@ db { users: User[] }
                             .map_err(|e| RuntimeError::new(format!("delete (soft) falló: {e}")))?
                     }
                     None => {
-                        let sql = format!("DELETE FROM \"{collection}\" WHERE \"id\" = {}", self.backend.placeholder(1));
+                        let sql = format!("DELETE FROM \"{collection}\" WHERE \"{id_col}\" = {}", self.backend.placeholder(1));
                         self.backend
                             .execute(&sql, &[id_cell])
                             .map_err(|e| RuntimeError::new(format!("delete falló: {e}")))?
@@ -2581,7 +2687,7 @@ db { users: User[] }
             // las filas; findWhere las devolvía TODAS) -- fallar con un
             // mensaje claro es siempre mejor que una respuesta que parece
             // válida y no lo es.
-            "deleteWhere" | "findWhere" | "countWhere" => Err(RuntimeError::new(format!(
+            "deleteWhere" | "findWhere" | "countWhere" | "updateWhere" => Err(RuntimeError::new(format!(
                 "'db.{collection}.{method}' solo se puede invocar a través del intérprete (evalúa un predicado por fila, y este método no tiene acceso a closures) -- llegó directo a Db::call, sin pasar por runtime::call_method"
             ))),
             other => Err(RuntimeError::new(format!("método desconocido: 'db.{collection}.{other}'"))),
@@ -2691,7 +2797,7 @@ db { users: User[] }
     /// una escritura suya en la MISMA conexión a mitad de esta transacción.
     /// Las llamadas de adentro (`db.<c>.insert(...)`, etc.) piden este
     /// mismo candado por su cuenta -- reentrante, así que no hay deadlock.
-    pub(crate) fn with_exclusive_connection<T>(&self, f: impl FnOnce() -> T) -> T {
+    pub fn with_exclusive_connection<T>(&self, f: impl FnOnce() -> T) -> T {
         self.backend.with_exclusive(f)
     }
 
@@ -2912,11 +3018,21 @@ db { users: User[] }
         }
     }
 
+    /// Nombre físico de la clave primaria en la base de datos SQL ("id" o alias de @column("...")).
+    pub(crate) fn id_col(&self, collection: &str) -> &str {
+        self.id_columns.get(collection).map(String::as_str).unwrap_or("id")
+    }
+
     /// `"<campo>" IS NULL`, si `collection` tiene un campo `@softDelete`
     /// (GRAMMAR.md §3.78) -- `None` para la enorme mayoría de colecciones,
-    /// que no usan soft-delete.
+    /// que no usan soft-delete. Usa el alias `@column` si existe.
     fn soft_delete_where(&self, collection: &str) -> Option<String> {
-        self.soft_delete_fields.get(collection).map(|field| format!("\"{field}\" IS NULL"))
+        let field = self.soft_delete_fields.get(collection)?;
+        let col_name = self.columns.get(collection)
+            .and_then(|cols| cols.iter().find(|c| &c.field.name == field))
+            .map(|c| c.sql_name.as_str())
+            .unwrap_or(field.as_str());
+        Some(format!("\"{col_name}\" IS NULL"))
     }
 
     /// GRAMMAR.md §3.177: tipo de la PK de `collection` -- `IdKind::Int`
@@ -2965,12 +3081,13 @@ db { users: User[] }
             .columns
             .get(collection)
             .ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let id_col = self.id_col(collection);
         let (id_cell, id_display) = self.id_cell_and_display(id)?;
-        let mut col_names = vec!["\"id\"".to_string()];
+        let mut col_names = vec![format!("\"{id_col}\"")];
         let mut params: Vec<Cell> = vec![id_cell];
         for col in columns {
             let slot = fields.iter().find(|(n, _)| n == &col.field.name).map(|(_, v)| v);
-            col_names.push(format!("\"{}\"", col.field.name));
+            col_names.push(format!("\"{}\"", col.sql_name));
             params.push(self.write_param(col, slot)?);
         }
         let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
@@ -2995,9 +3112,10 @@ db { users: User[] }
         if self.id_kind(collection) != IdKind::Int {
             return Ok(()); // una PK Uuid no tiene ningún concepto de secuencia
         }
+        let id_col = self.id_col(collection);
         let rows = self
             .backend
-            .query(&format!("SELECT MAX(\"id\") FROM \"{collection}\""), &[], &[ColumnKind::Int])
+            .query(&format!("SELECT MAX(\"{id_col}\") FROM \"{collection}\""), &[], &[ColumnKind::Int])
             .map_err(|e| RuntimeError::new(format!("resync de secuencia de '{collection}' falló: {e}")))?;
         let Some(Cell::Int(max_id)) = rows.first().and_then(|r| r.first()) else {
             return Ok(()); // tabla vacía -- MAX(id) es NULL, nada que resincronizar
@@ -3041,15 +3159,16 @@ db { users: User[] }
                     }
                 }
             }
-            Backend::Postgres { .. } => {
+            Backend::Postgres(..) => {
                 // `pg_get_serial_sequence` en vez de hardcodear
                 // `"<tabla>_id_seq"` (el nombre por default de una columna
                 // `BIGSERIAL`, `postgres_emit.rs`) -- la forma oficial y a
                 // prueba de quoting de resolver la secuencia real de una
                 // columna serial.
                 self.backend
-                    .execute("SELECT setval(pg_get_serial_sequence($1, 'id'), $2)", &[
+                    .execute("SELECT setval(pg_get_serial_sequence($1, $2), $3)", &[
                         Cell::Text(format!("\"{collection}\"")),
+                        Cell::Text(id_col.to_string()),
                         Cell::Int(*max_id),
                     ])
                     .map_err(|e| RuntimeError::new(format!("resync de secuencia de '{collection}' falló: {e}")))?;
@@ -3074,15 +3193,16 @@ db { users: User[] }
     /// soft-deleteada sigue siendo encontrable por id directo, solo
     /// desaparece de listados (`all`/`page`/`pageAfter`/agregaciones).
     fn select_rows(&self, collection: &str, columns: &[ColumnPlan], id: Option<Cell>) -> Result<Vec<Value>, RuntimeError> {
-        let mut col_list = vec!["\"id\"".to_string()];
-        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        let id_col = self.id_col(collection);
+        let mut col_list = vec![format!("\"{id_col}\"")];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
         let sql = match id {
             Some(_) => {
-                format!("SELECT {} FROM \"{collection}\" WHERE \"id\" = {}", col_list.join(", "), self.backend.placeholder(1))
+                format!("SELECT {} FROM \"{collection}\" WHERE \"{id_col}\" = {}", col_list.join(", "), self.backend.placeholder(1))
             }
             None => match self.soft_delete_where(collection) {
-                Some(cond) => format!("SELECT {} FROM \"{collection}\" WHERE {cond} ORDER BY \"id\"", col_list.join(", ")),
-                None => format!("SELECT {} FROM \"{collection}\" ORDER BY \"id\"", col_list.join(", ")),
+                Some(cond) => format!("SELECT {} FROM \"{collection}\" WHERE {cond} ORDER BY \"{id_col}\"", col_list.join(", ")),
+                None => format!("SELECT {} FROM \"{collection}\" ORDER BY \"{id_col}\"", col_list.join(", ")),
             },
         };
         // El orden de `kinds` es el del SELECT: "id" primero, después las
@@ -3127,7 +3247,10 @@ db { users: User[] }
     /// placeholder aparece en el SQL final, y como el recorrido es
     /// izquierda-a-derecha en el mismo orden en que se arma el string,
     /// `cells.len() + 1` en el momento de cada push ya da el número correcto.
-    fn leaf_condition_sql(&self, columns: &[ColumnPlan], field: &str, op: BinaryOp, value: &Value, cells: &mut Vec<Cell>) -> Option<String> {
+    fn leaf_condition_sql(&self, collection: &str, columns: &[ColumnPlan], field: &str, op: BinaryOp, value: &Value, cells: &mut Vec<Cell>) -> Option<String> {
+        let id_col = self.id_col(collection);
+        let col = if field == "id" { None } else { columns.iter().find(|c| c.field.name == field) };
+        let sql_col = if field == "id" { id_col } else { col?.sql_name.as_str() };
         // Bug real, encontrado en una auditoría propia: `"campo" = ?`
         // ligado a un parámetro NULL nunca es cierto en SQL (NULL no es
         // igual a nada, ni siquiera a sí mismo) -- pero el camino
@@ -3153,7 +3276,7 @@ db { users: User[] }
             if field != "id" && columns.iter().find(|c| c.field.name == field).is_none_or(|c| c.json) {
                 return None;
             }
-            return Some(format!("\"{field}\" {null_op}"));
+            return Some(format!("\"{sql_col}\" {null_op}"));
         }
         let sql_op = match op {
             BinaryOp::Eq => "=",
@@ -3170,7 +3293,7 @@ db { users: User[] }
             let Value::Int(id) = value else { return None };
             Cell::Int(*id)
         } else {
-            let col = columns.iter().find(|c| c.field.name == field)?;
+            let col = col?;
             // `col.encrypted` (GRAMMAR.md §3.191): el ciphertext es distinto
             // en cada escritura (nonce aleatorio) -- comparar contra el
             // VALOR de un parámetro pusheado a SQL nunca podría matchear la
@@ -3183,7 +3306,7 @@ db { users: User[] }
             }
             self.write_param(col, Some(value)).ok()?
         };
-        let clause = format!("\"{field}\" {sql_op} {}", self.backend.placeholder(cells.len() + 1));
+        let clause = format!("\"{sql_col}\" {sql_op} {}", self.backend.placeholder(cells.len() + 1));
         cells.push(cell);
         Some(clause)
     }
@@ -3205,7 +3328,7 @@ db { users: User[] }
     /// interpretado tampoco está libre de sorpresas en ese escenario:
     /// `row_to_fields` ya falla con un error limpio, no un panic, si
     /// encuentra un NULL inesperado en una columna no opcional).
-    fn field_pair_condition_sql(&self, columns: &[ColumnPlan], left_field: &str, op: BinaryOp, right_field: &str) -> Option<String> {
+    fn field_pair_condition_sql(&self, collection: &str, columns: &[ColumnPlan], left_field: &str, op: BinaryOp, right_field: &str) -> Option<String> {
         let sql_op = match op {
             BinaryOp::Lt => "<",
             BinaryOp::LtEq => "<=",
@@ -3215,11 +3338,17 @@ db { users: User[] }
             // cualquier otro operador nunca llega hasta acá.
             _ => return None,
         };
-        let pushable = |f: &str| f == "id" || columns.iter().any(|c| c.field.name == f && !c.json);
-        if !pushable(left_field) || !pushable(right_field) {
-            return None;
-        }
-        Some(format!("\"{left_field}\" {sql_op} \"{right_field}\""))
+        let id_col = self.id_col(collection);
+        let resolve_col = |f: &str| -> Option<&str> {
+            if f == "id" {
+                Some(id_col)
+            } else {
+                columns.iter().find(|c| c.field.name == f && !c.json).map(|c| c.sql_name.as_str())
+            }
+        };
+        let left_col = resolve_col(left_field)?;
+        let right_col = resolve_col(right_field)?;
+        Some(format!("\"{left_col}\" {sql_op} \"{right_col}\""))
     }
 
     /// Recorrido recursivo de un `ConditionExpr` (GRAMMAR.md §3.170) a una
@@ -3231,14 +3360,112 @@ db { users: User[] }
     /// MISMO tipo que el padre no puede aparecer -- `ast::merge_and`/
     /// `merge_or` ya aplanan esos casos al construir el árbol, así que no
     /// hace falta ese chequeo acá.
-    fn condition_expr_sql(&self, columns: &[ColumnPlan], expr: &ConditionExpr, cells: &mut Vec<Cell>) -> Option<String> {
+fn escape_like_wildcards(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '%' => out.push_str("\\%"),
+            '_' => out.push_str("\\_"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+    fn in_list_condition_sql(
+        &self,
+        collection: &str,
+        columns: &[ColumnPlan],
+        field: &str,
+        values: &[Value],
+        negated: bool,
+        cells: &mut Vec<Cell>,
+    ) -> Option<String> {
+        if values.is_empty() {
+            return Some(if negated { "1=1".to_string() } else { "1=0".to_string() });
+        }
+
+        let id_col = self.id_col(collection);
+        let (sql_col, col) = if field == "id" {
+            (id_col, None)
+        } else {
+            let c = columns.iter().find(|c| c.field.name == field)?;
+            (c.sql_name.as_str(), Some(c))
+        };
+
+        let not_kw = if negated { "NOT " } else { "" };
+        let mut placeholders = Vec::with_capacity(values.len());
+
+        for val in values {
+            let cell = if field == "id" {
+                match val {
+                    Value::Int(id) => Cell::Int(*id),
+                    Value::Uuid(u) => Cell::Text(u.clone()),
+                    Value::Str(s) => Cell::Text(s.clone()),
+                    _ => return None,
+                }
+            } else {
+                let col = col?;
+                if col.json || col.encrypted {
+                    return None;
+                }
+                self.write_param(col, Some(val)).ok()?
+            };
+            placeholders.push(self.backend.placeholder(cells.len() + 1));
+            cells.push(cell);
+        }
+
+        Some(format!("\"{sql_col}\" {not_kw}IN ({})", placeholders.join(", ")))
+    }
+
+    fn string_match_condition_sql(
+        &self,
+        collection: &str,
+        columns: &[ColumnPlan],
+        field: &str,
+        op: crate::ast::StringMatchOp,
+        pattern: &str,
+        negated: bool,
+        cells: &mut Vec<Cell>,
+    ) -> Option<String> {
+        let id_col = self.id_col(collection);
+        let (sql_col, col) = if field == "id" {
+            (id_col, None)
+        } else {
+            let c = columns.iter().find(|c| c.field.name == field)?;
+            (c.sql_name.as_str(), Some(c))
+        };
+
+        if let Some(col) = col {
+            if col.json || col.encrypted || col.kind() != ColumnKind::Text {
+                return None;
+            }
+        }
+
+        let escaped = Self::escape_like_wildcards(pattern);
+        let like_val = match op {
+            crate::ast::StringMatchOp::Contains => format!("%{escaped}%"),
+            crate::ast::StringMatchOp::StartsWith => format!("{escaped}%"),
+            crate::ast::StringMatchOp::EndsWith => format!("%{escaped}"),
+        };
+
+        let not_kw = if negated { "NOT " } else { "" };
+        let ph = self.backend.placeholder(cells.len() + 1);
+        cells.push(Cell::Text(like_val));
+        Some(format!("\"{sql_col}\" {not_kw}LIKE {ph} ESCAPE '\\'"))
+    }
+
+    fn condition_expr_sql(&self, collection: &str, columns: &[ColumnPlan], expr: &ConditionExpr, cells: &mut Vec<Cell>) -> Option<String> {
         match expr {
-            ConditionExpr::Leaf(field, op, value) => self.leaf_condition_sql(columns, field, *op, value, cells),
-            ConditionExpr::FieldPair(left_field, op, right_field) => self.field_pair_condition_sql(columns, left_field, *op, right_field),
+            ConditionExpr::Leaf(field, op, value) => self.leaf_condition_sql(collection, columns, field, *op, value, cells),
+            ConditionExpr::FieldPair(left_field, op, right_field) => self.field_pair_condition_sql(collection, columns, left_field, *op, right_field),
+            ConditionExpr::InList { field, values, negated } => self.in_list_condition_sql(collection, columns, field, values, *negated, cells),
+            ConditionExpr::StringMatch { field, op, pattern, negated } => self.string_match_condition_sql(collection, columns, field, *op, pattern, *negated, cells),
             ConditionExpr::And(items) => {
                 let mut clauses = Vec::with_capacity(items.len());
                 for item in items {
-                    let clause = self.condition_expr_sql(columns, item, cells)?;
+                    let clause = self.condition_expr_sql(collection, columns, item, cells)?;
                     clauses.push(if matches!(item, ConditionExpr::Or(_)) { format!("({clause})") } else { clause });
                 }
                 Some(clauses.join(" AND "))
@@ -3246,7 +3473,7 @@ db { users: User[] }
             ConditionExpr::Or(items) => {
                 let mut clauses = Vec::with_capacity(items.len());
                 for item in items {
-                    let clause = self.condition_expr_sql(columns, item, cells)?;
+                    let clause = self.condition_expr_sql(collection, columns, item, cells)?;
                     clauses.push(if matches!(item, ConditionExpr::And(_)) { format!("({clause})") } else { clause });
                 }
                 Some(clauses.join(" OR "))
@@ -3262,13 +3489,8 @@ db { users: User[] }
     /// `count_where_conjunction` y `find_where_conjunction` -- la única
     /// diferencia entre esos dos es qué `SELECT` arman con esta misma
     /// condición.
-    fn condition_sql(&self, collection: &str, columns: &[ColumnPlan], expr: &ConditionExpr) -> Option<(String, Vec<Cell>)> {
-        let mut cells = Vec::new();
-        let cond = self.condition_expr_sql(columns, expr, &mut cells)?;
-        // El `cond` entero se parentiza acá si el árbol es un `Or` de nivel
-        // superior -- sin esto, "a OR b AND soft_delete_is_null" parsearía
-        // como "a OR (b AND soft_delete_is_null)", perdiendo el filtro de
-        // soft-delete sobre la mitad "a" de la disyunción.
+    fn condition_sql_with_params(&self, collection: &str, columns: &[ColumnPlan], expr: &ConditionExpr, cells: &mut Vec<Cell>) -> Option<String> {
+        let cond = self.condition_expr_sql(collection, columns, expr, cells)?;
         let where_clause = match self.soft_delete_where(collection) {
             Some(sd) => {
                 let wrapped = if matches!(expr, ConditionExpr::Or(_)) { format!("({cond})") } else { cond };
@@ -3276,7 +3498,60 @@ db { users: User[] }
             }
             None => cond,
         };
+        Some(where_clause)
+    }
+
+    fn condition_sql(&self, collection: &str, columns: &[ColumnPlan], expr: &ConditionExpr) -> Option<(String, Vec<Cell>)> {
+        let mut cells = Vec::new();
+        let where_clause = self.condition_sql_with_params(collection, columns, expr, &mut cells)?;
         Some((where_clause, cells))
+    }
+
+    /// `db.<c>.updateWhere(predicate, patch)` (GRAMMAR.md §3.245):
+    /// Ejecuta un `UPDATE "{table}" SET ... WHERE ...` atómico directamente en SQL
+    /// cuando el predicado es pusheable (`ConditionExpr`).
+    /// Retorna `Ok(Some(affected_rows))` con la cantidad de filas modificadas,
+    /// o `Ok(None)` si el predicado o los campos no se pueden empujar a SQL
+    /// (en cuyo caso el caller cae al camino interpretado).
+    pub(crate) fn update_where_conjunction(
+        &self,
+        collection: &str,
+        conditions: &ConditionExpr,
+        patch: &Value,
+    ) -> Result<Option<usize>, RuntimeError> {
+        let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let Value::Struct(patch_fields) = patch else {
+            return Err(RuntimeError::new("updateWhere: el patch debe ser un struct"));
+        };
+
+        let mut set_clauses = Vec::new();
+        let mut params: Vec<Cell> = Vec::new();
+
+        for (name, value) in patch_fields {
+            if name == "id" {
+                continue;
+            }
+            let Some(col) = columns.iter().find(|c| &c.field.name == name) else {
+                continue;
+            };
+            if col.json || col.encrypted {
+                return Ok(None);
+            }
+            set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend.placeholder(params.len() + 1)));
+            params.push(self.write_param(col, Some(value))?);
+        }
+
+        if set_clauses.is_empty() {
+            return Ok(Some(0));
+        }
+
+        let Some(where_clause) = self.condition_sql_with_params(collection, columns, conditions, &mut params) else {
+            return Ok(None);
+        };
+
+        let sql = format!("UPDATE \"{collection}\" SET {} WHERE {where_clause}", set_clauses.join(", "));
+        let affected = self.backend.execute(&sql, &params).map_err(|e| write_error("updateWhere", e))?;
+        Ok(Some(affected))
     }
 
     /// `db.<c>.countWhere(|x| ...)` (GRAMMAR.md §3.95/§3.108/§3.109/§3.170):
@@ -3313,9 +3588,10 @@ db { users: User[] }
         let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions) else {
             return Ok(None);
         };
-        let mut col_list = vec!["\"id\"".to_string()];
-        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
-        let sql = format!("SELECT {} FROM \"{collection}\" WHERE {where_clause} ORDER BY \"id\"", col_list.join(", "));
+        let id_col = self.id_col(collection);
+        let mut col_list = vec![format!("\"{id_col}\"")];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
+        let sql = format!("SELECT {} FROM \"{collection}\" WHERE {where_clause} ORDER BY \"{id_col}\"", col_list.join(", "));
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
@@ -3335,11 +3611,12 @@ db { users: User[] }
     /// filas por un orden distinto en cada query serían peor que no tener
     /// paginación.
     fn select_rows_page(&self, collection: &str, columns: &[ColumnPlan], limit: i64, offset: i64) -> Result<Vec<Value>, RuntimeError> {
-        let mut col_list = vec!["\"id\"".to_string()];
-        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        let id_col = self.id_col(collection);
+        let mut col_list = vec![format!("\"{id_col}\"")];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
         let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
         let sql = format!(
-            "SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"id\" LIMIT {} OFFSET {}",
+            "SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{id_col}\" LIMIT {} OFFSET {}",
             col_list.join(", "),
             self.backend.placeholder(1),
             self.backend.placeholder(2)
@@ -3369,29 +3646,30 @@ db { users: User[] }
     /// cursor por `id` nunca tiene ese problema, porque no cuenta filas, filtra
     /// por una posición fija en el orden.
     fn select_rows_after(&self, collection: &str, columns: &[ColumnPlan], after: Option<i64>, limit: i64) -> Result<Vec<Value>, RuntimeError> {
-        let mut col_list = vec!["\"id\"".to_string()];
-        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        let id_col = self.id_col(collection);
+        let mut col_list = vec![format!("\"{id_col}\"")];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
         let soft_delete_cond = self.soft_delete_where(collection);
         let sql = match (after, &soft_delete_cond) {
             (Some(_), Some(sd)) => format!(
-                "SELECT {} FROM \"{collection}\" WHERE \"id\" > {} AND {sd} ORDER BY \"id\" LIMIT {}",
+                "SELECT {} FROM \"{collection}\" WHERE \"{id_col}\" > {} AND {sd} ORDER BY \"{id_col}\" LIMIT {}",
                 col_list.join(", "),
                 self.backend.placeholder(1),
                 self.backend.placeholder(2)
             ),
             (Some(_), None) => format!(
-                "SELECT {} FROM \"{collection}\" WHERE \"id\" > {} ORDER BY \"id\" LIMIT {}",
+                "SELECT {} FROM \"{collection}\" WHERE \"{id_col}\" > {} ORDER BY \"{id_col}\" LIMIT {}",
                 col_list.join(", "),
                 self.backend.placeholder(1),
                 self.backend.placeholder(2)
             ),
             (None, Some(sd)) => format!(
-                "SELECT {} FROM \"{collection}\" WHERE {sd} ORDER BY \"id\" LIMIT {}",
+                "SELECT {} FROM \"{collection}\" WHERE {sd} ORDER BY \"{id_col}\" LIMIT {}",
                 col_list.join(", "),
                 self.backend.placeholder(1)
             ),
             (None, None) => format!(
-                "SELECT {} FROM \"{collection}\" ORDER BY \"id\" LIMIT {}",
+                "SELECT {} FROM \"{collection}\" ORDER BY \"{id_col}\" LIMIT {}",
                 col_list.join(", "),
                 self.backend.placeholder(1)
             ),
@@ -3482,7 +3760,7 @@ db { users: User[] }
             // devolvía un `Value::Int` mal etiquetado en vez de
             // `Value::Int64`).
             let result_ty = if method == "avgBy" { Type::Float } else { value_col.field.ty.clone() };
-            (format!("CAST({sql_fn}(\"{value_field}\") AS {cast_as})"), kind, result_ty)
+            (format!("CAST({sql_fn}(\"{}\") AS {cast_as})", value_col.sql_name), kind, result_ty)
         };
 
         let key_ty = key_col.field.ty.clone();
@@ -3492,8 +3770,8 @@ db { users: User[] }
         // y GROUP BY (portable en los dos motores; referenciar el alias
         // "key" en GROUP BY no es seguro en todo dialecto/versión).
         let key_expr = match granularity {
-            Some(g) => truncate_timestamp_sql(&key_field, g, self.backend.is_postgres()),
-            None => format!("\"{key_field}\""),
+            Some(g) => truncate_timestamp_sql(&key_col.sql_name, g, self.backend.is_postgres()),
+            None => format!("\"{}\"", key_col.sql_name),
         };
         let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
         let sql =
@@ -3543,9 +3821,10 @@ db { users: User[] }
                     key.field
                 )));
             }
-            parts.push(format!("\"{}\" {} NULLS LAST", key.field, if key.desc { "DESC" } else { "ASC" }));
+            parts.push(format!("\"{}\" {} NULLS LAST", col.sql_name, if key.desc { "DESC" } else { "ASC" }));
         }
-        parts.push("\"id\"".to_string());
+        let id_col = self.id_col(collection);
+        parts.push(format!("\"{id_col}\""));
         Ok(format!("ORDER BY {}", parts.join(", ")))
     }
 
@@ -3555,7 +3834,7 @@ db { users: User[] }
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
         let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
         let order_by = self.order_by_sql(collection, columns, order)?;
-        let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}{order_by}", Self::select_list(columns));
+        let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}{order_by}", self.select_list(collection, columns));
         self.query_rows(collection, columns, &sql, &[])
     }
 
@@ -3569,7 +3848,7 @@ db { users: User[] }
         let order_by = self.order_by_sql(collection, columns, order)?;
         let sql = format!(
             "SELECT {} FROM \"{collection}\" {where_clause}{order_by} LIMIT {} OFFSET {}",
-            Self::select_list(columns),
+            self.select_list(collection, columns),
             self.backend.placeholder(1),
             self.backend.placeholder(2)
         );
@@ -3586,15 +3865,142 @@ db { users: User[] }
             return Ok(None);
         };
         let order_by = self.order_by_sql(collection, columns, order)?;
-        let sql = format!("SELECT {} FROM \"{collection}\" WHERE {where_clause} {order_by}", Self::select_list(columns));
+        let sql = format!("SELECT {} FROM \"{collection}\" WHERE {where_clause} {order_by}", self.select_list(collection, columns));
         self.query_rows(collection, columns, &sql, &cells).map(Some)
+    }
+
+    /// `db.<c>.select(selector)` (GRAMMAR.md §3.248): proyección de campos parciales
+    /// empujada a SQL `SELECT col1, col2, ...` en vez de `SELECT *`.
+    pub(crate) fn select_projected(&self, collection: &str, plan: &crate::ast::ProjectionPlan) -> Result<Option<Vec<Value>>, RuntimeError> {
+        self.select_projected_internal(collection, plan, None)
+    }
+
+    /// `db.<c>.orderBy(...).select(selector)` (GRAMMAR.md §3.248): proyección parcial con ORDER BY.
+    pub(crate) fn select_projected_ordered(
+        &self,
+        collection: &str,
+        plan: &crate::ast::ProjectionPlan,
+        order: &[OrderKey],
+    ) -> Result<Option<Vec<Value>>, RuntimeError> {
+        self.select_projected_internal(collection, plan, Some(order))
+    }
+
+    fn select_projected_internal(
+        &self,
+        collection: &str,
+        plan: &crate::ast::ProjectionPlan,
+        order: Option<&[OrderKey]>,
+    ) -> Result<Option<Vec<Value>>, RuntimeError> {
+        let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        let id_col = self.id_col(collection);
+        let id_kind = self.id_kind(collection);
+        let id_column_kind = self.id_column_kind(collection);
+        let key = self.encryption_key();
+
+        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let order_by = match order {
+            Some(ord) => self.order_by_sql(collection, columns, ord)?,
+            None => format!("ORDER BY \"{id_col}\""),
+        };
+
+        match plan {
+            crate::ast::ProjectionPlan::Scalar(source_field) => {
+                let (sql_col, col_kind, col_plan) = if source_field == "id" {
+                    (id_col.to_string(), id_column_kind, None)
+                } else {
+                    let Some(c) = columns.iter().find(|col| &col.field.name == source_field) else {
+                        return Ok(None);
+                    };
+                    (c.sql_name.clone(), c.kind(), Some(c))
+                };
+
+                let sql = format!("SELECT \"{sql_col}\" FROM \"{collection}\" {where_clause}{order_by}");
+                let rows = self
+                    .backend
+                    .query(&sql, &[], &[col_kind])
+                    .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+
+                let mut result = Vec::with_capacity(rows.len());
+                for cells in rows {
+                    let cell = cells.into_iter().next().unwrap_or(Cell::Null);
+                    let val = match col_plan {
+                        None => match (id_kind, cell) {
+                            (IdKind::Int, Cell::Int(n)) => Value::Int(n),
+                            (IdKind::Uuid, Cell::Text(s)) => Value::Uuid(s),
+                            _ => Value::Null,
+                        },
+                        Some(col) => match decode_column_cell(collection, col, &cell, "projection", &self.checker, key.as_ref())? {
+                            Some(v) => v,
+                            None => Value::Null,
+                        },
+                    };
+                    result.push(val);
+                }
+                Ok(Some(result))
+            }
+            crate::ast::ProjectionPlan::Struct { struct_name: _, fields } => {
+                if fields.is_empty() {
+                    return Ok(None);
+                }
+                let mut sql_cols = Vec::with_capacity(fields.len());
+                let mut kinds = Vec::with_capacity(fields.len());
+                let mut col_plans: Vec<Option<&ColumnPlan>> = Vec::with_capacity(fields.len());
+
+                for f in fields {
+                    if f.source == "id" {
+                        sql_cols.push(format!("\"{id_col}\""));
+                        kinds.push(id_column_kind);
+                        col_plans.push(None);
+                    } else {
+                        let Some(c) = columns.iter().find(|col| col.field.name == f.source) else {
+                            return Ok(None);
+                        };
+                        sql_cols.push(format!("\"{}\"", c.sql_name));
+                        kinds.push(c.kind());
+                        col_plans.push(Some(c));
+                    }
+                }
+
+                let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}{order_by}", sql_cols.join(", "));
+                let rows = self
+                    .backend
+                    .query(&sql, &[], &kinds)
+                    .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+
+                let mut result = Vec::with_capacity(rows.len());
+                for cells in rows {
+                    let mut struct_fields = Vec::with_capacity(fields.len());
+                    for (i, (f, cell)) in fields.iter().zip(cells.into_iter()).enumerate() {
+                        let col_opt = col_plans[i];
+                        match col_opt {
+                            None => {
+                                let id_val = match (id_kind, cell) {
+                                    (IdKind::Int, Cell::Int(n)) => Value::Int(n),
+                                    (IdKind::Uuid, Cell::Text(s)) => Value::Uuid(s),
+                                    _ => Value::Null,
+                                };
+                                struct_fields.push((f.target.clone(), id_val));
+                            }
+                            Some(col) => {
+                                if let Some(v) = decode_column_cell(collection, col, &cell, "projection", &self.checker, key.as_ref())? {
+                                    struct_fields.push((f.target.clone(), v));
+                                }
+                            }
+                        }
+                    }
+                    result.push(Value::Struct(struct_fields));
+                }
+                Ok(Some(result))
+            }
+        }
     }
 
     /// `"id", "campo1", ...` -- la lista de SELECT que comparten todas las
     /// lecturas de fila completa (mismo orden que `kinds` en `query_rows`).
-    fn select_list(columns: &[ColumnPlan]) -> String {
-        let mut col_list = vec!["\"id\"".to_string()];
-        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+    fn select_list(&self, collection: &str, columns: &[ColumnPlan]) -> String {
+        let id_col = self.id_col(collection);
+        let mut col_list = vec![format!("\"{id_col}\"")];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
         col_list.join(", ")
     }
 
@@ -3623,18 +4029,18 @@ db { users: User[] }
     /// vacía (o completamente soft-deleteada), nunca un error.
     fn top_row(&self, collection: &str, columns: &[ColumnPlan], method: &str, args: &[Value]) -> Result<Value, RuntimeError> {
         let field = closure_field_name(args.first(), "de orden")?;
-        if !columns.iter().any(|c| c.field.name == field) {
-            return Err(RuntimeError::new(format!("'{method}': '{field}' no es una columna real de '{collection}'")));
-        }
-        let mut col_list = vec!["\"id\"".to_string()];
-        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.field.name)));
+        let col = columns.iter().find(|c| c.field.name == field)
+            .ok_or_else(|| RuntimeError::new(format!("'{method}': '{field}' no es una columna real de '{collection}'")))?;
+        let id_col = self.id_col(collection);
+        let mut col_list = vec![format!("\"{id_col}\"")];
+        col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
         let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
         let order = match method {
             "maxRow" => "DESC",
             "minRow" => "ASC",
             other => panic!("top_row llamado con un método que Db::call no debería enrutar acá: '{other}'"),
         };
-        let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{field}\" {order} LIMIT 1", col_list.join(", "));
+        let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{}\" {order} LIMIT 1", col_list.join(", "), col.sql_name);
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
@@ -3666,11 +4072,13 @@ db { users: User[] }
         let selector = it.next();
         let field = closure_field_name(selector.as_ref(), "a incrementar")?;
         let delta = as_int(&it.next().ok_or_else(|| RuntimeError::new("increment requiere 3 argumentos (id, selector, delta)"))?)?;
-        if !columns.iter().any(|c| c.field.name == field) {
-            return Err(RuntimeError::new(format!("'increment': '{field}' no es una columna real de '{collection}'")));
-        }
+        let col = columns.iter().find(|c| c.field.name == field)
+            .ok_or_else(|| RuntimeError::new(format!("'increment': '{field}' no es una columna real de '{collection}'")))?;
+        let id_col = self.id_col(collection);
         let sql = format!(
-            "UPDATE \"{collection}\" SET \"{field}\" = \"{field}\" + {} WHERE \"id\" = {}",
+            "UPDATE \"{collection}\" SET \"{}\" = \"{}\" + {} WHERE \"{id_col}\" = {}",
+            col.sql_name,
+            col.sql_name,
             self.backend.placeholder(1),
             self.backend.placeholder(2)
         );
@@ -3719,6 +4127,118 @@ db { users: User[] }
 /// el porqué de fondo). Único punto de verdad para "cómo se convierte una
 /// fila cruda de vuelta a `Value`" -- `Db::row_to_fields` es ahora un
 /// wrapper de una línea sobre esto mismo.
+/// Decodifica una celda física para una columna específica (usado por `decode_row` y proyecciones `select`).
+pub(crate) fn decode_column_cell(
+    collection: &str,
+    col: &ColumnPlan,
+    cell: &Cell,
+    id: &str,
+    checker: &Checker,
+    encryption_key: Option<&[u8; encryption::KEY_LEN]>,
+) -> Result<Option<Value>, RuntimeError> {
+    let null_but_required = |field_name: &str| {
+        RuntimeError::new(format!(
+            "la colección '{collection}' tiene una fila (id={id}) con NULL en '{field_name}', pero el programa actual \
+             declara ese campo requerido (no `T?` ni `x?: T`) -- típico tras una migración de PostgreSQL, que siempre \
+             agrega una columna nueva como nullable sin importar si el campo es requerido en el `.link` (ver \
+             GRAMMAR.md §9.1.1): una fila insertada ANTES del cambio de tipo/opcionalidad queda con NULL ahí. \
+             Backfilleá esa columna a mano o volvé el campo a opcional."
+        ))
+    };
+
+    if col.json {
+        match cell {
+            Cell::Null => {
+                if !col.field.optional {
+                    return Err(null_but_required(&col.field.name));
+                }
+                return Ok(None);
+            }
+            Cell::Json(parsed) => {
+                let decoded = json_to_typed_value(parsed, &col.field.ty, checker, &col.field.name).map_err(|e| {
+                    RuntimeError::new(format!(
+                        "la colección '{collection}' tiene una fila (id={id}) con un JSON guardado en '{}' que no coincide con el tipo declarado actual: {e} -- típico tras evolucionar el tipo de un campo anidado (`--adopt-existing` o una migración de esquema); esa fila se guardó con una forma anterior",
+                        col.field.name
+                    ))
+                })?;
+                return Ok(Some(decoded));
+            }
+            other => {
+                return Err(RuntimeError::new(format!(
+                    "la colección '{collection}' tiene una fila (id={id}) cuya columna '{}' debería contener JSON (tipo declarado {:?}) pero la base devolvió {other:?} -- la tabla física no coincide con lo que el programa espera ahí",
+                    col.field.name, col.field.ty
+                )));
+            }
+        }
+    }
+
+    if col.encrypted {
+        let value = match cell {
+            Cell::Null => None,
+            Cell::Text(t) => {
+                let Some(key) = encryption_key else {
+                    return Err(RuntimeError::new(format!(
+                        "la colección '{collection}' tiene un campo '@encrypted' ('{}') pero no hay ninguna clave de cifrado configurada en este proceso",
+                        col.field.name
+                    )));
+                };
+                let plaintext = encryption::decrypt_field(t, key).map_err(|e| {
+                    RuntimeError::new(format!(
+                        "la colección '{collection}' tiene una fila (id={id}) con un valor '@encrypted' en '{}' que no se pudo descifrar: {e}",
+                        col.field.name
+                    ))
+                })?;
+                Some(Value::Str(plaintext))
+            }
+            other => {
+                return Err(RuntimeError::new(format!(
+                    "la colección '{collection}' tiene una fila (id={id}) cuya columna '@encrypted' '{}' debería contener texto cifrado pero la base devolvió {other:?}",
+                    col.field.name
+                )));
+            }
+        };
+        return match value {
+            Some(v) => Ok(Some(v)),
+            None if col.field.optional => Ok(None),
+            None if matches!(col.field.ty, Type::Optional(_)) => Ok(Some(Value::Null)),
+            None => Err(null_but_required(&col.field.name)),
+        };
+    }
+
+    let effective_ty: &Type = match &col.field.ty {
+        Type::Optional(inner) => inner.as_ref(),
+        other => other,
+    };
+    let value = match (effective_ty, cell) {
+        (_, Cell::Null) => None,
+        (Type::Int, Cell::Int(n)) => Some(Value::Int(*n)),
+        (Type::Int64, Cell::Int(n)) => Some(Value::Int64(*n)),
+        (Type::Decimal, Cell::Decimal(n)) => Some(Value::Decimal(*n)),
+        (Type::Timestamp, Cell::Int(n)) => Some(Value::Timestamp(*n)),
+        (Type::Float, Cell::Float(f)) => Some(Value::Float(*f)),
+        (Type::String, Cell::Text(t)) => Some(Value::Str(t.clone())),
+        (Type::Uuid, Cell::Text(t)) => Some(Value::Uuid(t.clone())),
+        (Type::Bool, Cell::Bool(b)) => Some(Value::Bool(*b)),
+        (Type::Enum(name), Cell::Text(variant)) => Some(Value::Variant {
+            enum_name: name.clone(),
+            variant: variant.clone(),
+            fields: Vec::new(),
+        }),
+        (ty, cell) => {
+            return Err(RuntimeError::new(format!(
+                "la colección '{collection}' tiene una fila (id={id}) cuya columna '{}' declara {ty} pero la base devolvió {cell:?} -- la tabla física no coincide con lo que el programa espera ahí (típico bajo --adopt-existing con datos que no calzan)",
+                col.field.name
+            )));
+        }
+    };
+    match value {
+        Some(v) => Ok(Some(v)),
+        None if col.field.optional => Ok(None),
+        None if matches!(col.field.ty, Type::Optional(_)) => Ok(Some(Value::Null)),
+        None => Err(null_but_required(&col.field.name)),
+    }
+}
+
 pub(crate) fn decode_row(
     collection: &str,
     cells: &[Cell],
@@ -3740,169 +4260,12 @@ pub(crate) fn decode_row(
     out.push(("id".to_string(), id_field));
     let id = &id_display;
 
-    let null_but_required = |field_name: &str| {
-            RuntimeError::new(format!(
-                "la colección '{collection}' tiene una fila (id={id}) con NULL en '{field_name}', pero el programa actual \
-                 declara ese campo requerido (no `T?` ni `x?: T`) -- típico tras una migración de PostgreSQL, que siempre \
-                 agrega una columna nueva como nullable sin importar si el campo es requerido en el `.link` (ver \
-                 GRAMMAR.md §9.1.1): una fila insertada ANTES del cambio de tipo/opcionalidad queda con NULL ahí. \
-                 Backfilleá esa columna a mano o volvé el campo a opcional."
-            ))
-        };
-
-        for (col, cell) in columns.iter().zip(cells.iter().skip(1)) {
-            if col.json {
-                match cell {
-                    // NULL en una columna JSON SIEMPRE significa "clave
-                    // ausente" -- solo alcanzable si `field.optional` (ver
-                    // `write_param`, nunca escribimos NULL acá si la clave es
-                    // requerida). Si la clave NO es opcional y de todos modos
-                    // llegó NULL, es el mismo desacuerdo real que el campo
-                    // nativo de abajo -- error limpio, no `Value::Null` silencioso.
-                    Cell::Null => {
-                        if !col.field.optional {
-                            return Err(null_but_required(&col.field.name));
-                        }
-                    }
-                    Cell::Json(parsed) => {
-                        // AUDIT-2026-08-27.md #14: el comentario original
-                        // ("un valor que nosotros escribimos") asume que
-                        // TODA fila fue escrita por este mismo programa --
-                        // falso bajo `--adopt-existing`/evolución de
-                        // esquema: un blob JSON legado, escrito por una
-                        // versión ANTERIOR del `.link` (un campo anidado que
-                        // ahora es requerido y antes no existía, por
-                        // ejemplo), puede no calzar con el tipo ACTUAL.
-                        // `panic!` mataba el hilo de esa request en vez de
-                        // dar el mismo `RuntimeError` limpio que el resto de
-                        // esta función ya usa para "el schema declarado no
-                        // coincide con lo que hay guardado".
-                        let decoded = json_to_typed_value(parsed, &col.field.ty, checker, &col.field.name).map_err(|e| {
-                            RuntimeError::new(format!(
-                                "la colección '{collection}' tiene una fila (id={id}) con un JSON guardado en '{}' que no coincide con el tipo declarado actual: {e} -- típico tras evolucionar el tipo de un campo anidado (`--adopt-existing` o una migración de esquema); esa fila se guardó con una forma anterior",
-                                col.field.name
-                            ))
-                        })?;
-                        out.push((col.field.name.clone(), decoded));
-                    }
-                    // Mismo motivo: bajo `--adopt-existing`, una columna que
-                    // el `.link` declara como JSON (struct/lista/map/
-                    // genérico) podría, en la tabla física real, no ser
-                    // JSON en absoluto (un `INTEGER`/`TEXT` plano de un
-                    // programa completamente distinto que casualmente
-                    // adoptó la misma tabla, por ejemplo).
-                    other => {
-                        return Err(RuntimeError::new(format!(
-                            "la colección '{collection}' tiene una fila (id={id}) cuya columna '{}' debería contener JSON (tipo declarado {:?}) pero la base devolvió {other:?} -- la tabla física no coincide con lo que el programa espera ahí",
-                            col.field.name, col.field.ty
-                        )))
-                    }
-                }
-                continue;
-            }
-
-            // `@encrypted` (GRAMMAR.md §3.191) -- el checker ya garantizó
-            // que un campo así marcado es `String`/`String?` sin `x?: T?`
-            // (así que nunca llega acá vía la rama JSON de arriba). Corre
-            // ANTES del match genérico de abajo porque descifrar es
-            // FALIBLE (clave incorrecta, dato corrompido) -- ese match
-            // devuelve `Option<Value>` sin lugar para propagar un `Err`.
-            if col.encrypted {
-                let value = match cell {
-                    Cell::Null => None,
-                    Cell::Text(t) => {
-                        // `encryption_key` es `None` solo si este `Db` nunca
-                        // tuvo `set_encryption_key` con `Some(...)` -- no
-                        // debería pasar nunca en un `linkc serve` real
-                        // (rechaza arrancar sin clave si hay campos
-                        // `@encrypted`, ver `server.rs::serve`), pero un
-                        // `RuntimeError` limpio acá es mejor que un panic si
-                        // de algún modo se llega igual (ej. un test que
-                        // arma un `Db` a mano sin pasar por `serve`).
-                        let Some(key) = encryption_key else {
-                            return Err(RuntimeError::new(format!(
-                                "la colección '{collection}' tiene un campo '@encrypted' ('{}') pero no hay ninguna clave de cifrado configurada en este proceso",
-                                col.field.name
-                            )));
-                        };
-                        let plaintext = encryption::decrypt_field(t, key).map_err(|e| {
-                            RuntimeError::new(format!(
-                                "la colección '{collection}' tiene una fila (id={id}) con un valor '@encrypted' en '{}' que no se pudo descifrar: {e}",
-                                col.field.name
-                            ))
-                        })?;
-                        Some(Value::Str(plaintext))
-                    }
-                    other => {
-                        return Err(RuntimeError::new(format!(
-                            "la colección '{collection}' tiene una fila (id={id}) cuya columna '@encrypted' '{}' debería contener texto cifrado pero la base devolvió {other:?}",
-                            col.field.name
-                        )))
-                    }
-                };
-                match value {
-                    Some(v) => out.push((col.field.name.clone(), v)),
-                    None if col.field.optional => {}
-                    None if matches!(col.field.ty, Type::Optional(_)) => out.push((col.field.name.clone(), Value::Null)),
-                    None => return Err(null_but_required(&col.field.name)),
-                }
-                continue;
-            }
-
-            let effective_ty: &Type = match &col.field.ty {
-                Type::Optional(inner) => inner.as_ref(),
-                other => other,
-            };
-            let value = match (effective_ty, cell) {
-                (_, Cell::Null) => None,
-                (Type::Int, Cell::Int(n)) => Some(Value::Int(*n)),
-                (Type::Int64, Cell::Int(n)) => Some(Value::Int64(*n)),
-                (Type::Decimal, Cell::Decimal(n)) => Some(Value::Decimal(*n)),
-                (Type::Timestamp, Cell::Int(n)) => Some(Value::Timestamp(*n)),
-                (Type::Float, Cell::Float(f)) => Some(Value::Float(*f)),
-                (Type::String, Cell::Text(t)) => Some(Value::Str(t.clone())),
-                (Type::Uuid, Cell::Text(t)) => Some(Value::Uuid(t.clone())),
-                (Type::Bool, Cell::Bool(b)) => Some(Value::Bool(*b)),
-                (Type::Enum(name), Cell::Text(variant)) => Some(Value::Variant {
-                    enum_name: name.clone(),
-                    variant: variant.clone(),
-                    fields: Vec::new(),
-                }),
-                // Un desajuste acá significa que el plan de columnas y lo que
-                // la base devolvió no coinciden: schema escrito por otra
-                // versión del programa, o un backend nuevo mapeando mal un
-                // tipo -- alcanzable de verdad bajo `--adopt-existing`
-                // (AUDIT-2026-08-27.md #14): `check_schema_for_adoption`
-                // valida existencia y tipo DECLARADO de cada columna, pero
-                // SQLite tiene afinidad de tipo, no enforcement -- una
-                // columna declarada `INTEGER` puede seguir teniendo filas
-                // con `TEXT` físico adentro si algo la escribió así antes.
-                // Fallar limpio con los dos lados a la vista (antes: panic,
-                // mataba el hilo) es lo único útil -- devolver un valor
-                // "parecido" escondería el problema adentro de la respuesta
-                // de un rpc.
-                (ty, cell) => {
-                    return Err(RuntimeError::new(format!(
-                        "la colección '{collection}' tiene una fila (id={id}) cuya columna '{}' declara {ty} pero la base devolvió {cell:?} -- la tabla física no coincide con lo que el programa espera ahí (típico bajo --adopt-existing con datos que no calzan)",
-                        col.field.name
-                    )))
-                }
-            };
-            match value {
-                Some(v) => out.push((col.field.name.clone(), v)),
-                // NULL en una columna nativa: "ausente" si la clave es
-                // opcional, si no la columna es nullable-por-tipo (`x: T?`) y
-                // NULL significa `Value::Null` con la clave presente. `x?: T?`
-                // con T nativo nunca llega acá -- ColumnPlan::for_field lo
-                // fuerza a `json` para tener el 3er estado. Si la clave NO es
-                // opcional NI el tipo declarado es `T?`, un NULL acá es el
-                // mismo desacuerdo real de arriba -- error limpio.
-                None if col.field.optional => {}
-                None if matches!(col.field.ty, Type::Optional(_)) => out.push((col.field.name.clone(), Value::Null)),
-                None => return Err(null_but_required(&col.field.name)),
-            }
+    for (col, cell) in columns.iter().zip(cells.iter().skip(1)) {
+        if let Some(v) = decode_column_cell(collection, col, cell, id, checker, encryption_key)? {
+            out.push((col.field.name.clone(), v));
         }
-        Ok(out)
+    }
+    Ok(out)
 }
 
 impl Db {
@@ -4775,4 +5138,187 @@ mod composite_index_tests {
             .collect();
         assert!(names.iter().any(|n| n == "idx_tasks_multi_6$active7$nextRun"), "{names:?}");
     }
+
+    #[test]
+    fn column_alias_creates_physical_columns_and_operates_crud() {
+        let path = std::env::temp_dir().join("c_script_test_column_alias.db");
+        let _ = std::fs::remove_file(&path);
+
+        let src = r#"
+            type User = {
+                @column("user_id") id: Int,
+                @column("user_name") name: String,
+                @column("mail_addr") email: String,
+                age: Int,
+            }
+            type NewUser = {
+                @column("user_name") name: String,
+                @column("mail_addr") email: String,
+                age: Int,
+            }
+            type PatchUser = {
+                @column("user_name") name: String?,
+                age: Int?,
+            }
+            db { users: User[] }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let db = Db::new(&program, &path);
+
+        // Verifica las columnas físicas en SQLite
+        let raw = Connection::open(&path).unwrap();
+        let mut stmt = raw.prepare("PRAGMA table_info(\"users\")").unwrap();
+        let col_names: Vec<String> = stmt.query_map([], |row| row.get(1)).unwrap().map(|r| r.unwrap()).collect();
+        assert_eq!(col_names, vec!["user_id", "user_name", "mail_addr", "age"]);
+
+        // Insert
+        let new_user = Value::Struct(vec![
+            ("name".to_string(), Value::Str("Alice".to_string())),
+            ("email".to_string(), Value::Str("alice@example.com".to_string())),
+            ("age".to_string(), Value::Int(30)),
+        ]);
+        let inserted = db.call("users", "insert", vec![new_user]).unwrap();
+        let Value::Struct(fields) = &inserted else { panic!("se esperaba struct") };
+        assert_eq!(fields.iter().find(|(n, _)| n == "id").unwrap().1, Value::Int(1));
+        assert_eq!(fields.iter().find(|(n, _)| n == "name").unwrap().1, Value::Str("Alice".to_string()));
+
+        // Find
+        let found = db.call("users", "find", vec![Value::Int(1)]).unwrap();
+        let Value::Struct(f_fields) = &found else { panic!("se esperaba struct") };
+        assert_eq!(f_fields.iter().find(|(n, _)| n == "name").unwrap().1, Value::Str("Alice".to_string()));
+
+        // ApplyPatch
+        let patch = Value::Struct(vec![
+            ("name".to_string(), Value::Str("Alicia".to_string())),
+        ]);
+        let patched = db.call("users", "applyPatch", vec![Value::Int(1), patch]).unwrap();
+        let Value::Struct(p_fields) = &patched else { panic!("se esperaba struct") };
+        assert_eq!(p_fields.iter().find(|(n, _)| n == "name").unwrap().1, Value::Str("Alicia".to_string()));
+
+        // Delete
+        let deleted = db.call("users", "delete", vec![Value::Int(1)]).unwrap();
+        assert_eq!(deleted, Value::Bool(true));
+        let all = db.call("users", "all", vec![]).unwrap();
+        assert_eq!(all, Value::List(vec![]));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pushdown_in_list_and_string_match_queries() {
+        let src = r#"
+            type Item = {
+                id: Int,
+                title: String,
+                sku: String,
+                price: Int,
+            }
+            db { items: Item[] }
+        "#;
+        let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
+        let db = Db::new(&program, std::path::Path::new(":memory:"));
+
+        db.call("items", "insert", vec![Value::Struct(vec![
+            ("title".to_string(), Value::Str("Laptop Pro 100%_genuine".to_string())),
+            ("sku".to_string(), Value::Str("TECH-LP-01".to_string())),
+            ("price".to_string(), Value::Int(1500)),
+        ])]).unwrap();
+
+        db.call("items", "insert", vec![Value::Struct(vec![
+            ("title".to_string(), Value::Str("Smartphone Ultra".to_string())),
+            ("sku".to_string(), Value::Str("TECH-SP-02".to_string())),
+            ("price".to_string(), Value::Int(800)),
+        ])]).unwrap();
+
+        db.call("items", "insert", vec![Value::Struct(vec![
+            ("title".to_string(), Value::Str("Coffee Mug".to_string())),
+            ("sku".to_string(), Value::Str("HOME-MG-03".to_string())),
+            ("price".to_string(), Value::Int(15)),
+        ])]).unwrap();
+
+        // 1. InList con IDs
+        let cond_in = ConditionExpr::InList {
+            field: "id".to_string(),
+            values: vec![Value::Int(1), Value::Int(3)],
+            negated: false,
+        };
+        let rows = db.find_where_conjunction("items", &cond_in).unwrap().unwrap();
+        assert_eq!(rows.len(), 2, "debe encontrar ids 1 y 3");
+
+        // 2. InList negado
+        let cond_not_in = ConditionExpr::InList {
+            field: "id".to_string(),
+            values: vec![Value::Int(1)],
+            negated: true,
+        };
+        let rows = db.find_where_conjunction("items", &cond_not_in).unwrap().unwrap();
+        assert_eq!(rows.len(), 2, "debe excluir id 1");
+
+        // 3. InList con lista vacía
+        let cond_empty = ConditionExpr::InList {
+            field: "id".to_string(),
+            values: vec![],
+            negated: false,
+        };
+        let rows = db.find_where_conjunction("items", &cond_empty).unwrap().unwrap();
+        assert_eq!(rows.len(), 0, "lista vacía no matchea nada");
+
+        // 4. StringMatch Contains
+        let cond_contains = ConditionExpr::StringMatch {
+            field: "title".to_string(),
+            op: crate::ast::StringMatchOp::Contains,
+            pattern: "Phone".to_string(),
+            negated: false,
+        };
+        let rows = db.find_where_conjunction("items", &cond_contains).unwrap().unwrap();
+        assert_eq!(rows.len(), 1, "Phone matchea Smartphone");
+
+        // 5. StringMatch StartsWith
+        let cond_starts = ConditionExpr::StringMatch {
+            field: "sku".to_string(),
+            op: crate::ast::StringMatchOp::StartsWith,
+            pattern: "TECH-".to_string(),
+            negated: false,
+        };
+        let rows = db.find_where_conjunction("items", &cond_starts).unwrap().unwrap();
+        assert_eq!(rows.len(), 2, "TECH- matchea 2 items");
+
+        // 6. StringMatch EndsWith
+        let cond_ends = ConditionExpr::StringMatch {
+            field: "sku".to_string(),
+            op: crate::ast::StringMatchOp::EndsWith,
+            pattern: "-03".to_string(),
+            negated: false,
+        };
+        let rows = db.find_where_conjunction("items", &cond_ends).unwrap().unwrap();
+        assert_eq!(rows.len(), 1, "-03 matchea Coffee Mug");
+
+        // 7. Escape de comodines: buscar '%_' no debe comportarse como comodines libres
+        let cond_escape = ConditionExpr::StringMatch {
+            field: "title".to_string(),
+            op: crate::ast::StringMatchOp::Contains,
+            pattern: "100%_".to_string(),
+            negated: false,
+        };
+        let rows = db.find_where_conjunction("items", &cond_escape).unwrap().unwrap();
+        assert_eq!(rows.len(), 1, "debe encontrar '100%_' literalmente");
+
+        // 8. Conjunción: InList + StringMatch
+        let cond_and = ConditionExpr::And(vec![
+            ConditionExpr::InList {
+                field: "id".to_string(),
+                values: vec![Value::Int(1), Value::Int(2)],
+                negated: false,
+            },
+            ConditionExpr::StringMatch {
+                field: "sku".to_string(),
+                op: crate::ast::StringMatchOp::StartsWith,
+                pattern: "TECH-SP".to_string(),
+                negated: false,
+            },
+        ]);
+        let rows = db.find_where_conjunction("items", &cond_and).unwrap().unwrap();
+        assert_eq!(rows.len(), 1, "intersección de id IN (1,2) y SKU TECH-SP");
+    }
+
 }

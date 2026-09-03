@@ -398,6 +398,8 @@ pub struct ServeConfig {
     /// GRAMMAR.md §3.241: `--max-concurrency`, tope de requests en vuelo;
     /// `None` = sin tope (un hilo por request, sin límite, como siempre).
     pub max_concurrency: Option<usize>,
+    /// PLAN.md §9.20 Fase 1.1: `--db-pool-size`/`LINK_DATABASE_POOL_SIZE`, tamaño del pool de conexiones PostgreSQL.
+    pub db_pool_size: Option<usize>,
 }
 pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     let ServeConfig {
@@ -417,6 +419,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         ai_timeout,
         fallback_upstream,
         max_concurrency,
+        db_pool_size,
         http_timeout,
         trust_proxy,
         service_api_key,
@@ -442,13 +445,13 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     // que ahí es `None` y el loop se queda con el `incoming_requests()`
     // bloqueante de siempre, sin overhead de polling.
     let (db, remote_changes) = match source {
-        DbSource::SqliteFile(db_path) => (Db::new_with_options(program, &db_path, adopt_existing), None),
+        DbSource::SqliteFile(db_path) => (Db::new_with_pool_options(program, &db_path, adopt_existing, db_pool_size), None),
         // A diferencia de abrir un archivo local, conectarse a una base remota
         // falla por motivos operativos normales (está caída, la clave cambió,
         // la base no existe todavía). Eso merece un mensaje que se entienda,
         // devuelto como `Err` -- no un exit del proceso entero, ver el
         // comentario de `serve` arriba.
-        DbSource::Postgres(url) => match Db::connect_postgres_with_options(program, &url, adopt_existing, db_schema.as_deref()) {
+        DbSource::Postgres(url) => match Db::connect_postgres_with_options(program, &url, adopt_existing, db_schema.as_deref(), db_pool_size) {
             Ok((db, rx)) => (db, Some(rx)),
             Err(e) => {
                 return Err(format!("error: {e}\n       revisá la URL de conexión (LINK_DATABASE_URL o --db) y que la base esté levantada"));

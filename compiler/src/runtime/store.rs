@@ -19,8 +19,6 @@
 //! `Cell` es el tipo de valor común: lo que se bindea a un parámetro y lo que
 //! se lee de una fila, idéntico para los dos motores.
 
-use std::cell::RefCell;
-
 /// Un valor SQL, en el vocabulario del lenguaje y no en el de un motor.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Cell {
@@ -75,107 +73,402 @@ pub(crate) enum ColumnKind {
     Decimal,
 }
 
-/// `ReentrantMutex`, no `std::sync::Mutex` -- GRAMMAR.md, Pilar 1 del
-/// roadmap de concurrencia (26/08/2026, a partir del pedido de skynet-d3):
-/// `linkc serve` pasa a un hilo por request, así que la conexión real
-/// necesita ser SEGURA entre hilos -- pero `transaction { }` (§3.154)
-/// sostiene el candado por TODA su duración (BEGIN + cuerpo + COMMIT/
-/// ROLLBACK), y el cuerpo llama de vuelta a `insert`/`applyPatch`/`find`/
-/// etc., que TAMBIÉN piden el candado para su propia operación -- con un
-/// `Mutex` común eso sería el mismo hilo bloqueándose a sí mismo (deadlock
-/// garantizado, no una condición de carrera rara). Reentrante: el mismo
-/// hilo puede volver a pedirlo cuantas veces haga falta sin bloquearse,
-/// otro hilo sí espera de verdad. `RefCell` adentro para Postgres porque
-/// `postgres::Client` pide `&mut self` para consultar -- `ReentrantMutex`
-/// solo da `&T` al lockear (nunca `&mut T`, sería inseguro si el mismo
-/// hilo pudiera reentrar con dos `&mut` vivos a la vez), así que la
-/// mutabilidad real todavía la da `RefCell` puertas adentro del candado ya
-/// tomado. SQLite no lo necesita: los métodos de `rusqlite::Connection`
-/// (`execute`/`query`/`prepare`) ya toman `&self`, la mutabilidad interna
-/// la maneja la propia librería C de SQLite.
-// La diferencia de tamaño entre variantes no importa acá: hay UNA instancia
-// de `Backend` por base conectada (una o dos por proceso), nunca una
-// colección de ellas -- boxear la variante grande solo sumaría una
-// indirección sin ahorrar nada real.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum Backend {
-    Sqlite(parking_lot::ReentrantMutex<rusqlite::Connection>),
-    Postgres {
-        client: parking_lot::ReentrantMutex<RefCell<postgres::Client>>,
-        /// La URL de conexión original -- guardada para poder RECONECTAR
-        /// (`with_reconnect`, abajo) con el mismo criterio de TLS que usó
-        /// la conexión inicial (`db::connect_postgres_client`), sin
-        /// duplicar esa lógica acá (GRAMMAR.md §3.40).
-        url: String,
-        /// `--db-schema`/`LINK_DATABASE_SCHEMA` (GRAMMAR.md §3.193), si se
-        /// configuró -- guardado por el MISMO motivo que `url`: un
-        /// reconnect (`with_reconnect`) tiene que reaplicar `SET
-        /// search_path` en la conexión NUEVA, no solo en la original.
-        schema: Option<String>,
-    },
+static POOL_ID_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+thread_local! {
+    static PINNED_PG_CLIENT: std::cell::RefCell<Option<(usize, postgres::Client, usize)>> = const { std::cell::RefCell::new(None) };
 }
 
-impl Backend {
-    pub(crate) fn is_postgres(&self) -> bool {
-        matches!(self, Backend::Postgres { .. })
+/// Pool de conexiones nativo para PostgreSQL (PLAN.md §9.20 Fase 1.1).
+///
+/// Permite consultas concurrentes reales en `linkc serve` sin serialización
+/// detrás de una conexión única. Soporta fijación de conexión por hilo
+/// (`with_exclusive`) para bloques de transacción (`transaction { ... }`) y
+/// `upsert`, con reentrancia en el mismo hilo y liberación segura con RAII
+/// incluso ante pánicos.
+pub(crate) struct PostgresPool {
+    id: usize,
+    url: String,
+    schema: Option<String>,
+    max_size: usize,
+    idle: parking_lot::Mutex<Vec<postgres::Client>>,
+    total_conns: parking_lot::Mutex<usize>,
+    available: parking_lot::Condvar,
+}
+
+impl PostgresPool {
+    pub(crate) fn new(initial_client: postgres::Client, url: &str, schema: Option<&str>, max_size: usize) -> Self {
+        let max_size = max_size.max(1);
+        Self {
+            id: POOL_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            url: url.to_string(),
+            schema: schema.map(str::to_string),
+            max_size,
+            idle: parking_lot::Mutex::new(vec![initial_client]),
+            total_conns: parking_lot::Mutex::new(1),
+            available: parking_lot::Condvar::new(),
+        }
     }
 
-    /// Sostiene el candado de la conexión por TODA la duración de `f` --
-    /// para `transaction { }` (GRAMMAR.md §3.154), que necesita que
-    /// `BEGIN`/el cuerpo entero/`COMMIT`-`ROLLBACK` corran como una sola
-    /// sección exclusiva, sin que OTRO hilo (otra request) intercale una
-    /// escritura suya a mitad de una transacción ajena en la MISMA
-    /// conexión física. `f` llama de vuelta a operaciones normales
-    /// (`execute`/`query`/etc.) que también piden este mismo candado --
-    /// reentrante, así que el mismo hilo no se bloquea a sí mismo.
-    pub(crate) fn with_exclusive<T>(&self, f: impl FnOnce() -> T) -> T {
-        match self {
-            Backend::Sqlite(conn) => {
-                let _guard = conn.lock();
-                f()
+    pub(crate) fn max_size(&self) -> usize {
+        self.max_size
+    }
+
+    pub(crate) fn total_conns(&self) -> usize {
+        *self.total_conns.lock()
+    }
+
+    pub(crate) fn idle_conns(&self) -> usize {
+        self.idle.lock().len()
+    }
+
+    pub(crate) fn acquire(&self) -> Result<postgres::Client, String> {
+        let mut idle_guard = self.idle.lock();
+        loop {
+            if let Some(client) = idle_guard.pop() {
+                if client.is_closed() {
+                    drop(idle_guard);
+                    if let Ok(fresh) = super::db::connect_postgres_client(&self.url, self.schema.as_deref()) {
+                        return Ok(fresh);
+                    } else {
+                        let mut tg = self.total_conns.lock();
+                        *tg = tg.saturating_sub(1);
+                        idle_guard = self.idle.lock();
+                        continue;
+                    }
+                }
+                return Ok(client);
             }
-            Backend::Postgres { client, .. } => {
-                let _guard = client.lock();
-                f()
+
+            let mut total_guard = self.total_conns.lock();
+            if *total_guard < self.max_size {
+                *total_guard += 1;
+                drop(total_guard);
+                drop(idle_guard);
+                match super::db::connect_postgres_client(&self.url, self.schema.as_deref()) {
+                    Ok(client) => return Ok(client),
+                    Err(e) => {
+                        let mut tg = self.total_conns.lock();
+                        *tg = tg.saturating_sub(1);
+                        self.available.notify_one();
+                        return Err(e);
+                    }
+                }
+            }
+            drop(total_guard);
+
+            let timeout_result = self.available.wait_for(&mut idle_guard, std::time::Duration::from_secs(30));
+            if timeout_result.timed_out() && idle_guard.is_empty() {
+                return Err("timeout (30s) esperando por una conexión disponible en el pool de PostgreSQL".to_string());
             }
         }
     }
 
-    /// El placeholder del parámetro `n` (1-based).
+    pub(crate) fn release(&self, client: postgres::Client) {
+        let mut idle_guard = self.idle.lock();
+        idle_guard.push(client);
+        self.available.notify_one();
+    }
+
+    pub(crate) fn with_exclusive<T>(&self, f: impl FnOnce() -> T) -> T {
+        PINNED_PG_CLIENT.with(|cell| {
+            let mut borrowed = cell.borrow_mut();
+            if let Some((pid, _, depth)) = borrowed.as_mut() {
+                if *pid == self.id {
+                    *depth += 1;
+                } else {
+                    panic!("no se puede anidar transacciones de pools diferentes en el mismo hilo");
+                }
+            } else {
+                let client = match self.acquire() {
+                    Ok(c) => c,
+                    Err(e) => panic!("falló al adquirir conexión para transacción: {e}"),
+                };
+                *borrowed = Some((self.id, client, 1));
+            }
+        });
+
+        struct ExclusiveGuard<'a> {
+            pool: &'a PostgresPool,
+        }
+
+        impl<'a> Drop for ExclusiveGuard<'a> {
+            fn drop(&mut self) {
+                let conn_to_release = PINNED_PG_CLIENT.with(|cell| {
+                    let mut borrowed = cell.borrow_mut();
+                    if let Some((pid, _, depth)) = borrowed.as_mut() {
+                        if *pid == self.pool.id {
+                            *depth -= 1;
+                            if *depth == 0 {
+                                return borrowed.take().map(|(_, client, _)| client);
+                            }
+                        }
+                    }
+                    None
+                });
+
+                if let Some(client) = conn_to_release {
+                    self.pool.release(client);
+                }
+            }
+        }
+
+        let _guard = ExclusiveGuard { pool: self };
+        f()
+    }
+
+    pub(crate) fn with_client<T>(&self, op: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error>) -> Result<T, String> {
+        let is_pinned = PINNED_PG_CLIENT.with(|cell| {
+            cell.borrow().as_ref().map(|(pid, _, _)| *pid == self.id).unwrap_or(false)
+        });
+
+        if is_pinned {
+            return PINNED_PG_CLIENT.with(|cell| {
+                let mut borrowed = cell.borrow_mut();
+                let (_, client, _) = borrowed.as_mut().unwrap();
+                with_client_reconnect(client, &self.url, self.schema.as_deref(), op)
+            });
+        }
+
+        let mut client = self.acquire()?;
+        let result = with_client_reconnect(&mut client, &self.url, self.schema.as_deref(), op);
+        self.release(client);
+        result
+    }
+}
+
+fn with_client_reconnect<T>(
+    client: &mut postgres::Client,
+    url: &str,
+    schema: Option<&str>,
+    op: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error>,
+) -> Result<T, String> {
+    let result = op(client);
+    if let Err(e) = &result {
+        if e.is_closed() {
+            if let Ok(fresh) = super::db::connect_postgres_client(url, schema) {
+                *client = fresh;
+            }
+        }
+    }
+    result.map_err(|e| describe_postgres_error(&e))
+}
+
+/// PLAN.md §9.20 Fase 1.2 / GRAMMAR.md §3.246: Pool de conexiones SQLite sobre WAL
+/// con 1 conexión escritora serializada y un pool de lectores paralelos sin contención.
+pub(crate) struct SqlitePool {
+    writer: parking_lot::ReentrantMutex<rusqlite::Connection>,
+    readers: parking_lot::Mutex<Vec<rusqlite::Connection>>,
+    db_path: Option<std::path::PathBuf>,
+    max_readers: usize,
+}
+
+thread_local! {
+    static SQLITE_IN_TRANSACTION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct SqliteExclusiveGuard;
+impl Drop for SqliteExclusiveGuard {
+    fn drop(&mut self) {
+        SQLITE_IN_TRANSACTION.with(|depth| {
+            let cur = depth.get();
+            if cur > 0 {
+                depth.set(cur - 1);
+            }
+        });
+    }
+}
+
+impl SqlitePool {
+    pub(crate) fn new(writer: rusqlite::Connection, path: Option<&std::path::Path>, max_readers: usize) -> Self {
+        let _ = writer.pragma_update(None, "journal_mode", "WAL");
+        let _ = writer.pragma_update(None, "synchronous", "NORMAL");
+
+        let db_path = path.and_then(|p| {
+            let s = p.to_string_lossy();
+            if s == ":memory:" || s.is_empty() {
+                None
+            } else {
+                Some(p.to_path_buf())
+            }
+        });
+
+        SqlitePool {
+            writer: parking_lot::ReentrantMutex::new(writer),
+            readers: parking_lot::Mutex::new(Vec::new()),
+            db_path,
+            max_readers: max_readers.max(1),
+        }
+    }
+
+    pub(crate) fn max_readers(&self) -> usize {
+        self.max_readers
+    }
+
+    pub(crate) fn idle_readers(&self) -> usize {
+        self.readers.lock().len()
+    }
+
+    pub(crate) fn with_exclusive<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _writer_guard = self.writer.lock();
+        SQLITE_IN_TRANSACTION.with(|depth| depth.set(depth.get() + 1));
+        let _depth_guard = SqliteExclusiveGuard;
+        f()
+    }
+
+    pub(crate) fn execute(&self, sql: &str, params: &[Cell]) -> Result<usize, String> {
+        let conn = self.writer.lock();
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+        conn.execute(sql, refs.as_slice()).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn execute_ddl(&self, sql: &str) -> Result<(), String> {
+        self.writer.lock().execute_batch(sql).map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn insert_returning_id(&self, sql: &str, params: &[Cell]) -> Result<i64, String> {
+        let conn = self.writer.lock();
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+        conn.execute(sql, refs.as_slice()).map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub(crate) fn with_reader<T>(&self, f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>) -> Result<T, String> {
+        let in_tx = SQLITE_IN_TRANSACTION.with(|d| d.get() > 0);
+        if in_tx || self.db_path.is_none() {
+            let conn = self.writer.lock();
+            return f(&conn);
+        }
+
+        let path = self.db_path.as_ref().unwrap();
+        let mut conn = {
+            let mut readers = self.readers.lock();
+            readers.pop()
+        };
+
+        if conn.is_none() {
+            let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            match rusqlite::Connection::open_with_flags(path, flags) {
+                Ok(new_conn) => {
+                    let _ = new_conn.busy_timeout(std::time::Duration::from_millis(5000));
+                    let _ = new_conn.pragma_update(None, "query_only", "ON");
+                    conn = Some(new_conn);
+                }
+                Err(_) => {
+                    let fallback_flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+                    match rusqlite::Connection::open_with_flags(path, fallback_flags) {
+                        Ok(new_conn) => {
+                            let _ = new_conn.busy_timeout(std::time::Duration::from_millis(5000));
+                            conn = Some(new_conn);
+                        }
+                        Err(_) => {
+                            let conn = self.writer.lock();
+                            return f(&conn);
+                        }
+                    }
+                }
+            }
+        }
+
+        let conn = conn.unwrap();
+        let res = f(&conn);
+
+        let mut readers = self.readers.lock();
+        if readers.len() < self.max_readers {
+            readers.push(conn);
+        }
+
+        res
+    }
+
+    pub(crate) fn query(
+        &self,
+        sql: &str,
+        params: &[Cell],
+        kinds: &[ColumnKind],
+    ) -> Result<Vec<Vec<Cell>>, String> {
+        self.with_reader(|conn| {
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+            let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(refs.as_slice(), |row| {
+                    let mut out = Vec::with_capacity(kinds.len());
+                    for (i, kind) in kinds.iter().enumerate() {
+                        out.push(sqlite_cell(row, i, *kind)?);
+                    }
+                    Ok(out)
+                })
+                .map_err(|e| e.to_string())?;
+            rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
+        })
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Backend {
+    Sqlite(std::sync::Arc<SqlitePool>),
+    Postgres(std::sync::Arc<PostgresPool>),
+}
+
+impl Backend {
+    pub(crate) fn is_postgres(&self) -> bool {
+        matches!(self, Backend::Postgres(_))
+    }
+
+    pub(crate) fn sqlite(connection: rusqlite::Connection, path: Option<&std::path::Path>, max_readers: usize) -> Self {
+        Backend::Sqlite(std::sync::Arc::new(SqlitePool::new(connection, path, max_readers)))
+    }
+
+    pub(crate) fn sqlite_pool_info(&self) -> Option<(usize, usize)> {
+        match self {
+            Backend::Sqlite(pool) => Some((pool.max_readers(), pool.idle_readers())),
+            Backend::Postgres(_) => None,
+        }
+    }
+
+    pub(crate) fn postgres(client: postgres::Client, url: &str, schema: Option<&str>, pool_size: usize) -> Self {
+        Backend::Postgres(std::sync::Arc::new(PostgresPool::new(client, url, schema, pool_size)))
+    }
+
+    pub(crate) fn postgres_pool_info(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            Backend::Sqlite(_) => None,
+            Backend::Postgres(pool) => Some((pool.max_size(), pool.total_conns(), pool.idle_conns())),
+        }
+    }
+
+    pub(crate) fn with_exclusive<T>(&self, f: impl FnOnce() -> T) -> T {
+        match self {
+            Backend::Sqlite(pool) => pool.with_exclusive(f),
+            Backend::Postgres(pool) => pool.with_exclusive(f),
+        }
+    }
+
     pub(crate) fn placeholder(&self, n: usize) -> String {
         match self {
             Backend::Sqlite(_) => "?".to_string(),
-            Backend::Postgres { .. } => format!("${n}"),
+            Backend::Postgres(_) => format!("${n}"),
         }
     }
 
     pub(crate) fn execute(&self, sql: &str, params: &[Cell]) -> Result<usize, String> {
         match self {
-            Backend::Sqlite(conn) => {
-                let conn = conn.lock();
-                let refs: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
-                conn.execute(sql, refs.as_slice()).map_err(|e| e.to_string())
-            }
-            Backend::Postgres { client, url, schema } => {
+            Backend::Sqlite(pool) => pool.execute(sql, params),
+            Backend::Postgres(pool) => {
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     params.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
-                with_reconnect(client, url, schema.as_deref(), |c| c.execute(sql, refs.as_slice())).map(|n| n as usize)
+                pool.with_client(|c| c.execute(sql, refs.as_slice())).map(|n| n as usize)
             }
         }
     }
 
-    /// Ejecuta SQL sin parámetros ni filas de vuelta (DDL).
     pub(crate) fn execute_ddl(&self, sql: &str) -> Result<(), String> {
         match self {
-            Backend::Sqlite(conn) => conn.lock().execute_batch(sql).map_err(|e| e.to_string()),
-            Backend::Postgres { client, url, schema } => with_reconnect(client, url, schema.as_deref(), |c| c.batch_execute(sql)),
+            Backend::Sqlite(pool) => pool.execute_ddl(sql),
+            Backend::Postgres(pool) => pool.with_client(|c| c.batch_execute(sql)),
         }
     }
 
-    /// Las filas, decodificadas posicionalmente según `kinds`. Una columna NULL
-    /// siempre vuelve como `Cell::Null`, sea del tipo que sea -- distinguir
-    /// "ausente" de "null" es trabajo de `ColumnPlan`, no de acá.
     pub(crate) fn query(
         &self,
         sql: &str,
@@ -183,26 +476,11 @@ impl Backend {
         kinds: &[ColumnKind],
     ) -> Result<Vec<Vec<Cell>>, String> {
         match self {
-            Backend::Sqlite(conn) => {
-                let conn = conn.lock();
-                let refs: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
-                let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-                let rows = stmt
-                    .query_map(refs.as_slice(), |row| {
-                        let mut out = Vec::with_capacity(kinds.len());
-                        for (i, kind) in kinds.iter().enumerate() {
-                            out.push(sqlite_cell(row, i, *kind)?);
-                        }
-                        Ok(out)
-                    })
-                    .map_err(|e| e.to_string())?;
-                rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
-            }
-            Backend::Postgres { client, url, schema } => {
+            Backend::Sqlite(pool) => pool.query(sql, params, kinds),
+            Backend::Postgres(pool) => {
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     params.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
-                let rows = with_reconnect(client, url, schema.as_deref(), |c| c.query(sql, refs.as_slice()))?;
+                let rows = pool.with_client(|c| c.query(sql, refs.as_slice()))?;
                 rows.iter()
                     .map(|row| {
                         kinds
@@ -216,108 +494,27 @@ impl Backend {
         }
     }
 
-    /// El INSERT y el id que la base le asignó a la fila, en una sola operación
-    /// donde el motor lo permite. `sql` no debe traer `RETURNING`: lo agrega
-    /// esta función cuando corresponde.
-    pub(crate) fn insert_returning_id(&self, sql: &str, params: &[Cell]) -> Result<i64, String> {
+    pub(crate) fn insert_returning_id(&self, sql: &str, params: &[Cell], id_col: &str) -> Result<i64, String> {
         match self {
-            Backend::Sqlite(conn) => {
-                let conn = conn.lock();
-                let refs: Vec<&dyn rusqlite::ToSql> =
-                    params.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
-                conn.execute(sql, refs.as_slice()).map_err(|e| e.to_string())?;
-                Ok(conn.last_insert_rowid())
-            }
-            // En PostgreSQL no hay `last_insert_rowid()`, y su equivalente
-            // (`lastval()`) es por sesión: con una segunda conexión de por medio
-            // devolvería el id de otra fila. `RETURNING` lo resuelve en la misma
-            // sentencia, sin ventana de carrera posible.
-            Backend::Postgres { client, url, schema } => {
+            Backend::Sqlite(pool) => pool.insert_returning_id(sql, params),
+            Backend::Postgres(pool) => {
                 let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     params.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
-                let returning = format!("{sql} RETURNING \"id\"");
-                let row = with_reconnect(client, url, schema.as_deref(), |c| c.query_one(&returning, refs.as_slice()))?;
-                // `Row::get` (a diferencia de todo lo demás en este archivo)
-                // PANICKEA si el valor no convierte al tipo pedido -- documentado
-                // así en tokio-postgres. `Db::connect_postgres` ya rechaza al
-                // conectar cualquier tabla preexistente cuyo "id" no sea entero
-                // (ver validate_existing_id_column en db.rs), así que en el
-                // camino normal esto nunca dispara -- pero como handle_rpc corre
-                // sincrónico en el hilo principal del accept-loop (server.rs), un
-                // panic acá tira abajo el servidor ENTERO, no solo esta request.
-                // `try_get` es la variante que no panickea: defensa en
-                // profundidad, no confiar en que la validación de arriba sea la
-                // única puerta.
-                //
-                // `validate_existing_id_column` (db.rs) acepta "bigint",
-                // "integer" Y "smallint" -- una tabla preexistente con "id"
-                // `SERIAL`/`INTEGER GENERATED ALWAYS AS IDENTITY` (int4, no
-                // int8) pasa esa validación al conectar. `try_get::<_, i64>`
-                // exige que el OID de la columna sea EXACTAMENTE int8 --
-                // contra un int4/int2 real devolvía error en CADA insert,
-                // pese a que el connect había aceptado la tabla (el mismo
-                // desacuerdo entre capas que GRAMMAR.md §3.9 viene
-                // documentando desde v1.0). `postgres_int_cell` prueba los
-                // tres anchos que esa validación ya reconoce como válidos.
+                let returning = format!("{sql} RETURNING \"{id_col}\"");
+                let row = pool.with_client(|c| c.query_one(&returning, refs.as_slice()))?;
                 postgres_int_cell(&row, 0)?.ok_or_else(|| "\"id\" devuelto por RETURNING es NULL".to_string())
             }
         }
     }
 
-    /// `NOTIFY <channel>, <payload>` (GRAMMAR.md §3.44) -- no-op para
-    /// SQLite, que no tiene ningún mecanismo de notificación cross-proceso
-    /// (y cross-instancia solo importa cuando hay más de una instancia
-    /// compartiendo la base, que es justo el caso que Postgres cubre).
-    /// `channel` es un literal fijo del propio compilador (nunca viene de
-    /// afuera, así que interpolarlo en el SQL no es una inyección), pero
-    /// `payload` SÍ es un parámetro bindeado -- via `pg_notify()`, la forma
-    /// de función, en vez de la sentencia `NOTIFY canal, 'texto'`, que
-    /// exigiría escapar el payload a mano dentro de un literal SQL.
     pub(crate) fn notify(&self, channel: &str, payload: &str) -> Result<(), String> {
         match self {
             Backend::Sqlite(_) => Ok(()),
-            Backend::Postgres { client, url, schema } => {
-                with_reconnect(client, url, schema.as_deref(), |c| c.execute("SELECT pg_notify($1, $2)", &[&channel, &payload])).map(|_| ())
+            Backend::Postgres(pool) => {
+                pool.with_client(|c| c.execute("SELECT pg_notify($1, $2)", &[&channel, &payload])).map(|_| ())
             }
         }
     }
-}
-
-/// Repara la conexión SOLA cuando se cortó, pero nunca reintenta la
-/// operación que la encontró cortada (GRAMMAR.md §3.40). `op` corre UNA
-/// vez -- si el error es de conexión cerrada (`Error::is_closed`, ver
-/// tokio-postgres), esta request sigue devolviendo ese error tal cual (no
-/// hay forma de saber si el servidor ya había aplicado un INSERT/UPDATE
-/// antes de que la conexión se cayera; reintentarlo a ciegas podría
-/// duplicar una fila), pero la conexión se reemplaza por una nueva ANTES de
-/// devolver el error -- así que la PRÓXIMA request (un reintento real del
-/// cliente, o cualquier otro rpc) encuentra la base ya reconectada, en vez
-/// de que el proceso entero quede sirviendo error tras error hasta un
-/// reinicio manual (el comportamiento de antes de esta ronda).
-///
-/// Reconectar es best-effort: si TAMBIÉN falla, se deja el cliente viejo
-/// como estaba -- la request siguiente vuelve a intentarlo sola, con la
-/// misma lógica, sin ningún estado especial que limpiar.
-fn with_reconnect<T>(
-    client: &parking_lot::ReentrantMutex<RefCell<postgres::Client>>,
-    url: &str,
-    schema: Option<&str>,
-    op: impl FnOnce(&mut postgres::Client) -> Result<T, postgres::Error>,
-) -> Result<T, String> {
-    let guard = client.lock();
-    let result = op(&mut guard.borrow_mut());
-    if let Err(e) = &result {
-        if e.is_closed() {
-            // `connect_postgres_client` reaplica `SET search_path` (GRAMMAR.md
-            // §3.193) como parte de conectar -- una conexión NUEVA tras una
-            // caída no hereda la sesión vieja, así que sin esto una
-            // reconexión real perdería silenciosamente el schema configurado.
-            if let Ok(fresh) = super::db::connect_postgres_client(url, schema) {
-                *guard.borrow_mut() = fresh;
-            }
-        }
-    }
-    result.map_err(|e| describe_postgres_error(&e))
 }
 
 /// Bug real, encontrado verificando a mano el `@unique` COMPUESTO nuevo

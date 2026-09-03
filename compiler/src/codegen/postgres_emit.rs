@@ -9,7 +9,7 @@ use crate::runtime::db::{
     type_checks_by_collection,
 };
 use crate::types::{FieldType, Type};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Mapeo de tipos de Link a dialecto PostgreSQL nativo.
 ///
@@ -76,6 +76,7 @@ pub fn create_postgres_table_sql(
     simple_enums: &HashSet<String>,
     checks: &[(String, FieldCheck)],
     type_checks: &[String],
+    aliases: &HashMap<String, String>,
 ) -> String {
     // GRAMMAR.md §3.177: una PK `Uuid` usa el tipo NATIVO `UUID` de
     // Postgres (a diferencia de un campo `Uuid` normal, que sigue
@@ -87,24 +88,26 @@ pub fn create_postgres_table_sql(
     // nunca depende de un default de columna -- agregarlo solo sumaría
     // un requisito de versión (PostgreSQL 13+) sin ningún beneficio para
     // el camino real, así que se deja afuera a propósito.
+    let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
     let id_def = match id_field_ty {
-        Type::Uuid => "\"id\" UUID PRIMARY KEY".to_string(),
-        _ => "\"id\" BIGSERIAL PRIMARY KEY".to_string(),
+        Type::Uuid => format!("\"{id_col}\" UUID PRIMARY KEY"),
+        _ => format!("\"{id_col}\" BIGSERIAL PRIMARY KEY"),
     };
     let mut cols = vec![id_def];
 
     for f in fields {
+        let sql_col = aliases.get(&f.name).map(String::as_str).unwrap_or(&f.name);
         let pg_type = postgres_column_type(f, simple_enums);
         let not_null = if !f.optional && !matches!(f.ty, Type::Optional(_)) {
             " NOT NULL"
         } else {
             ""
         };
-        let check_clause = match checks.iter().find(|(name, _)| name == &f.name) {
-            Some((_, c)) => format!(" {}", check_clause_sql(&f.name, c)),
+        let check_clause = match checks.iter().find(|(name, _)| name == &f.name || name == sql_col) {
+            Some((_, c)) => format!(" {}", check_clause_sql(sql_col, c)),
             None => String::new(),
         };
-        cols.push(format!("\"{}\" {}{}{}", f.name, pg_type, not_null, check_clause));
+        cols.push(format!("\"{sql_col}\" {pg_type}{not_null}{check_clause}"));
     }
     for sql in type_checks {
         cols.push(format!("CHECK {sql}"));
@@ -138,6 +141,8 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
     // necesitó -- la respuesta correcta no era documentar el requisito, era
     // borrarla.
     let mut statements = vec!["-- Schema generado automáticamente por Link (PostgreSQL Enterprise Backend)".to_string()];
+    let aliases_by_collection = crate::runtime::db::column_aliases_by_collection(program, &checker);
+    let empty_aliases = HashMap::new();
     let checks_by_collection = check_fields_by_collection(program, &checker);
     let type_checks_by_collection = type_checks_by_collection(program, &checker);
     let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
@@ -149,7 +154,8 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
             let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
             let checks = checks_by_collection.get(coll_name).unwrap_or(&empty_checks);
             let type_checks = type_checks_by_collection.get(coll_name).unwrap_or(&empty_type_checks);
-            let sql = create_postgres_table_sql(coll_name, id_field_ty, &non_id_fields, &simple_enums, checks, type_checks);
+            let aliases = aliases_by_collection.get(coll_name).unwrap_or(&empty_aliases);
+            let sql = create_postgres_table_sql(coll_name, id_field_ty, &non_id_fields, &simple_enums, checks, type_checks, aliases);
             statements.push(sql);
         }
     }
@@ -161,23 +167,12 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
     // conserva -- mismo criterio que `index_fields_by_collection` en
     // `runtime/db.rs` (duplicado acá porque este módulo genera el DDL
     // ESTÁTICO para `linkc build`, sin instanciar ningún `Db` real).
-    for (coll_name, elem_ty) in checker.db_collections() {
-        let Type::Struct { name: Some(type_name), .. } = elem_ty else { continue };
-        for item in &program.items {
-            let crate::ast::Item::Type(t) = item else { continue };
-            if &t.name != type_name {
-                continue;
-            }
-            let crate::ast::TypeExpr::Struct(ast_fields) = &t.ty else { continue };
-            for f in ast_fields {
-                if let Some(unique) = f.index() {
-                    let unique_kw = if unique { "UNIQUE " } else { "" };
-                    statements.push(format!(
-                        "CREATE {unique_kw}INDEX IF NOT EXISTS \"idx_{coll_name}_{}\" ON \"{coll_name}\"(\"{}\");",
-                        f.name, f.name
-                    ));
-                }
-            }
+    for (coll_name, indexed) in crate::runtime::db::index_fields_by_collection(program, &checker) {
+        for (col_name, unique) in indexed {
+            let unique_kw = if unique { "UNIQUE " } else { "" };
+            statements.push(format!(
+                "CREATE {unique_kw}INDEX IF NOT EXISTS \"idx_{coll_name}_{col_name}\" ON \"{coll_name}\"(\"{col_name}\");"
+            ));
         }
     }
 
@@ -206,11 +201,12 @@ pub fn alter_table_add_column_postgres(
     collection: &str,
     field: &FieldType,
     simple_enums: &HashSet<String>,
+    sql_name: Option<&str>,
 ) -> String {
+    let col_name = sql_name.unwrap_or(&field.name);
     let pg_type = postgres_column_type(field, simple_enums);
     format!(
-        "ALTER TABLE \"{collection}\" ADD COLUMN IF NOT EXISTS \"{}\" {};",
-        field.name, pg_type
+        "ALTER TABLE \"{collection}\" ADD COLUMN IF NOT EXISTS \"{col_name}\" {pg_type};"
     )
 }
 
@@ -352,7 +348,7 @@ mod tests {
             ty: Type::Optional(Box::new(Type::String)),
         };
         assert_eq!(
-            alter_table_add_column_postgres("users", &field, &simple_enums),
+            alter_table_add_column_postgres("users", &field, &simple_enums, None),
             "ALTER TABLE \"users\" ADD COLUMN IF NOT EXISTS \"nickname\" JSONB;"
         );
     }
@@ -367,7 +363,7 @@ mod tests {
             ty: Type::Optional(Box::new(Type::String)),
         };
         assert_eq!(
-            alter_table_add_column_postgres("users", &field, &simple_enums),
+            alter_table_add_column_postgres("users", &field, &simple_enums, None),
             "ALTER TABLE \"users\" ADD COLUMN IF NOT EXISTS \"avatar_url\" TEXT;"
         );
     }
@@ -474,10 +470,16 @@ mod tests {
             optional: true,
             ty: Type::String,
         };
-        let alter_sql = alter_table_add_column_postgres("users", &field, &simple_enums);
+        let alter_sql = alter_table_add_column_postgres("users", &field, &simple_enums, None);
         assert_eq!(
             alter_sql,
             "ALTER TABLE \"users\" ADD COLUMN IF NOT EXISTS \"avatar_url\" TEXT;"
+        );
+
+        let alter_sql_alias = alter_table_add_column_postgres("users", &field, &simple_enums, Some("user_avatar"));
+        assert_eq!(
+            alter_sql_alias,
+            "ALTER TABLE \"users\" ADD COLUMN IF NOT EXISTS \"user_avatar\" TEXT;"
         );
     }
 }

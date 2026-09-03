@@ -8276,6 +8276,418 @@ Origen: `PLAN.md §9.18` Eje B ítem 2, subido a "corrección" por §9.20 Eje H 
 
 **Límite honesto**: es un tope y un rechazo, no una cola: no hay espera acotada ("bloqueá hasta 100 ms antes de rechazar"), y la respuesta 503 sale sin los headers CORS de §3.41 (un browser verá un fallo de red genérico en ese caso; el proxy de delante debería ser el que reintenta). El pool de conexiones a la base (Eje B ítem 3) sigue pendiente: `N` hilos siguen compartiendo UNA conexión física con un candado (§3.158).
 
+### 3.242 `@column("nombre_sql")`: mapeo desacoplado de nombres físicos de columnas SQL — RESUELTO, cierra PLAN.md §9.20 Eje H ítem 1
+
+Origen: `PLAN.md §9.20` Eje H ítem 1 ("Fase 1: Mapeo de columnas físicas `@column(...)`"). Hasta esta versión, el nombre del campo en `.link` (`userName`) determinaba obligatoriamente el nombre de la columna física en la base de datos SQL (`"userName"`). Al conectar con una base de datos preexistente o legacy (vía `--adopt-existing` o en migraciones empresariales), las columnas suelen seguir convenciones snake_case (`user_name`, `mail_address`, `acc_id`), forzando a los desarrolladores a afear los tipos de c-script y el contrato frontend en TypeScript (`user_name: string` en vez de `userName: string`).
+
+**Qué hay (v1.200.0)**: anotación `@column("nombre_sql")` sobre campos de structs declarados en `type T = { ... }`.
+- **Desacoplamiento total**: el backend en SQL (SQLite y PostgreSQL) usa el identificador físico especificado en `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WHERE`, `ORDER BY`, `CREATE TABLE` y `ALTER TABLE`.
+- **Contrato y runtime limpios**: el tipo de datos en memoria, el JSON serializado por HTTP, y el contrato emitido en TypeScript (`contract.d.ts`), Zod y validadores siguen usando el nombre idiomático del campo en c-script (`userName`).
+- **Validaciones estáticas**:
+  - El nombre de columna solo puede contener caracteres alfanuméricos y guiones bajos (`[a-zA-Z0-9_]`).
+  - No puede estar vacío.
+  - Dos campos dentro del mismo struct no pueden mapear al mismo nombre físico de columna (detección de colisiones).
+  - No se permite `@column` en variantes de enum.
+- Funciona tanto para campos regulares como para la clave primaria `id` (ej. `@column("user_id") id: Int`).
+
+<!-- linkc:check -->
+```rust
+type User = {
+  @column("user_id") id: Int,
+  @column("full_name") userName: String,
+  @column("mail_addr") email: String,
+  age: Int,
+}
+
+type NewUser = {
+  @column("full_name") userName: String,
+  @column("mail_addr") email: String,
+  age: Int,
+}
+
+db {
+  users: User[],
+}
+
+service Users {
+  rpc create(name: String, email: String, age: Int) -> User {
+    db.users.insert(NewUser {
+      userName: name,
+      email: email,
+      age: age,
+    })
+  }
+
+  rpc byName(name: String) -> User[] {
+    db.users.findWhere(|u: User| { u.userName == name })
+  }
+}
+
+test "insert y findWhere respetan el alias fisico" {
+  let u = Users.create("Ada", "ada@example.com", 36);
+  assert(u.id == 1, "id asignado");
+  assert(u.userName == "Ada", "nombre logico preservado");
+  let found = Users.byName("Ada");
+  assert(found.length() == 1, "encontrado por findWhere");
+  assert(found[0].email == "ada@example.com", "email preservado");
+}
+```
+
+**Verificado**: `compiler/tests/cli_column_alias.rs` y `compiler/src/runtime/db.rs` con tests unitarios y de integración contra el binario real, cubriendo el ciclo CRUD completo, codegen a `contract.d.ts`, y rechazo estático de colisiones y nombres inválidos.
+
+**Límites honestos**: `@column` solo aplica a campos de structs; un alias a nivel de colección/tabla (`@table("nombre")`) es parte de la Fase 4 del plan de bases de datos.
+
+### 3.243 Pushdown SQL para `lista.contains(item.campo)` (`IN`) y métodos de texto (`.contains`, `.startsWith`, `.endsWith`) — RESUELTO, cierra PLAN.md §9.20 Eje H Fase 2 (ítems 5 y 6)
+
+Origen: `PLAN.md §9.20` Eje H Fase 2 ítems 5 y 6. Hasta esta versión, el pushdown a SQL de predicados en `findWhere`/`countWhere`/`deleteWhere`/`upsert` (§3.95, §3.108, §3.109, §3.170, §3.171) solo reconocía operadores de comparación binarios planos (`==`, `!=`, `<`, `<=`, `>`, `>=`) entre campos y literales o entre dos campos. Consultas comunes como filtrar por una lista de IDs (`ids.contains(u.id)`) o buscar subcadenas (`u.name.contains("term")`, `u.code.startsWith("PR-")`) no se reconocían como predicados SQL pusheables y caían al camino interpretado (trayendo la tabla entera a memoria para filtrar fila por fila en Rust).
+
+**Qué hay (v1.200.0)**:
+- **Pertenencia a listas / conjuntos (`IN (...)`)**:
+  - `lista.contains(item.campo)` se traduce a SQL `"campo" IN (?, ?, ...)` (SQLite) / `"campo" IN ($1, $2, ...)` (Postgres).
+  - Admite variables de entorno capturadas (`let ids = [1, 2, 3]; db.users.findWhere(|u| ids.contains(u.id))`) y literales de lista directa (`[1, 2].contains(u.id)`).
+  - Respeta alias físicos `@column("...")` de la columna o de la clave primaria `id`.
+  - Lista vacía (`[]`): se optimiza directamente a `"1=0"` (o `"1=1"` si está negado), sin ejecutar un `IN ()` sintácticamente inválido en SQL.
+  - Negación soportada: `!lista.contains(item.campo)` se traduce a `"campo" NOT IN (...)`.
+- **Búsqueda textual (`LIKE ... ESCAPE '\'`)**:
+  - `item.campo.contains(sub)` traduce a `"campo" LIKE ? ESCAPE '\'` con valor `"%sub%"`.
+  - `item.campo.startsWith(pref)` traduce a `"campo" LIKE ? ESCAPE '\'` con valor `"pref%"`.
+  - `item.campo.endsWith(suf)` traduce a `"campo" LIKE ? ESCAPE '\'` con valor `"%suf"`.
+  - Negación soportada: `!item.campo.contains(...)` traduce a `"campo" NOT LIKE ? ESCAPE '\'`.
+  - **Escape de comodines automático**: caracteres `%`, `_` y `\` presentes en el término buscado se escapan automáticamente con `\`, evitando inyecciones de patrones accidentales.
+- **Composición total**: se combina de forma transparente con operadores lógicos `&&` y `||` existentes (ej. `ids.contains(u.id) && u.email.endsWith("@example.com")`).
+
+<!-- linkc:check -->
+```rust
+type Article = {
+  id: Int,
+  title: String,
+  category: String,
+}
+
+db {
+  articles: Article[],
+}
+
+service Blog {
+  rpc inCategories(cats: String[]) -> Article[] {
+    db.articles.findWhere(|a: Article| { cats.contains(a.category) })
+  }
+
+  rpc searchTitle(query: String) -> Article[] {
+    db.articles.findWhere(|a: Article| { a.title.contains(query) })
+  }
+}
+
+test "pushdown de IN y contains funciona de punta a punta" {
+  db.articles.insert(Article { id: 0, title: "Rust & c-script guide", category: "tech" });
+  db.articles.insert(Article { id: 0, title: "Cooking 101", category: "food" });
+
+  let techArticles = Blog.inCategories(["tech", "science"]);
+  assert(techArticles.length() == 1, "encuentra articulo por categoria");
+
+  let found = Blog.searchTitle("c-script");
+  assert(found.length() == 1, "encuentra articulo por titulo");
+}
+```
+
+**Verificado**: `compiler/tests/cli_pushdown_in_string.rs` contra el binario real `linkc test` cubriendo `findWhere`, `countWhere` y `deleteWhere` con `IN`, listas vacías, `contains`, `startsWith`, `endsWith`, escape de comodines y conjunciones; tests unitarios en `compiler/src/runtime/db.rs`.
+
+### 3.244 Pool de conexiones nativo PostgreSQL (`--db-pool-size <N>`) y fijación transaccional por hilo — RESUELTO, cierra PLAN.md §9.20 Eje H Fase 1 (ítem 1)
+
+Origen: `PLAN.md §9.20` Eje H Fase 1 ítem 1. Hasta esta versión, `Backend::Postgres` operaba con un `ReentrantMutex<RefCell<postgres::Client>>` sobre una única conexión compartida. Aunque `linkc serve` atiende cada petición HTTP en su propio hilo del thread pool, toda consulta SQL de lectura o escritura se serializaba contra esa única conexión física, convirtiéndose en el cuello de botella del backend bajo tráfico concurrente. Además, un bloque `transaction { }` (§3.154) retenía el candado exclusivo de la única conexión durante toda su duración (incluyendo la lógica intermedia de negocio), bloqueando completamente las lecturas de todas las demás peticiones HTTP.
+
+**Qué hay (v1.200.0)**:
+- **Pool de conexiones nativo (`PostgresPool`)**:
+  - Pool gestionado internamente sin dependencias pesadas externas, combinando lista ociosa protegida por mutex y variables de condición (`Condvar`) para sincronización de hilos.
+  - Tamaño configurable mediante el nuevo flag CLI `--db-pool-size <N>` en `linkc serve` o la variable de entorno `LINK_DATABASE_POOL_SIZE` (entero $\ge 1$). Default: `10` conexiones concurrentes.
+  - Creación bajo demanda: arranca con 1 conexión al inicializar el servidor y escala transparentemente hasta el límite fijado al recibir carga concurrente.
+  - Reutilización inmediata: las peticiones comunes (`all`, `find`, `findWhere`, `insert`, etc.) toman prestada una conexión disponible, ejecutan su consulta y la retornan de inmediato al pool, permitiendo ejecución verdaderamente paralela en PostgreSQL.
+  - Auto-reconexión ante desconexiones ociosas (`is_closed()`), preservando el `search_path` de `--db-schema` (§3.193).
+- **Fijación transaccional por hilo (`thread_local!`)**:
+  - En bloques `transaction { ... }` y `upsert`, la conexión asignada se fija exclusivamente al hilo actual de la petición durante toda su ejecución (`BEGIN` $\rightarrow$ cuerpo $\rightarrow$ `COMMIT`/`ROLLBACK`).
+  - Cero contención global: las consultas dentro de la transacción acceden a su conexión fijada mediante almacenamiento local de hilo sin adquirir candados compartidos con otros hilos.
+  - Soporte completo para reentrancia: llamadas anidadas incrementan un contador de profundidad sin bloquearse ni requerir conexiones adicionales.
+  - Seguridad contra pánicos mediante RAII (`Drop`): ante cualquier desenrollado de pila o error no recuperado, el guardián libera la conexión y la devuelve limpia al pool sin fugas.
+
+<!-- linkc:check -->
+```rust
+type Counter = {
+  id: Int,
+  key: String,
+  val: Int,
+}
+
+db {
+  counters: Counter[],
+}
+
+service Counters {
+  rpc increment(key: String) -> Int {
+    transaction {
+      let existing = db.counters.findWhere(|c: Counter| { c.key == key });
+      if existing.length() > 0 {
+        let current = existing[0];
+        db.counters.increment(current.id, |c: Counter| { c.val }, 1);
+        current.val + 1
+      } else {
+        db.counters.insert(Counter { id: 0, key: key, val: 1 });
+        1
+      }
+    }
+  }
+
+  rpc get(key: String) -> Int? {
+    let matches = db.counters.findWhere(|c: Counter| { c.key == key });
+    if matches.length() > 0 {
+      matches[0].val
+    } else {
+      null
+    }
+  }
+}
+
+test "transacciones fijadas por hilo y lecturas concurrentes operan con pool" {
+  let val1 = Counters.increment("hits");
+  assert(val1 == 1, "primer incremento");
+  let val2 = Counters.increment("hits");
+  assert(val2 == 2, "segundo incremento");
+  assert(Counters.get("hits") == 2, "lectura coincide");
+}
+```
+
+**Verificado**: `compiler/tests/pg_integration.rs` (`postgres_connection_pool_runs_concurrent_queries_and_pins_transactions`) con 8 hilos concurrentes realizando escrituras y lecturas en paralelo sobre un pool acotado a 4 conexiones, más transacciones fijadas concurrentes; `compiler/tests/docs_drift.rs` validando `--db-pool-size`; y suite completa con 88 tests de integración PostgreSQL reales.
+
+### 3.245 Actualizaciones masivas atómicas: `db.<c>.updateWhere(predicate, patch)` — RESUELTO, cierra PLAN.md §9.20 Fase 2 (ítem 7)
+
+Origen: `PLAN.md §9.20` Fase 2 ítem 7. Modificar el estado de múltiples registros de una colección requería hasta hoy un bucle manual (`findWhere` $\rightarrow$ iterar filas en memoria $\rightarrow$ `applyPatch` una a una), multiplicando las llamadas de red o sentencias SQL y perdiendo atomicidad frente a escritores concurrentes.
+
+**Qué hay (v1.200.0)**:
+- **`db.<c>.updateWhere(predicate: (T) -> Bool, patch: Patch<T>) -> Int`**:
+  - Aplica un conjunto de modificaciones (`patch`) a todas las filas que cumplan el predicado, devolviendo la cantidad exacta de filas modificadas (`Int`).
+  - **Atajo atómico directo a SQL**: si el predicado es reconocido como pusheable (`recognize_pushable_predicate`, §3.95/§3.108/§3.109/§3.170/§3.243), se genera una única sentencia `UPDATE "<tabla>" SET col1 = $1, col2 = $2 WHERE <condicion>` ejecutada de forma atómica en PostgreSQL y SQLite.
+  - **Mapeo de nombres físicos (`@column`, §3.242)**: cada campo del patch se mapea transparentemente a su `sql_name` físico.
+  - **Campos `@autoUpdate` (§3.77)**: campos con `@autoUpdate` (ej. `updatedAt: Timestamp = now()`) se actualizan automáticamente al timestamp actual (`now()`) durante la operación atómica, sin requerir mencionarlos explícitamente en el patch.
+  - **Respeto a `@softDelete` (§3.78)**: la cláusula `WHERE` excluye automáticamente filas eliminadas lógicamente (`AND "<soft_col>" IS NULL`).
+  - **Subtipado natural de structs hacia `Patch<T>`**: el checker acepta tanto un `Patch<T>` recibido del wire como cualquier struct propio (`Type::Struct`) cuyos campos sean un subconjunto de los campos de `T`.
+  - **Fallback interpretado**: si el predicado contiene lógica no traducible a SQL (comparación entre dos campos, llamadas a funciones de usuario), el runtime evalúa el predicado fila por fila y aplica los parches individualmente sin fallar.
+
+<!-- linkc:check -->
+```rust
+type Invoice = {
+  id: Int,
+  status: String,
+  amount: Int,
+  @autoUpdate updatedAt: Timestamp = now(),
+}
+
+type NewInvoice = {
+  status: String,
+  amount: Int,
+  updatedAt: Timestamp = now(),
+}
+
+type StatusUpdate = {
+  status: String,
+}
+
+db {
+  invoices: Invoice[],
+}
+
+service Invoicing {
+  rpc markPaid(minAmount: Int) -> Int {
+    db.invoices.updateWhere(
+      |i: Invoice| { i.status == "pending" && i.amount >= minAmount },
+      StatusUpdate { status: "paid" }
+    )
+  }
+}
+
+test "updateWhere actualiza en lote y devuelve el total de filas modificadas" {
+  db.invoices.insert(NewInvoice { status: "pending", amount: 100 });
+  db.invoices.insert(NewInvoice { status: "pending", amount: 50 });
+  db.invoices.insert(NewInvoice { status: "draft", amount: 200 });
+
+  let updated = Invoicing.markPaid(80);
+  assert(updated == 1, "solo una factura pending cumple amount >= 80");
+
+  let paidInvoices = db.invoices.findWhere(|i: Invoice| { i.status == "paid" });
+  assert(paidInvoices.length() == 1, "factura marcada como paid");
+  assert(paidInvoices[0].amount == 100, "es la factura de 100");
+}
+```
+
+**Verificado**: `compiler/tests/cli_update_where.rs` de punta a punta a través del binario real `linkc test` cubriendo pushdown a SQL, alias `@column`, `@autoUpdate`, conteos exactos y fallback interpretado; `compiler/tests/pg_integration.rs` (`update_where_pushes_atomic_update_to_real_postgres`) validando ejecución sobre PostgreSQL real con servidor HTTP; y `compiler/src/types.rs` verificando subtipado `Struct <: PatchOf`.
+
+### 3.246 SQLite WAL multilector: 1 conexión escritora serializada y pool de lectores paralelos sin contención — RESUELTO, cierra PLAN.md §9.21 Fase 1 (ítem 2)
+
+Origen: `PLAN.md §9.21` Fase 1 ítem 2. Hasta esta versión, `Backend::Sqlite` utilizaba una única conexión física encapsulada en un mutex reentrante. A pesar de que `linkc serve` atiende cada petición HTTP en un hilo independiente, cada consulta de lectura (`SELECT`, `all`, `findWhere`, `count`) competía por el mismo candado que las mutaciones (`insert`, `applyPatch`, `delete`), serializando todas las operaciones sobre SQLite e impidiendo aprovechar el modo WAL multilector.
+
+**Qué hay (v1.200.0)**:
+- **Pool multilector nativo (`SqlitePool`)**:
+  - 1 conexión escritora exclusiva protegida por mutex reentrante (`writer`).
+  - Pool de conexiones lectoras reciclables (`readers`) sobre SQLite en modo WAL (`PRAGMA journal_mode=WAL`, `PRAGMA synchronous=NORMAL`).
+  - Tamaño del pool de lectores configurable mediante `--db-pool-size <N>` en `linkc serve` y `linkc serve-all`, o mediante la variable de entorno `LINK_DATABASE_POOL_SIZE` (entero $\ge 1$, default: 10).
+  - Apertura de conexiones lectoras con `PRAGMA query_only = ON` y `busy_timeout` de 5000 ms, permitiendo lecturas concurrentes en paralelo sin contención sobre la conexión escritora.
+  - Fallback automático: bases en memoria (`:memory:`) o errores de apertura degradan transparentemente a la conexión escritora sin fallar.
+  - Aislamiento transaccional: dentro de un bloque `transaction { ... }` o `with_exclusive_connection`, las lecturas del mismo hilo se enrutan automáticamente a la conexión escritora para garantizar visibilidad inmediata de las mutaciones locales pendientes.
+
+<!-- linkc:check -->
+```rust
+type Task = {
+  id: Int,
+  title: String,
+  done: Bool,
+}
+
+db {
+  tasks: Task[],
+}
+
+service Tasks {
+  rpc add(title: String) -> Task {
+    db.tasks.insert(Task { id: 0, title: title, done: false })
+  }
+
+  rpc list() -> Task[] {
+    db.tasks.all()
+  }
+
+  rpc countDone() -> Int {
+    db.tasks.countWhere(|t: Task| { t.done })
+  }
+}
+
+test "operaciones sobre pool SQLite" {
+  let t = Tasks.add("probar wal");
+  assert(t.id > 0, "insert exitoso");
+  assert(Tasks.list().length() == 1, "lectura en pool exitosa");
+  assert(Tasks.countDone() == 0, "conteo correcto");
+}
+```
+
+**Verificado**: `compiler/tests/cli_sqlite_wal_pool.rs` cubriendo: fallback limpio en memoria, 8 hilos lectores concurrentes mientras un escritor muta datos, aislamiento en transacción donde las lecturas ven cambios pendientes, validación de `--db-pool-size` y peticiones HTTP reales concurrentes.
+
+### 3.247 `linkc introspect` completo: soporte SQLite, Foreign Keys, índices, defaults y constraints CHECK — RESUELTO, cierra PLAN.md §9.21 Fase 1 (ítem 4)
+
+Origen: `PLAN.md §9.21` Fase 1 ítem 4. Hasta esta versión, `linkc introspect` solo soportaba PostgreSQL como fuente y extraía únicamente columnas y tipos básicos sin capturar Foreign Keys, índices simples ni compuestos, valores por defecto, `@autoUpdate` ni restricciones CHECK. Esto obligaba a reconstruir manualmente el esquema `.link` para bases existentes en SQLite o con esquemas ricos.
+
+**Qué hay (v1.200.0)**:
+- **Detección unificada de origen (PostgreSQL y SQLite)**:
+  - `linkc introspect <ruta-o-url>` detecta automáticamente si el objetivo es una URL PostgreSQL (`postgres://` / `postgresql://`) o una base SQLite (`.db`, `.sqlite`, o con prefijo `sqlite://`).
+- **Extracción completa de esquemas**:
+  - **Claves primarias (`PK`)**: soporte para `id: Int` e `id: Uuid`.
+  - **Foreign Keys**: documentadas como comentarios explicativos (`// FK -> destino(columna)`).
+  - **Índices simples y únicos**: anotaciones `@unique` y `@index` a nivel de campo.
+  - **Índices compuestos**: anotaciones `@unique(col1, col2)` y `@index(col1, col2)` a nivel de `type`.
+  - **Valores por defecto**: parseo y emisión de valores por defecto compatibles con c-script (`= now()`, `= true`, `= false`, literales numéricos, strings y `.toDecimal()`).
+  - **`@autoUpdate`**: detección automática en columnas `updated_at`/`updatedAt` con default temporal.
+  - **Restricciones CHECK**: documentadas como comentarios explicativos (`// CHECK: <condición>`).
+- **Garantía de compilación inmediata**: el archivo `.link` generado es sintáctica y semánticamente válido, permitiendo ejecutar `linkc test` sobre el esquema resultante como punto de partida sin errores de tipo.
+
+<!-- linkc:check -->
+```rust
+@unique(deptId, fullName)
+type Employee = {
+  id: Int,
+  @index deptId: Int, // FK -> departments(id)
+  fullName: String,
+  salary: Decimal = 50000.toDecimal(),
+  active: Bool = true,
+  createdAt: Timestamp = now(),
+  @autoUpdate updatedAt: Timestamp = now(),
+  // CHECK: salary >= 0
+}
+
+db {
+  employees: Employee[],
+}
+
+service EmployeesService {
+  rpc list() -> Employee[] {
+    db.employees.all()
+  }
+}
+
+test "esquema introspeccionado compila y ejecuta" {
+  assert(EmployeesService.list().length() == 0, "lista vacia inicial");
+}
+```
+
+**Verificado**: `compiler/tests/cli_introspect_sqlite.rs` cubriendo: detección de archivo inexistente y base vacía, introspección completa de una base SQLite real con PK, FKs, índices únicos y compuestos, defaults, `@autoUpdate`, restricciones CHECK y roundtrip de compilación exitoso con `linkc test`.
+
+### 3.248 Proyecciones parciales `db.<c>.select(...)` empujadas a SQL — RESUELTO, cierra PLAN.md §9.21 Fase 2 (ítem 8)
+
+Origen: `PLAN.md §9.21` Fase 2 ítem 8. Hasta esta versión, consultar colecciones de la base de datos requería traer la fila completa a memoria mediante `all()` o `findWhere(...)` para luego proyectar o mapear campos con `.map(...)`. Para tablas con muchas columnas, campos grandes de texto o blobs JSON, esto forzaba transferencia de datos y decodificación innecesarias en el runtime.
+
+**Qué hay (v1.200.0)**:
+- **Proyecciones parciales directas a SQL**:
+  - `db.<c>.select(selector)` y `db.<c>.orderBy(...).select(selector)` ejecutan `SELECT col1, col2, ...` o `SELECT col` directamente en la base de datos SQL cuando el selector es pusheable (`ast::recognize_projection_selector`).
+  - **Proyección a Struct (tipado o anónimo)**: `|u: User| { id: u.id, name: u.name }` o `|u: User| UserDTO { id: u.id, name: u.name }` selecciona únicamente las columnas requeridas y reconstruye el struct con los nombres de campo destino (`f.target`), permitiendo renombres (`userId: u.id`).
+  - **Proyección Escalar**: `|u: User| u.name` o `|u: User| u.id` selecciona únicamente la columna física solicitada y devuelve una lista de escalares (`String[]`, `Int[]`, etc.).
+  - **Compatibilidad con `@column`**: mapea transparentemente los nombres físicos en la base de datos SQL hacia los identificadores de campo del struct c-script.
+  - **Respeto automático de `@softDelete`**: las filas marcadas como eliminadas son excluidas automáticamente por la cláusula `WHERE` generada en SQL.
+  - **Compatibilidad con `@encrypted` y JSON**: las columnas proyectadas cifradas se descifran en destino y las columnas JSON se deserializan fielmente al tipo declarado.
+  - **Fallback transparente en memoria**: selectores con transformaciones o cálculos arbitrarios (ej. `|u: User| u.name.toUpper()`, `|u: User| u.score * 2`) se evalúan transparentemente en el intérprete conservando la corrección sin requerir intervención manual.
+
+<!-- linkc:check -->
+```rust
+type Member = {
+  id: Int,
+  name: String,
+  email: String,
+  role: String,
+  score: Int,
+}
+
+type MemberCard = {
+  id: Int,
+  name: String,
+}
+
+db {
+  members: Member[],
+}
+
+service MembersService {
+  rpc add(name: String, email: String, role: String, score: Int) -> Member {
+    db.members.insert(Member { id: 0, name: name, email: email, role: role, score: score })
+  }
+
+  // Proyección a struct con SELECT "id", "name" en SQL
+  rpc listCards() -> MemberCard[] {
+    db.members.select(|m: Member| { MemberCard { id: m.id, name: m.name } })
+  }
+
+  // Proyección escalar con SELECT "name" en SQL
+  rpc listNames() -> String[] {
+    db.members.select(|m: Member| { m.name })
+  }
+
+  // Proyección ordenada con ORDER BY y SELECT proyectado
+  rpc topCards() -> MemberCard[] {
+    db.members.orderByDesc(|m: Member| { m.score }).select(|m: Member| { MemberCard { id: m.id, name: m.name } })
+  }
+}
+
+test "proyecciones parciales select funcionan correctamente" {
+  MembersService.add("Ada", "ada@example.com", "admin", 100);
+  MembersService.add("Alan", "alan@example.com", "member", 90);
+
+  let cards = MembersService.listCards();
+  assert(cards.length() == 2, "dos tarjetas proyectadas");
+  assert(cards[0].name == "Ada" && cards[1].name == "Alan");
+
+  let names = MembersService.listNames();
+  assert(names[0] == "Ada" && names[1] == "Alan");
+
+  let top = MembersService.topCards();
+  assert(top[0].name == "Ada", "Ada es la primera en ranking");
+}
+```
+
+**Verificado**: `compiler/tests/cli_select_projection.rs` cubriendo: proyección escalar, proyección a struct DTO y anónimo, alias `@column`, `@softDelete`, ordenamiento con `orderByDesc`, renombramiento de claves destino y fallback interpretado en memoria para expresiones calculadas; y `compiler/tests/pg_integration.rs` (`select_pushes_partial_projection_to_real_postgres`) validando ejecución sobre PostgreSQL real con servidor HTTP.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

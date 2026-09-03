@@ -357,6 +357,14 @@ impl Field {
     pub fn hidden(&self) -> bool {
         self.annotations.iter().any(|a| matches!(a, FieldAnnotation::Hidden))
     }
+
+    /// El nombre de columna SQL declarado con `@column("...")`, si hay (GRAMMAR.md §3.242).
+    pub fn column_name(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            FieldAnnotation::Column(c) => Some(c.as_str()),
+            _ => None,
+        })
+    }
 }
 
 impl PartialEq for Field {
@@ -413,6 +421,11 @@ pub enum FieldAnnotation {
     /// `openapi_emit` lo omiten del contrato. Un type con campos `@hidden`
     /// no puede ser parámetro de rpc (el checker lo rechaza).
     Hidden,
+    /// `@column("nombre_sql")` -- alias de columna física en la base de datos
+    /// (GRAMMAR.md §3.242 / PLAN.md §9.21). El campo en TypeScript y JSON usa el
+    /// nombre declarado en `.link` (`camelCase`), mientras que las consultas SQL
+    /// usan el nombre físico (`snake_case`).
+    Column(String),
 }
 
 /// Las tres formas de `@check(...)` (GRAMMAR.md §3.96) -- mismo criterio de
@@ -1232,6 +1245,69 @@ pub fn recognize_field_selector<'a>(param_names: &[String], body: &'a Block) -> 
     matches!(&base.node, Expr::Ident(n) if n == param).then(|| field.as_str())
 }
 
+/// Campo de proyección: nombre del campo en el struct resultante y nombre en la colección.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectionField {
+    pub target: String,
+    pub source: String,
+}
+
+/// Plan de proyección para empujar a `SELECT col1, col2, ...` en SQL (PLAN.md §9.21 Fase 2 ítem 8, GRAMMAR.md §3.248).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectionPlan {
+    /// Proyección a struct con campos: `|u| { id: u.id, name: u.name }` o `|u| UserDTO { id: u.id, name: u.name }`
+    Struct {
+        struct_name: Option<String>,
+        fields: Vec<ProjectionField>,
+    },
+    /// Proyección a un campo escalar directo: `|u| u.name`
+    Scalar(String),
+}
+
+/// Reconoce un selector de proyección `|x| ...` para `db.<c>.select(...)`.
+/// Retorna `Some(ProjectionPlan)` si la proyección solo accede a campos directos del parámetro,
+/// o `None` si contiene lógica compleja que deba evaluarse en memoria.
+pub fn recognize_projection_selector(param_names: &[String], body: &Block) -> Option<ProjectionPlan> {
+    let [param] = param_names else { return None };
+    if !body.stmts.is_empty() {
+        return None;
+    }
+    let tail_expr = strip_parens(body.tail.as_ref()?);
+    match &tail_expr.node {
+        Expr::FieldAccess { base, field } => {
+            if matches!(&strip_parens(base).node, Expr::Ident(p) if p == param) {
+                Some(ProjectionPlan::Scalar(field.clone()))
+            } else {
+                None
+            }
+        }
+        Expr::StructLit { name, variant: None, fields } => {
+            if fields.is_empty() {
+                return None;
+            }
+            let mut proj_fields = Vec::with_capacity(fields.len());
+            for (target_name, field_expr) in fields {
+                let unwrapped = strip_parens(field_expr);
+                let Expr::FieldAccess { base, field: source_name } = &unwrapped.node else {
+                    return None;
+                };
+                if !matches!(&strip_parens(base).node, Expr::Ident(p) if p == param) {
+                    return None;
+                }
+                proj_fields.push(ProjectionField {
+                    target: target_name.clone(),
+                    source: source_name.clone(),
+                });
+            }
+            Some(ProjectionPlan::Struct {
+                struct_name: if name.is_empty() { None } else { Some(name.clone()) },
+                fields: proj_fields,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Granularidad de truncado de fecha para el selector de AGRUPACIÓN de
 /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.157) -- el
 /// límite que §3.65 dejaba abierto a propósito ("sin truncado de fechas").
@@ -1300,8 +1376,29 @@ pub enum PredicateOperand<'a> {
 /// (`recognize_predicate_expr` los aplana) -- una cadena `a && b && c`
 /// sigue siendo un solo `And` de 3 hojas, no `And(And(a,b),c)`, así que el
 /// SQL generado para el caso puro de siempre no cambia de forma.
+/// Operador de coincidencia de subcadena empujable a SQL (LIKE / ILIKE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringMatchOp {
+    Contains,
+    StartsWith,
+    EndsWith,
+}
+
 pub enum PredicateExpr<'a> {
     Leaf(&'a str, BinaryOp, PredicateOperand<'a>),
+    /// `lista.contains(item.campo)` empujado a `WHERE "campo" IN (...)` (PLAN.md §9.20 Fase 2.1).
+    InList {
+        field: &'a str,
+        list_expr: &'a Spanned<Expr>,
+        negated: bool,
+    },
+    /// `item.campo.contains(...)`, `startsWith(...)` o `endsWith(...)` empujado a SQL `LIKE` (Fase 2.2).
+    StringMatch {
+        field: &'a str,
+        op: StringMatchOp,
+        pattern_expr: &'a Spanned<Expr>,
+        negated: bool,
+    },
     And(Vec<PredicateExpr<'a>>),
     Or(Vec<PredicateExpr<'a>>),
 }
@@ -1394,6 +1491,92 @@ fn merge_or<'a>(l: PredicateExpr<'a>, r: PredicateExpr<'a>) -> PredicateExpr<'a>
     PredicateExpr::Or(items)
 }
 
+fn expr_mentions_param(param: &str, expr: &Spanned<Expr>) -> bool {
+    match &expr.node {
+        Expr::Ident(name) => name == param,
+        Expr::FieldAccess { base, .. } => expr_mentions_param(param, base),
+        Expr::Call { callee, args } => {
+            expr_mentions_param(param, callee) || args.iter().any(|a| expr_mentions_param(param, a))
+        }
+        Expr::ArrayLit(items) | Expr::TupleLit(items) => items.iter().any(|i| expr_mentions_param(param, i)),
+        Expr::Index { base, index } => expr_mentions_param(param, base) || expr_mentions_param(param, index),
+        Expr::TupleIndex { base, .. } => expr_mentions_param(param, base),
+        Expr::Binary { left, right, .. } => expr_mentions_param(param, left) || expr_mentions_param(param, right),
+        Expr::Unary { operand, .. } | Expr::Paren(operand) => expr_mentions_param(param, operand),
+        _ => false,
+    }
+}
+
+fn recognize_call_predicate<'a>(
+    param: &str,
+    callee: &'a Spanned<Expr>,
+    args: &'a [Spanned<Expr>],
+    negated: bool,
+) -> Option<PredicateExpr<'a>> {
+    let callee = strip_parens(callee);
+    let Expr::FieldAccess { base, field: method } = &callee.node else { return None };
+    let base = strip_parens(base);
+
+    if args.len() != 1 {
+        return None;
+    }
+    let arg = strip_parens(&args[0]);
+
+    match method.as_str() {
+        "contains" => {
+            // Caso 1: `lista.contains(item.campo)` -> InList
+            if let Some(field) = field_of_param(param, arg) {
+                if !expr_mentions_param(param, base) {
+                    return Some(PredicateExpr::InList {
+                        field,
+                        list_expr: base,
+                        negated,
+                    });
+                }
+            }
+            // Caso 2: `item.campo.contains(pattern)` -> StringMatch(Contains)
+            if let Some(field) = field_of_param(param, base) {
+                if !expr_mentions_param(param, arg) {
+                    return Some(PredicateExpr::StringMatch {
+                        field,
+                        op: StringMatchOp::Contains,
+                        pattern_expr: arg,
+                        negated,
+                    });
+                }
+            }
+            None
+        }
+        "startsWith" => {
+            let field = field_of_param(param, base)?;
+            if !expr_mentions_param(param, arg) {
+                Some(PredicateExpr::StringMatch {
+                    field,
+                    op: StringMatchOp::StartsWith,
+                    pattern_expr: arg,
+                    negated,
+                })
+            } else {
+                None
+            }
+        }
+        "endsWith" => {
+            let field = field_of_param(param, base)?;
+            if !expr_mentions_param(param, arg) {
+                Some(PredicateExpr::StringMatch {
+                    field,
+                    op: StringMatchOp::EndsWith,
+                    pattern_expr: arg,
+                    negated,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn recognize_predicate_tree<'a>(param: &str, expr: &'a Spanned<Expr>) -> Option<PredicateExpr<'a>> {
     let expr = strip_parens(expr);
     match &expr.node {
@@ -1412,24 +1595,27 @@ fn recognize_predicate_tree<'a>(param: &str, expr: &'a Spanned<Expr>) -> Option<
         {
             let left = strip_parens(left);
             let right = strip_parens(right);
-            // `item.endDate > item.startDate` -- comparación entre DOS
-            // campos del propio parámetro, GRAMMAR.md §3.171. Acotado a los
-            // cuatro operadores relacionales a propósito: el checker
-            // (checker.rs::synth_binary, brazo `Lt | LtEq | Gt | GtEq`) solo
-            // los tipa cuando ambos lados son Int/Int64/Float/Timestamp SIN
-            // envolver en `Optional` -- y un campo no-opcional siempre es
-            // `NOT NULL` en la columna real (ver postgres_emit.rs, el test
-            // que confirma que desenvolver `Optional` no cuela un `NOT NULL`
-            // de más) -- así que esta forma nunca puede toparse con el
-            // problema de NULL-seguridad que si tiene `==`/`!=` (donde el
-            // checker sí permite comparar dos `T?`, y `NULL = NULL` en SQL
-            // no es `true` como en el camino interpretado). Por eso `==`/
-            // `!=` entre dos campos NO se reconoce acá -- cae al camino
-            // interpretado de siempre (ya lo hacía antes de este cambio,
-            // sin que hiciera falta ningún chequeo nuevo: el lado derecho
-            // queda envuelto en `PredicateOperand::Expr` de un
-            // `FieldAccess`, que `evaluate_predicate_tree` ya rechaza por no
-            // ser un literal ni un `Ident`).
+
+            // Coincidencia booleana con llamada: `ids.contains(u.id) == true/false`
+            if matches!(op, BinaryOp::Eq | BinaryOp::NotEq) {
+                if let Expr::Bool(b) = right.node {
+                    let is_negated = if *op == BinaryOp::Eq { !b } else { b };
+                    if let Expr::Call { callee, args } = &left.node {
+                        if let Some(pred) = recognize_call_predicate(param, callee, args, is_negated) {
+                            return Some(pred);
+                        }
+                    }
+                }
+                if let Expr::Bool(b) = left.node {
+                    let is_negated = if *op == BinaryOp::Eq { !b } else { b };
+                    if let Expr::Call { callee, args } = &right.node {
+                        if let Some(pred) = recognize_call_predicate(param, callee, args, is_negated) {
+                            return Some(pred);
+                        }
+                    }
+                }
+            }
+
             if matches!(op, BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) {
                 if let (Some(lf), Some(rf)) = (field_of_param(param, left), field_of_param(param, right)) {
                     return Some(PredicateExpr::Leaf(lf, *op, PredicateOperand::Field(rf)));
@@ -1444,8 +1630,17 @@ fn recognize_predicate_tree<'a>(param: &str, expr: &'a Spanned<Expr>) -> Option<
             None
         }
         Expr::Unary { op: UnaryOp::Not, operand } => {
-            let field = field_of_param(param, strip_parens(operand))?;
+            let inner = strip_parens(operand);
+            if let Expr::Call { callee, args } = &inner.node {
+                if let Some(pred) = recognize_call_predicate(param, callee, args, true) {
+                    return Some(pred);
+                }
+            }
+            let field = field_of_param(param, inner)?;
             Some(PredicateExpr::Leaf(field, BinaryOp::Eq, PredicateOperand::Bool(false)))
+        }
+        Expr::Call { callee, args } => {
+            recognize_call_predicate(param, callee, args, false)
         }
         _ => {
             let field = field_of_param(param, expr)?;

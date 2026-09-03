@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.200.0] - 2026-09-03
+
+### ✨ Añadido
+**Ocho ítems de PLAN.md §9.21 Fase 1 (rendimiento físico y mapeo) y Fase 2 (pushdown SQL), todos verificados contra Postgres y SQLite reales**:
+- **`@column("nombre_sql")`**: alias campo↔columna física en `ColumnPlan`, desacopla el nombre SQL (`snake_case` legacy) del nombre idiomático en AST/JSON/`contract.d.ts` (`camelCase`), con validación estática y detección de colisiones. Ver GRAMMAR.md §3.242.
+- **Pushdown de `lista.contains(x.campo)` a `IN`/`NOT IN`** (lista vacía → `1=0`) y de `.contains`/`.startsWith`/`.endsWith` de texto a `LIKE ... ESCAPE '\'` con escape automático de comodines. Ver GRAMMAR.md §3.243.
+- **`PostgresPool` nativo** (`--db-pool-size <N>`/`LINK_DATABASE_POOL_SIZE`, default 10), asignación por request, fijación transaccional por hilo en `transaction { ... }`/`upsert` con guard RAII y reentrancia. Ver GRAMMAR.md §3.244.
+- **`db.<c>.updateWhere(predicate, patch)`** empujado a un único `UPDATE ... WHERE` atómico cuando el predicado es pusheable, compatible con `@column`/`@autoUpdate`/`@softDelete`, retorna filas afectadas (`Int`), con fallback interpretado. Ver GRAMMAR.md §3.245.
+- **`SqlitePool` nativo sobre WAL**: 1 escritora serializada + pool de lectoras (`PRAGMA journal_mode=WAL`, `synchronous=NORMAL`, `query_only=ON` en lectores), mismo `--db-pool-size`/`LINK_DATABASE_POOL_SIZE`. Ver GRAMMAR.md §3.246.
+- **`linkc introspect` completo**: detección automática de SQLite además de Postgres, Foreign Keys y CHECK como comentarios descriptivos, índices simples/compuestos, defaults, `@autoUpdate`; el `.link` generado compila y corre con `linkc test`. Ver GRAMMAR.md §3.247.
+- **`db.<c>.select(selector)`** (encadenable tras `.orderBy(...)`) empujado a `SELECT col1, col2, ...` para proyecciones a structs o escalares directos, compatible con `@column`/`@softDelete`/`@encrypted`/JSON, con fallback interpretado para selectores calculados. Ver GRAMMAR.md §3.248.
+
 ## [1.199.0] - 2026-09-03
 
 ### ✨ Añadido

@@ -182,14 +182,17 @@ pub(crate) fn column_plans(program: &Program) -> Result<Vec<(String, Vec<ColumnP
     }
     let simple_enums = simple_enum_names(program);
     let encrypted = encrypted_fields_by_collection(program, &checker);
+    let aliases_by_collection = crate::runtime::db::column_aliases_by_collection(program, &checker);
+    let empty_aliases = HashMap::new();
     let mut out = Vec::new();
     for (name, element_ty) in checker.db_collections() {
         let Type::Struct { fields, .. } = element_ty else { continue };
         let encrypted_here = encrypted.get(name).cloned().unwrap_or_default();
+        let aliases = aliases_by_collection.get(name).unwrap_or(&empty_aliases);
         let plans: Vec<ColumnPlan> = fields
             .iter()
             .filter(|f| f.name != "id")
-            .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_here.contains(&f.name)))
+            .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_here.contains(&f.name), aliases.get(&f.name).cloned()))
             .collect();
         out.push((name.clone(), plans));
     }
@@ -232,7 +235,7 @@ pub(crate) fn check_program(program: &Program, backend: &Backend) -> Result<Vec<
         let Some(physical) = physical_columns(backend, &collection)? else { continue };
         let by_name: HashMap<&str, &PhysicalColumn> = physical.iter().map(|c| (c.name.as_str(), c)).collect();
         for plan in &plans {
-            let Some(col) = by_name.get(plan.field.name.as_str()) else { continue };
+            let Some(col) = by_name.get(plan.sql_name.as_str()) else { continue };
             if let Some((severity, message)) = check_column(plan, col) {
                 issues.push(ColumnIssue { collection: collection.clone(), column: plan.field.name.clone(), severity, message });
             }

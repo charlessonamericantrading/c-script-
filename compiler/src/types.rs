@@ -282,6 +282,26 @@ pub fn is_subtype(sub: &Type, sup: &Type) -> bool {
         }
         (ResultOf(a1, b1), ResultOf(a2, b2)) => is_subtype(a1, a2) && is_subtype(b1, b2),
         (PatchOf(a), PatchOf(b)) => is_subtype(a, b),
+        (
+            Struct {
+                fields: sub_fields, ..
+            },
+            PatchOf(inner),
+        ) => {
+            if let Struct { fields: inner_fields, .. } = &**inner {
+                sub_fields.iter().all(|sub_f| {
+                    match inner_fields.iter().find(|inf| inf.name == sub_f.name) {
+                        Some(inf) => {
+                            is_subtype(&sub_f.ty, &inf.ty)
+                                || (matches!(inf.ty, Type::Optional(_)) && is_subtype(&sub_f.ty, &Type::Null))
+                        }
+                        None => false,
+                    }
+                })
+            } else {
+                false
+            }
+        },
         (MapOf(k1, v1), MapOf(k2, v2)) => is_subtype(k1, k2) && is_subtype(v1, v2),
         // Regla estándar de subtipado de funciones (contravariante en los
         // parámetros, covariante en el retorno): S <: T si T acepta todo lo
@@ -361,6 +381,23 @@ mod tests {
                 FieldType { name: "y".into(), optional: false, ty: Type::Int },
             ],
         }
+    }
+
+    #[test]
+    fn struct_with_subset_of_fields_is_subtype_of_patch_of() {
+        let full = point(Some("Point"));
+        let patch = Type::Struct {
+            name: Some("PointPatch".into()),
+            fields: vec![FieldType { name: "x".into(), optional: false, ty: Type::Int }],
+        };
+        let patch_of = Type::PatchOf(Box::new(full.clone()));
+        assert!(is_subtype(&patch, &patch_of));
+
+        let bad_patch = Type::Struct {
+            name: Some("BadPatch".into()),
+            fields: vec![FieldType { name: "z".into(), optional: false, ty: Type::Int }],
+        };
+        assert!(!is_subtype(&bad_patch, &patch_of));
     }
 
     #[test]

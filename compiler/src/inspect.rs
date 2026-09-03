@@ -95,11 +95,7 @@ pub fn inspect_sqlite(program: &Program, db_path: &Path) -> Result<Vec<Collectio
 pub fn inspect_postgres(program: &Program, url: &str, schema: Option<&str>) -> Result<Vec<CollectionStatus>, String> {
     let collections = declared_collections(program)?;
     let client = connect_postgres_client(url, schema)?;
-    let backend = Backend::Postgres {
-        client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)),
-        url: url.to_string(),
-        schema: schema.map(str::to_string),
-    };
+    let backend = Backend::postgres(client, url, schema, 1);
     // GRAMMAR.md §3.229: una sola pasada de tipos para todo el programa,
     // repartida por colección abajo.
     let mut issues_by_collection: std::collections::HashMap<String, Vec<crate::schema_check::ColumnIssue>> = std::collections::HashMap::new();

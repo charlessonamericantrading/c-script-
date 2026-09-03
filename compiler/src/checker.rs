@@ -1309,7 +1309,8 @@ impl Checker {
                                 .chain(checker.check_field_soft_delete(fields, &t.type_params))
                                 .chain(checker.check_field_encrypted(fields, &t.type_params))
                                 .chain(checker.check_field_hidden(fields))
-                                .chain(checker.check_field_checks(fields, &t.type_params)),
+                                .chain(checker.check_field_checks(fields, &t.type_params))
+                                .chain(checker.check_field_columns(fields, &t.name)),
                         );
                     }
                     for e in item_errors {
@@ -1331,6 +1332,7 @@ impl Checker {
                                 .chain(checker.check_field_soft_delete(fields, &en.type_params))
                                 .chain(checker.check_field_encrypted(fields, &en.type_params))
                                 .chain(checker.check_field_checks(fields, &en.type_params))
+                                .chain(checker.check_field_columns_enum(fields))
                             {
                                 let mut e = e;
                                 if let Some(file) = file_for(index) {
@@ -2639,6 +2641,50 @@ impl Checker {
             .map(|f| {
                 err("'@hidden' sobre 'id': el id tiene que viajar en el JSON (find, applyPatch, pageAfter, el cliente generado) -- no se puede ocultar (GRAMMAR.md §3.232)")
                     .with_span(f.name_span)
+            })
+            .collect()
+    }
+
+    /// `@column("nombre_sql")` (GRAMMAR.md §3.242 / PLAN.md §9.21):
+    /// verifica que el alias de columna sea un identificador SQL válido y que
+    /// no existan colisiones físicas entre dos campos del mismo struct.
+    fn check_field_columns(&self, fields: &[Field], struct_name: &str) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for f in fields {
+            let col_name = f.column_name().unwrap_or(&f.name);
+            if col_name.is_empty() {
+                errors.push(err(format!("'@column' en el campo '{}': el nombre no puede estar vacío", f.name)).with_span(f.name_span));
+                continue;
+            }
+            if !col_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                errors.push(err(format!(
+                    "'@column(\"{col_name}\")' en el campo '{}': el nombre de columna SQL solo puede contener caracteres alfanuméricos y guiones bajos",
+                    f.name
+                )).with_span(f.name_span));
+            }
+            if let Some(prev) = seen.get(col_name) {
+                errors.push(err(format!(
+                    "colisión de nombre de columna SQL '{col_name}' en el struct '{struct_name}': tanto el campo '{prev}' como '{}' mapean a la misma columna",
+                    f.name
+                )).with_span(f.name_span));
+            } else {
+                seen.insert(col_name.to_string(), f.name.clone());
+            }
+        }
+        errors
+    }
+
+    /// `@column` solo tiene sentido en structs que representen tablas SQL, nunca en variantes de enum.
+    fn check_field_columns_enum(&self, fields: &[Field]) -> Vec<CheckError> {
+        fields
+            .iter()
+            .filter_map(|f| {
+                if f.column_name().is_some() {
+                    Some(err(format!("'@column' en el campo '{}': las variantes de enum se guardan como JSON, no son columnas SQL individuales", f.name)).with_span(f.name_span))
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -5342,6 +5388,15 @@ impl Checker {
                 self.check_expr(pred_arg, &pred_ty, env)?;
                 Ok(Type::Int)
             }
+            "updateWhere" => {
+                let [pred_arg, patch_arg] = args else {
+                    return Err(err("'updateWhere' toma exactamente 2 argumentos (predicate: fn(T) -> Bool, patch: Patch<T>)"));
+                };
+                let pred_ty = Type::Function(vec![element_ty.clone()], Box::new(Type::Bool));
+                self.check_expr(pred_arg, &pred_ty, env)?;
+                self.check_expr(patch_arg, &Type::PatchOf(Box::new(element_ty.clone())), env)?;
+                Ok(Type::Int)
+            }
             "findWhere" => {
                 let [pred_arg] = args else {
                     return Err(err("'findWhere' toma exactamente 1 argumento (fn(T) -> Bool)"));
@@ -5436,6 +5491,14 @@ impl Checker {
                 Ok(element_ty.clone())
             }
 
+            "select" => {
+                let [f_arg] = args else {
+                    return Err(err("'select' toma exactamente 1 argumento (selector: (T) -> R)"));
+                };
+                let result_ty = self.synth_callback_result(f_arg, element_ty, env)?;
+                Ok(Type::List(Box::new(result_ty)))
+            }
+
             // Deliberadamente SIEMPRE un error acá, nunca una firma normal
             // y libremente componible como las de arriba (GRAMMAR.md
             // §3.16): la única forma de que `subscribe()` tipe en TODO el
@@ -5451,7 +5514,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/increment/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/updateWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/increment/select/subscribe)"
             ))),
         }
     }
@@ -5881,12 +5944,12 @@ impl Checker {
     fn check_db_query_method(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
         match method {
             "orderBy" | "orderByDesc" => self.check_order_by(element_ty, method, args),
-            "all" | "page" | "findWhere" => self.check_db_method(element_ty, method, args, env),
+            "all" | "page" | "findWhere" | "select" => self.check_db_method(element_ty, method, args, env),
             "pageAfter" => Err(err(
                 "'pageAfter' no se puede combinar con 'orderBy'/'orderByDesc': su cursor es una posición en el orden por id (GRAMMAR.md §3.61), que un ORDER BY distinto rompería en silencio -- usá 'page(limit, offset)' sobre la consulta ordenada",
             )),
             other => Err(err(format!(
-                "'{other}' no existe sobre una consulta ordenada (db.<c>.orderBy(...)) -- solo all(), page(limit, offset), findWhere(...) y otro orderBy/orderByDesc como clave secundaria (GRAMMAR.md §3.230)"
+                "'{other}' no existe sobre una consulta ordenada (db.<c>.orderBy(...)) -- solo all(), page(limit, offset), findWhere(...), select(...) y otro orderBy/orderByDesc como clave secundaria (GRAMMAR.md §3.230, §3.248)"
             ))),
         }
     }
@@ -5932,6 +5995,21 @@ impl Checker {
         fields: &[(String, Spanned<Expr>)],
         env: &Env,
     ) -> Result<Type, CheckError> {
+        if name.is_empty() {
+            let mut field_types = Vec::with_capacity(fields.len());
+            for (fname, fexpr) in fields {
+                let ty = self.synth_expr(fexpr, env)?;
+                field_types.push(FieldType {
+                    name: fname.clone(),
+                    optional: false,
+                    ty,
+                });
+            }
+            return Ok(Type::Struct {
+                name: None,
+                fields: field_types,
+            });
+        }
         if name == "Result" {
             return Err(err(
                 "'Result.Ok'/'Result.Err' necesitan un tipo esperado del contexto (ej. el retorno declarado del rpc) — no se pueden usar en posición de síntesis (GRAMMAR.md §3.5)",

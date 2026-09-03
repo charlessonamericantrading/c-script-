@@ -688,9 +688,22 @@ impl Parser {
                     }
                     annotations.push(FieldAnnotation::Hidden);
                 }
+                // `@column("nombre_sql")` (GRAMMAR.md §3.242 / PLAN.md §9.21)
+                "column" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::Column(_))) {
+                        return Err(self.error("'@column' repetido sobre el mismo campo: un campo tiene a lo sumo un alias SQL".to_string()));
+                    }
+                    self.eat(&TokenKind::LParen)?;
+                    let col_name = self.eat_string()?;
+                    self.eat(&TokenKind::RParen)?;
+                    if col_name.trim().is_empty() {
+                        return Err(self.error("`@column(\"\")` sobre un campo: el nombre de columna no puede estar vacío".to_string()));
+                    }
+                    annotations.push(FieldAnnotation::Column(col_name));
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)', '@encrypted' o '@hidden')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)', '@encrypted', '@hidden' o '@column(\"nombre\")')"
                     )))
                 }
             }
@@ -1226,6 +1239,29 @@ impl Parser {
                     }
                     let span = e.span;
                     stmts.push(Spanned { node: Stmt::Expr(e), span });
+                }
+                // Literal anónimo de struct como cuerpo o tail de bloque: `{ id: x.id, name: x.name }`
+                // (GRAMMAR.md §3.248, PLAN.md §9.21 ítem 8)
+                TokenKind::Ident(_) if matches!(self.peek_at(1), TokenKind::Colon) => {
+                    let mut fields = Vec::new();
+                    fields.push(self.parse_field_init()?);
+                    while self.check(&TokenKind::Comma) {
+                        self.advance();
+                        if self.check(&TokenKind::RBrace) {
+                            break;
+                        }
+                        fields.push(self.parse_field_init()?);
+                    }
+                    let span = merge(fields.first().unwrap().1.span, self.prev_span());
+                    tail = Some(Box::new(Spanned {
+                        node: Expr::StructLit {
+                            name: String::new(),
+                            variant: None,
+                            fields,
+                        },
+                        span,
+                    }));
+                    break;
                 }
                 _ => {
                     let e = self.parse_expr()?;
@@ -1822,6 +1858,12 @@ impl Parser {
             TokenKind::PipePipe => {
                 self.advance();
                 Err(self.empty_closure_error())
+            }
+            TokenKind::LBrace if !no_struct_lit => {
+                let start = self.span();
+                let fields = self.parse_field_init_list()?;
+                let span = merge(start, self.prev_span());
+                Ok(Spanned { node: Expr::StructLit { name: String::new(), variant: None, fields }, span })
             }
             other => Err(self.error(format!("se esperaba una expresión, se encontró {other:?}"))),
         }

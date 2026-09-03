@@ -50,6 +50,7 @@ struct CollectionPlan {
     name: String,
     columns: Vec<ColumnPlan>,
     id_kind: IdKind,
+    id_col: String,
 }
 
 /// Mismo `Checker::build_symbols` (sin instanciar ningún `Db`/DDL) que
@@ -80,6 +81,8 @@ fn declared_collection_plans(program: &Program) -> Result<(Checker, Vec<Collecti
             names.join(", ")
         ));
     }
+    let aliases_by_collection = crate::runtime::db::column_aliases_by_collection(program, &checker);
+    let empty_aliases = HashMap::new();
     let simple_enums = simple_enum_names(program);
     let mut out: Vec<CollectionPlan> = checker
         .db_collections()
@@ -87,12 +90,14 @@ fn declared_collection_plans(program: &Program) -> Result<(Checker, Vec<Collecti
         .filter_map(|(name, ty)| match ty {
             Type::Struct { fields, .. } => {
                 let id_field_ty = &fields.iter().find(|f| f.name == "id")?.ty;
+                let aliases = aliases_by_collection.get(name).unwrap_or(&empty_aliases);
+                let id_col = aliases.get("id").map(String::as_str).unwrap_or("id").to_string();
                 let columns: Vec<ColumnPlan> = fields
                     .iter()
                     .filter(|f| f.name != "id")
-                    .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, false))
+                    .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, false, aliases.get(&f.name).cloned()))
                     .collect();
-                Some(CollectionPlan { name: name.clone(), columns, id_kind: IdKind::from_field_type(id_field_ty) })
+                Some(CollectionPlan { name: name.clone(), columns, id_kind: IdKind::from_field_type(id_field_ty), id_col })
             }
             _ => None,
         })
@@ -124,13 +129,13 @@ fn read_all_rows(
     simple_enums: &HashSet<String>,
     plan: &CollectionPlan,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let mut col_list = vec!["\"id\"".to_string()];
+    let mut col_list = vec![format!("\"{}\"", plan.id_col)];
     let mut kinds = vec![id_column_kind_for(plan.id_kind)];
     for col in &plan.columns {
-        col_list.push(format!("\"{}\"", col.field.name));
+        col_list.push(format!("\"{}\"", col.sql_name));
         kinds.push(col.kind());
     }
-    let sql = format!("SELECT {} FROM \"{}\" ORDER BY \"id\"", col_list.join(", "), plan.name);
+    let sql = format!("SELECT {} FROM \"{}\" ORDER BY \"{}\"", col_list.join(", "), plan.name, plan.id_col);
     let rows = backend.query(&sql, &[], &kinds)?;
     rows.into_iter()
         .map(|cells| {
@@ -168,7 +173,7 @@ pub fn export_sqlite(program: &Program, db_path: &Path) -> Result<ExportFile, St
     // de envolverla en un `Backend` (que la toma por valor) -- una sola
     // conexión sirve para las N colecciones de este export.
     let existing: HashSet<String> = plans.iter().filter(|p| sqlite_table_exists(&connection, &p.name)).map(|p| p.name.clone()).collect();
-    let backend = Backend::Sqlite(parking_lot::ReentrantMutex::new(connection));
+    let backend = Backend::sqlite(connection, None, 1);
     for plan in &plans {
         let rows = if existing.contains(&plan.name) { read_all_rows(&backend, &checker, &simple_enums, plan)? } else { Vec::new() };
         collections.insert(plan.name.clone(), rows);
@@ -185,11 +190,7 @@ pub fn export_postgres(program: &Program, url: &str, schema: Option<&str>) -> Re
     let (checker, plans) = declared_collection_plans(program)?;
     let simple_enums = simple_enum_names(program);
     let client = connect_postgres_client(url, schema)?;
-    let backend = Backend::Postgres {
-        client: parking_lot::ReentrantMutex::new(std::cell::RefCell::new(client)),
-        url: url.to_string(),
-        schema: schema.map(str::to_string),
-    };
+    let backend = Backend::postgres(client, url, schema, 1);
     let mut collections = HashMap::with_capacity(plans.len());
     for plan in &plans {
         let exists = !crate::migrate::existing_columns(&backend, &plan.name)?.is_empty();

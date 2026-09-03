@@ -19,13 +19,12 @@ use crate::ast::Program;
 use crate::checker::Checker;
 use crate::codegen::postgres_emit::{alter_table_add_column_postgres, create_postgres_table_sql};
 use crate::runtime::db::{
-    check_fields_by_collection, composite_unique_by_collection, connect_postgres_client, create_composite_unique_statements,
+    check_fields_by_collection, column_aliases_by_collection, composite_unique_by_collection, connect_postgres_client, create_composite_unique_statements,
     create_index_statements, index_fields_by_collection, type_checks_by_collection, validate_existing_id_column, IdKind,
 };
 use crate::runtime::store::{Backend, Cell, ColumnKind};
 use crate::types::{FieldType, Type};
-use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// El reporte completo (texto plano, ya formateado para imprimir tal cual)
 /// de lo que `linkc serve --db <url>` ejecutaría en esta base AHORA MISMO,
@@ -45,15 +44,13 @@ pub fn dry_run_postgres(program: &Program, url: &str, schema: Option<&str>) -> R
         .collect();
 
     let client = connect_postgres_client(url, schema)?;
-    let backend = Backend::Postgres {
-        client: parking_lot::ReentrantMutex::new(RefCell::new(client)),
-        url: url.to_string(),
-        schema: schema.map(str::to_string),
-    };
+    let backend = Backend::postgres(client, url, schema, 1);
     let checks_by_collection = check_fields_by_collection(program, &checker);
     let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
     let indexed_by_collection = index_fields_by_collection(program, &checker);
     let composite_unique_by_collection_map = composite_unique_by_collection(program, &checker);
+    let aliases_by_collection = column_aliases_by_collection(program, &checker);
+    let empty_aliases = HashMap::new();
 
     let mut out = String::new();
     out.push_str("-- 'linkc migrate --dry-run': DDL que 'linkc serve'/'linkc serve-all' ejecutaría\n");
@@ -65,8 +62,10 @@ pub fn dry_run_postgres(program: &Program, url: &str, schema: Option<&str>) -> R
         let non_id: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
         let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
         let id_kind = IdKind::from_field_type(id_field_ty);
+        let aliases = aliases_by_collection.get(coll_name).unwrap_or(&empty_aliases);
+        let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
 
-        if let Err(e) = validate_existing_id_column(&backend, coll_name, id_kind) {
+        if let Err(e) = validate_existing_id_column(&backend, coll_name, id_col, id_kind) {
             out.push_str(&format!("-- '{coll_name}': ¡ESTO FALLARÍA AL CONECTAR DE VERDAD! {e}\n\n"));
             any_change = true;
             continue;
@@ -79,10 +78,10 @@ pub fn dry_run_postgres(program: &Program, url: &str, schema: Option<&str>) -> R
             let checks = checks_by_collection.get(coll_name).cloned().unwrap_or_default();
             let type_checks = type_checks_by_collection_map.get(coll_name).cloned().unwrap_or_default();
             out.push_str(&format!("-- '{coll_name}': tabla nueva\n"));
-            out.push_str(&create_postgres_table_sql(coll_name, id_field_ty, &non_id, &simple_enums, &checks, &type_checks));
+            out.push_str(&create_postgres_table_sql(coll_name, id_field_ty, &non_id, &simple_enums, &checks, &type_checks, aliases));
             out.push_str("\n\n");
         } else {
-            let declared_names: Vec<&str> = non_id.iter().map(|f| f.name.as_str()).collect();
+            let declared_names: Vec<&str> = non_id.iter().map(|f| aliases.get(&f.name).map(String::as_str).unwrap_or(f.name.as_str())).collect();
             if !declared_names.is_empty() && !declared_names.iter().any(|n| existing.contains(*n)) {
                 out.push_str(&format!(
                     "-- ADVERTENCIA '{coll_name}': la tabla ya existe pero NINGUNA columna declarada ([{}]) \
@@ -91,14 +90,18 @@ pub fn dry_run_postgres(program: &Program, url: &str, schema: Option<&str>) -> R
                     { let mut v: Vec<&str> = existing.iter().map(String::as_str).collect(); v.sort(); v.join(", ") },
                 ));
             }
-            let missing: Vec<&FieldType> = non_id.iter().filter(|f| !existing.contains(&f.name)).collect();
+            let missing: Vec<&FieldType> = non_id.iter().filter(|f| {
+                let col_name = aliases.get(&f.name).map(String::as_str).unwrap_or(&f.name);
+                !existing.contains(col_name)
+            }).collect();
             if missing.is_empty() {
                 out.push_str(&format!("-- '{coll_name}': sin cambios (todas las columnas declaradas ya existen)\n\n"));
             } else {
                 any_change = true;
                 out.push_str(&format!("-- '{coll_name}': {} columna(s) nueva(s), agregada(s) SIEMPRE nullable (GRAMMAR.md §3.17)\n", missing.len()));
                 for f in missing {
-                    out.push_str(&alter_table_add_column_postgres(coll_name, f, &simple_enums));
+                    let col_name = aliases.get(&f.name).map(String::as_str);
+                    out.push_str(&alter_table_add_column_postgres(coll_name, f, &simple_enums, col_name));
                     out.push('\n');
                 }
                 out.push('\n');

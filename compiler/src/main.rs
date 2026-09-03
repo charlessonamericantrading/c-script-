@@ -192,6 +192,18 @@ fn resolve_max_concurrency(args: &[String]) -> Result<Option<usize>, String> {
     }
 }
 
+/// PLAN.md §9.20 Fase 1.1 / GRAMMAR.md §3.244: `--db-pool-size <N>`/`LINK_DATABASE_POOL_SIZE`
+/// -- tamaño del pool de conexiones PostgreSQL (entero >= 1; ausente = 10 por default).
+fn resolve_db_pool_size(args: &[String]) -> Result<Option<usize>, String> {
+    let Some(raw) = read_flag_or_env(args, "--db-pool-size", "LINK_DATABASE_POOL_SIZE")? else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(Some(n)),
+        _ => Err(format!("--db-pool-size/LINK_DATABASE_POOL_SIZE: se esperaba un entero >= 1, se recibió '{raw}'")),
+    }
+}
+
 /// GRAMMAR.md §3.238: `--fallback-upstream <url>`/`LINK_FALLBACK_UPSTREAM`
 /// -- validado al arrancar: `http://` o `https://`, sin path (el path lo
 /// pone cada request), para que un valor mal escrito no se descubra en el
@@ -270,7 +282,7 @@ fn print_usage(to_stderr: bool) {
     out("     linkc docker <archivo.link> [outdir]   (genera Dockerfile y docker-compose.yml de producción)");
     out("     linkc systemd <archivo.link> <puerto> [outdir]   (genera una unidad systemd lista para /etc/systemd/system/)");
     out("     linkc pm2-config <archivo.link> <puerto> [-o <archivo>]   (genera un ecosystem.json de PM2, default ./ecosystem.json)");
-    out("     linkc introspect <db-url> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)");
+    out("     linkc introspect <db-url|archivo.db> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL o SQLite ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)");
     out("     linkc explain <código>                 (explica un código de error estable, ej. 'linkc explain L0001' -- NO todo error tiene uno, GRAMMAR.md §3.210)");
     out("     linkc triggers <archivo.link> [--db-schema <nombre>] [--only-streams]   (imprime el DDL idempotente de PostgreSQL -- una función + un trigger AFTER INSERT/UPDATE/DELETE por colección -- que hace que un stream de 'linkc serve' reaccione a escrituras hechas por OTRO sistema sobre la misma base, vía el mismo canal LISTEN/NOTIFY; no se conecta a nada ni aplica nada, GRAMMAR.md §3.225; --only-streams limita el DDL a las colecciones que algún stream observa con db.<c>.subscribe())");
     out("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)");
@@ -280,8 +292,8 @@ fn print_usage(to_stderr: bool) {
     out("     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>] (escribe las filas de un archivo de 'db export' contra un target, preservando el id original de cada fila -- un target vacío ES el caso 'seed')");
     out("     linkc db shell <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (REPL de solo lectura sobre stdin/stdout, una consulta SQL por línea -- SQLite abre de solo lectura, Postgres corre con default_transaction_read_only)");
     out("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)");
-    out("     linkc serve <archivo.link> <puerto> [--db <url>] [--db-schema <nombre>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--mcp-jwt-secret <secreto>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>]  (servidor HTTP; sin tope de requests en vuelo por default, o backpressure real vía --max-concurrency/LINK_MAX_CONCURRENCY: la request N+1 recibe 503 + Retry-After en vez de un hilo, /live nunca cuenta, GRAMMAR.md §3.241; toda request que este .link no declara (path sin forma /Service/rpc, o rpc inexistente) se reenvía tal cual al backend viejo vía --fallback-upstream/LINK_FALLBACK_UPSTREAM y se devuelve su status/body -- el estrangulador a nivel de proceso, GRAMMAR.md §3.238; modelos de 'ai { }' resueltos al arrancar -- nombre de Ollama ya descargado o ruta .gguf relativa a --models-dir/LINK_MODELS_DIR, con --ai-memory-budget-mb/LINK_AI_MEMORY_BUDGET_MB como tope de modelos residentes a la vez, GRAMMAR.md §3.234; ai.generate/ai.chat con timeout de 60s por default, configurable vía --ai-timeout/LINK_AI_TIMEOUT, GRAMMAR.md §3.235; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; sin schema propio por default (el 'public' de siempre), o namespacing vía --db-schema/LINK_DATABASE_SCHEMA (crea el schema si no existe, salvo --adopt-existing) para compartir una base entre varios .link sin colisión de nombre de tabla -- solo PostgreSQL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; clave de @encrypted vía --encryption-key/LINK_ENCRYPTION_KEY (32 bytes en base64), obligatoria si el programa declara algún campo @encrypted; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)");
-    out("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--service-api-key-exempt <nombre1,nombre2,...>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {\"nombre_archivo\": puerto, ...} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)");
+    out("     linkc serve <archivo.link> <puerto> [--db <url>] [--db-schema <nombre>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--mcp-jwt-secret <secreto>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]  (servidor HTTP; sin tope de requests en vuelo por default, o backpressure real vía --max-concurrency/LINK_MAX_CONCURRENCY: la request N+1 recibe 503 + Retry-After en vez de un hilo, /live nunca cuenta, GRAMMAR.md §3.241; toda request que este .link no declara (path sin forma /Service/rpc, o rpc inexistente) se reenvía tal cual al backend viejo vía --fallback-upstream/LINK_FALLBACK_UPSTREAM y se devuelve su status/body -- el estrangulador a nivel de proceso, GRAMMAR.md §3.238; modelos de 'ai { }' resueltos al arrancar -- nombre de Ollama ya descargado o ruta .gguf relativa a --models-dir/LINK_MODELS_DIR, con --ai-memory-budget-mb/LINK_AI_MEMORY_BUDGET_MB como tope de modelos residentes a la vez, GRAMMAR.md §3.234; ai.generate/ai.chat con timeout de 60s por default, configurable vía --ai-timeout/LINK_AI_TIMEOUT, GRAMMAR.md §3.235; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; pool de conexiones PostgreSQL con 10 por default, o configurable vía --db-pool-size/LINK_DATABASE_POOL_SIZE; sin schema propio por default (el 'public' de siempre), o namespacing vía --db-schema/LINK_DATABASE_SCHEMA (crea el schema si no existe, salvo --adopt-existing) para compartir una base entre varios .link sin colisión de nombre de tabla -- solo PostgreSQL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; clave de @encrypted vía --encryption-key/LINK_ENCRYPTION_KEY (32 bytes en base64), obligatoria si el programa declara algún campo @encrypted; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante)");
+    out("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--service-api-key-exempt <nombre1,nombre2,...>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {\"nombre_archivo\": puerto, ...} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)");
     out("     linkc lsp                              (inicia el servidor Language Server Protocol)");
     out("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)");
 }
@@ -542,10 +554,10 @@ fn cmd_pm2_config(args: &[String]) -> ExitCode {
 /// del archivo por error.
 fn cmd_introspect(args: &[String]) -> ExitCode {
     let Some(url) = args.first() else {
-        eprintln!("uso: linkc introspect <db-url>");
+        eprintln!("uso: linkc introspect <db-url|archivo.db>");
         return ExitCode::FAILURE;
     };
-    match linkc::introspect::generate_link_from_postgres(url) {
+    match linkc::introspect::generate_link(url) {
         Ok((content, warnings)) => {
             println!("{content}");
             if !warnings.is_empty() {
@@ -1957,7 +1969,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--mcp-jwt-secret <clave>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>]"
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--mcp-jwt-secret <clave>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
         );
         return ExitCode::FAILURE;
     };
@@ -2144,6 +2156,13 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let db_pool_size = match resolve_db_pool_size(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let config = runtime::server::ServeConfig {
         host: host.clone(),
         port,
@@ -2153,6 +2172,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         ai_timeout,
         fallback_upstream,
         max_concurrency,
+        db_pool_size,
         db_schema,
         cors,
         session_ttl,
@@ -2379,7 +2399,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
     };
     let Some(dir) = args.first() else {
         eprintln!(
-            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--service-api-key-exempt <nombre1,nombre2,...>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>]"
+            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--service-api-key-exempt <nombre1,nombre2,...>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
         );
         return ExitCode::FAILURE;
     };
@@ -2608,6 +2628,13 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let db_pool_size = match resolve_db_pool_size(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let (ports, updated_registry): (Vec<u16>, Option<serde_json::Map<String, serde_json::Value>>) = match &port_registry {
         Some(path) => match resolve_stable_ports(&link_files, port_base, path) {
@@ -2736,6 +2763,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
                     ai_timeout,
                     fallback_upstream,
                     max_concurrency,
+                    db_pool_size,
                     // `serve-all` nunca conecta a Postgres (cada servicio
                     // usa su propio SQLite local, ver el rechazo de
                     // --db-schema más arriba en cmd_serve_all) -- siempre

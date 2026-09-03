@@ -5149,3 +5149,193 @@ service S {{
     let web = groups.iter().find(|g| g["key"] == "web").unwrap();
     assert_eq!(web["value"].as_i64(), Some(150), "{totals}");
 }
+
+/// PLAN.md §9.20 Fase 1.1 / GRAMMAR.md §3.244: Conexiones concurrentes reales sobre PostgresPool
+/// sin serialización behind a single connection, con fijación por hilo en transacciones.
+#[test]
+fn postgres_connection_pool_runs_concurrent_queries_and_pins_transactions() {
+    const COLLECTION: &str = "pool_items";
+    let Ok(url) = std::env::var("LINK_TEST_PG_URL") else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let src = format!(r#"
+type Item = {{ id: Int, threadId: Int, val: Int }}
+db {{ {COLLECTION}: Item[] }}
+"#);
+    let tokens = linkc::lexer::tokenize(&src).unwrap();
+    let program = linkc::parser::parse(tokens).unwrap();
+
+    let pool_size = 4;
+    let db = std::sync::Arc::new(
+        linkc::runtime::db::Db::connect_postgres_for_testing_with_pool(&program, &url, false, None, pool_size).unwrap()
+    );
+
+    let (max_s, total_c, _) = db.postgres_pool_info().expect("debe ser postgres");
+    assert_eq!(max_s, 4, "max_size configurado a 4");
+    assert!(total_c >= 1, "al menos 1 conexión inicial");
+
+    // 1. Concurrencia real: 8 hilos ejecutando inserts simultáneos sobre el pool de 4 conexiones
+    let mut handles = Vec::new();
+    for t_id in 0..8 {
+        let db_clone = db.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..5 {
+                let item = linkc::runtime::Value::Struct(vec![
+                    ("threadId".to_string(), linkc::runtime::Value::Int(t_id)),
+                    ("val".to_string(), linkc::runtime::Value::Int(i)),
+                ]);
+                db_clone.call(COLLECTION, "insert", vec![item]).unwrap();
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // 2. Verificación de conteo total: 8 hilos * 5 inserts = 40 filas
+    let all = db.call(COLLECTION, "all", vec![]).unwrap();
+    let linkc::runtime::Value::List(rows) = all else { panic!("se esperaba lista") };
+    assert_eq!(rows.len(), 40, "40 filas insertadas concurrentemente a través del pool");
+
+    // 3. Fijación exclusiva por hilo (`with_exclusive_connection`)
+    let mut tx_handles = Vec::new();
+    for t_id in 100..104 {
+        let db_clone = db.clone();
+        tx_handles.push(std::thread::spawn(move || {
+            db_clone.with_exclusive_connection(|| {
+                let item = linkc::runtime::Value::Struct(vec![
+                    ("threadId".to_string(), linkc::runtime::Value::Int(t_id)),
+                    ("val".to_string(), linkc::runtime::Value::Int(999)),
+                ]);
+                db_clone.call(COLLECTION, "insert", vec![item]).unwrap();
+            });
+        }));
+    }
+
+    for h in tx_handles {
+        h.join().unwrap();
+    }
+
+    let all_after_tx = db.call(COLLECTION, "all", vec![]).unwrap();
+    let linkc::runtime::Value::List(rows_after) = all_after_tx else { panic!("se esperaba lista") };
+    assert_eq!(rows_after.len(), 44, "44 filas después de las transacciones exclusivas por hilo");
+}
+
+/// PLAN.md §9.20 Fase 2.3 / GRAMMAR.md §3.245: `db.<c>.updateWhere` atómico empujado a SQL UPDATE contra PostgreSQL real
+#[test]
+fn update_where_pushes_atomic_update_to_real_postgres() {
+    const COLLECTION: &str = "pg_update_where_items";
+    let Ok(url) = std::env::var("LINK_TEST_PG_URL") else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let program = format!(
+        r#"
+type OrderItem = {{ id: Int, status: String, qty: Int }}
+type NewOrderItem = {{ status: String, qty: Int }}
+type StatusPatch = {{ status: String }}
+db {{ {COLLECTION}: OrderItem[] }}
+service Orders {{
+  rpc create(status: String, qty: Int) -> OrderItem {{
+    db.{COLLECTION}.insert(NewOrderItem {{ status: status, qty: qty }})
+  }}
+  rpc batchUpdate(fromStatus: String, toStatus: String) -> Int {{
+    db.{COLLECTION}.updateWhere(|i: OrderItem| {{ i.status == fromStatus }}, StatusPatch {{ status: toStatus }})
+  }}
+  rpc listByStatus(status: String) -> OrderItem[] {{
+    db.{COLLECTION}.findWhere(|i: OrderItem| {{ i.status == status }})
+  }}
+}}
+"#
+    );
+    let temp = TempDir::new("update-where-pg");
+    let src = temp.write("app.link", &program);
+    let server = Serve::start(&src, &url);
+
+    server.rpc("Orders/create", r#"{"status":"pending","qty":10}"#);
+    server.rpc("Orders/create", r#"{"status":"pending","qty":20}"#);
+    server.rpc("Orders/create", r#"{"status":"shipped","qty":5}"#);
+    server.rpc("Orders/create", r#"{"status":"pending","qty":30}"#);
+
+    let count = server.rpc("Orders/batchUpdate", r#"{"fromStatus":"pending","toStatus":"processing"}"#);
+    assert_eq!(count.as_i64(), Some(3), "actualiza 3 ordenes de pending a processing");
+
+    let processing = server.rpc("Orders/listByStatus", r#"{"status":"processing"}"#);
+    let items = processing.as_array().unwrap();
+    assert_eq!(items.len(), 3, "hay 3 ordenes en processing");
+
+    let shipped = server.rpc("Orders/listByStatus", r#"{"status":"shipped"}"#);
+    assert_eq!(shipped.as_array().unwrap().len(), 1, "la orden shipped no fue tocada");
+}
+
+#[test]
+fn select_pushes_partial_projection_to_real_postgres() {
+    const COLLECTION: &str = "pg_select_projection_items";
+    let Ok(url) = std::env::var("LINK_TEST_PG_URL") else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let program = format!(
+        r#"
+type Product = {{
+  id: Int,
+  title: String,
+  price: Int,
+  category: String,
+}}
+type NewProduct = {{ title: String, price: Int, category: String }}
+type ProductCard = {{ id: Int, title: String }}
+
+db {{ {COLLECTION}: Product[] }}
+
+service Catalog {{
+  rpc add(title: String, price: Int, category: String) -> Product {{
+    db.{COLLECTION}.insert(NewProduct {{ title: title, price: price, category: category }})
+  }}
+  rpc listTitles() -> String[] {{
+    db.{COLLECTION}.select(|p: Product| {{ p.title }})
+  }}
+  rpc listCards() -> ProductCard[] {{
+    db.{COLLECTION}.select(|p: Product| {{ ProductCard {{ id: p.id, title: p.title }} }})
+  }}
+  rpc topCards() -> ProductCard[] {{
+    db.{COLLECTION}.orderByDesc(|p: Product| {{ p.price }}).select(|p: Product| {{ ProductCard {{ id: p.id, title: p.title }} }})
+  }}
+}}
+"#
+    );
+    let temp = TempDir::new("select-pg");
+    let src = temp.write("app.link", &program);
+    let server = Serve::start(&src, &url);
+
+    server.rpc("Catalog/add", r#"{"title":"Keyboard","price":100,"category":"Electronics"}"#);
+    server.rpc("Catalog/add", r#"{"title":"Mouse","price":50,"category":"Electronics"}"#);
+    server.rpc("Catalog/add", r#"{"title":"Monitor","price":300,"category":"Electronics"}"#);
+
+    let titles = server.rpc("Catalog/listTitles", "{}");
+    let title_list: Vec<String> = titles.as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(title_list, vec!["Keyboard", "Mouse", "Monitor"]);
+
+    let cards = server.rpc("Catalog/listCards", "{}");
+    let card_arr = cards.as_array().unwrap();
+    assert_eq!(card_arr.len(), 3);
+    assert_eq!(card_arr[0].get("title").unwrap().as_str(), Some("Keyboard"));
+
+    let top = server.rpc("Catalog/topCards", "{}");
+    let top_arr = top.as_array().unwrap();
+    assert_eq!(top_arr.len(), 3);
+    assert_eq!(top_arr[0].get("title").unwrap().as_str(), Some("Monitor"));
+    assert_eq!(top_arr[1].get("title").unwrap().as_str(), Some("Keyboard"));
+    assert_eq!(top_arr[2].get("title").unwrap().as_str(), Some("Mouse"));
+}

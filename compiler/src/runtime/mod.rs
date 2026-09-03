@@ -1248,6 +1248,19 @@ pub(crate) enum ConditionExpr {
     /// "campoB"` directo, sin placeholder. Solo los cuatro operadores
     /// relacionales llegan hasta acá -- ver `ast::recognize_predicate_tree`.
     FieldPair(String, BinaryOp, String),
+    /// `lista.contains(item.campo)` (PLAN.md §9.20 Fase 2.1)
+    InList {
+        field: String,
+        values: Vec<Value>,
+        negated: bool,
+    },
+    /// `item.campo.contains(...)`, `startsWith(...)` o `endsWith(...)` (Fase 2.2)
+    StringMatch {
+        field: String,
+        op: crate::ast::StringMatchOp,
+        pattern: String,
+        negated: bool,
+    },
     And(Vec<ConditionExpr>),
     Or(Vec<ConditionExpr>),
 }
@@ -1264,6 +1277,25 @@ fn recognize_pushable_predicate(f: &Value) -> Option<ConditionExpr> {
     evaluate_predicate_tree(tree, captured_env)
 }
 
+fn eval_simple_expr(expr: &Spanned<Expr>, captured_env: &Env) -> Option<Value> {
+    match &expr.node {
+        Expr::Int(n) => Some(Value::Int(*n)),
+        Expr::Float(x) => Some(Value::Float(*x)),
+        Expr::Str(s) => Some(Value::Str(s.clone())),
+        Expr::Bool(b) => Some(Value::Bool(*b)),
+        Expr::Ident(name) => captured_env.get(name.as_str()).map(|c| c.borrow().clone()),
+        Expr::ArrayLit(items) => {
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                values.push(eval_simple_expr(item, captured_env)?);
+            }
+            Some(Value::List(values))
+        }
+        Expr::Paren(inner) => eval_simple_expr(inner, captured_env),
+        _ => None,
+    }
+}
+
 fn evaluate_predicate_tree(tree: crate::ast::PredicateExpr, captured_env: &Env) -> Option<ConditionExpr> {
     match tree {
         crate::ast::PredicateExpr::Leaf(field, op, operand) => match operand {
@@ -1272,17 +1304,29 @@ fn evaluate_predicate_tree(tree: crate::ast::PredicateExpr, captured_env: &Env) 
             }
             crate::ast::PredicateOperand::Bool(b) => Some(ConditionExpr::Leaf(field.to_string(), op, Value::Bool(b))),
             crate::ast::PredicateOperand::Expr(value_expr) => {
-                let value = match &value_expr.node {
-                    Expr::Int(n) => Value::Int(*n),
-                    Expr::Float(x) => Value::Float(*x),
-                    Expr::Str(s) => Value::Str(s.clone()),
-                    Expr::Bool(b) => Value::Bool(*b),
-                    Expr::Ident(name) => captured_env.get(name.as_str())?.borrow().clone(),
-                    _ => return None,
-                };
+                let value = eval_simple_expr(value_expr, captured_env)?;
                 Some(ConditionExpr::Leaf(field.to_string(), op, value))
             }
         },
+        crate::ast::PredicateExpr::InList { field, list_expr, negated } => {
+            let val = eval_simple_expr(list_expr, captured_env)?;
+            let Value::List(values) = val else { return None };
+            Some(ConditionExpr::InList {
+                field: field.to_string(),
+                values,
+                negated,
+            })
+        }
+        crate::ast::PredicateExpr::StringMatch { field, op, pattern_expr, negated } => {
+            let val = eval_simple_expr(pattern_expr, captured_env)?;
+            let Value::Str(pattern) = val else { return None };
+            Some(ConditionExpr::StringMatch {
+                field: field.to_string(),
+                op,
+                pattern,
+                negated,
+            })
+        }
         crate::ast::PredicateExpr::And(items) => {
             Some(ConditionExpr::And(items.into_iter().map(|i| evaluate_predicate_tree(i, captured_env)).collect::<Option<Vec<_>>>()?))
         }
@@ -1290,6 +1334,13 @@ fn evaluate_predicate_tree(tree: crate::ast::PredicateExpr, captured_env: &Env) 
             Some(ConditionExpr::Or(items.into_iter().map(|i| evaluate_predicate_tree(i, captured_env)).collect::<Option<Vec<_>>>()?))
         }
     }
+}
+
+/// Reconoce un selector de proyección `|x| ...` para `db.<c>.select(...)`.
+/// Retorna `Some(ProjectionPlan)` si es un acceso directo de campos del parámetro, o `None` si requiere fallback.
+fn recognize_pushable_projection(f: &Value) -> Option<crate::ast::ProjectionPlan> {
+    let Value::Closure(params, body, _captured_env) = f else { return None };
+    crate::ast::recognize_projection_selector(params, body)
 }
 
 /// Cubre `+`/`-`/`*`/`/`/`%` -- todo operador aritmético entero de c-script
@@ -2970,8 +3021,23 @@ fn call_method(
                 }
                 Ok(Value::List(kept))
             }
+            "select" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'select' requiere 1 argumento"))?;
+                if let Some(plan) = recognize_pushable_projection(&f) {
+                    if let Some(rows) = db.select_projected_ordered(&query.collection, &plan, &query.order)? {
+                        return Ok(Value::List(rows));
+                    }
+                }
+                // Fallback interpretado si no es pusheable
+                let items = db.select_all_ordered(&query.collection, &query.order)?;
+                let mut projected = Vec::with_capacity(items.len());
+                for item in items {
+                    projected.push(call_callable(f.clone(), vec![item], db, fns, checker, sessions, current_token, step_budget)?);
+                }
+                Ok(Value::List(projected))
+            }
             other => Err(err(format!(
-                "'{other}' no existe sobre una consulta ordenada (db.<c>.orderBy(...)) -- solo all/page/findWhere/orderBy/orderByDesc (GRAMMAR.md §3.230)"
+                "'{other}' no existe sobre una consulta ordenada (db.<c>.orderBy(...)) -- solo all/page/findWhere/select/orderBy/orderByDesc (GRAMMAR.md §3.230, §3.248)"
             ))),
         },
         Value::DbCollection(coll) => match method {
@@ -3088,6 +3154,73 @@ fn call_method(
                     }
                 }
                 Ok(Value::Int(count))
+            }
+            // GRAMMAR.md §3.245: `updateWhere(predicate, patch)` -- actualización masiva atómica
+            // empujada a `UPDATE "{table}" SET ... WHERE ...` directo en SQL cuando el predicado
+            // es pusheable (`recognize_pushable_predicate`), con fallback interpretado cuando no.
+            "updateWhere" => {
+                let mut it = args.into_iter();
+                let f = it.next().ok_or_else(|| err("'updateWhere' requiere 2 argumentos (predicate, patch)"))?;
+                let patch = it.next().ok_or_else(|| err("'updateWhere' requiere 2 argumentos (predicate, patch)"))?;
+                let patch = augment_with_auto_update_fields(&coll, checker, patch);
+
+                // 1. Atajo atómico directo a SQL cuando el predicado y campos son pusheables
+                if let Some(conditions) = recognize_pushable_predicate(&f) {
+                    if let Some(affected) = db.update_where_conjunction(&coll, &conditions, &patch)? {
+                        return Ok(Value::Int(affected as i64));
+                    }
+                }
+
+                // 2. Fallback interpretado para predicados complejos
+                let (items, already_filtered) = match recognize_pushable_predicate(&f) {
+                    Some(conditions) => match db.find_where_conjunction(&coll, &conditions)? {
+                        Some(rows) => (rows, true),
+                        None => (all_items(db, &coll)?, false),
+                    },
+                    None => (all_items(db, &coll)?, false),
+                };
+                let mut count = 0i64;
+                for item in items {
+                    let matches = if already_filtered {
+                        true
+                    } else {
+                        as_bool(&call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?)?
+                    };
+                    if matches {
+                        if let Value::Struct(fields) = &item {
+                            if let Some((_, Value::Int(id))) = fields.iter().find(|(n, _)| n == "id") {
+                                if let Ok(_) = db.call(&coll, "applyPatch", vec![Value::Int(*id), patch.clone()]) {
+                                    count += 1;
+                                }
+                            } else if let Some((_, Value::Uuid(id))) = fields.iter().find(|(n, _)| n == "id") {
+                                if let Ok(_) = db.call(&coll, "applyPatch", vec![Value::Uuid(id.clone()), patch.clone()]) {
+                                    count += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Value::Int(count))
+            }
+            // GRAMMAR.md §3.248: `db.<c>.select(selector)` -- proyección parcial
+            // empujada a SQL `SELECT col1, col2, ...` en vez de `SELECT *` cuando el selector
+            // accede directamente a campos del parámetro (`recognize_projection_selector`),
+            // con fallback interpretado en memoria para expresiones calculadas arbitrarias.
+            "select" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'select' requiere 1 argumento"))?;
+                if let Some(plan) = recognize_pushable_projection(&f) {
+                    if let Some(rows) = db.select_projected(&coll, &plan)? {
+                        return Ok(Value::List(rows));
+                    }
+                }
+                // Fallback interpretado si no es pusheable
+                let all_val = db.call(&coll, "all", vec![])?;
+                let Value::List(items) = all_val else { return Ok(Value::List(vec![])); };
+                let mut projected = Vec::with_capacity(items.len());
+                for item in items {
+                    projected.push(call_callable(f.clone(), vec![item], db, fns, checker, sessions, current_token, step_budget)?);
+                }
+                Ok(Value::List(projected))
             }
             // GRAMMAR.md §3.76: cada elemento pasa por el mismo `insert`
             // real de siempre (una sentencia SQL autocommit por fila) -- lo
