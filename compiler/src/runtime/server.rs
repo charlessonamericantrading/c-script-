@@ -395,6 +395,9 @@ pub struct ServeConfig {
     /// GRAMMAR.md §3.238: `--fallback-upstream`, el backend viejo al que va
     /// toda request que este `.link` no declara.
     pub fallback_upstream: Option<String>,
+    /// GRAMMAR.md §3.241: `--max-concurrency`, tope de requests en vuelo;
+    /// `None` = sin tope (un hilo por request, sin límite, como siempre).
+    pub max_concurrency: Option<usize>,
 }
 pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     let ServeConfig {
@@ -413,6 +416,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         ai_memory_budget_bytes,
         ai_timeout,
         fallback_upstream,
+        max_concurrency,
         http_timeout,
         trust_proxy,
         service_api_key,
@@ -654,6 +658,8 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     // `cors`/`hsts`/`service_api_key` son pequeños (un enum con un
     // `Vec<String>` a lo sumo, dos `Option<String>`) -- clonarlos por
     // request es más simple que otro `Arc` y el costo es insignificante.
+    // GRAMMAR.md §3.241: requests en vuelo, para `--max-concurrency`.
+    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     macro_rules! spawn_handler {
         ($request:expr) => {{
             let program = std::sync::Arc::clone(&program);
@@ -671,6 +677,35 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
             let mcp_state = mcp_state.clone();
             let fallback_upstream = fallback_upstream.clone();
             let request = $request;
+            // GRAMMAR.md §3.241: admisión ANTES de gastar un hilo. `/live`
+            // nunca cuenta ni se rechaza: un orquestador tiene que poder
+            // preguntar "¿vivo?" justo cuando el proceso está saturado.
+            let counted = max_concurrency.is_some() && request.url() != "/live";
+            let admitted = match max_concurrency {
+                Some(max) if counted => {
+                    let before = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if before >= max {
+                        in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        false
+                    } else {
+                        true
+                    }
+                }
+                _ => true,
+            };
+            if !admitted {
+                metrics_store.lock().record_saturated();
+                let max = max_concurrency.unwrap_or_default();
+                let body = error_json(&format!(
+                    "saturado: ya hay {max} requests en vuelo (--max-concurrency/LINK_MAX_CONCURRENCY) -- reintentá en un momento (GRAMMAR.md §3.241)"
+                ));
+                let resp = tiny_http::Response::from_string(body)
+                    .with_status_code(503)
+                    .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap())
+                    .with_header(tiny_http::Header::from_bytes(&b"Retry-After"[..], &b"1"[..]).unwrap());
+                let _ = request.respond(resp);
+            } else {
+            let in_flight_for_thread = std::sync::Arc::clone(&in_flight);
             std::thread::spawn(move || {
                 handle_request(
                     &program,
@@ -692,7 +727,11 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                     fallback_upstream.as_deref(),
                     request,
                 );
+                if counted {
+                    in_flight_for_thread.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                }
             });
+            }
         }};
     }
 

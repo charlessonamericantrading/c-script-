@@ -34,6 +34,8 @@ pub struct MetricsStore {
     /// la señal que le permite a un operador NOTAR el problema en vez de
     /// enterarse por un endpoint caro sin protección real.
     rate_limit_rejections: HashMap<String, u64>,
+    /// GRAMMAR.md §3.241: requests rechazadas 503 por `--max-concurrency`.
+    saturated: u64,
     /// (corridas OK, corridas fallidas) de cada tarea `@cron` (GRAMMAR.md
     /// §3.159), por `Servicio.rpc` -- una tarea recurrente corre sola, sin
     /// ningún caller HTTP que note un 5xx si su cuerpo empieza a fallar;
@@ -49,6 +51,7 @@ impl MetricsStore {
             by_method: HashMap::new(),
             notify_latency: (0, 0.0),
             rate_limit_rejections: HashMap::new(),
+            saturated: 0,
             cron_runs: HashMap::new(),
         }
     }
@@ -69,6 +72,12 @@ impl MetricsStore {
     /// punto que ya arma la respuesta 429, antes de devolverla.
     pub fn record_rate_limit_rejection(&mut self, method: &str) {
         *self.rate_limit_rejections.entry(method.to_string()).or_insert(0) += 1;
+    }
+
+    /// GRAMMAR.md §3.241: una request rechazada 503 porque ya había
+    /// `--max-concurrency` en vuelo.
+    pub fn record_saturated(&mut self) {
+        self.saturated += 1;
     }
 
     /// Registra la latencia de UN evento de propagación NOTIFY recibido
@@ -188,6 +197,12 @@ impl MetricsStore {
             for (model, row) in ai {
                 out.push_str(&format!("linkc_ai_prefix_cache_hits_total{{model=\"{}\"}} {}\n", escape_label(model), row.prefix_hits));
             }
+        }
+        // GRAMMAR.md §3.241: solo si alguna vez se saturó, como el resto.
+        if self.saturated > 0 {
+            out.push_str("# HELP linkc_http_saturated_total Requests rechazadas 503 por --max-concurrency (backpressure).\n");
+            out.push_str("# TYPE linkc_http_saturated_total counter\n");
+            out.push_str(&format!("linkc_http_saturated_total {}\n", self.saturated));
         }
         if !self.rate_limit_rejections.is_empty() {
             out.push_str("# HELP linkc_rate_limit_rejections_total Requests rechazadas 429 por @rate_limit, por rpc.\n");

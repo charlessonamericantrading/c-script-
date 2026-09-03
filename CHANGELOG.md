@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.199.0] - 2026-09-03
+
+### ✨ Añadido
+**`--max-concurrency <N>`/`LINK_MAX_CONCURRENCY` para `serve`/`serve-all` (PLAN.md §9.18 Eje B ítem 2, prerrequisito de §9.20 Eje H ítem 4)**: tope de requests en vuelo comprobado antes de gastar un hilo; la N+1 recibe `503` + `Retry-After: 1` de inmediato (no se encola), `/live` nunca cuenta ni se rechaza, `linkc_http_saturated_total` en `/metrics`. Sin el flag, sin tope (como siempre). Ver GRAMMAR.md §3.241.
+
 ## [1.198.0] - 2026-09-03
 
 ### ✨ Añadido

@@ -262,6 +262,7 @@
   - [3.238 `--fallback-upstream <url>`: el estrangulador a nivel de proceso — RESUELTO](#3238---fallback-upstream-url-el-estrangulador-a-nivel-de-proceso--resuelto)
   - [3.239 `@index(campo1, campo2, ...)` a nivel de `type`: índice compuesto no único, opcionalmente parcial — RESUELTO](#3239-indexcampo1-campo2--a-nivel-de-type-índice-compuesto-no-único-opcionalmente-parcial--resuelto)
   - [3.240 `GET /openapi.json` servido por `linkc serve` y `traceparent` propagado a las llamadas `http.*` salientes — RESUELTO](#3240-get-openapijson-servido-por-linkc-serve-y-traceparent-propagado-a-las-llamadas-http-salientes--resuelto)
+  - [3.241 `--max-concurrency <N>`: backpressure real, la request N+1 recibe 503 en vez de un hilo — RESUELTO](#3241---max-concurrency-n-backpressure-real-la-request-n1-recibe-503-en-vez-de-un-hilo--resuelto)
 
 - [4. Tabla de Mapeo c-script → TypeScript (exhaustiva)](#4-tabla-de-mapeo-c-script--typescript-exhaustiva)
   - [4.1 Qué puede aparecer en la firma de un `rpc`](#41-qué-puede-aparecer-en-la-firma-de-un-rpc)
@@ -8259,6 +8260,21 @@ Origen: `PLAN.md §9.20` Eje H ítem 10. Skynet publica OpenAPI 3.1 de 76 endpoi
 **Verificado**: `tests/cli_openapi_trace.rs` contra el binario: `/openapi.json` responde `application/json` con `openapi: 3.x`, el path `/Items/list` y el schema `Item`; con `--service-api-key` rechaza sin la clave y responde con ella; y un rpc que hace `http.get` contra un upstream falso que refleja el header recibe exactamente el `traceparent` de la request entrante, y `none` cuando no venía.
 
 **Límite honesto**: el `.link` propaga, no genera: no crea spans propios ni exporta a un collector OTLP (eso sería un exportador nuevo; queda para cuando un adoptante lo pida con un collector real delante). El título del documento es fijo (`linkc serve`), no el nombre del archivo como en `build`. No hay Swagger UI embebido: cualquier UI apunta a `/openapi.json`.
+
+### 3.241 `--max-concurrency <N>`: backpressure real, la request N+1 recibe 503 en vez de un hilo — RESUELTO, cierra PLAN.md §9.18 Eje B ítem 2 (prerrequisito de §9.20 Eje H ítem 4)
+
+Origen: `PLAN.md §9.18` Eje B ítem 2, subido a "corrección" por §9.20 Eje H ítem 4: con el motor de inferencia dentro del proceso (§3.235), una request puede ocupar un núcleo decenas de segundos, y §3.158 seguía siendo "un hilo de sistema operativo por request, sin límite" -- bajo carga, el proceso aceptaba TODO, cada request nueva competía por la misma CPU y todas salían peor, sin que ningún cliente ni orquestador supiera que estaba saturado.
+
+**Qué hay (v1.199.0)**: `linkc serve`/`serve-all` con `--max-concurrency <N>` (o `LINK_MAX_CONCURRENCY`, entero >= 1; en `serve-all` es por servicio, cada uno tiene su propio pool). Un contador de requests en vuelo, comprobado ANTES de gastar un hilo:
+- Si ya hay `N` en vuelo, la request recibe **`503` + `Retry-After: 1`** con `{"error": "saturado: ya hay N requests en vuelo (--max-concurrency/LINK_MAX_CONCURRENCY) -- reintentá en un momento"}`, inmediatamente, sin encolarse -- rechazar rápido es lo que deja que un balanceador reparta a otra instancia o que el cliente reintente, en vez de acumular hilos que van a tardar más todavía. `linkc_http_saturated_total` en `/metrics` cuenta los rechazos (solo aparece si hubo alguno).
+- **`/live` nunca cuenta ni se rechaza**: un orquestador tiene que poder preguntar "¿vivo?" justo cuando el proceso está al tope; `/ready` sí pasa por el tope (readiness = "¿puedo atender AHORA?", y saturado es exactamente "ahora no").
+- Sin el flag, la conducta de siempre: sin tope. Un valor inválido (`0`, negativo, texto) se rechaza al arrancar nombrando el flag.
+
+**Cuánto poner**: el número de núcleos para rpcs que hacen inferencia local (una generación satura un núcleo; el candado de §3.235 ya las serializa por programa, pero las requests que esperan ese candado también cuentan), y bastante más (decenas) para un servicio que solo hace I/O a la base y a `http.*` -- cada hilo en espera cuesta poco. La cifra correcta se mide con `linkc_http_saturated_total` y la latencia de `/metrics` (§3.150), no se adivina.
+
+**Verificado**: `tests/cli_max_concurrency.rs` contra el binario: con `--max-concurrency 1` y una request lenta en vuelo (un `http.get` a un upstream falso que tarda 2 s), la siguiente recibe 503 con `Retry-After: 1` en menos de 1,5 s (no se encola), `/live` responde 200 mientras tanto, al terminar la lenta el slot se libera y la siguiente pasa, y `/metrics` trae `linkc_http_saturated_total 1`; sin el flag, 8 requests concurrentes pasan y no aparece la serie; `0`, `-3` y `muchos` se rechazan al arrancar.
+
+**Límite honesto**: es un tope y un rechazo, no una cola: no hay espera acotada ("bloqueá hasta 100 ms antes de rechazar"), y la respuesta 503 sale sin los headers CORS de §3.41 (un browser verá un fallo de red genérico en ese caso; el proxy de delante debería ser el que reintenta). El pool de conexiones a la base (Eje B ítem 3) sigue pendiente: `N` hilos siguen compartiendo UNA conexión física con un candado (§3.158).
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
