@@ -25,6 +25,7 @@ use crate::runtime::db::{
 use crate::runtime::store::{Backend, Cell, ColumnKind};
 use crate::types::{FieldType, Type};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// El reporte completo (texto plano, ya formateado para imprimir tal cual)
 /// de lo que `linkc serve --db <url>` ejecutaría en esta base AHORA MISMO,
@@ -32,6 +33,21 @@ use std::collections::{HashMap, HashSet};
 /// leer `information_schema.columns` para saber qué ya existe), pero solo
 /// hace `SELECT` -- nunca `CREATE`/`ALTER`.
 pub fn dry_run_postgres(program: &Program, url: &str, schema: Option<&str>) -> Result<String, String> {
+    let (body, _any_change) = compute_postgres_diff(program, url, schema)?;
+    Ok(format!(
+        "-- 'linkc migrate --dry-run': DDL que 'linkc serve'/'linkc serve-all' ejecutaría\n\
+         -- al conectar a esta base AHORA MISMO -- nada de esto se aplicó.\n\n{body}"
+    ))
+}
+
+/// Cuerpo compartido de `dry_run_postgres` y `generate_migration` (GRAMMAR.md
+/// §3.252, PLAN.md §9.21 Fase 4 ítem 14) -- el mismo DDL, calculado UNA sola
+/// vez, con dos usos distintos: mostrarlo (`--dry-run`) o guardarlo en un
+/// archivo de migración versionado (`migrate generate`). Devuelve el texto
+/// (DDL real + comentarios SQL `--`, ejecutable tal cual con `batch_execute`)
+/// y si hay algún cambio de verdad -- `generate_migration` usa ese booleano
+/// para decidir si vale la pena crear un archivo.
+fn compute_postgres_diff(program: &Program, url: &str, schema: Option<&str>) -> Result<(String, bool), String> {
     let (checker, errors) = Checker::build_symbols(program);
     if let Some(e) = errors.into_iter().next() {
         return Err(format!("programa inválido: {e}"));
@@ -53,8 +69,6 @@ pub fn dry_run_postgres(program: &Program, url: &str, schema: Option<&str>) -> R
     let empty_aliases = HashMap::new();
 
     let mut out = String::new();
-    out.push_str("-- 'linkc migrate --dry-run': DDL que 'linkc serve'/'linkc serve-all' ejecutaría\n");
-    out.push_str("-- al conectar a esta base AHORA MISMO -- nada de esto se aplicó.\n\n");
 
     let mut any_change = false;
     for (coll_name, elem_ty) in checker.db_collections() {
@@ -146,7 +160,140 @@ pub fn dry_run_postgres(program: &Program, url: &str, schema: Option<&str>) -> R
          --allow-destructive -- Postgres solo CREA tablas nuevas y AGREGA columnas nullable, nunca \
          borra ni cambia el tipo de nada existente (ver la matriz completa en GRAMMAR.md §3.17).\n",
     );
-    Ok(out)
+    Ok((out, any_change))
+}
+
+/// `linkc migrate generate <archivo.link> <nombre> --db <url>` (PLAN.md
+/// §9.21 Fase 4 ítem 14, GRAMMAR.md §3.252): calcula el mismo diff que
+/// `--dry-run` y, si hay algo que migrar, lo guarda en un archivo NUEVO y
+/// numerado dentro de `migrations_dir` (`0001_<nombre>.sql`,
+/// `0002_<nombre>.sql`, ...) -- nunca lo aplica, workflow explícito y
+/// APARTE del auto-apply de siempre en `linkc serve` [decisión del
+/// usuario: los dos conviven, este comando es opcional]. `Ok(None)` sin
+/// crear ningún archivo si no hay ningún cambio -- generar una migración
+/// vacía no tiene sentido.
+pub fn generate_migration(program: &Program, url: &str, schema: Option<&str>, name: &str, migrations_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let (body, any_change) = compute_postgres_diff(program, url, schema)?;
+    if !any_change {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(migrations_dir).map_err(|e| format!("no se pudo crear '{}': {e}", migrations_dir.display()))?;
+    let next = next_migration_number(migrations_dir)?;
+    let slug = sanitize_migration_name(name);
+    let filename = format!("{next:04}_{slug}.sql");
+    let path = migrations_dir.join(&filename);
+    let header = format!(
+        "-- Migración generada por 'linkc migrate generate' -- {filename}\n\
+         -- Ejecutable tal cual: 'linkc migrate apply' la corre como un solo batch atómico.\n\n"
+    );
+    std::fs::write(&path, format!("{header}{body}")).map_err(|e| format!("no se pudo escribir '{}': {e}", path.display()))?;
+    Ok(Some(path))
+}
+
+/// Mismo criterio de slug que cualquier generador de migraciones conocido
+/// (Rails/Django/Prisma): minúsculas, solo alfanumérico, todo separador se
+/// colapsa a UN guion bajo. Nunca vacío -- `"migration"` como default si el
+/// nombre no dejó ningún caracter válido.
+fn sanitize_migration_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "migration".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// El próximo número secuencial de 4 dígitos -- escanea `migrations_dir`
+/// por archivos `NNNN_...` y toma el máximo + 1. `1` si el directorio no
+/// existe todavía o está vacío (primera migración del proyecto).
+fn next_migration_number(migrations_dir: &Path) -> Result<u32, String> {
+    let mut max = 0u32;
+    if migrations_dir.exists() {
+        let entries = std::fs::read_dir(migrations_dir).map_err(|e| format!("no se pudo leer '{}': {e}", migrations_dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(prefix) = name.split('_').next() {
+                if let Ok(n) = prefix.parse::<u32>() {
+                    max = max.max(n);
+                }
+            }
+        }
+    }
+    Ok(max + 1)
+}
+
+/// `linkc migrate apply --db <url>` (PLAN.md §9.21 Fase 4 ítem 14,
+/// GRAMMAR.md §3.252): aplica, EN ORDEN, cada archivo de `migrations_dir`
+/// que todavía no figure en la tabla de estado `"_link_migrations"` --
+/// creándola si hace falta (idempotente, mismo criterio que el resto del
+/// DDL de este proyecto). Cada migración corre como un solo
+/// `batch_execute` -- el protocolo simple de Postgres ya envuelve varias
+/// sentencias de un mismo mensaje en una transacción implícita, así que un
+/// archivo con tres `ALTER TABLE` es todo-o-nada por sí solo, sin
+/// `BEGIN`/`COMMIT` explícito -- seguido del `INSERT` que la marca
+/// aplicada, EN LA MISMA llamada: si el DDL falla, el `INSERT` tampoco
+/// corre, así que un archivo nunca queda "medio aplicado" en el estado.
+/// Se corta en la primera que falle: las migraciones ya aplicadas en
+/// llamadas ANTERIORES quedan aplicadas, las que faltan después de la que
+/// falló ni se intentan -- mismo principio que cualquier migrador
+/// (Rails/Django/Prisma), nunca "seguir de largo ante un error".
+pub fn apply_migrations(url: &str, schema: Option<&str>, migrations_dir: &Path) -> Result<Vec<String>, String> {
+    let client = connect_postgres_client(url, schema)?;
+    let backend = Backend::postgres(client, url, schema, 1);
+    backend.execute_ddl(
+        "CREATE TABLE IF NOT EXISTS \"_link_migrations\" (\
+            \"id\" BIGSERIAL PRIMARY KEY, \
+            \"name\" TEXT NOT NULL UNIQUE, \
+            \"applied_at\" TIMESTAMPTZ NOT NULL DEFAULT now()\
+        )",
+    )?;
+
+    let applied: HashSet<String> = backend
+        .query("SELECT \"name\" FROM \"_link_migrations\"", &[], &[ColumnKind::Text])?
+        .into_iter()
+        .filter_map(|row| row.into_iter().next())
+        .filter_map(|cell| if let Cell::Text(s) = cell { Some(s) } else { None })
+        .collect();
+
+    let mut files: Vec<(String, PathBuf)> = if migrations_dir.exists() {
+        std::fs::read_dir(migrations_dir)
+            .map_err(|e| format!("no se pudo leer '{}': {e}", migrations_dir.display()))?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sql"))
+            .map(|e| (e.file_name().to_string_lossy().to_string(), e.path()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut newly_applied = Vec::new();
+    for (name, path) in files {
+        if applied.contains(&name) {
+            continue;
+        }
+        let sql = std::fs::read_to_string(&path).map_err(|e| format!("no se pudo leer '{}': {e}", path.display()))?;
+        // Sin bind param acá -- `execute_ddl`/`batch_execute` es el
+        // protocolo SIMPLE de Postgres, no acepta parámetros -- así que el
+        // nombre (un nombre de archivo, no un valor de red arbitrario) se
+        // escapa a mano duplicando comillas simples, el escape estándar de
+        // un literal SQL.
+        let escaped_name = name.replace('\'', "''");
+        let combined = format!("{sql}\nINSERT INTO \"_link_migrations\" (\"name\") VALUES ('{escaped_name}');");
+        backend.execute_ddl(&combined).map_err(|e| format!("'{name}' falló, se cortó acá sin tocar las siguientes -- {e}"))?;
+        newly_applied.push(name);
+    }
+    Ok(newly_applied)
 }
 
 pub(crate) fn existing_columns(backend: &Backend, collection: &str) -> Result<HashSet<String>, String> {
@@ -161,4 +308,45 @@ pub(crate) fn existing_columns(backend: &Backend, collection: &str) -> Result<Ha
     );
     let rows = backend.query(&sql, &[Cell::Text(collection.to_string())], &[ColumnKind::Text])?;
     Ok(rows.into_iter().filter_map(|row| row.into_iter().next()).filter_map(|cell| if let Cell::Text(s) = cell { Some(s) } else { None }).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_migration_name_lowercases_and_collapses_separators() {
+        assert_eq!(sanitize_migration_name("Adds Reviews"), "adds_reviews");
+        assert_eq!(sanitize_migration_name("agrega--facturas!!"), "agrega_facturas");
+        assert_eq!(sanitize_migration_name("  leading and trailing  "), "leading_and_trailing");
+    }
+
+    #[test]
+    fn sanitize_migration_name_falls_back_to_migration_when_nothing_survives() {
+        assert_eq!(sanitize_migration_name("---"), "migration");
+        assert_eq!(sanitize_migration_name(""), "migration");
+        assert_eq!(sanitize_migration_name("!@#$%"), "migration");
+    }
+
+    #[test]
+    fn next_migration_number_is_one_for_an_empty_or_missing_directory() {
+        let dir = std::env::temp_dir().join(format!("linkc-migrate-test-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(next_migration_number(&dir).unwrap(), 1, "directorio inexistente");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(next_migration_number(&dir).unwrap(), 1, "directorio vacío");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_migration_number_takes_the_max_prefix_plus_one_regardless_of_creation_order() {
+        let dir = std::env::temp_dir().join(format!("linkc-migrate-test-seq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("0001_first.sql"), "").unwrap();
+        std::fs::write(dir.join("0003_third.sql"), "").unwrap();
+        std::fs::write(dir.join("0002_second.sql"), "").unwrap();
+        assert_eq!(next_migration_number(&dir).unwrap(), 4, "toma el máximo existente (3) + 1, sin importar el orden en que se crearon");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

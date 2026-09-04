@@ -5673,3 +5673,255 @@ service Blog {{
     assert_eq!(items[2]["related"]["name"], "Alan");
     assert_eq!(items[0]["row"]["title"], "Post 1");
 }
+
+// ---- migraciones versionadas (`migrate generate`/`migrate apply`, GRAMMAR.md §3.252) ----
+
+#[test]
+fn migrate_generate_writes_a_numbered_migration_file_without_applying_it() {
+    const COLLECTION: &str = "reviews_migrate_generate_new";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let temp = TempDir::new("migrate-generate-new");
+    let link = temp.write(
+        "app.link",
+        &format!(r#"type Review = {{ id: Int, rating: Int }} db {{ {COLLECTION}: Review[] }} service Reviews {{ rpc noop() -> Int {{ 1 }} }}"#),
+    );
+    let migrations_dir = temp.0.join("migrations");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("migrate")
+        .arg("generate")
+        .arg(&link)
+        .arg("adds_reviews")
+        .arg("--db")
+        .arg(&url)
+        .arg("--migrations-dir")
+        .arg(&migrations_dir)
+        .output()
+        .expect("ejecutar linkc migrate generate");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("generado:"), "{stdout}");
+
+    let entries: Vec<_> = std::fs::read_dir(&migrations_dir).expect("leer migrations/").collect();
+    assert_eq!(entries.len(), 1, "un solo archivo generado");
+    let path = entries.into_iter().next().unwrap().unwrap().path();
+    assert!(path.file_name().unwrap().to_string_lossy().starts_with("0001_adds_reviews"), "{path:?}");
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(content.contains(&format!("CREATE TABLE IF NOT EXISTS \"{COLLECTION}\"")), "{content}");
+
+    // 'generate' NUNCA aplica -- la tabla no existe de verdad todavía.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let exists = client
+        .query_one("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)", &[&COLLECTION])
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap();
+    assert!(!exists, "'migrate generate' no debe crear la tabla de verdad");
+}
+
+#[test]
+fn migrate_generate_writes_no_file_when_schema_already_matches() {
+    const COLLECTION: &str = "reviews_migrate_generate_nochange";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    client
+        .batch_execute(&format!("CREATE TABLE \"{COLLECTION}\" (\"id\" BIGSERIAL PRIMARY KEY, \"rating\" BIGINT NOT NULL)"))
+        .expect("crear la tabla a mano, ya al día");
+
+    let temp = TempDir::new("migrate-generate-nochange");
+    let link = temp.write(
+        "app.link",
+        &format!(r#"type Review = {{ id: Int, rating: Int }} db {{ {COLLECTION}: Review[] }} service Reviews {{ rpc noop() -> Int {{ 1 }} }}"#),
+    );
+    let migrations_dir = temp.0.join("migrations");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("migrate")
+        .arg("generate")
+        .arg(&link)
+        .arg("noop")
+        .arg("--db")
+        .arg(&url)
+        .arg("--migrations-dir")
+        .arg(&migrations_dir)
+        .output()
+        .expect("ejecutar linkc migrate generate");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("sin cambios"), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(!migrations_dir.exists() || std::fs::read_dir(&migrations_dir).unwrap().next().is_none(), "no debería haber generado ningún archivo");
+}
+
+#[test]
+fn migrate_generate_increments_the_sequence_number_across_calls() {
+    const COLLECTION_A: &str = "reviews_migrate_seq_a";
+    const COLLECTION_B: &str = "reviews_migrate_seq_b";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION_A);
+    reset_schema(&url, COLLECTION_B);
+
+    let temp = TempDir::new("migrate-seq");
+    let migrations_dir = temp.0.join("migrations");
+
+    for (name, coll) in [("first", COLLECTION_A), ("second", COLLECTION_B)] {
+        let link = temp.write(
+            &format!("{name}.link"),
+            &format!(r#"type Review = {{ id: Int, rating: Int }} db {{ {coll}: Review[] }} service Reviews {{ rpc noop() -> Int {{ 1 }} }}"#),
+        );
+        let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+            .arg("migrate")
+            .arg("generate")
+            .arg(&link)
+            .arg(name)
+            .arg("--db")
+            .arg(&url)
+            .arg("--migrations-dir")
+            .arg(&migrations_dir)
+            .output()
+            .expect("ejecutar linkc migrate generate");
+        assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let mut names: Vec<String> =
+        std::fs::read_dir(&migrations_dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names[0].starts_with("0001_first"), "{names:?}");
+    assert!(names[1].starts_with("0002_second"), "{names:?}");
+}
+
+#[test]
+fn migrate_apply_creates_the_tracking_table_and_applies_pending_migrations_in_order() {
+    const COLLECTION: &str = "reviews_migrate_apply";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    {
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+        let _ = client.batch_execute("DROP TABLE IF EXISTS \"_link_migrations\"");
+    }
+
+    let temp = TempDir::new("migrate-apply");
+    let link = temp.write(
+        "app.link",
+        &format!(r#"type Review = {{ id: Int, rating: Int }} db {{ {COLLECTION}: Review[] }} service Reviews {{ rpc noop() -> Int {{ 1 }} }}"#),
+    );
+    let migrations_dir = temp.0.join("migrations");
+
+    let gen_out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("migrate")
+        .arg("generate")
+        .arg(&link)
+        .arg("adds_reviews")
+        .arg("--db")
+        .arg(&url)
+        .arg("--migrations-dir")
+        .arg(&migrations_dir)
+        .output()
+        .expect("ejecutar linkc migrate generate");
+    assert!(gen_out.status.success(), "stderr: {}", String::from_utf8_lossy(&gen_out.stderr));
+
+    let apply_out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("migrate")
+        .arg("apply")
+        .arg("--db")
+        .arg(&url)
+        .arg("--migrations-dir")
+        .arg(&migrations_dir)
+        .output()
+        .expect("ejecutar linkc migrate apply");
+    assert!(apply_out.status.success(), "stderr: {}", String::from_utf8_lossy(&apply_out.stderr));
+    let stdout = String::from_utf8_lossy(&apply_out.stdout);
+    assert!(stdout.contains("aplicadas 1 migración"), "{stdout}");
+    assert!(stdout.contains("0001_adds_reviews"), "{stdout}");
+
+    // La tabla existe de verdad ahora, y el registro de estado también.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let exists = client
+        .query_one("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)", &[&COLLECTION])
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap();
+    assert!(exists, "'migrate apply' tiene que haber creado la tabla de verdad");
+    let applied_names: Vec<String> =
+        client.query("SELECT \"name\" FROM \"_link_migrations\"", &[]).unwrap().iter().map(|r| r.get(0)).collect();
+    assert_eq!(applied_names.len(), 1);
+    assert!(applied_names[0].starts_with("0001_adds_reviews"), "{applied_names:?}");
+
+    // Segunda corrida: ya está al día, no reintenta nada.
+    let second_out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("migrate")
+        .arg("apply")
+        .arg("--db")
+        .arg(&url)
+        .arg("--migrations-dir")
+        .arg(&migrations_dir)
+        .output()
+        .expect("ejecutar linkc migrate apply de nuevo");
+    assert!(second_out.status.success());
+    assert!(String::from_utf8_lossy(&second_out.stdout).contains("al día"), "{}", String::from_utf8_lossy(&second_out.stdout));
+}
+
+#[test]
+fn migrate_apply_stops_at_the_first_failing_migration_and_keeps_earlier_ones_applied() {
+    const COLLECTION: &str = "reviews_migrate_apply_fail";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    {
+        let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+        let _ = client.batch_execute("DROP TABLE IF EXISTS \"_link_migrations\"");
+    }
+
+    let temp = TempDir::new("migrate-apply-fail");
+    let migrations_dir = temp.0.join("migrations");
+    std::fs::create_dir_all(&migrations_dir).unwrap();
+    std::fs::write(
+        migrations_dir.join("0001_ok.sql"),
+        format!("CREATE TABLE IF NOT EXISTS \"{COLLECTION}\" (\"id\" BIGSERIAL PRIMARY KEY, \"rating\" BIGINT NOT NULL);"),
+    )
+    .unwrap();
+    std::fs::write(migrations_dir.join("0002_broken.sql"), "ESTO NO ES SQL VALIDO;").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_linkc"))
+        .arg("migrate")
+        .arg("apply")
+        .arg("--db")
+        .arg(&url)
+        .arg("--migrations-dir")
+        .arg(&migrations_dir)
+        .output()
+        .expect("ejecutar linkc migrate apply");
+    assert!(!out.status.success(), "tiene que fallar por la migración rota");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("0002_broken"), "{stderr}");
+
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let exists = client
+        .query_one("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)", &[&COLLECTION])
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap();
+    assert!(exists, "la primera migración (válida) tiene que haber quedado aplicada");
+    let applied_names: Vec<String> =
+        client.query("SELECT \"name\" FROM \"_link_migrations\"", &[]).unwrap().iter().map(|r| r.get(0)).collect();
+    assert_eq!(applied_names, vec!["0001_ok.sql".to_string()], "solo la primera quedó registrada, nunca la rota");
+}

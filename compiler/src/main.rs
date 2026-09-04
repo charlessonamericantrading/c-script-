@@ -286,6 +286,8 @@ fn print_usage(to_stderr: bool) {
     out("     linkc explain <código>                 (explica un código de error estable, ej. 'linkc explain L0001' -- NO todo error tiene uno, GRAMMAR.md §3.210)");
     out("     linkc triggers <archivo.link> [--db-schema <nombre>] [--only-streams]   (imprime el DDL idempotente de PostgreSQL -- una función + un trigger AFTER INSERT/UPDATE/DELETE por colección -- que hace que un stream de 'linkc serve' reaccione a escrituras hechas por OTRO sistema sobre la misma base, vía el mismo canal LISTEN/NOTIFY; no se conecta a nada ni aplica nada, GRAMMAR.md §3.225; --only-streams limita el DDL a las colecciones que algún stream observa con db.<c>.subscribe())");
     out("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)");
+    out("     linkc migrate generate <archivo.link> <nombre> --db <url-postgres> [--migrations-dir <dir>] (guarda el mismo diff en un archivo de migración nuevo y numerado -- migrations/0001_<nombre>.sql -- sin aplicarlo; GRAMMAR.md §3.252)");
+    out("     linkc migrate apply --db <url-postgres> [--migrations-dir <dir>] (aplica en orden cada migración pendiente de 'migrations/', registrada en la tabla \"_link_migrations\"; workflow explícito y APARTE del auto-apply de 'linkc serve', los dos conviven -- GRAMMAR.md §3.252)");
     out("     linkc doctor <archivo.link> [--db <url|archivo>] [--target-url <url>] (diagnóstico de entorno antes de un despliegue: versión, que el archivo y sus imports resuelvan/tipen, permiso de escritura en su directorio, y conectividad de solo lectura a la base configurada -- --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'; con --target-url/LINK_DOCTOR_TARGET_URL, además compara la versión local contra la de un 'linkc serve' real corriendo ahí, vía /health)");
     out("     linkc db inspect <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (lista cada colección declarada con su estado físico real -- existe o no, cuántas filas -- sin ejecutar ningún DDL; --db/LINK_DATABASE_URL, mismo criterio que 'linkc serve'/'linkc doctor'; --db-schema/LINK_DATABASE_SCHEMA solo Postgres)");
     out("     linkc db export <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>] (vuelca cada colección declarada a un archivo JSON, byte-idéntico al wire real -- sin ejecutar ningún DDL)");
@@ -583,15 +585,26 @@ fn cmd_introspect(args: &[String]) -> ExitCode {
 /// Solo PostgreSQL: SQLite ya reporta el diff exacto al conectar de verdad
 /// (`check_schema_matches`, GRAMMAR.md §3.17), antes de tocar nada.
 fn cmd_migrate(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        Some("generate") => return cmd_migrate_generate(&args[1..]),
+        Some("apply") => return cmd_migrate_apply(&args[1..]),
+        _ => {}
+    }
     let Some(path) = args.first() else {
-        eprintln!("uso: linkc migrate <archivo.link> --db <url-postgres> [--db-schema <nombre>] --dry-run");
+        eprintln!(
+            "uso: linkc migrate <archivo.link> --db <url-postgres> [--db-schema <nombre>] --dry-run\n\
+             o:  linkc migrate generate <archivo.link> <nombre> --db <url-postgres> [--db-schema <nombre>] [--migrations-dir <dir>]\n\
+             o:  linkc migrate apply --db <url-postgres> [--db-schema <nombre>] [--migrations-dir <dir>]"
+        );
         return ExitCode::FAILURE;
     };
     if !args.iter().any(|a| a == "--dry-run") {
         eprintln!(
-            "uso: linkc migrate <archivo.link> --db <url-postgres> --dry-run -- esta ronda solo soporta \
-             --dry-run (mostrar el DDL sin aplicarlo). Aplicar de verdad ya pasa automáticamente al conectar \
-             con 'linkc serve'/'linkc serve-all', que es intencional, no un olvido."
+            "uso: linkc migrate <archivo.link> --db <url-postgres> --dry-run -- esta forma solo soporta \
+             --dry-run (mostrar el DDL sin aplicarlo); aplicar de verdad ya pasa automáticamente al conectar \
+             con 'linkc serve'/'linkc serve-all', que sigue siendo intencional, no un olvido. Si en cambio \
+             querés un historial versionado con un paso explícito de aplicación (GRAMMAR.md §3.252), usá \
+             'linkc migrate generate <archivo.link> <nombre> --db <url>' y 'linkc migrate apply --db <url>'."
         );
         return ExitCode::FAILURE;
     }
@@ -630,6 +643,127 @@ fn cmd_migrate(args: &[String]) -> ExitCode {
     match linkc::migrate::dry_run_postgres(&program, &url, db_schema.as_deref()) {
         Ok(report) => {
             println!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `--migrations-dir <dir>` (default `./migrations`, relativo al directorio
+/// desde donde se corre `linkc`) -- mismo default en `generate` y `apply`
+/// para que apuntar los dos al mismo lugar sea el camino de cero
+/// configuración; ninguno de los dos necesita el archivo `.link` para saber
+/// dónde está (a diferencia de `generate`, que sí lo necesita para calcular
+/// el diff).
+fn resolve_migrations_dir(args: &[String]) -> PathBuf {
+    args.iter()
+        .position(|a| a == "--migrations-dir")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("migrations"))
+}
+
+/// `linkc migrate generate <archivo.link> <nombre> --db <url> [--db-schema
+/// <nombre>] [--migrations-dir <dir>]` (PLAN.md §9.21 Fase 4 ítem 14,
+/// GRAMMAR.md §3.252): calcula el mismo diff que `--dry-run` y lo guarda en
+/// un archivo de migración nuevo, sin aplicarlo -- workflow EXPLÍCITO y
+/// aparte del auto-apply de siempre en `linkc serve` [decisión del
+/// usuario: los dos conviven].
+fn cmd_migrate_generate(args: &[String]) -> ExitCode {
+    let (Some(path), Some(name)) = (args.first(), args.get(1)) else {
+        eprintln!(
+            "uso: linkc migrate generate <archivo.link> <nombre> --db <url-postgres> [--db-schema <nombre>] [--migrations-dir <dir>]"
+        );
+        return ExitCode::FAILURE;
+    };
+    let url = match read_flag_or_env(args, "--db", "LINK_DATABASE_URL") {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            eprintln!("uso: linkc migrate generate <archivo.link> <nombre> --db <url-postgres> (o LINK_DATABASE_URL)");
+            return ExitCode::FAILURE;
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        eprintln!("'linkc migrate generate' solo aplica a PostgreSQL -- mismo alcance que '--dry-run'.");
+        return ExitCode::FAILURE;
+    }
+    let db_schema = match resolve_db_schema(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let program = match load_and_check(path) {
+        Ok(p) => p,
+        Err(code) => return code,
+    };
+    let migrations_dir = resolve_migrations_dir(args);
+
+    match linkc::migrate::generate_migration(&program, &url, db_schema.as_deref(), name, &migrations_dir) {
+        Ok(Some(path)) => {
+            println!("generado: {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            println!("sin cambios -- el schema declarado ya coincide con la base, no se generó ningún archivo");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `linkc migrate apply --db <url> [--db-schema <nombre>] [--migrations-dir
+/// <dir>]` (PLAN.md §9.21 Fase 4 ítem 14, GRAMMAR.md §3.252): aplica, en
+/// orden, cada migración de `migrations_dir` que todavía no figure en
+/// `"_link_migrations"`. No necesita el archivo `.link` -- aplica lo que
+/// haya en el directorio de migraciones, sea cual sea el estado actual del
+/// programa.
+fn cmd_migrate_apply(args: &[String]) -> ExitCode {
+    let url = match read_flag_or_env(args, "--db", "LINK_DATABASE_URL") {
+        Ok(Some(u)) => u,
+        Ok(None) => {
+            eprintln!("uso: linkc migrate apply --db <url-postgres> (o LINK_DATABASE_URL)");
+            return ExitCode::FAILURE;
+        }
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !(url.starts_with("postgres://") || url.starts_with("postgresql://")) {
+        eprintln!("'linkc migrate apply' solo aplica a PostgreSQL -- mismo alcance que '--dry-run'/'generate'.");
+        return ExitCode::FAILURE;
+    }
+    let db_schema = match resolve_db_schema(args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let migrations_dir = resolve_migrations_dir(args);
+
+    match linkc::migrate::apply_migrations(&url, db_schema.as_deref(), &migrations_dir) {
+        Ok(applied) if applied.is_empty() => {
+            println!("al día -- ninguna migración pendiente en '{}'", migrations_dir.display());
+            ExitCode::SUCCESS
+        }
+        Ok(applied) => {
+            println!("aplicadas {} migración(es):", applied.len());
+            for name in applied {
+                println!("  - {name}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {

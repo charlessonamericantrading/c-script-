@@ -1025,7 +1025,7 @@ Ninguna es grande (`skynet_knowledge` 293 filas, `messages` 162, el resto < 100)
 
 ### 9.21 Evolución y modernización integral de la capa de Base de Datos (03/09/2026)
 
-**Estado: Fase 1 y Fase 2 HECHAS (03/09/2026, v1.200.0, ítems 1-8); Fase 3 ítems 9-10 HECHOS (03/09/2026, v1.200.2/v1.200.3); ítem 11 PARCIAL (03/09/2026, v1.200.4, solo `id: String`, PKs compuestas quedan afuera); Fase 4 sin ejecutar.** Origen: pedido explícito del usuario para estructurar las mejoras del subsistema de persistencia (`db { ... }`). Detalla los cuellos de botella de concurrencia física, la falta de relaciones formales (N+1 forzado), la rigidez de nombres de columna y los límites actuales de pushdown SQL.
+**Estado: Fase 1 y Fase 2 HECHAS (03/09/2026, v1.200.0, ítems 1-8); Fase 3 ítems 9-10 HECHOS (03/09/2026, v1.200.2/v1.200.3); ítem 11 PARCIAL (03/09/2026, v1.200.4, solo `id: String`, PKs compuestas quedan afuera); Fase 4 ítem 14 HECHO (04/09/2026, v1.200.6); ítems 12-13 sin ejecutar (necesitan decisión del usuario).** Origen: pedido explícito del usuario para estructurar las mejoras del subsistema de persistencia (`db { ... }`). Detalla los cuellos de botella de concurrencia física, la falta de relaciones formales (N+1 forzado), la rigidez de nombres de columna y los límites actuales de pushdown SQL.
 
 #### 1. Fricciones y límites medidos en el código actual
 - **Conexión física única en PostgreSQL y SQLite**: `store.rs:78-95` encapsula la conexión Postgres en un `ReentrantMutex`. Toda request concurrente en `linkc serve` se encola detrás de este mutex. En SQLite no hay separación WAL de lectores paralelos.
@@ -1056,13 +1056,13 @@ Ninguna es grande (`skynet_knowledge` 293 filas, `messages` 162, el resto < 100)
 ##### Fase 4 -- Seguridad SaaS, IA y control de esquemas
 12. **Multi-tenancy declarativo `@tenant(campo)` [decisión del usuario]**: Inyección automática e invisible del filtro de tenant en runtime para toda consulta y mutación. Esfuerzo M-L.
 13. **`Vector<N>` + pgvector nativo [decisión del usuario]**: Tipo vectorial, índice HNSW y método `.nearest(...)` para búsqueda semántica/RAG (cierra §9.18 F2 y §9.20 H2). Esfuerzo M-L.
-14. **Migraciones versionadas con estado**: Tabla `_link_migrations`, `linkc migrate generate <nombre>` (DDL numerado) y `linkc migrate apply`. Esfuerzo M.
+14. ~~**Migraciones versionadas con estado**~~ **HECHO (04/09/2026, v1.200.6, GRAMMAR.md §3.252) [decisión del usuario: aditivo, convive con el auto-apply de `linkc serve`, nunca lo reemplaza]**: `linkc migrate generate <archivo.link> <nombre> --db <url>` calcula el mismo diff que `--dry-run` (cero duplicación) y lo guarda en `migrations/NNNN_<nombre>.sql` sin aplicarlo; `linkc migrate apply --db <url>` crea `"_link_migrations"` y aplica en orden cada migración pendiente, un archivo = una transacción implícita (protocolo simple de Postgres), se corta en la primera que falla. Sin ciclo Expand/Contract ni rollback -- mismo alcance no-destructivo que el DDL que ya genera `--dry-run`. Texto original: Tabla `_link_migrations`, `linkc migrate generate <nombre>` (DDL numerado) y `linkc migrate apply`. Esfuerzo M.
 
 #### 3. Orden recomendado de ejecución
 - **Ronda 1 (Inmediatos, sin cambio de sintaxis) -- HECHA v1.200.0**: 1 (Pool Postgres), 3 (`@column`), 5 (Pushdown `IN`), 6 (Texto `ILIKE`).
 - **Ronda 2 (Rendimiento y queries masivas) -- HECHA v1.200.0**: 2 (SQLite WAL), 7 (`.updateWhere`), 4 (`introspect` completo).
 - **Ronda 3 (Relaciones y tipos, con luz verde del usuario)**: 9 (`@ref`) -- HECHA v1.200.2, 10 (`.with` sin N+1) -- HECHA v1.200.3, 11 (PKs flexibles) -- PARCIAL v1.200.4 (`id: String` hecho, PKs compuestas pendientes).
-- **Ronda 4 (SaaS, IA y Migraciones)**: 12 (`@tenant`), 13 (`Vector<N>`), 14 (`migrate apply`).
+- **Ronda 4 (SaaS, IA y Migraciones)**: 12 (`@tenant`), 13 (`Vector<N>`), 14 (`migrate apply`) -- HECHA v1.200.6.
 
 ---
 

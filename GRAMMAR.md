@@ -4773,7 +4773,7 @@ linkc migrate backend.link --db postgres://user:pass@host/produccion --dry-run
 
 **Solo PostgreSQL, a propósito.** SQLite (`check_schema_matches`) ya falla FUERTE ante cualquier diferencia de schema al conectar de verdad, con un mensaje que nombra el diff exacto ANTES de tocar nada -- un modo `--dry-run` aparte no agregaría ninguna información que ese camino no dé ya. `linkc migrate` sobre una URL que no empieza con `postgres://`/`postgresql://` se rechaza con este motivo explícito.
 
-**Solo `--dry-run` en esta ronda -- sin un modo "aplicar" separado.** `linkc migrate <archivo> --db <url>` SIN `--dry-run` se rechaza con un mensaje explícito: aplicar de verdad ya pasa automáticamente al conectar con `linkc serve`/`linkc serve-all` -- un segundo camino que también "aplica" sería ambiguo (¿cuál gana si los dos corren a la vez?) sin agregar nada que `linkc serve` no haga ya.
+**Solo `--dry-run` en esta forma -- sin un modo "aplicar" separado.** `linkc migrate <archivo> --db <url>` SIN `--dry-run` se rechaza con un mensaje explícito: aplicar de verdad ya pasa automáticamente al conectar con `linkc serve`/`linkc serve-all` -- un segundo camino que también "aplica" en el MISMO lugar sería ambiguo (¿cuál gana si los dos corren a la vez?). GRAMMAR.md §3.252 agrega un workflow EXPLÍCITO y aparte (`migrate generate`/`migrate apply`, con su propia tabla de estado) para quien quiera historial versionado -- convive con el auto-apply de acá, nunca lo reemplaza.
 
 **Límites honestos:**
 - **Sin `--allow-destructive`, porque no hace falta uno todavía.** El pedido original mencionaba "comportamiento configurable ante una migración que perdería datos" -- auditando la migración real de Postgres (GRAMMAR.md §3.17) apareció que HOY no existe ningún camino destructivo: solo crea tablas nuevas y agrega columnas SIEMPRE nullable, nunca borra ni cambia el tipo de una columna existente. No hay ninguna migración "peligrosa" que un dry-run necesite advertir hoy -- si el proyecto suma en el futuro una migración genuinamente destructiva (un `DROP COLUMN` explícito, por ejemplo), ESE sería el momento de agregar el flag, no antes.
@@ -8859,6 +8859,42 @@ test "id: String genera un uuid y funciona en el ciclo completo" {
 ```
 
 **Verificado**: `compiler/tests/cli_string_pk.rs` (5 tests: ciclo CRUD completo vía `linkc test`, rechazo de `pageAfter`, el DDL estático de `linkc build` emitiendo `VARCHAR` -- nunca `UUID` nativo --, `linkc introspect` mapeando una columna SQLite real `VARCHAR` a `id: String`, y `--adopt-existing` leyendo una fila preexistente de una tabla SQLite real con PK `VARCHAR`); `compiler/tests/pg_integration.rs` (`string_pk_collection_supports_the_full_crud_cycle_against_a_fresh_postgres_table` confirmando la columna real como `character varying`, y `adopt_existing_varchar_pk_table_with_gen_random_uuid_default_supports_the_full_crud_cycle_against_a_real_postgres_table` -- el caso real de Skynet, tabla preexistente con `DEFAULT gen_random_uuid()::text`).
+
+### 3.252 `linkc migrate generate`/`linkc migrate apply`: migraciones versionadas con estado — RESUELTO, cierra PLAN.md §9.21 Fase 4 (ítem 14)
+
+Origen: `PLAN.md §9.21` Fase 4 ítem 14. `linkc migrate --dry-run` (§3.97) ya reportaba el DDL exacto, y `linkc serve` ya lo aplicaba automáticamente al conectar -- pero sin ningún HISTORIAL: nadie podía ver qué cambios de esquema ya se aplicaron contra una base en particular, ni revisar en un pull request el DDL exacto de un cambio antes de que corra contra producción. **Decisión de diseño explícita del usuario**: este workflow es ADITIVO, nunca reemplaza el auto-apply de `linkc serve` al conectar -- los dos conviven, cada equipo elige uno, ninguno de los dos deja de funcionar por la existencia del otro.
+
+```bash
+# Genera un archivo NUEVO y numerado con el diff -- nunca lo aplica.
+linkc migrate generate backend.link agrega_facturas --db postgres://user:pass@host/produccion
+# generado: migrations/0001_agrega_facturas.sql
+
+# Revisar el archivo a mano (o en un PR) antes de aplicarlo:
+cat migrations/0001_agrega_facturas.sql
+# -- Migración generada por 'linkc migrate generate' -- 0001_agrega_facturas.sql
+# -- Ejecutable tal cual: 'linkc migrate apply' la corre como un solo batch atómico.
+#
+# -- 'facturas': tabla nueva
+# CREATE TABLE IF NOT EXISTS "facturas" ( ... );
+
+# Aplica, en orden, cada migración pendiente -- y la registra.
+linkc migrate apply --db postgres://user:pass@host/produccion
+# aplicadas 1 migración(es):
+#   - 0001_agrega_facturas.sql
+```
+
+- **`linkc migrate generate <archivo.link> <nombre> --db <url> [--db-schema <nombre>] [--migrations-dir <dir>]`**: calcula EXACTAMENTE el mismo diff que `--dry-run` (misma función interna, cero duplicación de la generación de DDL, GRAMMAR.md §3.9) y, si hay algo que migrar, lo guarda en `<migrations-dir>/NNNN_<nombre>.sql` (default `./migrations`, secuencial de 4 dígitos, `nombre` normalizado a minúsculas/guiones bajos). Sin cambios que migrar -- "sin cambios", no crea ningún archivo.
+- **`linkc migrate apply --db <url> [--db-schema <nombre>] [--migrations-dir <dir>]`**: crea la tabla de estado `"_link_migrations"` (`id`, `name` UNIQUE, `applied_at`) si no existe, y aplica -- EN ORDEN, por nombre de archivo -- cada migración de `migrations-dir` que todavía no figure ahí. Cada archivo corre como un solo batch (el protocolo simple de PostgreSQL ya envuelve varias sentencias del mismo mensaje en una transacción implícita: un archivo con tres `ALTER TABLE` es todo-o-nada) seguido, en la MISMA llamada, del `INSERT` que la marca aplicada -- si el DDL falla, el `INSERT` tampoco corre, así que un archivo nunca queda "medio aplicado" en el estado. Se corta en la primera que falle: las anteriores (de esta corrida o de una anterior) quedan aplicadas, las de después ni se intentan.
+- **No necesita el `.link`**: a diferencia de `generate`, `apply` no lee ningún programa -- aplica lo que haya en `migrations-dir` contra la base, sea cual sea el estado actual del código. Mismo espíritu que cualquier migrador de otro ecosistema (Rails/Django/Prisma): las migraciones YA GENERADAS son la fuente de verdad de "qué corre", no el `.link` del momento.
+- **Solo PostgreSQL**, mismo motivo que `--dry-run`: SQLite no tiene este problema (aplica y reporta el diff al conectar, sin nada que versionar aparte).
+
+**Límites honestos:**
+- **Nunca destructivo, mismo alcance que el DDL que ya genera `--dry-run`**: solo crea tablas y agrega columnas nullable -- ninguna migración generada por este comando puede borrar una columna o cambiar un tipo existente, porque el generador de DDL subyacente tampoco lo hace.
+- **Sin ciclo Expand/Contract**: una migración generada agrega, nunca quita ni renombra -- un rename de columna sigue siendo "agregar la nueva + migrar datos a mano + borrar la vieja en otra ronda", no automatizado.
+- **Sin rollback/`down`**: cada migración es un archivo `.sql` de ida, sin su contraparte de reversión -- deshacer un cambio ya aplicado es DDL manual, como con `--dry-run` hasta ahora.
+- **Migraciones escritas a mano no se validan de ninguna forma especial**: un archivo `.sql` agregado directamente a `migrations-dir` (sin pasar por `generate`) se aplica tal cual, con el mismo criterio de "todo o nada por archivo" -- útil para un cambio que el generador automático no cubre (un `DROP COLUMN` explícito, por ejemplo), pero sin ninguna garantía extra sobre su contenido.
+
+**Verificado**: `compiler/tests/pg_integration.rs`, 6 tests contra PostgreSQL real -- `generate` escribe el archivo numerado sin aplicar nada; sin cambios no genera ningún archivo; dos llamadas sucesivas numeran 0001/0002; `apply` crea `_link_migrations`, aplica la migración pendiente, y una segunda corrida la reconoce ya aplicada; una migración rota corta la corrida sin tocar las migraciones posteriores, dejando aplicadas solo las anteriores.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

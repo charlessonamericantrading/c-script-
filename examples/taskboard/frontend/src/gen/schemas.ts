@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.200.5 — no editar a mano.
+// Generado automáticamente por linkc v1.200.6 — no editar a mano.
 
 import { z } from "zod";
 

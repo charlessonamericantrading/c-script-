@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.200.6] - 2026-09-04
+
+### ✨ Añadido
+**`linkc migrate generate`/`linkc migrate apply` -- migraciones versionadas con estado (PLAN.md §9.21 Fase 4 ítem 14)**: `linkc migrate generate <archivo.link> <nombre> --db <url>` calcula el mismo diff que `--dry-run` (cero duplicación de la generación de DDL) y lo guarda en `migrations/NNNN_<nombre>.sql` sin aplicarlo; `linkc migrate apply --db <url>` crea la tabla de estado `"_link_migrations"` y aplica en orden cada migración pendiente -- un archivo = una transacción implícita (protocolo simple de Postgres), se corta en la primera que falla, sin tocar las siguientes. Aditivo por decisión explícita del usuario: convive con el auto-apply de `linkc serve` al conectar, nunca lo reemplaza -- cada equipo elige uno. Sin ciclo Expand/Contract ni rollback, mismo alcance no-destructivo que el DDL que ya genera `--dry-run`. Ver GRAMMAR.md §3.252.
+
 ## [1.200.5] - 2026-09-03
 
 ### 🔧 Proceso
