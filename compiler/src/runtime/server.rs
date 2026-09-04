@@ -1977,7 +1977,7 @@ fn check_resource_ownership(
         .db_collections()
         .get(&clause.collection)
         .unwrap_or_else(|| unreachable!("check_requires_ownership_clause ya garantizó que '{}' es una colección real", clause.collection));
-    let id_ty = crate::checker::Checker::db_id_type(element_ty);
+    let id_ty = checker.db_id_type(element_ty);
     let Some(id_json) = args_json.get(&clause.id_param) else {
         return Err((400, format!("falta el parámetro '{}'", clause.id_param)));
     };

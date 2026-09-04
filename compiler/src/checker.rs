@@ -1143,6 +1143,13 @@ impl Checker {
                 "el tipo de elemento de una colección de 'db' tiene que ser un struct, se encontró {element_ty:?}"
             )));
         };
+        // GRAMMAR.md §3.255: `@primaryKey(...)` es una ALTERNATIVA válida al
+        // 'id' escalar de abajo -- ya validada por `check_type_annotations`
+        // (2+ campos, requeridos, Int/Uuid/String), así que acá alcanza con
+        // confirmar que la anotación está presente.
+        if self.composite_pk_fields(element_ty).is_some() {
+            return Ok(());
+        }
         // GRAMMAR.md §3.251: `id: String` (PLAN.md §9.21 Fase 3 ítem 11) --
         // tercera forma de PK, junto a `Int`/`Uuid`. Pensada para adoptar
         // una tabla existente cuya columna `id` es `VARCHAR`/`TEXT` (no el
@@ -1153,20 +1160,44 @@ impl Checker {
         let id_ok = fields.iter().any(|f| f.name == "id" && !f.optional && matches!(f.ty, Type::Int | Type::Uuid | Type::String));
         if !id_ok {
             return Err(err(
-                "toda colección de 'db' necesita un campo 'id: Int', 'id: Uuid' o 'id: String' requerido (no opcional, no nullable)",
+                "toda colección de 'db' necesita un campo 'id: Int', 'id: Uuid' o 'id: String' requerido (no opcional, no nullable), o una anotación '@primaryKey(campo1, campo2, ...)' antes del 'type' (GRAMMAR.md §3.255)",
             ));
         }
         Ok(())
     }
 
-    /// El tipo REAL del campo `id` de una colección ya validada por
-    /// `validate_db_element_type` -- `Int` (autoincremento), `Uuid` o
-    /// `String` (los dos últimos generados del lado de la aplicación,
-    /// GRAMMAR.md §3.177/§3.251). `find`/`applyPatch`/`delete`/`increment`/
-    /// `pageAfter` tipan su argumento/cursor de id contra ESTE tipo en vez
-    /// de un `Type::Int` fijo, para aceptar los tres casos con el mismo
-    /// código.
-    pub(crate) fn db_id_type(element_ty: &Type) -> Type {
+    /// Los campos de la clave primaria COMPUESTA de `element_ty` (GRAMMAR.md
+    /// §3.255), en el orden que `@primaryKey(...)` los declaró -- `None`
+    /// para la inmensa mayoría de colecciones, que usan la PK escalar `id`.
+    /// Mismo cruce `self.types` + `TypeExpr::Struct` que `tenant_field_name`/
+    /// `field_ref_target` (la anotación vive en `ast::TypeDecl`, no en el
+    /// `Type` ya resuelto). Asume que `check_type_annotations` YA validó
+    /// forma/tipo de cada campo -- no repite esa validación acá.
+    pub(crate) fn composite_pk_fields(&self, element_ty: &Type) -> Option<Vec<FieldType>> {
+        let Type::Struct { name: Some(type_name), fields } = element_ty else { return None };
+        let decl = self.types.get(type_name)?;
+        let TypeExpr::Struct(_) = &decl.ty else { return None };
+        let names = decl.annotations.iter().find_map(|a| match a {
+            TypeAnnotation::PrimaryKey(names) => Some(names),
+            _ => None,
+        })?;
+        Some(names.iter().filter_map(|n| fields.iter().find(|f| &f.name == n).cloned()).collect())
+    }
+
+    /// El tipo REAL del "id" de una colección ya validada por
+    /// `validate_db_element_type` -- el campo `id` escalar (`Int`
+    /// autoincremento, `Uuid` o `String`, GRAMMAR.md §3.177/§3.251) para el
+    /// caso normal, o un struct ANÓNIMO con los campos de `@primaryKey(...)`
+    /// (GRAMMAR.md §3.255) para una clave compuesta -- `find`/`applyPatch`/
+    /// `delete`/`increment` tipan su argumento/cursor de id contra ESTE tipo
+    /// en vez de uno fijo, así que los dos casos (y los tres tipos
+    /// escalares) comparten el mismo código de chequeo: `check_expr` ya
+    /// sabe validar un literal de struct contra un `Type::Struct` igual que
+    /// contra un escalar, sin ninguna rama aparte acá.
+    pub(crate) fn db_id_type(&self, element_ty: &Type) -> Type {
+        if let Some(fields) = self.composite_pk_fields(element_ty) {
+            return Type::Struct { name: None, fields };
+        }
         let Type::Struct { fields, .. } = element_ty else {
             unreachable!("validate_db_element_type ya garantizó que element_ty sea un struct");
         };
@@ -2744,7 +2775,7 @@ impl Checker {
                 );
                 continue;
             };
-            let id_ty = Self::db_id_type(target_ty);
+            let id_ty = self.db_id_type(target_ty);
             let ty = if type_params.is_empty() { self.resolve_type(&f.ty) } else { self.resolve_type_abstract(&f.ty, type_params) };
             let ty = match ty {
                 Ok(ty) => ty,
@@ -3084,8 +3115,68 @@ impl Checker {
         // PARCIALES distintos, no un duplicado (`composite_unique_index_name`,
         // runtime/db.rs, ya asume esto para no colisionar de nombre).
         let mut seen_sets: Vec<(std::collections::BTreeSet<String>, Option<Expr>)> = Vec::new();
+        let mut seen_primary_key = false;
         for ann in &t.annotations {
             match ann {
+                // GRAMMAR.md §3.255: clave primaria COMPUESTA -- mismas
+                // reglas de forma que `@unique`/`@index` (2+ campos, sin
+                // repetidos, campos reales), más las que ya exige un `id`
+                // escalar (`validate_db_element_type`): cada campo
+                // requerido y de tipo Int/Uuid/String. A lo sumo una por
+                // type -- dos `@primaryKey` en el mismo struct no tiene
+                // ninguna interpretación válida.
+                TypeAnnotation::PrimaryKey(names) => {
+                    if names.len() < 2 {
+                        errors.push(err(format!(
+                            "'{}': '@primaryKey(...)' necesita al menos 2 campos -- para uno solo, declará 'id: Int'/'id: Uuid'/'id: String' directamente (GRAMMAR.md §3.177)",
+                            t.name
+                        )));
+                        continue;
+                    }
+                    let set: std::collections::BTreeSet<String> = names.iter().cloned().collect();
+                    if set.len() != names.len() {
+                        errors.push(err(format!("'{}': '@primaryKey({})' repite el mismo campo más de una vez", t.name, names.join(", "))));
+                        continue;
+                    }
+                    if seen_primary_key {
+                        errors.push(err(format!(
+                            "'{}' declara '@primaryKey' más de una vez -- una colección tiene una sola clave primaria",
+                            t.name
+                        )));
+                        continue;
+                    }
+                    seen_primary_key = true;
+                    for name in names {
+                        let Some(field) = fields.iter().find(|f| &f.name == name) else {
+                            errors.push(err(format!(
+                                "'{}': '@primaryKey(...)' nombra '{name}', que no es un campo declarado de este type",
+                                t.name
+                            )));
+                            continue;
+                        };
+                        let ty = if t.type_params.is_empty() {
+                            self.resolve_type(&field.ty)
+                        } else {
+                            self.resolve_type_abstract(&field.ty, &t.type_params)
+                        };
+                        match ty {
+                            Ok(ty) if field.optional || matches!(ty, Type::Optional(_)) => {
+                                errors.push(err(format!(
+                                    "'{}': '@primaryKey(...)' incluye '{name}', que es opcional -- cada campo de una clave compuesta tiene que ser requerido",
+                                    t.name
+                                )));
+                            }
+                            Ok(ty) if !matches!(ty, Type::Int | Type::Uuid | Type::String) => {
+                                errors.push(err(format!(
+                                    "'{}': '@primaryKey(...)' incluye '{name}', que es {ty} -- cada campo tiene que ser Int, Uuid o String (GRAMMAR.md §3.255)",
+                                    t.name
+                                )));
+                            }
+                            Ok(_) => {}
+                            Err(e) => errors.push(e),
+                        }
+                    }
+                }
                 // GRAMMAR.md §3.239: `@index(...)` comparte TODAS las reglas
                 // de `@unique(...)` (2+ campos, sin repetidos, campos reales,
                 // `where` validado, sin duplicados) -- solo cambia el DDL.
@@ -3312,7 +3403,7 @@ impl Checker {
             )));
         };
         let param_ty = self.resolve_type(&param.ty)?;
-        let id_ty = Self::db_id_type(element_ty);
+        let id_ty = self.db_id_type(element_ty);
         if param_ty != id_ty {
             return Err(err(format!(
                 "@requires(..., id: {}) en '{}': '{}' tiene que ser {id_ty} (la PK de '{}'), es {param_ty}",
@@ -5523,6 +5614,27 @@ impl Checker {
     /// desconocido ya es un error de tipos acá, no algo que se descubre en
     /// runtime (`Type::Dynamic` dejaba pasar cualquier nombre antes).
     fn check_db_method(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
+        // GRAMMAR.md §3.255: una colección con `@primaryKey(...)` (PK
+        // compuesta) solo soporta el núcleo CRUD en esta ronda -- todo lo
+        // demás asume en algún punto un único "id" secuencial (cursor de
+        // `pageAfter`, autoincremento de `increment`, el `Value::Int` que
+        // `deleteWhere`/`updateWhere` extraen fila por fila, el `ORDER BY
+        // "id"` implícito de varias de estas lecturas). Ampliar cada una es
+        // una extensión mecánica, pero deliberadamente afuera de esta
+        // ronda -- mismo criterio de alcance acotado que ya usaron
+        // `id: String` (dejó las PKs compuestas afuera) y `Vector<N>` (dejó
+        // el índice HNSW afuera): un núcleo chico y sólido antes que una
+        // superficie ancha a medio probar.
+        if self.composite_pk_fields(element_ty).is_some()
+            && !matches!(method, "all" | "find" | "insert" | "insertMany" | "delete" | "applyPatch" | "count")
+        {
+            return Err(err(format!(
+                "'{method}' no está soportado sobre una colección con clave primaria compuesta ('@primaryKey(...)', \
+                 GRAMMAR.md §3.255) -- por ahora solo all/find/insert/insertMany/delete/applyPatch/count. El resto \
+                 (page/pageAfter/increment/findWhere/countWhere/updateWhere/deleteWhere/orderBy/select/with/nearest/\
+                 sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/upsert) queda para una ronda futura."
+            )));
+        }
         match method {
             "all" => {
                 self.expect_no_args(args, "all")?;
@@ -5532,7 +5644,7 @@ impl Checker {
                 let [id_arg] = args else {
                     return Err(err("'find' toma exactamente 1 argumento (id: Int o Uuid, según la PK de la colección)"));
                 };
-                self.check_expr(id_arg, &Self::db_id_type(element_ty), env)?;
+                self.check_expr(id_arg, &self.db_id_type(element_ty), env)?;
                 Ok(Type::Optional(Box::new(element_ty.clone())))
             }
             "insert" => {
@@ -5563,7 +5675,7 @@ impl Checker {
                 let [id_arg, patch_arg] = args else {
                     return Err(err("'applyPatch' toma exactamente 2 argumentos (id: Int o Uuid, patch: Patch<T>)"));
                 };
-                self.check_expr(id_arg, &Self::db_id_type(element_ty), env)?;
+                self.check_expr(id_arg, &self.db_id_type(element_ty), env)?;
                 self.check_expr(patch_arg, &Type::PatchOf(Box::new(element_ty.clone())), env)?;
                 Ok(element_ty.clone())
             }
@@ -5571,7 +5683,7 @@ impl Checker {
                 let [id_arg] = args else {
                     return Err(err("'delete' toma exactamente 1 argumento (id: Int o Uuid, según la PK de la colección)"));
                 };
-                self.check_expr(id_arg, &Self::db_id_type(element_ty), env)?;
+                self.check_expr(id_arg, &self.db_id_type(element_ty), env)?;
                 Ok(Type::Bool)
             }
             "deleteWhere" => {
@@ -5640,7 +5752,7 @@ impl Checker {
                 // error que lo señale. Dejarlo pasar con orden lexicográfico
                 // habría sido "compila y corre" con una garantía documentada
                 // rota en silencio.
-                let id_ty = Self::db_id_type(element_ty);
+                let id_ty = self.db_id_type(element_ty);
                 if id_ty == Type::Uuid || id_ty == Type::String {
                     return Err(err(format!(
                         "'pageAfter' no está soportado sobre una colección con 'id: {id_ty}' -- su garantía de que \
@@ -5650,6 +5762,18 @@ impl Checker {
                          cursor actual quedaría afuera de toda página futura, en silencio. Usá 'page' (offset), que \
                          no depende de ese orden, o un campo propio de fecha/secuencia para paginación estable",
                     )));
+                }
+                // GRAMMAR.md §3.255: mismo motivo que Uuid/String arriba,
+                // más agudo -- una PK compuesta ni siquiera tiene un ÚNICO
+                // valor que crezca, y ninguno de sus campos autoincrementa
+                // (todos son explícitos en cada `insert`).
+                if matches!(id_ty, Type::Struct { .. }) {
+                    return Err(err(
+                        "'pageAfter' no está soportado sobre una colección con clave primaria compuesta \
+                         ('@primaryKey(...)', GRAMMAR.md §3.255) -- su garantía depende de un único id que crezca \
+                         en el orden de inserción (autoincremento), que una PK compuesta no tiene. Usá 'page' \
+                         (offset), o un campo propio de fecha/secuencia para paginación estable",
+                    ));
                 }
                 self.check_expr(cursor_arg, &Type::Optional(Box::new(Type::Int)), env)?;
                 self.check_expr(limit_arg, &Type::Int, env)?;
@@ -5845,9 +5969,6 @@ impl Checker {
         let Type::Struct { fields, .. } = element_ty else {
             return Err(err("una colección de 'db' debe resolver a un struct"));
         };
-        if !fields.iter().any(|f| f.name == "id") {
-            return Err(err("cada colección de 'db' necesita un campo 'id: Int'"));
-        }
         // GRAMMAR.md §3.253: el campo `@tenant`, si hay uno, tampoco es
         // parte del shape insertable -- `Db::call` ("insert") lo
         // autocompleta con el valor del claim de la request actual, mismo
@@ -5855,6 +5976,19 @@ impl Checker {
         // (§3.177/§3.251). Dejar que el caller lo mande permitiría
         // "insertar en el tenant de otro" con solo poner el valor a mano.
         let tenant_field = self.tenant_field_name(element_ty);
+        // GRAMMAR.md §3.255: una PK COMPUESTA nunca se autogenera -- ninguno
+        // de sus campos autoincrementa (a diferencia de "id" escalar), así
+        // que el caller SIEMPRE los manda explícitos en el insert. Acá no
+        // hay ningún "id" que excluir (la colección ni siquiera necesita un
+        // campo con ese nombre, ver `validate_db_element_type`) -- solo el
+        // tenant, si corresponde.
+        if self.composite_pk_fields(element_ty).is_some() {
+            let without_tenant: Vec<FieldType> = fields.iter().filter(|f| Some(&f.name) != tenant_field.as_ref()).cloned().collect();
+            return Ok(Type::Struct { name: None, fields: without_tenant });
+        }
+        if !fields.iter().any(|f| f.name == "id") {
+            return Err(err("cada colección de 'db' necesita un campo 'id: Int'"));
+        }
         let without_id: Vec<FieldType> =
             fields.iter().filter(|f| f.name != "id" && Some(&f.name) != tenant_field.as_ref()).cloned().collect();
         Ok(Type::Struct { name: None, fields: without_id })
@@ -6311,7 +6445,7 @@ impl Checker {
                 "'{method}' toma exactamente 3 argumentos (id: Int o Uuid, selector: |item: T| item.campo, delta: Int)"
             )));
         };
-        self.check_expr(id_arg, &Self::db_id_type(element_ty), env)?;
+        self.check_expr(id_arg, &self.db_id_type(element_ty), env)?;
         let (field_name, field_ty) = self.field_selector(element_ty, selector_arg, method, "a incrementar")?;
         if !matches!(field_ty, Type::Int) {
             return Err(err(format!(

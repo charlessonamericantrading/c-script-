@@ -400,6 +400,45 @@ pub(crate) fn tenant_field_by_collection(program: &Program, checker: &Checker) -
     result
 }
 
+/// Un componente de una clave primaria COMPUESTA (`@primaryKey(...)`,
+/// GRAMMAR.md §3.255): su nombre lógico y su columna SQL física (alias
+/// `@column` si existe, mismo criterio que `FkRef`/`TenantField`). Sin un
+/// `IdKind` propio -- a diferencia de la PK escalar, el bindeo pasa por la
+/// `ColumnPlan` real de cada campo (`write_param`), que ya sabe su tipo;
+/// ningún componente autoincrementa nunca (todos van explícitos en cada
+/// `insert`, ver `Db::composite_insert`).
+#[derive(Clone)]
+pub(crate) struct PkComponent {
+    pub(crate) field_name: String,
+    pub(crate) sql_col: String,
+}
+
+/// Nombre de colección -> sus componentes de PK compuesta, en el orden que
+/// `@primaryKey(...)` los declaró (GRAMMAR.md §3.255) -- `None` (ausente
+/// del mapa) para la inmensa mayoría de colecciones, que usan la PK
+/// escalar `id`. `Checker::composite_pk_fields` ya resolvió CUÁLES campos
+/// son (y validó su forma); acá solo se les suma la columna física.
+pub(crate) fn composite_pk_by_collection(
+    checker: &Checker,
+    aliases_by_collection: &HashMap<String, HashMap<String, String>>,
+) -> HashMap<String, Vec<PkComponent>> {
+    let mut result = HashMap::new();
+    let empty_aliases = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Some(fields) = checker.composite_pk_fields(element_ty) else { continue };
+        let aliases = aliases_by_collection.get(coll_name).unwrap_or(&empty_aliases);
+        let components = fields
+            .iter()
+            .map(|f| PkComponent {
+                field_name: f.name.clone(),
+                sql_col: aliases.get(&f.name).cloned().unwrap_or_else(|| f.name.clone()),
+            })
+            .collect();
+        result.insert(coll_name.clone(), components);
+    }
+    result
+}
+
 /// GRAMMAR.md §3.254: ¿`element_ty` tiene al menos un campo `Vector<N>` de
 /// PRIMER NIVEL (una columna `vector(N)` real que necesita la extensión
 /// pgvector)? Un `Vector<N>` ANIDADO dentro de otro struct queda como JSON
@@ -538,7 +577,11 @@ pub(crate) fn composite_unique_by_collection(program: &Program, checker: &Checke
                         let mapped = fields.iter().map(|f| alias_map.get(f.as_str()).copied().unwrap_or(f.as_str()).to_string()).collect();
                         Some((mapped, condition.as_ref().map(|c| type_check_expr_sql(&c.node)), false))
                     }
-                    TypeAnnotation::Check(_) => None,
+                    // GRAMMAR.md §3.255: `@primaryKey` no es un `@unique`/
+                    // `@index` -- su propio DDL (`PRIMARY KEY (...)` inline
+                    // en el `CREATE TABLE`, ver `composite_pk_by_collection`
+                    // más abajo) no pasa por acá.
+                    TypeAnnotation::Check(_) | TypeAnnotation::PrimaryKey(_) => None,
                 })
                 .collect();
             if !sets.is_empty() {
@@ -569,7 +612,7 @@ pub(crate) fn type_checks_by_collection(program: &Program, checker: &Checker) ->
                 .iter()
                 .filter_map(|a| match a {
                     TypeAnnotation::Check(expr) => Some(type_check_expr_sql(&expr.node)),
-                    TypeAnnotation::Unique(..) | TypeAnnotation::Index(..) => None,
+                    TypeAnnotation::Unique(..) | TypeAnnotation::Index(..) | TypeAnnotation::PrimaryKey(_) => None,
                 })
                 .collect();
             if !clauses.is_empty() {
@@ -829,12 +872,15 @@ pub(crate) fn check_clause_sql(field: &str, check: &FieldCheck) -> String {
 
 fn create_table_sql(
     collection: &str,
-    id_col: &str,
-    id_kind: IdKind,
+    id: Option<(&str, IdKind)>,
     columns: &[ColumnPlan],
     checks: &[(String, FieldCheck)],
     type_checks: &[String],
     refs: &HashMap<String, FkRef>,
+    // GRAMMAR.md §3.255: nombres SQL físicos de una PK compuesta, en el
+    // orden declarado -- `Some` exactamente cuando `id` es `None` (una
+    // colección tiene una PK escalar O compuesta, nunca las dos).
+    composite_pk: Option<&[String]>,
 ) -> String {
     // GRAMMAR.md §3.177: una PK `Uuid` se genera del lado de la
     // aplicación (`crypto.uuid()`, `Db::call` "insert") ANTES de cada
@@ -848,15 +894,24 @@ fn create_table_sql(
     // documentado del motor, distinto del estándar SQL); sin esto, un
     // `id` NULL pasaría el `CREATE TABLE ... STRICT` de arriba sin
     // ninguna queja.
-    let id_def = match id_kind {
-        IdKind::Int => format!("\"{id_col}\" INTEGER PRIMARY KEY AUTOINCREMENT"),
-        // GRAMMAR.md §3.251: mismo DDL SQLite que `Uuid` -- SQLite no
-        // distingue "uuid" de "texto plano", la diferencia con Postgres
-        // (VARCHAR/TEXT en vez del tipo nativo uuid) solo importa del lado
-        // Postgres (ver `codegen::postgres_emit::create_postgres_table_sql`).
-        IdKind::Uuid | IdKind::String => format!("\"{id_col}\" TEXT PRIMARY KEY NOT NULL"),
+    let mut defs: Vec<String> = match id {
+        Some((id_col, id_kind)) => {
+            let id_def = match id_kind {
+                IdKind::Int => format!("\"{id_col}\" INTEGER PRIMARY KEY AUTOINCREMENT"),
+                // GRAMMAR.md §3.251: mismo DDL SQLite que `Uuid` -- SQLite no
+                // distingue "uuid" de "texto plano", la diferencia con Postgres
+                // (VARCHAR/TEXT en vez del tipo nativo uuid) solo importa del lado
+                // Postgres (ver `codegen::postgres_emit::create_postgres_table_sql`).
+                IdKind::Uuid | IdKind::String => format!("\"{id_col}\" TEXT PRIMARY KEY NOT NULL"),
+            };
+            vec![id_def]
+        }
+        // GRAMMAR.md §3.255: PK compuesta -- sin columna "id" propia, cada
+        // campo que la integra ya viene en `columns` como una columna más
+        // (nunca autoincrementa) y el `PRIMARY KEY (...)` sale al final
+        // como constraint de tabla.
+        None => Vec::new(),
     };
-    let mut defs = vec![id_def];
 
     for col in columns {
         let not_null = if col.not_null() { " NOT NULL" } else { "" };
@@ -886,6 +941,9 @@ fn create_table_sql(
     for sql in type_checks {
         defs.push(format!("CHECK {sql}"));
     }
+    if let Some(pk_cols) = composite_pk {
+        defs.push(format!("PRIMARY KEY ({})", pk_cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ")));
+    }
     // STRICT (SQLite >= 3.37, muy por debajo de la versión bundleada de
     // rusqlite 0.40): que SQLite rechace un tipo incompatible en vez de
     // coaccionarlo por type affinity -- defensa en profundidad barata,
@@ -904,8 +962,7 @@ fn create_table_sql(
 fn check_schema_matches(
     connection: &Connection,
     collection: &str,
-    id_col: &str,
-    id_kind: IdKind,
+    id: Option<(&str, IdKind)>,
     columns: &[ColumnPlan],
     db_path: &str,
 ) -> Result<(), RuntimeError> {
@@ -930,11 +987,16 @@ fn check_schema_matches(
     // detectaría un mismatch falso desde el primer arranque. `id TEXT
     // PRIMARY KEY` (GRAMMAR.md §3.177) SÍ declara `NOT NULL` de verdad
     // (ver `create_table_sql`), así que ahí notnull=1 es lo esperado.
-    let id_expected = match id_kind {
-        IdKind::Int => ("INTEGER".to_string(), false),
-        IdKind::Uuid | IdKind::String => ("TEXT".to_string(), true),
-    };
-    expected.insert(id_col.to_string(), id_expected);
+    // GRAMMAR.md §3.255: PK compuesta -- sin columna "id" propia que
+    // esperar acá; cada campo que la integra ya entra por el loop de abajo
+    // como una columna más (`columns` la incluye completa).
+    if let Some((id_col, id_kind)) = id {
+        let id_expected = match id_kind {
+            IdKind::Int => ("INTEGER".to_string(), false),
+            IdKind::Uuid | IdKind::String => ("TEXT".to_string(), true),
+        };
+        expected.insert(id_col.to_string(), id_expected);
+    }
     for col in columns {
         expected.insert(col.sql_name.clone(), (col.sql_type.to_string(), col.not_null()));
     }
@@ -1360,6 +1422,12 @@ pub struct Db {
     /// filtro que aplicar -- comportamiento IDÉNTICO al de antes de esta
     /// ronda para cualquier programa que no use la anotación.
     tenant_fields: HashMap<String, TenantField>,
+    /// Nombre de colección -> componentes de su PK COMPUESTA (GRAMMAR.md
+    /// §3.255), en el orden que `@primaryKey(...)` los declaró. Ausente del
+    /// mapa == la colección usa la PK escalar normal (`id_kinds`/
+    /// `id_columns` de abajo) -- las dos formas son mutuamente excluyentes
+    /// por colección.
+    composite_pks: HashMap<String, Vec<PkComponent>>,
     /// `Some` solo si `server.rs` lo fijó (`set_sessions`, una vez al
     /// arrancar) -- `None` en `linkc test`/unit tests/cualquier `Db` que
     /// nunca pasó por `run_serve`. `@tenant` lo necesita para resolver
@@ -1902,16 +1970,43 @@ impl Db {
         let mut columns = HashMap::new();
         let mut id_kinds = HashMap::new();
         let mut id_columns = HashMap::new();
+        let composite_pks = composite_pk_by_collection(&checker, &aliases_by_collection);
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
                 unreachable!("Checker::validate_db_element_type ya garantizó que el elemento sea un struct");
             };
+            let aliases = aliases_by_collection.get(name).unwrap_or(&empty_aliases);
+            let encrypted_fields = encrypted_by_collection.get(name).unwrap_or(&empty_encrypted);
+
+            // GRAMMAR.md §3.255: PK compuesta -- TODOS los campos son
+            // columnas regulares (nada que excluir, ninguno autoincrementa),
+            // sin "id_col"/"id_kind" propios.
+            if let Some(pk) = composite_pks.get(name) {
+                if adopt_existing {
+                    panic!(
+                        "'{name}': '--adopt-existing' todavía no soporta una colección con clave primaria compuesta ('@primaryKey(...)', GRAMMAR.md §3.255)"
+                    );
+                }
+                let cols: Vec<ColumnPlan> = fields
+                    .iter()
+                    .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_fields.contains(&f.name), aliases.get(&f.name).cloned()))
+                    .collect();
+                let checks = checks_by_collection.get(name).unwrap_or(&empty_checks);
+                let type_checks = type_checks_by_collection_map.get(name).unwrap_or(&empty_type_checks);
+                let refs = refs_by_collection.get(name).unwrap_or(&empty_refs);
+                let pk_cols: Vec<String> = pk.iter().map(|c| c.sql_col.clone()).collect();
+                connection
+                    .execute(&create_table_sql(name, None, &cols, checks, type_checks, refs, Some(&pk_cols)), [])
+                    .unwrap_or_else(|e| panic!("no se pudo crear la tabla '{name}' en '{db_path_display}': {e}"));
+                check_schema_matches(&connection, name, None, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
+                columns.insert(name.clone(), cols);
+                continue;
+            }
+
             let id_kind = IdKind::from_field_type(
                 &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty,
             );
-            let aliases = aliases_by_collection.get(name).unwrap_or(&empty_aliases);
             let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
-            let encrypted_fields = encrypted_by_collection.get(name).unwrap_or(&empty_encrypted);
             let cols: Vec<ColumnPlan> = fields
                 .iter()
                 .filter(|f| f.name != "id")
@@ -1932,9 +2027,9 @@ impl Db {
                 let type_checks = type_checks_by_collection_map.get(name).unwrap_or(&empty_type_checks);
                 let refs = refs_by_collection.get(name).unwrap_or(&empty_refs);
                 connection
-                    .execute(&create_table_sql(name, id_col, id_kind, &cols, checks, type_checks, refs), [])
+                    .execute(&create_table_sql(name, Some((id_col, id_kind)), &cols, checks, type_checks, refs, None), [])
                     .unwrap_or_else(|e| panic!("no se pudo crear la tabla '{name}' en '{db_path_display}': {e}"));
-                check_schema_matches(&connection, name, id_col, id_kind, &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
+                check_schema_matches(&connection, name, Some((id_col, id_kind)), &cols, &db_path_display).unwrap_or_else(|e| panic!("{e}"));
             }
             columns.insert(name.clone(), cols);
             id_kinds.insert(name.clone(), id_kind);
@@ -1969,6 +2064,7 @@ impl Db {
             id_columns,
             refs: refs_by_collection,
             tenant_fields,
+            composite_pks,
             sessions: parking_lot::RwLock::new(None),
             subscribers: parking_lot::Mutex::new(HashMap::new()),
             pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
@@ -2078,15 +2174,55 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
         let mut columns = HashMap::new();
         let mut id_kinds = HashMap::new();
         let mut id_columns = HashMap::new();
+        let composite_pks = composite_pk_by_collection(&checker, &aliases_by_collection);
         for (name, element_ty) in checker.db_collections() {
             let Type::Struct { fields, .. } = element_ty else {
                 unreachable!("Checker::validate_db_element_type ya garantizó que el elemento sea un struct");
             };
+            let aliases = aliases_by_collection.get(name).unwrap_or(&empty_aliases);
+            let encrypted_fields = encrypted_by_collection.get(name).unwrap_or(&empty_encrypted);
+
+            // GRAMMAR.md §3.255: PK compuesta -- rama aparte, sin
+            // "id_col"/"id_kind" propios; ver el comentario equivalente en
+            // `new_with_pool_options` (SQLite) para el porqué de cada paso.
+            if let Some(pk) = composite_pks.get(name) {
+                if adopt_existing {
+                    return Err(format!(
+                        "'{name}': '--adopt-existing' todavía no soporta una colección con clave primaria compuesta ('@primaryKey(...)', GRAMMAR.md §3.255)"
+                    ));
+                }
+                let cols: Vec<ColumnPlan> = fields
+                    .iter()
+                    .map(|f| ColumnPlan::for_field(f.clone(), &simple_enums, encrypted_fields.contains(&f.name), aliases.get(&f.name).cloned()))
+                    .collect();
+                let all_fields: Vec<FieldType> = cols.iter().map(|c| c.field.clone()).collect();
+                let checks = checks_by_collection.get(name).unwrap_or(&empty_checks);
+                let type_checks = type_checks_by_collection_map.get(name).unwrap_or(&empty_type_checks);
+                let pk_cols: Vec<String> = pk.iter().map(|c| c.sql_col.clone()).collect();
+                backend
+                    .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(
+                        name,
+                        None,
+                        &all_fields,
+                        &simple_enums,
+                        checks,
+                        type_checks,
+                        aliases,
+                        Some(&pk_cols),
+                    ))
+                    .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
+                for col in &cols {
+                    backend
+                        .execute_ddl(&crate::codegen::postgres_emit::alter_table_add_column_postgres(name, &col.field, &simple_enums, Some(&col.sql_name)))
+                        .map_err(|e| format!("no se pudo migrar la tabla '{name}': {e}"))?;
+                }
+                columns.insert(name.clone(), cols);
+                continue;
+            }
+
             let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
             let id_kind = IdKind::from_field_type(id_field_ty);
-            let aliases = aliases_by_collection.get(name).unwrap_or(&empty_aliases);
             let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
-            let encrypted_fields = encrypted_by_collection.get(name).unwrap_or(&empty_encrypted);
             let cols: Vec<ColumnPlan> = fields
                 .iter()
                 .filter(|f| f.name != "id")
@@ -2105,12 +2241,13 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 backend
                     .execute_ddl(&crate::codegen::postgres_emit::create_postgres_table_sql(
                         name,
-                        id_field_ty,
+                        Some(id_field_ty),
                         &non_id,
                         &simple_enums,
                         checks,
                         type_checks,
                         aliases,
+                        None,
                     ))
                     .map_err(|e| format!("no se pudo crear la tabla '{name}': {e}"))?;
             }
@@ -2227,6 +2364,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 id_columns,
                 refs: refs_by_collection,
                 tenant_fields,
+                composite_pks,
                 sessions: parking_lot::RwLock::new(None),
                 subscribers: parking_lot::Mutex::new(HashMap::new()),
                 pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
@@ -2810,6 +2948,15 @@ db { users: User[] }
 
     pub fn call(&self, collection: &str, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
+        // GRAMMAR.md §3.255: PK compuesta -- dispatch COMPLETAMENTE aparte,
+        // sin "id_col"/"id_kind" (ausentes de los mapas para esta
+        // colección). El checker ya limitó los métodos alcanzables acá a
+        // los que `composite_call` implementa (`check_db_method`) -- este
+        // `match` de abajo, con su lógica de "id" escalar, nunca corre
+        // para una colección así.
+        if let Some(pk) = self.composite_pks.get(collection) {
+            return self.composite_call(collection, columns, pk, method, args);
+        }
         match method {
             "all" => self.select_rows(collection, columns, None).map(Value::List),
             "page" => {
@@ -3794,6 +3941,271 @@ db { users: User[] }
                 Ok(with_dist.into_iter().take(k.max(0) as usize).map(|(_, row)| row).collect())
             }
         }
+    }
+
+    /// GRAMMAR.md §3.255: dispatch de `Db::call` para una colección con PK
+    /// COMPUESTA -- núcleo CRUD acotado a propósito (`check_db_method` ya
+    /// rechazó cualquier otro método en compilación, así que `other` acá
+    /// abajo solo es alcanzable llamando a `Db::call` directo desde Rust,
+    /// sin pasar por el checker -- mismo caso borde ya documentado para
+    /// `deleteWhere`/`findWhere`/etc. en el `match` escalar de arriba).
+    fn composite_call(&self, collection: &str, columns: &[ColumnPlan], pk: &[PkComponent], method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {
+        match method {
+            "all" => self.composite_select_all(collection, columns, pk).map(Value::List),
+            "count" => {
+                let mut params: Vec<Cell> = Vec::new();
+                let where_clause = self.base_where(collection, &mut params)?;
+                let sql = format!("SELECT COUNT(*) FROM \"{collection}\" {where_clause}");
+                let rows = self
+                    .backend
+                    .query(&sql, &params, &[ColumnKind::Int])
+                    .map_err(|e| RuntimeError::new(format!("error en count de '{collection}': {e}")))?;
+                match rows.first().and_then(|r| r.first()) {
+                    Some(Cell::Int(count)) => Ok(Value::Int(*count)),
+                    other => Err(RuntimeError::new(format!("count de '{collection}' devolvió algo que no es un entero: {other:?}"))),
+                }
+            }
+            "find" => {
+                let id_value = args.into_iter().next().ok_or_else(|| RuntimeError::new("find requiere 1 argumento"))?;
+                self.composite_find(collection, columns, pk, &id_value)
+            }
+            "insert" => {
+                let v = args.into_iter().next().ok_or_else(|| RuntimeError::new("insert requiere 1 argumento"))?;
+                self.composite_insert(collection, columns, pk, &v)
+            }
+            "delete" => {
+                let id_value = args.into_iter().next().ok_or_else(|| RuntimeError::new("delete requiere 1 argumento"))?;
+                self.composite_delete(collection, columns, pk, &id_value)
+            }
+            "applyPatch" => {
+                let mut it = args.into_iter();
+                let id_value = it.next().ok_or_else(|| RuntimeError::new("applyPatch requiere 2 argumentos"))?;
+                let patch = it.next().ok_or_else(|| RuntimeError::new("applyPatch requiere 2 argumentos"))?;
+                self.composite_apply_patch(collection, columns, pk, &id_value, &patch)
+            }
+            other => Err(RuntimeError::new(format!(
+                "'{other}' no está soportado sobre una colección con clave primaria compuesta (GRAMMAR.md §3.255) -- solo all/find/insert/insertMany/delete/applyPatch/count"
+            ))),
+        }
+    }
+
+    /// Los `(columna_sql, Cell)` de cada componente de `pk`, extraídos del
+    /// struct `id_value` que `find`/`delete`/`applyPatch` recibieron
+    /// (GRAMMAR.md §3.255) -- inversa de `composite_insert` armando el
+    /// mismo shape para el WHERE. `write_param` (vía la `ColumnPlan` real
+    /// de cada campo) hace la conversión Value -> Cell, mismo camino que
+    /// `insert`/`applyPatch` escalares ya usan.
+    fn composite_pk_cells(&self, collection: &str, columns: &[ColumnPlan], pk: &[PkComponent], id_value: &Value) -> Result<Vec<(String, Cell)>, RuntimeError> {
+        let Value::Struct(fields) = id_value else {
+            return Err(RuntimeError::new(format!(
+                "'{collection}': se esperaba un struct con los campos de la clave primaria compuesta"
+            )));
+        };
+        pk.iter()
+            .map(|c| {
+                let v = fields.iter().find(|(n, _)| n == &c.field_name).map(|(_, v)| v).ok_or_else(|| {
+                    RuntimeError::new(format!("'{collection}': falta el campo '{}' de la clave primaria compuesta", c.field_name))
+                })?;
+                let col = columns.iter().find(|col| col.field.name == c.field_name).ok_or_else(|| {
+                    RuntimeError::new(format!("'{collection}': '{}' no es una columna real", c.field_name))
+                })?;
+                Ok((c.sql_col.clone(), self.write_param(col, Some(v))?))
+            })
+            .collect()
+    }
+
+    /// `SELECT` de a lo sumo una fila por igualdad exacta de CADA
+    /// componente de la PK compuesta -- equivalente compuesto de
+    /// `select_rows(..., Some(id))`. Mismo criterio que esa función para
+    /// `@softDelete`: NO se aplica acá (una fila soft-deleteada sigue
+    /// siendo encontrable por su clave directa) -- `@tenant` SÍ, vía
+    /// `tenant_condition`.
+    fn composite_select(&self, collection: &str, columns: &[ColumnPlan], pk_values: &[(String, Cell)]) -> Result<Vec<Value>, RuntimeError> {
+        let col_list: Vec<String> = columns.iter().map(|c| format!("\"{}\"", c.sql_name)).collect();
+        let mut params: Vec<Cell> = Vec::new();
+        let mut conds = Vec::new();
+        for (sql_col, cell) in pk_values {
+            params.push(cell.clone());
+            conds.push(format!("\"{sql_col}\" = {}", self.backend.placeholder(params.len())));
+        }
+        if let Some(t) = self.tenant_condition(collection, &mut params)? {
+            conds.push(t);
+        }
+        let sql = format!("SELECT {} FROM \"{collection}\" WHERE {}", col_list.join(", "), conds.join(" AND "));
+        let kinds: Vec<ColumnKind> = columns.iter().map(ColumnPlan::kind).collect();
+        let rows = self
+            .backend
+            .query(&sql, &params, &kinds)
+            .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+        rows.iter().map(|cells| self.decode_composite_row(collection, cells, columns).map(Value::Struct)).collect()
+    }
+
+    /// `db.<c>.all()` sobre una colección con PK compuesta -- mismo
+    /// `base_where` (tenant + softDelete) que el resto de las lecturas,
+    /// `ORDER BY` por los campos de la PK en el orden declarado (ninguno
+    /// autoincrementa, así que no hay ningún orden "natural" salvo el que
+    /// la propia clave ya da).
+    fn composite_select_all(&self, collection: &str, columns: &[ColumnPlan], pk: &[PkComponent]) -> Result<Vec<Value>, RuntimeError> {
+        let col_list: Vec<String> = columns.iter().map(|c| format!("\"{}\"", c.sql_name)).collect();
+        let mut params: Vec<Cell> = Vec::new();
+        let where_clause = self.base_where(collection, &mut params)?;
+        let order_by = pk.iter().map(|c| format!("\"{}\"", c.sql_col)).collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}ORDER BY {order_by}", col_list.join(", "));
+        let kinds: Vec<ColumnKind> = columns.iter().map(ColumnPlan::kind).collect();
+        let rows = self
+            .backend
+            .query(&sql, &params, &kinds)
+            .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
+        rows.iter().map(|cells| self.decode_composite_row(collection, cells, columns).map(Value::Struct)).collect()
+    }
+
+    fn composite_find(&self, collection: &str, columns: &[ColumnPlan], pk: &[PkComponent], id_value: &Value) -> Result<Value, RuntimeError> {
+        let pk_values = self.composite_pk_cells(collection, columns, pk, id_value)?;
+        Ok(self.composite_select(collection, columns, &pk_values)?.into_iter().next().unwrap_or(Value::Null))
+    }
+
+    /// `db.<c>.insert(...)` sobre una colección con PK compuesta -- a
+    /// diferencia del caso escalar, NINGÚN campo se autogenera (ni
+    /// autoincremento ni Uuid del lado de la app): cada componente de la
+    /// PK viene explícito en el literal, el checker ya lo garantizó
+    /// (`omit_id_field` no los excluye del shape insertable). `@tenant`
+    /// (si la colección también lo tiene) SÍ se autopuebla acá, mismo
+    /// criterio que el insert escalar.
+    fn composite_insert(&self, collection: &str, columns: &[ColumnPlan], pk: &[PkComponent], value: &Value) -> Result<Value, RuntimeError> {
+        let Value::Struct(fields) = value else {
+            return Err(RuntimeError::new("insert: el valor debe ser un struct"));
+        };
+        let tenant = self.tenant_fields.get(collection).cloned();
+        let mut col_names = Vec::with_capacity(columns.len());
+        let mut params: Vec<Cell> = Vec::with_capacity(columns.len());
+        for col in columns {
+            if let Some(t) = tenant.as_ref().filter(|t| t.sql_col == col.sql_name) {
+                col_names.push(format!("\"{}\"", col.sql_name));
+                params.push(self.tenant_cell(collection, t)?);
+                continue;
+            }
+            let slot = fields.iter().find(|(n, _)| n == &col.field.name).map(|(_, v)| v);
+            col_names.push(format!("\"{}\"", col.sql_name));
+            params.push(self.write_param(col, slot)?);
+        }
+        let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
+        let sql = format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "));
+        self.backend.execute(&sql, &params).map_err(|e| write_error("insert", e))?;
+        let pk_values = self.composite_pk_cells(collection, columns, pk, value)?;
+        let inserted = self
+            .composite_select(collection, columns, &pk_values)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con esa clave primaria en '{collection}' recién insertado")))?;
+        self.publish(collection, &inserted);
+        Ok(inserted)
+    }
+
+    fn composite_delete(&self, collection: &str, columns: &[ColumnPlan], pk: &[PkComponent], id_value: &Value) -> Result<Value, RuntimeError> {
+        let pk_values = self.composite_pk_cells(collection, columns, pk, id_value)?;
+        let existing = self.composite_select(collection, columns, &pk_values)?.into_iter().next();
+        let rows_affected = match self.soft_delete_fields.get(collection) {
+            Some(field) => {
+                let soft_col = columns.iter().find(|c| &c.field.name == field).map(|c| c.sql_name.as_str()).unwrap_or(field.as_str());
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let mut params = vec![Cell::Int(now_ms)];
+                let mut conds = vec![format!("\"{soft_col}\" IS NULL")];
+                for (sql_col, cell) in &pk_values {
+                    params.push(cell.clone());
+                    conds.push(format!("\"{sql_col}\" = {}", self.backend.placeholder(params.len())));
+                }
+                if let Some(t) = self.tenant_condition(collection, &mut params)? {
+                    conds.push(t);
+                }
+                let sql = format!("UPDATE \"{collection}\" SET \"{soft_col}\" = {} WHERE {}", self.backend.placeholder(1), conds.join(" AND "));
+                self.backend.execute(&sql, &params).map_err(|e| write_error("delete (soft)", e))?
+            }
+            None => {
+                let mut params: Vec<Cell> = Vec::new();
+                let mut conds = Vec::new();
+                for (sql_col, cell) in &pk_values {
+                    params.push(cell.clone());
+                    conds.push(format!("\"{sql_col}\" = {}", self.backend.placeholder(params.len())));
+                }
+                if let Some(t) = self.tenant_condition(collection, &mut params)? {
+                    conds.push(t);
+                }
+                let sql = format!("DELETE FROM \"{collection}\" WHERE {}", conds.join(" AND "));
+                self.backend.execute(&sql, &params).map_err(|e| write_error("delete", e))?
+            }
+        };
+        if rows_affected > 0 {
+            if let Some(deleted_row) = existing {
+                self.publish(collection, &deleted_row);
+            }
+        }
+        Ok(Value::Bool(rows_affected > 0))
+    }
+
+    fn composite_apply_patch(
+        &self,
+        collection: &str,
+        columns: &[ColumnPlan],
+        pk: &[PkComponent],
+        id_value: &Value,
+        patch: &Value,
+    ) -> Result<Value, RuntimeError> {
+        let pk_values = self.composite_pk_cells(collection, columns, pk, id_value)?;
+        let Value::Struct(patch_fields) = patch else {
+            return Err(RuntimeError::new("applyPatch: el patch debe ser un objeto"));
+        };
+        let mut set_clauses = Vec::new();
+        let mut params: Vec<Cell> = Vec::new();
+        for (name, value) in patch_fields {
+            // Los campos de la PK compuesta tampoco son escribibles vía
+            // patch -- mismo criterio que "id"/"@tenant" en el camino
+            // escalar: reasignar la clave de una fila existente no es una
+            // operación soportada.
+            if pk.iter().any(|c| &c.field_name == name) {
+                continue;
+            }
+            let Some(col) = columns.iter().find(|c| &c.field.name == name) else { continue };
+            set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend.placeholder(params.len() + 1)));
+            params.push(self.write_param(col, Some(value))?);
+        }
+        if !set_clauses.is_empty() {
+            let mut conds = Vec::new();
+            for (sql_col, cell) in &pk_values {
+                params.push(cell.clone());
+                conds.push(format!("\"{sql_col}\" = {}", self.backend.placeholder(params.len())));
+            }
+            if let Some(t) = self.tenant_condition(collection, &mut params)? {
+                conds.push(t);
+            }
+            let sql = format!("UPDATE \"{collection}\" SET {} WHERE {}", set_clauses.join(", "), conds.join(" AND "));
+            self.backend.execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
+        }
+        let updated = self
+            .composite_select(collection, columns, &pk_values)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| RuntimeError::new(format!("no hay ningún elemento con esa clave primaria en '{collection}'")))?;
+        self.publish(collection, &updated);
+        Ok(updated)
+    }
+
+    /// Inversa de `write_param`, para una fila de una colección con PK
+    /// COMPUESTA -- a diferencia de `decode_row` (el camino escalar), acá
+    /// no hay ninguna columna "id" implícita al principio: cada celda
+    /// corresponde 1 a 1 con `columns`, que YA incluye los campos de la PK
+    /// como columnas regulares (`composite_pk_by_collection`).
+    fn decode_composite_row(&self, collection: &str, cells: &[Cell], columns: &[ColumnPlan]) -> Result<Vec<(String, Value)>, RuntimeError> {
+        let key = self.encryption_key();
+        let mut out = Vec::with_capacity(columns.len());
+        for (col, cell) in columns.iter().zip(cells.iter()) {
+            if let Some(v) = decode_column_cell(collection, col, cell, "<clave compuesta>", &self.checker, key.as_ref())? {
+                out.push((col.field.name.clone(), v));
+            }
+        }
+        Ok(out)
     }
 
     /// Cells bindeables + condición SQL `"{f1}" OP1 ? AND "{f2}" OP2 ? AND

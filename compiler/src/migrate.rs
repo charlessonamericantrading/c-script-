@@ -73,16 +73,27 @@ fn compute_postgres_diff(program: &Program, url: &str, schema: Option<&str>) -> 
     let mut any_change = false;
     for (coll_name, elem_ty) in checker.db_collections() {
         let Type::Struct { fields, .. } = elem_ty else { continue };
-        let non_id: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
-        let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
-        let id_kind = IdKind::from_field_type(id_field_ty);
         let aliases = aliases_by_collection.get(coll_name).unwrap_or(&empty_aliases);
-        let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
+        // GRAMMAR.md §3.255: PK compuesta -- todos los campos entran al
+        // diff (nada que excluir, ninguno autoincrementa), y no hay ningún
+        // "id" físico que `validate_existing_id_column` pueda validar.
+        let composite_pk = checker.composite_pk_fields(elem_ty);
+        let (non_id, id_field_ty, id_col, id_kind): (Vec<FieldType>, Option<&Type>, &str, Option<IdKind>) =
+            if composite_pk.is_some() {
+                (fields.clone(), None, "", None)
+            } else {
+                let non_id = fields.iter().filter(|f| f.name != "id").cloned().collect();
+                let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
+                let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
+                (non_id, Some(id_field_ty), id_col, Some(IdKind::from_field_type(id_field_ty)))
+            };
 
-        if let Err(e) = validate_existing_id_column(&backend, coll_name, id_col, id_kind) {
-            out.push_str(&format!("-- '{coll_name}': ¡ESTO FALLARÍA AL CONECTAR DE VERDAD! {e}\n\n"));
-            any_change = true;
-            continue;
+        if let (Some(id_kind), false) = (id_kind, composite_pk.is_some()) {
+            if let Err(e) = validate_existing_id_column(&backend, coll_name, id_col, id_kind) {
+                out.push_str(&format!("-- '{coll_name}': ¡ESTO FALLARÍA AL CONECTAR DE VERDAD! {e}\n\n"));
+                any_change = true;
+                continue;
+            }
         }
 
         let existing = existing_columns(&backend, coll_name)?;
@@ -92,7 +103,19 @@ fn compute_postgres_diff(program: &Program, url: &str, schema: Option<&str>) -> 
             let checks = checks_by_collection.get(coll_name).cloned().unwrap_or_default();
             let type_checks = type_checks_by_collection_map.get(coll_name).cloned().unwrap_or_default();
             out.push_str(&format!("-- '{coll_name}': tabla nueva\n"));
-            out.push_str(&create_postgres_table_sql(coll_name, id_field_ty, &non_id, &simple_enums, &checks, &type_checks, aliases));
+            let pk_cols: Option<Vec<String>> = composite_pk.as_ref().map(|pk| {
+                pk.iter().map(|f| aliases.get(&f.name).cloned().unwrap_or_else(|| f.name.clone())).collect()
+            });
+            out.push_str(&create_postgres_table_sql(
+                coll_name,
+                id_field_ty,
+                &non_id,
+                &simple_enums,
+                &checks,
+                &type_checks,
+                aliases,
+                pk_cols.as_deref(),
+            ));
             out.push_str("\n\n");
         } else {
             let declared_names: Vec<&str> = non_id.iter().map(|f| aliases.get(&f.name).map(String::as_str).unwrap_or(f.name.as_str())).collect();

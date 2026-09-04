@@ -74,14 +74,25 @@ fn postgres_column_type(field: &FieldType, simple_enums: &HashSet<String>) -> St
 /// de TABLA (no de columna, a diferencia de `checks`), mismo lugar en el
 /// `CREATE TABLE` que ocuparía cualquier otro `CHECK` de más de una
 /// columna.
+///
+/// 8 parámetros posicionales, no un struct de opciones: cada uno viene de
+/// una fuente independiente en cada uno de los 3 callers (DDL estático,
+/// connect en vivo, `migrate`/`--dry-run`) -- agruparlos en un struct solo
+/// movería el mismo conteo a otro lado, sin ganar nada real.
+#[allow(clippy::too_many_arguments)]
 pub fn create_postgres_table_sql(
     collection: &str,
-    id_field_ty: &Type,
+    id_field_ty: Option<&Type>,
     fields: &[FieldType],
     simple_enums: &HashSet<String>,
     checks: &[(String, FieldCheck)],
     type_checks: &[String],
     aliases: &HashMap<String, String>,
+    // GRAMMAR.md §3.255: nombres SQL físicos (ya resueltos por `@column`,
+    // en el orden que `@primaryKey(...)` los declaró) de una clave
+    // compuesta -- `Some` exactamente cuando `id_field_ty` es `None`, nunca
+    // los dos a la vez (una colección tiene una PK escalar O compuesta).
+    composite_pk: Option<&[String]>,
 ) -> String {
     // GRAMMAR.md §3.177: una PK `Uuid` usa el tipo NATIVO `UUID` de
     // Postgres (a diferencia de un campo `Uuid` normal, que sigue
@@ -93,19 +104,28 @@ pub fn create_postgres_table_sql(
     // nunca depende de un default de columna -- agregarlo solo sumaría
     // un requisito de versión (PostgreSQL 13+) sin ningún beneficio para
     // el camino real, así que se deja afuera a propósito.
-    let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
-    let id_def = match id_field_ty {
-        Type::Uuid => format!("\"{id_col}\" UUID PRIMARY KEY"),
-        // GRAMMAR.md §3.251: `id: String` -- VARCHAR de texto plano, NUNCA
-        // el tipo nativo `uuid` (ese es justo el punto: adoptar una tabla
-        // cuya PK es una columna de texto, aunque guarde algo con forma de
-        // UUID). Sin `DEFAULT` acá tampoco -- mismo motivo que `Uuid`
-        // arriba, c-script genera el valor del lado de la app en cada
-        // insert.
-        Type::String => format!("\"{id_col}\" VARCHAR PRIMARY KEY"),
-        _ => format!("\"{id_col}\" BIGSERIAL PRIMARY KEY"),
+    let mut cols: Vec<String> = match id_field_ty {
+        Some(ty) => {
+            let id_col = aliases.get("id").map(String::as_str).unwrap_or("id");
+            let id_def = match ty {
+                Type::Uuid => format!("\"{id_col}\" UUID PRIMARY KEY"),
+                // GRAMMAR.md §3.251: `id: String` -- VARCHAR de texto plano,
+                // NUNCA el tipo nativo `uuid` (ese es justo el punto:
+                // adoptar una tabla cuya PK es una columna de texto, aunque
+                // guarde algo con forma de UUID). Sin `DEFAULT` acá
+                // tampoco -- mismo motivo que `Uuid` arriba, c-script
+                // genera el valor del lado de la app en cada insert.
+                Type::String => format!("\"{id_col}\" VARCHAR PRIMARY KEY"),
+                _ => format!("\"{id_col}\" BIGSERIAL PRIMARY KEY"),
+            };
+            vec![id_def]
+        }
+        // GRAMMAR.md §3.255: PK compuesta -- sin columna "id" propia; cada
+        // campo que la integra entra por el loop de abajo como una columna
+        // MÁS (nunca autoincrementa, `fields` ya la incluye), y el
+        // `PRIMARY KEY (...)` se agrega como constraint de TABLA al final.
+        None => Vec::new(),
     };
-    let mut cols = vec![id_def];
 
     for f in fields {
         let sql_col = aliases.get(&f.name).map(String::as_str).unwrap_or(&f.name);
@@ -123,6 +143,9 @@ pub fn create_postgres_table_sql(
     }
     for sql in type_checks {
         cols.push(format!("CHECK {sql}"));
+    }
+    if let Some(pk_cols) = composite_pk {
+        cols.push(format!("PRIMARY KEY ({})", pk_cols.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ")));
     }
 
     format!("CREATE TABLE IF NOT EXISTS \"{collection}\" (\n  {}\n);", cols.join(",\n  "))
@@ -162,12 +185,25 @@ pub fn generate_postgres_ddl(program: &Program) -> Result<String, String> {
 
     for (coll_name, elem_ty) in checker.db_collections() {
         if let Type::Struct { fields, .. } = elem_ty {
-            let non_id_fields: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
-            let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
             let checks = checks_by_collection.get(coll_name).unwrap_or(&empty_checks);
             let type_checks = type_checks_by_collection.get(coll_name).unwrap_or(&empty_type_checks);
             let aliases = aliases_by_collection.get(coll_name).unwrap_or(&empty_aliases);
-            let sql = create_postgres_table_sql(coll_name, id_field_ty, &non_id_fields, &simple_enums, checks, type_checks, aliases);
+            // GRAMMAR.md §3.255: PK compuesta -- TODOS los campos entran
+            // por `fields` (nada que excluir, ninguno autoincrementa) y el
+            // `PRIMARY KEY (...)` sale como constraint de tabla, no como
+            // columna "id" propia.
+            let sql = match checker.composite_pk_fields(elem_ty) {
+                Some(pk_fields) => {
+                    let pk_cols: Vec<String> =
+                        pk_fields.iter().map(|f| aliases.get(&f.name).cloned().unwrap_or_else(|| f.name.clone())).collect();
+                    create_postgres_table_sql(coll_name, None, fields, &simple_enums, checks, type_checks, aliases, Some(&pk_cols))
+                }
+                None => {
+                    let non_id_fields: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
+                    let id_field_ty = &fields.iter().find(|f| f.name == "id").expect("validate_db_element_type ya garantizó 'id'").ty;
+                    create_postgres_table_sql(coll_name, Some(id_field_ty), &non_id_fields, &simple_enums, checks, type_checks, aliases, None)
+                }
+            };
             statements.push(sql);
         }
     }

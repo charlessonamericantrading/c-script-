@@ -8985,6 +8985,71 @@ service Notes {
 
 **Verificado**: `compiler/tests/cli_vector_annotation.rs` (rechazos del checker/parser -- `Vector<N>` sin argumento entero, `N` no positivo, campo no-Vector pasado a `nearest`, selector con forma inválida, dimensión de la consulta que no coincide con la del campo -- y los artefactos generados: `number[]` en `contract.d.ts`, el chequeo de largo+finitud en `validators.ts`/`schemas.ts`/`openapi.json`) y un servidor real sobre SQLite confirmando `insert`/`all`/`find`/`nearest` de punta a punta con el DDL físico (`BLOB`, no JSON); `compiler/tests/pg_integration.rs` (`vector_nearest_pushes_down_to_the_pgvector_operator_against_real_postgres`: `CREATE EXTENSION` automático, columna `vector(N)` real, orden por distancia coseno idéntico al de SQLite).
 
+### 3.255 `@primaryKey(campo1, campo2, ...)`: claves primarias COMPUESTAS — RESUELTO, cierra el resto de PLAN.md §9.21 Fase 3 (ítem 11)
+
+Origen: `PLAN.md §9.21` Fase 3 ítem 11, dejado deliberadamente afuera cuando `id: String` (§3.251) cerró la primera mitad -- a diferencia de agregar una tercera forma ESCALAR de PK (un cambio mecánico, guiado por la exhaustividad de `match IdKind` del propio compilador), una PK compuesta cambia la FORMA de `find`/`delete`/`applyPatch`/`increment`/`pageAfter` en cada capa (checker, runtime, DDL, el shape insertable del contrato TS) -- necesitaba su propia ronda. **Decisión de diseño explícita del usuario**: el id compuesto se pasa como un STRUCT con nombre (`find({ tenantId: x, id: y })`), no una tupla posicional (`find(x, y)`) -- autodocumentado y a prueba de orden equivocado, mismo espíritu que el wrapper `{ row, related }` de `.with()` (§3.250).
+
+**Qué hay (v1.203.0)**:
+- **`@primaryKey(campo1, campo2, ...)`** antes de un `type` (mismo lugar que `@unique(...)`/`@index(...)` compuestos, §3.155/§3.239): reemplaza, para ESE `type`, el requisito normal de un campo escalar `id: Int/Uuid/String` -- una colección con `@primaryKey` no necesita ningún campo llamado "id" (aunque puede tener uno, como una PIEZA más de la clave, igual que cualquier otro campo). Al menos 2 campos -- para uno solo ya existe la forma simple `id: T`. Cada campo tiene que ser `Int`, `Uuid` o `String`, requerido (ni `x?: T` ni `T?`) -- misma regla que la PK escalar, por el mismo motivo (GRAMMAR.md §3.177).
+- **`find`/`delete`/`applyPatch`** toman el struct compuesto en vez de un escalar -- `db_id_type` (el tipo contra el que el checker valida el argumento de id en los tres) es ahora un struct anónimo `{ campo1: T1, campo2: T2, ... }` con los nombres reales de `@primaryKey(...)`, así que `check_expr` valida un literal o una variable de ese tipo exactamente igual que ya validaba un escalar -- sin código de checker aparte para el caso compuesto.
+- **`insert`**: NINGÚN campo de la PK se autogenera (a diferencia de `id: Int`/`Uuid`/`String`, que sí) -- todos van explícitos en el literal, el checker los exige (quedan FUERA del shape insertable solo si además son `@tenant`, §3.253). El literal SIGUE necesitando el NOMBRE del `type` completo con todos sus campos con nombre (`OrderLine { orderId: ..., lineNumber: ..., sku: ... }`) -- un literal con nombre se chequea contra su tipo NOMINAL propio primero, mismo motivo por el que "id" también va explícito en el caso escalar pese a estar excluido del shape insertable ahí.
+- **`applyPatch`** ignora en silencio cualquier intento de reasignar un campo de la PK vía patch -- mismo criterio que ya aplica a "id"/`@tenant`: la clave de una fila existente no se puede mover.
+- **DDL**: `PRIMARY KEY (col1, col2, ...)` como constraint de TABLA en los dos backends -- sin autoincremento, sin `BIGSERIAL`/`AUTOINCREMENT`, cada campo es una columna regular más.
+- **`@tenant` (§3.253) convive normal** con una PK compuesta -- es solo otra columna más en el `WHERE`, ortogonal a la forma de la PK.
+
+<!-- linkc:check -->
+```rust
+@primaryKey(orderId, lineNumber)
+type OrderLine = {
+  orderId: Int,
+  lineNumber: Int,
+  sku: String,
+  qty: Int,
+}
+
+db {
+  orderLines: OrderLine[],
+}
+
+service Orders {
+  rpc addLine(orderId: Int, lineNumber: Int, sku: String, qty: Int) -> OrderLine {
+    db.orderLines.insert(OrderLine { orderId: orderId, lineNumber: lineNumber, sku: sku, qty: qty })
+  }
+
+  rpc getLine(id: { orderId: Int, lineNumber: Int }) -> OrderLine? {
+    db.orderLines.find(id)
+  }
+
+  rpc listLines() -> OrderLine[] {
+    db.orderLines.all()
+  }
+}
+
+test "PK compuesta -- insert, find por struct, all" {
+  let a = Orders.addLine(1, 1, "A", 10);
+  let b = Orders.addLine(1, 2, "B", 5);
+  assert(Orders.listLines().length() == 2, "dos líneas insertadas");
+
+  let found = Orders.getLine({ orderId: 1, lineNumber: 2 });
+  assert(found.isSome(), "encontrada por su clave compuesta");
+  match found {
+    line: OrderLine => assert(line.sku == "B", "es la fila correcta"),
+    null => assert(false, "tendria que haber encontrado la fila"),
+  }
+
+  let missing = Orders.getLine({ orderId: 99, lineNumber: 99 });
+  assert(missing.isNone(), "una clave que no existe da null, no un error");
+}
+```
+
+**Límites honestos**:
+- **Núcleo CRUD acotado a propósito, v1**: solo `all`/`find`/`insert`/`insertMany`/`delete`/`applyPatch`/`count` -- `page`/`pageAfter`/`increment`/`findWhere`/`countWhere`/`updateWhere`/`deleteWhere`/`orderBy`/`select`/`with`/`nearest`/`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`/`maxRow`/`minRow`/`upsert` se RECHAZAN en compilación con un mensaje explícito sobre una colección `@primaryKey`, no en runtime. Cada uno de esos asume en algún punto un único "id" (el cursor de `pageAfter`, el autoincremento que `increment` reconsulta, el `ORDER BY "id"` implícito de varias lecturas) -- extenderlos es mecánico pero deliberadamente una ronda aparte, mismo criterio que ya usaron `id: String` (dejó las PKs compuestas afuera) y `Vector<N>` (dejó el índice HNSW afuera).
+- **`@ref(...)` no puede apuntar a una colección con PK compuesta**: `@ref` solo referencia una PK ESCALAR (un campo `Int`/`Uuid`/`String` que calza con la PK destino) -- una FK multi-columna es una extensión propia, fuera de esta ronda. El error sale naturalmente del chequeo de tipo existente ("tiene que ser `{ orderId: Int, lineNumber: Int }`, es Int"), sin código de rechazo dedicado.
+- **`--adopt-existing` todavía no soporta una tabla con PK compuesta preexistente** -- falla al conectar con un mensaje explícito. Adoptar necesitaría leer la PK física real de `information_schema`/`pg_constraint` y validarla campo por campo, más allá del alcance de esta ronda.
+- **`linkc migrate generate`/`--dry-run` sí generan el DDL correcto** (`PRIMARY KEY (...)`) para una colección `@primaryKey` nueva, pero -- igual que `--adopt-existing` -- no validan una PK compuesta física preexistente antes de generar el diff.
+
+**Verificado**: `compiler/tests/cli_primary_key_annotation.rs` (11 tests: rechazos del checker -- menos de 2 campos, campo repetido, campo inexistente, tipo no soportado, campo opcional, `@primaryKey` declarado dos veces, un método no soportado sobre PK compuesta --, el contrato TypeScript emitiendo el id compuesto como struct inline, y dos servidores reales sobre SQLite -- ciclo CRUD completo con `applyPatch` ignorando un intento de tocar la PK y `delete` idempotente, más un reinicio confirmando que el DDL `PRIMARY KEY (...)` sigue matcheando).
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

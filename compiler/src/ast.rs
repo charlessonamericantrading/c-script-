@@ -182,6 +182,14 @@ pub enum TypeAnnotation {
     /// expresar (identificadores/literales/aritmética/comparación/lógica --
     /// nunca una llamada, acceso a `db`, closure ni campo de otro struct).
     Check(Spanned<Expr>),
+    /// `@primaryKey(campo1, campo2, ...)` (GRAMMAR.md §3.255, PLAN.md §9.21
+    /// Fase 3 ítem 11 resto): clave primaria COMPUESTA -- reemplaza, para
+    /// ESTE `type`, el requisito normal de un campo escalar `id: Int/Uuid/
+    /// String` (`Checker::validate_db_element_type`). Al menos 2 campos --
+    /// mismo criterio que `Unique`/`Index` arriba (para uno solo, ya existe
+    /// la forma simple `id: T`). Sin `where <expr>`: una PK nunca es
+    /// parcial/condicional, a diferencia de un `UNIQUE`/`INDEX`.
+    PrimaryKey(Vec<String>),
 }
 
 /// Valida que un `@check(<expr>)` de nivel `type` (GRAMMAR.md §3.173) use

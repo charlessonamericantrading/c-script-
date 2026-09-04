@@ -411,6 +411,19 @@ impl Parser {
             self.advance();
             let name = self.eat_ident()?;
             let annotation = match name.as_str() {
+                // GRAMMAR.md §3.255: `@primaryKey(campo1, campo2, ...)` --
+                // mismo loop de coma que `unique`/`index`, pero SIN `where
+                // <expr>` (una PK nunca es parcial).
+                "primaryKey" => {
+                    self.eat(&TokenKind::LParen)?;
+                    let mut fields = vec![self.eat_ident()?];
+                    while self.check(&TokenKind::Comma) {
+                        self.advance();
+                        fields.push(self.eat_ident()?);
+                    }
+                    self.eat(&TokenKind::RParen)?;
+                    TypeAnnotation::PrimaryKey(fields)
+                }
                 "unique" | "index" => {
                     self.eat(&TokenKind::LParen)?;
                     let mut fields = vec![self.eat_ident()?];
@@ -454,7 +467,7 @@ impl Parser {
                 }
                 other => {
                     return Err(self.error(format!(
-                        "'@{other}' no es una anotación válida antes de 'type' -- las disponibles hoy son '@unique(campo1, campo2, ...)', '@index(campo1, campo2, ...)' y '@check(<expr>)'"
+                        "'@{other}' no es una anotación válida antes de 'type' -- las disponibles hoy son '@primaryKey(campo1, campo2, ...)', '@unique(campo1, campo2, ...)', '@index(campo1, campo2, ...)' y '@check(<expr>)'"
                     )))
                 }
             };

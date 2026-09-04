@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.203.0] - 2026-09-04
+
+### ✨ Añadido
+**`@primaryKey(campo1, campo2, ...)` -- claves primarias COMPUESTAS (PLAN.md §9.21 Fase 3, cierra el resto del ítem 11)**: reemplaza, para un `type` dado, el requisito normal de un campo escalar `id: Int/Uuid/String` -- al menos 2 campos, cada uno `Int`/`Uuid`/`String` requerido. Decisión de diseño explícita del usuario: el id compuesto se pasa como un STRUCT con nombre (`find({ tenantId: x, id: y })`), no una tupla posicional -- autodocumentado y a prueba de orden equivocado, mismo espíritu que el wrapper `{ row, related }` de `.with()`. `find`/`delete`/`applyPatch` toman ese struct anónimo (`db_id_type` generaliza limpio: el checker ya sabía validar un struct igual que un escalar, sin código aparte); `insert` nunca autogenera ningún componente de la PK (todos van explícitos, a diferencia de `id: Int`/`Uuid`/`String`); `applyPatch` ignora en silencio cualquier intento de reasignar un campo de la PK. DDL: `PRIMARY KEY (col1, col2, ...)` como constraint de tabla en los dos backends, sin autoincremento. Núcleo CRUD acotado a propósito, v1: solo `all`/`find`/`insert`/`insertMany`/`delete`/`applyPatch`/`count` -- el resto (`page`/`pageAfter`/`increment`/`findWhere`/`countWhere`/`updateWhere`/`deleteWhere`/`orderBy`/`select`/`with`/`nearest`/aggregates/`upsert`) se rechaza en compilación con un mensaje claro sobre una colección `@primaryKey`, cada uno asume en algún punto un único "id" secuencial. `@ref(...)` no puede apuntar a una PK compuesta; `--adopt-existing`/`migrate` no validan una PK compuesta física preexistente. Ver GRAMMAR.md §3.255.
+
 ## [1.202.1] - 2026-09-04
 
 ### 🔧 Proceso
