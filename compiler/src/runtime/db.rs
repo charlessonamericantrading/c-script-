@@ -131,6 +131,7 @@ impl ColumnPlan {
             Type::Float => ColumnKind::Float,
             Type::Bool => ColumnKind::Bool,
             Type::String | Type::Uuid | Type::Enum(_) => ColumnKind::Text,
+            Type::Vector(_) => ColumnKind::Vector,
             other => unreachable!("tipo nativo inesperado en una columna no-JSON: {other:?}"),
         }
     }
@@ -233,6 +234,13 @@ fn native_sql_type(ty: &Type, simple_enums: &HashSet<String>) -> Option<&'static
         Type::Uuid => Some("TEXT"),
         Type::Bool => Some("INTEGER"),
         Type::Enum(name) if simple_enums.contains(name) => Some("TEXT"),
+        // GRAMMAR.md §3.254: SQLite no tiene un tipo vector nativo --
+        // componentes `f32` empaquetados en un BLOB crudo (`Cell::to_sql`),
+        // sin búsqueda nativa (`.nearest()` trae todo y calcula coseno en
+        // el propio proceso). A diferencia de Postgres (`vector(N)`, ver
+        // `codegen::postgres_emit::link_to_postgres_type`), `N` no aparece
+        // acá -- BLOB no lo necesita, el largo del blob ya lo implica.
+        Type::Vector(_) => Some("BLOB"),
         _ => None,
     }
 }
@@ -390,6 +398,22 @@ pub(crate) fn tenant_field_by_collection(program: &Program, checker: &Checker) -
         }
     }
     result
+}
+
+/// GRAMMAR.md §3.254: ¿`element_ty` tiene al menos un campo `Vector<N>` de
+/// PRIMER NIVEL (una columna `vector(N)` real que necesita la extensión
+/// pgvector)? Un `Vector<N>` ANIDADO dentro de otro struct queda como JSON
+/// común (`ColumnPlan::for_field` solo mira el tipo de campo DIRECTO), sin
+/// necesitar la extensión -- por eso esto no recorre recursivamente. Usado
+/// SOLO para decidir si `CREATE EXTENSION IF NOT EXISTS vector` hace falta
+/// al conectar (`connect_postgres_with_options`).
+fn program_type_uses_vector(element_ty: &Type) -> bool {
+    let Type::Struct { fields, .. } = element_ty else { return false };
+    fields.iter().any(|f| match &f.ty {
+        Type::Vector(_) => true,
+        Type::Optional(inner) => matches!(**inner, Type::Vector(_)),
+        _ => false,
+    })
 }
 
 /// Nombre de colección -> mapa de `{ columna_sql -> FkRef }` para cada campo
@@ -2024,6 +2048,20 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""))
                 .map_err(|e| format!("no se pudo crear el schema '{schema}': {e}"))?;
         }
+        // GRAMMAR.md §3.254: `vector(N)` es una extensión, no un tipo core
+        // de Postgres -- a diferencia de `gen_random_uuid()` (PLAN.md §9.1,
+        // built-in desde PG13, sin `CREATE EXTENSION` necesario), pgvector
+        // NO tiene alternativa sin extensión. Sale SOLO si el programa
+        // declara `Vector<N>` en algún lado -- cero fricción de permisos
+        // (`CREATE EXTENSION` a veces necesita superusuario en Postgres
+        // gestionado) para el 99% de programas que nunca usan esto.
+        // `--adopt-existing` nunca ejecuta DDL, ni siquiera esto: si la
+        // columna ya existe, la extensión ya está instalada.
+        if !adopt_existing && checker.db_collections().values().any(program_type_uses_vector) {
+            client
+                .batch_execute("CREATE EXTENSION IF NOT EXISTS vector")
+                .map_err(|e| format!("no se pudo crear la extensión 'vector' (pgvector) -- necesaria para 'Vector<N>' (GRAMMAR.md §3.254): {e}"))?;
+        }
         let pool_size = pool_size.unwrap_or(Self::DEFAULT_POSTGRES_POOL_SIZE);
         let backend = Backend::postgres(client, url, schema, pool_size);
 
@@ -2801,6 +2839,16 @@ db { users: User[] }
             "with" => {
                 let field = closure_field_name(args.first(), "de relación")?;
                 self.with_related(collection, columns, &field)
+            }
+            "nearest" => {
+                let mut it = args.into_iter();
+                let field = closure_field_name(it.next().as_ref(), "de vector")?;
+                let query = match it.next() {
+                    Some(Value::Vector(v)) => v,
+                    _ => return Err(RuntimeError::new("'nearest': el segundo argumento debe ser un Vector<N>")),
+                };
+                let k = as_int(&it.next().ok_or_else(|| RuntimeError::new("nearest requiere 3 argumentos (selector, vec, k)"))?)?;
+                self.nearest(collection, columns, &field, query, k).map(Value::List)
             }
             "increment" => self.increment(collection, columns, args),
             "find" => {
@@ -3693,6 +3741,59 @@ db { users: User[] }
             })
             .collect();
         Ok(Value::List(wrapped))
+    }
+
+    /// `db.<c>.nearest(selector, vec, k) -> List<T>` (GRAMMAR.md §3.254,
+    /// PLAN.md §9.21 Fase 4 ítem 13): las `k` filas más cercanas a `vec` por
+    /// distancia coseno sobre el campo `Vector<N>` que `selector` nombra --
+    /// respeta `@tenant`/`@softDelete` como cualquier otra lectura (vía
+    /// `base_where`/`select_rows`, el mismo camino que `.all()`).
+    ///
+    /// Postgres empuja `ORDER BY "col" <=> $1 LIMIT $2` -- el operador
+    /// nativo de pgvector, sin traer más filas de las que hacen falta.
+    /// SQLite no tiene búsqueda de vectores nativa (GRAMMAR.md §3.254,
+    /// "Límites honestos"): trae la colección entera y calcula/ordena por
+    /// coseno en el propio proceso -- correcto, más lento, suficiente para
+    /// dev/test, mismo criterio ya documentado para esta feature.
+    fn nearest(&self, collection: &str, columns: &[ColumnPlan], field: &str, query: Vec<f32>, k: i64) -> Result<Vec<Value>, RuntimeError> {
+        let col = columns
+            .iter()
+            .find(|c| c.field.name == field)
+            .ok_or_else(|| RuntimeError::new(format!("'nearest': '{field}' no es una columna real de '{collection}'")))?;
+        match &self.backend {
+            Backend::Postgres(..) => {
+                let id_col = self.id_col(collection);
+                let mut col_list = vec![format!("\"{id_col}\"")];
+                col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
+                let mut params: Vec<Cell> = vec![Cell::Vector(query), Cell::Int(k.max(0))];
+                let where_clause = self.base_where(collection, &mut params)?;
+                let sql = format!(
+                    "SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{}\" <=> {} LIMIT {}",
+                    col_list.join(", "),
+                    col.sql_name,
+                    self.backend.placeholder(1),
+                    self.backend.placeholder(2)
+                );
+                self.query_rows(collection, columns, &sql, &params)
+            }
+            Backend::Sqlite(_) => {
+                let field = field.to_string();
+                let rows = self.select_rows(collection, columns, None)?;
+                let mut with_dist: Vec<(f32, Value)> = rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        let Value::Struct(fs) = &row else { return None };
+                        let v = fs.iter().find(|(n, _)| n == &field).and_then(|(_, v)| match v {
+                            Value::Vector(v) => Some(v.clone()),
+                            _ => None,
+                        })?;
+                        Some((cosine_distance(&query, &v), row))
+                    })
+                    .collect();
+                with_dist.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                Ok(with_dist.into_iter().take(k.max(0) as usize).map(|(_, row)| row).collect())
+            }
+        }
     }
 
     /// Cells bindeables + condición SQL `"{f1}" OP1 ? AND "{f2}" OP2 ? AND
@@ -4727,6 +4828,7 @@ pub(crate) fn decode_column_cell(
         (Type::Float, Cell::Float(f)) => Some(Value::Float(*f)),
         (Type::String, Cell::Text(t)) => Some(Value::Str(t.clone())),
         (Type::Uuid, Cell::Text(t)) => Some(Value::Uuid(t.clone())),
+        (Type::Vector(_), Cell::Vector(v)) => Some(Value::Vector(v.clone())),
         (Type::Bool, Cell::Bool(b)) => Some(Value::Bool(*b)),
         (Type::Enum(name), Cell::Text(variant)) => Some(Value::Variant {
             enum_name: name.clone(),
@@ -4829,6 +4931,7 @@ impl Db {
             Value::Float(f) => Cell::Float(*f),
             Value::Str(s) => Cell::Text(s.clone()),
             Value::Uuid(s) => Cell::Text(s.clone()),
+            Value::Vector(v) => Cell::Vector(v.clone()),
             Value::Bool(b) => Cell::Bool(*b),
             Value::Variant { variant, .. } => Cell::Text(variant.clone()),
             other => panic!("valor no representable en una columna nativa de SQL: {other:?}"),
@@ -4884,6 +4987,22 @@ fn closure_group_key(arg: Option<&Value>) -> Result<(String, Option<TimeGranular
     crate::ast::recognize_group_key_selector(params, body)
         .map(|(field, g)| (field.to_string(), g))
         .ok_or_else(|| RuntimeError::new("selector de agrupación inválido: se esperaba `|item: T| item.campo`"))
+}
+
+/// `1 - similitud coseno` -- MISMA fórmula que el operador `<=>` de
+/// pgvector (GRAMMAR.md §3.254), para que el brute-force de SQLite ordene
+/// exactamente igual que Postgres ante los mismos datos. `f32::INFINITY`
+/// para cualquiera de los dos vectores en cero (norma cero, coseno
+/// indefinido) -- nunca un `NaN`, que `sort_by`/`partial_cmp` no puede
+/// ordenar de forma consistente.
+fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return f32::INFINITY;
+    }
+    1.0 - (dot / (norm_a * norm_b))
 }
 
 /// Expresión SQL que trunca un campo `Timestamp` (milisegundos-desde-epoch

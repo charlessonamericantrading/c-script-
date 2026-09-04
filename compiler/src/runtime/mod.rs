@@ -68,6 +68,12 @@ pub enum Value {
     /// plano" una vez que la información de tipo ESTÁTICO ya no está
     /// disponible en runtime.
     Uuid(String),
+    /// `f32`, no `f64` -- ver la doc de `Type::Vector` (types.rs, GRAMMAR.md
+    /// §3.254): pgvector almacena precisión simple, y sin sintaxis de
+    /// literal en v0 este `Value` solo nace de un wire decode (parámetro de
+    /// `rpc`) o de una lectura de `db` -- nunca se construye dentro de
+    /// código `.link`.
+    Vector(Vec<f32>),
     Bool(bool),
     Null,
     Struct(Vec<(String, Value)>),
@@ -196,6 +202,12 @@ fn supports_bound_method_access(v: &Value) -> bool {
         | Value::Tuple(_)
         | Value::BoundMethod(_, _)
         | Value::FnRef(_)
+        // GRAMMAR.md §3.254: sin métodos propios en v1 -- ni siquiera
+        // `.length()` (que `List<T>` sí tiene): la dimensión ya la conoce
+        // el TIPO (`Vector<N>`), no hace falta consultarla en runtime, y
+        // ningún otro método (aritmética, normalización) está en el
+        // alcance de esta ronda.
+        | Value::Vector(_)
         | Value::Closure(_, _, _) => false,
     }
 }
@@ -236,6 +248,7 @@ fn is_marker_singleton(v: &Value) -> bool {
         | Value::Float(_)
         | Value::Str(_)
         | Value::Uuid(_)
+        | Value::Vector(_)
         | Value::Bool(_)
         | Value::Null
         | Value::Struct(_)
@@ -262,6 +275,7 @@ impl PartialEq for Value {
             (Float(a), Float(b)) => a == b,
             (Str(a), Str(b)) => a == b,
             (Uuid(a), Uuid(b)) => a == b,
+            (Vector(a), Vector(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Null, Null) => true,
             (Struct(a), Struct(b)) => a == b,
@@ -299,6 +313,7 @@ impl std::fmt::Debug for Value {
             Value::Float(n) => f.debug_tuple("Float").field(n).finish(),
             Value::Str(s) => f.debug_tuple("Str").field(s).finish(),
             Value::Uuid(s) => f.debug_tuple("Uuid").field(s).finish(),
+            Value::Vector(v) => f.debug_tuple("Vector").field(v).finish(),
             Value::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Value::Null => write!(f, "Null"),
             Value::Struct(fields) => f.debug_tuple("Struct").field(fields).finish(),
@@ -4807,6 +4822,33 @@ pub(crate) fn json_to_typed_value(
             .filter(|s| is_canonical_uuid(s))
             .map(|s| Value::Uuid(s.to_string()))
             .ok_or_else(mismatch),
+        // GRAMMAR.md §3.254: array de EXACTAMENTE `n` números -- el largo se
+        // valida ACÁ, en el borde, para el mismo caso real que motiva
+        // `Type::Tuple` arriba (un cliente que manda el largo equivocado es
+        // un 400 claro, no un desajuste silencioso que revienta recién al
+        // escribir la columna `vector(n)`). `as_f64` (no `as_i64`) porque el
+        // cliente puede mandar cualquier número JSON -- `f32` angosta al
+        // final, perdiendo precisión de la misma forma "aceptada" que
+        // cualquier otro `Float` de este lenguaje (GRAMMAR.md §3.7).
+        Type::Vector(n) => {
+            let items = j.as_array().ok_or_else(mismatch)?;
+            if items.len() != *n as usize {
+                return Err(bad_req(format!(
+                    "'{path}': se esperaba un Vector<{n}> ({n} componentes), se recibieron {}",
+                    items.len()
+                )));
+            }
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    item.as_f64().map(|f| f as f32).ok_or_else(|| {
+                        bad_req(format!("'{path}[{i}]': se esperaba un número, se recibió {}", describe_json(item)))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Vector)
+        }
         Type::Bool => j.as_bool().map(Value::Bool).ok_or_else(mismatch),
         Type::Optional(inner) => {
             if j.is_null() {
@@ -5343,6 +5385,7 @@ fn describe_type(ty: &crate::types::Type) -> String {
         Type::Float => "Float".into(),
         Type::String => "String".into(),
         Type::Uuid => "Uuid".into(),
+        Type::Vector(n) => format!("Vector<{n}>"),
         Type::Bool => "Bool".into(),
         Type::Null | Type::Void => "null".into(),
         Type::Optional(inner) => format!("{}?", describe_type(inner)),
@@ -5552,6 +5595,10 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         // Mismo texto plano que un String -- ver la nota simétrica en
         // json_to_typed_value (que sí exige el formato al DECODIFICAR).
         Value::Uuid(s) => json!(s),
+        // `number[]` liso -- GRAMMAR.md §3.254. `f32 -> f64` es exacto (todo
+        // f32 representa exactamente en f64, nunca al revés), así que
+        // serializar como número JSON normal no pierde nada.
+        Value::Vector(v) => serde_json::Value::Array(v.iter().map(|x| json!(x)).collect()),
         Value::Bool(b) => json!(b),
         Value::Null => serde_json::Value::Null,
         Value::Struct(fields) => {

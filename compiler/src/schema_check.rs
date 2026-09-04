@@ -141,6 +141,15 @@ pub(crate) fn check_column(plan: &ColumnPlan, physical: &PhysicalColumn) -> Opti
                 matches!(dt.as_str(), "json" | "jsonb") || text_like
             }
         }
+        // GRAMMAR.md §3.254: `vector(N)` es un tipo de EXTENSIÓN (pgvector),
+        // no un tipo core de Postgres -- `information_schema.columns` lo
+        // reporta como `data_type = 'USER-DEFINED'` con `udt_name = 'vector'`
+        // (mismo mecanismo que cualquier otro tipo de extensión, nunca
+        // 'vector' directo en `data_type`). Sin comparar la dimensión `N`
+        // acá -- `introspect`/`--adopt-existing` no la exponen hoy, así que
+        // cualquier `vector(*)` existente se acepta; un mismatch de
+        // dimensión real recién se ve al escribir/leer una fila.
+        ColumnKind::Vector => dt == "user-defined" && udt == "vector",
     };
     if !compatible {
         let kind_name = match kind {
@@ -152,6 +161,7 @@ pub(crate) fn check_column(plan: &ColumnPlan, physical: &PhysicalColumn) -> Opti
             ColumnKind::Bool => "boolean",
             ColumnKind::Uuid => "uuid o text",
             ColumnKind::Text => "text/varchar (o uuid/inet/cidr/json/jsonb)",
+            ColumnKind::Vector => "vector(N) (extensión pgvector)",
         };
         let shown = if dt == "user-defined" || dt == "array" { format!("{dt} ({udt})") } else { dt.clone() };
         return Some((

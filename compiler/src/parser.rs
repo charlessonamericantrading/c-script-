@@ -1200,6 +1200,22 @@ impl Parser {
             TokenKind::Ident(name) => {
                 let name_span = self.span(); // cubre solo el identificador, no los type_args -- ver ast.rs::TypeExpr::Named
                 self.advance();
+                // `Vector<N>` (GRAMMAR.md §3.254): `N` es un ENTERO LITERAL,
+                // no un tipo -- el único generic builtin cuyo argumento no es
+                // sintácticamente un `TypeExpr` normal, así que se parsea
+                // aparte del camino genérico de abajo. Se reempaqueta como
+                // `Named("<dígitos>", [], _)` para no agregar una variante
+                // nueva a `TypeExpr` solo por esto (checker.rs lo desempaqueta).
+                if name == "Vector" && self.check(&TokenKind::Lt) {
+                    self.advance();
+                    let dim_span = self.span();
+                    let TokenKind::Int(dim) = self.peek().clone() else {
+                        return Err(self.error("'Vector<N>' espera un entero literal como dimensión, ej. 'Vector<1536>'".to_string()));
+                    };
+                    self.advance();
+                    self.eat(&TokenKind::Gt)?;
+                    return Ok(TypeExpr::Named("Vector".to_string(), vec![TypeExpr::Named(dim.to_string(), vec![], dim_span)], name_span));
+                }
                 let args = if self.check(&TokenKind::Lt) {
                     self.advance();
                     let mut args = vec![self.parse_type_expr()?];

@@ -36,6 +36,11 @@ pub(crate) enum Cell {
     /// Una columna JSON: TEXT en SQLite, JSONB en PostgreSQL. El envoltorio es
     /// del motor; lo de adentro es el mismo `serde_json::Value` en los dos.
     Json(serde_json::Value),
+    /// `Type::Vector(N)` (GRAMMAR.md §3.254) -- `f32`, no `f64`: pgvector
+    /// almacena precisión simple, y guardar/leer más ancho que eso solo
+    /// simularía una precisión que la base nunca tuvo. `N` no viaja acá (ya
+    /// lo sabe la columna destino) -- solo los componentes.
+    Vector(Vec<f32>),
 }
 
 /// Qué se espera leer de una columna. Sale de `ColumnPlan`, así que la fila
@@ -71,6 +76,13 @@ pub(crate) enum ColumnKind {
     /// para schema generado como adoptado -- ver `postgres_decimal_cell`/
     /// `Cell::to_sql`.
     Decimal,
+    /// `Type::Vector(N)` (GRAMMAR.md §3.254) -- `BLOB` (componentes `f32`
+    /// empaquetados) en SQLite, columna NATIVA `vector(N)` de la extensión
+    /// pgvector en Postgres. Sin búsqueda nativa del lado SQLite -- `.nearest()`
+    /// trae la colección entera y calcula coseno en el propio proceso
+    /// (PLAN.md §9.21 Fase 4 ítem 13, "correcto, lento, suficiente para
+    /// dev/test", mismo criterio que ya se documentó para esta feature).
+    Vector,
 }
 
 static POOL_ID_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
@@ -627,6 +639,26 @@ fn sqlite_cell(row: &rusqlite::Row, i: usize, kind: ColumnKind) -> rusqlite::Res
             ),
             None => Cell::Null,
         },
+        // Inversa exacta de `Cell::to_sql` -- `f32` little-endian, 4 bytes
+        // cada uno, sin cabecera. Un BLOB guardado por nosotros mismos
+        // siempre tiene un largo múltiplo de 4 -- un resto no-cero acá
+        // significaría datos corrompidos o una columna que nunca escribimos
+        // nosotros, cualquiera de los dos un error real, no un valor a
+        // truncar en silencio.
+        ColumnKind::Vector => match row.get::<_, Option<Vec<u8>>>(i)? {
+            Some(bytes) => {
+                if bytes.len() % 4 != 0 {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        i,
+                        rusqlite::types::Type::Blob,
+                        format!("un BLOB de vector tiene que tener un largo múltiplo de 4, tiene {}", bytes.len()).into(),
+                    ));
+                }
+                let values = bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+                Cell::Vector(values)
+            }
+            None => Cell::Null,
+        },
     })
 }
 
@@ -864,6 +896,42 @@ fn decimal_scaled_to_pg_numeric_binary(raw: i128) -> Vec<u8> {
         out.extend_from_slice(&d.to_be_bytes());
     }
     out
+}
+
+/// GRAMMAR.md §3.254: una columna `vector(N)` de la extensión pgvector --
+/// `accepts` matchea por NOMBRE (`ty.name()`), no por una constante de
+/// `postgres::types::Type`, porque pgvector NO es un tipo built-in del
+/// protocolo: su OID se asigna en runtime al instalar la extensión, así que
+/// no existe ningún `Type::VECTOR` fijo que comparar (a diferencia de
+/// `Type::UUID`/`Type::NUMERIC`, arriba). Sin depender del crate `pgvector`
+/// (mismo criterio de "cero dependencias nuevas" que Uuid/Decimal) -- el
+/// formato binario real (`vector_send`/`vector_recv`, código C de pgvector)
+/// es fijo y chico: 2 bytes de dimensión (u16 big-endian), 2 bytes
+/// reservados (siempre 0, se ignoran al leer), después cada componente
+/// como `f32` big-endian -- NO `f64`, pgvector almacena precisión simple.
+pub(crate) struct PgVector(pub(crate) Vec<f32>);
+
+impl<'a> postgres::types::FromSql<'a> for PgVector {
+    fn from_sql(ty: &postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        if raw.len() < 4 {
+            return Err(format!("'{ty}': vector truncado, se esperaban al menos 4 bytes de cabecera, llegaron {}", raw.len()).into());
+        }
+        let dim = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+        let expected_len = 4 + dim * 4;
+        if raw.len() < expected_len {
+            return Err(format!("'{ty}': vector truncado, se esperaban {expected_len} bytes, llegaron {}", raw.len()).into());
+        }
+        let mut values = Vec::with_capacity(dim);
+        for i in 0..dim {
+            let offset = 4 + i * 4;
+            values.push(f32::from_be_bytes([raw[offset], raw[offset + 1], raw[offset + 2], raw[offset + 3]]));
+        }
+        Ok(PgVector(values))
+    }
+
+    fn accepts(ty: &postgres::types::Type) -> bool {
+        ty.name() == "vector"
+    }
 }
 
 /// GRAMMAR.md §3.177: los 16 bytes CRUDOS de un `uuid` nativo de Postgres
@@ -1174,6 +1242,10 @@ fn postgres_cell(row: &postgres::Row, i: usize, kind: ColumnKind) -> Result<Cell
                 None => return Err(json_err.to_string()),
             },
         },
+        ColumnKind::Vector => match row.try_get::<_, Option<PgVector>>(i).map_err(|e| e.to_string())? {
+            Some(PgVector(v)) => Cell::Vector(v),
+            None => Cell::Null,
+        },
     })
 }
 
@@ -1288,6 +1360,18 @@ impl rusqlite::ToSql for Cell {
             Cell::Json(v) => ToSqlOutput::Owned(SqlValue::Text(
                 serde_json::to_string(v).expect("serializar a JSON no puede fallar"),
             )),
+            // GRAMMAR.md §3.254: `f32` little-endian, 4 bytes cada uno,
+            // concatenados sin cabecera -- SQLite no necesita saber `N` (la
+            // longitud del BLOB ya lo implica), a diferencia del formato de
+            // pgvector (`PgVector`, más abajo), que sí lleva la dimensión en
+            // el propio wire binario.
+            Cell::Vector(v) => {
+                let mut bytes = Vec::with_capacity(v.len() * 4);
+                for x in v {
+                    bytes.extend_from_slice(&x.to_le_bytes());
+                }
+                ToSqlOutput::Owned(SqlValue::Blob(bytes))
+            }
         })
     }
 }
@@ -1418,6 +1502,21 @@ impl postgres::types::ToSql for Cell {
                 postgres::types::Kind::Array(elem) => json_array_to_pg(v, elem, ty, out),
                 _ => v.to_sql(ty, out),
             },
+            // GRAMMAR.md §3.254: `vector(N)` es una extensión (pgvector),
+            // no un tipo built-in de `postgres::types::Type` -- inversa
+            // exacta de `PgVector::from_sql`, más abajo (mismo formato
+            // binario real de `vector_send`/`vector_recv`).
+            Cell::Vector(v) => {
+                let dim: u16 = v.len().try_into().map_err(|_| {
+                    format!("un vector de {} componentes no entra en el formato binario de pgvector (máximo {})", v.len(), u16::MAX)
+                })?;
+                out.extend_from_slice(&dim.to_be_bytes());
+                out.extend_from_slice(&0u16.to_be_bytes()); // "unused", reservado -- siempre 0
+                for x in v {
+                    out.extend_from_slice(&x.to_be_bytes());
+                }
+                Ok(postgres::types::IsNull::No)
+            }
         }
     }
 

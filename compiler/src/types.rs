@@ -47,6 +47,18 @@ pub enum Type {
     /// Se guarda como `TEXT`/`string` en los dos backends SQL y en TS --
     /// mismo criterio de "sin rama por backend" que el resto del lenguaje.
     Uuid,
+    /// `Vector<N>` (GRAMMAR.md §3.254, PLAN.md §9.21 Fase 4 ítem 13): un
+    /// vector de `N` componentes `f32`, `N` fijo en el TIPO (parte de la
+    /// igualdad de `Type` -- `Vector<768>` y `Vector<1536>` son tipos
+    /// DISTINTOS, incompatibles entre sí, mismo criterio nominal que
+    /// `Enum(String)`). Se guarda nativo como `vector(N)` de la extensión
+    /// pgvector en PostgreSQL, `BLOB` (bytes crudos, sin BÚSQUEDA nativa) en
+    /// SQLite. Wire y TS: `number[]` de largo exactamente `N`. Sin sintaxis
+    /// de literal en v0 -- mismo criterio que `Timestamp`: solo llega como
+    /// parámetro de un `rpc` (embeddings que el cliente ya calculó) o ya
+    /// guardado en `db` (una fila adoptada/leída), nunca construido dentro
+    /// de código `.link`.
+    Vector(u32),
     Bool,
     Void,
     /// El tipo del literal `null`. Solo es subtipo de `Optional(_)` — ver
@@ -189,6 +201,7 @@ impl std::fmt::Display for Type {
             Type::Float => write!(f, "Float"),
             Type::String => write!(f, "String"),
             Type::Uuid => write!(f, "Uuid"),
+            Type::Vector(n) => write!(f, "Vector<{n}>"),
             Type::Bool => write!(f, "Bool"),
             Type::Void => write!(f, "Void"),
             Type::Null => write!(f, "null"),

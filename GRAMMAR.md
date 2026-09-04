@@ -8940,6 +8940,51 @@ service Notes {
 
 **Verificado**: `compiler/tests/cli_tenant_annotation.rs` (rechazos del checker/parser -- tipo no soportado, campo opcional, `@tenant` repetido en el mismo campo y en más de un campo, junto con `@encrypted`, sobre una variante de enum, `@tenant(...)` con una keyword que no es `claim`, `@tenant(claim: "")` -- y que un literal `insert(Note { id: 0, orgId: "...", text: "..." })` que SÍ menciona el campo `@tenant` tipa igual, aunque el runtime lo ignore por completo, ver el ejemplo abajo) y `compiler/tests/server_http.rs` (`tenant_annotation_isolates_rows_end_to_end_over_a_real_subprocess_with_signed_jwts`: dos tenants con JWTs firmados distintos, cada uno solo ve/cuenta/encuentra sus propias filas, un `applyPatch`/`delete`/`increment` cruzado nunca toca la fila del otro tenant aunque conozca su id exacto, y una request sin token da 400).
 
+### 3.254 `Vector<N>` + pgvector nativo + `db.<c>.nearest(...)`: búsqueda semántica — RESUELTO, cierra PLAN.md §9.21 Fase 4 (ítem 13) y §9.18 Eje F ítem 2
+
+Origen: `PLAN.md §9.21` Fase 4 ítem 13, y antes `PLAN.md §9.18` Eje F ítem 2. Evidencia de demanda real: Ignis Love ya corre pgvector en producción (sesión colaboradora skynet-d3); antes de esta ronda, `linkc introspect`/`db shell` (§3.189) mostraban una columna `vector` como "tipo no soportado". **Decisiones de diseño explícitas del usuario** (dos, ambas necesarias antes de implementar por ser un tipo nuevo): `nearest()` usa SOLO distancia coseno (sin parámetro de métrica -- la única que usa el caso real) y devuelve `List<T>` liso (sin la distancia adjunta -- API mínima, mismo criterio que `maxRow`/`minRow` devuelven `T`, no un par).
+
+**Qué hay (v1.201.0)**:
+- **`Vector<N>`** (`N` un entero LITERAL positivo, ej. `Vector<1536>` -- no un argumento de tipo real, así que `Vector<T>` con un nombre no compila) como tipo de campo. `N` es parte del TIPO: `Vector<768>` y `Vector<1536>` son incompatibles entre sí, mismo criterio nominal que un `enum`.
+- **Storage nativo por backend**: columna `vector(N)` de la extensión pgvector en PostgreSQL (formato binario real `vector_send`/`vector_recv`, sin depender del crate `pgvector` -- mismo criterio de "cero dependencias nuevas" que `Uuid`/`Decimal`, GRAMMAR.md §3.9). `CREATE EXTENSION IF NOT EXISTS vector` se ejecuta SOLO si el programa declara `Vector<N>` en algún lado -- cero fricción de permisos para el resto. En SQLite, un `BLOB` con los componentes `f32` empaquetados -- SQLite no tiene búsqueda de vectores nativa, ver "Límites honestos".
+- **`db.<c>.nearest(selector, vec, k) -> List<T>`**: las `k` filas más cercanas a `vec` (un `Vector<N>`, MISMO `N` que el campo) por distancia coseno sobre el campo que `selector` nombra -- `selector` con la forma exacta `|item: T| item.campo` (mismo reconocimiento de forma que `.with()`, §3.250), exigiendo que `campo` sea `Vector<N>` requerido (no opcional). En PostgreSQL empuja `ORDER BY "col" <=> $1 LIMIT $2` -- el operador nativo de pgvector. Respeta `@tenant`/`@softDelete` como cualquier otra lectura.
+- **Wire y TS**: `number[]` de largo exactamente `N`, validado en las dos direcciones -- `validators.ts`/`schemas.ts` (Zod) chequean el largo Y que cada elemento sea un número finito (`Number.isFinite`, rechaza `NaN`/`Infinity`); el servidor hace lo mismo al decodificar un parámetro de `rpc`, con `400` si el largo no coincide.
+
+<!-- linkc:check -->
+```rust
+type Note = {
+  id: Int,
+  embedding: Vector<3>,
+  text: String,
+}
+
+db {
+  notes: Note[],
+}
+
+service Notes {
+  // Sin sintaxis de literal para 'Vector<N>' (ver "Límites honestos" abajo)
+  // -- 'embedding' SIEMPRE llega como parámetro de este rpc, nunca
+  // construido dentro del cuerpo.
+  rpc add(text: String, embedding: Vector<3>) -> Note {
+    db.notes.insert(Note { id: 0, embedding: embedding, text: text })
+  }
+
+  rpc closest(query: Vector<3>, k: Int) -> Note[] {
+    db.notes.nearest(|n: Note| { n.embedding }, query, k)
+  }
+}
+```
+
+**Límites honestos**:
+- **Sin sintaxis de literal en v0**: a diferencia de un array común (`[1, 2, 3]` tipa como `List<Int>`), no hay forma de escribir un `Vector<N>` dentro de código `.link` -- mismo criterio que `Timestamp` (§3.31, "sin construcción desde código fuente"): un `Value::Vector` solo nace de un wire decode (parámetro de `rpc`) o de una lectura de `db`. Consecuencia real: un `test { }` (§3.33) no puede ejercitar `insert`/`nearest` sobre una colección con `Vector<N>` -- verificar el round-trip real necesita un `linkc serve` de verdad (ver `compiler/tests/pg_integration.rs`/`cli_vector_annotation.rs`), no un `test { }`.
+- **Sin índice HNSW/ANN todavía**: `nearest()` da resultados CORRECTOS en los dos backends (`<=>` sin índice sigue siendo una comparación exacta contra cada fila, solo sin la aceleración de un índice aproximado) -- lo que falta es la velocidad a gran escala. Agregar `CREATE INDEX ... USING hnsw` queda para una ronda aparte (parámetros propios de tuning -- `m`/`ef_construction` -- que ameritan su propia sintaxis, no una extensión apurada de esta).
+- **SQLite es fuerza bruta real**: sin `sqlite-vec` (dependencia opcional nueva, fuera de alcance en v1 -- mismo criterio que el resto del proyecto con dependencias). `nearest()` en SQLite trae la colección entera (ya filtrada por `@tenant`/`@softDelete`) y calcula/ordena coseno en el propio proceso -- correcto, lento, suficiente para dev/test, nunca para producción a escala.
+- **`stream`/`subscribe`, `db import`/`export`, `linkc introspect`**: mismos límites ya documentados para `@tenant` (§3.253) y otros tipos nativos -- `stream` no tiene ningún filtro semántico; `import`/`export` sí funcionan (`Vector<N>` viaja como cualquier otro campo por `value_to_json`/`json_to_typed_value`, sin el bloqueo que sí tiene `@encrypted`); `introspect` reconoce una columna `vector(N)` existente pero NO puede leer `N` de `information_schema` (vive en `pg_attribute.atttypmod`, fuera de la consulta actual) -- avisa con un mensaje accionable en vez de sugerir `String` en silencio.
+- **Sin métodos propios sobre el `Value`**: ni `.length()` (la dimensión ya la sabe el TIPO) ni aritmética/normalización -- fuera de alcance de esta ronda.
+
+**Verificado**: `compiler/tests/cli_vector_annotation.rs` (rechazos del checker/parser -- `Vector<N>` sin argumento entero, `N` no positivo, campo no-Vector pasado a `nearest`, selector con forma inválida, dimensión de la consulta que no coincide con la del campo -- y los artefactos generados: `number[]` en `contract.d.ts`, el chequeo de largo+finitud en `validators.ts`/`schemas.ts`/`openapi.json`) y un servidor real sobre SQLite confirmando `insert`/`all`/`find`/`nearest` de punta a punta con el DDL físico (`BLOB`, no JSON); `compiler/tests/pg_integration.rs` (`vector_nearest_pushes_down_to_the_pgvector_operator_against_real_postgres`: `CREATE EXTENSION` automático, columna `vector(N)` real, orden por distancia coseno idéntico al de SQLite).
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

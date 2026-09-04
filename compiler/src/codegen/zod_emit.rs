@@ -22,6 +22,10 @@ fn render_zod_type(ty: &Type) -> String {
         Type::Uuid => {
             "z.string().regex(/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/)".to_string()
         }
+        // GRAMMAR.md §3.254: array de exactamente `n` números finitos --
+        // mismo criterio que validators.ts (`Number.isFinite`, no solo
+        // `z.number()`, para rechazar NaN/Infinity de la distancia coseno).
+        Type::Vector(n) => format!("z.array(z.number().finite()).length({n})"),
         Type::Bool => "z.boolean()".to_string(),
         Type::Void => "z.void()".to_string(),
         Type::Timestamp => "z.string().datetime()".to_string(),

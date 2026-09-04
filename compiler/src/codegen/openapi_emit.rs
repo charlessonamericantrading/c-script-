@@ -73,6 +73,8 @@ pub(crate) fn type_to_json_schema(ty: &Type) -> Value {
         // validators.ts/schemas.ts (que sí necesitan su propia regex,
         // GRAMMAR.md §3.70).
         Type::Uuid => json!({ "type": "string", "format": "uuid" }),
+        // GRAMMAR.md §3.254: array de exactamente `n` números.
+        Type::Vector(n) => json!({ "type": "array", "items": { "type": "number" }, "minItems": n, "maxItems": n }),
         Type::Bool => json!({ "type": "boolean" }),
         Type::Void => json!({ "type": "null" }),
         Type::Timestamp => json!({ "type": "string", "format": "date-time" }),

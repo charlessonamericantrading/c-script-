@@ -78,6 +78,22 @@ fn map_pg_type(pg_type: &str, udt_name: &str, column_name: &str) -> (&'static st
                  (fecha + hora, GRAMMAR.md §3.31), no le cabe una hora suelta sin fecha; revisar a mano"
             )),
         ),
+        // GRAMMAR.md §3.254: una columna `vector(N)` de la extensión
+        // pgvector -- `information_schema.columns` la reporta como
+        // "USER-DEFINED" con `udt_name = "vector"`, pero NO expone `N` (la
+        // dimensión vive en `pg_attribute.atttypmod`, fuera del alcance de
+        // la consulta que este módulo ya hace) -- así que, a diferencia de
+        // cualquier otro tipo reconocido acá, no se puede sugerir
+        // 'Vector<N>' con el N real sin adivinar. Igual que el resto del
+        // módulo: mejor un warning honesto y accionable que una String
+        // silenciosa que oculta que hay una columna vector real ahí.
+        "USER-DEFINED" if udt_name == "vector" => (
+            "String",
+            Some(format!(
+                "'{column_name}' es una columna 'vector(N)' de la extensión pgvector (GRAMMAR.md §3.254) -- la dimensión N \
+                 no se puede leer de information_schema; reemplazá 'String' acá por 'Vector<N>' a mano, con el N real de la columna"
+            )),
+        ),
         other => (
             "String",
             Some(format!("'{column_name}' es '{other}', un tipo sin mapeo conocido -- revisado como String a mano")),

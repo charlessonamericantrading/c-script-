@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.202.0] - 2026-09-04
+
+### ✨ Añadido
+**`Vector<N>` + pgvector nativo + `db.<c>.nearest(...)` -- búsqueda semántica (PLAN.md §9.21 Fase 4 ítem 13, cierra también §9.18 Eje F ítem 2)**: `Vector<N>` (`N` un entero literal, ej. `Vector<1536>`) como tipo de campo -- columna nativa `vector(N)` de la extensión pgvector en PostgreSQL (`CREATE EXTENSION IF NOT EXISTS vector` automático solo si el programa la usa; formato binario `vector_send`/`vector_recv` hecho a mano, sin depender del crate `pgvector`, mismo criterio de cero-dependencias-nuevas que `Uuid`/`Decimal`) y un `BLOB` de componentes `f32` empaquetados en SQLite. `db.<c>.nearest(selector, vec, k) -> List<T>` -- decisión de diseño explícita del usuario: solo distancia coseno, sin distancia adjunta al resultado -- empuja `ORDER BY "col" <=> $1 LIMIT $2` (el operador nativo de pgvector) en Postgres, y trae la colección entera para calcular/ordenar coseno en el propio proceso en SQLite (correcto, más lento, documentado como límite de dev/test). Respeta `@tenant`/`@softDelete` como cualquier otra lectura. Wire y TS: `number[]` de largo exactamente `N`, validado en las dos direcciones. Sin sintaxis de literal en el lenguaje (mismo criterio que `Timestamp`: un valor solo llega como parámetro de `rpc` o de una lectura de `db`) y sin índice HNSW/ANN todavía (resultados correctos en los dos backends, sin la aceleración de un índice aproximado -- ronda aparte). Ver GRAMMAR.md §3.254.
+
 ## [1.201.0] - 2026-09-04
 
 ### ✨ Añadido

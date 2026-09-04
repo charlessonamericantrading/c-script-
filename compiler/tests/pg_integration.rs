@@ -5934,3 +5934,101 @@ fn migrate_apply_stops_at_the_first_failing_migration_and_keeps_earlier_ones_app
         client.query("SELECT \"name\" FROM \"_link_migrations\"", &[]).unwrap().iter().map(|r| r.get(0)).collect();
     assert_eq!(applied_names, vec!["0001_ok.sql".to_string()], "solo la primera quedó registrada, nunca la rota");
 }
+
+/// `Vector<N>` + `db.<c>.nearest(...)` (GRAMMAR.md §3.254, PLAN.md §9.21
+/// Fase 4 ítem 13) contra Postgres real: la extensión pgvector se crea
+/// sola (`CREATE EXTENSION IF NOT EXISTS vector`, sin que el test la pida a
+/// mano), la columna física es `vector(3)` de verdad (no JSONB, no TEXT), y
+/// `ORDER BY "col" <=> $1 LIMIT $2` da el MISMO orden por distancia coseno
+/// que el brute-force de SQLite (`cli_vector_annotation.rs`) sobre los
+/// mismos tres vectores -- confirma que los dos backends están de acuerdo,
+/// no solo que cada uno compila.
+#[test]
+fn vector_nearest_pushes_down_to_the_pgvector_operator_against_real_postgres() {
+    const COLLECTION: &str = "pg_vector_notes";
+    let Ok(url) = std::env::var("LINK_TEST_PG_URL") else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let program = format!(
+        r#"
+type Note = {{ id: Int, embedding: Vector<3>, text: String }}
+type NewNote = {{ embedding: Vector<3>, text: String }}
+db {{
+  {COLLECTION}: Note[],
+}}
+service Notes {{
+  rpc add(embedding: Vector<3>, text: String) -> Note {{
+    db.{COLLECTION}.insert(NewNote {{ embedding: embedding, text: text }})
+  }}
+  rpc list() -> Note[] {{
+    db.{COLLECTION}.all()
+  }}
+  rpc closest(query: Vector<3>, k: Int) -> Note[] {{
+    db.{COLLECTION}.nearest(|n: Note| {{ n.embedding }}, query, k)
+  }}
+}}
+"#
+    );
+    let temp = TempDir::new("vector-pg");
+    let src = temp.write("app.link", &program);
+    let server = Serve::start(&src, &url);
+
+    server.rpc("Notes/add", r#"{"embedding":[1.0,0.0,0.0],"text":"a"}"#);
+    server.rpc("Notes/add", r#"{"embedding":[0.0,1.0,0.0],"text":"b"}"#);
+    server.rpc("Notes/add", r#"{"embedding":[0.9,0.1,0.0],"text":"c"}"#);
+
+    assert_eq!(server.rpc("Notes/list", "{}").as_array().unwrap().len(), 3);
+
+    // La extensión se creó sola, y la columna es 'vector(3)' de verdad --
+    // ni JSONB (el fallback genérico para tipos compuestos) ni TEXT.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let udt_name: String = client
+        .query_one(
+            "SELECT udt_name FROM information_schema.columns WHERE table_name = $1 AND column_name = 'embedding'",
+            &[&COLLECTION],
+        )
+        .map(|row| row.get(0))
+        .expect("leer el tipo físico de 'embedding'");
+    assert_eq!(udt_name, "vector", "la columna Vector<3> tiene que ser 'vector' nativo de pgvector: {udt_name}");
+
+    let extension_installed: bool = client
+        .query_one("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')", &[])
+        .map(|row| row.get(0))
+        .expect("chequear pg_extension");
+    assert!(extension_installed, "'CREATE EXTENSION IF NOT EXISTS vector' tiene que haber corrido sola al conectar");
+
+    // Mismo orden que el test equivalente sobre SQLite
+    // (vector_annotation_full_crud_and_nearest_ordering_over_real_sqlite):
+    // 'a' (idéntico) primero, 'c' (casi idéntico) segundo -- confirma que
+    // el operador nativo <=> de pgvector y el coseno calculado a mano en
+    // Rust están de acuerdo sobre los mismos datos.
+    let near = server.rpc("Notes/closest", r#"{"query":[1.0,0.0,0.0],"k":2}"#);
+    let near = near.as_array().unwrap();
+    assert_eq!(near.len(), 2, "{near:?}");
+    assert_eq!(near[0]["text"], "a", "la fila idéntica tiene que salir primero: {near:?}");
+    assert_eq!(near[1]["text"], "c", "la fila casi-idéntica tiene que salir segunda: {near:?}");
+
+    let near_b = server.rpc("Notes/closest", r#"{"query":[0.0,1.0,0.0],"k":1}"#);
+    assert_eq!(near_b[0]["text"], "b", "{near_b:?}");
+
+    // Dimensión equivocada -> 400 del lado del servidor, antes de tocar la base.
+    let (status, _) = ureq::post(&format!("http://127.0.0.1:{}/Notes/closest", server.port))
+        .set("Content-Type", "application/json")
+        .send_string(r#"{"query":[1.0,0.0],"k":1}"#)
+        .map(|r| (r.status(), r.into_string().unwrap_or_default()))
+        .unwrap_or_else(|e| match e {
+            ureq::Error::Status(status, r) => (status, r.into_string().unwrap_or_default()),
+            e => panic!("closest falló de red: {e}"),
+        });
+    assert_eq!(status, 400, "un Vector<3> con 2 componentes tiene que ser 400");
+
+    // Segundo arranque: 'CREATE EXTENSION IF NOT EXISTS' tiene que ser un
+    // no-op silencioso, no un error -- mismo criterio que los tests de
+    // reinicio de '@ref'/'.with()' de más arriba en este archivo.
+    let server2 = Serve::start(&src, &url);
+    assert_eq!(server2.rpc("Notes/list", "{}").as_array().unwrap().len(), 3, "los datos sobreviven el reinicio");
+}

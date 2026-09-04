@@ -227,6 +227,7 @@ fn type_key(ty: &Type) -> String {
         Type::Float => "Float".into(),
         Type::String => "String".into(),
         Type::Uuid => "Uuid".into(),
+        Type::Vector(n) => format!("Vector{n}"),
         Type::Bool => "Bool".into(),
         Type::Void => "Void".into(),
         Type::Null => "Null".into(),
@@ -294,6 +295,15 @@ fn render_check(ty: &Type, expr: &str, worklist: &mut Vec<Type>, seen: &mut Vec<
         // aunque `crypto.uuid()` siempre las emite en minúscula.
         Type::Uuid => format!(
             "(typeof {expr} === \"string\" && /^[0-9a-fA-F]{{8}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{4}}-[0-9a-fA-F]{{12}}$/.test({expr}))"
+        ),
+        // GRAMMAR.md §3.254: array de EXACTAMENTE `n` números -- el largo se
+        // valida acá porque TS no tiene tuplas de largo `N` genérico
+        // (mismo motivo que `render_type` emite `number[]` liso, no un tipo
+        // branded). `Number.isFinite` (no solo `typeof === "number"`)
+        // rechaza `NaN`/`Infinity`, que rompería la distancia coseno en
+        // `nearest()`.
+        Type::Vector(n) => format!(
+            "(Array.isArray({expr}) && {expr}.length === {n} && {expr}.every((item: unknown) => typeof item === \"number\" && Number.isFinite(item)))"
         ),
         Type::Bool => format!("typeof {expr} === \"boolean\""),
         // Void nunca es un payload real (solo retorno de rpc, tabla de

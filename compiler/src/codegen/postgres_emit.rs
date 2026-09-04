@@ -20,28 +20,33 @@ use std::collections::{HashMap, HashSet};
 /// declaraba `JSONB`. El runtime SQLite ya desenvuelve (`ColumnPlan::for_field`
 /// en runtime/db.rs), de modo que los dos backends emitian esquemas distintos
 /// para el mismo programa.
-pub fn link_to_postgres_type(ty: &Type, simple_enums: &HashSet<String>) -> &'static str {
+pub fn link_to_postgres_type(ty: &Type, simple_enums: &HashSet<String>) -> String {
     match ty {
         Type::Optional(inner) => link_to_postgres_type(inner.as_ref(), simple_enums),
-        Type::Int | Type::Int64 | Type::Timestamp => "BIGINT",
+        Type::Int | Type::Int64 | Type::Timestamp => "BIGINT".to_string(),
         // GRAMMAR.md §3.184: NUMERIC nativo, no BIGINT -- a diferencia de
         // Int64 (mismo ancho físico que Int, sin necesidad de un tipo
         // Postgres propio), Decimal necesita el tipo real de precisión
         // exacta -- 38 dígitos totales, 4 decimales fijos, más que
         // suficiente para el i128 interno.
-        Type::Decimal => "NUMERIC(38,4)",
-        Type::Float => "DOUBLE PRECISION",
-        Type::String => "TEXT",
+        Type::Decimal => "NUMERIC(38,4)".to_string(),
+        Type::Float => "DOUBLE PRECISION".to_string(),
+        Type::String => "TEXT".to_string(),
         // TEXT, no el tipo nativo UUID de Postgres -- mismo criterio de
         // "sin rama por backend" que el resto de este mapeo: SQLite no
         // tiene un tipo UUID nativo, así que los dos backends usan TEXT
         // (GRAMMAR.md §3.70). La validación de forma vive en el borde JSON,
         // no en una constraint de columna.
-        Type::Uuid => "TEXT",
-        Type::Bool => "BOOLEAN",
-        Type::Enum(name) if simple_enums.contains(name) => "TEXT",
+        Type::Uuid => "TEXT".to_string(),
+        // GRAMMAR.md §3.254: único tipo con un argumento DINÁMICO -- por
+        // eso esta función dejó de devolver `&'static str`. Requiere la
+        // extensión pgvector (`CREATE EXTENSION IF NOT EXISTS vector`, ver
+        // `generate_postgres_ddl` más abajo) instalada en la base destino.
+        Type::Vector(n) => format!("vector({n})"),
+        Type::Bool => "BOOLEAN".to_string(),
+        Type::Enum(name) if simple_enums.contains(name) => "TEXT".to_string(),
         // Todo tipo compuesto (structs, arrays, mapas, genéricos, uniones) se guarda en JSONB nativo
-        _ => "JSONB",
+        _ => "JSONB".to_string(),
     }
 }
 
@@ -50,10 +55,10 @@ pub fn link_to_postgres_type(ty: &Type, simple_enums: &HashSet<String>) -> &'sta
 /// ausente / null / valor, y eso no lo puede representar una columna nativa
 /// nullable -- necesita JSON. Un solo nivel de opcionalidad, en cambio, es una
 /// columna nativa que admite NULL.
-fn postgres_column_type(field: &FieldType, simple_enums: &HashSet<String>) -> &'static str {
+fn postgres_column_type(field: &FieldType, simple_enums: &HashSet<String>) -> String {
     let double_optional = field.optional && matches!(field.ty, Type::Optional(_));
     if double_optional {
-        "JSONB"
+        "JSONB".to_string()
     } else {
         link_to_postgres_type(&field.ty, simple_enums)
     }

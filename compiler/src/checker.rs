@@ -1511,6 +1511,27 @@ impl Checker {
             "Float" => Ok(Type::Float),
             "String" => Ok(Type::String),
             "Uuid" => Ok(Type::Uuid),
+            // GRAMMAR.md §3.254: `Vector<N>` -- `N` NO es un argumento de
+            // tipo real, es un entero literal que `parse_primary_type`
+            // (parser.rs) reempaqueta como `TypeExpr::Named("<dígitos>", [],
+            // _)` para reusar la misma forma sintáctica de `args:
+            // Vec<TypeExpr>` sin agregar una variante nueva a `TypeExpr` ni
+            // tocar `resolve_type_subst` en ningún otro lado.
+            "Vector" => {
+                let [TypeExpr::Named(digits, dim_args, _)] = args else {
+                    return Err(err("'Vector<N>' requiere exactamente 1 argumento -- un entero literal, ej. 'Vector<1536>'"));
+                };
+                if !dim_args.is_empty() {
+                    return Err(err("'Vector<N>': N tiene que ser un entero literal, no un tipo"));
+                }
+                let n: u32 = digits.parse().map_err(|_| {
+                    err(format!("'Vector<N>': N tiene que ser un entero positivo, se encontró '{digits}'"))
+                })?;
+                if n == 0 {
+                    return Err(err("'Vector<N>': N tiene que ser mayor que 0"));
+                }
+                Ok(Type::Vector(n))
+            }
             "Bool" => Ok(Type::Bool),
             "Void" => Ok(Type::Void),
             "Result" => {
@@ -1603,7 +1624,8 @@ impl Checker {
                         Ok(Type::Generic(name.to_string(), resolved_args))
                     }
                 } else {
-                    let mut candidates: Vec<&str> = vec!["Int", "Int64", "Decimal", "Timestamp", "Float", "String", "Uuid", "Bool", "Void", "Result", "Patch", "Map"];
+                    let mut candidates: Vec<&str> =
+                        vec!["Int", "Int64", "Decimal", "Timestamp", "Float", "String", "Uuid", "Vector", "Bool", "Void", "Result", "Patch", "Map"];
                     candidates.extend(self.types.keys().map(String::as_str));
                     candidates.extend(self.enums.keys().map(String::as_str));
                     if let Some(sug) = find_best_suggestion(name, candidates) {
@@ -5675,6 +5697,8 @@ impl Checker {
 
             "with" => self.check_with(element_ty, args),
 
+            "nearest" => self.check_nearest(element_ty, args, env),
+
             // Deliberadamente SIEMPRE un error acá, nunca una firma normal
             // y libremente componible como las de arriba (GRAMMAR.md
             // §3.16): la única forma de que `subscribe()` tipe en TODO el
@@ -5690,7 +5714,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/updateWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/increment/select/with/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/updateWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/increment/select/with/nearest/subscribe)"
             ))),
         }
     }
@@ -6198,6 +6222,52 @@ impl Checker {
             ],
         };
         Ok(Type::List(Box::new(wrapper)))
+    }
+
+    /// `db.<c>.nearest(selector, vec, k) -> List<T>` (GRAMMAR.md §3.254,
+    /// PLAN.md §9.21 Fase 4 ítem 13) -- búsqueda semántica por distancia
+    /// coseno. `selector` usa el MISMO reconocimiento de forma que `with`
+    /// (`|item: T| item.campo`, arriba), pero exigiendo que el campo sea
+    /// `Vector<N>`, no `@ref(...)`. `vec` (la consulta) tiene que ser el
+    /// MISMO `Vector<N>` -- comparar contra otra dimensión no tiene ningún
+    /// resultado sensato en pgvector (`<=>` directamente rechaza el
+    /// mismatch en runtime, así que rechazarlo acá, en compilación, es
+    /// estrictamente mejor). Decisión de diseño explícita del usuario: solo
+    /// coseno (sin parámetro de métrica) y `List<T>` (sin distancia
+    /// adjunta) -- API mínima, coherente con que Ignis Love (el caso real
+    /// que motiva esto) solo usa coseno.
+    fn check_nearest(&self, element_ty: &Type, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
+        let [selector_arg, vec_arg, k_arg] = args else {
+            return Err(err("'nearest' toma exactamente 3 argumentos (selector: |item: T| item.campoVector, vec: Vector<N>, k: Int)"));
+        };
+        let shape_err = || {
+            err(
+                "'nearest' espera un selector de la forma `|item: T| item.campo`, un acceso de campo simple sobre \
+                 el propio parámetro, donde 'campo' es 'Vector<N>' (GRAMMAR.md §3.254)",
+            )
+        };
+        let Expr::Closure { params, body } = &selector_arg.node else {
+            return Err(shape_err());
+        };
+        let param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+        let Some(field_name) = crate::ast::recognize_field_selector(&param_names, body) else {
+            return Err(shape_err());
+        };
+        let Type::Struct { fields, .. } = element_ty else {
+            return Err(err("una colección de 'db' debe resolver a un struct"));
+        };
+        let Some(field) = fields.iter().find(|f| f.name == field_name) else {
+            return Err(err(format!("'nearest': '{field_name}' no es un campo de este struct")));
+        };
+        let &Type::Vector(n) = &field.ty else {
+            return Err(err(format!(
+                "'nearest': '{field_name}' es {}, tiene que ser 'Vector<N>' (GRAMMAR.md §3.254)",
+                field.ty
+            )));
+        };
+        self.check_expr(vec_arg, &Type::Vector(n), env)?;
+        self.check_expr(k_arg, &Type::Int, env)?;
+        Ok(Type::List(Box::new(element_ty.clone())))
     }
 
     /// Tipos con un orden total real tanto en SQL (`ORDER BY`) como en

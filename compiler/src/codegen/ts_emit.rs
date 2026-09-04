@@ -1556,6 +1556,12 @@ pub(crate) fn render_type(ty: &Type) -> String {
         // validación real (GRAMMAR.md §3.70) vive en validators.ts, no en el
         // sistema de tipos de TS.
         Type::Uuid => "string".to_string(),
+        // `number[]` liso, sin brand de largo -- GRAMMAR.md §3.254: TS no
+        // tiene tuplas de largo `N` genérico sin generar código por cada
+        // `N` (fuera de alcance), así que el chequeo real del largo vive en
+        // el borde JSON (`json_to_typed_value`), igual que Uuid/Timestamp
+        // arriba delegan su propia validación de forma a `validators.ts`.
+        Type::Vector(_) => "number[]".to_string(),
         Type::Bool => "boolean".to_string(),
         Type::Void => "void".to_string(),
         Type::Null => "null".to_string(),
@@ -1681,7 +1687,7 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
                 collect_type_names(m, names);
             }
         }
-        Type::Int | Type::Int64 | Type::Decimal | Type::Timestamp | Type::Float | Type::String | Type::Uuid | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
+        Type::Int | Type::Int64 | Type::Decimal | Type::Timestamp | Type::Float | Type::String | Type::Uuid | Type::Vector(_) | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
         Type::Db | Type::DbCollection(_) | Type::DbQuery(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Pdf | Type::Excel | Type::Ai | Type::Mcp | Type::Env | Type::Request | Type::Smtp | Type::Response => {
             unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64/Pdf/Excel/Mcp nunca aparece en un TypeExpr real")
         }
