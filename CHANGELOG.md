@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.202.1] - 2026-09-04
+
+### 🔧 Proceso
+**v1.202.0 quedó con CI en rojo** -- `vector_nearest_pushes_down_to_the_pgvector_operator_against_real_postgres` (nueva en esa versión) falló al arrancar el servidor: `CREATE EXTENSION IF NOT EXISTS vector` da error contra un Postgres que NUNCA tuvo la extensión disponible (distinto de "ya existe", que sí es un no-op) -- el job de CI usaba la imagen `postgres:16` lisa, sin pgvector compilado. Cambiado a `pgvector/pgvector:pg16` (imagen del propio proyecto pgvector, drop-in sobre `postgres:16`, mismas env vars) en `.github/workflows/ci.yml`. Sin código de producto nuevo -- el resto de la suite (101/102 tests de `pg_integration.rs`, incluidos los 8 anteriores de esta misma ronda) ya había pasado contra Postgres real en el primer push.
+
 ## [1.202.0] - 2026-09-04
 
 ### ✨ Añadido

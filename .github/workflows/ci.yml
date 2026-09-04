@@ -143,7 +143,12 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # GRAMMAR.md §3.254: imagen del PROPIO proyecto pgvector, drop-in
+        # sobre postgres:16 (mismo major, mismas env vars) con la extensión
+        # ya compilada -- `postgres:16` liso no la trae, y `CREATE EXTENSION
+        # IF NOT EXISTS vector` falla en un servidor que nunca la tuvo
+        # (distinto de "ya existe", que ESE caso sí es un no-op).
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_PASSWORD: link
           POSTGRES_DB: linkc_test
