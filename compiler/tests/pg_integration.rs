@@ -6032,3 +6032,101 @@ service Notes {{
     let server2 = Serve::start(&src, &url);
     assert_eq!(server2.rpc("Notes/list", "{}").as_array().unwrap().len(), 3, "los datos sobreviven el reinicio");
 }
+
+/// `@primaryKey(campo1, campo2, ...)` (GRAMMAR.md §3.255, PLAN.md §9.21
+/// Fase 3 ítem 11) contra Postgres real: el `PRIMARY KEY (...)` de tabla
+/// (sin `BIGSERIAL`/autoincremento) es real, y el ciclo CRUD completo --
+/// insert/find/applyPatch/delete por struct compuesto -- funciona sobre la
+/// columna física de verdad, no solo sobre el DDL estático que ya prueban
+/// los tests locales de SQLite (`cli_primary_key_annotation.rs`).
+#[test]
+fn composite_primary_key_supports_the_full_crud_cycle_against_a_real_postgres_table() {
+    const COLLECTION: &str = "pg_pk_order_lines";
+    let Ok(url) = std::env::var("LINK_TEST_PG_URL") else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+
+    let program = format!(
+        r#"
+@primaryKey(orderId, lineNumber)
+type OrderLine = {{ orderId: Int, lineNumber: Int, sku: String, qty: Int }}
+db {{
+  {COLLECTION}: OrderLine[],
+}}
+service Orders {{
+  rpc addLine(orderId: Int, lineNumber: Int, sku: String, qty: Int) -> OrderLine {{
+    db.{COLLECTION}.insert(OrderLine {{ orderId: orderId, lineNumber: lineNumber, sku: sku, qty: qty }})
+  }}
+  rpc getLine(id: {{ orderId: Int, lineNumber: Int }}) -> OrderLine? {{
+    db.{COLLECTION}.find(id)
+  }}
+  rpc listLines() -> OrderLine[] {{
+    db.{COLLECTION}.all()
+  }}
+  rpc bumpQty(id: {{ orderId: Int, lineNumber: Int }}, patch: Patch<OrderLine>) -> OrderLine {{
+    db.{COLLECTION}.applyPatch(id, patch)
+  }}
+  rpc removeLine(id: {{ orderId: Int, lineNumber: Int }}) -> Bool {{
+    db.{COLLECTION}.delete(id)
+  }}
+}}
+"#
+    );
+    let temp = TempDir::new("composite-pk-pg");
+    let src = temp.write("app.link", &program);
+    let server = Serve::start(&src, &url);
+
+    server.rpc("Orders/addLine", r#"{"orderId":1,"lineNumber":1,"sku":"A","qty":10}"#);
+    server.rpc("Orders/addLine", r#"{"orderId":1,"lineNumber":2,"sku":"B","qty":5}"#);
+    server.rpc("Orders/addLine", r#"{"orderId":2,"lineNumber":1,"sku":"C","qty":1}"#);
+    assert_eq!(server.rpc("Orders/listLines", "{}").as_array().unwrap().len(), 3);
+
+    // La columna física es un PRIMARY KEY COMPUESTO de verdad -- ni BIGSERIAL
+    // ni un solo "id" autoincremento.
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let pk_cols: Vec<String> = client
+        .query(
+            "SELECT a.attname FROM pg_index i \
+             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+             WHERE i.indrelid = $1::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)",
+            &[&COLLECTION],
+        )
+        .expect("leer la PK física")
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(pk_cols, vec!["orderId".to_string(), "lineNumber".to_string()], "PRIMARY KEY compuesto real, en orden");
+    let id_column_exists: bool = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = $1 AND column_name = 'id')",
+            &[&COLLECTION],
+        )
+        .map(|row| row.get(0))
+        .unwrap();
+    assert!(!id_column_exists, "una colección @primaryKey no tiene ninguna columna 'id' propia");
+
+    let found = server.rpc("Orders/getLine", r#"{"id":{"orderId":1,"lineNumber":2}}"#);
+    assert_eq!(found["sku"], "B", "{found:?}");
+    let missing = server.rpc("Orders/getLine", r#"{"id":{"orderId":99,"lineNumber":99}}"#);
+    assert!(missing.is_null(), "una clave que no existe da null: {missing:?}");
+
+    let patched = server.rpc("Orders/bumpQty", r#"{"id":{"orderId":1,"lineNumber":1},"patch":{"qty":999}}"#);
+    assert_eq!(patched["qty"], 999, "{patched:?}");
+    let unmoved = server.rpc("Orders/bumpQty", r#"{"id":{"orderId":1,"lineNumber":1},"patch":{"orderId":777}}"#);
+    assert_eq!(unmoved["orderId"], 1, "un patch nunca reasigna un campo de la PK compuesta: {unmoved:?}");
+
+    let deleted = server.rpc("Orders/removeLine", r#"{"id":{"orderId":2,"lineNumber":1}}"#);
+    assert_eq!(deleted, serde_json::json!(true));
+    let already_gone = server.rpc("Orders/removeLine", r#"{"id":{"orderId":2,"lineNumber":1}}"#);
+    assert_eq!(already_gone, serde_json::json!(false), "borrar una fila ya borrada da false, no un error");
+    assert_eq!(server.rpc("Orders/listLines", "{}").as_array().unwrap().len(), 2);
+
+    // Segundo arranque: la migración ADD COLUMN corre normal, sin quejarse
+    // de que "id" no existe -- mismo criterio de reinicio que el resto de
+    // los tests de este archivo.
+    let server2 = Serve::start(&src, &url);
+    assert_eq!(server2.rpc("Orders/listLines", "{}").as_array().unwrap().len(), 2, "los datos sobreviven el reinicio");
+}

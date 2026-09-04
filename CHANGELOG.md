@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.203.1] - 2026-09-04
+
+### 🧪 Tests
+**Verificación real contra PostgreSQL para `@primaryKey(...)` (v1.203.0)**: `composite_primary_key_supports_the_full_crud_cycle_against_a_real_postgres_table` en `compiler/tests/pg_integration.rs` -- v1.203.0 solo había verificado el ciclo CRUD compuesto contra SQLite real (`cli_primary_key_annotation.rs`); este test confirma el `PRIMARY KEY (...)` físico de Postgres (leído de `pg_index`/`pg_attribute`, en el orden declarado), que la colección NO tiene ninguna columna "id" propia, el ciclo insert/find/applyPatch (ignorando un intento de reasignar la PK)/delete sobre la tabla real, y que un reinicio no se queja de la ausencia de "id" al migrar columnas. Sin código de producto nuevo.
+
 ## [1.203.0] - 2026-09-04
 
 ### ✨ Añadido
