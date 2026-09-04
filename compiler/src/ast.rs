@@ -375,6 +375,17 @@ impl Field {
             _ => None,
         })
     }
+
+    /// ¿Lleva `@tenant`/`@tenant(claim: "...")`? (GRAMMAR.md §3.253). El
+    /// nombre del claim JWT a usar -- el explícito si se declaró, o el
+    /// propio nombre del campo si `@tenant` vino sin paréntesis. `None` si
+    /// el campo no lleva `@tenant` en absoluto.
+    pub fn tenant_claim_name(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            FieldAnnotation::Tenant(explicit) => Some(explicit.as_deref().unwrap_or(&self.name)),
+            _ => None,
+        })
+    }
 }
 
 impl PartialEq for Field {
@@ -443,6 +454,15 @@ pub enum FieldAnnotation {
     /// (`Checker::check_field_refs`). Sin `onDelete`, el DDL no agrega
     /// cláusula `ON DELETE` (comportamiento `NO ACTION` estándar de SQL).
     Ref(String, Option<OnDelete>),
+    /// `@tenant` o `@tenant(claim: "nombre")` -- multi-tenancy declarativo
+    /// (GRAMMAR.md §3.253 / PLAN.md §9.21 Fase 4 ítem 12). `None` (forma sin
+    /// paréntesis) usa el nombre del campo COMO nombre del claim JWT; con
+    /// paréntesis, el nombre del claim es explícito. Aislamiento TOTAL, sin
+    /// escape hatch [decisión del usuario]: toda lectura/escritura de esa
+    /// colección filtra/exige este campo == el valor del claim de la
+    /// request actual, sin excepción -- sin claim disponible, la operación
+    /// falla en vez de devolver vacío o todo.
+    Tenant(Option<String>),
 }
 
 /// Acción de `ON DELETE` para un `@ref(...)` (GRAMMAR.md §3.249). Vocabulario

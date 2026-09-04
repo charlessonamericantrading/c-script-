@@ -8896,6 +8896,50 @@ linkc migrate apply --db postgres://user:pass@host/produccion
 
 **Verificado**: `compiler/tests/pg_integration.rs`, 6 tests contra PostgreSQL real -- `generate` escribe el archivo numerado sin aplicar nada; sin cambios no genera ningún archivo; dos llamadas sucesivas numeran 0001/0002; `apply` crea `_link_migrations`, aplica la migración pendiente, y una segunda corrida la reconoce ya aplicada; una migración rota corta la corrida sin tocar las migraciones posteriores, dejando aplicadas solo las anteriores.
 
+### 3.253 `@tenant`/`@tenant(claim: "nombre")`: multi-tenancy declarativo, aislamiento total — RESUELTO, cierra PLAN.md §9.21 Fase 4 (ítem 12)
+
+Origen: `PLAN.md §9.21` Fase 4 ítem 12. Antes de esta ronda, una app multi-tenant tenía que acordarse de agregar `.filter(|x| x.orgId == currentOrg)` a MANO en cada `rpc` que tocara una colección compartida entre tenants -- un solo `rpc` nuevo que se olvidara ese filtro filtraba datos de un tenant a otro, y nada en el compilador podía verlo. **Decisión de diseño explícita del usuario**: aislamiento TOTAL, sin escape hatch -- ninguna forma de leer o escribir una colección `@tenant` sin un tenant resuelto, ni siquiera para un rol admin ni desde dentro del propio backend.
+
+**Qué hay (v1.201.0)**:
+- **`@tenant`** (usa el NOMBRE DEL CAMPO como nombre del claim JWT) o **`@tenant(claim: "nombre")`** (nombre del claim explícito, distinto del nombre del campo) sobre un campo `Int`/`Uuid`/`String` REQUERIDO (no opcional) del tipo de elemento de una colección de `db { }`. A lo sumo un campo `@tenant` por tipo; incompatible con `@encrypted` sobre el mismo campo (un ciphertext no es comparable en un `WHERE`, mismo motivo que `orderBy`/§3.191 ya documentan para otras anotaciones).
+- **Lectura**: `all`/`find`/`page`/`pageAfter`/`findWhere`/`countWhere`/`count`/`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`/`maxRow`/`minRow`/`orderBy(...).*`/`select(...)`/`with(...)` (la colección relacionada incluida, si también es `@tenant`) agregan automáticamente `AND "<columna>" = <tenant actual>` al `WHERE` -- nunca hace falta escribirlo a mano, y no hay forma de desactivarlo.
+- **Escritura**: `insert` autopuebla el campo `@tenant` con el tenant de la request actual -- el campo queda EXCLUIDO del tipo insertable (`Omit<T, "id" | "<campoTenant>">`, mismo mecanismo que ya excluye `"id"`), así que el caller no puede fijarlo ni por accidente. `applyPatch`/`updateWhere` ignoran en silencio cualquier intento de escribir ese campo (mismo criterio que ya aplica a `"id"`) -- reasignar el tenant de una fila existente no es una operación soportada, ni siquiera vía patch. `delete`/`increment`/la reconsulta de `insert`/`applyPatch` filtran TAMBIÉN por tenant en el propio `UPDATE`/`DELETE` -- no solo en la re-lectura posterior -- para que una fila de otro tenant nunca pueda mutarse aunque la reconsulta después no la encuentre.
+- **De dónde sale "el tenant actual"**: del claim JWT (`auth.claim(nombre)`, §3.197) del token de la request en curso -- exactamente el mismo mecanismo, resuelto internamente sin que el `.link` tenga que llamarlo. Sin tenant resuelto (sin `--jwt-secret` configurado, sin token en la request, o el claim ausente/token inválido), la operación falla con `400` en vez de devolver una lista vacía o sin filtrar -- el aislamiento total significa que "no sé qué tenant es" es un error, nunca una respuesta.
+- **Límite real, heredado de `auth.claim`**: solo funciona con JWT verificado externamente (`linkc serve --jwt-secret ...`) -- las sesiones PROPIAS de c-script (`auth.createSession`, §3.14) nunca resuelven un claim arbitrario (`SessionStore::claim_for` da `None` para un token de sesión interno, a propósito, ver §3.197). Una colección `@tenant` en un programa que solo usa sesiones internas nunca puede leerse ni escribirse -- siempre 400.
+- **`stream`/`subscribe` NO filtran por tenant**: un suscriptor real-time (§3.16) sigue viendo CADA escritura a la colección, de cualquier tenant -- streaming nunca tuvo ningún filtro por fila, y `@tenant` no le agrega uno en esta ronda. No exponer una colección `@tenant` sensible vía `stream` sin filtrar del lado del cliente, o esperar una ronda futura dedicada a esto.
+- **`linkc db import`/`db export` son admin, no tenant-scoped**: operan con acceso completo a la tabla física, igual que `pg_dump`/una migración a mano -- un `import` tiene que traer el valor del campo `@tenant` explícito por fila (no hay request de la que derivarlo), y un `export` vuelca TODOS los tenants juntos.
+- **No probable desde `test { }`**: un bloque `test` (§3.33) nunca corre con un token de request (`linkc test` no abre ningún socket HTTP), así que cualquier operación sobre una colección `@tenant` dentro de un `test { }` falla con el mismo 400 de "sin tenant resuelto" -- verificar el aislamiento real necesita un `linkc serve` real con un JWT firmado a mano, no un `test { }`.
+
+<!-- linkc:check -->
+```rust
+type Note = {
+  id: Int,
+  @tenant(claim: "orgId") orgId: String,
+  text: String,
+}
+
+db {
+  notes: Note[],
+}
+
+service Notes {
+  // 'orgId' tiene que estar en el literal para que compile (un literal con
+  // nombre se chequea contra su tipo NOMINAL completo primero, mismo motivo
+  // por el que "id" también va explícito pese a estar excluido del shape
+  // insertable) -- pero el runtime SIEMPRE lo autopuebla con el claim
+  // resuelto de la request, así que cualquier valor puesto acá se descarta.
+  rpc add(text: String) -> Note {
+    db.notes.insert(Note { id: 0, orgId: "ignored-by-runtime", text: text })
+  }
+
+  rpc list() -> Note[] {
+    db.notes.all()
+  }
+}
+```
+
+**Verificado**: `compiler/tests/cli_tenant_annotation.rs` (rechazos del checker/parser -- tipo no soportado, campo opcional, `@tenant` repetido en el mismo campo y en más de un campo, junto con `@encrypted`, sobre una variante de enum, `@tenant(...)` con una keyword que no es `claim`, `@tenant(claim: "")` -- y que un literal `insert(Note { id: 0, orgId: "...", text: "..." })` que SÍ menciona el campo `@tenant` tipa igual, aunque el runtime lo ignore por completo, ver el ejemplo abajo) y `compiler/tests/server_http.rs` (`tenant_annotation_isolates_rows_end_to_end_over_a_real_subprocess_with_signed_jwts`: dos tenants con JWTs firmados distintos, cada uno solo ve/cuenta/encuentra sus propias filas, un `applyPatch`/`delete`/`increment` cruzado nunca toca la fila del otro tenant aunque conozca su id exacto, y una request sin token da 400).
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

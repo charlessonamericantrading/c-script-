@@ -1201,3 +1201,145 @@ fn ownership_clause_applies_to_every_role_listed_in_the_same_requires_including_
     server.shutdown();
 }
 
+/// GRAMMAR.md §3.253: `@tenant orgId: String` filtra automáticamente CADA
+/// lectura por el claim JWT `orgId` de la request actual, y autopuebla ese
+/// campo en cada `insert` -- sin escape hatch [decisión del usuario]. El
+/// literal de `insert` igual menciona `orgId` (un literal con nombre se
+/// chequea contra su tipo NOMINAL completo, mismo motivo por el que "id"
+/// también va explícito) pero el runtime lo ignora por completo.
+const TENANT_PROGRAM: &str = r#"
+type Note = {
+  id: Int,
+  @tenant orgId: String,
+  text: String,
+  amount: Int,
+}
+
+db {
+  notes: Note[],
+}
+
+service Notes {
+  rpc add(text: String, amount: Int) -> Note {
+    db.notes.insert(Note { id: 0, orgId: "ignored-by-runtime", text: text, amount: amount })
+  }
+
+  rpc list() -> Note[] {
+    db.notes.all()
+  }
+
+  rpc get(id: Int) -> Note? {
+    db.notes.find(id)
+  }
+
+  rpc count() -> Int {
+    db.notes.count()
+  }
+
+  rpc rename(id: Int, patch: Patch<Note>) -> Note {
+    db.notes.applyPatch(id, patch)
+  }
+
+  rpc bump(id: Int, delta: Int) -> Note {
+    db.notes.increment(id, |n: Note| { n.amount }, delta)
+  }
+
+  rpc remove(id: Int) -> Bool {
+    db.notes.delete(id)
+  }
+}
+"#;
+
+#[test]
+fn tenant_annotation_isolates_rows_end_to_end_over_a_real_subprocess_with_signed_jwts() {
+    let server = ServeProcess::start_with_program_and_args("tenant-isolation", TENANT_PROGRAM, &["--jwt-secret", "shh"]);
+
+    let jwt_a = make_jwt("shh", "HS256", r#"{"orgId":"tenant-a"}"#);
+    let jwt_b = make_jwt("shh", "HS256", r#"{"orgId":"tenant-b"}"#);
+
+    // Sin token: 400 -- "sin tenant resuelto" es un error, nunca una lista
+    // vacía ni una sin filtrar (aislamiento total, sin escape hatch).
+    let (status, body) = server.post("/Notes/list", &json!({}), None);
+    assert_eq!(status, 400, "sin token, una colección @tenant tiene que fallar en vez de dar una lista sin filtrar: {body:?}");
+
+    // Tenant A crea dos notas, tenant B crea una.
+    let (status, note_a1) = server.post("/Notes/add", &json!({"text": "a1", "amount": 10}), Some(&jwt_a));
+    assert_eq!(status, 200, "body: {note_a1:?}");
+    let (status, note_a2) = server.post("/Notes/add", &json!({"text": "a2", "amount": 20}), Some(&jwt_a));
+    assert_eq!(status, 200, "body: {note_a2:?}");
+    let (status, note_b1) = server.post("/Notes/add", &json!({"text": "b1", "amount": 100}), Some(&jwt_b));
+    assert_eq!(status, 200, "body: {note_b1:?}");
+
+    // El runtime autopobló 'orgId' con el claim REAL -- el valor
+    // "ignored-by-runtime" del literal de 'add' nunca llega a la fila.
+    assert_eq!(note_a1["orgId"], "tenant-a", "body: {note_a1:?}");
+    assert_eq!(note_b1["orgId"], "tenant-b", "body: {note_b1:?}");
+
+    let a1_id = note_a1["id"].as_i64().unwrap();
+    let a2_id = note_a2["id"].as_i64().unwrap();
+    let b1_id = note_b1["id"].as_i64().unwrap();
+
+    // list()/count() solo ven las filas del propio tenant.
+    let (status, list_a) = server.post("/Notes/list", &json!({}), Some(&jwt_a));
+    assert_eq!(status, 200, "body: {list_a:?}");
+    assert_eq!(list_a.as_array().unwrap().len(), 2, "tenant A ve sus 2 notas: {list_a:?}");
+    let (status, list_b) = server.post("/Notes/list", &json!({}), Some(&jwt_b));
+    assert_eq!(status, 200, "body: {list_b:?}");
+    assert_eq!(list_b.as_array().unwrap().len(), 1, "tenant B ve solo su 1 nota: {list_b:?}");
+
+    let (status, count_a) = server.post("/Notes/count", &json!({}), Some(&jwt_a));
+    assert_eq!(status, 200, "body: {count_a:?}");
+    assert_eq!(count_a, json!(2));
+
+    // find(id) cruzado: tenant B pidiendo el id de tenant A -- null, NUNCA
+    // la fila ajena (mismo camino que 'all', select_rows con id: Some(_)
+    // también filtra por tenant, a diferencia de @softDelete).
+    let (status, cross_get) = server.post("/Notes/get", &json!({"id": a1_id}), Some(&jwt_b));
+    assert_eq!(status, 200, "body: {cross_get:?}");
+    assert_eq!(cross_get, serde_json::Value::Null, "tenant B no puede leer una fila de tenant A por id directo: {cross_get:?}");
+
+    // find(id) propio: sigue andando normal.
+    let (status, own_get) = server.post("/Notes/get", &json!({"id": b1_id}), Some(&jwt_b));
+    assert_eq!(status, 200, "body: {own_get:?}");
+    assert_eq!(own_get["id"], json!(b1_id));
+
+    // applyPatch cruzado: tenant B intentando renombrar una nota de tenant
+    // A -- nunca 200, y la fila de A queda intacta (el UPDATE en sí lleva
+    // el filtro de tenant, no solo la reconsulta posterior).
+    let (status, cross_patch) = server.post("/Notes/rename", &json!({"id": a1_id, "patch": {"text": "hijacked"}}), Some(&jwt_b));
+    assert_ne!(status, 200, "tenant B no puede renombrar una fila de tenant A: {cross_patch:?}");
+
+    let (status, still_a1) = server.post("/Notes/get", &json!({"id": a1_id}), Some(&jwt_a));
+    assert_eq!(status, 200, "body: {still_a1:?}");
+    assert_eq!(still_a1["text"], "a1", "la fila de A no cambió pese al intento cruzado: {still_a1:?}");
+
+    // increment cruzado: mismo criterio -- nunca toca el 'amount' de la fila ajena.
+    let (status, cross_bump) = server.post("/Notes/bump", &json!({"id": a2_id, "delta": 1000}), Some(&jwt_b));
+    assert_ne!(status, 200, "tenant B no puede incrementar una fila de tenant A: {cross_bump:?}");
+    let (status, still_a2) = server.post("/Notes/get", &json!({"id": a2_id}), Some(&jwt_a));
+    assert_eq!(status, 200, "body: {still_a2:?}");
+    assert_eq!(still_a2["amount"], json!(20), "el amount de A no se movió pese al intento cruzado: {still_a2:?}");
+
+    // Propio increment: sigue andando normal.
+    let (status, own_bump) = server.post("/Notes/bump", &json!({"id": a2_id, "delta": 5}), Some(&jwt_a));
+    assert_eq!(status, 200, "body: {own_bump:?}");
+    assert_eq!(own_bump["amount"], json!(25));
+
+    // delete cruzado: tenant B borrando una fila de tenant A -- false (0
+    // filas afectadas, el DELETE en sí lleva el filtro de tenant), la fila
+    // sigue viva.
+    let (status, cross_delete) = server.post("/Notes/remove", &json!({"id": a1_id}), Some(&jwt_b));
+    assert_eq!(status, 200, "body: {cross_delete:?}");
+    assert_eq!(cross_delete, json!(false), "delete cruzado no borra nada, devuelve false: {cross_delete:?}");
+    let (status, list_a_after) = server.post("/Notes/list", &json!({}), Some(&jwt_a));
+    assert_eq!(status, 200, "body: {list_a_after:?}");
+    assert_eq!(list_a_after.as_array().unwrap().len(), 2, "las 2 notas de A siguen ahí después del intento de borrado cruzado: {list_a_after:?}");
+
+    // Propio delete: sigue andando normal.
+    let (status, own_delete) = server.post("/Notes/remove", &json!({"id": b1_id}), Some(&jwt_b));
+    assert_eq!(status, 200, "body: {own_delete:?}");
+    assert_eq!(own_delete, json!(true));
+
+    server.shutdown();
+}
+

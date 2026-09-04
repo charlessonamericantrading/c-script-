@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.201.0] - 2026-09-04
+
+### ✨ Añadido
+**`@tenant`/`@tenant(claim: "nombre")` -- multi-tenancy declarativo con aislamiento total (PLAN.md §9.21 Fase 4 ítem 12)**: un campo `Int`/`Uuid`/`String` requerido, filtrado automáticamente en TODA lectura (`all`/`find`/`page`/`pageAfter`/`findWhere`/`countWhere`/`count`/`sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy`/`maxRow`/`minRow`/`orderBy`/`select`/`with`) contra el claim JWT de la request actual, sin que el `.link` tenga que escribir el filtro a mano. `insert` autopuebla el campo (excluido del shape insertable, mismo mecanismo que ya excluye `"id"`); `applyPatch`/`updateWhere` ignoran en silencio cualquier intento de reasignarlo; `delete`/`increment`/la reconsulta post-escritura de `insert`/`applyPatch` filtran por tenant en el propio `UPDATE`/`DELETE`, no solo en la relectura -- una fila de otro tenant nunca se muta, ni siquiera cuando el caller conoce su id exacto. Decisión de diseño explícita del usuario: **aislamiento total, sin escape hatch** -- sin tenant resuelto (sin `--jwt-secret`, sin token, claim ausente), la operación falla con 400, nunca una lista vacía o sin filtrar. Límite real heredado de `auth.claim`: solo funciona con JWT verificado externamente, nunca con sesiones internas de c-script. `stream`/`subscribe` y `db import`/`export` quedan fuera del alcance de esta anotación (documentado). Ver GRAMMAR.md §3.253.
+
 ## [1.200.7] - 2026-09-04
 
 ### 🔧 Proceso

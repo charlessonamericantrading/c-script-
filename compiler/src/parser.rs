@@ -740,9 +740,39 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     annotations.push(FieldAnnotation::Ref(target, on_delete));
                 }
+                // `@tenant` o `@tenant(claim: "nombre")` (GRAMMAR.md §3.253 /
+                // PLAN.md §9.21 Fase 4 ítem 12) -- a diferencia de `@ref`
+                // (paréntesis siempre obligatorios), acá son OPCIONALES:
+                // mismo criterio de "default por convención, override
+                // explícito" que otras anotaciones de este lenguaje no
+                // tienen todavía pero que acá hace falta porque la forma
+                // bare necesita saber si hay un `(` antes de decidir si
+                // parsear algo más.
+                "tenant" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::Tenant(..))) {
+                        return Err(self.error("'@tenant' repetido sobre el mismo campo: un campo tiene a lo sumo un claim de tenant".to_string()));
+                    }
+                    let claim = if self.check(&TokenKind::LParen) {
+                        self.advance();
+                        let kw = self.eat_ident()?;
+                        if kw != "claim" {
+                            return Err(self.error(format!("'@tenant(...)' solo acepta 'claim: \"nombre\"' como argumento, no '{kw}'")));
+                        }
+                        self.eat(&TokenKind::Colon)?;
+                        let name = self.eat_string()?;
+                        if name.trim().is_empty() {
+                            return Err(self.error("'@tenant(claim: \"\")': el nombre del claim no puede estar vacío".to_string()));
+                        }
+                        self.eat(&TokenKind::RParen)?;
+                        Some(name)
+                    } else {
+                        None
+                    };
+                    annotations.push(FieldAnnotation::Tenant(claim));
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)', '@encrypted', '@hidden', '@column(\"nombre\")' o '@ref(Coleccion)')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)', '@encrypted', '@hidden', '@column(\"nombre\")', '@ref(Coleccion)' o '@tenant')"
                     )))
                 }
             }

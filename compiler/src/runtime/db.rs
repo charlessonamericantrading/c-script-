@@ -9,6 +9,7 @@
 // mismo espíritu que contract.d.ts/client.ts/validators.ts (todos derivados
 // de la misma fuente de verdad, cero duplicación manual).
 
+use super::session::SessionStore;
 use super::{as_int, encryption, generate_uuid_v4, json_to_typed_value, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
 use crate::ast::{BinaryOp, FieldCheck, Item, OnDelete, Program, TimeGranularity, TypeAnnotation, TypeExpr};
 use crate::checker::Checker;
@@ -353,6 +354,42 @@ pub(crate) struct FkRef {
     pub(crate) target_table: String,
     pub(crate) target_id_col: String,
     pub(crate) on_delete: Option<OnDelete>,
+}
+
+/// El campo `@tenant` de una colección, ya resuelto (GRAMMAR.md §3.253):
+/// su columna SQL física (usa el alias `@column` si existe, mismo criterio
+/// que `FkRef`) y el nombre del claim JWT a pedirle a `auth.claim(...)`.
+#[derive(Clone)]
+pub(crate) struct TenantField {
+    pub(crate) sql_col: String,
+    pub(crate) claim_name: String,
+}
+
+/// Nombre de colección -> `TenantField`, para cada tipo de elemento con un
+/// campo `@tenant(...)` (GRAMMAR.md §3.253) -- mismo cruce
+/// `checker.db_collections()` + `program.items` que `ref_fields_by_collection`,
+/// mismo motivo (la anotación vive en `ast::Field`, no en el `Type` ya
+/// resuelto).
+pub(crate) fn tenant_field_by_collection(program: &Program, checker: &Checker) -> HashMap<String, TenantField> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let TypeExpr::Struct(fields) = &t.ty else { continue };
+            for f in fields {
+                if let Some(claim_name) = f.tenant_claim_name() {
+                    let sql_col = f.column_name().unwrap_or(&f.name).to_string();
+                    result.insert(coll_name.clone(), TenantField { sql_col, claim_name: claim_name.to_string() });
+                    break;
+                }
+            }
+        }
+    }
+    result
 }
 
 /// Nombre de colección -> mapa de `{ columna_sql -> FkRef }` para cada campo
@@ -1293,6 +1330,20 @@ pub struct Db {
     /// necesita en runtime para resolver la colección/columna destino sin
     /// recalcular nada.
     refs: HashMap<String, HashMap<String, FkRef>>,
+    /// Nombre de colección -> `TenantField` (columna SQL + nombre del claim
+    /// JWT) del campo `@tenant`, si esa colección tiene uno (GRAMMAR.md
+    /// §3.253). Ausente del mapa == la colección no tiene `@tenant`, sin
+    /// filtro que aplicar -- comportamiento IDÉNTICO al de antes de esta
+    /// ronda para cualquier programa que no use la anotación.
+    tenant_fields: HashMap<String, TenantField>,
+    /// `Some` solo si `server.rs` lo fijó (`set_sessions`, una vez al
+    /// arrancar) -- `None` en `linkc test`/unit tests/cualquier `Db` que
+    /// nunca pasó por `run_serve`. `@tenant` lo necesita para resolver
+    /// `sessions.claim_for(token, claim)` desde DENTRO de `Db`
+    /// (`tenant_claim_value`, más abajo) -- mismo criterio que `ai_engine`
+    /// (`set_ai_engine`), un recurso que solo existe una vez conocido
+    /// después de construir `Db`.
+    sessions: parking_lot::RwLock<Option<std::sync::Arc<SessionStore>>>,
     /// Suscriptores activos por colección, para push real (GRAMMAR.md
     /// §3.16). `Mutex`, no `RefCell` -- Pilar 1 del roadmap de concurrencia
     /// (26/08/2026): con un hilo por request (`runtime/server.rs`), dos
@@ -1532,6 +1583,14 @@ pub(crate) struct RequestContext {
     /// se guardan tal cual para no perder la capitalización original en caso
     /// de que algo alguna vez necesite mostrarlos.
     pub headers: Vec<(String, String)>,
+    /// GRAMMAR.md §3.253: el bearer token de ESTA request (si vino), para
+    /// que `@tenant` pueda resolver `sessions.claim_for(token, claim)`
+    /// desde DENTRO de `Db` (`tenant_claim_value`, más abajo) -- mismo
+    /// token que `runtime::call_method` ya extrae para `auth.claim(...)`,
+    /// duplicado acá porque `Db` no tiene forma de llamar de vuelta al
+    /// intérprete. `server.rs` lo fija en el mismo lugar que `raw_body`/
+    /// `headers`, antes de cualquier dispatch.
+    pub current_token: Option<String>,
 }
 
 /// Única forma de abrir una conexión NUEVA a PostgreSQL -- usada tanto por
@@ -1874,6 +1933,7 @@ impl Db {
             }
         }
         let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
+        let tenant_fields = tenant_field_by_collection(program, &checker);
         let pool_size = pool_size.unwrap_or(Self::DEFAULT_SQLITE_READER_POOL_SIZE);
 
         Db {
@@ -1884,6 +1944,8 @@ impl Db {
             id_kinds,
             id_columns,
             refs: refs_by_collection,
+            tenant_fields,
+            sessions: parking_lot::RwLock::new(None),
             subscribers: parking_lot::Mutex::new(HashMap::new()),
             pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
             oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
@@ -1970,6 +2032,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
         let checks_by_collection = check_fields_by_collection(program, &checker);
         let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
         let refs_by_collection = ref_fields_by_collection(program, &checker, &aliases_by_collection);
+        let tenant_fields = tenant_field_by_collection(program, &checker);
         let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let empty_type_checks: Vec<String> = Vec::new();
@@ -2125,6 +2188,8 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 id_kinds,
                 id_columns,
                 refs: refs_by_collection,
+                tenant_fields,
+                sessions: parking_lot::RwLock::new(None),
                 subscribers: parking_lot::Mutex::new(HashMap::new()),
                 pending_notify_retries: parking_lot::Mutex::new(std::collections::VecDeque::new()),
                 oversized_notify_drops: parking_lot::Mutex::new(HashMap::new()),
@@ -2271,6 +2336,108 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
     #[cfg(feature = "inference")]
     pub fn ai_engine(&self) -> Option<std::sync::Arc<crate::inference::ServerState>> {
         self.ai_engine.read().clone()
+    }
+
+    /// GRAMMAR.md §3.253: fijado UNA vez al arrancar `linkc serve`
+    /// (`server.rs::run_serve`, justo después de envolver `sessions` en
+    /// `Arc`) -- ver el campo `sessions`, mismo criterio que `set_ai_engine`.
+    pub(crate) fn set_sessions(&self, sessions: std::sync::Arc<SessionStore>) {
+        *self.sessions.write() = Some(sessions);
+    }
+
+    /// GRAMMAR.md §3.253: el valor del claim `claim_name` de la request
+    /// ACTUAL -- mismo mecanismo que `auth.claim(...)` (§3.197), resuelto
+    /// desde DENTRO de `Db` vía el campo `sessions` + el token que
+    /// `CURRENT_REQUEST` ya guarda. `Err` (nunca `Ok(None)`/fila vacía en
+    /// silencio) ante CUALQUIERA de las tres formas de "no hay tenant
+    /// resuelto con certeza" -- `sessions` sin fijar (`linkc test`/un `Db`
+    /// que nunca pasó por `run_serve`), sin token en la request actual, o
+    /// el claim ausente/token inválido -- porque el aislamiento que
+    /// `@tenant` promete es TOTAL, sin excepción [decisión del usuario]:
+    /// una colección `@tenant` sin tenant resuelto no es "ver todo" ni "ver
+    /// nada", es un error.
+    fn tenant_claim_value(&self, claim_name: &str) -> Result<String, RuntimeError> {
+        let sessions_guard = self.sessions.read();
+        let sessions = sessions_guard.as_ref().ok_or_else(|| {
+            RuntimeError::bad_request(format!(
+                "esta colección tiene un campo '@tenant' (claim '{claim_name}') pero no hay contexto de sesión disponible \
+                 acá (GRAMMAR.md §3.253) -- típico de 'linkc test'/un cron/@background sin request HTTP; una colección \
+                 @tenant no es usable fuera de una request autenticada"
+            ))
+        })?;
+        let token = CURRENT_REQUEST.with(|c| c.borrow().as_ref().and_then(|c| c.current_token.clone()));
+        let token = token.ok_or_else(|| {
+            RuntimeError::bad_request(format!(
+                "esta colección tiene un campo '@tenant' (claim '{claim_name}') pero la request actual no trae un token \
+                 -- sin token no hay tenant que resolver (GRAMMAR.md §3.253)"
+            ))
+        })?;
+        sessions.claim_for(&token, claim_name).ok_or_else(|| {
+            RuntimeError::bad_request(format!(
+                "esta colección tiene un campo '@tenant' pero el claim '{claim_name}' no está presente en el token \
+                 actual (o el token no es válido) -- GRAMMAR.md §3.253"
+            ))
+        })
+    }
+
+    /// El `Cell` del tenant ACTUAL para la columna `@tenant` de `collection`
+    /// -- `claim_for` (session.rs) siempre da un `String` (un claim JWT se
+    /// stringifica sin importar su tipo de origen), así que si la columna
+    /// física es `Int` (GRAMMAR.md §3.253 permite `Int`/`Uuid`/`String`)
+    /// hace falta parsearlo de vuelta -- un claim no-numérico contra una
+    /// columna `Int` es un error claro, no un bind que Postgres rechace con
+    /// un mensaje de tipo de cable ilegible para quien escribió el `.link`.
+    fn tenant_cell(&self, collection: &str, tenant: &TenantField) -> Result<Cell, RuntimeError> {
+        let raw = self.tenant_claim_value(&tenant.claim_name)?;
+        let is_int = self
+            .columns
+            .get(collection)
+            .and_then(|cols| cols.iter().find(|c| c.sql_name == tenant.sql_col))
+            .is_some_and(|c| matches!(c.kind(), ColumnKind::Int));
+        if is_int {
+            raw.parse::<i64>().map(Cell::Int).map_err(|_| {
+                RuntimeError::bad_request(format!(
+                    "el claim '{}' del tenant vale '{raw}', que no es un entero válido -- la columna '@tenant' de \
+                     '{collection}' es Int (GRAMMAR.md §3.253)",
+                    tenant.claim_name
+                ))
+            })
+        } else {
+            Ok(Cell::Text(raw))
+        }
+    }
+
+    /// `"<col>" = <placeholder>`, empujando el `Cell` del tenant al FINAL de
+    /// `params` -- el placeholder usa `params.len()` DESPUÉS de empujar, así
+    /// que el orden siempre es correcto en los dos backends (SQLite liga
+    /// por posición en el texto, Postgres por número explícito, y acá
+    /// coinciden porque el `Cell` siempre es el último). `Ok(None)` si
+    /// `collection` no tiene `@tenant` -- cero cambio de comportamiento
+    /// para cualquier programa que no use la anotación.
+    fn tenant_condition(&self, collection: &str, params: &mut Vec<Cell>) -> Result<Option<String>, RuntimeError> {
+        let Some(tenant) = self.tenant_fields.get(collection).cloned() else { return Ok(None) };
+        let cell = self.tenant_cell(collection, &tenant)?;
+        params.push(cell);
+        Ok(Some(format!("\"{}\" = {}", tenant.sql_col, self.backend.placeholder(params.len()))))
+    }
+
+    /// Fragmento `WHERE ...` (con el prefijo, o cadena vacía) combinando
+    /// `@softDelete` y `@tenant` -- reemplaza el idiom repetido
+    /// `soft_delete_where(...).map(|c| format!("WHERE {c} "))...` en cada
+    /// lugar que NO tiene ya un predicado propio (a diferencia de
+    /// `condition_sql_with_params`, que sí lo tiene). El caller SIEMPRE
+    /// tiene que pasar el `params` que de verdad va a bindear (nunca
+    /// `&[]`), aunque hoy no tenga ningún otro valor -- el tenant, si
+    /// corresponde, necesita ese vector.
+    fn base_where(&self, collection: &str, params: &mut Vec<Cell>) -> Result<String, RuntimeError> {
+        let mut conds = Vec::new();
+        if let Some(sd) = self.soft_delete_where(collection) {
+            conds.push(sd);
+        }
+        if let Some(t) = self.tenant_condition(collection, params)? {
+            conds.push(t);
+        }
+        Ok(if conds.is_empty() { String::new() } else { format!("WHERE {} ", conds.join(" AND ")) })
     }
 
     pub(crate) fn set_encryption_key(&self, key: Option<[u8; encryption::KEY_LEN]>) {
@@ -2671,7 +2838,19 @@ db { users: User[] }
                     col_names.push(format!("\"{id_col}\""));
                     params.push(Cell::Text(uuid.clone()));
                 }
+                // GRAMMAR.md §3.253: el campo `@tenant` (si `collection` tiene
+                // uno) tampoco viene en `fields` -- `omit_id_field`
+                // (checker.rs) lo excluyó del tipo insertable, mismo
+                // criterio que "id" -- así que se autopuebla acá con el
+                // claim de la request ACTUAL, nunca con lo que el caller
+                // haya podido mandar.
+                let tenant = self.tenant_fields.get(collection).cloned();
                 for col in columns {
+                    if let Some(t) = tenant.as_ref().filter(|t| t.sql_col == col.sql_name) {
+                        col_names.push(format!("\"{}\"", col.sql_name));
+                        params.push(self.tenant_cell(collection, t)?);
+                        continue;
+                    }
                     let slot = fields.iter().find(|(n, _)| n == &col.field.name).map(|(_, v)| v);
                     col_names.push(format!("\"{}\"", col.sql_name));
                     params.push(self.write_param(col, slot)?);
@@ -2721,19 +2900,36 @@ db { users: User[] }
                 let Value::Struct(patch_fields) = patch else {
                     return Err(RuntimeError::new("applyPatch: el patch debe ser un objeto"));
                 };
+                let tenant = self.tenant_fields.get(collection).cloned();
                 let mut set_clauses = Vec::new();
                 let mut params: Vec<Cell> = Vec::new();
                 for (name, value) in &patch_fields {
                     // "id" nunca es escribible -- mismo criterio que insert,
                     // que también lo excluye de lo que el caller puede fijar.
                     let Some(col) = columns.iter().find(|c| name == &c.field.name) else { continue };
+                    // `@tenant` (GRAMMAR.md §3.253) TAMPOCO: dejar que un
+                    // patch reasigne el campo de tenant sería un escape
+                    // hatch de facto -- movería la fila a OTRO tenant sin
+                    // pasar por el claim resuelto. Se ignora en silencio,
+                    // mismo criterio que "id" arriba.
+                    if tenant.as_ref().is_some_and(|t| t.sql_col == col.sql_name) {
+                        continue;
+                    }
                     set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend.placeholder(params.len() + 1)));
                     params.push(self.write_param(col, Some(value))?);
                 }
                 if !set_clauses.is_empty() {
-                    let id_placeholder = self.backend.placeholder(params.len() + 1);
                     params.push(id_cell.clone());
-                    let sql = format!("UPDATE \"{collection}\" SET {} WHERE \"{id_col}\" = {id_placeholder}", set_clauses.join(", "));
+                    // El WHERE necesita `@tenant` TAMBIÉN -- sin esto el
+                    // UPDATE en sí modificaría la fila de otro tenant (mismo
+                    // motivo que `increment`, arriba: la reconsulta filtrada
+                    // por tenant fallaría DESPUÉS de que el dato ajeno ya
+                    // quedó mutado).
+                    let mut conds = vec![format!("\"{id_col}\" = {}", self.backend.placeholder(params.len()))];
+                    if let Some(t) = self.tenant_condition(collection, &mut params)? {
+                        conds.push(t);
+                    }
+                    let sql = format!("UPDATE \"{collection}\" SET {} WHERE {}", set_clauses.join(", "), conds.join(" AND "));
                     self.backend.execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
                 }
                 // Reconsultar por id, tanto si hubo UPDATE como si el patch
@@ -2764,6 +2960,11 @@ db { users: User[] }
                 // hace falta: encontrar la fila sea cual sea su estado, para
                 // saber si hay algo que borrar y qué publicar si se borra.
                 let existing = self.select_rows(collection, columns, Some(id_cell.clone()))?.into_iter().next();
+                // `@tenant` (GRAMMAR.md §3.253) va en el WHERE de las DOS
+                // ramas -- mismo motivo que `applyPatch`/`increment`: sin
+                // esto, el DELETE/soft-delete en sí modificaría la fila de
+                // otro tenant aunque `existing` (arriba, ya tenant-filtrado)
+                // hubiera dado `None`.
                 let rows_affected = match self.soft_delete_fields.get(collection) {
                     Some(field) => {
                         let soft_col = columns.iter().find(|c| &c.field.name == field).map(|c| c.sql_name.as_str()).unwrap_or(field.as_str());
@@ -2771,16 +2972,23 @@ db { users: User[] }
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
-                        let sql = format!(
-                            "UPDATE \"{collection}\" SET \"{soft_col}\" = {} WHERE \"{id_col}\" = {} AND \"{soft_col}\" IS NULL",
-                            self.backend.placeholder(1),
-                            self.backend.placeholder(2)
-                        );
-                        self.backend.execute(&sql, &[Cell::Int(now_ms), id_cell]).map_err(|e| write_error("delete (soft)", e))?
+                        let mut params = vec![Cell::Int(now_ms), id_cell.clone()];
+                        let mut conds =
+                            vec![format!("\"{id_col}\" = {}", self.backend.placeholder(2)), format!("\"{soft_col}\" IS NULL")];
+                        if let Some(t) = self.tenant_condition(collection, &mut params)? {
+                            conds.push(t);
+                        }
+                        let sql = format!("UPDATE \"{collection}\" SET \"{soft_col}\" = {} WHERE {}", self.backend.placeholder(1), conds.join(" AND "));
+                        self.backend.execute(&sql, &params).map_err(|e| write_error("delete (soft)", e))?
                     }
                     None => {
-                        let sql = format!("DELETE FROM \"{collection}\" WHERE \"{id_col}\" = {}", self.backend.placeholder(1));
-                        self.backend.execute(&sql, &[id_cell]).map_err(|e| write_error("delete", e))?
+                        let mut params = vec![id_cell];
+                        let mut conds = vec![format!("\"{id_col}\" = {}", self.backend.placeholder(1))];
+                        if let Some(t) = self.tenant_condition(collection, &mut params)? {
+                            conds.push(t);
+                        }
+                        let sql = format!("DELETE FROM \"{collection}\" WHERE {}", conds.join(" AND "));
+                        self.backend.execute(&sql, &params).map_err(|e| write_error("delete", e))?
                     }
                 };
                 if rows_affected > 0 {
@@ -2791,11 +2999,12 @@ db { users: User[] }
                 Ok(Value::Bool(rows_affected > 0))
             }
             "count" => {
-                let where_clause = self.soft_delete_where(collection).map(|c| format!(" WHERE {c}")).unwrap_or_default();
-                let sql = format!("SELECT COUNT(*) FROM \"{collection}\"{where_clause}");
+                let mut params: Vec<Cell> = Vec::new();
+                let where_clause = self.base_where(collection, &mut params)?;
+                let sql = format!("SELECT COUNT(*) FROM \"{collection}\" {where_clause}");
                 let rows = self
                     .backend
-                    .query(&sql, &[], &[ColumnKind::Int])
+                    .query(&sql, &params, &[ColumnKind::Int])
                     .map_err(|e| RuntimeError::new(format!("error en count de '{collection}': {e}")))?;
                 match rows.first().and_then(|r| r.first()) {
                     Some(Cell::Int(count)) => Ok(Value::Int(*count)),
@@ -3340,24 +3549,38 @@ db { users: User[] }
     /// simplicidad (ver "Límites honestos", GRAMMAR.md §3.78): una fila
     /// soft-deleteada sigue siendo encontrable por id directo, solo
     /// desaparece de listados (`all`/`page`/`pageAfter`/agregaciones).
+    ///
+    /// `@tenant` (GRAMMAR.md §3.253) es DISTINTO -- se aplica en LAS DOS
+    /// ramas, `id: Some(_)` incluida: la re-consulta de `insert`/
+    /// `applyPatch`/`delete`/`increment` corre bajo el MISMO tenant que
+    /// acaba de escribir la fila (nunca puede fallar por eso), pero un
+    /// `find(id)` de otro tenant ajeno a esa fila SÍ tiene que devolver
+    /// vacío -- el aislamiento es total, sin excepción [decisión del
+    /// usuario], y "encontrable por id directo" de soft-delete no aplica
+    /// acá.
     fn select_rows(&self, collection: &str, columns: &[ColumnPlan], id: Option<Cell>) -> Result<Vec<Value>, RuntimeError> {
         let id_col = self.id_col(collection);
         let mut col_list = vec![format!("\"{id_col}\"")];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
+        let mut params: Vec<Cell> = Vec::new();
         let sql = match id {
-            Some(_) => {
-                format!("SELECT {} FROM \"{collection}\" WHERE \"{id_col}\" = {}", col_list.join(", "), self.backend.placeholder(1))
+            Some(id_cell) => {
+                params.push(id_cell);
+                let mut conds = vec![format!("\"{id_col}\" = {}", self.backend.placeholder(params.len()))];
+                if let Some(t) = self.tenant_condition(collection, &mut params)? {
+                    conds.push(t);
+                }
+                format!("SELECT {} FROM \"{collection}\" WHERE {}", col_list.join(", "), conds.join(" AND "))
             }
-            None => match self.soft_delete_where(collection) {
-                Some(cond) => format!("SELECT {} FROM \"{collection}\" WHERE {cond} ORDER BY \"{id_col}\"", col_list.join(", ")),
-                None => format!("SELECT {} FROM \"{collection}\" ORDER BY \"{id_col}\"", col_list.join(", ")),
-            },
+            None => {
+                let where_clause = self.base_where(collection, &mut params)?;
+                format!("SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{id_col}\"", col_list.join(", "))
+            }
         };
         // El orden de `kinds` es el del SELECT: "id" primero, después las
         // columnas declaradas, en el mismo orden que `columns`.
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
-        let params: Vec<Cell> = id.map(|c| vec![c]).unwrap_or_default();
 
         let rows = self
             .backend
@@ -3372,6 +3595,12 @@ db { users: User[] }
     /// sola consulta en vez de una por fila (evita N+1). Lista vacía de ids
     /// -> lista vacía, sin tocar la base -- mismo caso borde que el
     /// pushdown de `IN` de §3.243 (acá simplemente no hay nada que pedir).
+    ///
+    /// Si la colección RELACIONADA también tiene `@tenant` (GRAMMAR.md
+    /// §3.253), se filtra igual acá -- sin esto, `.with()` podría filtrar
+    /// las filas base por tenant pero traer la fila relacionada de OTRO
+    /// tenant (la FK en sí no sabe de tenants), rompiendo el aislamiento
+    /// total [decisión del usuario].
     fn select_rows_by_ids(&self, collection: &str, columns: &[ColumnPlan], ids: &[Cell]) -> Result<Vec<Value>, RuntimeError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -3380,12 +3609,17 @@ db { users: User[] }
         let mut col_list = vec![format!("\"{id_col}\"")];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
         let placeholders: Vec<String> = (1..=ids.len()).map(|i| self.backend.placeholder(i)).collect();
-        let sql = format!("SELECT {} FROM \"{collection}\" WHERE \"{id_col}\" IN ({})", col_list.join(", "), placeholders.join(", "));
+        let mut params: Vec<Cell> = ids.to_vec();
+        let mut conds = vec![format!("\"{id_col}\" IN ({})", placeholders.join(", "))];
+        if let Some(t) = self.tenant_condition(collection, &mut params)? {
+            conds.push(t);
+        }
+        let sql = format!("SELECT {} FROM \"{collection}\" WHERE {}", col_list.join(", "), conds.join(" AND "));
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
             .backend
-            .query(&sql, ids, &kinds)
+            .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
     }
@@ -3725,30 +3959,42 @@ fn escape_like_wildcards(s: &str) -> String {
         }
     }
 
-    /// Cells bindeables + condición SQL completa (con soft-delete AND-eado
-    /// al final si corresponde) para el árbol que `countWhere`/`findWhere`/
-    /// `upsert` empujan a SQL (GRAMMAR.md §3.95, `==` v1.59.0; §3.108, los
-    /// otros cinco operadores relacionales; §3.109, una conjunción `&&` de
-    /// varias condiciones; §3.170, `||` combinándolas). Compartido entre
-    /// `count_where_conjunction` y `find_where_conjunction` -- la única
-    /// diferencia entre esos dos es qué `SELECT` arman con esta misma
-    /// condición.
-    fn condition_sql_with_params(&self, collection: &str, columns: &[ColumnPlan], expr: &ConditionExpr, cells: &mut Vec<Cell>) -> Option<String> {
-        let cond = self.condition_expr_sql(collection, columns, expr, cells)?;
-        let where_clause = match self.soft_delete_where(collection) {
-            Some(sd) => {
-                let wrapped = if matches!(expr, ConditionExpr::Or(_)) { format!("({cond})") } else { cond };
-                format!("{wrapped} AND {sd}")
-            }
-            None => cond,
-        };
-        Some(where_clause)
+    /// Cells bindeables + condición SQL completa (con soft-delete Y
+    /// `@tenant`, GRAMMAR.md §3.253, AND-eados al final si corresponde)
+    /// para el árbol que `countWhere`/`findWhere`/`upsert`/`updateWhere`
+    /// empujan a SQL (GRAMMAR.md §3.95, `==` v1.59.0; §3.108, los otros
+    /// cinco operadores relacionales; §3.109, una conjunción `&&` de varias
+    /// condiciones; §3.170, `||` combinándolas). Compartido entre
+    /// `count_where_conjunction`, `find_where_conjunction` y
+    /// `update_where_conjunction` -- la única diferencia entre esos tres es
+    /// qué SQL arman con esta misma condición.
+    fn condition_sql_with_params(
+        &self,
+        collection: &str,
+        columns: &[ColumnPlan],
+        expr: &ConditionExpr,
+        cells: &mut Vec<Cell>,
+    ) -> Result<Option<String>, RuntimeError> {
+        let Some(cond) = self.condition_expr_sql(collection, columns, expr, cells) else { return Ok(None) };
+        let mut extra = Vec::new();
+        if let Some(sd) = self.soft_delete_where(collection) {
+            extra.push(sd);
+        }
+        if let Some(t) = self.tenant_condition(collection, cells)? {
+            extra.push(t);
+        }
+        if extra.is_empty() {
+            return Ok(Some(cond));
+        }
+        let wrapped = if matches!(expr, ConditionExpr::Or(_)) { format!("({cond})") } else { cond };
+        extra.insert(0, wrapped);
+        Ok(Some(extra.join(" AND ")))
     }
 
-    fn condition_sql(&self, collection: &str, columns: &[ColumnPlan], expr: &ConditionExpr) -> Option<(String, Vec<Cell>)> {
+    fn condition_sql(&self, collection: &str, columns: &[ColumnPlan], expr: &ConditionExpr) -> Result<Option<(String, Vec<Cell>)>, RuntimeError> {
         let mut cells = Vec::new();
-        let where_clause = self.condition_sql_with_params(collection, columns, expr, &mut cells)?;
-        Some((where_clause, cells))
+        let Some(where_clause) = self.condition_sql_with_params(collection, columns, expr, &mut cells)? else { return Ok(None) };
+        Ok(Some((where_clause, cells)))
     }
 
     /// `db.<c>.updateWhere(predicate, patch)` (GRAMMAR.md §3.245):
@@ -3768,6 +4014,7 @@ fn escape_like_wildcards(s: &str) -> String {
             return Err(RuntimeError::new("updateWhere: el patch debe ser un struct"));
         };
 
+        let tenant = self.tenant_fields.get(collection).cloned();
         let mut set_clauses = Vec::new();
         let mut params: Vec<Cell> = Vec::new();
 
@@ -3778,6 +4025,11 @@ fn escape_like_wildcards(s: &str) -> String {
             let Some(col) = columns.iter().find(|c| &c.field.name == name) else {
                 continue;
             };
+            // `@tenant` (GRAMMAR.md §3.253) tampoco es escribible vía
+            // `updateWhere` -- mismo criterio que `applyPatch`, arriba.
+            if tenant.as_ref().is_some_and(|t| t.sql_col == col.sql_name) {
+                continue;
+            }
             if col.json || col.encrypted {
                 return Ok(None);
             }
@@ -3789,7 +4041,7 @@ fn escape_like_wildcards(s: &str) -> String {
             return Ok(Some(0));
         }
 
-        let Some(where_clause) = self.condition_sql_with_params(collection, columns, conditions, &mut params) else {
+        let Some(where_clause) = self.condition_sql_with_params(collection, columns, conditions, &mut params)? else {
             return Ok(None);
         };
 
@@ -3808,7 +4060,7 @@ fn escape_like_wildcards(s: &str) -> String {
     /// lento en ese caso.
     pub(crate) fn count_where_conjunction(&self, collection: &str, conditions: &ConditionExpr) -> Result<Option<i64>, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
-        let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions) else {
+        let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions)? else {
             return Ok(None);
         };
         let sql = format!("SELECT COUNT(*) FROM \"{collection}\" WHERE {where_clause}");
@@ -3829,7 +4081,7 @@ fn escape_like_wildcards(s: &str) -> String {
     /// `count_where_conjunction`.
     pub(crate) fn find_where_conjunction(&self, collection: &str, conditions: &ConditionExpr) -> Result<Option<Vec<Value>>, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
-        let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions) else {
+        let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions)? else {
             return Ok(None);
         };
         let id_col = self.id_col(collection);
@@ -3858,7 +4110,11 @@ fn escape_like_wildcards(s: &str) -> String {
         let id_col = self.id_col(collection);
         let mut col_list = vec![format!("\"{id_col}\"")];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
-        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        // LIMIT/OFFSET siempre van en placeholder(1)/(2) -- `base_where`
+        // empuja el `Cell` del tenant (si corresponde) DESPUÉS de estos dos,
+        // así que su propio placeholder cae naturalmente en el 3.
+        let mut params = vec![Cell::Int(limit), Cell::Int(offset)];
+        let where_clause = self.base_where(collection, &mut params)?;
         let sql = format!(
             "SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{id_col}\" LIMIT {} OFFSET {}",
             col_list.join(", "),
@@ -3867,7 +4123,6 @@ fn escape_like_wildcards(s: &str) -> String {
         );
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
-        let params = vec![Cell::Int(limit), Cell::Int(offset)];
 
         let rows = self
             .backend
@@ -3893,37 +4148,27 @@ fn escape_like_wildcards(s: &str) -> String {
         let id_col = self.id_col(collection);
         let mut col_list = vec![format!("\"{id_col}\"")];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
-        let soft_delete_cond = self.soft_delete_where(collection);
-        let sql = match (after, &soft_delete_cond) {
-            (Some(_), Some(sd)) => format!(
-                "SELECT {} FROM \"{collection}\" WHERE \"{id_col}\" > {} AND {sd} ORDER BY \"{id_col}\" LIMIT {}",
-                col_list.join(", "),
-                self.backend.placeholder(1),
-                self.backend.placeholder(2)
-            ),
-            (Some(_), None) => format!(
-                "SELECT {} FROM \"{collection}\" WHERE \"{id_col}\" > {} ORDER BY \"{id_col}\" LIMIT {}",
-                col_list.join(", "),
-                self.backend.placeholder(1),
-                self.backend.placeholder(2)
-            ),
-            (None, Some(sd)) => format!(
-                "SELECT {} FROM \"{collection}\" WHERE {sd} ORDER BY \"{id_col}\" LIMIT {}",
-                col_list.join(", "),
-                self.backend.placeholder(1)
-            ),
-            (None, None) => format!(
-                "SELECT {} FROM \"{collection}\" ORDER BY \"{id_col}\" LIMIT {}",
-                col_list.join(", "),
-                self.backend.placeholder(1)
-            ),
-        };
+        let mut params: Vec<Cell> = Vec::new();
+        let mut conds = Vec::new();
+        if let Some(id) = after {
+            params.push(Cell::Int(id));
+            conds.push(format!("\"{id_col}\" > {}", self.backend.placeholder(params.len())));
+        }
+        if let Some(sd) = self.soft_delete_where(collection) {
+            conds.push(sd);
+        }
+        if let Some(t) = self.tenant_condition(collection, &mut params)? {
+            conds.push(t);
+        }
+        let where_clause = if conds.is_empty() { String::new() } else { format!("WHERE {} ", conds.join(" AND ")) };
+        // `limit` siempre va AL FINAL de `params` -- después de `after`
+        // (si corresponde) y del tenant (si corresponde) -- mismo criterio
+        // que el resto de los helpers de esta sección.
+        params.push(Cell::Int(limit));
+        let limit_ph = self.backend.placeholder(params.len());
+        let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{id_col}\" LIMIT {limit_ph}", col_list.join(", "));
         let mut kinds = vec![ColumnKind::Int];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
-        let params: Vec<Cell> = match after {
-            Some(id) => vec![Cell::Int(id), Cell::Int(limit)],
-            None => vec![Cell::Int(limit)],
-        };
 
         let rows = self
             .backend
@@ -4017,13 +4262,14 @@ fn escape_like_wildcards(s: &str) -> String {
             Some(g) => truncate_timestamp_sql(&key_col.sql_name, g, self.backend.is_postgres()),
             None => format!("\"{}\"", key_col.sql_name),
         };
-        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let mut params: Vec<Cell> = Vec::new();
+        let where_clause = self.base_where(collection, &mut params)?;
         let sql =
             format!("SELECT {key_expr} AS \"key\", {value_expr} AS \"value\" FROM \"{collection}\" {where_clause}GROUP BY {key_expr}");
         let kinds = vec![key_col.kind(), value_kind];
         let rows = self
             .backend
-            .query(&sql, &[], &kinds)
+            .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter()
             .map(|cells| {
@@ -4076,10 +4322,11 @@ fn escape_like_wildcards(s: &str) -> String {
     /// `ORDER BY` de la consulta en vez del `"id"` implícito de `select_rows`.
     pub(crate) fn select_all_ordered(&self, collection: &str, order: &[OrderKey]) -> Result<Vec<Value>, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
-        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let mut params: Vec<Cell> = Vec::new();
+        let where_clause = self.base_where(collection, &mut params)?;
         let order_by = self.order_by_sql(collection, columns, order)?;
         let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}{order_by}", self.select_list(collection, columns));
-        self.query_rows(collection, columns, &sql, &[])
+        self.query_rows(collection, columns, &sql, &params)
     }
 
     /// `db.<c>.orderBy(...).page(limit, offset)` (GRAMMAR.md §3.230): como
@@ -4088,7 +4335,8 @@ fn escape_like_wildcards(s: &str) -> String {
     /// exactamente lo que `page` solo, ordenado por id, no podía dar.
     pub(crate) fn select_page_ordered(&self, collection: &str, order: &[OrderKey], limit: i64, offset: i64) -> Result<Vec<Value>, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
-        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let mut params = vec![Cell::Int(limit), Cell::Int(offset)];
+        let where_clause = self.base_where(collection, &mut params)?;
         let order_by = self.order_by_sql(collection, columns, order)?;
         let sql = format!(
             "SELECT {} FROM \"{collection}\" {where_clause}{order_by} LIMIT {} OFFSET {}",
@@ -4096,7 +4344,7 @@ fn escape_like_wildcards(s: &str) -> String {
             self.backend.placeholder(1),
             self.backend.placeholder(2)
         );
-        self.query_rows(collection, columns, &sql, &[Cell::Int(limit), Cell::Int(offset)])
+        self.query_rows(collection, columns, &sql, &params)
     }
 
     /// `db.<c>.orderBy(...).findWhere(...)` (GRAMMAR.md §3.230): como
@@ -4105,7 +4353,7 @@ fn escape_like_wildcards(s: &str) -> String {
     /// memoria sobre `select_all_ordered`, que ya viene ordenado).
     pub(crate) fn find_where_conjunction_ordered(&self, collection: &str, conditions: &ConditionExpr, order: &[OrderKey]) -> Result<Option<Vec<Value>>, RuntimeError> {
         let columns = self.columns.get(collection).ok_or_else(|| RuntimeError::new(format!("colección desconocida: '{collection}'")))?;
-        let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions) else {
+        let Some((where_clause, cells)) = self.condition_sql(collection, columns, conditions)? else {
             return Ok(None);
         };
         let order_by = self.order_by_sql(collection, columns, order)?;
@@ -4141,7 +4389,8 @@ fn escape_like_wildcards(s: &str) -> String {
         let id_column_kind = self.id_column_kind(collection);
         let key = self.encryption_key();
 
-        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let mut params: Vec<Cell> = Vec::new();
+        let where_clause = self.base_where(collection, &mut params)?;
         let order_by = match order {
             Some(ord) => self.order_by_sql(collection, columns, ord)?,
             None => format!("ORDER BY \"{id_col}\""),
@@ -4161,7 +4410,7 @@ fn escape_like_wildcards(s: &str) -> String {
                 let sql = format!("SELECT \"{sql_col}\" FROM \"{collection}\" {where_clause}{order_by}");
                 let rows = self
                     .backend
-                    .query(&sql, &[], &[col_kind])
+                    .query(&sql, &params, &[col_kind])
                     .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
 
                 let mut result = Vec::with_capacity(rows.len());
@@ -4213,7 +4462,7 @@ fn escape_like_wildcards(s: &str) -> String {
                 let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}{order_by}", sql_cols.join(", "));
                 let rows = self
                     .backend
-                    .query(&sql, &[], &kinds)
+                    .query(&sql, &params, &kinds)
                     .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
 
                 let mut result = Vec::with_capacity(rows.len());
@@ -4287,7 +4536,8 @@ fn escape_like_wildcards(s: &str) -> String {
         let id_col = self.id_col(collection);
         let mut col_list = vec![format!("\"{id_col}\"")];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
-        let where_clause = self.soft_delete_where(collection).map(|c| format!("WHERE {c} ")).unwrap_or_default();
+        let mut params: Vec<Cell> = Vec::new();
+        let where_clause = self.base_where(collection, &mut params)?;
         let order = match method {
             "maxRow" => "DESC",
             "minRow" => "ASC",
@@ -4298,7 +4548,7 @@ fn escape_like_wildcards(s: &str) -> String {
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
             .backend
-            .query(&sql, &[], &kinds)
+            .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         match rows.into_iter().next() {
             Some(cells) => self.row_to_fields(collection, &cells, columns).map(Value::Struct),
@@ -4328,14 +4578,20 @@ fn escape_like_wildcards(s: &str) -> String {
         let col = columns.iter().find(|c| c.field.name == field)
             .ok_or_else(|| RuntimeError::new(format!("'increment': '{field}' no es una columna real de '{collection}'")))?;
         let id_col = self.id_col(collection);
-        let sql = format!(
-            "UPDATE \"{collection}\" SET \"{}\" = \"{}\" + {} WHERE \"{id_col}\" = {}",
-            col.sql_name,
-            col.sql_name,
-            self.backend.placeholder(1),
-            self.backend.placeholder(2)
-        );
-        self.backend.execute(&sql, &[Cell::Int(delta), id_cell.clone()]).map_err(|e| write_error("increment", e))?;
+        // `@tenant` (GRAMMAR.md §3.253) tiene que ir en el WHERE del UPDATE
+        // en sí, no solo en la reconsulta de abajo -- sin esto, el UPDATE
+        // modificaría la fila de OTRO tenant igual, y recién la reconsulta
+        // (que sí filtra por tenant) fallaría con "no existe" mientras el
+        // dato ajeno ya quedó mutado. Aislamiento total significa que la
+        // ESCRITURA en sí nunca toca una fila fuera del tenant actual.
+        let mut params = vec![Cell::Int(delta), id_cell.clone()];
+        let mut conds = vec![format!("\"{id_col}\" = {}", self.backend.placeholder(2))];
+        if let Some(t) = self.tenant_condition(collection, &mut params)? {
+            conds.push(t);
+        }
+        let sql =
+            format!("UPDATE \"{collection}\" SET \"{}\" = \"{}\" + {} WHERE {}", col.sql_name, col.sql_name, self.backend.placeholder(1), conds.join(" AND "));
+        self.backend.execute(&sql, &params).map_err(|e| write_error("increment", e))?;
         let updated = self
             .select_rows(collection, columns, Some(id_cell))?
             .into_iter()

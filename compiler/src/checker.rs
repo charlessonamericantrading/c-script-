@@ -1319,7 +1319,8 @@ impl Checker {
                                 .chain(checker.check_field_hidden(fields))
                                 .chain(checker.check_field_checks(fields, &t.type_params))
                                 .chain(checker.check_field_columns(fields, &t.name))
-                                .chain(checker.check_field_refs(fields, &t.type_params, &t.name)),
+                                .chain(checker.check_field_refs(fields, &t.type_params, &t.name))
+                                .chain(checker.check_field_tenant(fields, &t.type_params, &t.name)),
                         );
                     }
                     for e in item_errors {
@@ -1343,6 +1344,7 @@ impl Checker {
                                 .chain(checker.check_field_checks(fields, &en.type_params))
                                 .chain(checker.check_field_columns_enum(fields))
                                 .chain(checker.check_field_refs_enum(fields))
+                                .chain(checker.check_field_tenant_enum(fields))
                             {
                                 let mut e = e;
                                 if let Some(file) = file_for(index) {
@@ -2778,6 +2780,80 @@ impl Checker {
             .filter_map(|f| {
                 if f.ref_target().is_some() {
                     Some(err(format!("'@ref' en el campo '{}': las variantes de enum se guardan como JSON, no son columnas SQL individuales", f.name)).with_span(f.name_span))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// `@tenant`/`@tenant(claim: "...")` (GRAMMAR.md §3.253, PLAN.md §9.21
+    /// Fase 4 ítem 12): a lo sumo UN campo por struct (una colección tiene
+    /// una sola dimensión de tenant, no varias a la vez), tipo `Int`/`Uuid`/
+    /// `String` (los mismos tres que ya sirven de PK -- comparables contra
+    /// el valor de un claim JWT sin ambigüedad), requerido (no opcional: un
+    /// tenant `NULL` nunca matchearía ningún filtro, la fila quedaría
+    /// huérfana para siempre), y nunca `@encrypted` (el ciphertext con
+    /// nonce aleatorio no se puede comparar por igualdad contra el claim en
+    /// texto plano, mismo motivo que `@encrypted` ya es incompatible con
+    /// `@index`/`@unique`).
+    fn check_field_tenant(&self, fields: &[Field], type_params: &[String], struct_name: &str) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        let tenant_fields: Vec<&Field> = fields.iter().filter(|f| f.tenant_claim_name().is_some()).collect();
+        if tenant_fields.len() > 1 {
+            let names: Vec<&str> = tenant_fields.iter().map(|f| f.name.as_str()).collect();
+            errors.push(
+                err(format!(
+                    "'{struct_name}' declara '@tenant' en más de un campo ({}) -- una colección solo puede tener una dimensión de tenant",
+                    names.join(", ")
+                ))
+                .with_span(tenant_fields[1].name_span),
+            );
+        }
+        for f in &tenant_fields {
+            if f.encrypted() {
+                errors.push(
+                    err(format!(
+                        "'@tenant' en el campo '{}': incompatible con '@encrypted' -- el ciphertext (nonce aleatorio) no se puede comparar por igualdad contra el claim en texto plano",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+            }
+            let ty = if type_params.is_empty() { self.resolve_type(&f.ty) } else { self.resolve_type_abstract(&f.ty, type_params) };
+            let ty = match ty {
+                Ok(ty) => ty,
+                Err(e) => {
+                    errors.push(e.with_span(f.name_span));
+                    continue;
+                }
+            };
+            if f.optional || matches!(ty, Type::Optional(_)) {
+                errors.push(
+                    err(format!(
+                        "'@tenant' en el campo '{}': tiene que ser requerido (ni 'x?: T' ni 'T?') -- una fila con este campo en NULL nunca matchearía ningún filtro de tenant, quedaría huérfana para siempre",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+                continue;
+            }
+            if !matches!(ty, Type::Int | Type::Uuid | Type::String) {
+                errors.push(
+                    err(format!("'@tenant' en el campo '{}': tiene que ser Int, Uuid o String -- es {ty}", f.name)).with_span(f.name_span),
+                );
+            }
+        }
+        errors
+    }
+
+    /// `@tenant` solo tiene sentido en structs que representen tablas SQL, nunca en variantes de enum.
+    fn check_field_tenant_enum(&self, fields: &[Field]) -> Vec<CheckError> {
+        fields
+            .iter()
+            .filter_map(|f| {
+                if f.tenant_claim_name().is_some() {
+                    Some(err(format!("'@tenant' en el campo '{}': las variantes de enum se guardan como JSON, no son columnas SQL individuales", f.name)).with_span(f.name_span))
                 } else {
                     None
                 }
@@ -5748,7 +5824,15 @@ impl Checker {
         if !fields.iter().any(|f| f.name == "id") {
             return Err(err("cada colección de 'db' necesita un campo 'id: Int'"));
         }
-        let without_id: Vec<FieldType> = fields.iter().filter(|f| f.name != "id").cloned().collect();
+        // GRAMMAR.md §3.253: el campo `@tenant`, si hay uno, tampoco es
+        // parte del shape insertable -- `Db::call` ("insert") lo
+        // autocompleta con el valor del claim de la request actual, mismo
+        // criterio que ya usa para autogenerar `id: Uuid`/`id: String`
+        // (§3.177/§3.251). Dejar que el caller lo mande permitiría
+        // "insertar en el tenant de otro" con solo poner el valor a mano.
+        let tenant_field = self.tenant_field_name(element_ty);
+        let without_id: Vec<FieldType> =
+            fields.iter().filter(|f| f.name != "id" && Some(&f.name) != tenant_field.as_ref()).cloned().collect();
         Ok(Type::Struct { name: None, fields: without_id })
     }
 
@@ -5864,6 +5948,18 @@ impl Checker {
         let f = fields.iter().find(|f| f.name == field_name)?;
         let (target, on_delete) = f.ref_target()?;
         Some((target.to_string(), on_delete))
+    }
+
+    /// Nombre del campo `@tenant` de `element_ty`, si tiene uno (GRAMMAR.md
+    /// §3.253) -- `check_field_tenant` ya garantizó que hay a lo sumo uno.
+    /// Mismo cruce que `field_ref_target`/`field_is_encrypted`: `element_ty`
+    /// resuelto no conserva anotaciones, hay que volver al `ast::Field`
+    /// original vía `self.types`.
+    fn tenant_field_name(&self, element_ty: &Type) -> Option<String> {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { return None };
+        let decl = self.types.get(type_name)?;
+        let TypeExpr::Struct(fields) = &decl.ty else { return None };
+        fields.iter().find(|f| f.tenant_claim_name().is_some()).map(|f| f.name.clone())
     }
 
     /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.52):

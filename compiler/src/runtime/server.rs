@@ -579,6 +579,11 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     let program = std::sync::Arc::new(program.clone());
     let db = std::sync::Arc::new(db);
     let sessions = std::sync::Arc::new(sessions);
+    // GRAMMAR.md §3.253: `@tenant` necesita resolver `auth.claim(...)`
+    // desde DENTRO de `Db` (`tenant_claim_value`) -- una sola vez acá,
+    // ahora que `sessions` ya está en `Arc` (mismo objeto que cada hilo de
+    // request comparte, `Arc::clone` más abajo).
+    db.set_sessions(std::sync::Arc::clone(&sessions));
     let route_table = std::sync::Arc::new(route_table);
     let rate_limiter = std::sync::Arc::new(parking_lot::Mutex::new(rate_limiter));
     let idempotency_store = std::sync::Arc::new(parking_lot::Mutex::new(idempotency_store));
@@ -943,7 +948,13 @@ fn handle_request(
     // hace falta limpiarlo a mano entre medio.
     let headers: Vec<(String, String)> =
         request.headers().iter().map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string())).collect();
-    db.set_request_context(super::db::RequestContext { raw_body: body.clone(), headers });
+    // GRAMMAR.md §3.253: extraído ACÁ (no solo más abajo, para el auth gate)
+    // para que `@tenant` lo tenga disponible desde el arranque del
+    // dispatch -- `extract_bearer_token` es pura (`&request` sin
+    // consumirlo), así que llamarla de nuevo más abajo para el auth gate
+    // sigue siendo correcto, sin ningún costo real.
+    let current_token = extract_bearer_token(&request);
+    db.set_request_context(super::db::RequestContext { raw_body: body.clone(), headers, current_token });
 
     // `/live` y `/ready` (GRAMMAR.md §3.220, PLAN.md §9.18 Eje E ítem 2):
     // las DOS preguntas que `/health` (§3.87) contesta juntas, separadas
