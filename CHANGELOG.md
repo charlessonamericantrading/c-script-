@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.203.2] - 2026-09-04
+
+### 🔧 Proceso
+**v1.203.1 quedó con CI en rojo** -- el nuevo test de PK compuesta contra Postgres real (`composite_primary_key_supports_the_full_crud_cycle_against_a_real_postgres_table`) leía la PK física con `WHERE i.indrelid = $1::regclass`, bindeando el nombre de la tabla como parámetro -- `&str::ToSql` no acepta el tipo `regclass` que ese cast le pide al protocolo binario (`WrongType { postgres: Regclass, rust: "&str" }`). `COLLECTION` es una constante fija del propio test, nunca input externo, así que se interpola directo en el SQL (`'{COLLECTION}'::regclass`) en vez de bindearse -- sin código de producto nuevo, y los 102 tests restantes de `pg_integration.rs` ya habían pasado en el push anterior, confirmando que solo el test nuevo tenía el bug.
+
 ## [1.203.1] - 2026-09-04
 
 ### 🧪 Tests

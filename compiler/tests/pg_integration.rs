@@ -6085,14 +6085,21 @@ service Orders {{
     assert_eq!(server.rpc("Orders/listLines", "{}").as_array().unwrap().len(), 3);
 
     // La columna física es un PRIMARY KEY COMPUESTO de verdad -- ni BIGSERIAL
-    // ni un solo "id" autoincremento.
+    // ni un solo "id" autoincremento. `COLLECTION` es una constante fija del
+    // propio test (nunca input externo), así que interpolarla directo en el
+    // `::regclass` es seguro -- bindearla como parámetro contra esa posición
+    // no funciona: `&str::ToSql` no acepta el tipo `regclass` que el cast le
+    // pide al protocolo (`WrongType { postgres: Regclass, rust: "&str" }`,
+    // encontrado corriendo esto de verdad contra Postgres real).
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
     let pk_cols: Vec<String> = client
         .query(
-            "SELECT a.attname FROM pg_index i \
-             JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
-             WHERE i.indrelid = $1::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)",
-            &[&COLLECTION],
+            &format!(
+                "SELECT a.attname FROM pg_index i \
+                 JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+                 WHERE i.indrelid = '{COLLECTION}'::regclass AND i.indisprimary ORDER BY array_position(i.indkey, a.attnum)"
+            ),
+            &[],
         )
         .expect("leer la PK física")
         .iter()
