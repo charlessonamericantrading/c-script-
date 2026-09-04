@@ -2307,7 +2307,16 @@ fn introspect_maps_a_text_primary_key_to_id_string_without_warning() {
     let warnings = String::from_utf8_lossy(&output.stderr).to_string();
 
     assert!(generated.contains("id: String,"), "{generated}");
-    assert!(!warnings.contains(COLLECTION), "una PK TEXT ya no debería generar warning: stderr: {warnings}");
+    // `linkc introspect <url>` (sin nombrar una tabla) vuelca TODA la base
+    // compartida de test -- `warnings.contains(COLLECTION)` haría falso
+    // positivo si otra tabla de OTRO test tiene a `COLLECTION` como
+    // substring de su propio nombre (ej. "legacy_orders_bool_pk" contiene
+    // "legacy_orders"); `"- {COLLECTION}:"` matchea el nombre EXACTO como
+    // lo formatea cada línea de advertencia, nunca un prefijo ajeno.
+    assert!(
+        !warnings.contains(&format!("- {COLLECTION}:")),
+        "una PK TEXT ya no debería generar warning para '{COLLECTION}': stderr: {warnings}"
+    );
 }
 
 #[test]

@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.200.7] - 2026-09-04
+
+### 🔧 Proceso
+**v1.200.6 quedó con CI en rojo** -- pero no por `migrate generate`/`apply`: los 5 tests nuevos de esa feature pasaron los dos, de punta a punta contra Postgres real. El fallo fue `introspect_maps_a_text_primary_key_to_id_string_without_warning` (agregado en v1.200.5, dos versiones atrás): su aserción `!warnings.contains(COLLECTION)` (con `COLLECTION = "legacy_orders"`) matcheaba por SUBSTRING contra la tabla `legacy_orders_bool_pk` de otro test corriendo en la misma base compartida de CI -- un falso positivo de "todavía genera warning" que no tenía nada que ver con la tabla propia del test. Corregido a un match exacto `"- {COLLECTION}:"` (el prefijo real de cada línea de advertencia), que ya no puede confundir un nombre de tabla con un prefijo de otro. Sin código de producto nuevo, solo el test tenía una aserción demasiado floja.
+
 ## [1.200.6] - 2026-09-04
 
 ### ✨ Añadido
