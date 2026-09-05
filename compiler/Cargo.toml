@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.208.0"
+version = "1.209.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -42,6 +42,7 @@ runtime = [
     "dep:rust_xlsxwriter",
     "dep:calamine",
     "dep:image",
+    "dep:jsonwebtoken",
 ]
 # GRAMMAR.md §3.233 / PLAN.md §9.20 Eje G: el motor de inferencia de Skynet
 # (Rust puro, cero dependencias externas, vendorizado en `inference/crates/`,
@@ -167,6 +168,23 @@ rust_xlsxwriter = { version = "0.99", optional = true }
 # Love/CRM) citó necesitarlos, mismo criterio que descartó MySQL en
 # §9.12 ítem 8.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"], optional = true }
+# Octava excepción real a "cero dependencias nuevas" (ver `regex`/`flate2`/
+# `aes-gcm`/`pdf-writer`/`rust_xlsxwriter`+`calamine`/`image` arriba,
+# GRAMMAR.md §3.261): firmar un JWT RS256/ES256 exige parsear una clave
+# privada PEM (PKCS#1/PKCS#8/SEC1 -- ASN.1 DER real) y firmar con
+# RSA-PKCS1v15-SHA256 o ECDSA P-256-SHA256 -- la MISMA clase de "protocolo
+# de seguridad real que nunca se hand-rollea" que ya justificó `argon2`/
+# `bcrypt`/`aes-gcm`, con la complejidad extra de parsear ASN.1 DER encima
+# (bastante más que el HMAC ya hand-rolleado en `runtime/session.rs` para
+# HS256, que no necesita parsear ninguna clave -- HMAC usa el secreto tal
+# cual). `jsonwebtoken` (Keats, el firmante/verificador de JWT de facto del
+# ecosistema Rust) -- backend `ring` (v9, sin la opción `rust_crypto` de
+# versiones más nuevas), pero `ring` YA es dependencia transitiva de este
+# proyecto vía `rustls`/`tokio-postgres-rustls` (TLS de Postgres, GRAMMAR.md
+# §3.40) -- esto no suma una clase de dependencia nueva, reusa la que ya
+# está. `default-features = false` + `use_pem` para el parseo de clave PEM
+# sin arrastrar nada más de lo que hace falta.
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"], optional = true }
 # GRAMMAR.md §3.233: el motor de inferencia vendorizado (feature `inference`).
 # `server` es el crate que junta cargador GGUF, cache de modelos residentes y
 # resolución de alias de Ollama; `model-core` trae los traits

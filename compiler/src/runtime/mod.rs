@@ -2584,6 +2584,35 @@ fn aws_sigv4_presigned_url(
     Ok(Value::Str(format!("https://{host}{canonical_uri}?{canonical_query_string}&X-Amz-Signature={signature}")))
 }
 
+/// `crypto.jwtSignRS256`/`crypto.jwtSignES256` (GRAMMAR.md §3.261) --
+/// primitivo genérico compartido por los dos: arma un JWT COMPACTO
+/// completo (header.payload.firma, base64url, listo para usar como
+/// `Authorization: Bearer <token>`) a partir de un payload JSON crudo y una
+/// clave privada PEM. `key_id` (`Some` solo para ES256, que APNs exige
+/// como header `kid`) es la única diferencia de FORMA entre los dos --
+/// FCM (RS256) no necesita `kid` en el header.
+fn sign_jwt_value(
+    builtin_name: &str,
+    payload_json: &str,
+    private_key_pem: &str,
+    algorithm: jsonwebtoken::Algorithm,
+    key_id: Option<&str>,
+) -> Result<Value, RuntimeError> {
+    let claims: serde_json::Value = serde_json::from_str(payload_json)
+        .map_err(|e| err(format!("{builtin_name}: 'payloadJson' no es JSON válido: {e}")))?;
+    let encoding_key = match algorithm {
+        jsonwebtoken::Algorithm::RS256 => jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes()),
+        jsonwebtoken::Algorithm::ES256 => jsonwebtoken::EncodingKey::from_ec_pem(private_key_pem.as_bytes()),
+        _ => unreachable!("sign_jwt_value solo se llama con RS256/ES256, ver los dos call sites"),
+    }
+    .map_err(|e| err(format!("{builtin_name}: 'privateKeyPem' no es una clave PEM válida para {algorithm:?}: {e}")))?;
+    let mut header = jsonwebtoken::Header::new(algorithm);
+    header.kid = key_id.map(str::to_string);
+    let token = jsonwebtoken::encode(&header, &claims, &encoding_key)
+        .map_err(|e| err(format!("{builtin_name}: no se pudo firmar el JWT: {e}")))?;
+    Ok(Value::Str(token))
+}
+
 /// Comparación que no corta en el primer byte distinto: dos secretos se comparan
 /// en tiempo constante para no filtrar, vía la duración, cuánto del valor
 /// esperado adivinó quien está probando.
@@ -3703,6 +3732,20 @@ fn call_method(
                 aws_sigv4_presigned_url(
                     "crypto.awsS3PresignedUploadUrl", "PUT", access_key_id, secret_access_key, region, bucket, object_key, expires_seconds, Some(content_type),
                 )
+            }
+            "jwtSignRS256" => {
+                let (payload_json, private_key_pem) = match (args.first(), args.get(1)) {
+                    (Some(Value::Str(p)), Some(Value::Str(k))) => (p, k),
+                    _ => return Err(err("crypto.jwtSignRS256 requiere dos argumentos String (payloadJson, privateKeyPem)")),
+                };
+                sign_jwt_value("crypto.jwtSignRS256", payload_json, private_key_pem, jsonwebtoken::Algorithm::RS256, None)
+            }
+            "jwtSignES256" => {
+                let (payload_json, private_key_pem, key_id) = match (args.first(), args.get(1), args.get(2)) {
+                    (Some(Value::Str(p)), Some(Value::Str(k)), Some(Value::Str(kid))) => (p, k, kid),
+                    _ => return Err(err("crypto.jwtSignES256 requiere tres argumentos String (payloadJson, privateKeyPem, keyId)")),
+                };
+                sign_jwt_value("crypto.jwtSignES256", payload_json, private_key_pem, jsonwebtoken::Algorithm::ES256, Some(key_id))
             }
             "randomToken" => {
                 let length = match args.first() {
@@ -6937,6 +6980,97 @@ mod tests {
         let signature: String = hmac_sha256_raw(&k_signing, string_to_sign.as_bytes()).unwrap().iter().map(|b| format!("{b:02x}")).collect();
 
         assert_eq!(signature, "b27ccfbfa7df52a200ff74193ca6e32d4b48b8856fab7ebf1c595d0670a7e470", "no matchea el vector oficial de AWS (get-vanilla)");
+    }
+
+    // ---- crypto.jwtSignRS256 / crypto.jwtSignES256 (GRAMMAR.md §3.261) ----
+    //
+    // Las claves de `tests/fixtures/` son un par RSA-2048 y un par EC P-256
+    // generados SOLO para este test (`openssl genrsa`/`ecparam`, nunca
+    // usadas fuera de este repo -- ver `tests/fixtures/README.md`). Además
+    // de este round-trip en Rust, los dos JWT que produce
+    // `crypto.jwtSignRS256`/`ES256` se verificaron una vez, a mano, contra
+    // PyJWT (implementación completamente independiente, Python) durante
+    // el desarrollo -- confirmó las dos firmas válidas Y que un token
+    // manipulado se rechaza, mismo criterio de "otra implementación
+    // confirma el formato" que `excel.build` ya usó con `openpyxl`.
+
+    const TEST_RSA_PRIVATE_PEM: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_rsa_private.pem"));
+    const TEST_RSA_PUBLIC_PEM: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_rsa_public.pem"));
+    const TEST_EC_PRIVATE_PEM: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_ec_private.pem"));
+    const TEST_EC_PUBLIC_PEM: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test_ec_public.pem"));
+
+    #[test]
+    fn jwt_sign_rs256_produces_a_token_verifiable_with_the_public_key() {
+        let Value::Str(token) = sign_jwt_value(
+            "test",
+            r#"{"iss":"fcm-service-account","aud":"https://oauth2.googleapis.com/token","iat":1000,"exp":9999999999}"#,
+            TEST_RSA_PRIVATE_PEM,
+            jsonwebtoken::Algorithm::RS256,
+            None,
+        )
+        .unwrap() else {
+            panic!("sign_jwt_value tiene que devolver Value::Str");
+        };
+        let decoding_key = jsonwebtoken::DecodingKey::from_rsa_pem(TEST_RSA_PUBLIC_PEM.as_bytes()).unwrap();
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+        validation.set_audience(&["https://oauth2.googleapis.com/token"]);
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(&token, &decoding_key, &validation)
+            .expect("un JWT firmado con la clave privada tiene que verificar contra su clave pública");
+        assert_eq!(decoded.claims["iss"], "fcm-service-account");
+        assert_eq!(decoded.header.alg, jsonwebtoken::Algorithm::RS256);
+        assert!(decoded.header.kid.is_none(), "RS256 (FCM) no necesita 'kid' en el header");
+    }
+
+    #[test]
+    fn jwt_sign_es256_sets_the_kid_header_and_is_verifiable_with_the_public_key() {
+        let Value::Str(token) =
+            sign_jwt_value("test", r#"{"iss":"TEAMID1234","iat":1000}"#, TEST_EC_PRIVATE_PEM, jsonwebtoken::Algorithm::ES256, Some("KEYID5678")).unwrap()
+        else {
+            panic!("sign_jwt_value tiene que devolver Value::Str");
+        };
+        let decoding_key = jsonwebtoken::DecodingKey::from_ec_pem(TEST_EC_PUBLIC_PEM.as_bytes()).unwrap();
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+        validation.validate_exp = false; // el payload de este test no lleva 'exp'
+        validation.required_spec_claims.clear(); // por default exige 'exp' PRESENTE, no solo válido
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(&token, &decoding_key, &validation)
+            .expect("un JWT firmado con la clave privada tiene que verificar contra su clave pública");
+        assert_eq!(decoded.claims["iss"], "TEAMID1234");
+        assert_eq!(decoded.header.kid.as_deref(), Some("KEYID5678"), "APNs exige 'kid' en el header ES256");
+    }
+
+    #[test]
+    fn jwt_sign_rejects_invalid_json_payload_cleanly() {
+        let e = sign_jwt_value("crypto.jwtSignRS256", "esto no es JSON", TEST_RSA_PRIVATE_PEM, jsonwebtoken::Algorithm::RS256, None).unwrap_err();
+        assert!(e.message.contains("crypto.jwtSignRS256") && e.message.contains("JSON"), "mensaje inesperado: {}", e.message);
+    }
+
+    #[test]
+    fn jwt_sign_rejects_an_invalid_pem_key_cleanly_not_a_panic() {
+        let e = sign_jwt_value("crypto.jwtSignRS256", "{}", "esto no es una clave PEM", jsonwebtoken::Algorithm::RS256, None).unwrap_err();
+        assert!(e.message.contains("crypto.jwtSignRS256") && e.message.contains("PEM"), "mensaje inesperado: {}", e.message);
+    }
+
+    #[test]
+    fn jwt_sign_rs256_is_reachable_end_to_end_through_a_real_link_program() {
+        // A diferencia del test de arriba (llama a `sign_jwt_value` directo),
+        // este pasa por el pipeline completo: parser -> checker ->
+        // `Expr::FieldAccess` -> `Value::BoundMethod` -> `call_method` --
+        // confirma que `crypto.jwtSignRS256` es alcanzable de verdad desde
+        // un programa real, no solo desde una llamada interna a Rust.
+        let key_literal = TEST_RSA_PRIVATE_PEM.replace('\n', "\\n");
+        let program = program_from(&format!(
+            r#"
+            service Auth {{
+                rpc token() -> String {{
+                    crypto.jwtSignRS256("{{\"iss\":\"test\"}}", "{key_literal}")
+                }}
+            }}
+        "#
+        ));
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "Auth", "token", &json!({}), &db).expect("crypto.jwtSignRS256 tiene que ser alcanzable end-to-end");
+        let token = result.as_str().expect("crypto.jwtSignRS256 devuelve String");
+        assert_eq!(token.split('.').count(), 3, "un JWT compacto tiene 3 partes separadas por '.': {token}");
     }
 
     /// `aws_uri_encode`: los caracteres "sin reservar" (`A-Za-z0-9-._~`)

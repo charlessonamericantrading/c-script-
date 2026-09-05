@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.209.0] - 2026-09-05
+
+### ✨ Añadido
+**`crypto.jwtSignRS256`/`crypto.jwtSignES256` -- notificaciones push FCM/APNs (PLAN.md §9.22 ítem 6)**: primitivos genéricos de firma JWT, no builtins por proveedor -- `crypto.jwtSignRS256(payloadJson, privateKeyPem)` (JWT Bearer Token Flow de FCM, cuenta de servicio de Google) y `crypto.jwtSignES256(payloadJson, privateKeyPem, keyId)` (token de proveedor de APNs, con `kid` en el header). Cada uno devuelve un JWT compacto completo (base64url, listo como `Authorization: Bearer`) -- el resto de cada integración ya funcionaba con `http.postWithHeaders`/`json.parse`/`json.stringify`. `jsonwebtoken` es la octava excepción real a "cero dependencias nuevas" (parsear una clave PEM real y firmar RSA/ECDSA nunca se hand-rollea) -- reusa `ring`, ya transitivo vía `rustls`, sin sumar una clase de dependencia nueva. Requiere clave privada en formato PKCS#8 (`-----BEGIN PRIVATE KEY-----`) para las dos -- una clave EC en formato SEC1 necesita convertirse primero. Verificado con round-trip real (firmar/verificar con un par RSA-2048 y un par EC P-256) y, además, a mano contra PyJWT (implementación independiente). Ver GRAMMAR.md §3.261.
+
 ## [1.208.0] - 2026-09-05
 
 ### ✨ Añadido

@@ -5208,6 +5208,18 @@ impl Checker {
                 self.check_expr(message, &Type::String, env)?;
                 Some(Type::String)
             }
+            // GRAMMAR.md §3.261: primitivos genéricos de firma JWT -- no
+            // "fcm.send"/"apns.send" a medida, mismo criterio que
+            // `crypto.hmacSha256` + `http.postWithHeaders` ya resolviendo
+            // Stripe/Twilio/SendGrid sin builtins por proveedor (§9.9).
+            (Type::Crypto, "jwtSignRS256") => builtin_args!(
+                self, args, env, "crypto.jwtSignRS256",
+                [(payload_json, "payloadJson: String", Type::String), (private_key_pem, "privateKeyPem: String", Type::String)] -> Type::String
+            ),
+            (Type::Crypto, "jwtSignES256") => builtin_args!(
+                self, args, env, "crypto.jwtSignES256",
+                [(payload_json, "payloadJson: String", Type::String), (private_key_pem, "privateKeyPem: String", Type::String), (key_id, "keyId: String", Type::String)] -> Type::String
+            ),
             (Type::Crypto, "awsS3PresignedUrl") => {
                 let [access_key_id, secret_access_key, region, bucket, object_key, expires_seconds] = args else {
                     return Err(err(
@@ -9685,6 +9697,40 @@ type T = { id: Int, s: Status }")
             fn f() -> String {
                 crypto.awsS3PresignedUploadUrl("AKID", "secret", "us-east-1", "bucket", "key.pdf", 3600, 1)
             }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    // ---- crypto.jwtSignRS256 / crypto.jwtSignES256 (GRAMMAR.md §3.261) ----
+
+    #[test]
+    fn jwt_sign_rs256_takes_two_strings_and_returns_string() {
+        let src = r#"
+            fn f(payload: String, key: String) -> String { crypto.jwtSignRS256(payload, key) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn jwt_sign_rs256_rejects_the_wrong_number_of_arguments() {
+        let src = r#"
+            fn f(payload: String) -> String { crypto.jwtSignRS256(payload) }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn jwt_sign_es256_takes_three_strings_and_returns_string() {
+        let src = r#"
+            fn f(payload: String, key: String, keyId: String) -> String { crypto.jwtSignES256(payload, key, keyId) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn jwt_sign_es256_rejects_a_non_string_key_id() {
+        let src = r#"
+            fn f(payload: String, key: String) -> String { crypto.jwtSignES256(payload, key, 123) }
         "#;
         assert!(check_source(src).is_err());
     }

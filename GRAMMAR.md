@@ -9282,6 +9282,65 @@ linkc serve feed.link 8080 --db "postgres://.../primaria" --read-replica-url "po
 
 **Verificado**: tests de checker (`@readReplica` tipa en un rpc/stream de solo lectura, combina con `@authenticated`/`@rate_limit`, rechaza cada uno de los ocho métodos de escritura con un mensaje que nombra el método y la anotación, y el flag de anidamiento se restaura correctamente entre un rpc `@readReplica` y el siguiente rpc normal del mismo programa) + `compiler/tests/cli_read_replica.rs` (fallback a primario sobre SQLite real sin `--read-replica-url`, `--read-replica-url` con primaria SQLite rechazado al arrancar con un mensaje limpio -- nunca un panic --, y un `insert` dentro del cuerpo rechazado por el binario real vía `linkc test`) + `compiler/tests/pg_integration.rs` (`--read-replica-url` abre una conexión Postgres real y separada, confirmada por su propio `application_name` en `pg_stat_activity` -- mismo mecanismo ya probado por `a_dropped_connection_self_heals_without_a_process_restart`, §3.40 --, con un rpc `@readReplica` sirviendo datos correctos a través de ella; y el mismo programa sin el flag configurado sigue funcionando idéntico contra Postgres real). Sin streaming replication real disponible en este entorno de test -- primaria y "réplica" apuntan a la MISMA base en ambos tests, mismo criterio ya aceptado para verificar `@cache`/`@rate_limit` distribuidos.
 
+### 3.261 `crypto.jwtSignRS256`/`crypto.jwtSignES256`: notificaciones push (FCM/APNs) — RESUELTO, cierra el ítem 6 de la hoja de ruta del informe "c-script para Instagram" (PLAN.md §9.22)
+
+Origen: `PLAN.md §9.22` ítem 6. El informe original dejó la promesa condicionada: "plausiblemente el mismo patrón que ya cerró Stripe/SendGrid (`http.postWithHeaders` + Bearer), pero hay que verificar el primitivo de firma exacto que exige cada proveedor... antes de prometerlo cerrado". Verificado antes de escribir código: **NO era el mismo patrón** -- a diferencia de Stripe/SendGrid/Twilio (HMAC-SHA256 o Basic Auth, ya cubiertos por `crypto.hmacSha256`/`base64.encode`, §9.9), FCM exige un JWT firmado RS256 (para pedir un token OAuth2 vía "JWT Bearer Token Flow" contra una cuenta de servicio de Google) y APNs un JWT firmado ES256 (token de proveedor, enviado directo como `Authorization: Bearer`). Ninguno de los dos primitivos de firma existía: `runtime/session.rs` solo sabía firmar/verificar HS256 (§3.64, simétrico -- el mismo secreto firma y verifica), y HS256 no sirve para ninguno de los dos proveedores (los dos exigen un par de claves asimétrico).
+
+**`crypto.jwtSignRS256(payloadJson: String, privateKeyPem: String) -> String` / `crypto.jwtSignES256(payloadJson: String, privateKeyPem: String, keyId: String) -> String`**: primitivos GENÉRICOS, no `fcm.send()`/`apns.send()` a medida -- mismo criterio que cerró Stripe/Twilio/SendGrid sin builtins por proveedor (§9.9): la firma es el único primitivo que faltaba, `http.postWithHeaders` (§3.47) + `json.parse`/`json.stringify` (§3.114) ya alcanzan para el resto de cada integración. Cada uno arma un JWT COMPACTO completo (header + payload + firma, base64url, unidos por `.`) listo para usar tal cual como `Authorization: Bearer <token>` -- el caller nunca toca base64url a mano. `keyId` (solo en la versión ES256) llena el header `kid`, que APNs exige para identificar cuál de las claves de tu cuenta de desarrollador firmó el token; RS256 (FCM) no lleva `kid`.
+
+<!-- linkc:fragment -->
+```rust
+// FCM (HTTP v1): el JWT RS256 se cambia por un access token OAuth2 antes de
+// poder mandar la notificación -- "JWT Bearer Token Flow" estándar de
+// Google, misma forma que ya documenta §3.114 para cualquier OAuth2
+// client-credentials.
+rpc sendPushFcm(projectId: String, deviceToken: String, title: String, body: String, serviceAccountEmail: String, privateKeyPem: String) -> String {
+  let iat = now().toMillis() / 1000;
+  let claims = "{\"iss\":\"" + serviceAccountEmail + "\",\"scope\":\"https://www.googleapis.com/auth/firebase.messaging\",\"aud\":\"https://oauth2.googleapis.com/token\",\"iat\":" + iat.toString() + ",\"exp\":" + (iat + 3600).toString() + "}";
+  let assertion = crypto.jwtSignRS256(claims, privateKeyPem);
+
+  let tokenBody = "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=" + assertion;
+  let tokenResponse = http.postWithHeaders(
+    "https://oauth2.googleapis.com/token",
+    tokenBody,
+    [{ name: "Content-Type", value: "application/x-www-form-urlencoded" }],
+  );
+  let accessToken = json.parse(tokenResponse).access_token;
+
+  let message = "{\"message\":{\"token\":\"" + deviceToken + "\",\"notification\":{\"title\":\"" + title + "\",\"body\":\"" + body + "\"}}}";
+  http.postWithHeaders(
+    "https://fcm.googleapis.com/v1/projects/" + projectId + "/messages:send",
+    message,
+    [{ name: "Authorization", value: "Bearer " + accessToken }, { name: "Content-Type", value: "application/json" }],
+  )
+}
+
+// APNs: el JWT ES256 (token de proveedor) se manda DIRECTO como Bearer en
+// cada request -- sin intercambio previo, a diferencia de FCM. `keyId` es
+// el Key ID de la clave `.p8` descargada del portal de desarrolladores de
+// Apple; `teamId` va en el claim `iss` del payload, no en el header.
+rpc sendPushApns(deviceToken: String, teamId: String, keyId: String, privateKeyPem: String, bundleId: String, body: String) -> String {
+  let iat = now().toMillis() / 1000;
+  let claims = "{\"iss\":\"" + teamId + "\",\"iat\":" + iat.toString() + "}";
+  let providerToken = crypto.jwtSignES256(claims, privateKeyPem, keyId);
+
+  http.postWithHeaders(
+    "https://api.push.apple.com/3/device/" + deviceToken,
+    "{\"aps\":{\"alert\":\"" + body + "\"}}",
+    [
+      { name: "Authorization", value: "Bearer " + providerToken },
+      { name: "apns-topic", value: bundleId },
+    ],
+  )
+}
+```
+
+**Por qué `jsonwebtoken` (Keats) en vez de hand-rollear otro HMAC más: a diferencia de HS256 (ya hand-rolleado en `session.rs` sobre `hmac`/`sha2`, que YA eran dependencias), RS256/ES256 exigen parsear una clave privada PEM real (ASN.1 DER -- PKCS#1/PKCS#8/SEC1) antes de poder firmar nada.** Un parser ASN.1 DER a mano, solo para esto, es exactamente la clase de superficie de bugs silenciosos ("firma técnicamente válida pero el proveedor la rechaza") que ya justificó `argon2`/`bcrypt`/`aes-gcm`: un protocolo de seguridad real nunca se hand-rollea sin una razón de peso, y acá no la hay. Octava excepción real a "cero dependencias nuevas" (ver el comentario en `compiler/Cargo.toml`) -- reusa `ring` como backend de firma, que YA era dependencia transitiva de este proyecto vía `rustls`/TLS de Postgres (§3.40): no suma una clase de dependencia nueva.
+
+**Límite real, no documentado como honesto sino como REQUISITO**: `privateKeyPem` tiene que venir en formato **PKCS#8** (`-----BEGIN PRIVATE KEY-----`) para las dos, RSA y EC -- una clave EC en formato SEC1 (`-----BEGIN EC PRIVATE KEY-----`, lo que `openssl ecparam -genkey` produce por default) no es aceptada, hay que convertirla primero (`openssl pkcs8 -topk8 -nocrypt -in clave.pem -out clave_pkcs8.pem`). Confirmado así contra el binario real durante el desarrollo -- no es una limitación inventada de antemano. La clave `.p8` que Apple da para APNs YA viene en PKCS#8 nativo; una cuenta de servicio de Google para FCM también.
+
+**Verificado**: tests de checker (aridad/tipo de las dos, rechazo de `keyId` no-`String`) + tests de runtime (round-trip real: firmar con la clave PRIVADA de un par RSA-2048/EC P-256 generado para el test y verificar con la clave PÚBLICA vía `jsonwebtoken::decode`, confirmando el algoritmo y que `kid` aparece en ES256 y está ausente en RS256; JSON inválido y PEM inválida dan `RuntimeError` limpio, nunca un panic; alcanzable end-to-end desde un programa real vía `invoke_rpc`) + **verificación manual contra una implementación completamente independiente (PyJWT, Python)**: las dos firmas (RS256 y ES256) verifican correctas contra sus claves públicas, y un token con el payload manipulado un solo byte se rechaza -- mismo criterio que `excel.build` verificado con `openpyxl`. Suite completa sin regresiones.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
