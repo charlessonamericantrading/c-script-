@@ -9182,6 +9182,66 @@ test "una miniatura entra en la caja preservando la relación de aspecto" {
 
 **Verificado**: tests de checker (aridad/tipo de `image.thumbnail`/`image.dimensions`, rechazo de un tamaño no-`Int`, rechazo de un argumento no-`String`) + tests de runtime contra imágenes reales generadas con el mismo crate `image` (no un mock): redimensionado 40x20 dentro de una caja 10x10 da exactamente 10x5 confirmado decodificando el resultado; un JPEG de entrada devuelve un JPEG de salida (firma `0xFFD8`); un GIF de entrada colapsa a PNG estático (firma `\x89PNG`); `image.dimensions` lee 33x17 exacto sin redimensionar; `maxWidth`/`maxHeight` <= 0 da un `RuntimeError` limpio nombrando el problema; bytes que no son una imagen real (pero sí base64 válido) dan un `RuntimeError` limpio, no un panic; base64 inválido da un `RuntimeError` limpio en los dos builtins. Suite completa sin regresiones.
 
+### 3.259 Versionado de contrato -- YA FUNCIONA HOY, sin sintaxis nueva — RESUELTO, cierra el ítem 7 de la hoja de ruta del informe "c-script para Instagram" (PLAN.md §9.22)
+
+El ítem 7 de PLAN.md §9.22 pedía "versionado de API a nivel de contrato -- decisión de diseño propia (¿prefijo de ruta? ¿`@version`? ¿contratos paralelos?)". Antes de diseñar cualquiera de las tres, la pregunta real es qué problema hay que resolver: que un cliente viejo (una app móvil que no puede actualizarse de inmediato) siga funcionando cuando el contrato evoluciona de forma incompatible (un campo renombrado, un `rpc` que cambia de forma). Auditado contra el binario real antes de escribir código nuevo -- y el binario real ya resuelve esto, con las piezas existentes.
+
+**La única forma real de que dos formas de la "misma" operación convivan es que sean dos `rpc`/`service` con nombre DISTINTO -- y eso ya es válido c-script hoy, cero cambios.** Un prefijo de ruta o una anotación `@version` sobre el `rpc` ACTUAL no resuelven nada por sí solos: si `Users.get` cambia de forma, cualquier alias de ruta hacia ESE MISMO `rpc` sigue devolviendo la forma nueva -- la única manera honesta de congelar la forma vieja es que el código de la versión vieja siga existiendo, en un `service`/`rpc` con otro nombre. `@route("...")` (§3.37/§3.42) ya deja que esos dos nombres distintos respondan en URLs prolijas con prefijo de versión -- las dos direcciones (la ruta linda y el `/Service/rpc` de siempre) conviven siempre, sin excluirse.
+
+<!-- linkc:check -->
+```rust
+type UserV1 = { id: Int, name: String }
+type UserV2 = { id: Int, fullName: String, email: String }
+
+db {
+  users: UserV2[],
+}
+
+service UsersV1 {
+  @route("/v1/users/:id")
+  rpc get(id: Int) -> UserV1 {
+    let u = db.users.find(id);
+    match u {
+      v: UserV2 => UserV1 { id: v.id, name: v.fullName },
+      null => UserV1 { id: 0, name: "" },
+    }
+  }
+}
+
+service UsersV2 {
+  @route("/v2/users/:id")
+  rpc get(id: Int) -> UserV2 {
+    let u = db.users.find(id);
+    match u {
+      v: UserV2 => v,
+      null => UserV2 { id: 0, fullName: "", email: "" },
+    }
+  }
+
+  rpc create(fullName: String, email: String) -> UserV2 {
+    db.users.insert(UserV2 { id: 0, fullName: fullName, email: email })
+  }
+}
+
+test "v1 y v2 conviven en el mismo programa, cada uno con su propia forma" {
+  let created = UsersV2.create("Jose Nunez", "jose@example.com");
+  let v2 = UsersV2.get(created.id);
+  assert(v2.fullName == "Jose Nunez", "v2 devuelve el nombre completo");
+
+  let v1 = UsersV1.get(created.id);
+  assert(v1.name == "Jose Nunez", "v1 sigue devolviendo su forma vieja, mapeada desde la misma fila");
+}
+```
+
+**Por qué ninguna de las tres opciones nombradas por el informe agrega algo real por encima de esto**:
+- **Prefijo de ruta**: ya existe (`@route`), y como se explicó arriba, un prefijo por sí solo no congela ninguna forma -- necesita nombres de `service`/`rpc` distintos de todos modos, momento en el cual el prefijo de ruta YA alcanza.
+- **`@version` como anotación nueva**: sería, en el mejor caso, azúcar sintáctica sobre `@route("/v<N>/...")` -- mismo resultado, una palabra clave más que aprender, sin capacidad nueva.
+- **Contratos paralelos** (que el propio compilador tipeche y emita N formas simultáneas de un mismo `rpc`): la opción genuinamente distinta, pero resuelve un problema que no existe -- un `service` versionado como el de arriba YA hace que `linkc build` emita `contract.d.ts`/`client.ts`/`schemas.ts`/`openapi.json` con las dos formas (`UserV1`/`UserV2`) y los dos clientes (`UsersV1Client`/`UsersV2Client`) correctamente, sin ninguna infraestructura de compilación nueva -- son simplemente dos `service` más, como cualquier otro par sin relación.
+
+**El único costo real es la duplicación del cuerpo del `rpc` viejo** (mapear la forma nueva de la base a la forma vieja del contrato, como el `match` de `UsersV1.get` arriba) -- exactamente el mismo costo que pagaría cualquier backend REST versionado en cualquier lenguaje, no algo que c-script pueda evitar sin ocultar el trabajo real de mantener un contrato viejo con vida.
+
+**Verificado de punta a punta contra un `linkc serve` real** (no solo contra el checker): el programa de arriba corriendo de verdad, `POST /UsersV2/create` crea una fila; `GET /v2/users/1` devuelve `{"id":1,"fullName":"...","email":"..."}`; `GET /v1/users/1` devuelve `{"id":1,"name":"..."}` -- la MISMA fila, dos formas de contrato simultáneas, sin ningún cambio de código en el compilador.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

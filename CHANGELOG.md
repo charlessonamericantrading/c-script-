@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.207.0] - 2026-09-05
+
+### 📝 Documentación
+**Versionado de API a nivel de contrato -- ya funciona hoy, sin sintaxis nueva (PLAN.md §9.22 ítem 7)**: de las tres opciones que el informe "c-script para Instagram" había dejado como decisión de diseño pendiente (prefijo de ruta, anotación `@version`, contratos paralelos), ninguna agrega algo real por encima de lo que ya existe -- congelar la forma vieja de un contrato exige un `service`/`rpc` con nombre distinto de todos modos (`UsersV1`/`UsersV2`), y `@route("/v1/...")`/`@route("/v2/...")` (§3.37/§3.42) ya da URLs prolijas versionadas sobre esos dos nombres, con `linkc build` emitiendo ambos contratos/clientes por separado sin ninguna infraestructura nueva. Verificado de punta a punta contra un `linkc serve` real: dos servicios con formas de contrato distintas sobre la misma fila, cada uno en su propia ruta versionada. Cero cambios de compilador. Ver GRAMMAR.md §3.259.
+
 ## [1.206.0] - 2026-09-05
 
 ### ✨ Añadido
