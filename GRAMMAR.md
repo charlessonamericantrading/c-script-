@@ -9133,6 +9133,55 @@ test "search combina title+body con semántica AND" {
 
 **Verificado**: `compiler/tests/cli_searchable_annotation.rs` (rechazos del checker -- campo no-`String`, `@searchable` repetido, incompatible con `@encrypted`, sobre una variante de enum, `search` sin ningún campo `@searchable` declarado, `search` con un argumento no-`String` --, un `test {}` real sobre SQLite confirmando semántica AND entre dos términos y case-insensitivity, y un servidor real sobre SQLite de punta a punta vía HTTP); `compiler/tests/pg_integration.rs` (`search_pushes_down_to_tsvector_and_plainto_tsquery_against_real_postgres`: mismo comportamiento AND contra el operador `@@`/`plainto_tsquery` reales de Postgres).
 
+### 3.258 `image.thumbnail(base64, maxWidth, maxHeight)` / `image.dimensions(base64)` — RESUELTO, cierra el ítem 5 de la hoja de ruta del informe "c-script para Instagram" (PLAN.md §9.22)
+
+Origen: `PLAN.md §9.22` ítem 5, siguiente candidato de la hoja de ruta tras §3.256 (caché distribuido) y §3.257 (búsqueda de texto completo) -- a diferencia de los ítems 1/2/7/8 de esa lista, no necesitaba ninguna decisión de diseño previa del usuario. Sin este primitivo, un feed al estilo Instagram no podía generar miniaturas del lado del servidor: cada imagen subida se serviría en su tamaño original, sin forma de recortar el ancho de banda de un feed que renderiza cientos de fotos chicas.
+
+**`image.thumbnail(base64: String, maxWidth: Int, maxHeight: Int) -> String`**: decodifica una imagen real (JPEG/PNG/GIF/BMP/WebP), la redimensiona para que entre en una caja `maxWidth x maxHeight` preservando la relación de aspecto (nunca recorta, nunca distorsiona -- mismo criterio de "caja delimitadora" que cualquier redimensionado de imagen real), y devuelve el resultado como `String` base64 -- mismo criterio de bytes-como-base64 que `pdf.build`/`excel.build` (§3.201/§3.202), porque este lenguaje no tiene un tipo de bytes nativo. `maxWidth`/`maxHeight` son explícitos, sin default: mismo criterio que `maxAttempts` en `http.postWithRetry` (§3.160), la única decisión que de verdad varía caso a caso (un avatar de perfil no comparte el mismo límite que una miniatura de feed).
+
+**`image.dimensions(base64: String) -> { width: Int, height: Int }`**: ancho/alto reales de la imagen decodificada, sin redimensionar nada -- mismo decode que `thumbnail`, para el caso real de querer guardar las dimensiones originales junto a una foto sin pagar el costo de generar una miniatura que no hace falta. Devuelve un struct ESTRUCTURAL sin nombre reservado (mismo criterio que `http.getWithStatus`, §3.60): cualquier `type` del programa con esos dos campos exactos sirve como destino.
+
+<!-- linkc:check -->
+```rust
+service Media {
+  rpc dimensionsOf(base64: String) -> Int[] {
+    let d = image.dimensions(base64);
+    [d.width, d.height]
+  }
+
+  rpc thumbnailOf(base64: String, maxWidth: Int, maxHeight: Int) -> String {
+    image.thumbnail(base64, maxWidth, maxHeight)
+  }
+}
+
+test "una miniatura entra en la caja preservando la relación de aspecto" {
+  // PNG real de 40x20 -- generado con el mismo crate `image` que decodifica
+  // este bloque, no un fixture inventado a mano.
+  let original = "iVBORw0KGgoAAAANSUhEUgAAACgAAAAUCAIAAABwJOjsAAAAxElEQVR4Ae3AA6AkWZbG8f937o3IzKdyS2Oubdu2bdu2bdu2bWmMnpZKr54yMyLu+Xa3anqmhztr1a/CH3fQQQcddNBBBx100EEHHXTQQQcddNBBBx100EEHHXTQQQcddNBBBx100EEHHXTQQQeVDf47UNngvwOVDf47UNngvwOVDf47UNngvwOVDf47UNngvwOVDf47UNngvwOVDf47UNngvwOVDf47UNngvwOVDf47UNngvwOVDf47UNngvwOVDf478I99VgKancYVZAAAAABJRU5ErkJggg==";
+
+  let originalDims = image.dimensions(original);
+  assert(originalDims.width == 40 && originalDims.height == 20, "la imagen de origen es 40x20");
+
+  let thumb = image.thumbnail(original, 10, 10);
+  let thumbDims = image.dimensions(thumb);
+  assert(thumbDims.width == 10 && thumbDims.height == 5, "40x20 dentro de una caja 10x10 preservando aspecto da 10x5, no 10x10 (distorsionaría)");
+}
+```
+
+**Crate elegida: `image` (image-rs), séptima excepción real a "cero dependencias nuevas"** (ver el comentario en `compiler/Cargo.toml`, mismo criterio que `regex`/`flate2`/`aes-gcm`/`pdf-writer`/`rust_xlsxwriter`+`calamine`): decodificar/redimensionar/codificar JPEG/PNG/GIF/BMP/WebP es el mismo tipo de formato real y complejo (cuantización DCT, filtros de predicción, LZW) que ya justificó las excepciones anteriores. `default-features = false` con solo los cinco códecs que un backend recibe de un cliente/navegador -- todos decodificadores PURO RUST bajo esas features, sin linkear contra libjpeg/libpng/libwebp en C. Formatos pesados o nicho (AVIF, TIFF, HDR, OpenEXR, QOI) quedan deliberadamente afuera -- sin evidencia real de que alguno de los tres proyectos de este ecosistema (MyFinance/Ignis Love/CRM) los necesite, mismo criterio que descartó MySQL en §9.12 ítem 8.
+
+**Reescribe en el mismo formato detectado, salvo GIF/WebP que colapsan a PNG.** JPEG/PNG/BMP de entrada mantienen su formato de salida -- cambiar el formato sin que nadie lo pida sería una sorpresa no pedida (y para PNG, perder el canal alfa). GIF/WebP colapsan a PNG estático: como esta ronda no anima nada (ver el límite de abajo), solo el primer frame sobrevive de todos modos, así que reescribir un GIF/WebP "animado" de un solo frame sería más confuso que un PNG sin pérdida, que es lo que en la práctica ya es el resultado. JPEG de salida convierte a RGB8 antes de codificar -- JPEG no tiene canal alfa, y el encoder de `image` rechaza escribir uno con transparencia directo.
+
+**Filtro de resize fijo (Lanczos3, buena calidad a costo razonable) -- sin parámetro de configuración**, mismo criterio que la página A4/márgenes fijos de `pdf.build` (§3.201): una decisión sensata tomada una vez, no una superficie de configuración nueva sin evidencia de que haga falta.
+
+**Límites honestos, deliberados**:
+- **Sin orientación EXIF**: una foto de celular en portrait con la bandera EXIF de rotación puede salir "acostada" -- `image` no la aplica sola, y corregirla necesitaría leer el bloque EXIF además de decodificar los píxeles. Fuera de alcance de v1, sin evidencia real todavía de que haga falta.
+- **Un GIF/WebP animado pierde su animación**: solo el primer frame sobrevive, reescrito como PNG estático (ver arriba). Generar una miniatura animada es un problema de codificación de video, no de miniaturas -- explícitamente fuera de alcance, mismo criterio que descartó transcodificación de video en la introducción de PLAN.md §9.22.
+- **`maxWidth`/`maxHeight` no distinguen agrandar de achicar**: una imagen más chica que la caja pedida se agranda igual que una más grande se achica -- sin un caso real que pida "solo achicar, nunca agrandar" todavía.
+- **Sin recorte (crop) ni relleno (pad) a un tamaño EXACTO**: `image.thumbnail` siempre preserva la relación de aspecto original -- para un avatar cuadrado forzado, hoy no hay primitivo (mismo alcance acotado que el resto de esta ronda).
+
+**Verificado**: tests de checker (aridad/tipo de `image.thumbnail`/`image.dimensions`, rechazo de un tamaño no-`Int`, rechazo de un argumento no-`String`) + tests de runtime contra imágenes reales generadas con el mismo crate `image` (no un mock): redimensionado 40x20 dentro de una caja 10x10 da exactamente 10x5 confirmado decodificando el resultado; un JPEG de entrada devuelve un JPEG de salida (firma `0xFFD8`); un GIF de entrada colapsa a PNG estático (firma `\x89PNG`); `image.dimensions` lee 33x17 exacto sin redimensionar; `maxWidth`/`maxHeight` <= 0 da un `RuntimeError` limpio nombrando el problema; bytes que no son una imagen real (pero sí base64 válido) dan un `RuntimeError` limpio, no un panic; base64 inválido da un `RuntimeError` limpio en los dos builtins. Suite completa sin regresiones.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

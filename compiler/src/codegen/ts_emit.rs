@@ -1623,7 +1623,7 @@ pub(crate) fn render_type(ty: &Type) -> String {
             .collect::<Vec<_>>()
             .join(" | "),
         // `db`/`db.<coleccion>`/`auth`/`Service`/`math`/`crypto`/`http`/`json`/`base64` son internos del checker
-        Type::Db | Type::DbCollection(_) | Type::DbQuery(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Pdf | Type::Excel | Type::Ai | Type::Mcp | Type::Env | Type::Request | Type::Smtp | Type::Response => {
+        Type::Db | Type::DbCollection(_) | Type::DbQuery(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Pdf | Type::Excel | Type::Ai | Type::Mcp | Type::Image | Type::Env | Type::Request | Type::Smtp | Type::Response => {
             unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64/Pdf/Excel/Mcp nunca aparece en un TypeExpr real")
         }
     }
@@ -1688,7 +1688,7 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
             }
         }
         Type::Int | Type::Int64 | Type::Decimal | Type::Timestamp | Type::Float | Type::String | Type::Uuid | Type::Vector(_) | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
-        Type::Db | Type::DbCollection(_) | Type::DbQuery(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Pdf | Type::Excel | Type::Ai | Type::Mcp | Type::Env | Type::Request | Type::Smtp | Type::Response => {
+        Type::Db | Type::DbCollection(_) | Type::DbQuery(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Pdf | Type::Excel | Type::Ai | Type::Mcp | Type::Image | Type::Env | Type::Request | Type::Smtp | Type::Response => {
             unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64/Pdf/Excel/Mcp nunca aparece en un TypeExpr real")
         }
     }

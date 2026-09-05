@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.205.0"
+version = "1.206.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -41,6 +41,7 @@ runtime = [
     "dep:pdf-writer",
     "dep:rust_xlsxwriter",
     "dep:calamine",
+    "dep:image",
 ]
 # GRAMMAR.md §3.233 / PLAN.md §9.20 Eje G: el motor de inferencia de Skynet
 # (Rust puro, cero dependencias externas, vendorizado en `inference/crates/`,
@@ -146,6 +147,26 @@ pdf-writer = { version = "0.15", optional = true }
 # contra el mismo criterio de licencia/mantenimiento/tamaño de árbol que
 # las excepciones anteriores.
 rust_xlsxwriter = { version = "0.99", optional = true }
+# Séptima excepción real a "cero dependencias nuevas" (ver `regex`/`flate2`/
+# `aes-gcm`/`pdf-writer`/`rust_xlsxwriter`+`calamine` arriba, GRAMMAR.md
+# §3.258): decodificar/redimensionar/codificar JPEG/PNG/GIF/BMP/WebP es el
+# mismo tipo de formato real y complejo (cuantización DCT, filtros de
+# predicción, LZW/deflate) que ya justificó las excepciones anteriores --
+# ningún subconjunto hand-rolleado de "solo lo que un thumbnail necesita"
+# sería honesto. `image` (image-rs, el decodificador de facto del
+# ecosistema Rust: usado por `resvg`/`usvg` de Typst, `photon`, etc.) --
+# MIT/Apache-2.0, activamente mantenida. `default-features = false` +
+# solo los 5 códecs que un backend real recibe de un cliente/navegador
+# (`jpeg`/`png`/`gif`/`bmp`/`webp`) -- todos decodificadores PURO RUST bajo
+# esas features (ninguno linkea contra libjpeg/libpng/libwebp en C), así
+# que esto no reintroduce la clase de dependencia C que `rusqlite`
+# (`bundled`) ya es la única excepción conocida a "sin tooling nuevo que
+# instalar". Formatos pesados/nicho (avif -- necesita un decodificador AV1
+# entero, tiff, dds, hdr, openexr, qoi) deliberadamente AFUERA -- ninguno
+# de los tres proyectos reales de este ecosistema (MyFinance/Ignis
+# Love/CRM) citó necesitarlos, mismo criterio que descartó MySQL en
+# §9.12 ítem 8.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"], optional = true }
 # GRAMMAR.md §3.233: el motor de inferencia vendorizado (feature `inference`).
 # `server` es el crate que junta cargador GGUF, cache de modelos residentes y
 # resolución de alias de Ollama; `model-core` trae los traits

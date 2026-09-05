@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.206.0] - 2026-09-05
+
+### ✨ Añadido
+**`image.thumbnail(base64, maxWidth, maxHeight)` / `image.dimensions(base64)` -- miniaturas reales de imagen (PLAN.md §9.22 ítem 5, cierra el tercer ítem de la hoja de ruta del informe "c-script para Instagram")**: `image.thumbnail` decodifica JPEG/PNG/GIF/BMP/WebP, redimensiona para que entre en una caja `maxWidth x maxHeight` preservando relación de aspecto (nunca recorta, nunca distorsiona; filtro Lanczos3 fijo) y devuelve el resultado como `String` base64, mismo criterio de bytes-como-base64 que `pdf.build`/`excel.build`. `image.dimensions` lee ancho/alto reales sin redimensionar, devuelto como struct estructural `{ width: Int, height: Int }` (mismo criterio que `http.getWithStatus`). JPEG/PNG/BMP de entrada preservan su formato de salida; GIF/WebP colapsan a PNG estático (solo el primer frame sobrevive). `image` (image-rs) es la séptima excepción real a "cero dependencias nuevas" -- `default-features = false` con solo los 5 códecs que un backend recibe de un cliente/navegador, todos decodificadores puro Rust. Sin orientación EXIF, sin animación de salida, sin crop/pad a tamaño exacto -- límites honestos documentados. Ver GRAMMAR.md §3.258.
+
 ## [1.205.0] - 2026-09-05
 
 ### ✨ Añadido

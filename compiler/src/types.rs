@@ -181,6 +181,11 @@ pub enum Type {
     /// Tipo interno para el módulo `mcp` builtin (GRAMMAR.md §3.203) --
     /// `mcp.sample`, streaming bidireccional real de MCP.
     Mcp,
+    /// Tipo interno para el módulo `image` builtin (GRAMMAR.md §3.258) --
+    /// `image.thumbnail`/`image.dimensions` sobre bytes de imagen real
+    /// (JPEG/PNG/GIF/BMP/WebP), mismo criterio de bytes-como-base64-String
+    /// que `pdf`/`excel`.
+    Image,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -267,6 +272,7 @@ impl std::fmt::Display for Type {
             Type::Excel => write!(f, "excel"),
             Type::Ai => write!(f, "ai"),
             Type::Mcp => write!(f, "mcp"),
+            Type::Image => write!(f, "image"),
         }
     }
 }

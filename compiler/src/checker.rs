@@ -120,6 +120,19 @@ fn http_response_type() -> Type {
     }
 }
 
+/// Lo que `image.dimensions` (GRAMMAR.md §3.258) devuelve -- mismo criterio
+/// estructural sin nombre que `http_response_type`: cualquier `type` del
+/// programa con estos dos campos exactos sirve como destino.
+fn image_dimensions_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "width".to_string(), optional: false, ty: Type::Int },
+            FieldType { name: "height".to_string(), optional: false, ty: Type::Int },
+        ],
+    }
+}
+
 /// El tipo que `sitemapXml(urls)` (GRAMMAR.md §3.116) espera para cada
 /// entrada -- mismo criterio estructural sin nombre que `http_header_type`.
 /// `lastmod` opcional: la mayoría de las URLs de un sitio real no tienen
@@ -4398,6 +4411,9 @@ impl Checker {
                 if name == "mcp" {
                     return Ok(Type::Mcp);
                 }
+                if name == "image" {
+                    return Ok(Type::Image);
+                }
                 if name == "env" {
                     return Ok(Type::Env);
                 }
@@ -5460,6 +5476,19 @@ impl Checker {
             (Type::Excel, "parse") => builtin_args!(
                 self, args, env, "excel.parse",
                 [(base64, "base64: String", Type::String)] -> Type::List(Box::new(excel_sheet_struct_type()))
+            ),
+            // GRAMMAR.md §3.258: `maxWidth`/`maxHeight` son explícitos, sin
+            // default -- mismo criterio que `maxAttempts` en
+            // `http.postWithRetry` (§3.160), la única decisión que de verdad
+            // varía caso a caso (un avatar de perfil vs. una miniatura de
+            // feed no comparten el mismo límite).
+            (Type::Image, "thumbnail") => builtin_args!(
+                self, args, env, "image.thumbnail",
+                [(base64, "base64: String", Type::String), (max_width, "maxWidth: Int", Type::Int), (max_height, "maxHeight: Int", Type::Int)] -> Type::String
+            ),
+            (Type::Image, "dimensions") => builtin_args!(
+                self, args, env, "image.dimensions",
+                [(base64, "base64: String", Type::String)] -> image_dimensions_type()
             ),
             // GRAMMAR.md §3.235: inferencia local. `maxTokens` es explícito a
             // propósito -- el techo de tokens es la decisión de costo más
@@ -10441,6 +10470,51 @@ type T = { id: Int, s: Status }")
         let src = r#"
             type NoEsUnaHoja = { titulo: String }
             fn f(x: NoEsUnaHoja[]) -> String { excel.build(x) }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    // ---- image.thumbnail / image.dimensions (GRAMMAR.md §3.258) ----
+
+    #[test]
+    fn image_thumbnail_takes_base64_and_two_ints_and_returns_string() {
+        let src = r#"
+            fn make(b64: String) -> String { image.thumbnail(b64, 200, 200) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn image_thumbnail_rejects_zero_arguments() {
+        let src = r#"
+            fn f() -> String { image.thumbnail() }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn image_thumbnail_rejects_a_non_int_size_argument() {
+        let src = r#"
+            fn f(b64: String) -> String { image.thumbnail(b64, "200", 200) }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn image_dimensions_takes_base64_and_returns_a_width_height_struct() {
+        let src = r#"
+            fn f(b64: String) -> Int {
+                let d = image.dimensions(b64);
+                d.width + d.height
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn image_dimensions_rejects_a_non_string_argument() {
+        let src = r#"
+            fn f() -> Int { image.dimensions(123).width }
         "#;
         assert!(check_source(src).is_err());
     }

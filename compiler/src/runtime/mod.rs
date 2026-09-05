@@ -11,6 +11,7 @@ pub(crate) mod pdf;
 pub mod server;
 pub mod session;
 pub(crate) mod store;
+pub(crate) mod thumbnail;
 pub(crate) mod timestamp;
 
 use crate::ast::*;
@@ -120,6 +121,8 @@ pub enum Value {
     Ai,
     /// Marcador interno para el módulo `mcp` (GRAMMAR.md §3.203)
     Mcp,
+    /// Marcador interno para el módulo `image` (GRAMMAR.md §3.258)
+    Image,
     /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
     Env,
     /// Marcador interno para el módulo `request` (GRAMMAR.md §3.38) -- body
@@ -186,6 +189,7 @@ fn supports_bound_method_access(v: &Value) -> bool {
         | Value::Excel
         | Value::Ai
         | Value::Mcp
+        | Value::Image
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -237,6 +241,7 @@ fn is_marker_singleton(v: &Value) -> bool {
         | Value::Excel
         | Value::Ai
         | Value::Mcp
+        | Value::Image
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -339,6 +344,7 @@ impl std::fmt::Debug for Value {
             Value::Excel => write!(f, "Excel"),
             Value::Ai => write!(f, "Ai"),
             Value::Mcp => write!(f, "Mcp"),
+            Value::Image => write!(f, "Image"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
             Value::Smtp => write!(f, "Smtp"),
@@ -574,6 +580,9 @@ pub(crate) fn eval_expr(
             }
             if name == "mcp" {
                 return Ok(Value::Mcp);
+            }
+            if name == "image" {
+                return Ok(Value::Image);
             }
             if name == "env" {
                 return Ok(Value::Env);
@@ -4059,6 +4068,36 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre excel: '{other}'"))),
         },
+        Value::Image => match method {
+            "thumbnail" => {
+                let mut it = args.into_iter();
+                let b64 = match it.next() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("image.thumbnail requiere un primer argumento String (base64)")),
+                };
+                let max_width = as_int(&it.next().ok_or_else(|| err("image.thumbnail requiere 3 argumentos (base64, maxWidth, maxHeight)"))?)?;
+                let max_height = as_int(&it.next().ok_or_else(|| err("image.thumbnail requiere 3 argumentos (base64, maxWidth, maxHeight)"))?)?;
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64.as_bytes())
+                    .map_err(|e| err(format!("image.thumbnail: el argumento no es base64 válido: {e}")))?;
+                let out = thumbnail::thumbnail(&bytes, max_width, max_height).map_err(err)?;
+                Ok(Value::Str(base64::engine::general_purpose::STANDARD.encode(out)))
+            }
+            "dimensions" => {
+                let b64 = match args.into_iter().next() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("image.dimensions requiere un argumento String (base64)")),
+                };
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64.as_bytes())
+                    .map_err(|e| err(format!("image.dimensions: el argumento no es base64 válido: {e}")))?;
+                let (width, height) = thumbnail::dimensions(&bytes).map_err(err)?;
+                Ok(Value::Struct(vec![("width".to_string(), Value::Int(width as i64)), ("height".to_string(), Value::Int(height as i64))]))
+            }
+            other => Err(err(format!("método desconocido sobre image: '{other}'"))),
+        },
         Value::Mcp => match method {
             "sample" => {
                 let prompt = match args.into_iter().next() {
@@ -5631,7 +5670,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Image | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
@@ -9896,6 +9935,146 @@ mod tests {
         assert!(e.message.contains("excel.parse"), "mensaje inesperado: {}", e.message);
     }
 
+    // ---- image.thumbnail / image.dimensions (GRAMMAR.md §3.258) ----
+
+    /// Codifica una imagen `w x h` sólida (un solo color) a bytes reales del
+    /// `format` pedido -- construida con el MISMO crate `image` que el
+    /// runtime usa para decodificar, así que estos tests ejercitan el camino
+    /// real de decode+resize+encode contra un insumo real, no un mock ni un
+    /// fixture binario pegado a mano.
+    fn encode_test_image(w: u32, h: u32, format: image::ImageFormat) -> String {
+        let img = image::RgbImage::from_fn(w, h, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 128]));
+        let dynamic = image::DynamicImage::ImageRgb8(img);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        dynamic.write_to(&mut buf, format).expect("encode_test_image: el fixture de test tiene que codificar limpio");
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(buf.into_inner())
+    }
+
+    #[test]
+    fn image_thumbnail_resizes_a_real_png_preserving_aspect_ratio() {
+        let b64 = encode_test_image(40, 20, image::ImageFormat::Png);
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make(b64: String) -> String { image.thumbnail(b64, 10, 10) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let out_b64 = invoke_rpc(&program, "Docs", "make", &json!({"b64": b64}), &db).expect("image.thumbnail tiene que generar una miniatura real");
+        let out_b64 = out_b64.as_str().unwrap();
+        use base64::Engine;
+        let out_bytes = base64::engine::general_purpose::STANDARD.decode(out_b64).expect("image.thumbnail tiene que devolver base64 válido");
+        assert!(out_bytes.starts_with(&[0x89, b'P', b'N', b'G']), "un PNG real arranca con la firma \\x89PNG");
+        let out_img = image::load_from_memory(&out_bytes).expect("el resultado tiene que decodificar como imagen real");
+        use image::GenericImageView;
+        assert_eq!(out_img.dimensions(), (10, 5), "40x20 dentro de una caja 10x10 preservando aspecto da 10x5, se obtuvo {:?}", out_img.dimensions());
+    }
+
+    #[test]
+    fn image_thumbnail_preserves_jpeg_format_on_a_jpeg_input() {
+        let b64 = encode_test_image(30, 30, image::ImageFormat::Jpeg);
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make(b64: String) -> String { image.thumbnail(b64, 10, 10) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let out_b64 = invoke_rpc(&program, "Docs", "make", &json!({"b64": b64}), &db).expect("image.thumbnail tiene que generar una miniatura real");
+        use base64::Engine;
+        let out_bytes = base64::engine::general_purpose::STANDARD.decode(out_b64.as_str().unwrap()).unwrap();
+        assert!(out_bytes.starts_with(&[0xFF, 0xD8]), "un JPEG real arranca con la firma 0xFFD8, un JPEG de entrada no debería reescribirse como PNG");
+    }
+
+    #[test]
+    fn image_thumbnail_collapses_an_animated_format_like_gif_to_static_png() {
+        // GRAMMAR.md §3.258: GIF/WebP colapsan a PNG (ver
+        // `thumbnail::output_format_for`) -- este test confirma el
+        // comportamiento documentado contra el binario real, no solo la
+        // intención del comentario.
+        let b64 = encode_test_image(16, 16, image::ImageFormat::Gif);
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make(b64: String) -> String { image.thumbnail(b64, 8, 8) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let out_b64 = invoke_rpc(&program, "Docs", "make", &json!({"b64": b64}), &db).expect("image.thumbnail tiene que generar una miniatura real");
+        use base64::Engine;
+        let out_bytes = base64::engine::general_purpose::STANDARD.decode(out_b64.as_str().unwrap()).unwrap();
+        assert!(out_bytes.starts_with(&[0x89, b'P', b'N', b'G']), "un GIF de entrada tiene que colapsar a PNG estático, no a GIF");
+    }
+
+    #[test]
+    fn image_dimensions_reads_width_and_height_without_resizing() {
+        let b64 = encode_test_image(33, 17, image::ImageFormat::Png);
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make(b64: String) -> Int[] {
+                    let d = image.dimensions(b64);
+                    [d.width, d.height]
+                }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let result = invoke_rpc(&program, "Docs", "make", &json!({"b64": b64}), &db).expect("image.dimensions tiene que leer las dimensiones reales");
+        assert_eq!(result, json!([33, 17]));
+    }
+
+    #[test]
+    fn image_thumbnail_rejects_a_non_positive_size_cleanly() {
+        let b64 = encode_test_image(10, 10, image::ImageFormat::Png);
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make(b64: String) -> String { image.thumbnail(b64, 0, 10) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "Docs", "make", &json!({"b64": b64}), &db).unwrap_err();
+        assert!(e.message.contains("image.thumbnail"), "mensaje inesperado: {}", e.message);
+        assert!(e.message.contains("mayores a 0"), "mensaje inesperado: {}", e.message);
+    }
+
+    #[test]
+    fn image_thumbnail_on_bytes_that_are_not_a_real_image_is_a_clean_runtime_error_not_a_panic() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make(b64: String) -> String { image.thumbnail(b64, 10, 10) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        // Base64 válido, pero el contenido decodificado no es una imagen real.
+        let not_an_image_b64 = "aG9sYSBtdW5kbw==";
+        let e = invoke_rpc(&program, "Docs", "make", &json!({"b64": not_an_image_b64}), &db).unwrap_err();
+        assert!(e.message.contains("image.thumbnail"), "mensaje inesperado: {}", e.message);
+    }
+
+    #[test]
+    fn image_dimensions_on_invalid_base64_is_a_clean_runtime_error() {
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make(b64: String) -> Int { image.dimensions(b64).width }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "Docs", "make", &json!({"b64": "no es base64 %%%"}), &db).unwrap_err();
+        assert!(e.message.contains("image.dimensions"), "mensaje inesperado: {}", e.message);
+        assert!(e.message.contains("base64 válido"), "mensaje inesperado: {}", e.message);
+    }
+
     // ---- mcp.sample (GRAMMAR.md §3.203, Pieza C) ----
 
     #[test]
@@ -9940,11 +10119,12 @@ mod tests {
                 rpc excelSelfEq() -> Bool { excel == excel }
                 rpc mcpSelfEq() -> Bool { mcp == mcp }
                 rpc envSelfEq() -> Bool { env == env }
+                rpc imageSelfEq() -> Bool { image == image }
             }
         "#,
         );
         let db = Db::seeded();
-        for rpc in ["pdfSelfEq", "excelSelfEq", "mcpSelfEq", "envSelfEq"] {
+        for rpc in ["pdfSelfEq", "excelSelfEq", "mcpSelfEq", "envSelfEq", "imageSelfEq"] {
             let result = invoke_rpc(&program, "Check", rpc, &json!({}), &db).unwrap();
             assert_eq!(result, json!(true), "{rpc} debería dar true, igual que math == math");
         }

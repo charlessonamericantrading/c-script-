@@ -1564,6 +1564,10 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             "sample(prompt)",
             "Ask the connected MCP client to sample a single-turn text completion, blocking until it responds",
         )]),
+        Type::Image => Some(vec![
+            method("thumbnail(base64, maxWidth, maxHeight)", "Resize an image (JPEG/PNG/GIF/BMP/WebP) to fit within maxWidth x maxHeight preserving aspect ratio, returned as a base64-encoded String"),
+            method("dimensions(base64)", "Read the width/height of a base64-encoded image without resizing it"),
+        ]),
         Type::Struct { fields, .. } => Some(
             fields
                 .iter()
