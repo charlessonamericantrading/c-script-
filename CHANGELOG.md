@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.204.1] - 2026-09-05
+
+### 🔧 Proceso
+**v1.204.0 quedó con CI en rojo** -- `adopt_existing_falls_back_to_in_memory_cache_without_the_internal_table` (nuevo en esa versión) declaraba `db { stats: Stat[] }` para poder probar el fallback a `CacheStore` en memoria -- pero bajo `--adopt-existing` el servidor rechaza el arranque si CUALQUIER colección declarada no tiene ya su tabla física, no solo si falta la tabla interna de cache (`la colección 'stats' no existe como tabla en PostgreSQL`). Mismo motivo por el que `RATE_LIMIT_PROGRAM` (el equivalente para el rate limiter distribuido) nunca declaró ningún `db {}`. Fix: un programa sin `db {}` (`CACHE_PROGRAM_NO_DB`) para ese test puntual -- los otros dos tests nuevos de la ronda (que sí necesitan una tabla real para probar "no se re-ejecutó el cuerpo") no usan `--adopt-existing`, así que no pisan esta restricción. Sin código de producto nuevo -- los 105 tests restantes de `pg_integration.rs` (incluidos los otros 2 nuevos de esta misma ronda) ya habían pasado contra Postgres real en el push anterior.
+
 ## [1.204.0] - 2026-09-05
 
 ### ✨ Añadido

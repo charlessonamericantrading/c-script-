@@ -1696,6 +1696,20 @@ service Stats {
 }
 "#;
 
+/// Sin ningún `db {}` -- mismo motivo que `RATE_LIMIT_PROGRAM` arriba: bajo
+/// `--adopt-existing`, el servidor rechaza el arranque si CUALQUIER
+/// colección declarada no tiene ya su tabla física (no es un chequeo
+/// específico de la tabla interna de cache) -- un programa con una
+/// colección de verdad no sirve para probar el fallback de LA TABLA
+/// INTERNA en particular, se necesita uno sin ninguna tabla de usuario de
+/// por medio.
+const CACHE_PROGRAM_NO_DB: &str = r#"
+service Stats {
+    @cache("60s")
+    rpc summary() -> Int { 1 }
+}
+"#;
+
 #[test]
 fn distributed_cache_shares_hits_across_two_real_server_instances() {
     // El punto entero de GRAMMAR.md §3.256: un `@cache("60s")` tiene que
@@ -1768,10 +1782,10 @@ fn adopt_existing_falls_back_to_in_memory_cache_without_the_internal_table() {
     };
     let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
     let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
-    let _ = client.batch_execute("DROP TABLE IF EXISTS \"_linkc_internal_cache\"; DROP TABLE IF EXISTS \"stats\"");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"_linkc_internal_cache\"");
 
     let temp = TempDir::new("cache-adopt-existing");
-    let link = temp.write("app.link", CACHE_PROGRAM_LONG_TTL);
+    let link = temp.write("app.link", CACHE_PROGRAM_NO_DB);
     let server = Serve::start_with_args(&link, &url, &["--adopt-existing"]);
 
     assert_eq!(server.rpc("Stats/summary", "{}"), serde_json::json!(1));
