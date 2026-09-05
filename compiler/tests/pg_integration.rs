@@ -6324,3 +6324,80 @@ service Orders {{
     let server2 = Serve::start(&src, &url);
     assert_eq!(server2.rpc("Orders/listLines", "{}").as_array().unwrap().len(), 2, "los datos sobreviven el reinicio");
 }
+
+// ---- @readReplica (GRAMMAR.md §3.260, PLAN.md §9.22 ítem 1) ----
+
+const READ_REPLICA_PROGRAM: &str = r#"
+type Task = { id: Int, done: Bool }
+db { tasks: Task[] }
+service Tasks {
+    @readReplica
+    rpc list() -> Task[] { db.tasks.all() }
+
+    rpc create() -> Task { db.tasks.insert(Task { id: 0, done: false }) }
+}
+"#;
+
+#[test]
+fn read_replica_url_opens_a_real_second_connection_and_reads_still_work() {
+    // No hay streaming replication real disponible en este entorno de test
+    // (mismo criterio que `@cache`/`@rate_limit` distribuidos, GRAMMAR.md
+    // §3.178/§3.256: primaria y "réplica" apuntan a la MISMA base) -- lo que
+    // SÍ es verificable de punta a punta es que `--read-replica-url` abre
+    // una conexión real y separada (identificable por su propio
+    // `application_name`, mismo mecanismo que ya prueba
+    // `a_dropped_connection_self_heals_without_a_process_restart` más
+    // arriba) y que un rpc `@readReplica` sigue devolviendo datos
+    // correctos a través de ella.
+    const APP_NAME_REPLICA: &str = "linkc_read_replica_test";
+    let Some(base_url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut client = postgres::Client::connect(&base_url, postgres::NoTls).expect("conectar");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"tasks\"");
+
+    let temp = TempDir::new("read-replica");
+    let link = temp.write("app.link", READ_REPLICA_PROGRAM);
+    let replica_url = with_query_param(&base_url, &format!("application_name={APP_NAME_REPLICA}"));
+    let server = Serve::start_with_args(&link, &base_url, &["--read-replica-url", &replica_url]);
+
+    let mut admin = postgres::Client::connect(&base_url, postgres::NoTls).expect("conectar como admin");
+    let replica_conns: i64 = admin
+        .query_one("SELECT count(*) FROM pg_stat_activity WHERE application_name = $1", &[&APP_NAME_REPLICA])
+        .map(|row| row.get(0))
+        .unwrap();
+    assert!(replica_conns >= 1, "la conexión de réplica no se abrió -- ¿--read-replica-url no conectó de verdad?");
+
+    let created = server.rpc("Tasks/create", "{}");
+    assert_eq!(created["done"], serde_json::json!(false), "{created:?}");
+
+    let list = server.rpc("Tasks/list", "{}");
+    let list = list.as_array().expect("Tasks/list devuelve una lista");
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert_eq!(list[0]["done"], serde_json::json!(false), "{list:?}");
+}
+
+#[test]
+fn read_replica_falls_back_to_the_primary_connection_against_real_postgres_when_not_configured() {
+    // Mismo programa, esta vez SIN `--read-replica-url` -- el rpc
+    // `@readReplica` tiene que seguir funcionando exactamente igual,
+    // enrutado al backend primario (degradación en capas, GRAMMAR.md
+    // §3.260), no fallar por falta de configuración.
+    let Some(base_url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut client = postgres::Client::connect(&base_url, postgres::NoTls).expect("conectar");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"tasks\"");
+
+    let temp = TempDir::new("read-replica-fallback");
+    let link = temp.write("app.link", READ_REPLICA_PROGRAM);
+    let server = Serve::start(&link, &base_url);
+
+    server.rpc("Tasks/create", "{}");
+    let list = server.rpc("Tasks/list", "{}");
+    assert_eq!(list.as_array().expect("Tasks/list devuelve una lista").len(), 1, "{list:?}");
+}

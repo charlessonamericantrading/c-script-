@@ -655,6 +655,11 @@ pub struct Checker {
     /// (una sola transacción SQL por vez; savepoints/anidamiento real
     /// quedan fuera de v0).
     in_transaction: std::sync::atomic::AtomicBool,
+    /// GRAMMAR.md §3.260: `true` mientras se chequea el CUERPO de un rpc/
+    /// stream `@readReplica` -- mismo mecanismo que `in_stream_body`, para
+    /// rechazar cualquier método de escritura de `db` sin duplicar la
+    /// clasificación lectura/escritura en runtime.
+    in_read_replica_rpc: std::sync::atomic::AtomicBool,
 }
 
 /// `enum PdfBlock { Text { content: String, bold: Bool, size: Int }, Table {
@@ -874,6 +879,7 @@ impl Checker {
             hover_result: std::sync::Mutex::new(None),
             in_stream_body: std::sync::atomic::AtomicBool::new(false),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
+            in_read_replica_rpc: std::sync::atomic::AtomicBool::new(false),
         };
         // `PdfBlock` (GRAMMAR.md §3.201) es un ADT reservado por el
         // compilador, no un enum que el usuario declare -- su forma la dicta
@@ -1818,8 +1824,10 @@ impl Checker {
             env.insert(p.name.clone(), immutable(pty));
         }
         let prev_in_stream = self.in_stream_body.swap(is_stream, std::sync::atomic::Ordering::Relaxed);
+        let prev_in_read_replica = self.in_read_replica_rpc.swap(r.read_replica(), std::sync::atomic::Ordering::Relaxed);
         let result = self.check_block(&r.body, &expected, &env);
         self.in_stream_body.store(prev_in_stream, std::sync::atomic::Ordering::Relaxed);
+        self.in_read_replica_rpc.store(prev_in_read_replica, std::sync::atomic::Ordering::Relaxed);
         result
     }
 
@@ -5718,6 +5726,19 @@ impl Checker {
                  search/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/upsert) queda para una ronda futura."
             )));
         }
+        // GRAMMAR.md §3.260: dentro del cuerpo de un rpc `@readReplica`,
+        // ningún método de ESCRITURA de `db` tipa -- es la garantía de
+        // compile-time que hace que `Db::backend()` (runtime/db.rs) pueda
+        // enrutar TODA lectura de ese cuerpo a la réplica sin tener que
+        // reclasificar método por método en runtime: si esto tipó, el
+        // cuerpo entero es, por construcción, de solo lectura.
+        if self.in_read_replica_rpc.load(std::sync::atomic::Ordering::Relaxed)
+            && matches!(method, "insert" | "insertMany" | "applyPatch" | "delete" | "deleteWhere" | "updateWhere" | "increment" | "upsert")
+        {
+            return Err(err(format!(
+                "'{method}' es un método de escritura de 'db' -- no está permitido dentro del cuerpo de un rpc '@readReplica' (GRAMMAR.md §3.260), que solo enruta lecturas a la réplica configurada. Sacá este rpc de '@readReplica' si necesita escribir."
+            )));
+        }
         match method {
             "all" => {
                 self.expect_no_args(args, "all")?;
@@ -8631,6 +8652,104 @@ type T = { id: Int, s: Status }")
             err.iter().any(|e| e.message.contains("idempotent") && e.message.contains("stream")),
             "mensaje inesperado: {err:?}"
         );
+    }
+
+    // ---- @readReplica (GRAMMAR.md §3.260) ----
+
+    #[test]
+    fn read_replica_annotation_type_checks_on_a_read_only_rpc() {
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @readReplica
+                rpc list() -> Task[] { db.tasks.all() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn read_replica_combines_with_other_annotations() {
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @authenticated
+                @readReplica
+                @rate_limit("30/1m")
+                rpc list() -> Task[] { db.tasks.all() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn read_replica_rejects_insert_inside_the_body() {
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @readReplica
+                rpc create() -> Task { db.tasks.insert(Task { id: 0, done: false }) }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("insert") && e.message.contains("readReplica")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn read_replica_rejects_delete_inside_the_body() {
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @readReplica
+                rpc remove(id: Int) -> Bool { db.tasks.delete(id) }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("delete") && e.message.contains("readReplica")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn read_replica_rejects_upsert_inside_the_body() {
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            type NewTask = { done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @readReplica
+                rpc touch(id: Int) -> Task {
+                    db.tasks.upsert(
+                        |t: Task| { t.id == id },
+                        NewTask { done: false },
+                        |t: Task| { NewTask { done: t.done } }
+                    )
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("upsert") && e.message.contains("readReplica")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn read_replica_does_not_leak_into_the_next_rpc_checked() {
+        // Confirma que `in_read_replica_rpc` se restaura correctamente
+        // (mismo criterio que `in_stream_body`) -- un rpc de escritura
+        // NORMAL, declarado DESPUÉS de uno `@readReplica` en el mismo
+        // programa, tiene que seguir aceptando `insert` sin problema.
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @readReplica
+                rpc list() -> Task[] { db.tasks.all() }
+
+                rpc create() -> Task { db.tasks.insert(Task { id: 0, done: false }) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 
     #[test]

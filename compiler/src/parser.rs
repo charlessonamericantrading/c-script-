@@ -1045,6 +1045,8 @@ impl Parser {
                 // Sin argumentos, igual que "authenticated" (GRAMMAR.md
                 // §3.140) -- ninguna clave que parsear.
                 "idempotent" => Annotation::Idempotent,
+                // Sin argumentos, mismo criterio que "idempotent" (GRAMMAR.md §3.260).
+                "readReplica" => Annotation::ReadReplica,
                 "cache" => {
                     self.eat(&TokenKind::LParen)?;
                     let ttl = self.eat_string()?;

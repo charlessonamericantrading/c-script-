@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.208.0] - 2026-09-05
+
+### ✨ Añadido
+**`@readReplica` + `--read-replica-url`/`LINK_READ_REPLICA_URL` -- réplicas de lectura (PLAN.md §9.22 ítem 1)**: `@readReplica` sobre un `rpc`/`stream` (sin argumentos, mismo criterio que `@idempotent`) enruta toda su actividad de `db.*` a una segunda conexión Postgres de solo lectura en vez de la primaria. El checker rechaza en COMPILE-TIME cualquier método de escritura (insert/insertMany/applyPatch/delete/deleteWhere/updateWhere/increment/upsert) dentro del cuerpo -- garantía que le permite al runtime enrutar sin reclasificar método por método. Degrada al backend primario sin el flag configurado (nunca rompe nada en dev/test); rechaza arrancar si la base primaria es SQLite (sin streaming replication que enrutar). c-script no crea ni mantiene la réplica -- apunta a una base que el operador ya mantiene al día por su cuenta. Ver GRAMMAR.md §3.260.
+
 ## [1.207.0] - 2026-09-05
 
 ### 📝 Documentación

@@ -33,8 +33,9 @@
 // el límite de `Send` de arriba: lo único que cruza al hilo escritor es
 // JSON puro, nunca `Db`/`Value`.
 
-use super::db::{encrypted_fields_by_collection, now_ms, Db};
+use super::db::{connect_postgres_client, encrypted_fields_by_collection, now_ms, Db};
 use super::encryption;
+use super::store::Backend;
 use super::session::SessionStore;
 use super::{
     ai_stream_member, invoke_rpc_with_sessions, is_cron_member, is_stream_member, live_subscribe_collection, required_auth, required_cache,
@@ -400,6 +401,12 @@ pub struct ServeConfig {
     pub max_concurrency: Option<usize>,
     /// PLAN.md §9.20 Fase 1.1: `--db-pool-size`/`LINK_DATABASE_POOL_SIZE`, tamaño del pool de conexiones PostgreSQL.
     pub db_pool_size: Option<usize>,
+    /// GRAMMAR.md §3.260: `--read-replica-url`/`LINK_READ_REPLICA_URL` --
+    /// segunda conexión Postgres de SOLO LECTURA para los rpc
+    /// `@readReplica`. `None` (el default) es CERO cambio de comportamiento.
+    /// Solo válido con `source: DbSource::Postgres(_)` -- `serve()` rechaza
+    /// arrancar si la base primaria es SQLite y esto es `Some`.
+    pub read_replica_url: Option<String>,
 }
 pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     let ServeConfig {
@@ -420,6 +427,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         fallback_upstream,
         max_concurrency,
         db_pool_size,
+        read_replica_url,
         http_timeout,
         trust_proxy,
         service_api_key,
@@ -444,6 +452,11 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     // SQLite no tiene ningún mecanismo de notificación cross-proceso, así
     // que ahí es `None` y el loop se queda con el `incoming_requests()`
     // bloqueante de siempre, sin overhead de polling.
+    // GRAMMAR.md §3.260: capturado ANTES del `match` de abajo (que consume
+    // `source`) -- una réplica de lectura solo tiene sentido con Postgres
+    // primario; SQLite no tiene streaming replication ni ningún concepto
+    // de "conexión de solo lectura separada" que enrutar.
+    let source_is_postgres = matches!(source, DbSource::Postgres(_));
     let (db, remote_changes) = match source {
         DbSource::SqliteFile(db_path) => (Db::new_with_pool_options(program, &db_path, adopt_existing, db_pool_size), None),
         // A diferencia de abrir un archivo local, conectarse a una base remota
@@ -458,6 +471,30 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
             }
         },
     };
+    // GRAMMAR.md §3.260: `--read-replica-url`/`LINK_READ_REPLICA_URL` -- una
+    // segunda conexión, SOLO de lectura, que los rpc `@readReplica` usan en
+    // vez de la primaria. Rechaza arrancar si la base primaria es SQLite
+    // (mensaje claro, no un `unwrap` más adelante) -- para todo lo demás,
+    // `connect_postgres_client` (NUNCA `connect_postgres_with_options`: esa
+    // corre DDL de creación de schema/extensión/tablas, que una réplica de
+    // solo lectura no debe ni puede ejecutar) más `Backend::postgres` dan la
+    // misma pooling/reconexión que la conexión primaria, sin duplicar esa
+    // lógica.
+    if let Some(replica_url) = read_replica_url {
+        if !source_is_postgres {
+            return Err(
+                "--read-replica-url/LINK_READ_REPLICA_URL requiere que la base PRIMARIA sea Postgres (GRAMMAR.md §3.260) -- \
+                 esta corrida usa SQLite, que no tiene réplicas de lectura que enrutar."
+                    .to_string(),
+            );
+        }
+        let replica_client = connect_postgres_client(&replica_url, db_schema.as_deref()).map_err(|e| {
+            format!("--read-replica-url/LINK_READ_REPLICA_URL: no se pudo conectar: {e}")
+        })?;
+        let replica_pool_size = db_pool_size.unwrap_or(1);
+        db.set_read_replica(Backend::postgres(replica_client, &replica_url, db_schema.as_deref(), replica_pool_size));
+        eprintln!("réplica de lectura configurada -- los rpc '@readReplica' enrutan ahí (GRAMMAR.md §3.260)");
+    }
     // GRAMMAR.md §3.191: si el programa declara algún campo `@encrypted`,
     // hace falta una clave real ANTES de aceptar la primera request --
     // fallar acá, con un mensaje claro, es mejor que fallar recién en el
@@ -1966,6 +2003,7 @@ pub(crate) fn check_auth_gate(
         | Annotation::Invalidates(_)
         | Annotation::Infinite { .. }
         | Annotation::Idempotent
+        | Annotation::ReadReplica
         | Annotation::Cache(_)
         | Annotation::Cors(_)
         | Annotation::Cron(_) => Ok(()),

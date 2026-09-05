@@ -225,6 +225,26 @@ fn resolve_fallback_upstream(args: &[String]) -> Result<Option<String>, String> 
     Ok(Some(value))
 }
 
+/// GRAMMAR.md §3.260: `--read-replica-url`/`LINK_READ_REPLICA_URL` --
+/// segunda conexión de SOLO LECTURA para los rpc `@readReplica`. Mismo
+/// criterio de validación de forma que `resolve_fallback_upstream` (arriba):
+/// un error claro ACÁ, antes de intentar conectar, en vez de un mensaje de
+/// `postgres::Client::connect` que no explica qué flag lo causó. La
+/// conexión real (y el rechazo si la base PRIMARIA es SQLite, GRAMMAR.md
+/// §3.260) pasa en `server.rs::serve`, no acá -- este archivo solo lee CLI.
+fn resolve_read_replica_url(args: &[String]) -> Result<Option<String>, String> {
+    let Some(raw) = read_flag_or_env(args, "--read-replica-url", "LINK_READ_REPLICA_URL")? else {
+        return Ok(None);
+    };
+    let value = raw.trim().to_string();
+    if !(value.starts_with("postgres://") || value.starts_with("postgresql://")) {
+        return Err(format!(
+            "--read-replica-url/LINK_READ_REPLICA_URL: se esperaba una URL 'postgres://...'/'postgresql://...', se recibió '{raw}'"
+        ));
+    }
+    Ok(Some(value))
+}
+
 /// GRAMMAR.md §3.234: `--models-dir`/`LINK_MODELS_DIR` y
 /// `--ai-memory-budget-mb`/`LINK_AI_MEMORY_BUDGET_MB` para `serve`/`serve-all`.
 fn resolve_ai_flags(args: &[String]) -> Result<(Option<std::path::PathBuf>, Option<u64>, std::time::Duration), String> {
@@ -2297,6 +2317,13 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let read_replica_url = match resolve_read_replica_url(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let config = runtime::server::ServeConfig {
         host: host.clone(),
         port,
@@ -2307,6 +2334,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         fallback_upstream,
         max_concurrency,
         db_pool_size,
+        read_replica_url,
         db_schema,
         cors,
         session_ttl,
@@ -2901,7 +2929,10 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
                     // `serve-all` nunca conecta a Postgres (cada servicio
                     // usa su propio SQLite local, ver el rechazo de
                     // --db-schema más arriba en cmd_serve_all) -- siempre
-                    // None acá, no hay ningún schema que aplicar.
+                    // None acá, no hay ningún schema que aplicar. Mismo
+                    // criterio para `read_replica_url`: una réplica de
+                    // lectura (GRAMMAR.md §3.260) exige Postgres primario.
+                    read_replica_url: None,
                     db_schema: None,
                     cors,
                     session_ttl,

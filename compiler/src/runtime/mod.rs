@@ -4741,6 +4741,12 @@ pub fn invoke_rpc_with_sessions(
         env.insert(p.name.clone(), cell(v));
     }
 
+    // GRAMMAR.md §3.260: activo SOLO mientras corre este cuerpo, en ESTE
+    // hilo (un hilo por request, §3.158) -- `Db::backend()` lo consulta en
+    // cada llamada a `db.*` para decidir si usar la réplica de lectura. El
+    // guard restaura el valor anterior al salir del scope, incluso si
+    // `eval_block` corta temprano con `?` o entra en pánico.
+    let _read_replica_guard = db::ReadReplicaGuard::enter(rpc.read_replica());
     let result = eval_block(&rpc.body, &env, db, &fns, &checker, sessions, current_token, &step_budget)?;
     let simple_enums = simple_enum_names(program);
     // GRAMMAR.md §3.232: los campos `@hidden` se quitan ACÁ, en el único

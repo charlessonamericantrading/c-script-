@@ -729,6 +729,11 @@ impl RpcDecl {
         self.annotations.iter().any(|a| matches!(a, Annotation::Idempotent))
     }
 
+    /// `true` si este rpc/stream lleva `@readReplica` (GRAMMAR.md §3.260).
+    pub fn read_replica(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, Annotation::ReadReplica))
+    }
+
     /// La duración cruda de `@cache("60s")`, si hay (GRAMMAR.md §3.144) --
     /// texto sin parsear, mismo criterio que `rate_limit()`/`cache_control()`:
     /// el checker valida el formato, acá es solo el string tal como se
@@ -879,6 +884,16 @@ pub enum Annotation {
     /// caller que no manda el header no ve ningún cambio de comportamiento
     /// -- la deduplicación es opt-in por REQUEST, no forzada por el rpc.
     Idempotent,
+    /// `@readReplica` (GRAMMAR.md §3.260) -- sin argumentos, como
+    /// `@idempotent`. Marca un rpc de SOLO LECTURA cuyas llamadas a `db.*`
+    /// se enrutan a la conexión de réplica (`--read-replica-url`/
+    /// `LINK_READ_REPLICA_URL`) mientras corre su cuerpo, en vez del backend
+    /// primario. El checker rechaza cualquier método de ESCRITURA de `db`
+    /// dentro del cuerpo (insert/applyPatch/delete/update.../upsert/
+    /// increment) -- un `rpc` `@readReplica` es, por construcción,
+    /// puramente de lectura. Sin réplica configurada, degrada al backend
+    /// primario (nunca un error de arranque ni de request).
+    ReadReplica,
     /// `@cache("60s")` (GRAMMAR.md §3.144) -- cachea el resultado de una
     /// ejecución EXITOSA en el servidor, keyeado por (service, rpc,
     /// argumentos), por la duración dada (`Ns`/`Nm`/`Nh`/`Nd`, mismo formato

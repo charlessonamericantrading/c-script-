@@ -426,6 +426,7 @@ impl SqlitePool {
 }
 
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 pub(crate) enum Backend {
     Sqlite(std::sync::Arc<SqlitePool>),
     Postgres(std::sync::Arc<PostgresPool>),

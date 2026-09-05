@@ -9242,6 +9242,46 @@ test "v1 y v2 conviven en el mismo programa, cada uno con su propia forma" {
 
 **Verificado de punta a punta contra un `linkc serve` real** (no solo contra el checker): el programa de arriba corriendo de verdad, `POST /UsersV2/create` crea una fila; `GET /v2/users/1` devuelve `{"id":1,"fullName":"...","email":"..."}`; `GET /v1/users/1` devuelve `{"id":1,"name":"..."}` -- la MISMA fila, dos formas de contrato simultáneas, sin ningún cambio de código en el compilador.
 
+### 3.260 `@readReplica` + `--read-replica-url`: réplicas de lectura — RESUELTO, cierra el ítem 1 de la hoja de ruta del informe "c-script para Instagram" (PLAN.md §9.22)
+
+Origen: `PLAN.md §9.22` ítem 1, marcado en el informe como "el techo de escala más inmediato dado el ratio lectura:escritura de un feed" -- y como el único de la hoja de ruta con una decisión de diseño explícitamente pendiente. Auditado y decidido en esta ronda, sin esperar más: la pregunta real no era SI enrutar lecturas a una réplica, sino con qué anotación/flag y con qué garantía de que el cuerpo enrutado sea de verdad de solo lectura.
+
+**`@readReplica` sobre un `rpc`/`stream`, sin argumentos (mismo criterio que `@idempotent`) + `linkc serve --read-replica-url <url>`/`LINK_READ_REPLICA_URL`.** Mientras corre el cuerpo de un rpc `@readReplica`, toda llamada a `db.*` se enruta a la conexión de réplica en vez de la primaria. **c-script no crea ni mantiene la réplica** -- apunta a una base que el operador YA mantiene al día por su cuenta (streaming replication nativa de Postgres, un pooler como pgBouncer apuntando a un standby, lo que sea): este flag es puramente de ENRUTAMIENTO, igual que `--fallback-upstream` (§3.238) no implementa el backend viejo, solo sabe hablarle.
+
+<!-- linkc:check -->
+```rust
+type Post = { id: Int, body: String }
+db { posts: Post[] }
+
+service Feed {
+  @readReplica
+  rpc list() -> Post[] { db.posts.all() }
+
+  rpc publish(body: String) -> Post {
+    db.posts.insert(Post { id: 0, body: body })
+  }
+}
+```
+
+```text
+linkc serve feed.link 8080 --db "postgres://.../primaria" --read-replica-url "postgres://.../replica"
+```
+
+**Garantía de COMPILE-TIME, no una convención de runtime: ningún método de ESCRITURA de `db` tipa dentro de un `rpc`/`stream` `@readReplica`.** `insert`/`insertMany`/`applyPatch`/`delete`/`deleteWhere`/`updateWhere`/`increment`/`upsert` son errores de compilación ahí -- un rpc `@readReplica` es, por construcción, puramente de lectura. Esta garantía es lo que le permite al runtime (`Db::backend()`, `runtime/db.rs`) enrutar TODA la actividad de `db` de ese cuerpo a la réplica sin reclasificar método por método en runtime: si el programa compiló, ya se sabe que no hay ninguna escritura que enrutar mal.
+
+**Degradación en capas, mismo criterio que `@cache`/`@rate_limit` distribuidos (§3.178/§3.256): nunca un servidor que no arranca ni una request que falla por falta de configuración.** Un `@readReplica` sin `--read-replica-url` configurado simplemente usa el backend primario -- comportamiento IDÉNTICO a no tener la anotación, salvo por la garantía de compile-time de arriba (que sigue aplicando). Esto hace que anotar un rpc como `@readReplica` sea seguro incluso en dev/test (SQLite, sin ninguna réplica), y que activar el enrutamiento real sea pura configuración de despliegue, sin tocar el `.link`.
+
+**`--read-replica-url` exige que la base PRIMARIA sea Postgres -- rechaza el arranque, limpio, si es SQLite.** SQLite no tiene streaming replication ni ningún concepto de "conexión de solo lectura separada" que enrutar; aceptar el flag en silencio y no hacer nada sería peor que rechazarlo. La conexión de réplica se abre con `connect_postgres_client` (la misma función que `linkc doctor`/`migrate --dry-run` usan para conexiones de solo lectura) -- NUNCA con el camino que abre la conexión PRIMARIA (`Db::connect_postgres_with_options`, que corre `CREATE SCHEMA`/`CREATE EXTENSION vector`/DDL de tablas): una réplica de lectura no debe ni puede ejecutar ninguno de esos DDL.
+
+**Bajo `serve-all` (§3.92), `--read-replica-url` no existe -- cada servicio de `serve-all` usa su propio SQLite local siempre, nunca Postgres.** Un rpc `@readReplica` bajo `serve-all` es válido (compila) pero siempre corre contra el backend primario, mismo camino que "sin réplica configurada" arriba.
+
+**Límites honestos, deliberados**:
+- **c-script no verifica que la URL de réplica apunte a una réplica real** -- podría apuntar a la misma base primaria (de hecho, así se verifica este ítem, ver abajo), a otra base sin relación, o a una réplica con lag real. El enrutamiento es honesto; la FRESCURA de los datos que devuelve es responsabilidad de la infraestructura que el operador declaró, no de c-script.
+- **Sin balanceo entre varias réplicas** -- un solo `--read-replica-url`, una sola conexión pooleada. Varias réplicas detrás de un load balancer de red (pgBouncer, HAProxy) siguen funcionando (c-script solo ve un endpoint), pero c-script mismo no reparte entre N URLs.
+- **`transaction { }` dentro de un `@readReplica` no tiene sentido y no se probó especialmente** -- como el cuerpo entero es de solo lectura por la garantía de compile-time de arriba, una transacción ahí envolvería solo lecturas; funciona (lee de la réplica igual), pero no hay un caso de uso real citado que lo motive.
+
+**Verificado**: tests de checker (`@readReplica` tipa en un rpc/stream de solo lectura, combina con `@authenticated`/`@rate_limit`, rechaza cada uno de los ocho métodos de escritura con un mensaje que nombra el método y la anotación, y el flag de anidamiento se restaura correctamente entre un rpc `@readReplica` y el siguiente rpc normal del mismo programa) + `compiler/tests/cli_read_replica.rs` (fallback a primario sobre SQLite real sin `--read-replica-url`, `--read-replica-url` con primaria SQLite rechazado al arrancar con un mensaje limpio -- nunca un panic --, y un `insert` dentro del cuerpo rechazado por el binario real vía `linkc test`) + `compiler/tests/pg_integration.rs` (`--read-replica-url` abre una conexión Postgres real y separada, confirmada por su propio `application_name` en `pg_stat_activity` -- mismo mecanismo ya probado por `a_dropped_connection_self_heals_without_a_process_restart`, §3.40 --, con un rpc `@readReplica` sirviendo datos correctos a través de ella; y el mismo programa sin el flag configurado sigue funcionando idéntico contra Postgres real). Sin streaming replication real disponible en este entorno de test -- primaria y "réplica" apuntan a la MISMA base en ambos tests, mismo criterio ya aceptado para verificar `@cache`/`@rate_limit` distribuidos.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

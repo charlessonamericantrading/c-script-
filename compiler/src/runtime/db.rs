@@ -1424,7 +1424,14 @@ fn validate_columns_exist_for_adoption(backend: &Backend, collection: &str, colu
 }
 
 pub struct Db {
-    backend: Backend,
+    /// La conexión PRIMARIA -- lecturas y TODAS las escrituras. Acceder a
+    /// este campo directo desde fuera de `backend()`/`set_read_replica`
+    /// (más abajo) es casi siempre un error: el resto del archivo llama
+    /// `self.backend()()` (nótese el paréntesis -- es un MÉTODO, no este
+    /// campo), que resuelve sola la réplica de lectura cuando corresponde
+    /// (GRAMMAR.md §3.260). Este campo sigue siendo privado a este módulo,
+    /// nunca `pub`.
+    primary_backend: Backend,
     /// Reconstruido UNA vez por vida del servidor (no por request, a
     /// diferencia de `invoke_rpc_with_sessions`) -- hace falta porque
     /// `json_to_typed_value` (usado para decodificar una columna JSON de
@@ -1567,6 +1574,17 @@ pub struct Db {
     /// `write_param`/`decode_row` lo leen para cifrar/descifrar cada campo
     /// `ColumnPlan::encrypted`.
     encryption_key: parking_lot::RwLock<Option<[u8; encryption::KEY_LEN]>>,
+    /// GRAMMAR.md §3.260 (`@readReplica`): conexión de SOLO LECTURA separada
+    /// de `backend`, fijada una vez por `serve()` si se configuró
+    /// `--read-replica-url`/`LINK_READ_REPLICA_URL` -- mismo criterio EXACTO
+    /// que `encryption_key`/`ai_engine` arriba (`RwLock`, `None` hasta que
+    /// `server.rs` la sobreescribe antes de la primera request). `Db::call`
+    /// la consulta vía `active_backend()` -- nunca crea NI replica NI
+    /// esquema: es SOLO una segunda conexión de lectura a una base que el
+    /// operador ya mantiene replicada por su cuenta (streaming replication
+    /// de Postgres, pgBouncer apuntando a un standby, lo que sea -- este
+    /// campo no le importa CÓMO se mantiene al día, solo A DÓNDE apunta).
+    read_replica: parking_lot::RwLock<Option<Backend>>,
     /// GRAMMAR.md §3.234: el motor de inferencia de ESTE programa (sus
     /// modelos de `ai { }` ya resueltos), fijado una vez por `serve` antes
     /// de la primera request. Por programa y no global porque `serve-all`
@@ -1722,6 +1740,43 @@ thread_local! {
     /// `response.redirect(url, permanent)` (GRAMMAR.md §3.111) -- mismo
     /// mecanismo y mismo ciclo de vida que `RESPONSE_STATUS_OVERRIDE`.
     static RESPONSE_LOCATION_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// GRAMMAR.md §3.260: `true` mientras ESTE hilo está evaluando el
+    /// cuerpo de un rpc `@readReplica` -- mismo criterio EXACTO que
+    /// `CURRENT_REQUEST` (un hilo por request, así que "está corriendo un
+    /// rpc @readReplica ahora mismo" es una propiedad de ESTE hilo, no un
+    /// dato compartido). `Db::backend()` lo consulta en cada llamada;
+    /// `runtime/mod.rs::invoke_rpc_with_sessions` lo fija/limpia con un
+    /// guard RAII alrededor de `eval_block`, así que un `?` que corta antes
+    /// de tiempo (o un panic) igual lo deja en `false` al salir de ese hilo.
+    static CURRENT_READ_REPLICA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Ver `CURRENT_READ_REPLICA` arriba. `pub(crate)` porque
+/// `runtime/mod.rs::invoke_rpc_with_sessions` (fuera de este módulo) es
+/// quien lo fija; `Db::backend()` (este módulo) es quien lo lee.
+pub(crate) fn read_replica_active() -> bool {
+    CURRENT_READ_REPLICA.with(|c| c.get())
+}
+
+/// RAII: `new(true)` al entrar al cuerpo de un rpc `@readReplica`,
+/// restaura el valor ANTERIOR (no simplemente `false`) al salir -- mismo
+/// motivo que cualquier guard de anidamiento de este archivo: un rpc no
+/// puede invocar a otro rpc directamente hoy, pero este guard es correcto
+/// igual si eso cambia alguna vez, sin asumir que el valor previo siempre
+/// era `false`.
+pub(crate) struct ReadReplicaGuard(bool);
+
+impl ReadReplicaGuard {
+    pub(crate) fn enter(active: bool) -> Self {
+        let previous = CURRENT_READ_REPLICA.with(|c| c.replace(active));
+        ReadReplicaGuard(previous)
+    }
+}
+
+impl Drop for ReadReplicaGuard {
+    fn drop(&mut self) {
+        CURRENT_READ_REPLICA.with(|c| c.set(self.0));
+    }
 }
 
 /// Ver la doc de `CURRENT_REQUEST` (arriba). Dos structs (no una tupla)
@@ -2116,7 +2171,7 @@ impl Db {
         let pool_size = pool_size.unwrap_or(Self::DEFAULT_SQLITE_READER_POOL_SIZE);
 
         Db {
-            backend: Backend::sqlite(connection, Some(db_path), pool_size),
+            primary_backend: Backend::sqlite(connection, Some(db_path), pool_size),
             checker,
             simple_enums,
             columns,
@@ -2134,6 +2189,7 @@ impl Db {
             argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
             http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
             encryption_key: parking_lot::RwLock::new(None),
+            read_replica: parking_lot::RwLock::new(None),
             #[cfg(feature = "inference")]
             ai_engine: parking_lot::RwLock::new(None),
             ai_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(60)),
@@ -2439,7 +2495,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
 
         Ok((
             Db {
-                backend,
+                primary_backend: backend,
                 checker,
                 simple_enums,
                 columns,
@@ -2457,6 +2513,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
                 http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
                 encryption_key: parking_lot::RwLock::new(None),
+                read_replica: parking_lot::RwLock::new(None),
                 #[cfg(feature = "inference")]
                 ai_engine: parking_lot::RwLock::new(None),
                 ai_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(60)),
@@ -2492,11 +2549,11 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
 
     /// Información del pool (max_size, total_creadas, ociosas) si el backend es PostgreSQL.
     pub fn postgres_pool_info(&self) -> Option<(usize, usize, usize)> {
-        self.backend.postgres_pool_info()
+        self.backend().postgres_pool_info()
     }
 
     pub fn sqlite_pool_info(&self) -> Option<(usize, usize)> {
-        self.backend.sqlite_pool_info()
+        self.backend().sqlite_pool_info()
     }
 
     /// Fija el costo de `crypto.hashPassword` para lo que quede de vida del
@@ -2679,7 +2736,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
         let Some(tenant) = self.tenant_fields.get(collection).cloned() else { return Ok(None) };
         let cell = self.tenant_cell(collection, &tenant)?;
         params.push(cell);
-        Ok(Some(format!("\"{}\" = {}", tenant.sql_col, self.backend.placeholder(params.len()))))
+        Ok(Some(format!("\"{}\" = {}", tenant.sql_col, self.backend().placeholder(params.len()))))
     }
 
     /// Fragmento `WHERE ...` (con el prefijo, o cadena vacía) combinando
@@ -2710,6 +2767,36 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
     /// esto no necesita clonar nada más que el propio array.
     pub(crate) fn encryption_key(&self) -> Option<[u8; encryption::KEY_LEN]> {
         *self.encryption_key.read()
+    }
+
+    /// GRAMMAR.md §3.260: fijada UNA vez por `server.rs::serve` si se
+    /// configuró `--read-replica-url`/`LINK_READ_REPLICA_URL`, mismo
+    /// criterio que `set_encryption_key`/`set_ai_engine`.
+    pub(crate) fn set_read_replica(&self, backend: Backend) {
+        *self.read_replica.write() = Some(backend);
+    }
+
+    /// El backend que `Db::call` debe usar PARA ESTA llamada: la réplica de
+    /// lectura si `CURRENT_READ_REPLICA` (mod.rs, fijado por
+    /// `invoke_rpc_with_sessions` mientras corre el cuerpo de un `rpc`
+    /// `@readReplica`) está activo Y hay una réplica configurada; el
+    /// backend primario en cualquier otro caso -- incluido un `@readReplica`
+    /// sin `--read-replica-url` configurado, que degrada en capas al
+    /// primario en vez de fallar (mismo criterio de "nunca un servidor que
+    /// no arranca ni una respuesta sin servir" que `@cache`/`@rate_limit`
+    /// distribuidos, GRAMMAR.md §3.178/§3.256). El checker (`checker.rs`,
+    /// `in_read_replica_rpc`) ya garantiza en COMPILE-TIME que el cuerpo de
+    /// un `@readReplica` no contiene ningún método de ESCRITURA de `db` --
+    /// por eso acá no hace falta reclasificar método por método: mientras
+    /// el flag está activo, TODO lo que `Db::call` haga es, por construcción,
+    /// una lectura.
+    fn backend(&self) -> Backend {
+        if read_replica_active() {
+            if let Some(replica) = self.read_replica.read().clone() {
+                return replica;
+            }
+        }
+        self.primary_backend.clone()
     }
 
     /// Fixture SOLO para tests y para el demo wasm (`bin/wasm_demo.rs`) --
@@ -2766,7 +2853,7 @@ db { users: User[] }
     /// Qué motor está atrás. Solo para reportarlo al arrancar: ningún camino
     /// del intérprete se ramifica por esto.
     pub fn is_postgres(&self) -> bool {
-        self.backend.is_postgres()
+        self.backend().is_postgres()
     }
 
     /// `/health` (GRAMMAR.md §3.87): un `SELECT 1` real contra la base --
@@ -2779,7 +2866,7 @@ db { users: User[] }
     /// hace su propio chequeo -- barato (un `SELECT 1`), y un health check
     /// que devuelve un resultado viejo no sirve para nada.
     pub fn health_check(&self) -> Result<(), String> {
-        self.backend.execute_ddl("SELECT 1")
+        self.backend().execute_ddl("SELECT 1")
     }
 
     /// GRAMMAR.md §3.178: rate limit DISTRIBUIDO vía la tabla interna
@@ -2852,7 +2939,7 @@ db { users: User[] }
         // es culpa suya. `Backend::query` ya reintenta una conexión caída
         // por su cuenta (`with_reconnect`, GRAMMAR.md §3.40) antes de
         // llegar hasta acá.
-        match self.backend.query(&sql, &params, &[ColumnKind::Float]) {
+        match self.backend().query(&sql, &params, &[ColumnKind::Float]) {
             Ok(rows) => Some(!rows.is_empty()),
             Err(e) => {
                 // Visible, no silenciosa -- degradarse al limitador en
@@ -2886,7 +2973,7 @@ db { users: User[] }
              WHERE \"cache_key\" = $1 AND \"expires_at_ms\" > $2::bigint"
         );
         let params = vec![Cell::Text(cache_key.to_string()), Cell::Int(now_ms)];
-        match self.backend.query(&sql, &params, &[ColumnKind::Int, ColumnKind::Text, ColumnKind::Text]) {
+        match self.backend().query(&sql, &params, &[ColumnKind::Int, ColumnKind::Text, ColumnKind::Text]) {
             Ok(rows) => match rows.into_iter().next() {
                 None => Some(None),
                 Some(row) => {
@@ -2937,7 +3024,7 @@ db { users: User[] }
             Cell::Text(content_type.to_string()),
             Cell::Int(expires_at_ms),
         ];
-        if let Err(e) = self.backend.execute(&sql, &params) {
+        if let Err(e) = self.backend().execute(&sql, &params) {
             eprintln!("advertencia: cache distribuido (@cache) falló al escribir ({e}) -- esta entrada solo quedó en el cache en memoria de este proceso");
             return false;
         }
@@ -2952,16 +3039,16 @@ db { users: User[] }
     /// literalmente cómo SQLite calcula el tamaño del archivo por dentro.
     /// Postgres sí tiene una función dedicada, `pg_database_size`.
     pub fn size_bytes(&self) -> Option<i64> {
-        match &self.backend {
+        match &self.backend() {
             Backend::Sqlite(_) => {
-                let page_count = self.backend.query("PRAGMA page_count", &[], &[ColumnKind::Int]).ok()?;
-                let page_size = self.backend.query("PRAGMA page_size", &[], &[ColumnKind::Int]).ok()?;
+                let page_count = self.backend().query("PRAGMA page_count", &[], &[ColumnKind::Int]).ok()?;
+                let page_size = self.backend().query("PRAGMA page_size", &[], &[ColumnKind::Int]).ok()?;
                 let Some(Cell::Int(pc)) = page_count.first().and_then(|r| r.first()) else { return None };
                 let Some(Cell::Int(ps)) = page_size.first().and_then(|r| r.first()) else { return None };
                 Some(pc * ps)
             }
             Backend::Postgres(..) => {
-                let rows = self.backend.query("SELECT pg_database_size(current_database())", &[], &[ColumnKind::Int]).ok()?;
+                let rows = self.backend().query("SELECT pg_database_size(current_database())", &[], &[ColumnKind::Int]).ok()?;
                 match rows.first().and_then(|r| r.first()) {
                     Some(Cell::Int(n)) => Some(*n),
                     _ => None,
@@ -2977,7 +3064,7 @@ db { users: User[] }
     /// en el propio `.link` de quien lo necesite -- la gramática de
     /// autorización YA existe, este ítem no inventa una nueva.
     pub fn run_vacuum(&self) -> Result<(), String> {
-        self.backend.execute_ddl("VACUUM")
+        self.backend().execute_ddl("VACUUM")
     }
 
     /// `db.tableStats() -> Map<String, Int>` (GRAMMAR.md §3.151) -- cuántas
@@ -2988,7 +3075,7 @@ db { users: User[] }
     pub fn table_stats(&self) -> Result<Vec<(String, i64)>, String> {
         let mut out = Vec::with_capacity(self.columns.len());
         for collection in self.columns.keys() {
-            let rows = self.backend.query(&format!("SELECT COUNT(*) FROM \"{collection}\""), &[], &[ColumnKind::Int])?;
+            let rows = self.backend().query(&format!("SELECT COUNT(*) FROM \"{collection}\""), &[], &[ColumnKind::Int])?;
             let Some(Cell::Int(n)) = rows.first().and_then(|r| r.first()) else {
                 return Err(format!("tableStats: no se pudo leer el conteo de '{collection}'"));
             };
@@ -3225,16 +3312,16 @@ db { users: User[] }
                 let sql = if col_names.is_empty() {
                     format!("INSERT INTO \"{collection}\" DEFAULT VALUES")
                 } else {
-                    let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
+                    let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend().placeholder(n)).collect();
                     format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "))
                 };
                 let (id_cell, id_display) = match generated_uuid {
                     Some(uuid) => {
-                        self.backend.execute(&sql, &params).map_err(|e| write_error("insert", e))?;
+                        self.backend().execute(&sql, &params).map_err(|e| write_error("insert", e))?;
                         (Cell::Text(uuid.clone()), uuid)
                     }
                     None => {
-                        let new_id = self.backend.insert_returning_id(&sql, &params, id_col).map_err(|e| write_error("insert", e))?;
+                        let new_id = self.backend().insert_returning_id(&sql, &params, id_col).map_err(|e| write_error("insert", e))?;
                         (Cell::Int(new_id), new_id.to_string())
                     }
                 };
@@ -3282,7 +3369,7 @@ db { users: User[] }
                     if tenant.as_ref().is_some_and(|t| t.sql_col == col.sql_name) {
                         continue;
                     }
-                    set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend.placeholder(params.len() + 1)));
+                    set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend().placeholder(params.len() + 1)));
                     params.push(self.write_param(col, Some(value))?);
                 }
                 if !set_clauses.is_empty() {
@@ -3292,12 +3379,12 @@ db { users: User[] }
                     // motivo que `increment`, arriba: la reconsulta filtrada
                     // por tenant fallaría DESPUÉS de que el dato ajeno ya
                     // quedó mutado).
-                    let mut conds = vec![format!("\"{id_col}\" = {}", self.backend.placeholder(params.len()))];
+                    let mut conds = vec![format!("\"{id_col}\" = {}", self.backend().placeholder(params.len()))];
                     if let Some(t) = self.tenant_condition(collection, &mut params)? {
                         conds.push(t);
                     }
                     let sql = format!("UPDATE \"{collection}\" SET {} WHERE {}", set_clauses.join(", "), conds.join(" AND "));
-                    self.backend.execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
+                    self.backend().execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
                 }
                 // Reconsultar por id, tanto si hubo UPDATE como si el patch
                 // no traía ningún campo escribible -- "no encontrado" en
@@ -3341,21 +3428,21 @@ db { users: User[] }
                             .unwrap_or(0);
                         let mut params = vec![Cell::Int(now_ms), id_cell.clone()];
                         let mut conds =
-                            vec![format!("\"{id_col}\" = {}", self.backend.placeholder(2)), format!("\"{soft_col}\" IS NULL")];
+                            vec![format!("\"{id_col}\" = {}", self.backend().placeholder(2)), format!("\"{soft_col}\" IS NULL")];
                         if let Some(t) = self.tenant_condition(collection, &mut params)? {
                             conds.push(t);
                         }
-                        let sql = format!("UPDATE \"{collection}\" SET \"{soft_col}\" = {} WHERE {}", self.backend.placeholder(1), conds.join(" AND "));
-                        self.backend.execute(&sql, &params).map_err(|e| write_error("delete (soft)", e))?
+                        let sql = format!("UPDATE \"{collection}\" SET \"{soft_col}\" = {} WHERE {}", self.backend().placeholder(1), conds.join(" AND "));
+                        self.backend().execute(&sql, &params).map_err(|e| write_error("delete (soft)", e))?
                     }
                     None => {
                         let mut params = vec![id_cell];
-                        let mut conds = vec![format!("\"{id_col}\" = {}", self.backend.placeholder(1))];
+                        let mut conds = vec![format!("\"{id_col}\" = {}", self.backend().placeholder(1))];
                         if let Some(t) = self.tenant_condition(collection, &mut params)? {
                             conds.push(t);
                         }
                         let sql = format!("DELETE FROM \"{collection}\" WHERE {}", conds.join(" AND "));
-                        self.backend.execute(&sql, &params).map_err(|e| write_error("delete", e))?
+                        self.backend().execute(&sql, &params).map_err(|e| write_error("delete", e))?
                     }
                 };
                 if rows_affected > 0 {
@@ -3370,7 +3457,7 @@ db { users: User[] }
                 let where_clause = self.base_where(collection, &mut params)?;
                 let sql = format!("SELECT COUNT(*) FROM \"{collection}\" {where_clause}");
                 let rows = self
-                    .backend
+                    .backend()
                     .query(&sql, &params, &[ColumnKind::Int])
                     .map_err(|e| RuntimeError::new(format!("error en count de '{collection}': {e}")))?;
                 match rows.first().and_then(|r| r.first()) {
@@ -3496,7 +3583,7 @@ db { users: User[] }
             return;
         }
         self.deliver_local(collection, &json);
-        if self.backend.is_postgres() {
+        if self.backend().is_postgres() {
             self.notify_remote(collection, &json);
         }
     }
@@ -3511,7 +3598,7 @@ db { users: User[] }
     /// Las llamadas de adentro (`db.<c>.insert(...)`, etc.) piden este
     /// mismo candado por su cuenta -- reentrante, así que no hay deadlock.
     pub fn with_exclusive_connection<T>(&self, f: impl FnOnce() -> T) -> T {
-        self.backend.with_exclusive(f)
+        self.backend().with_exclusive(f)
     }
 
     /// GRAMMAR.md §3.154: arranca la transacción SQL real detrás de un
@@ -3539,7 +3626,7 @@ db { users: User[] }
                 "ya hay una transacción abierta en esta misma ejecución -- 'transaction { }' no admite anidamiento, ni siquiera a través de una función auxiliar que abre su propia transacción (GRAMMAR.md §3.154)".to_string(),
             );
         }
-        self.backend.execute_ddl("BEGIN")?;
+        self.backend().execute_ddl("BEGIN")?;
         *self.transaction_pending_publishes.lock() = Some(Vec::new());
         Ok(())
     }
@@ -3566,7 +3653,7 @@ db { users: User[] }
     /// evitando el problema de raíz en vez de solo evitar el deadlock
     /// puntual.
     pub(crate) fn commit_transaction(&self) -> Result<Vec<(String, serde_json::Value)>, String> {
-        self.backend.execute_ddl("COMMIT")?;
+        self.backend().execute_ddl("COMMIT")?;
         Ok(self.transaction_pending_publishes.lock().take().unwrap_or_default())
     }
 
@@ -3578,7 +3665,7 @@ db { users: User[] }
     /// esas filas quedó firme en la base, así que ningún `stream` debe
     /// enterarse de ellas.
     pub(crate) fn rollback_transaction(&self) {
-        if let Err(e) = self.backend.execute_ddl("ROLLBACK") {
+        if let Err(e) = self.backend().execute_ddl("ROLLBACK") {
             eprintln!("aviso: 'ROLLBACK' de una transacción falló ({e}) -- probablemente la conexión ya se había cerrado, en cuyo caso la base ya descartó la transacción por su cuenta");
         }
         *self.transaction_pending_publishes.lock() = None;
@@ -3713,7 +3800,7 @@ db { users: User[] }
             *self.oversized_notify_drops.lock().entry(collection.to_string()).or_insert(0) += 1;
             return true;
         }
-        match self.backend.notify(REMOTE_CHANGE_CHANNEL, &payload) {
+        match self.backend().notify(REMOTE_CHANGE_CHANNEL, &payload) {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("aviso: no se pudo notificar el cambio en '{collection}' a otras instancias: {e}");
@@ -3814,9 +3901,9 @@ db { users: User[] }
             col_names.push(format!("\"{}\"", col.sql_name));
             params.push(self.write_param(col, slot)?);
         }
-        let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
+        let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend().placeholder(n)).collect();
         let sql = format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "));
-        self.backend
+        self.backend()
             .execute(&sql, &params)
             .map_err(|e| RuntimeError::new(format!("import: '{collection}' id={id_display}: {e}")))?;
         Ok(())
@@ -3838,13 +3925,13 @@ db { users: User[] }
         }
         let id_col = self.id_col(collection);
         let rows = self
-            .backend
+            .backend()
             .query(&format!("SELECT MAX(\"{id_col}\") FROM \"{collection}\""), &[], &[ColumnKind::Int])
             .map_err(|e| RuntimeError::new(format!("resync de secuencia de '{collection}' falló: {e}")))?;
         let Some(Cell::Int(max_id)) = rows.first().and_then(|r| r.first()) else {
             return Ok(()); // tabla vacía -- MAX(id) es NULL, nada que resincronizar
         };
-        match &self.backend {
+        match &self.backend() {
             Backend::Sqlite(_) => {
                 // `sqlite_sequence` solo existe para columnas `INTEGER
                 // PRIMARY KEY AUTOINCREMENT` (exactamente lo que
@@ -3858,7 +3945,7 @@ db { users: User[] }
                 // creada por `import` nunca hizo un insert autoincremental
                 // antes, así que `sqlite_sequence` no la conoce todavía).
                 let existing = self
-                    .backend
+                    .backend()
                     .query("SELECT seq FROM sqlite_sequence WHERE name = ?", &[Cell::Text(collection.to_string())], &[
                         ColumnKind::Int,
                     ])
@@ -3866,7 +3953,7 @@ db { users: User[] }
                 match existing.first().and_then(|r| r.first()) {
                     Some(Cell::Int(seq)) if *seq >= *max_id => {}
                     Some(_) => {
-                        self.backend
+                        self.backend()
                             .execute("UPDATE sqlite_sequence SET seq = ? WHERE name = ?", &[
                                 Cell::Int(*max_id),
                                 Cell::Text(collection.to_string()),
@@ -3874,7 +3961,7 @@ db { users: User[] }
                             .map_err(|e| RuntimeError::new(format!("resync de secuencia de '{collection}' falló: {e}")))?;
                     }
                     None => {
-                        self.backend
+                        self.backend()
                             .execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", &[
                                 Cell::Text(collection.to_string()),
                                 Cell::Int(*max_id),
@@ -3889,7 +3976,7 @@ db { users: User[] }
                 // `BIGSERIAL`, `postgres_emit.rs`) -- la forma oficial y a
                 // prueba de quoting de resolver la secuencia real de una
                 // columna serial.
-                self.backend
+                self.backend()
                     .execute("SELECT setval(pg_get_serial_sequence($1, $2), $3)", &[
                         Cell::Text(format!("\"{collection}\"")),
                         Cell::Text(id_col.to_string()),
@@ -3933,7 +4020,7 @@ db { users: User[] }
         let sql = match id {
             Some(id_cell) => {
                 params.push(id_cell);
-                let mut conds = vec![format!("\"{id_col}\" = {}", self.backend.placeholder(params.len()))];
+                let mut conds = vec![format!("\"{id_col}\" = {}", self.backend().placeholder(params.len()))];
                 if let Some(t) = self.tenant_condition(collection, &mut params)? {
                     conds.push(t);
                 }
@@ -3950,7 +4037,7 @@ db { users: User[] }
         kinds.extend(columns.iter().map(ColumnPlan::kind));
 
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
@@ -3975,7 +4062,7 @@ db { users: User[] }
         let id_col = self.id_col(collection);
         let mut col_list = vec![format!("\"{id_col}\"")];
         col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
-        let placeholders: Vec<String> = (1..=ids.len()).map(|i| self.backend.placeholder(i)).collect();
+        let placeholders: Vec<String> = (1..=ids.len()).map(|i| self.backend().placeholder(i)).collect();
         let mut params: Vec<Cell> = ids.to_vec();
         let mut conds = vec![format!("\"{id_col}\" IN ({})", placeholders.join(", "))];
         if let Some(t) = self.tenant_condition(collection, &mut params)? {
@@ -3985,7 +4072,7 @@ db { users: User[] }
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
@@ -4079,7 +4166,7 @@ db { users: User[] }
             .iter()
             .find(|c| c.field.name == field)
             .ok_or_else(|| RuntimeError::new(format!("'nearest': '{field}' no es una columna real de '{collection}'")))?;
-        match &self.backend {
+        match &self.backend() {
             Backend::Postgres(..) => {
                 let id_col = self.id_col(collection);
                 let mut col_list = vec![format!("\"{id_col}\"")];
@@ -4090,8 +4177,8 @@ db { users: User[] }
                     "SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{}\" <=> {} LIMIT {}",
                     col_list.join(", "),
                     col.sql_name,
-                    self.backend.placeholder(1),
-                    self.backend.placeholder(2)
+                    self.backend().placeholder(1),
+                    self.backend().placeholder(2)
                 );
                 self.query_rows(collection, columns, &sql, &params)
             }
@@ -4138,7 +4225,7 @@ db { users: User[] }
     /// correcto, más lento, mismo criterio de fallback ya documentado para
     /// `Vector<N>`.
     fn search(&self, collection: &str, columns: &[ColumnPlan], searchable_cols: &[String], query: &str) -> Result<Vec<Value>, RuntimeError> {
-        match &self.backend {
+        match &self.backend() {
             Backend::Postgres(..) => {
                 let id_col = self.id_col(collection);
                 let mut col_list = vec![format!("\"{id_col}\"")];
@@ -4146,7 +4233,7 @@ db { users: User[] }
                 let tsvector_expr = search_tsvector_expr(searchable_cols);
                 let mut params: Vec<Cell> = vec![Cell::Text(query.to_string())];
                 let base = self.base_where(collection, &mut params)?;
-                let placeholder = self.backend.placeholder(1);
+                let placeholder = self.backend().placeholder(1);
                 let match_expr = format!("{tsvector_expr} @@ plainto_tsquery('simple', {placeholder})");
                 let where_clause =
                     if base.is_empty() { format!("WHERE {match_expr} ") } else { format!("{base}AND {match_expr} ") };
@@ -4207,7 +4294,7 @@ db { users: User[] }
                 let where_clause = self.base_where(collection, &mut params)?;
                 let sql = format!("SELECT COUNT(*) FROM \"{collection}\" {where_clause}");
                 let rows = self
-                    .backend
+                    .backend()
                     .query(&sql, &params, &[ColumnKind::Int])
                     .map_err(|e| RuntimeError::new(format!("error en count de '{collection}': {e}")))?;
                 match rows.first().and_then(|r| r.first()) {
@@ -4276,7 +4363,7 @@ db { users: User[] }
         let mut conds = Vec::new();
         for (sql_col, cell) in pk_values {
             params.push(cell.clone());
-            conds.push(format!("\"{sql_col}\" = {}", self.backend.placeholder(params.len())));
+            conds.push(format!("\"{sql_col}\" = {}", self.backend().placeholder(params.len())));
         }
         if let Some(t) = self.tenant_condition(collection, &mut params)? {
             conds.push(t);
@@ -4284,7 +4371,7 @@ db { users: User[] }
         let sql = format!("SELECT {} FROM \"{collection}\" WHERE {}", col_list.join(", "), conds.join(" AND "));
         let kinds: Vec<ColumnKind> = columns.iter().map(ColumnPlan::kind).collect();
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.decode_composite_row(collection, cells, columns).map(Value::Struct)).collect()
@@ -4303,7 +4390,7 @@ db { users: User[] }
         let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}ORDER BY {order_by}", col_list.join(", "));
         let kinds: Vec<ColumnKind> = columns.iter().map(ColumnPlan::kind).collect();
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.decode_composite_row(collection, cells, columns).map(Value::Struct)).collect()
@@ -4338,9 +4425,9 @@ db { users: User[] }
             col_names.push(format!("\"{}\"", col.sql_name));
             params.push(self.write_param(col, slot)?);
         }
-        let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend.placeholder(n)).collect();
+        let placeholders: Vec<String> = (1..=col_names.len()).map(|n| self.backend().placeholder(n)).collect();
         let sql = format!("INSERT INTO \"{collection}\" ({}) VALUES ({})", col_names.join(", "), placeholders.join(", "));
-        self.backend.execute(&sql, &params).map_err(|e| write_error("insert", e))?;
+        self.backend().execute(&sql, &params).map_err(|e| write_error("insert", e))?;
         let pk_values = self.composite_pk_cells(collection, columns, pk, value)?;
         let inserted = self
             .composite_select(collection, columns, &pk_values)?
@@ -4365,26 +4452,26 @@ db { users: User[] }
                 let mut conds = vec![format!("\"{soft_col}\" IS NULL")];
                 for (sql_col, cell) in &pk_values {
                     params.push(cell.clone());
-                    conds.push(format!("\"{sql_col}\" = {}", self.backend.placeholder(params.len())));
+                    conds.push(format!("\"{sql_col}\" = {}", self.backend().placeholder(params.len())));
                 }
                 if let Some(t) = self.tenant_condition(collection, &mut params)? {
                     conds.push(t);
                 }
-                let sql = format!("UPDATE \"{collection}\" SET \"{soft_col}\" = {} WHERE {}", self.backend.placeholder(1), conds.join(" AND "));
-                self.backend.execute(&sql, &params).map_err(|e| write_error("delete (soft)", e))?
+                let sql = format!("UPDATE \"{collection}\" SET \"{soft_col}\" = {} WHERE {}", self.backend().placeholder(1), conds.join(" AND "));
+                self.backend().execute(&sql, &params).map_err(|e| write_error("delete (soft)", e))?
             }
             None => {
                 let mut params: Vec<Cell> = Vec::new();
                 let mut conds = Vec::new();
                 for (sql_col, cell) in &pk_values {
                     params.push(cell.clone());
-                    conds.push(format!("\"{sql_col}\" = {}", self.backend.placeholder(params.len())));
+                    conds.push(format!("\"{sql_col}\" = {}", self.backend().placeholder(params.len())));
                 }
                 if let Some(t) = self.tenant_condition(collection, &mut params)? {
                     conds.push(t);
                 }
                 let sql = format!("DELETE FROM \"{collection}\" WHERE {}", conds.join(" AND "));
-                self.backend.execute(&sql, &params).map_err(|e| write_error("delete", e))?
+                self.backend().execute(&sql, &params).map_err(|e| write_error("delete", e))?
             }
         };
         if rows_affected > 0 {
@@ -4418,20 +4505,20 @@ db { users: User[] }
                 continue;
             }
             let Some(col) = columns.iter().find(|c| &c.field.name == name) else { continue };
-            set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend.placeholder(params.len() + 1)));
+            set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend().placeholder(params.len() + 1)));
             params.push(self.write_param(col, Some(value))?);
         }
         if !set_clauses.is_empty() {
             let mut conds = Vec::new();
             for (sql_col, cell) in &pk_values {
                 params.push(cell.clone());
-                conds.push(format!("\"{sql_col}\" = {}", self.backend.placeholder(params.len())));
+                conds.push(format!("\"{sql_col}\" = {}", self.backend().placeholder(params.len())));
             }
             if let Some(t) = self.tenant_condition(collection, &mut params)? {
                 conds.push(t);
             }
             let sql = format!("UPDATE \"{collection}\" SET {} WHERE {}", set_clauses.join(", "), conds.join(" AND "));
-            self.backend.execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
+            self.backend().execute(&sql, &params).map_err(|e| write_error("applyPatch", e))?;
         }
         let updated = self
             .composite_select(collection, columns, &pk_values)?
@@ -4546,7 +4633,7 @@ db { users: User[] }
             }
             self.write_param(col, Some(value)).ok()?
         };
-        let clause = format!("\"{sql_col}\" {sql_op} {}", self.backend.placeholder(cells.len() + 1));
+        let clause = format!("\"{sql_col}\" {sql_op} {}", self.backend().placeholder(cells.len() + 1));
         cells.push(cell);
         Some(clause)
     }
@@ -4652,7 +4739,7 @@ fn escape_like_wildcards(s: &str) -> String {
                 }
                 self.write_param(col, Some(val)).ok()?
             };
-            placeholders.push(self.backend.placeholder(cells.len() + 1));
+            placeholders.push(self.backend().placeholder(cells.len() + 1));
             cells.push(cell);
         }
 
@@ -4692,7 +4779,7 @@ fn escape_like_wildcards(s: &str) -> String {
         };
 
         let not_kw = if negated { "NOT " } else { "" };
-        let ph = self.backend.placeholder(cells.len() + 1);
+        let ph = self.backend().placeholder(cells.len() + 1);
         cells.push(Cell::Text(like_val));
         Some(format!("\"{sql_col}\" {not_kw}LIKE {ph} ESCAPE '\\'"))
     }
@@ -4796,7 +4883,7 @@ fn escape_like_wildcards(s: &str) -> String {
             if col.json || col.encrypted {
                 return Ok(None);
             }
-            set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend.placeholder(params.len() + 1)));
+            set_clauses.push(format!("\"{}\" = {}", col.sql_name, self.backend().placeholder(params.len() + 1)));
             params.push(self.write_param(col, Some(value))?);
         }
 
@@ -4809,7 +4896,7 @@ fn escape_like_wildcards(s: &str) -> String {
         };
 
         let sql = format!("UPDATE \"{collection}\" SET {} WHERE {where_clause}", set_clauses.join(", "));
-        let affected = self.backend.execute(&sql, &params).map_err(|e| write_error("updateWhere", e))?;
+        let affected = self.backend().execute(&sql, &params).map_err(|e| write_error("updateWhere", e))?;
         Ok(Some(affected))
     }
 
@@ -4828,7 +4915,7 @@ fn escape_like_wildcards(s: &str) -> String {
         };
         let sql = format!("SELECT COUNT(*) FROM \"{collection}\" WHERE {where_clause}");
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &cells, &[ColumnKind::Int])
             .map_err(|e| RuntimeError::new(format!("error en countWhere de '{collection}': {e}")))?;
         match rows.first().and_then(|r| r.first()) {
@@ -4854,7 +4941,7 @@ fn escape_like_wildcards(s: &str) -> String {
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &cells, &kinds)
             .map_err(|e| RuntimeError::new(format!("error en findWhere de '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect::<Result<Vec<_>, _>>().map(Some)
@@ -4881,14 +4968,14 @@ fn escape_like_wildcards(s: &str) -> String {
         let sql = format!(
             "SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{id_col}\" LIMIT {} OFFSET {}",
             col_list.join(", "),
-            self.backend.placeholder(1),
-            self.backend.placeholder(2)
+            self.backend().placeholder(1),
+            self.backend().placeholder(2)
         );
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
 
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
@@ -4915,7 +5002,7 @@ fn escape_like_wildcards(s: &str) -> String {
         let mut conds = Vec::new();
         if let Some(id) = after {
             params.push(Cell::Int(id));
-            conds.push(format!("\"{id_col}\" > {}", self.backend.placeholder(params.len())));
+            conds.push(format!("\"{id_col}\" > {}", self.backend().placeholder(params.len())));
         }
         if let Some(sd) = self.soft_delete_where(collection) {
             conds.push(sd);
@@ -4928,13 +5015,13 @@ fn escape_like_wildcards(s: &str) -> String {
         // (si corresponde) y del tenant (si corresponde) -- mismo criterio
         // que el resto de los helpers de esta sección.
         params.push(Cell::Int(limit));
-        let limit_ph = self.backend.placeholder(params.len());
+        let limit_ph = self.backend().placeholder(params.len());
         let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}ORDER BY \"{id_col}\" LIMIT {limit_ph}", col_list.join(", "));
         let mut kinds = vec![ColumnKind::Int];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
 
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
@@ -5022,7 +5109,7 @@ fn escape_like_wildcards(s: &str) -> String {
         // y GROUP BY (portable en los dos motores; referenciar el alias
         // "key" en GROUP BY no es seguro en todo dialecto/versión).
         let key_expr = match granularity {
-            Some(g) => truncate_timestamp_sql(&key_col.sql_name, g, self.backend.is_postgres()),
+            Some(g) => truncate_timestamp_sql(&key_col.sql_name, g, self.backend().is_postgres()),
             None => format!("\"{}\"", key_col.sql_name),
         };
         let mut params: Vec<Cell> = Vec::new();
@@ -5031,7 +5118,7 @@ fn escape_like_wildcards(s: &str) -> String {
             format!("SELECT {key_expr} AS \"key\", {value_expr} AS \"value\" FROM \"{collection}\" {where_clause}GROUP BY {key_expr}");
         let kinds = vec![key_col.kind(), value_kind];
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter()
@@ -5104,8 +5191,8 @@ fn escape_like_wildcards(s: &str) -> String {
         let sql = format!(
             "SELECT {} FROM \"{collection}\" {where_clause}{order_by} LIMIT {} OFFSET {}",
             self.select_list(collection, columns),
-            self.backend.placeholder(1),
-            self.backend.placeholder(2)
+            self.backend().placeholder(1),
+            self.backend().placeholder(2)
         );
         self.query_rows(collection, columns, &sql, &params)
     }
@@ -5172,7 +5259,7 @@ fn escape_like_wildcards(s: &str) -> String {
 
                 let sql = format!("SELECT \"{sql_col}\" FROM \"{collection}\" {where_clause}{order_by}");
                 let rows = self
-                    .backend
+                    .backend()
                     .query(&sql, &params, &[col_kind])
                     .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
 
@@ -5224,7 +5311,7 @@ fn escape_like_wildcards(s: &str) -> String {
 
                 let sql = format!("SELECT {} FROM \"{collection}\" {where_clause}{order_by}", sql_cols.join(", "));
                 let rows = self
-                    .backend
+                    .backend()
                     .query(&sql, &params, &kinds)
                     .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
 
@@ -5276,7 +5363,7 @@ fn escape_like_wildcards(s: &str) -> String {
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
-            .backend
+            .backend()
             .query(sql, params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         rows.iter().map(|cells| self.row_to_fields(collection, cells, columns).map(Value::Struct)).collect()
@@ -5310,7 +5397,7 @@ fn escape_like_wildcards(s: &str) -> String {
         let mut kinds = vec![self.id_column_kind(collection)];
         kinds.extend(columns.iter().map(ColumnPlan::kind));
         let rows = self
-            .backend
+            .backend()
             .query(&sql, &params, &kinds)
             .map_err(|e| RuntimeError::new(format!("error de SQL en '{collection}': {e}")))?;
         match rows.into_iter().next() {
@@ -5348,13 +5435,13 @@ fn escape_like_wildcards(s: &str) -> String {
         // dato ajeno ya quedó mutado. Aislamiento total significa que la
         // ESCRITURA en sí nunca toca una fila fuera del tenant actual.
         let mut params = vec![Cell::Int(delta), id_cell.clone()];
-        let mut conds = vec![format!("\"{id_col}\" = {}", self.backend.placeholder(2))];
+        let mut conds = vec![format!("\"{id_col}\" = {}", self.backend().placeholder(2))];
         if let Some(t) = self.tenant_condition(collection, &mut params)? {
             conds.push(t);
         }
         let sql =
-            format!("UPDATE \"{collection}\" SET \"{}\" = \"{}\" + {} WHERE {}", col.sql_name, col.sql_name, self.backend.placeholder(1), conds.join(" AND "));
-        self.backend.execute(&sql, &params).map_err(|e| write_error("increment", e))?;
+            format!("UPDATE \"{collection}\" SET \"{}\" = \"{}\" + {} WHERE {}", col.sql_name, col.sql_name, self.backend().placeholder(1), conds.join(" AND "));
+        self.backend().execute(&sql, &params).map_err(|e| write_error("increment", e))?;
         let updated = self
             .select_rows(collection, columns, Some(id_cell))?
             .into_iter()
@@ -6434,7 +6521,7 @@ mod composite_index_tests {
         let program = crate::parser::parse(crate::lexer::tokenize(src).unwrap()).unwrap();
         let db = Db::new(&program, std::path::Path::new(":memory:"));
         let names: Vec<String> = db
-            .backend
+            .backend()
             .query("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'tasks'", &[], &[ColumnKind::Text])
             .unwrap()
             .into_iter()
