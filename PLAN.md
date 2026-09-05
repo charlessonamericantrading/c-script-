@@ -1066,6 +1066,24 @@ Ninguna es grande (`skynet_knowledge` 293 filas, `messages` 162, el resto < 100)
 
 ---
 
+### 9.22 Hoja de ruta derivada del informe "c-script para Instagram" (04/09/2026)
+
+**Origen**: con §9.21 (capa de Base de Datos) recién cerrado, pedido del usuario de un análisis extenso de qué le faltaría al lenguaje para soportar un backend del tamaño y la forma de Instagram -- no como plan de producto real, sino como caso de estiramiento máximo para encontrar brechas genuinas. El informe completo (verificado contra el binario real, no contra intención documentada) quedó publicado como artefacto; esta sección trackea la ejecución de su hoja de ruta priorizada, en el mismo formato que el resto de este documento.
+
+**Los 8 ítems del informe, en el orden priorizado que propuso (por valor de desbloqueo, no por dificultad)**:
+1. **Réplicas de lectura con enrutamiento read/write** -- el techo de escala más inmediato dado el ratio lectura:escritura de un feed. Ya anotado como bloqueado en §9.12 hasta diseño aprobado -- **[decisión del usuario]**, pendiente. Esfuerzo M.
+2. **`@background` + tabla de jobs** -- diseño v1 ya escrito en §9.18 Eje F ítem 3, patrón de reemplazo ya validado en la práctica por "Approvals sin WebSocket" (§9.20 ítem 9). **[decisión del usuario]**, pendiente. Esfuerzo L.
+3. ~~**Caché distribuido para `@cache` vía Postgres**~~ **HECHO (05/09/2026, v1.204.0, GRAMMAR.md §3.256)**: mismo playbook exacto que el rate limiter distribuido (§3.178) -- tabla interna `_linkc_internal_cache`, sin flag ni sintaxis nueva, degradación en capas a memoria local. Sin dependencia nueva. Esfuerzo S-M.
+4. **Búsqueda de texto completo (`tsvector`/GIN nativo de Postgres)** -- mismo espíritu "nativo de la base" que ya justificó `Vector<N>`, sin dependencia nueva. Sin decisión de diseño bloqueante -- siguiente candidato natural de esta ronda. Esfuerzo M.
+5. **Procesamiento de imagen (miniaturas primero)** -- necesita evaluar una crate de imagen bajo el mismo criterio que ya justificó `pdf-writer`/`rust_xlsxwriter` (§3.201/§3.202). Esfuerzo M-L.
+6. **Notificaciones push (FCM/APNs)** -- plausiblemente el mismo patrón que ya cerró Stripe/SendGrid (`http.postWithHeaders` + Bearer), pero hay que verificar el primitivo de firma exacto que exige cada proveedor (FCM HTTP v1 puede necesitar un JWT de cuenta de servicio RS256; APNs, un token de proveedor ES256 -- ninguno de los dos confirmado como ya cubierto por los primitivos de `crypto.*` actuales) antes de prometerlo cerrado. Esfuerzo S-M.
+7. **Versionado de API a nivel de contrato** -- decisión de diseño propia (¿prefijo de ruta? ¿`@version`? ¿contratos paralelos?). **[decisión del usuario]**, pendiente. Esfuerzo M.
+8. **Particionado horizontal (sharding)** -- el ítem más grande, ya marcado bloqueado en §9.12 hasta diseño aprobado, y correctamente último: recién tiene sentido con datos reales de uso del ítem 1. **[decisión del usuario]**, pendiente. Esfuerzo XL.
+
+**Fuera de alcance a propósito** (mismo criterio "límites honestos" que el resto de este documento, no un olvido): transcodificación de video/streaming adaptativo, CDN, entrenamiento de modelos de ML (`ai.*` es inferencia local, no training) y motor de ranking/subasta de anuncios -- los cuatro son disciplinas propias que un backend de aplicación debería llamar, nunca reimplementar.
+
+---
+
 ### Sobre el nombre
 
 Decidido: **c-script**, en minúsculas. La extensión de archivo (`.link`) y el nombre del binario del compilador (`linkc`) se mantienen como está — no hace falta que deletreen la marca, igual que `.rs` no dice "rust". Ver [GRAMMAR.md](GRAMMAR.md) para el resto de las convenciones de nomenclatura.

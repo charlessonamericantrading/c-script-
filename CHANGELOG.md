@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.204.0] - 2026-09-05
+
+### ✨ Añadido
+**`@cache` distribuido vía Postgres (PLAN.md §9.22 ítem 3, cierra el primer ítem de la hoja de ruta del informe "c-script para Instagram")**: mismo playbook exacto que §3.178 (`@rate_limit` distribuido), aplicado a `@cache("Ns"/"Nm"/"Nh"/"Nd")` -- sin flag ni sintaxis nueva. Con más de una instancia de `linkc serve`/`serve-all` compartiendo la misma base Postgres, la entrada vive en una tabla interna (`_linkc_internal_cache`, mismo prefijo reservado que la de rate limiting) en vez de un `CacheStore` por proceso: la SEGUNDA instancia que recibe la misma llamada ve el hit de la primera en vez de recalcular. A diferencia del rate limiter (un UPSERT con el cálculo del token bucket adentro), una entrada de cache es de solo-reemplazo -- un `SELECT`/`INSERT ... ON CONFLICT DO UPDATE` planos alcanzan, sin ninguna carrera que importe. SQLite sigue igual que siempre (en memoria). Degradación en capas: `--adopt-existing` sin la tabla ya creada, o un fallo de lectura, caen al `CacheStore` en memoria de siempre; un fallo de ESCRITURA además graba la entrada en memoria local como red de contención. Ver GRAMMAR.md §3.256.
+
 ## [1.203.2] - 2026-09-04
 
 ### 🔧 Proceso

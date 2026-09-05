@@ -9050,6 +9050,33 @@ test "PK compuesta -- insert, find por struct, all" {
 
 **Verificado**: `compiler/tests/cli_primary_key_annotation.rs` (11 tests: rechazos del checker -- menos de 2 campos, campo repetido, campo inexistente, tipo no soportado, campo opcional, `@primaryKey` declarado dos veces, un método no soportado sobre PK compuesta --, el contrato TypeScript emitiendo el id compuesto como struct inline, y dos servidores reales sobre SQLite -- ciclo CRUD completo con `applyPatch` ignorando un intento de tocar la PK y `delete` idempotente, más un reinicio confirmando que el DDL `PRIMARY KEY (...)` sigue matcheando); `compiler/tests/pg_integration.rs` (`composite_primary_key_supports_the_full_crud_cycle_against_a_real_postgres_table`: el `PRIMARY KEY (...)` físico leído de `pg_index`/`pg_attribute` en el orden declarado, sin ninguna columna "id" propia, mismo ciclo CRUD completo contra Postgres real).
 
+### 3.256 `@cache` distribuido vía Postgres — RESUELTO, cierra el ítem 3 de la hoja de ruta del informe "c-script para Instagram" (PLAN.md §9.22)
+
+`@cache("60s")` (§3.144) era, igual que `@rate_limit` antes de §3.178, un `CacheStore` en memoria por PROCESO -- con más de una instancia de `linkc serve`/`serve-all` detrás de un balanceador, cada una cachea por su cuenta: ni consistencia (una instancia puede servir un hit viejo mientras otra ya recalculó) ni el ahorro de trabajo esperado (`N` instancias recalculan el mismo resultado `N` veces en vez de una). Mismo gap, mismo remedio: reusar el playbook exacto que §3.178 ya probó, no inventar uno nuevo.
+
+**Sin flag nuevo, sin cambio de sintaxis -- `@cache("Ns"/"Nm"/"Nh"/"Nd")` es exactamente el mismo de siempre.** Lo que cambia es DÓNDE vive la entrada: una tabla interna, `_linkc_internal_cache` (mismo prefijo reservado que `_linkc_internal_rate_limits`, nunca colisiona con una colección declarada por el usuario), creada automáticamente al conectar contra Postgres -- invisible para `db {}`/`linkc introspect`/`linkc migrate`, igual que su análoga de rate limiting. SQLite sigue exactamente igual que siempre -- un solo proceso ya tiene el estado exacto en memoria.
+
+<!-- linkc:check -->
+```rust
+type Stat = { id: Int, n: Int }
+db { stats: Stat[] }
+service Stats {
+  @cache("60s")
+  rpc summary() -> Int {
+    db.stats.insert(Stat { id: 0, n: 1 });
+    db.stats.all().length()
+  }
+}
+```
+
+**Una lectura y una escritura simples, no el UPSERT-con-cálculo-adentro del rate limiter.** La diferencia de fondo con §3.178: una entrada de `@cache` es un valor de solo-REEMPLAZO -- nunca se combina aritméticamente con el anterior, a diferencia de "tokens restantes", que sí depende del valor previo para decidir el nuevo. Un `SELECT ... WHERE expires_at_ms > ahora` para leer y un `INSERT ... ON CONFLICT ("cache_key") DO UPDATE` plano para escribir alcanzan sin ninguna carrera que importe: el peor caso de dos escrituras casi simultáneas a la misma clave es que gane la última, exactamente el mismo comportamiento que ya tenía el `CacheStore` en memoria bajo un solo `Mutex`.
+
+**Degradación por capas, nunca un servidor que no arranca ni una respuesta sin cachear.** `--adopt-existing` nunca ejecuta DDL, ni siquiera para esta tabla propia -- si no existe ya, esta instancia cae al `CacheStore` en memoria de siempre. Fuera de ese modo, si la creación falla (rol sin permiso de `CREATE TABLE`), el arranque no aborta, solo se degrada con una advertencia por stderr. Un fallo puntual de LECTURA cae al `CacheStore` en memoria para ESE check; un fallo puntual de ESCRITURA además graba igual la entrada en el `CacheStore` en memoria (red de contención: esta instancia sigue sirviendo el hit local mientras el problema de infra no se resuelve, en vez de terminar sin cachear nada en ningún lado).
+
+**Límite honesto, deliberado**: la clave sigue siendo `(servicio, rpc, argumentos-como-JSON)`, sin namespace explícito -- mismo límite ya aceptado en §3.178 para el bucket del rate limiter, y por el mismo motivo: sin evidencia de demanda real de correr dos `.link` distintos con el mismo par (servicio, rpc) contra la misma base.
+
+**Verificado contra Postgres real** (`pg_integration.rs`): dos instancias `linkc serve` reales apuntando a la MISMA base -- la primera ejecuta el cuerpo de un `@cache("60s")` (una fila real insertada), la segunda recibe el HIT de la primera sin ejecutar el cuerpo de nuevo (una sola fila total, confirmado por un rpc sin `@cache` que cuenta filas de verdad); vencido el TTL, la siguiente llamada vuelve a correr el cuerpo (segunda fila real); `--adopt-existing` sin la tabla interna preexistente sirve normal en modo memoria local y confirma que la tabla nunca se creó.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

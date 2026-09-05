@@ -1665,6 +1665,128 @@ fn adopt_existing_falls_back_to_in_memory_rate_limiting_without_the_internal_tab
     assert!(!exists, "--adopt-existing nunca debe haber creado la tabla interna");
 }
 
+/// `summary` inserta una fila real cada vez que CORRE de verdad -- `rowCount`
+/// (sin `@cache`) es lo que prueba que un hit nunca ejecutó el cuerpo de
+/// nuevo, no solo que devolvió un número parecido. Mismo programa que
+/// `CACHE_PROGRAM` en `server_http.rs` (proceso único); acá lo que importa es
+/// que DOS procesos distintos vean la MISMA fila insertada una sola vez.
+const CACHE_PROGRAM_LONG_TTL: &str = r#"
+type Stat = { id: Int, n: Int }
+db { stats: Stat[] }
+service Stats {
+    @cache("60s")
+    rpc summary() -> Int {
+        db.stats.insert(Stat { id: 0, n: 1 });
+        db.stats.all().length()
+    }
+    rpc rowCount() -> Int { db.stats.all().length() }
+}
+"#;
+
+const CACHE_PROGRAM_SHORT_TTL: &str = r#"
+type Stat = { id: Int, n: Int }
+db { stats: Stat[] }
+service Stats {
+    @cache("1s")
+    rpc summary() -> Int {
+        db.stats.insert(Stat { id: 0, n: 1 });
+        db.stats.all().length()
+    }
+    rpc rowCount() -> Int { db.stats.all().length() }
+}
+"#;
+
+#[test]
+fn distributed_cache_shares_hits_across_two_real_server_instances() {
+    // El punto entero de GRAMMAR.md §3.256: un `@cache("60s")` tiene que
+    // servir el MISMO resultado grabado por CUALQUIER instancia, no solo la
+    // que lo calculó -- que es exactamente lo que NO pasaría con el
+    // `CacheStore` en memoria de siempre, cada uno con su propio HashMap.
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"_linkc_internal_cache\"; DROP TABLE IF EXISTS \"stats\"");
+
+    let temp_a = TempDir::new("cache-distributed-a");
+    let temp_b = TempDir::new("cache-distributed-b");
+    let link_a = temp_a.write("app.link", CACHE_PROGRAM_LONG_TTL);
+    let link_b = temp_b.write("app.link", CACHE_PROGRAM_LONG_TTL);
+    // Arrancan una atrás de otra, mismo motivo que el rate limiter
+    // distribuido: la primera crea la tabla interna, la segunda la
+    // encuentra ya creada -- las dos terminan con `distributed_cache = true`
+    // de todos modos.
+    let server_a = Serve::start(&link_a, &url);
+    let server_b = Serve::start(&link_b, &url);
+
+    let first = server_a.rpc("Stats/summary", "{}");
+    assert_eq!(first, serde_json::json!(1), "la primera llamada corre el cuerpo de verdad: una fila insertada");
+
+    let second = server_b.rpc("Stats/summary", "{}");
+    assert_eq!(second, serde_json::json!(1), "la SEGUNDA instancia tiene que ver el hit de la primera, no recalcular");
+
+    let row_count = server_a.rpc("Stats/rowCount", "{}");
+    assert_eq!(row_count, serde_json::json!(1), "solo una fila real insertada entre las dos instancias -- el hit en B no ejecutó el cuerpo");
+}
+
+#[test]
+fn distributed_cache_expires_after_the_ttl_like_the_in_memory_store() {
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"_linkc_internal_cache\"; DROP TABLE IF EXISTS \"stats\"");
+
+    let temp = TempDir::new("cache-distributed-ttl");
+    let link = temp.write("app.link", CACHE_PROGRAM_SHORT_TTL);
+    let server = Serve::start(&link, &url);
+
+    assert_eq!(server.rpc("Stats/summary", "{}"), serde_json::json!(1));
+    assert_eq!(server.rpc("Stats/summary", "{}"), serde_json::json!(1), "dentro del TTL, hit -- sigue en 1");
+
+    std::thread::sleep(Duration::from_millis(1300)); // > 1s del TTL
+
+    assert_eq!(server.rpc("Stats/summary", "{}"), serde_json::json!(2), "vencido el TTL, corre de nuevo: segunda fila real");
+    assert_eq!(server.rpc("Stats/rowCount", "{}"), serde_json::json!(2));
+}
+
+#[test]
+fn adopt_existing_falls_back_to_in_memory_cache_without_the_internal_table() {
+    // `--adopt-existing` nunca ejecuta DDL, ni siquiera para la tabla
+    // interna de cache propia -- sin ella ya creada a mano, el servidor
+    // tiene que arrancar y servir requests normalmente (el `CacheStore` en
+    // memoria de siempre, degradado en silencio salvo por el
+    // `distributed_cache = false` interno), nunca un fallo de arranque por
+    // una tabla que ni siquiera es del usuario.
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"_linkc_internal_cache\"; DROP TABLE IF EXISTS \"stats\"");
+
+    let temp = TempDir::new("cache-adopt-existing");
+    let link = temp.write("app.link", CACHE_PROGRAM_LONG_TTL);
+    let server = Serve::start_with_args(&link, &url, &["--adopt-existing"]);
+
+    assert_eq!(server.rpc("Stats/summary", "{}"), serde_json::json!(1));
+    assert_eq!(server.rpc("Stats/summary", "{}"), serde_json::json!(1), "el cache en memoria sigue funcionando sin la tabla interna");
+
+    let exists = client
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = '_linkc_internal_cache')",
+            &[],
+        )
+        .map(|row| row.get::<_, bool>(0))
+        .unwrap_or(false);
+    assert!(!exists, "--adopt-existing nunca debe haber creado la tabla interna");
+}
+
 #[test]
 fn a_bad_connection_url_fails_with_a_message_instead_of_a_panic() {
     // Este no necesita base: prueba justamente el camino en que no hay ninguna.

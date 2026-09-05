@@ -1067,6 +1067,31 @@ fn create_rate_limit_table_sql() -> String {
     )
 }
 
+/// GRAMMAR.md §3.256: `@cache("60s")` DISTRIBUIDO -- mismo motivo y misma
+/// forma que `RATE_LIMIT_TABLE` arriba (tabla interna de prefijo reservado,
+/// compartida por todas las instancias contra la MISMA base Postgres, solo
+/// Postgres). La diferencia de fondo con el rate limiter: una entrada de
+/// cache es un valor de solo-REEMPLAZO (nunca se combina aritméticamente
+/// con el anterior, a diferencia de "tokens restantes"), así que no hace
+/// falta el mismo UPSERT-con-cálculo-adentro -- un `SELECT` para leer y un
+/// UPSERT plano para escribir alcanzan sin ninguna carrera que importe: el
+/// peor caso de dos escrituras casi simultáneas a la misma clave es que
+/// gane la última, exactamente el mismo comportamiento que ya tenía
+/// `CacheStore` en memoria bajo un solo `Mutex`.
+const CACHE_TABLE: &str = "_linkc_internal_cache";
+
+fn create_cache_table_sql() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS \"{CACHE_TABLE}\" (\
+            \"cache_key\" TEXT PRIMARY KEY, \
+            \"status\" INTEGER NOT NULL, \
+            \"body\" TEXT NOT NULL, \
+            \"content_type\" TEXT NOT NULL, \
+            \"expires_at_ms\" BIGINT NOT NULL\
+        )"
+    )
+}
+
 /// GRAMMAR.md §3.192: `table_schema = ANY(current_schemas(false))` -- antes
 /// hardcodeaba `table_schema = 'public'`, así que una tabla en cualquier
 /// OTRO schema (visible por el `search_path` real de la sesión) se
@@ -1549,6 +1574,11 @@ pub struct Db {
     /// caller (`runtime/server.rs`) cae al `RateLimiter` en memoria de
     /// siempre, comportamiento IDÉNTICO al de antes de esta ronda).
     distributed_rate_limit: bool,
+    /// GRAMMAR.md §3.256: igual que `distributed_rate_limit` arriba, pero
+    /// para la tabla interna de cache distribuido (`CACHE_TABLE`) que hace
+    /// cumplir `@cache("...")` compartido entre instancias en vez de un
+    /// `CacheStore` por proceso.
+    distributed_cache: bool,
 }
 
 /// Un cambio anunciado por OTRA instancia de `linkc serve` contra la misma
@@ -2082,10 +2112,11 @@ impl Db {
             soft_delete_fields,
             static_routes: crate::route::static_public_routes(program),
             outbound_http: parking_lot::Mutex::new(HashMap::new()),
-            // GRAMMAR.md §3.178: rate limiting distribuido es un concepto
-            // exclusivamente Postgres -- SQLite nunca lo necesita, un solo
-            // proceso ya tiene el estado exacto en memoria.
+            // GRAMMAR.md §3.178/§3.256: rate limiting y cache distribuidos
+            // son conceptos exclusivamente Postgres -- SQLite nunca los
+            // necesita, un solo proceso ya tiene el estado exacto en memoria.
             distributed_rate_limit: false,
+            distributed_cache: false,
         }
     }
 
@@ -2354,6 +2385,26 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
             }
         };
 
+        // GRAMMAR.md §3.256: mismo criterio exacto que `distributed_rate_limit`
+        // arriba -- `--adopt-existing` nunca ejecuta DDL propia, y un fallo
+        // al crear la tabla degrada a cache en memoria en vez de abortar el
+        // arranque del servidor por una tabla que ni siquiera es del usuario.
+        let distributed_cache = match adopt_existing {
+            true => postgres_table_exists(&backend, CACHE_TABLE).unwrap_or(false),
+            false => {
+                let ddl = create_cache_table_sql();
+                if let Err(e) = backend.execute_ddl(&ddl) {
+                    eprintln!(
+                        "advertencia: no se pudo crear la tabla interna '{CACHE_TABLE}' ({e}) -- \
+                         el cache de @cache correrá en modo memoria local, no coordinado entre instancias"
+                    );
+                    false
+                } else {
+                    true
+                }
+            }
+        };
+
         Ok((
             Db {
                 backend,
@@ -2383,6 +2434,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 static_routes: crate::route::static_public_routes(program),
                 outbound_http: parking_lot::Mutex::new(HashMap::new()),
                 distributed_rate_limit,
+                distributed_cache,
             },
             remote_rx,
         ))
@@ -2779,6 +2831,84 @@ db { users: User[] }
                 None
             }
         }
+    }
+
+    /// GRAMMAR.md §3.256: lectura de `@cache` DISTRIBUIDO. `None` si la
+    /// tabla no está disponible en este proceso (mismos motivos que
+    /// `check_rate_limit_distributed`: SQLite, `--adopt-existing` sin la
+    /// tabla ya creada, o la creación falló al conectar) -- el caller
+    /// (`runtime/server.rs`) cae al `CacheStore` en memoria de siempre.
+    /// `Some(None)` es un miss real (clave ausente o vencida) dentro de un
+    /// proceso que SÍ tiene la tabla lista; `Some(Some(..))` es un hit.
+    pub fn cache_get_distributed(&self, cache_key: &str) -> Option<Option<(u16, String, String)>> {
+        if !self.distributed_cache {
+            return None;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let sql = format!(
+            "SELECT \"status\", \"body\", \"content_type\" FROM \"{CACHE_TABLE}\" \
+             WHERE \"cache_key\" = $1 AND \"expires_at_ms\" > $2::bigint"
+        );
+        let params = vec![Cell::Text(cache_key.to_string()), Cell::Int(now_ms)];
+        match self.backend.query(&sql, &params, &[ColumnKind::Int, ColumnKind::Text, ColumnKind::Text]) {
+            Ok(rows) => match rows.into_iter().next() {
+                None => Some(None),
+                Some(row) => {
+                    let (Cell::Int(status), Cell::Text(body), Cell::Text(content_type)) = (&row[0], &row[1], &row[2]) else {
+                        return Some(None);
+                    };
+                    Some(Some((*status as u16, body.clone(), content_type.clone())))
+                }
+            },
+            Err(e) => {
+                // Mismo criterio que `check_rate_limit_distributed`: visible
+                // (stderr), nunca deja una request colgada por un problema
+                // de infra que no es culpa suya -- se degrada a un miss del
+                // cache en memoria de este proceso, nunca a un error 500.
+                eprintln!("advertencia: cache distribuido (@cache) falló al leer ({e}) -- esta request usó el cache en memoria de este proceso");
+                None
+            }
+        }
+    }
+
+    /// GRAMMAR.md §3.256: escritura de `@cache` DISTRIBUIDO. `false` si la
+    /// tabla no está disponible en este proceso O si el `INSERT` falló --
+    /// en cualquiera de los dos casos el caller ya escribe la MISMA entrada
+    /// en el `CacheStore` en memoria de este proceso como red de contención
+    /// (nunca hay una respuesta 2xx que termine sin quedar cacheada en
+    /// algún lado). Un UPSERT plano (`ON CONFLICT ... DO UPDATE`) alcanza
+    /// -- ver el comentario de `CACHE_TABLE` arriba sobre por qué esta
+    /// escritura no necesita el mismo cálculo atómico que el rate limiter.
+    pub fn cache_put_distributed(&self, cache_key: &str, status: u16, body: &str, content_type: &str, ttl: Duration) -> bool {
+        if !self.distributed_cache {
+            return false;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let expires_at_ms = now_ms.saturating_add(ttl.as_millis() as i64);
+        let sql = format!(
+            "INSERT INTO \"{CACHE_TABLE}\" (\"cache_key\", \"status\", \"body\", \"content_type\", \"expires_at_ms\") \
+             VALUES ($1, $2, $3, $4, $5::bigint) \
+             ON CONFLICT (\"cache_key\") DO UPDATE SET \
+                \"status\" = $2, \"body\" = $3, \"content_type\" = $4, \"expires_at_ms\" = $5::bigint"
+        );
+        let params = vec![
+            Cell::Text(cache_key.to_string()),
+            Cell::Int(status as i64),
+            Cell::Text(body.to_string()),
+            Cell::Text(content_type.to_string()),
+            Cell::Int(expires_at_ms),
+        ];
+        if let Err(e) = self.backend.execute(&sql, &params) {
+            eprintln!("advertencia: cache distribuido (@cache) falló al escribir ({e}) -- esta entrada solo quedó en el cache en memoria de este proceso");
+            return false;
+        }
+        true
     }
 
     /// `GET /metrics` (GRAMMAR.md §3.149): tamaño de la base en bytes, o

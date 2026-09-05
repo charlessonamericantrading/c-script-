@@ -1460,7 +1460,18 @@ fn handle_request(
     let cache_ttl = required_cache(program, service_name, rpc_name);
     let cache_key = cache_ttl.map(|_| args_json.to_string());
     if let (Some(_), Some(key)) = (cache_ttl, &cache_key) {
-        if let Some((status, body, content_type)) = cache_store.lock().get(service_name, rpc_name, key) {
+        // GRAMMAR.md §3.256: la clave distribuida incluye servicio+rpc (la
+        // tabla interna es compartida por TODO el programa, a diferencia
+        // del `CacheStore` en memoria que ya separa por esos dos campos en
+        // su propia clave compuesta) -- mismo separador `|` que ya usa
+        // `rate_limit.rs` para su `bucket_identity`, con la misma garantía
+        // de no colisión (ningún nombre de servicio/rpc real lo contiene).
+        let distributed_key = format!("{service_name}|{rpc_name}|{key}");
+        let hit = match db.cache_get_distributed(&distributed_key) {
+            Some(distributed_hit) => distributed_hit,
+            None => cache_store.lock().get(service_name, rpc_name, key),
+        };
+        if let Some((status, body, content_type)) = hit {
             let resp = cors_response_with_type(status, body, &content_type, &cors_headers, None, None, &request);
             let _ = request.respond(resp);
             log_done_with_audit(log, req_id, Some(&method), status, start, "cache=\"hit\"", auth_audit.as_ref());
@@ -1498,7 +1509,17 @@ fn handle_request(
     if let (Some(raw_ttl), Some(key)) = (cache_ttl, &cache_key) {
         if (200..300).contains(&status) {
             let ttl = crate::cache::parse_ttl(raw_ttl).expect("check_cache_annotation (checker.rs) ya validó este formato en compilación");
-            cache_store.lock().put(service_name, rpc_name, key, status, response_body.clone(), response_type.clone(), ttl);
+            // GRAMMAR.md §3.256: si el cache distribuido está disponible Y
+            // la escritura funcionó, listo -- todas las instancias ya ven
+            // esta entrada. Si no (SQLite, --adopt-existing sin la tabla, o
+            // un fallo transitorio), cae al `CacheStore` en memoria de
+            // siempre, para que esta instancia al menos siga sirviendo el
+            // hit local mientras el problema de infra no se resuelve.
+            let distributed_key = format!("{service_name}|{rpc_name}|{key}");
+            let wrote_distributed = db.cache_put_distributed(&distributed_key, status, &response_body, &response_type, ttl);
+            if !wrote_distributed {
+                cache_store.lock().put(service_name, rpc_name, key, status, response_body.clone(), response_type.clone(), ttl);
+            }
         }
     }
     // `response_body` en una falla es `{"error": "<mensaje>"}`
