@@ -400,6 +400,30 @@ pub(crate) fn tenant_field_by_collection(program: &Program, checker: &Checker) -
     result
 }
 
+/// Nombre de colección -> nombres de columna SQL física de sus campos
+/// `@searchable` (GRAMMAR.md §3.257), en el orden declarado -- mismo cruce
+/// que `index_fields_by_collection`, misma resolución de alias `@column`.
+/// Ausente del mapa (no `Vec::new()`) para una colección sin ningún campo
+/// así marcado, mismo criterio que `tenant_field_by_collection`.
+pub(crate) fn searchable_fields_by_collection(program: &Program, checker: &Checker) -> HashMap<String, Vec<String>> {
+    let mut result = HashMap::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let TypeExpr::Struct(fields) = &t.ty else { continue };
+            let cols: Vec<String> = fields.iter().filter(|f| f.searchable()).map(|f| f.column_name().unwrap_or(&f.name).to_string()).collect();
+            if !cols.is_empty() {
+                result.insert(coll_name.clone(), cols);
+            }
+        }
+    }
+    result
+}
+
 /// Un componente de una clave primaria COMPUESTA (`@primaryKey(...)`,
 /// GRAMMAR.md §3.255): su nombre lógico y su columna SQL física (alias
 /// `@column` si existe, mismo criterio que `FkRef`/`TenantField`). Sin un
@@ -1579,6 +1603,11 @@ pub struct Db {
     /// cumplir `@cache("...")` compartido entre instancias en vez de un
     /// `CacheStore` por proceso.
     distributed_cache: bool,
+    /// Nombre de colección -> columnas SQL de sus campos `@searchable`
+    /// (GRAMMAR.md §3.257) -- ausente (no `Vec::new()`) para una colección
+    /// sin ninguno. Calculado una vez al abrir la conexión, igual que
+    /// `tenant_fields`/`soft_delete_fields`.
+    searchable_fields: HashMap<String, Vec<String>>,
 }
 
 /// Un cambio anunciado por OTRA instancia de `linkc serve` contra la misma
@@ -2083,6 +2112,7 @@ impl Db {
         }
         let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
         let tenant_fields = tenant_field_by_collection(program, &checker);
+        let searchable_fields = searchable_fields_by_collection(program, &checker);
         let pool_size = pool_size.unwrap_or(Self::DEFAULT_SQLITE_READER_POOL_SIZE);
 
         Db {
@@ -2117,6 +2147,7 @@ impl Db {
             // necesita, un solo proceso ya tiene el estado exacto en memoria.
             distributed_rate_limit: false,
             distributed_cache: false,
+            searchable_fields,
         }
     }
 
@@ -2198,6 +2229,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
         let type_checks_by_collection_map = type_checks_by_collection(program, &checker);
         let refs_by_collection = ref_fields_by_collection(program, &checker, &aliases_by_collection);
         let tenant_fields = tenant_field_by_collection(program, &checker);
+        let searchable_fields = searchable_fields_by_collection(program, &checker);
         let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let empty_type_checks: Vec<String> = Vec::new();
@@ -2435,6 +2467,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 outbound_http: parking_lot::Mutex::new(HashMap::new()),
                 distributed_rate_limit,
                 distributed_cache,
+                searchable_fields,
             },
             remote_rx,
         ))
@@ -3126,6 +3159,15 @@ db { users: User[] }
                 };
                 let k = as_int(&it.next().ok_or_else(|| RuntimeError::new("nearest requiere 3 argumentos (selector, vec, k)"))?)?;
                 self.nearest(collection, columns, &field, query, k).map(Value::List)
+            }
+            "search" => {
+                let query = match args.into_iter().next() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(RuntimeError::new("'search' requiere 1 argumento (query: String)")),
+                };
+                let empty = Vec::new();
+                let searchable_cols = self.searchable_fields.get(collection).unwrap_or(&empty);
+                self.search(collection, columns, searchable_cols, &query).map(Value::List)
             }
             "increment" => self.increment(collection, columns, args),
             "find" => {
@@ -4069,6 +4111,84 @@ db { users: User[] }
                     .collect();
                 with_dist.sort_by(|(a, _), (b, _)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 Ok(with_dist.into_iter().take(k.max(0) as usize).map(|(_, row)| row).collect())
+            }
+        }
+    }
+
+    /// `db.<c>.search(query: String) -> List<T>` (GRAMMAR.md §3.257): las
+    /// filas cuyo texto `@searchable` combinado matchea `query` -- respeta
+    /// `@tenant`/`@softDelete` como cualquier otra lectura (vía
+    /// `base_where`, el mismo camino que `.all()`/`.nearest()`).
+    ///
+    /// Postgres empuja `to_tsvector('simple', coalesce(col1,'') || ' ' ||
+    /// coalesce(col2,'') || ...) @@ plainto_tsquery('simple', $1)`,
+    /// ordenado por `ts_rank(...)` descendente -- `'simple'` (sin stemming,
+    /// tokeniza por espacios/puntuación) a propósito, no un idioma
+    /// específico: el proyecto no le pide al `.link` elegir un idioma de
+    /// búsqueda, mismo criterio que "sin configuración seleccionable en
+    /// v1" ya documentado para otras piezas. Sin índice GIN todavía (mismo
+    /// criterio que `Vector<N>` sin HNSW, GRAMMAR.md §3.254): resultados
+    /// correctos, sin la aceleración de un índice, hasta que haya
+    /// evidencia real de que hace falta.
+    ///
+    /// SQLite no tiene FTS nativo habilitado (GRAMMAR.md §3.257, "Límites
+    /// honestos"): trae la colección entera y filtra en memoria por
+    /// substring de cada término en minúsculas (semántica AND, igual que
+    /// `plainto_tsquery`), ordenado por cantidad total de apariciones --
+    /// correcto, más lento, mismo criterio de fallback ya documentado para
+    /// `Vector<N>`.
+    fn search(&self, collection: &str, columns: &[ColumnPlan], searchable_cols: &[String], query: &str) -> Result<Vec<Value>, RuntimeError> {
+        match &self.backend {
+            Backend::Postgres(..) => {
+                let id_col = self.id_col(collection);
+                let mut col_list = vec![format!("\"{id_col}\"")];
+                col_list.extend(columns.iter().map(|c| format!("\"{}\"", c.sql_name)));
+                let tsvector_expr = search_tsvector_expr(searchable_cols);
+                let mut params: Vec<Cell> = vec![Cell::Text(query.to_string())];
+                let base = self.base_where(collection, &mut params)?;
+                let placeholder = self.backend.placeholder(1);
+                let match_expr = format!("{tsvector_expr} @@ plainto_tsquery('simple', {placeholder})");
+                let where_clause =
+                    if base.is_empty() { format!("WHERE {match_expr} ") } else { format!("{base}AND {match_expr} ") };
+                let sql = format!(
+                    "SELECT {} FROM \"{collection}\" {where_clause}ORDER BY ts_rank({tsvector_expr}, plainto_tsquery('simple', {placeholder})) DESC",
+                    col_list.join(", ")
+                );
+                self.query_rows(collection, columns, &sql, &params)
+            }
+            Backend::Sqlite(_) => {
+                let terms: Vec<String> = query.to_lowercase().split_whitespace().map(str::to_string).collect();
+                if terms.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let field_names: Vec<&str> = searchable_cols
+                    .iter()
+                    .filter_map(|sql_col| columns.iter().find(|c| &c.sql_name == sql_col))
+                    .map(|c| c.field.name.as_str())
+                    .collect();
+                let rows = self.select_rows(collection, columns, None)?;
+                let mut scored: Vec<(usize, Value)> = rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        let Value::Struct(fs) = &row else { return None };
+                        let haystack = field_names
+                            .iter()
+                            .filter_map(|name| fs.iter().find(|(n, _)| n == name))
+                            .filter_map(|(_, v)| match v {
+                                Value::Str(s) => Some(s.to_lowercase()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if !terms.iter().all(|t| haystack.contains(t.as_str())) {
+                            return None;
+                        }
+                        let score: usize = terms.iter().map(|t| haystack.matches(t.as_str()).count()).sum();
+                        Some((score, row))
+                    })
+                    .collect();
+                scored.sort_by(|(a, _), (b, _)| b.cmp(a));
+                Ok(scored.into_iter().map(|(_, row)| row).collect())
             }
         }
     }
@@ -5545,6 +5665,18 @@ fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
         return f32::INFINITY;
     }
     1.0 - (dot / (norm_a * norm_b))
+}
+
+/// `to_tsvector('simple', coalesce("col1",'') || ' ' || coalesce("col2",'') || ...)`
+/// -- combina todas las columnas `@searchable` de una colección en un solo
+/// texto buscable (GRAMMAR.md §3.257). `coalesce(...,'')` para que una
+/// columna en NULL no vuelva NULL a todo el `||` (Postgres: `NULL || x` es
+/// siempre `NULL`), mismo motivo que `coalesce` ya aparece en otras
+/// expresiones armadas por este archivo. Recibe al menos un elemento
+/// siempre -- `check_search` ya lo garantizó en compilación.
+fn search_tsvector_expr(searchable_cols: &[String]) -> String {
+    let parts: Vec<String> = searchable_cols.iter().map(|c| format!("coalesce(\"{c}\", '')")).collect();
+    format!("to_tsvector('simple', {})", parts.join(" || ' ' || "))
 }
 
 /// Expresión SQL que trunca un campo `Timestamp` (milisegundos-desde-epoch

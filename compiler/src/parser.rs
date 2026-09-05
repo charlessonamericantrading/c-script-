@@ -783,9 +783,21 @@ impl Parser {
                     };
                     annotations.push(FieldAnnotation::Tenant(claim));
                 }
+                // Sin paréntesis, mismo criterio que `@encrypted`/`@hidden`
+                // (GRAMMAR.md §3.257) -- a diferencia de esos dos, VARIOS
+                // campos del mismo `type` pueden llevarlo a la vez (se
+                // combinan en un solo texto buscable), así que acá solo se
+                // rechaza repetirlo sobre el MISMO campo, no su presencia en
+                // más de uno.
+                "searchable" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::Searchable)) {
+                        return Err(self.error("'@searchable' repetido sobre el mismo campo".to_string()));
+                    }
+                    annotations.push(FieldAnnotation::Searchable);
+                }
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)', '@encrypted', '@hidden', '@column(\"nombre\")', '@ref(Coleccion)' o '@tenant')"
+                        "anotación desconocida '@{other}' sobre un campo (se esperaba '@deprecated(\"motivo\")', '@validate(...)', '@autoUpdate', '@softDelete', '@index', '@unique', '@check(...)', '@encrypted', '@hidden', '@column(\"nombre\")', '@ref(Coleccion)', '@tenant' o '@searchable')"
                     )))
                 }
             }

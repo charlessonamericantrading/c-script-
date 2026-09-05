@@ -9077,6 +9077,62 @@ service Stats {
 
 **Verificado contra Postgres real** (`pg_integration.rs`): dos instancias `linkc serve` reales apuntando a la MISMA base -- la primera ejecuta el cuerpo de un `@cache("60s")` (una fila real insertada), la segunda recibe el HIT de la primera sin ejecutar el cuerpo de nuevo (una sola fila total, confirmado por un rpc sin `@cache` que cuenta filas de verdad); vencido el TTL, la siguiente llamada vuelve a correr el cuerpo (segunda fila real); `--adopt-existing` sin la tabla interna preexistente sirve normal en modo memoria local y confirma que la tabla nunca se creó.
 
+### 3.257 `@searchable` + `db.<c>.search(query)`: búsqueda de texto completo — RESUELTO, cierra el ítem 4 de la hoja de ruta del informe "c-script para Instagram" (PLAN.md §9.22)
+
+Origen: `PLAN.md §9.22` ítem 4, el siguiente candidato natural de la hoja de ruta después de §3.256 (caché distribuido) -- a diferencia de los ítems 1/2/7/8 de esa lista, este no necesitaba ninguna decisión de diseño previa del usuario: cómo marcar campos buscables ya tenía un patrón establecido (`@unique`/`@index`, anotación declarativa por campo) y la forma de retorno ya la había resuelto `Vector<N>` (`List<T>` liso, sin métrica adjunta, GRAMMAR.md §3.254) -- aplicar el mismo criterio acá era la opción consistente, no una bifurcación nueva.
+
+**Qué hay (v1.205.0)**:
+- **`@searchable`** (sin paréntesis) sobre uno o más campos `String`/`String?` de un `type` usado en `db {}`. A diferencia de `@tenant` (a lo sumo uno por struct), VARIOS campos pueden llevarlo a la vez -- todos se combinan en un solo texto buscable.
+- **`db.<c>.search(query: String) -> List<T>`**: sin selector -- busca automáticamente sobre TODOS los campos `@searchable` de la colección, mismo espíritu que `@tenant` filtrando sin que el caller nombre la columna. Necesita al menos un campo `@searchable` declarado; si no, error de compilación.
+- **Postgres**: empuja `to_tsvector('simple', coalesce("col1",'') || ' ' || coalesce("col2",'') || ...) @@ plainto_tsquery('simple', $1)`, ordenado por `ts_rank(...)` descendente. `'simple'` (sin stemming, tokeniza por espacios/puntuación) a propósito -- ningún idioma específico, el `.link` no elige uno.
+- **SQLite**: sin FTS nativo habilitado -- trae la colección entera y filtra en memoria por substring de cada término en minúsculas (semántica AND, igual que `plainto_tsquery`), ordenado por cantidad total de apariciones.
+- Respeta `@tenant`/`@softDelete` como cualquier otra lectura (vía `base_where`, el mismo camino que `.all()`/`.nearest()`). Incompatible con `@encrypted` en el mismo campo -- el texto cifrado nunca matchearía una búsqueda real.
+
+<!-- linkc:check -->
+```rust
+type Article = {
+  id: Int,
+  @searchable
+  title: String,
+  @searchable
+  body: String,
+}
+
+db {
+  articles: Article[],
+}
+
+service Articles {
+  rpc add(title: String, body: String) -> Article {
+    db.articles.insert(Article { id: 0, title: title, body: body })
+  }
+
+  rpc find(query: String) -> Article[] {
+    db.articles.search(query)
+  }
+}
+
+test "search combina title+body con semántica AND" {
+  Articles.add("Rust en producción", "una guía práctica de despliegue");
+  Articles.add("Guía de TypeScript", "tipos avanzados y genéricos");
+
+  let both = Articles.find("guía");
+  assert(both.length() == 2, "las dos filas tienen 'guía' en título o cuerpo");
+
+  let one = Articles.find("rust despliegue");
+  assert(one.length() == 1, "AND entre dos términos: solo la fila que tiene los dos");
+}
+```
+
+**Límites honestos**:
+- **Sin índice GIN todavía**: mismo criterio que `Vector<N>` sin HNSW (GRAMMAR.md §3.254) -- resultados correctos en Postgres, sin la aceleración de un índice, hasta que haya evidencia real de que hace falta a un volumen que lo justifique.
+- **`'simple'` fijo, sin configuración de idioma**: sin stemming (buscar "corriendo" no encuentra una fila con "correr") ni diccionarios de stopwords por idioma -- coincidencia de palabra tokenizada, no de raíz lingüística.
+- **SQLite es fuerza bruta**: sin índice, trae la colección entera a memoria en cada búsqueda -- correcto, más lento, suficiente para dev/test (mismo límite ya documentado para `Vector<N>` en SQLite).
+- **Sin ranking configurable ni resaltado (highlighting) de coincidencias** -- `ts_rank` con sus pesos por default, sin forma de ajustarlos desde el `.link`.
+- **Núcleo acotado**: solo `search(query)` -- sin combinarse con `findWhere`/`orderBy`/`select`/paginación en esta ronda, mismo criterio de alcance chico y sólido que el resto de los métodos de `db` nuevos de esta temporada.
+
+**Verificado**: `compiler/tests/cli_searchable_annotation.rs` (rechazos del checker -- campo no-`String`, `@searchable` repetido, incompatible con `@encrypted`, sobre una variante de enum, `search` sin ningún campo `@searchable` declarado, `search` con un argumento no-`String` --, un `test {}` real sobre SQLite confirmando semántica AND entre dos términos y case-insensitivity, y un servidor real sobre SQLite de punta a punta vía HTTP); `compiler/tests/pg_integration.rs` (`search_pushes_down_to_tsvector_and_plainto_tsquery_against_real_postgres`: mismo comportamiento AND contra el operador `@@`/`plainto_tsquery` reales de Postgres).
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

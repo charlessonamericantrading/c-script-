@@ -1351,7 +1351,8 @@ impl Checker {
                                 .chain(checker.check_field_checks(fields, &t.type_params))
                                 .chain(checker.check_field_columns(fields, &t.name))
                                 .chain(checker.check_field_refs(fields, &t.type_params, &t.name))
-                                .chain(checker.check_field_tenant(fields, &t.type_params, &t.name)),
+                                .chain(checker.check_field_tenant(fields, &t.type_params, &t.name))
+                                .chain(checker.check_field_searchable(fields, &t.type_params)),
                         );
                     }
                     for e in item_errors {
@@ -1376,6 +1377,7 @@ impl Checker {
                                 .chain(checker.check_field_columns_enum(fields))
                                 .chain(checker.check_field_refs_enum(fields))
                                 .chain(checker.check_field_tenant_enum(fields))
+                                .chain(checker.check_field_searchable_enum(fields))
                             {
                                 let mut e = e;
                                 if let Some(file) = file_for(index) {
@@ -3007,6 +3009,58 @@ impl Checker {
             }
         }
         errors
+    }
+
+    /// `@searchable` (GRAMMAR.md §3.257) solo sobre `String`/`String?` --
+    /// mismo motivo que `@encrypted` arriba (columna `TEXT` de siempre, sin
+    /// `ColumnKind` nuevo). Incompatible con `@encrypted` en el mismo campo:
+    /// el texto buscable tiene que ser el PLANO, y `to_tsvector`/la
+    /// comparación de substring de SQLite corren contra la columna física
+    /// directamente -- sobre ciphertext (nonce aleatorio distinto en cada
+    /// escritura) nunca matchearía nada real, una garantía falsa, no una
+    /// limitación honesta. A diferencia de `@tenant`, VARIOS campos del
+    /// mismo struct pueden llevar `@searchable` a la vez -- sin chequeo de
+    /// "a lo sumo uno" acá.
+    fn check_field_searchable(&self, fields: &[Field], type_params: &[String]) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        for f in fields {
+            if !f.searchable() {
+                continue;
+            }
+            if f.encrypted() {
+                errors.push(
+                    err(format!(
+                        "'@searchable' en el campo '{}': incompatible con '@encrypted' -- el texto cifrado (nonce aleatorio) nunca matchearía una búsqueda real sobre el valor en texto plano",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+            }
+            let ty = if type_params.is_empty() { self.resolve_type(&f.ty) } else { self.resolve_type_abstract(&f.ty, type_params) };
+            match ty {
+                Ok(Type::String) => {}
+                Ok(Type::Optional(inner)) if matches!(*inner, Type::String) => {}
+                Ok(ty) => errors.push(
+                    err(format!("'@searchable' en el campo '{}': solo aplica sobre `String`/`String?` -- es `{ty}`", f.name)).with_span(f.name_span),
+                ),
+                Err(e) => errors.push(e.with_span(f.name_span)),
+            }
+        }
+        errors
+    }
+
+    /// `@searchable` solo tiene sentido en structs que representen tablas
+    /// SQL, nunca en variantes de enum (guardadas como JSON, mismo motivo
+    /// que `check_field_tenant_enum`).
+    fn check_field_searchable_enum(&self, fields: &[Field]) -> Vec<CheckError> {
+        fields
+            .iter()
+            .filter(|f| f.searchable())
+            .map(|f| {
+                err(format!("'@searchable' en el campo '{}': las variantes de enum se guardan como JSON, no son columnas SQL individuales", f.name))
+                    .with_span(f.name_span)
+            })
+            .collect()
     }
 
     /// `@check(...)` (GRAMMAR.md §3.96) sobre cada campo de `fields` --
@@ -5632,7 +5686,7 @@ impl Checker {
                 "'{method}' no está soportado sobre una colección con clave primaria compuesta ('@primaryKey(...)', \
                  GRAMMAR.md §3.255) -- por ahora solo all/find/insert/insertMany/delete/applyPatch/count. El resto \
                  (page/pageAfter/increment/findWhere/countWhere/updateWhere/deleteWhere/orderBy/select/with/nearest/\
-                 sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/upsert) queda para una ronda futura."
+                 search/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/upsert) queda para una ronda futura."
             )));
         }
         match method {
@@ -5823,6 +5877,8 @@ impl Checker {
 
             "nearest" => self.check_nearest(element_ty, args, env),
 
+            "search" => self.check_search(element_ty, args, env),
+
             // Deliberadamente SIEMPRE un error acá, nunca una firma normal
             // y libremente componible como las de arriba (GRAMMAR.md
             // §3.16): la única forma de que `subscribe()` tipe en TODO el
@@ -5838,7 +5894,7 @@ impl Checker {
                  `while true { db.<coleccion>.subscribe() }` -- no se puede usar en ninguna otra posición (GRAMMAR.md §3.16)",
             )),
             other => Err(err(format!(
-                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/updateWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/increment/select/with/nearest/subscribe)"
+                "'{other}' no es un método conocido de una colección de 'db' (all/find/insert/insertMany/applyPatch/delete/deleteWhere/updateWhere/findWhere/count/countWhere/page/upsert/sumBy/countBy/avgBy/maxBy/minBy/maxRow/minRow/increment/select/with/nearest/search/subscribe)"
             ))),
         }
     }
@@ -6118,6 +6174,18 @@ impl Checker {
         let decl = self.types.get(type_name)?;
         let TypeExpr::Struct(fields) = &decl.ty else { return None };
         fields.iter().find(|f| f.tenant_claim_name().is_some()).map(|f| f.name.clone())
+    }
+
+    /// Nombres de TODOS los campos `@searchable` de `element_ty`, en el
+    /// orden declarado (GRAMMAR.md §3.257) -- vacío si no tiene ninguno.
+    /// A diferencia de `tenant_field_name` (a lo sumo uno), acá puede haber
+    /// varios: `db.<c>.search(query)` los combina todos en un solo texto
+    /// buscable. Mismo cruce que `tenant_field_name`/`field_ref_target`.
+    pub(crate) fn searchable_field_names(&self, element_ty: &Type) -> Vec<String> {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { return Vec::new() };
+        let Some(decl) = self.types.get(type_name) else { return Vec::new() };
+        let TypeExpr::Struct(fields) = &decl.ty else { return Vec::new() };
+        fields.iter().filter(|f| f.searchable()).map(|f| f.name.clone()).collect()
     }
 
     /// `sumBy`/`countBy`/`avgBy`/`maxBy`/`minBy` (GRAMMAR.md §3.52):
@@ -6401,6 +6469,23 @@ impl Checker {
         };
         self.check_expr(vec_arg, &Type::Vector(n), env)?;
         self.check_expr(k_arg, &Type::Int, env)?;
+        Ok(Type::List(Box::new(element_ty.clone())))
+    }
+
+    /// `db.<c>.search(query: String) -> List<T>` (GRAMMAR.md §3.257) --
+    /// sin selector, a diferencia de `nearest`: busca automáticamente sobre
+    /// TODOS los campos `@searchable` del type, mismo espíritu que
+    /// `@tenant` filtrando sin que el caller nombre la columna.
+    fn check_search(&self, element_ty: &Type, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
+        let [query_arg] = args else {
+            return Err(err("'search' toma exactamente 1 argumento (query: String)"));
+        };
+        if self.searchable_field_names(element_ty).is_empty() {
+            return Err(err(
+                "'search' necesita al menos un campo '@searchable' declarado en este type (GRAMMAR.md §3.257)",
+            ));
+        }
+        self.check_expr(query_arg, &Type::String, env)?;
         Ok(Type::List(Box::new(element_ty.clone())))
     }
 

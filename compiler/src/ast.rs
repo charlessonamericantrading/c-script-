@@ -394,6 +394,13 @@ impl Field {
             _ => None,
         })
     }
+
+    /// ¿Lleva `@searchable`? (GRAMMAR.md §3.257) -- un campo `String`/
+    /// `String?` así marcado entra al texto combinado que
+    /// `db.<c>.search(query)` busca.
+    pub fn searchable(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, FieldAnnotation::Searchable))
+    }
 }
 
 impl PartialEq for Field {
@@ -471,6 +478,13 @@ pub enum FieldAnnotation {
     /// request actual, sin excepción -- sin claim disponible, la operación
     /// falla en vez de devolver vacío o todo.
     Tenant(Option<String>),
+    /// `@searchable` (sin paréntesis) -- búsqueda de texto completo
+    /// (GRAMMAR.md §3.257). Solo sobre `String`/`String?`. Uno o más campos
+    /// así marcados en el mismo `type` se combinan en un solo texto
+    /// buscable para `db.<c>.search(query: String) -> List<T>` -- mismo
+    /// espíritu que varios `@tenant`/`@index` conviviendo, ninguno excluye
+    /// a los demás.
+    Searchable,
 }
 
 /// Acción de `ON DELETE` para un `@ref(...)` (GRAMMAR.md §3.249). Vocabulario

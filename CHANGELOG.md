@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.205.0] - 2026-09-05
+
+### ✨ Añadido
+**`@searchable` + `db.<c>.search(query)` -- búsqueda de texto completo (PLAN.md §9.22 ítem 4, cierra el segundo ítem de la hoja de ruta del informe "c-script para Instagram")**: `@searchable` declarativo sobre uno o más campos `String`/`String?` de un `type` en `db {}` (varios campos se combinan en un solo texto buscable, mismo espíritu que `@unique`/`@index`); `db.<c>.search(query: String) -> List<T>` busca automáticamente sobre todos los campos marcados, sin selector. Postgres empuja `to_tsvector('simple', coalesce(...) || ' ' || ...) @@ plainto_tsquery('simple', $1)`, ordenado por `ts_rank(...)` descendente -- `'simple'` a propósito, sin idioma específico. SQLite (sin FTS nativo) cae a fuerza bruta en memoria con la misma semántica AND. Respeta `@tenant`/`@softDelete`; incompatible con `@encrypted` en el mismo campo. Sin índice GIN todavía (mismo criterio que `Vector<N>` sin HNSW), sin configuración de idioma ni ranking ajustable -- alcance acotado a propósito. Ver GRAMMAR.md §3.257.
+
 ## [1.204.1] - 2026-09-05
 
 ### 🔧 Proceso

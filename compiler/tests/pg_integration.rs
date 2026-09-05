@@ -1801,6 +1801,57 @@ fn adopt_existing_falls_back_to_in_memory_cache_without_the_internal_table() {
     assert!(!exists, "--adopt-existing nunca debe haber creado la tabla interna");
 }
 
+const SEARCH_PROGRAM: &str = r#"
+type Article = {
+  id: Int,
+  @searchable
+  title: String,
+  @searchable
+  body: String,
+}
+db { articles: Article[] }
+service Articles {
+  rpc add(title: String, body: String) -> Article {
+    db.articles.insert(Article { id: 0, title: title, body: body })
+  }
+  rpc find(query: String) -> Article[] { db.articles.search(query) }
+}
+"#;
+
+#[test]
+fn search_pushes_down_to_tsvector_and_plainto_tsquery_against_real_postgres() {
+    // GRAMMAR.md §3.257: mismo espíritu que `vector_nearest_pushes_down...`
+    // -- confirmar que el pushdown real a Postgres (no solo el fallback de
+    // SQLite, ya probado en `cli_searchable_annotation.rs`) da la semántica
+    // AND esperada y respeta un término inexistente sin error.
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).expect("conectar");
+    let _ = client.batch_execute("DROP TABLE IF EXISTS \"articles\"");
+
+    let temp = TempDir::new("search-postgres");
+    let link = temp.write("app.link", SEARCH_PROGRAM);
+    let server = Serve::start(&link, &url);
+
+    server.rpc("Articles/add", r#"{"title":"Rust en producción","body":"una guía práctica de despliegue"}"#);
+    server.rpc("Articles/add", r#"{"title":"Guía de TypeScript","body":"tipos avanzados y genéricos"}"#);
+    server.rpc("Articles/add", r#"{"title":"Otra nota","body":"sin relación con ninguno de los dos temas"}"#);
+
+    let both = server.rpc("Articles/find", r#"{"query":"guía"}"#);
+    assert_eq!(both.as_array().unwrap().len(), 2, "las dos filas con 'guía' en título o cuerpo: {both:?}");
+
+    let and_terms = server.rpc("Articles/find", r#"{"query":"rust despliegue"}"#);
+    let and_terms = and_terms.as_array().unwrap();
+    assert_eq!(and_terms.len(), 1, "AND entre dos términos: solo la fila que tiene los dos: {and_terms:?}");
+    assert_eq!(and_terms[0]["title"], "Rust en producción");
+
+    let none = server.rpc("Articles/find", r#"{"query":"palabraQueNoExiste"}"#);
+    assert_eq!(none.as_array().unwrap().len(), 0, "ningún término matchea -> lista vacía: {none:?}");
+}
+
 #[test]
 fn a_bad_connection_url_fails_with_a_message_instead_of_a_panic() {
     // Este no necesita base: prueba justamente el camino en que no hay ninguna.
