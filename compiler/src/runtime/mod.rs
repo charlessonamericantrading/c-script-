@@ -10243,6 +10243,28 @@ mod tests {
     }
 
     #[test]
+    fn image_thumbnail_on_invalid_base64_is_a_clean_runtime_error() {
+        // Distinto del test de arriba: ACÁ el string ni siquiera decodifica
+        // como base64 (a diferencia de "aG9sYSBtdW5kbw==", que sí es base64
+        // válido -- solo que no es una imagen). Auditoría del lenguaje
+        // (05/09/2026): GRAMMAR.md §3.258 afirmaba este caso probado para
+        // "los dos builtins" de `image`, pero solo `image.dimensions` tenía
+        // el test simétrico (`image_dimensions_on_invalid_base64_is_a_clean_
+        // runtime_error`, abajo) -- este cierra el hueco real.
+        let program = program_from(
+            r#"
+            service Docs {
+                rpc make(b64: String) -> String { image.thumbnail(b64, 10, 10) }
+            }
+        "#,
+        );
+        let db = Db::seeded();
+        let e = invoke_rpc(&program, "Docs", "make", &json!({"b64": "no es base64 %%%"}), &db).unwrap_err();
+        assert!(e.message.contains("image.thumbnail"), "mensaje inesperado: {}", e.message);
+        assert!(e.message.contains("base64 válido"), "mensaje inesperado: {}", e.message);
+    }
+
+    #[test]
     fn image_dimensions_on_invalid_base64_is_a_clean_runtime_error() {
         let program = program_from(
             r#"

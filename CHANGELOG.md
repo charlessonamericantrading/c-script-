@@ -3,6 +3,14 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.211.0] - 2026-09-05
+
+### 🐛 Corregido
+**Auditoría del lenguaje: `@background` combinado con `@idempotent` rompía en silencio la garantía de deduplicación** -- confirmado contra el binario real: dos requests con la MISMA `Idempotency-Key` contra un rpc `@background @idempotent` disparaban DOS jobs de verdad, porque `runtime/server.rs` responde `{ jobId }` y devuelve ANTES de llegar al bloque de idempotencia. `@background` ahora rechaza en compile-time combinarse con `@idempotent`/`@cache`/`@cache_control`/`@content_type` (las cuatro asumen que la respuesta HTTP es el resultado real del rpc) -- para `@cache`/`@cache_control`/`@content_type` el problema era un no-op silencioso, para `@idempotent` una garantía incumplida. Ver GRAMMAR.md §3.262.
+
+### 🧪 Tests
+Cerradas dos afirmaciones de cobertura sobrestimadas encontradas en la misma auditoría: `image.thumbnail` no tenía test de base64 genuinamente inválido (GRAMMAR.md §3.258 decía "los dos builtins", solo `image.dimensions` lo tenía probado); `@readReplica` solo tenía test dedicado para 3 de los 8 métodos de escritura que rechaza (GRAMMAR.md §3.260 decía "cada uno de los ocho"). Agregados los 6 tests que faltaban -- el comportamiento ya era correcto en los dos casos, la cobertura ahora respalda la afirmación tal como está escrita.
+
 ## [1.210.0] - 2026-09-05
 
 ### ✨ Añadido

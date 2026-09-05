@@ -2475,9 +2475,50 @@ impl Checker {
     /// antes de que su cuerpo termine, así que no hay ningún momento
     /// sensato para devolver `{ jobId }` en su lugar.
     fn check_background_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
-        if r.background() && is_stream {
+        if !r.background() {
+            return Ok(());
+        }
+        if is_stream {
             return Err(err(format!(
                 "`@background` en el stream '{}': una conexión SSE no puede responder `{{ jobId }}` de inmediato Y seguir emitiendo eventos (GRAMMAR.md §3.262) -- llamalo desde un 'rpc' normal",
+                r.name
+            )));
+        }
+        // Auditoría del lenguaje (05/09/2026): `runtime/server.rs` responde
+        // `{ jobId }` e intercepta la request ANTES de llegar al bloque de
+        // `@idempotent`/`@cache`/`@cache_control`, y la respuesta de un
+        // `@background` es SIEMPRE `{ jobId }` JSON (nunca lo que
+        // `@content_type` pediría) -- combinar cualquiera de estas cuatro
+        // compilaba limpio antes de este chequeo, pero la anotación
+        // combinada quedaba MUERTA en silencio (`@cache`/`@cache_control`)
+        // o, peor, rota de forma activa: dos requests con la MISMA
+        // `Idempotency-Key` contra un `@background @idempotent` disparaban
+        // DOS jobs reales en vez de que el segundo repita el resultado del
+        // primero -- exactamente el duplicado que `@idempotent` existe
+        // para impedir (confirmado contra el binario real, dos `jobId`
+        // distintos con la misma clave). Rechazar en compile-time es más
+        // honesto que un no-op o una garantía rota en silencio.
+        if r.idempotent() {
+            return Err(err(format!(
+                "'{}' combina `@background` con `@idempotent`: la garantía de `@idempotent` (una `Idempotency-Key` repetida nunca corre el cuerpo dos veces) no aplica -- `@background` responde `{{ jobId }}` y encola ANTES de llegar al chequeo de idempotencia, así que dos requests con la misma clave encolarían dos jobs reales (GRAMMAR.md §3.262)",
+                r.name
+            )));
+        }
+        if r.cache().is_some() {
+            return Err(err(format!(
+                "'{}' combina `@background` con `@cache`: no hay ningún resultado que cachear -- `@background` responde `{{ jobId }}` de inmediato, un valor distinto en cada llamada, antes de llegar al bloque de `@cache` (GRAMMAR.md §3.262)",
+                r.name
+            )));
+        }
+        if r.cache_control().is_some() {
+            return Err(err(format!(
+                "'{}' combina `@background` con `@cache_control`: el header nunca se aplica -- `@background` responde ANTES de llegar al bloque que lo agrega (GRAMMAR.md §3.262)",
+                r.name
+            )));
+        }
+        if r.content_type().is_some() {
+            return Err(err(format!(
+                "'{}' combina `@background` con `@content_type`: la respuesta de un `@background` es SIEMPRE `{{ jobId }}` en JSON, nunca el Content-Type declarado (GRAMMAR.md §3.262)",
                 r.name
             )));
         }
@@ -8783,6 +8824,82 @@ type T = { id: Int, s: Status }")
         assert!(err.iter().any(|e| e.message.contains("upsert") && e.message.contains("readReplica")), "mensaje inesperado: {err:?}");
     }
 
+    // Auditoría del lenguaje (05/09/2026): GRAMMAR.md §3.260 afirmaba que
+    // los OCHO métodos de escritura estaban probados individualmente, pero
+    // solo insert/delete/upsert tenían test dedicado -- los cinco de abajo
+    // cierran el hueco real entre la afirmación y la cobertura.
+
+    #[test]
+    fn read_replica_rejects_insert_many_inside_the_body() {
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            type NewTask = { done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @readReplica
+                rpc seed() -> Task[] { db.tasks.insertMany([NewTask { done: false }]) }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("insertMany") && e.message.contains("readReplica")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn read_replica_rejects_apply_patch_inside_the_body() {
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @readReplica
+                rpc touch(id: Int) -> Task { db.tasks.applyPatch(id, { done: true }) }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("applyPatch") && e.message.contains("readReplica")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn read_replica_rejects_delete_where_inside_the_body() {
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @readReplica
+                rpc clear() -> Int { db.tasks.deleteWhere(|t: Task| { t.done }) }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("deleteWhere") && e.message.contains("readReplica")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn read_replica_rejects_update_where_inside_the_body() {
+        let src = r#"
+            type Task = { id: Int, done: Bool }
+            db { tasks: Task[] }
+            service Tasks {
+                @readReplica
+                rpc finishAll() -> Int { db.tasks.updateWhere(|t: Task| { !t.done }, { done: true }) }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("updateWhere") && e.message.contains("readReplica")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn read_replica_rejects_increment_inside_the_body() {
+        let src = r#"
+            type Counter = { id: Int, hits: Int }
+            db { counters: Counter[] }
+            service Counters {
+                @readReplica
+                rpc bump(id: Int) -> Counter { db.counters.increment(id, |c: Counter| { c.hits }, 1) }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("increment") && e.message.contains("readReplica")), "mensaje inesperado: {err:?}");
+    }
+
     #[test]
     fn read_replica_does_not_leak_into_the_next_rpc_checked() {
         // Confirma que `in_read_replica_rpc` se restaura correctamente
@@ -8840,6 +8957,66 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    // Auditoría del lenguaje (05/09/2026): `@background` combinado con
+    // `@idempotent`/`@cache`/`@cache_control`/`@content_type` compilaba
+    // limpio pero la segunda anotación quedaba muerta en silencio -- o,
+    // para `@idempotent`, activamente ROTA (confirmado contra el binario
+    // real: dos requests con la misma `Idempotency-Key` disparaban dos
+    // jobs). Los cuatro tests de abajo confirman el rechazo en
+    // compile-time que reemplaza a ese no-op/garantía rota.
+
+    #[test]
+    fn background_rejects_idempotent() {
+        let src = r#"
+            service Jobs {
+                @background
+                @idempotent
+                rpc process(id: Int) -> Int { id }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("background") && e.message.contains("idempotent")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn background_rejects_cache() {
+        let src = r#"
+            service Jobs {
+                @background
+                @cache("60s")
+                rpc process(id: Int) -> Int { id }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("background") && e.message.contains("cache")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn background_rejects_cache_control() {
+        let src = r#"
+            service Jobs {
+                @background
+                @cache_control("public, max-age=3600")
+                rpc process(id: Int) -> Int { id }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("background") && e.message.contains("cache_control")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn background_rejects_content_type() {
+        let src = r#"
+            service Jobs {
+                @background
+                @content_type("text/plain")
+                rpc process(id: Int) -> String { "x" }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("background") && e.message.contains("content_type")), "mensaje inesperado: {err:?}");
     }
 
     #[test]

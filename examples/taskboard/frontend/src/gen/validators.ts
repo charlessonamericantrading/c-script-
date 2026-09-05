@@ -1,4 +1,4 @@
-// Generado automáticamente por linkc v1.210.0 — no editar a mano.
+// Generado automáticamente por linkc v1.211.0 — no editar a mano.
 
 import type { BoardStats, ColumnId, NewTask, Patch, Priority, Task } from "./contract";
 
