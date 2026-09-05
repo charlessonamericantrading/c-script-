@@ -401,6 +401,20 @@ pub fn emit_client(program: &Program) -> Result<String, String> {
             continue;
         }
 
+        // GRAMMAR.md §3.262: un `@background` responde `{ jobId }` de
+        // inmediato -- ni valida ni revive contra `ret_ty` (esa forma
+        // describe lo que el JOB produce, nunca esta respuesta HTTP). El
+        // caller sondea `background.status(jobId)` -- del lado de `.link`,
+        // no hay un método de cliente generado para eso todavía (mismo
+        // límite v1 documentado en GRAMMAR.md).
+        if rpc.background() {
+            out.push_str(&format!("  async {}({}): Promise<{{ jobId: string }}> {{\n", rpc.name, params.join(", ")));
+            push_fetch_call(&mut out, &service.name, &rpc.name, &arg_names, params_have_int64);
+            out.push_str("    return (await res.json()) as { jobId: string };\n");
+            out.push_str("  }\n\n");
+            continue;
+        }
+
         out.push_str(&format!(
             "  async {}({}): Promise<{}> {{\n",
             rpc.name,
@@ -767,7 +781,12 @@ pub fn emit_hooks(program: &Program) -> Result<String, String> {
     for (service, members) in services {
         for (rpc, is_stream, param_tys, ret_ty) in members {
             let cap_rpc = capitalize(&rpc.name);
-            let ret_str = render_type(&ret_ty);
+            // GRAMMAR.md §3.262: un `@background` responde `{ jobId }` de
+            // inmediato -- todo lo de abajo (Query/Mutation hook) queda
+            // parametrizado por `ret_str`, así que sobreescribirlo ACÁ
+            // alcanza para que el hook generado tipe contra la forma real
+            // de la respuesta, sin una rama aparte por cada hook.
+            let ret_str = if rpc.background() { "{ jobId: string }".to_string() } else { render_type(&ret_ty) };
             // `ret_str` YA termina en " | null" cuando el rpc devuelve un
             // tipo opcional (`T?`, `Type::Optional` en `render_type`) --
             // reusar esto en cada lugar que necesita "el tipo de retorno,
@@ -1503,6 +1522,12 @@ fn emit_service_interface(out: &mut String, s: &ServiceDecl, checker: &Checker) 
         let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
         let ret_str = if is_stream {
             format!("AsyncIterable<{}>", render_type(&ret_ty))
+        } else if rpc.background() {
+            // GRAMMAR.md §3.262: un rpc `@background` responde `{ jobId }`
+            // de inmediato -- el `ret_ty` declarado describe lo que el JOB
+            // produce (leído después vía `background.status`), nunca la
+            // forma de ESTA respuesta HTTP.
+            "Promise<{ jobId: string }>".to_string()
         } else {
             format!("Promise<{}>", render_type(&ret_ty))
         };
@@ -1623,7 +1648,7 @@ pub(crate) fn render_type(ty: &Type) -> String {
             .collect::<Vec<_>>()
             .join(" | "),
         // `db`/`db.<coleccion>`/`auth`/`Service`/`math`/`crypto`/`http`/`json`/`base64` son internos del checker
-        Type::Db | Type::DbCollection(_) | Type::DbQuery(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Pdf | Type::Excel | Type::Ai | Type::Mcp | Type::Image | Type::Env | Type::Request | Type::Smtp | Type::Response => {
+        Type::Db | Type::DbCollection(_) | Type::DbQuery(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Pdf | Type::Excel | Type::Ai | Type::Mcp | Type::Image | Type::Background | Type::Env | Type::Request | Type::Smtp | Type::Response => {
             unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64/Pdf/Excel/Mcp nunca aparece en un TypeExpr real")
         }
     }
@@ -1688,7 +1713,7 @@ pub(crate) fn collect_type_names(ty: &Type, names: &mut std::collections::BTreeS
             }
         }
         Type::Int | Type::Int64 | Type::Decimal | Type::Timestamp | Type::Float | Type::String | Type::Uuid | Type::Vector(_) | Type::Bool | Type::Void | Type::Null | Type::Dynamic | Type::TypeParam(_) => {}
-        Type::Db | Type::DbCollection(_) | Type::DbQuery(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Pdf | Type::Excel | Type::Ai | Type::Mcp | Type::Image | Type::Env | Type::Request | Type::Smtp | Type::Response => {
+        Type::Db | Type::DbCollection(_) | Type::DbQuery(_) | Type::Auth | Type::Service(_) | Type::Math | Type::Crypto | Type::Http | Type::Json | Type::Base64 | Type::Pdf | Type::Excel | Type::Ai | Type::Mcp | Type::Image | Type::Background | Type::Env | Type::Request | Type::Smtp | Type::Response => {
             unreachable!("Type::Db/DbCollection/Auth/Service/Math/Crypto/Http/Json/Base64/Pdf/Excel/Mcp nunca aparece en un TypeExpr real")
         }
     }

@@ -347,6 +347,7 @@ fn annotation_badges(r: &RpcDecl) -> String {
         | Some(Annotation::Infinite { .. })
         | Some(Annotation::Idempotent)
         | Some(Annotation::ReadReplica)
+        | Some(Annotation::Background)
         | Some(Annotation::Cache(_))
         | Some(Annotation::Cors(_))
         | Some(Annotation::Cron(_))

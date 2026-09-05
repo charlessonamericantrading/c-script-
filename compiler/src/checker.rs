@@ -120,6 +120,22 @@ fn http_response_type() -> Type {
     }
 }
 
+/// Lo que `background.status(jobId)` (GRAMMAR.md §3.262) devuelve --
+/// estructural sin nombre reservado, mismo criterio que
+/// `http_response_type()`/`image_dimensions_type()`. `result` es `Dynamic?`
+/// porque cada rpc `@background` produce una forma distinta -- no hay un
+/// tipo único que este builtin pueda exigir de antemano.
+fn background_job_status_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "status".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "result".to_string(), optional: false, ty: Type::Optional(Box::new(Type::Dynamic)) },
+            FieldType { name: "error".to_string(), optional: false, ty: Type::Optional(Box::new(Type::String)) },
+        ],
+    }
+}
+
 /// Lo que `image.dimensions` (GRAMMAR.md §3.258) devuelve -- mismo criterio
 /// estructural sin nombre que `http_response_type`: cualquier `type` del
 /// programa con estos dos campos exactos sirve como destino.
@@ -2454,6 +2470,20 @@ impl Checker {
         Ok(())
     }
 
+    /// `@background` (GRAMMAR.md §3.262) -- mismo criterio que
+    /// `@idempotent`: un `stream` ya empieza a responder (los headers SSE)
+    /// antes de que su cuerpo termine, así que no hay ningún momento
+    /// sensato para devolver `{ jobId }` en su lugar.
+    fn check_background_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        if r.background() && is_stream {
+            return Err(err(format!(
+                "`@background` en el stream '{}': una conexión SSE no puede responder `{{ jobId }}` de inmediato Y seguir emitiendo eventos (GRAMMAR.md §3.262) -- llamalo desde un 'rpc' normal",
+                r.name
+            )));
+        }
+        Ok(())
+    }
+
     /// `@cache("60s")` (GRAMMAR.md §3.144, PLAN.md §9.3) -- mismo criterio
     /// que `check_cache_control_annotation`: rechaza más de una vez y sobre
     /// un `stream` (una conexión SSE no tiene un único resultado que
@@ -3416,6 +3446,7 @@ impl Checker {
         self.check_invalidates_annotation(r, is_stream, service)?;
         self.check_infinite_annotation(r, is_stream)?;
         self.check_idempotent_annotation(r, is_stream)?;
+        self.check_background_annotation(r, is_stream)?;
         self.check_cache_annotation(r, is_stream)?;
         self.check_cors_annotation(r)?;
         self.check_cron_annotation(r, is_stream)?;
@@ -4421,6 +4452,9 @@ impl Checker {
                 }
                 if name == "image" {
                     return Ok(Type::Image);
+                }
+                if name == "background" {
+                    return Ok(Type::Background);
                 }
                 if name == "env" {
                     return Ok(Type::Env);
@@ -5509,6 +5543,10 @@ impl Checker {
             (Type::Image, "dimensions") => builtin_args!(
                 self, args, env, "image.dimensions",
                 [(base64, "base64: String", Type::String)] -> image_dimensions_type()
+            ),
+            (Type::Background, "status") => builtin_args!(
+                self, args, env, "background.status",
+                [(job_id, "jobId: String", Type::String)] -> background_job_status_type()
             ),
             // GRAMMAR.md §3.235: inferencia local. `maxTokens` es explícito a
             // propósito -- el techo de tokens es la decisión de costo más
@@ -8760,6 +8798,78 @@ type T = { id: Int, s: Status }")
 
                 rpc create() -> Task { db.tasks.insert(Task { id: 0, done: false }) }
             }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    // ---- @background / background.status (GRAMMAR.md §3.262) ----
+
+    #[test]
+    fn background_annotation_type_checks_on_a_plain_rpc() {
+        let src = r#"
+            service Jobs {
+                @background
+                rpc process(id: Int) -> Int { id }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn background_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @background
+                stream list() -> Task { db.tasks.all() }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("background") && e.message.contains("stream")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn background_combines_with_other_annotations() {
+        let src = r#"
+            service Jobs {
+                @authenticated
+                @background
+                @rate_limit("10/1m")
+                rpc process(id: Int) -> Int { id }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn background_status_takes_a_string_and_returns_a_structural_status() {
+        let src = r#"
+            fn f(jobId: String) -> String { background.status(jobId).status }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn background_status_rejects_a_non_string_argument() {
+        let src = r#"
+            fn f() -> String { background.status(123).status }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn background_status_narrower_declared_type_accepts_the_wider_real_shape() {
+        // `background.status` devuelve `{ status, result: Dynamic?, error }`
+        // -- pero "Dynamic" no se puede ESCRIBIR como tipo en código fuente
+        // (es puramente interno, igual que en `json.parse`). El camino real
+        // para propagar el resultado de un rpc que envuelve `background.
+        // status` es declarar un tipo MÁS ANGOSTO que omita `result` --
+        // subtipado estructural de ancho (GRAMMAR.md §3.2) acepta la forma
+        // real (más ancha) contra la declarada (más angosta).
+        let src = r#"
+            type JobStatusNarrow = { status: String, error: String? }
+            fn f(jobId: String) -> JobStatusNarrow { background.status(jobId) }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }

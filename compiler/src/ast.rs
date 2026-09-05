@@ -734,6 +734,11 @@ impl RpcDecl {
         self.annotations.iter().any(|a| matches!(a, Annotation::ReadReplica))
     }
 
+    /// `true` si este rpc lleva `@background` (GRAMMAR.md §3.262).
+    pub fn background(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, Annotation::Background))
+    }
+
     /// La duración cruda de `@cache("60s")`, si hay (GRAMMAR.md §3.144) --
     /// texto sin parsear, mismo criterio que `rate_limit()`/`cache_control()`:
     /// el checker valida el formato, acá es solo el string tal como se
@@ -894,6 +899,14 @@ pub enum Annotation {
     /// puramente de lectura. Sin réplica configurada, degrada al backend
     /// primario (nunca un error de arranque ni de request).
     ReadReplica,
+    /// `@background` (GRAMMAR.md §3.262) -- sin argumentos, como
+    /// `@idempotent`. Un `rpc` `@background` responde `{ jobId: String }`
+    /// de inmediato en vez de correr su cuerpo sincrónicamente -- un worker
+    /// interno lo corre después, y `background.status(jobId)` deja
+    /// consultar el resultado eventual. Solo válido sobre `rpc`, nunca
+    /// `stream` (una conexión SSE no tiene un `jobId` que devolver antes de
+    /// empezar a emitir).
+    Background,
     /// `@cache("60s")` (GRAMMAR.md §3.144) -- cachea el resultado de una
     /// ejecución EXITOSA en el servidor, keyeado por (service, rpc,
     /// argumentos), por la duración dada (`Ns`/`Nm`/`Nh`/`Nd`, mismo formato

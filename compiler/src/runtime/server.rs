@@ -38,8 +38,8 @@ use super::encryption;
 use super::store::Backend;
 use super::session::SessionStore;
 use super::{
-    ai_stream_member, invoke_rpc_with_sessions, is_cron_member, is_stream_member, live_subscribe_collection, required_auth, required_cache,
-    required_cors, required_idempotent, required_rate_limit,
+    ai_stream_member, invoke_rpc_with_sessions, is_cron_member, is_stream_member, live_subscribe_collection, program_has_any_background_rpc,
+    required_auth, required_background, required_cache, required_cors, required_idempotent, required_rate_limit,
 };
 use crate::ast::{Annotation, Item, Member};
 use crate::ast::Program;
@@ -689,6 +689,56 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                         let msg = super::panic_payload_message(&*payload);
                         metrics_store.lock().record_cron_run(&method, false);
                         log_cron_tick(log, &method, false, start.elapsed(), &format!("panic={msg:?}"));
+                    }
+                }
+            });
+        }
+    }
+
+    // `@background` (GRAMMAR.md §3.262): un pool CHICO y FIJO de workers,
+    // spawneado una sola vez -- invisible (cero hilos, cero costo) para un
+    // programa que nunca usa la anotación, mismo criterio que el resto de
+    // las features opt-in de este servidor. Cada worker hace polling simple
+    // (sin condvar/canal: `BackgroundJobStore` vive detrás de un `Mutex`
+    // liviano, y un `sleep` corto entre chequeos vacíos alcanza para la
+    // escala de "un proceso, sin cola distribuida" que esta ronda declaró a
+    // propósito). El número de workers es fijo en v1 -- sin flag nuevo,
+    // sin evidencia real todavía de que haga falta ajustarlo.
+    const BACKGROUND_WORKERS: usize = 4;
+    const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+    if program_has_any_background_rpc(&program) {
+        for _ in 0..BACKGROUND_WORKERS {
+            let program = std::sync::Arc::clone(&program);
+            let db = std::sync::Arc::clone(&db);
+            let sessions = std::sync::Arc::clone(&sessions);
+            std::thread::spawn(move || loop {
+                let Some((job_id, service_name, rpc_name, args_json_str, token)) = db.claim_next_background_job() else {
+                    std::thread::sleep(BACKGROUND_POLL_INTERVAL);
+                    continue;
+                };
+                let args_json: serde_json::Value = match serde_json::from_str(&args_json_str) {
+                    Ok(v) => v,
+                    // No debería pasar nunca (`args_json_str` viene de
+                    // `serde_json::Value::to_string()` en `enqueue_background_job`),
+                    // pero un job corrupto falla limpio en vez de un panic.
+                    Err(e) => {
+                        db.fail_background_job(&job_id, format!("argumentos del job corruptos: {e}"));
+                        continue;
+                    }
+                };
+                // Mismo `catch_unwind` y mismo motivo exacto que el loop de
+                // `@cron` arriba (GRAMMAR.md §3.164): sin esto, un panic
+                // real dentro del cuerpo del job se llevaría puesto ESTE
+                // worker para siempre, sin ninguna línea de log que lo marque.
+                let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    invoke_rpc_with_sessions(&program, &service_name, &rpc_name, &args_json, &db, &sessions, token.as_deref())
+                }));
+                match unwind_result {
+                    Ok(Ok(result)) => db.complete_background_job(&job_id, result.to_string()),
+                    Ok(Err(e)) => db.fail_background_job(&job_id, e.to_string()),
+                    Err(payload) => {
+                        let msg = super::panic_payload_message(&*payload);
+                        db.fail_background_job(&job_id, format!("panic: {msg}"));
                     }
                 }
             });
@@ -1439,6 +1489,25 @@ fn handle_request(
         return;
     }
 
+    // `@background` (GRAMMAR.md §3.262): responde `{ jobId }` de inmediato y
+    // vuelve -- el cuerpo real lo corre un worker (más abajo en este
+    // archivo, ver `spawn_background_workers`), nunca este hilo de request.
+    // Corre DESPUÉS del gate de auth de arriba (encolar sigue exigiendo
+    // estar autorizado) pero ANTES de `@idempotent`/`@cache`: un `{ jobId }`
+    // nuevo en cada llamada no tiene ningún sentido cacheado ni repetido.
+    if required_background(program, service_name, rpc_name) {
+        let outcome = db.enqueue_background_job(service_name, rpc_name, args_json.to_string(), token.clone());
+        let (status, response_body, extra) = match outcome {
+            Ok(job_id) => (200, serde_json::json!({ "jobId": job_id }).to_string(), "background=\"enqueued\"".to_string()),
+            Err(e) => (status_for(&e), error_json(&e.to_string()), format!("error={:?}", e.to_string())),
+        };
+        let resp = cors_response_with_type(status, response_body, JSON_CONTENT_TYPE, &cors_headers, None, None, &request);
+        let _ = request.respond(resp);
+        log_done_with_audit(log, req_id, Some(&method), status, start, &extra, auth_audit.as_ref());
+        db.clear_request_context();
+        return;
+    }
+
     // `@idempotent` (GRAMMAR.md §3.140): opt-in por REQUEST, no por rpc --
     // si el caller no manda `Idempotency-Key`, este bloque entero es un
     // no-op y el rpc corre exactamente como si la anotación no existiera.
@@ -2004,6 +2073,7 @@ pub(crate) fn check_auth_gate(
         | Annotation::Infinite { .. }
         | Annotation::Idempotent
         | Annotation::ReadReplica
+        | Annotation::Background
         | Annotation::Cache(_)
         | Annotation::Cors(_)
         | Annotation::Cron(_) => Ok(()),

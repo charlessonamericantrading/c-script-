@@ -1568,6 +1568,10 @@ fn completions_for_receiver_type(ty: &Type) -> Option<Vec<Value>> {
             method("thumbnail(base64, maxWidth, maxHeight)", "Resize an image (JPEG/PNG/GIF/BMP/WebP) to fit within maxWidth x maxHeight preserving aspect ratio, returned as a base64-encoded String"),
             method("dimensions(base64)", "Read the width/height of a base64-encoded image without resizing it"),
         ]),
+        Type::Background => Some(vec![method(
+            "status(jobId)",
+            "Look up the eventual result of a '@background' rpc job: { status, result, error }",
+        )]),
         Type::Struct { fields, .. } => Some(
             fields
                 .iter()

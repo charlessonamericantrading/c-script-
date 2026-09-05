@@ -351,7 +351,14 @@ pub fn emit_openapi_json(program: &Program, title: &str) -> Result<String, Strin
             }
 
             let ret_ty = checker.resolve_type(&rpc.return_type).map_err(|e| e.to_string())?;
-            let res_schema = type_to_json_schema(&ret_ty);
+            // GRAMMAR.md §3.262: un `@background` responde `{ jobId }` de
+            // inmediato -- `ret_ty` describe lo que el JOB produce, nunca
+            // esta respuesta HTTP.
+            let res_schema = if rpc.background() {
+                json!({ "type": "object", "properties": { "jobId": { "type": "string" } }, "required": ["jobId"] })
+            } else {
+                type_to_json_schema(&ret_ty)
+            };
 
             // Un rpc con `@content_type` responde ese tipo, no JSON
             // (GRAMMAR.md §3.35) -- si el spec dijera application/json, un

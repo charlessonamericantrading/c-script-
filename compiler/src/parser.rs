@@ -1047,6 +1047,8 @@ impl Parser {
                 "idempotent" => Annotation::Idempotent,
                 // Sin argumentos, mismo criterio que "idempotent" (GRAMMAR.md §3.260).
                 "readReplica" => Annotation::ReadReplica,
+                // Sin argumentos, mismo criterio que "idempotent" (GRAMMAR.md §3.262).
+                "background" => Annotation::Background,
                 "cache" => {
                     self.eat(&TokenKind::LParen)?;
                     let ttl = self.eat_string()?;

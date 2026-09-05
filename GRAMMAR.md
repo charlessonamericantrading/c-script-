@@ -9341,6 +9341,54 @@ rpc sendPushApns(deviceToken: String, teamId: String, keyId: String, privateKeyP
 
 **Verificado**: tests de checker (aridad/tipo de las dos, rechazo de `keyId` no-`String`) + tests de runtime (round-trip real: firmar con la clave PRIVADA de un par RSA-2048/EC P-256 generado para el test y verificar con la clave PÚBLICA vía `jsonwebtoken::decode`, confirmando el algoritmo y que `kid` aparece en ES256 y está ausente en RS256; JSON inválido y PEM inválida dan `RuntimeError` limpio, nunca un panic; alcanzable end-to-end desde un programa real vía `invoke_rpc`) + **verificación manual contra una implementación completamente independiente (PyJWT, Python)**: las dos firmas (RS256 y ES256) verifican correctas contra sus claves públicas, y un token con el payload manipulado un solo byte se rechaza -- mismo criterio que `excel.build` verificado con `openpyxl`. Suite completa sin regresiones.
 
+### 3.262 `@background` + `background.status(jobId)`: rpcs que devuelven un id y corren después — RESUELTO, cierra el ítem 2 de la hoja de ruta del informe "c-script para Instagram" (PLAN.md §9.22) y PLAN.md §9.18 Eje F ítem 3
+
+Origen: PLAN.md §9.18 Eje F ítem 3 ("un `@cron` corre en su hilo pero no hay forma de 'encolar este trabajo largo ahora y consultarlo después'; una llamada a un LLM de 40s dentro de un rpc ocupa un hilo del pool y un timeout del cliente la mata"), retomado por §9.22 ítem 2 de la hoja de ruta del informe "c-script para Instagram" con el diseño v1 ya escrito de la ronda anterior -- esta vez sin ninguna decisión de diseño nueva que tomar, solo ejecutarlo.
+
+**`@background` sobre un `rpc` (sin argumentos, mismo criterio que `@idempotent`): la respuesta HTTP es `{ jobId: String }` de inmediato -- el cuerpo real corre después, en un worker interno.** `background.status(jobId: String) -> { status: String, result: Dynamic?, error: String? }` deja consultar el resultado eventual. `status` es uno de `"pending"`/`"running"`/`"done"`/`"failed"`/`"not_found"` (este último para un id que nunca existió, o cuya entrada terminada ya venció -- nunca un error de runtime: sondear un id viejo o mal tipeado es un caso esperable).
+
+<!-- linkc:check -->
+```rust
+type Task = { id: Int, done: Bool }
+type JobStatusNarrow = { status: String, error: String? }
+
+db { tasks: Task[] }
+
+service Tasks {
+  @background
+  rpc process(id: Int) -> Task {
+    db.tasks.applyPatch(id, { done: true })
+  }
+
+  rpc create() -> Task {
+    db.tasks.insert(Task { id: 0, done: false })
+  }
+
+  // "Dynamic" no se puede ESCRIBIR como tipo en código fuente (es puramente
+  // interno, igual que en `json.parse`, §3.114) -- un tipo declarado MÁS
+  // ANGOSTO que omita `result` alcanza vía subtipado estructural de ancho
+  // (§3.2): la forma real (más ancha) siempre es válida contra la angosta.
+  rpc checkStatus(jobId: String) -> JobStatusNarrow {
+    background.status(jobId)
+  }
+}
+```
+
+**Sin cola distribuida, a propósito -- v1 es "un proceso" (PLAN.md, ambos orígenes de esta feature coinciden en esa frase).** A diferencia de `@cache`/`@rate_limit` distribuidos (§3.178/§3.256, que SÍ necesitan una tabla Postgres compartida porque varias instancias tienen que coordinarse), un job `@background` nunca cruza a otro proceso: se encola y se ejecuta en worker threads del MISMO `linkc serve`. Por eso el estado vive en memoria (`runtime/background.rs::BackgroundJobStore`, mismo criterio y mismo modelo de concurrencia que `IdempotencyStore`/`RateLimiter`) y no en una tabla SQL -- no hay ninguna otra instancia con la que compartirlo. Mismo límite que ya aceptan `@idempotent`/`@rate_limit` en memoria: un job encolado y un restart del servidor antes de que corra se pierde.
+
+**Pool de workers fijo (4), spawneado una sola vez si el programa declara algún `@background` -- invisible, sin ningún hilo de más, para el resto.** Cada worker hace polling simple (sin condvar/canal: un `Mutex` liviano + `sleep(100ms)` entre chequeos vacíos alcanza para la escala de "un proceso" que este v1 declaró a propósito) -- sin flag para ajustar el número de workers todavía, sin evidencia real de que haga falta.
+
+**El worker reproduce el token del caller ORIGINAL -- `auth.currentRole()`/`currentUserId()` dentro del cuerpo del job ven el mismo rol/usuario que si hubiera corrido sincrónicamente.** El bearer token de la request que encoló el job (si vino) se guarda junto con `(service, rpc, argumentos)`, y el worker lo pasa tal cual a `invoke_rpc_with_sessions` -- el mismo mecanismo que ya usa `@cron` (que en cambio siempre corre anónimo, sin ningún token). Esto significa que un `@requires(Role.Admin)` sobre el rpc `@background` sigue protegiéndolo igual (el gate corre al ENCOLAR, en la request HTTP real) y que el cuerpo del job puede seguir leyendo la identidad de quien lo pidió.
+
+**Límites honestos, deliberados**:
+- **Los parámetros NO se validan contra el tipo declarado al encolar, solo al ejecutar.** Un `@background` con argumentos mal tipados responde 200 con un `jobId` real de todos modos -- el rechazo (el mismo `RuntimeError` que un rpc normal daría de inmediato) recién aparece cuando el worker lo corre, visible vía `background.status` con `status: "failed"`. Diferencia real de comportamiento contra un rpc normal (que rechazaría con 400 en el `POST` mismo) -- documentada, no oculta.
+- **Sin reintentos automáticos.** Un job que falla queda `"failed"` para siempre -- reintentar es responsabilidad de quien encoló (llamar al rpc de nuevo, un `jobId` nuevo).
+- **Sin cancelación.** Un job `Pending` no se puede sacar de la cola una vez encolado.
+- **`transaction { }`/`upsert` dentro de un `@background` no reciben ningún tratamiento especial** -- corren en el hilo del worker exactamente como correrían en el hilo de una request normal.
+- **Sin un método de cliente generado que sondee solo** -- `client.ts` tipa el método `@background` como `Promise<{ jobId: string }>` (`contract.d.ts`/`openapi.json` reflejan la misma forma), pero `background.status` no tiene un wrapper de conveniencia en el cliente todavía; un frontend real hace su propio polling contra el rpc que expone `background.status` en el `.link`.
+
+**Verificado**: tests de checker (`@background` tipa en un rpc de solo ida, rechazado en un `stream` con mensaje claro, combina con `@authenticated`/`@rate_limit`, aridad/tipo de `background.status`, y el subtipado estructural de ancho que deja declarar un tipo de retorno más angosto que omita `result`) + `compiler/tests/cli_background.rs` contra un `linkc serve` real sobre SQLite: un `@background` responde `{jobId}` de inmediato, nunca la forma real; el job corre de verdad (la fila cambia) y `background.status` pasa de `pending`/`running` a `done`; un job que falla (un `applyPatch` sobre un id inexistente) queda `failed` con el mensaje de error real; un `jobId` desconocido da `not_found`; y el caso que más importaba verificar de punta a punta -- un job encolado con un token de sesión real, corrido por el worker minutos "después" (en otro hilo, sin ninguna request HTTP de por medio), donde `auth.currentRole()` ADENTRO del cuerpo del job sigue viendo el rol de quien lo encoló. Suite completa sin regresiones.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

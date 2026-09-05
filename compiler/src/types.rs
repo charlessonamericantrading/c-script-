@@ -186,6 +186,10 @@ pub enum Type {
     /// (JPEG/PNG/GIF/BMP/WebP), mismo criterio de bytes-como-base64-String
     /// que `pdf`/`excel`.
     Image,
+    /// Tipo interno para el módulo `background` builtin (GRAMMAR.md §3.262)
+    /// -- `background.status(jobId)`, consultar el resultado eventual de un
+    /// rpc `@background`.
+    Background,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -273,6 +277,7 @@ impl std::fmt::Display for Type {
             Type::Ai => write!(f, "ai"),
             Type::Mcp => write!(f, "mcp"),
             Type::Image => write!(f, "image"),
+            Type::Background => write!(f, "background"),
         }
     }
 }

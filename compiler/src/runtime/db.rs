@@ -1585,6 +1585,10 @@ pub struct Db {
     /// de Postgres, pgBouncer apuntando a un standby, lo que sea -- este
     /// campo no le importa CÓMO se mantiene al día, solo A DÓNDE apunta).
     read_replica: parking_lot::RwLock<Option<Backend>>,
+    /// GRAMMAR.md §3.262 (`@background`): estado en memoria de los jobs
+    /// encolados de ESTE proceso -- ver `runtime/background.rs` para el
+    /// porqué de vivir acá (y no como `Arc` paralelo en `server.rs`).
+    background_jobs: parking_lot::Mutex<super::background::BackgroundJobStore>,
     /// GRAMMAR.md §3.234: el motor de inferencia de ESTE programa (sus
     /// modelos de `ai { }` ya resueltos), fijado una vez por `serve` antes
     /// de la primera request. Por programa y no global porque `serve-all`
@@ -2190,6 +2194,7 @@ impl Db {
             http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
             encryption_key: parking_lot::RwLock::new(None),
             read_replica: parking_lot::RwLock::new(None),
+            background_jobs: parking_lot::Mutex::new(super::background::BackgroundJobStore::new()),
             #[cfg(feature = "inference")]
             ai_engine: parking_lot::RwLock::new(None),
             ai_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(60)),
@@ -2514,6 +2519,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
                 encryption_key: parking_lot::RwLock::new(None),
                 read_replica: parking_lot::RwLock::new(None),
+                background_jobs: parking_lot::Mutex::new(super::background::BackgroundJobStore::new()),
                 #[cfg(feature = "inference")]
                 ai_engine: parking_lot::RwLock::new(None),
                 ai_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(60)),
@@ -2790,6 +2796,53 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
     /// por eso acá no hace falta reclasificar método por método: mientras
     /// el flag está activo, TODO lo que `Db::call` haga es, por construcción,
     /// una lectura.
+    /// GRAMMAR.md §3.262: encola un job `@background` -- `server.rs` lo
+    /// llama en vez de invocar el rpc sincrónicamente, generando el id acá
+    /// mismo (mismo generador que `crypto.uuid()`) para que el caller nunca
+    /// tenga que coordinarse con este `Db` sobre CÓMO se genera.
+    pub(crate) fn enqueue_background_job(&self, service: &str, rpc: &str, args_json: String, token: Option<String>) -> Result<String, RuntimeError> {
+        let job_id = generate_uuid_v4()?;
+        self.background_jobs.lock().enqueue(job_id.clone(), service.to_string(), rpc.to_string(), args_json, token);
+        Ok(job_id)
+    }
+
+    /// GRAMMAR.md §3.262: llamado por los hilos worker (`server.rs`) en un
+    /// loop -- `None` cuando no hay ningún job `Pending` en este momento.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn claim_next_background_job(&self) -> Option<(String, String, String, String, Option<String>)> {
+        self.background_jobs.lock().claim_next()
+    }
+
+    pub(crate) fn complete_background_job(&self, job_id: &str, result_json: String) {
+        self.background_jobs.lock().complete(job_id, result_json);
+    }
+
+    pub(crate) fn fail_background_job(&self, job_id: &str, error: String) {
+        self.background_jobs.lock().fail(job_id, error);
+    }
+
+    /// `background.status(jobId)` (GRAMMAR.md §3.262) -- mapea el
+    /// `JobStatus` interno a la forma estructural que el checker declaró
+    /// (`background_job_status_type`, checker.rs): `{ status, result,
+    /// error }`. `result_json` se decodifica con `json_to_value` (la misma
+    /// función genérica que ya usa cualquier `Dynamic`, GRAMMAR.md §3.114) --
+    /// nunca necesita el tipo DECLARADO del rpc que produjo el job, porque
+    /// `Dynamic` no lo exige.
+    pub(crate) fn background_job_status(&self, job_id: &str) -> Value {
+        use super::background::JobStatus;
+        let (status, result, error) = match self.background_jobs.lock().status(job_id) {
+            None => ("not_found", Value::Null, Value::Null),
+            Some(JobStatus::Pending) => ("pending", Value::Null, Value::Null),
+            Some(JobStatus::Running) => ("running", Value::Null, Value::Null),
+            Some(JobStatus::Done { result_json }) => {
+                let parsed: serde_json::Value = serde_json::from_str(&result_json).unwrap_or(serde_json::Value::Null);
+                ("done", super::json_to_value(&parsed), Value::Null)
+            }
+            Some(JobStatus::Failed { error }) => ("failed", Value::Null, Value::Str(error)),
+        };
+        Value::Struct(vec![("status".to_string(), Value::Str(status.to_string())), ("result".to_string(), result), ("error".to_string(), error)])
+    }
+
     fn backend(&self) -> Backend {
         if read_replica_active() {
             if let Some(replica) = self.read_replica.read().clone() {

@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.210.0] - 2026-09-05
+
+### ✨ Añadido
+**`@background` + `background.status(jobId)` -- rpcs que devuelven un id y corren después (PLAN.md §9.18 Eje F ítem 3 / §9.22 ítem 2)**: un rpc `@background` responde `{ jobId: String }` de inmediato -- el cuerpo real corre en un pool fijo de 4 workers internos, spawneado solo si el programa declara la anotación. `background.status(jobId) -> { status, result: Dynamic?, error }` consulta el resultado eventual (`status`: pending/running/done/failed/not_found). Estado en memoria (`BackgroundJobStore`, mismo criterio que `IdempotencyStore`/`RateLimiter`), no una tabla SQL -- v1 es explícitamente "un proceso, sin cola distribuida", sin otra instancia con la que coordinar. El worker reproduce el bearer token de quien encoló el job, así que `auth.currentRole()`/`currentUserId()` dentro del cuerpo ven la misma identidad que si hubiera corrido sincrónicamente. `contract.d.ts`/`client.ts`/`openapi.json` reflejan la forma real de la respuesta (`{ jobId: string }`, no el tipo declarado del rpc). Sin validación de parámetros al encolar (falla recién al ejecutar, visible como `status: "failed"`), sin reintentos automáticos, sin cancelación -- límites v1 documentados. Ver GRAMMAR.md §3.262.
+
 ## [1.209.0] - 2026-09-05
 
 ### ✨ Añadido

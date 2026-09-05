@@ -3,6 +3,7 @@
 // No es el runtime final del lenguaje — Fase 1+ compila a WASM/nativo
 // (PLAN.md §4) — esto solo alcanza para que la demo E2E responda de verdad.
 
+pub(crate) mod background;
 pub mod db;
 pub(crate) mod encryption;
 pub(crate) mod excel;
@@ -123,6 +124,8 @@ pub enum Value {
     Mcp,
     /// Marcador interno para el módulo `image` (GRAMMAR.md §3.258)
     Image,
+    /// Marcador interno para el módulo `background` (GRAMMAR.md §3.262)
+    Background,
     /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
     Env,
     /// Marcador interno para el módulo `request` (GRAMMAR.md §3.38) -- body
@@ -190,6 +193,7 @@ fn supports_bound_method_access(v: &Value) -> bool {
         | Value::Ai
         | Value::Mcp
         | Value::Image
+        | Value::Background
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -242,6 +246,7 @@ fn is_marker_singleton(v: &Value) -> bool {
         | Value::Ai
         | Value::Mcp
         | Value::Image
+        | Value::Background
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -345,6 +350,7 @@ impl std::fmt::Debug for Value {
             Value::Ai => write!(f, "Ai"),
             Value::Mcp => write!(f, "Mcp"),
             Value::Image => write!(f, "Image"),
+            Value::Background => write!(f, "Background"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
             Value::Smtp => write!(f, "Smtp"),
@@ -583,6 +589,9 @@ pub(crate) fn eval_expr(
             }
             if name == "image" {
                 return Ok(Value::Image);
+            }
+            if name == "background" {
+                return Ok(Value::Background);
             }
             if name == "env" {
                 return Ok(Value::Env);
@@ -4141,6 +4150,16 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre image: '{other}'"))),
         },
+        Value::Background => match method {
+            "status" => {
+                let job_id = match args.into_iter().next() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("background.status requiere un argumento String (jobId)")),
+                };
+                Ok(db.background_job_status(&job_id))
+            }
+            other => Err(err(format!("método desconocido sobre background: '{other}'"))),
+        },
         Value::Mcp => match method {
             "sample" => {
                 let prompt = match args.into_iter().next() {
@@ -5631,6 +5650,29 @@ pub fn required_idempotent(program: &Program, service_name: &str, rpc_name: &str
     })
 }
 
+/// GRAMMAR.md §3.262: `true` si `service_name.rpc_name` lleva `@background`
+/// -- mismo criterio exacto que `required_idempotent`. `server.rs` lo
+/// consulta ANTES de invocar, para encolar en vez de correr sincrónicamente.
+pub fn required_background(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) if s.name == service_name => {
+            s.members.iter().any(|m| matches!(m, Member::Rpc(r) if r.name == rpc_name && r.background()))
+        }
+        _ => false,
+    })
+}
+
+/// GRAMMAR.md §3.262: `true` si ALGÚN rpc de `program` lleva `@background`
+/// -- `server.rs` lo consulta UNA vez al arrancar para decidir si vale la
+/// pena levantar el pool de workers (invisible, sin costo, para un programa
+/// que nunca usa la anotación).
+pub fn program_has_any_background_rpc(program: &Program) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) => s.members.iter().any(|m| matches!(m, Member::Rpc(r) if r.background())),
+        _ => false,
+    })
+}
+
 /// Si el CUERPO de `service_name.rpc_name` matchea el shape de push real
 /// v0 (GRAMMAR.md §3.16), el nombre de la colección a la que se suscribe.
 /// Otra hermana de `is_stream_member`/`required_auth`: `server.rs` la usa
@@ -5719,7 +5761,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Image | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Image | Value::Background | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }
