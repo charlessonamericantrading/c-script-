@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.226.2] - 2026-09-07
+
+### 🐛 Corregido
+**El accept loop dejaba de aceptar conexiones POR COMPLETO al drenar -- eso incluía a `/ready`, así que ningún proxy podía observar nunca el `503`/`draining:true` que el drenado gracioso existe para exponer (v1.226.1 quedó en rojo en `ubuntu-latest` CI por esto).** El diseño original (v1.226.0/v1.226.1) hacía que el accept loop dejara de llamar `accept()` de una apenas llegaba la señal -- correcto para requests de negocio normales, pero también apagaba `/ready` y `/live`, que necesitan seguir respondiendo DURANTE todo el drenado para que un load balancer real pueda enterarse de que hay que dejar de enrutar tráfico. Corregido: el accept loop ahora SIGUE aceptando conexiones durante todo el drenado; `/`, `/health`, `/status`, `/live`, `/ready` se procesan normal, cualquier otra request nueva se rechaza con `503` de inmediato (sin gastar un hilo) desde la ADMISIÓN, no dejando de aceptar. El loop sale recién cuando `in_flight` llega a 0 o se agota `--drain-timeout`. Ver GRAMMAR.md §3.282.
+
+Verificado: `cli_graceful_drain.rs` ahora exige (no tolera en silencio) que `/ready` responda con `draining:true` durante el drenado, y agrega una request nueva real confirmando el rechazo 503 sin correr el rpc. Suite completa sin regresiones, `cargo clippy -D warnings` limpio; pendiente confirmación de CI en `ubuntu-latest`, el ambiente que encontró los tres bugs de este ítem.
+
 ## [1.226.1] - 2026-09-07
 
 ### 🐛 Corregido

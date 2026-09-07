@@ -847,6 +847,27 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
             let fallback_upstream = fallback_upstream.clone();
             let draining = std::sync::Arc::clone(&draining);
             let request = $request;
+            // GRAMMAR.md §3.282: mientras el proceso drena, cualquier
+            // request NUEVA que no sea de liveness/readiness se rechaza acá
+            // mismo, ANTES de gastar un hilo o tocar `in_flight` -- el loop
+            // principal de abajo sigue aceptando conexiones durante TODO el
+            // drenado (nunca deja de llamar `accept()`) precisamente para
+            // que `/ready` (que sí sigue procesándose normal, y reporta
+            // `draining:true`/503 desde adentro) sea OBSERVABLE por un
+            // proxy real -- si el proceso dejara de aceptar conexiones de
+            // una, ningún load balancer podría enterarse de que hay que
+            // dejar de enrutar tráfico nuevo hacia acá.
+            let path_for_draining_check = request.url().to_string();
+            let exempt_from_draining =
+                matches!(path_for_draining_check.as_str(), "/" | "/health" | "/status" | "/live" | "/ready");
+            if draining.load(std::sync::atomic::Ordering::SeqCst) && !exempt_from_draining {
+                let resp = tiny_http::Response::from_string(error_json(
+                    "el servidor está drenando (apagado gracioso en curso) -- no acepta requests nuevas (GRAMMAR.md §3.282)",
+                ))
+                .with_status_code(503)
+                .with_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap());
+                let _ = request.respond(resp);
+            } else {
             // GRAMMAR.md §3.241/§3.282: admisión ANTES de gastar un hilo.
             // `/live` nunca cuenta ni se rechaza: un orquestador tiene que
             // poder preguntar "¿vivo?" justo cuando el proceso está
@@ -913,6 +934,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                 }
             });
             }
+            }
         }};
     }
 
@@ -927,6 +949,11 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     // sin Postgres, a cambio de que un `Ctrl-C`/SIGTERM se note en como
     // mucho ese intervalo en vez de nunca.
     let poll_interval = if remote_changes.is_some() { REMOTE_CHANGE_POLL_INTERVAL } else { DRAIN_POLL_INTERVAL };
+    // `None` hasta que `draining` se prende por primera vez -- el momento
+    // en que pasa a `Some` es también el único punto donde vale la pena
+    // imprimir el aviso de "empezando a drenar" (una sola vez, no en cada
+    // vuelta del loop).
+    let mut drain_started: Option<std::time::Instant> = None;
     loop {
         if let Some(remote_rx) = &remote_changes {
             while let Ok(change) = remote_rx.try_recv() {
@@ -951,35 +978,36 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
             // que ya drena `remote_rx` arriba, sin ningún hilo/timer nuevo.
             db.flush_pending_notify_retries();
         }
-        // GRAMMAR.md §3.282: revisado en CADA vuelta, antes de aceptar la
-        // próxima request -- una señal recibida mientras el loop esperaba
-        // en `recv_timeout` se nota acá, como mucho `poll_interval` después.
+        // GRAMMAR.md §3.282: revisado en CADA vuelta. A propósito NO
+        // rompe el loop apenas `draining` se prende -- el loop SIGUE
+        // aceptando conexiones durante todo el drenado (`/ready`/`/live`
+        // siguen respondiendo normal, cualquier otra request nueva la
+        // rechaza `spawn_handler!` con 503 antes de llegar acá) hasta que
+        // ya no queda ninguna request real en vuelo, o se agotó
+        // `drain_timeout` -- lo que pase primero. Sin esto, un proxy real
+        // nunca podría OBSERVAR el `draining:true` de `/ready`: si el
+        // proceso dejara de aceptar conexiones de una, esa misma request
+        // de `/ready` tampoco tendría cómo llegar.
         if draining.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
+            let started = *drain_started.get_or_insert_with(|| {
+                eprintln!("señal de apagado recibida -- drenando requests en vuelo (hasta {drain_timeout:?})...");
+                std::time::Instant::now()
+            });
+            if in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                eprintln!("drenado completo en {:?}, saliendo", started.elapsed());
+                break;
+            }
+            if started.elapsed() >= drain_timeout {
+                let remaining = in_flight.load(std::sync::atomic::Ordering::SeqCst);
+                eprintln!("drenado incompleto: {remaining} request(s) seguían en vuelo después de {drain_timeout:?}, saliendo de todos modos");
+                break;
+            }
         }
         match server.recv_timeout(poll_interval) {
             Ok(Some(request)) => spawn_handler!(request),
             Ok(None) => {}
             Err(e) => eprintln!("error aceptando una conexión: {e}"),
         }
-    }
-
-    // GRAMMAR.md §3.282: el loop de arriba ya dejó de aceptar -- lo único
-    // que falta es esperar a que las requests YA en vuelo (`in_flight`,
-    // incrementado por `spawn_handler!` de arriba) terminen solas, hasta
-    // `drain_timeout`. Poll corto (no otro canal/`Condvar`): el número de
-    // wakeups de sobra en el peor caso (unos pocos por segundo, por unos
-    // pocos segundos) no vale la complejidad de sincronización real.
-    eprintln!("señal de apagado recibida -- drenando requests en vuelo (hasta {drain_timeout:?})...");
-    let drain_started = std::time::Instant::now();
-    while in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0 && drain_started.elapsed() < drain_timeout {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let remaining = in_flight.load(std::sync::atomic::Ordering::SeqCst);
-    if remaining > 0 {
-        eprintln!("drenado incompleto: {remaining} request(s) seguían en vuelo después de {drain_timeout:?}, saliendo de todos modos");
-    } else {
-        eprintln!("drenado completo en {:?}, saliendo", drain_started.elapsed());
     }
     Ok(())
 }

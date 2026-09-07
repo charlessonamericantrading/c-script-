@@ -222,12 +222,20 @@ fn graceful_shutdown_lets_an_in_flight_request_finish_then_exits_cleanly() {
 
     // /ready pasa a draining=true casi de inmediato -- el proceso todavía
     // no salió (la request lenta sigue corriendo), pero ya avisa que no hay
-    // que enrutarle tráfico nuevo.
+    // que enrutarle tráfico nuevo. El accept loop SIGUE aceptando conexiones
+    // durante todo el drenado a propósito -- si dejara de aceptar de una,
+    // esta misma request de /ready no tendría cómo llegar, y ningún proxy
+    // real podría enterarse de que hay que dejar de enrutar tráfico nuevo.
     std::thread::sleep(Duration::from_millis(200));
-    if let Ok((status, body)) = request(port, "GET", "/ready", "") {
-        assert_eq!(status, 503, "{body}");
-        assert!(body.contains("\"draining\":true"), "{body}");
-    }
+    let (status, body) = request(port, "GET", "/ready", "").expect("/ready tiene que seguir respondiendo durante el drenado");
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("\"draining\":true"), "{body}");
+
+    // Una request NUEVA (no de liveness/readiness) durante el drenado se
+    // rechaza con 503 de inmediato -- nunca llega a correr el rpc.
+    let (status, body) = request(port, "POST", "/Slow/fast", "{}").expect("debería responder, aunque sea con un rechazo");
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("drenando"), "{body}");
 
     // La request lenta, YA EN VUELO antes de la señal, termina con éxito --
     // el drenado la deja completar en vez de cortarla.
