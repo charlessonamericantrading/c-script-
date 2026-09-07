@@ -2045,6 +2045,19 @@ impl Parser {
                 self.advance();
                 Err(self.empty_closure_error())
             }
+            // GRAMMAR.md §3.273: un literal de `Map<String, V>` se distingue
+            // de un struct-lit anónimo por el PRIMER token adentro de `{` --
+            // un `Str` (clave entre comillas) en vez de un identificador.
+            // `{}` vacío sigue siendo el struct-lit anónimo de siempre (sin
+            // nada que mirar para decidir) -- el checker lo acepta como Map
+            // vacío también cuando el contexto lo pide (check_expr contra
+            // Type::MapOf).
+            TokenKind::LBrace if !no_struct_lit && matches!(self.peek_at(1), TokenKind::Str(_)) => {
+                let start = self.span();
+                let fields = self.parse_map_lit_fields()?;
+                let span = merge(start, self.prev_span());
+                Ok(Spanned { node: Expr::MapLit(fields), span })
+            }
             TokenKind::LBrace if !no_struct_lit => {
                 let start = self.span();
                 let fields = self.parse_field_init_list()?;
@@ -2149,6 +2162,45 @@ impl Parser {
         self.eat(&TokenKind::Colon)?;
         let value = self.parse_expr()?;
         Ok((name, value))
+    }
+
+    /// GRAMMAR.md §3.273: mismo shape que `parse_field_init_list`, pero cada
+    /// clave es un `Str` entre comillas en vez de un identificador -- una
+    /// clave que no sea `Str` (ej. mezclar `{"a": 1, b: 2}`) es un error de
+    /// parseo claro, no un fallback silencioso a struct-lit a mitad de
+    /// camino.
+    fn parse_map_lit_fields(&mut self) -> Result<Vec<(String, Spanned<Expr>)>, ParseError> {
+        self.eat(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        if !self.check(&TokenKind::RBrace) {
+            fields.push(self.parse_map_lit_field()?);
+            while self.check(&TokenKind::Comma) {
+                self.advance();
+                if self.check(&TokenKind::RBrace) {
+                    break;
+                }
+                fields.push(self.parse_map_lit_field()?);
+            }
+        }
+        self.eat(&TokenKind::RBrace)?;
+        Ok(fields)
+    }
+
+    fn parse_map_lit_field(&mut self) -> Result<(String, Spanned<Expr>), ParseError> {
+        let key = match self.peek().clone() {
+            TokenKind::Str(s) => {
+                self.advance();
+                s
+            }
+            other => {
+                return Err(self.error(format!(
+                    "se esperaba una clave String entre comillas para un literal de Map, se encontró {other:?}"
+                )))
+            }
+        };
+        self.eat(&TokenKind::Colon)?;
+        let value = self.parse_expr()?;
+        Ok((key, value))
     }
 }
 
@@ -2347,6 +2399,57 @@ mod tests {
             }
             other => panic!("se esperaba Match, fue {other:?}"),
         }
+    }
+
+    // ---- literal de Map `{"clave": valor}` (GRAMMAR.md §3.273) ----
+
+    #[test]
+    fn a_brace_with_a_quoted_first_key_parses_as_map_lit_not_struct_lit() {
+        let prog = parse_source(r#"fn f() -> Dynamic { {"a": 1, "b": 2} }"#);
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        let tail = body.tail.as_deref().unwrap();
+        match &tail.node {
+            Expr::MapLit(fields) => {
+                assert_eq!(fields.len(), 2);
+                assert_eq!(fields[0].0, "a");
+                assert_eq!(fields[1].0, "b");
+            }
+            other => panic!("se esperaba MapLit, fue {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_brace_with_a_bare_ident_first_key_still_parses_as_struct_lit() {
+        let prog = parse_source(r#"fn f() -> Dynamic { {a: 1, b: 2} }"#);
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        let tail = body.tail.as_deref().unwrap();
+        match &tail.node {
+            Expr::StructLit { name, fields, .. } => {
+                assert_eq!(name, "");
+                assert_eq!(fields.len(), 2);
+            }
+            other => panic!("se esperaba StructLit, fue {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_brace_still_parses_as_an_empty_struct_lit() {
+        // `{}` nunca puede ser MapLit -- no hay ningún token adentro para
+        // decidir. El checker lo acepta como Map vacío también, ver
+        // checker.rs.
+        let prog = parse_source("fn f() -> Dynamic { {} }");
+        let Item::Fn(FnDecl { body, .. }) = &prog.items[0] else { panic!() };
+        let tail = body.tail.as_deref().unwrap();
+        match &tail.node {
+            Expr::StructLit { fields, .. } => assert!(fields.is_empty()),
+            other => panic!("se esperaba StructLit vacío, fue {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_map_lit_with_a_mixed_key_after_the_first_is_a_clean_parse_error() {
+        let tokens = tokenize(r#"fn f() -> Dynamic { {"a": 1, b: 2} }"#).unwrap();
+        assert!(parse(tokens).is_err(), "una clave sin comillas después de la primera (ya Str) debería rechazarse");
     }
 
     #[test]

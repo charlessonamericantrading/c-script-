@@ -928,6 +928,49 @@ pub(crate) fn eval_expr(
                     return call_callable(callee_v, arg_vs, db, fns, checker, sessions, current_token, step_budget);
                 }
             }
+            // `Map<K,V>.get/set/has/remove/keys/values/entries` (GRAMMAR.md
+            // §3.273): MISMO problema estructural que `isSome`/`isNone`
+            // arriba -- `Map<K,V>` ES `Value::Struct` en runtime (sin marca
+            // propia), así que `Expr::FieldAccess` genérico de más abajo
+            // buscaría "get" como una CLAVE real del mapa y fallaría a
+            // `Value::Null` en vez de producir el método.
+            //
+            // A diferencia de `isSome`/`isNone` (nombres específicos que
+            // casi nunca colisionan con un campo real), acá la resolución
+            // de "¿es un campo real o el método?" NO puede ser "¿existe esa
+            // clave?" a secas -- un `Map<K,V>` real puede perfectamente
+            // tener una clave llamada "get" (ej. agrupado por un valor que
+            // por casualidad es la palabra "get"), y en ESE caso el método
+            // builtin tiene que seguir funcionando para CUALQUIER clave que
+            // se le pida, no solo dejar de andar en cuanto el mapa contiene
+            // esa clave. La distinción real es: ¿el valor guardado ahí es
+            // CALLABLE (closure/fn-ref/bound-method)? Si lo es, es un campo
+            // de closure de un struct DECLARADO real (GRAMMAR.md §3.10,
+            // mismo patrón que `x.isSome()` cuando `isSome` es un campo de
+            // verdad) -- se llama tal cual. Si no lo es, se ignora la
+            // coincidencia y se usa el método builtin del Map. Límite
+            // honesto: un `Map<String, Fn>` (valores función) con una clave
+            // literal que coincida con uno de estos 7 nombres es el único
+            // caso que esto no cubre -- sin evidencia de que exista hoy.
+            if let Expr::FieldAccess { base, field } = &callee.node {
+                if matches!(field.as_str(), "get" | "set" | "has" | "remove" | "keys" | "values" | "entries") {
+                    let base_v = eval_expr(base, env, db, fns, checker, sessions, current_token, step_budget)?;
+                    if matches!(&base_v, Value::Struct(_)) {
+                        let shadowing_field = match &base_v {
+                            Value::Struct(fields) => fields.iter().find(|(n, _)| n == field).map(|(_, v)| v.clone()),
+                            _ => unreachable!("garantizado por el matches! de arriba"),
+                        };
+                        let is_callable_shadow =
+                            matches!(&shadowing_field, Some(Value::Closure(..) | Value::FnRef(_) | Value::BoundMethod(..)));
+                        if is_callable_shadow {
+                            let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                            return call_callable(shadowing_field.unwrap(), arg_vs, db, fns, checker, sessions, current_token, step_budget);
+                        }
+                        let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        return call_method(base_v, field, arg_vs, db, fns, checker, sessions, current_token, step_budget);
+                    }
+                }
+            }
             // `db.vacuum()`/`db.tableStats()` (GRAMMAR.md §3.151): mismo
             // motivo que el atajo de `isSome`/`isNone` arriba -- interceptar
             // ACÁ, antes de la evaluación genérica de `callee` como
@@ -1025,6 +1068,18 @@ pub(crate) fn eval_expr(
                 }
                 None => Ok(Value::Struct(evaluated)),
             }
+        }
+        // GRAMMAR.md §3.273: MISMA forma en runtime que `Map<K,V>` en
+        // cualquier otro lado (`db.tableStats()`, `List<T>.groupBy`) --
+        // `Value::Struct` sin ninguna marca especial. Sin defaults/
+        // validadores/`@check` de nivel type: un literal de Map no está
+        // atado a ningún `type` declarado.
+        Expr::MapLit(fields) => {
+            let evaluated = fields
+                .iter()
+                .map(|(k, e)| Ok((k.clone(), eval_expr(e, env, db, fns, checker, sessions, current_token, step_budget)?)))
+                .collect::<Result<Vec<_>, RuntimeError>>()?;
+            Ok(Value::Struct(evaluated))
         }
         Expr::Match { scrutinee, arms } => {
             let v = eval_expr(scrutinee, env, db, fns, checker, sessions, current_token, step_budget)?;
@@ -3816,6 +3871,53 @@ fn call_method(
                 Ok(Value::List(items.into_iter().zip(other).map(|(a, b)| Value::Tuple(vec![a, b])).collect()))
             }
             other => Err(err(format!("método de lista desconocido: '{other}'"))),
+        },
+        // GRAMMAR.md §3.273: `Map<K,V>` ES `Value::Struct` en runtime (sin
+        // marca especial, mismo valor que `db.tableStats()`/`groupBy`
+        // producen) -- el checker ya garantizó K = String antes de llegar
+        // acá.
+        Value::Struct(fields) => match method {
+            "get" => {
+                let key = match args.first() {
+                    Some(Value::Str(k)) => k,
+                    _ => return Err(err("'get' requiere un argumento String (key)")),
+                };
+                Ok(fields.into_iter().find(|(k, _)| k == key).map(|(_, v)| v).unwrap_or(Value::Null))
+            }
+            // Actualizar una clave EXISTENTE preserva su posición original
+            // (`iter_mut().find` + reemplazo in-place); una clave nueva se
+            // agrega al final -- mismo comportamiento que `Map`/dict de
+            // JS/Python, nunca reordena todo el mapa.
+            "set" => {
+                let (key, value) = match (args.first(), args.get(1)) {
+                    (Some(Value::Str(k)), Some(v)) => (k.clone(), v.clone()),
+                    _ => return Err(err("'set' requiere un argumento String (key) y un valor")),
+                };
+                let mut new_fields = fields;
+                match new_fields.iter_mut().find(|(k, _)| k == &key) {
+                    Some((_, existing)) => *existing = value,
+                    None => new_fields.push((key, value)),
+                }
+                Ok(Value::Struct(new_fields))
+            }
+            "has" => {
+                let key = match args.first() {
+                    Some(Value::Str(k)) => k,
+                    _ => return Err(err("'has' requiere un argumento String (key)")),
+                };
+                Ok(Value::Bool(fields.iter().any(|(k, _)| k == key)))
+            }
+            "remove" => {
+                let key = match args.first() {
+                    Some(Value::Str(k)) => k,
+                    _ => return Err(err("'remove' requiere un argumento String (key)")),
+                };
+                Ok(Value::Struct(fields.into_iter().filter(|(k, _)| k != key).collect()))
+            }
+            "keys" => Ok(Value::List(fields.iter().map(|(k, _)| Value::Str(k.clone())).collect())),
+            "values" => Ok(Value::List(fields.into_iter().map(|(_, v)| v).collect())),
+            "entries" => Ok(Value::List(fields.into_iter().map(|(k, v)| Value::Tuple(vec![Value::Str(k), v])).collect())),
+            other => Err(err(format!("método desconocido sobre Map: '{other}'"))),
         },
         Value::Int(n) => match method {
             "toFloat" => Ok(Value::Float(n as f64)),

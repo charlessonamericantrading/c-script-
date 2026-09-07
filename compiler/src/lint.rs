@@ -386,7 +386,7 @@ fn lint_secret_comparisons_in_expr(expr: &Spanned<Expr>, warnings: &mut Vec<Lint
                 lint_secret_comparisons_in_expr(e, warnings);
             }
         }
-        Expr::StructLit { fields, .. } => {
+        Expr::StructLit { fields, .. } | Expr::MapLit(fields) => {
             for (_, v) in fields {
                 lint_secret_comparisons_in_expr(v, warnings);
             }
@@ -526,7 +526,7 @@ fn expr_count_ident(expr: &Expr, target: &str) -> usize {
         Expr::Index { base, index } => expr_count_ident(&base.node, target) + expr_count_ident(&index.node, target),
         Expr::TupleLit(elems) => elems.iter().map(|e| expr_count_ident(&e.node, target)).sum(),
         Expr::TupleIndex { base, .. } => expr_count_ident(&base.node, target),
-        Expr::StructLit { fields, .. } => fields.iter().map(|(_, v)| expr_count_ident(&v.node, target)).sum(),
+        Expr::StructLit { fields, .. } | Expr::MapLit(fields) => fields.iter().map(|(_, v)| expr_count_ident(&v.node, target)).sum(),
         Expr::Closure { body, .. } => usize::from(block_uses_ident(body, target)),
         // GRAMMAR.md §3.154: mismo motivo que el bloque de comentario de
         // arriba -- sin este arm, `target` usado SOLO adentro de un
@@ -599,7 +599,7 @@ fn expr_calls_auth_identity(expr: &Expr) -> bool {
         Expr::Binary { left, right, .. } => expr_calls_auth_identity(&left.node) || expr_calls_auth_identity(&right.node),
         Expr::Index { base, index } => expr_calls_auth_identity(&base.node) || expr_calls_auth_identity(&index.node),
         Expr::ArrayLit(elems) | Expr::TupleLit(elems) => elems.iter().any(|e| expr_calls_auth_identity(&e.node)),
-        Expr::StructLit { fields, .. } => fields.iter().any(|(_, v)| expr_calls_auth_identity(&v.node)),
+        Expr::StructLit { fields, .. } | Expr::MapLit(fields) => fields.iter().any(|(_, v)| expr_calls_auth_identity(&v.node)),
         Expr::Closure { body, .. } | Expr::Transaction(body) => block_calls_auth_identity(body),
         Expr::If { cond, then_block, else_block } => {
             expr_calls_auth_identity(&cond.node) || block_calls_auth_identity(then_block) || block_calls_auth_identity(else_block)

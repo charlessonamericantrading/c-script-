@@ -195,7 +195,7 @@ fn is_literal_expr(e: &Expr) -> bool {
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
         Expr::Unary { op: UnaryOp::Neg, operand } => matches!(operand.node, Expr::Int(_) | Expr::Float(_)),
         Expr::ArrayLit(items) | Expr::TupleLit(items) => items.iter().all(|i| is_literal_expr(&i.node)),
-        Expr::StructLit { fields, .. } => fields.iter().all(|(_, v)| is_literal_expr(&v.node)),
+        Expr::StructLit { fields, .. } | Expr::MapLit(fields) => fields.iter().all(|(_, v)| is_literal_expr(&v.node)),
         _ => false,
     }
 }
@@ -580,7 +580,7 @@ fn is_const_literal_shape(e: &Expr) -> bool {
     match e {
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
         Expr::ArrayLit(items) | Expr::TupleLit(items) => items.iter().all(|it| is_const_literal_shape(&it.node)),
-        Expr::StructLit { fields, .. } => fields.iter().all(|(_, fe)| is_const_literal_shape(&fe.node)),
+        Expr::StructLit { fields, .. } | Expr::MapLit(fields) => fields.iter().all(|(_, fe)| is_const_literal_shape(&fe.node)),
         _ => false,
     }
 }
@@ -3920,6 +3920,12 @@ impl Checker {
                     "un array vacío '[]' requiere un tipo esperado de lista, se esperaba {other}"
                 ))),
             },
+            // GRAMMAR.md §3.273: un struct-lit anónimo VACÍO (`{}`) es la
+            // ÚNICA forma en que el parser puede producir "nada adentro de
+            // las llaves" -- `Expr::MapLit` nunca es vacío (ver su nota en
+            // synth_expr_inner) -- así que también es el Map vacío cuando el
+            // contexto lo pide, mismo criterio que `[]` arriba.
+            Expr::StructLit { name, variant: None, fields } if name.is_empty() && fields.is_empty() && matches!(expected, Type::MapOf(_, _)) => Ok(()),
             // Rama EXPLÍCITA, no delegar al fallback de abajo -- si esto
             // solo existiera en `synth_expr`, un closure sin anotar caería
             // acá, exigiría anotación en cada param (la regla de síntesis) y
@@ -4909,6 +4915,28 @@ impl Checker {
             }
             Expr::StructLit { name, variant, fields } => {
                 self.synth_struct_lit(name, variant.as_deref(), fields, env)
+            }
+            // GRAMMAR.md §3.273: mismo criterio de unificación que
+            // `ArrayLit` (primer VALOR sintetiza `V`, el resto se chequea
+            // contra ese tipo) -- acá el "elemento" es el valor de cada par
+            // clave-valor, la clave siempre es `String` por construcción del
+            // parser. Vacío no sintetiza, igual que `[]` -- pero un `{}`
+            // vacío nunca llega ACÁ (el parser solo produce `MapLit` cuando
+            // encontró al menos una clave `Str`; `{}` siempre parsea como
+            // `StructLit` vacío, aceptado como Map vacío en `check_expr`
+            // cuando el contexto lo pide).
+            Expr::MapLit(fields) => {
+                let mut iter = fields.iter();
+                let Some((_, first_value)) = iter.next() else {
+                    return Err(err(
+                        "un Map vacío no se puede sintetizar sin un tipo esperado (ej. anotá el 'let': let m: Map<String, Int> = {})",
+                    ));
+                };
+                let value_ty = self.synth_expr(first_value, env)?;
+                for (_, v) in iter {
+                    self.check_expr(v, &value_ty, env)?;
+                }
+                Ok(Type::MapOf(Box::new(Type::String), Box::new(value_ty)))
             }
             Expr::Match { .. } => Err(err(
                 "'match' en posición de síntesis no soportado — necesita un tipo esperado del contexto (GRAMMAR.md §3.1, regla Match es de modo chequeo)",
@@ -6040,6 +6068,60 @@ impl Checker {
                         return Err(err(format!("'zip' espera un argumento List<U>, se encontró {other}")))
                     }
                 }
+            }
+            // GRAMMAR.md §3.273 (PLAN.md §9.24 Fase 0 ítem A6): la API real
+            // que `Map<K,V>` no tenía -- cierra la Fase 0 entera. Acotado a
+            // K = String (mismo motivo que `groupBy`, arriba): `Value::Struct`
+            // -- lo que un `Map<K,V>` ES en runtime, ver `db.tableStats()`,
+            // §3.151 -- ya es string-keyed, y ningún caso real pidió todavía
+            // una clave que no sea `String`. Guard ÚNICO con el mensaje claro
+            // para los 7 métodos, en vez de repetirlo 7 veces.
+            (Type::MapOf(k, _), "get" | "set" | "has" | "remove" | "keys" | "values" | "entries") if !matches!(k.as_ref(), Type::String) => {
+                return Err(err(format!(
+                    "los métodos de Map<K,V> (get/set/has/remove/keys/values/entries) solo están implementados para K = String, se encontró Map<{k}, ...> (GRAMMAR.md §3.273)"
+                )));
+            }
+            // `V?` -- `null` en runtime cuando la clave no existe, nunca un
+            // error. Mismo criterio que cualquier otro acceso "puede no
+            // estar" del lenguaje (ej. un campo `Optional`).
+            (Type::MapOf(_, v), "get") => builtin_args!(
+                self, args, env, "Map.get",
+                [(key, "key: String", Type::String)] -> Type::Optional(v.clone())
+            ),
+            // Devuelve un Map NUEVO (nunca muta el receptor in-place) --
+            // mismo criterio de "sin mutación real de estructuras" que el
+            // resto del lenguaje (`List<T>.reverse()`/`.slice()` tampoco
+            // mutan). Actualizar una clave existente preserva su posición
+            // original; una clave nueva se agrega al final -- mismo
+            // comportamiento que `Map`/dict de JS/Python.
+            (Type::MapOf(k, v), "set") => builtin_args!(
+                self, args, env, "Map.set",
+                [(key, "key: String", Type::String), (value, "value: V", (**v).clone())] -> Type::MapOf(k.clone(), v.clone())
+            ),
+            (Type::MapOf(_, _), "has") => builtin_args!(
+                self, args, env, "Map.has",
+                [(key, "key: String", Type::String)] -> Type::Bool
+            ),
+            (Type::MapOf(k, v), "remove") => builtin_args!(
+                self, args, env, "Map.remove",
+                [(key, "key: String", Type::String)] -> Type::MapOf(k.clone(), v.clone())
+            ),
+            (Type::MapOf(k, _), "keys") => {
+                self.expect_no_args(args, "keys")?;
+                Some(Type::List(k.clone()))
+            }
+            (Type::MapOf(_, v), "values") => {
+                self.expect_no_args(args, "values")?;
+                Some(Type::List(v.clone()))
+            }
+            // "Iteración" real (PLAN.md §9.24 A6) sin inventar destructuring
+            // en el patrón de un `for` (`for (k, v) in map { }` queda fuera
+            // de alcance, §3.271) -- `entries()` + `for par in map.entries()
+            // { par.0; par.1; }` ya cubre el caso real, reusando el tipo
+            // `Tuple` existente (mismo criterio que `List<T>.zip`, §3.272).
+            (Type::MapOf(k, v), "entries") => {
+                self.expect_no_args(args, "entries")?;
+                Some(Type::List(Box::new(Type::Tuple(vec![(**k).clone(), (**v).clone()]))))
             }
             _ => None,
         };
@@ -11465,6 +11547,93 @@ type T = { id: Int, s: Status }")
             fn f(xs: Int[]) -> (Int, Int)[] { xs.zip("no es lista") }
         "#;
         assert!(check_source(src).is_err());
+    }
+
+    // ---- Map<K,V> literal + API real: get/set/has/remove/keys/values/entries (GRAMMAR.md §3.273, PLAN.md §9.24 A6) ----
+
+    #[test]
+    fn map_lit_unifies_all_values_to_one_type() {
+        let src = r#"
+            fn f() -> Map<String, Int> { {"a": 1, "b": 2} }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn map_lit_rejects_values_of_mixed_type() {
+        let src = r#"
+            fn f() -> Map<String, Int> { {"a": 1, "b": "dos"} }
+        "#;
+        assert!(check_source(src).is_err(), "los valores tienen que unificar a un único V, mismo criterio que ArrayLit");
+    }
+
+    #[test]
+    fn an_empty_brace_typechecks_as_an_empty_map_when_the_context_expects_one() {
+        let src = r#"
+            fn f() -> Map<String, Int> { {} }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn map_get_returns_an_optional_of_the_value_type() {
+        let src = r#"
+            fn f(m: Map<String, Int>) -> Int? { m.get("a") }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn map_set_takes_a_string_key_and_a_value_and_returns_the_same_map_type() {
+        let src = r#"
+            fn f(m: Map<String, Int>) -> Map<String, Int> { m.set("a", 1) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+        assert!(check_source(r#"fn f(m: Map<String, Int>) -> Map<String, Int> { m.set("a", "no es Int") }"#).is_err(), "value tiene que ser V");
+    }
+
+    #[test]
+    fn map_has_and_remove_take_a_string_key() {
+        let src = r#"
+            fn hasA(m: Map<String, Int>) -> Bool { m.has("a") }
+            fn removeA(m: Map<String, Int>) -> Map<String, Int> { m.remove("a") }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn map_keys_values_and_entries_return_the_right_shapes() {
+        let src = r#"
+            fn ks(m: Map<String, Int>) -> String[] { m.keys() }
+            fn vs(m: Map<String, Int>) -> Int[] { m.values() }
+            fn es(m: Map<String, Int>) -> (String, Int)[] { m.entries() }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn map_of_int_key_rejects_every_method_with_a_clear_message() {
+        // Ningún caso real produce hoy un Map<Int, V> (groupBy también está
+        // acotado a String), pero la firma del tipo lo permite -- el
+        // mensaje de rechazo tiene que ser explícito, no un "método
+        // desconocido" genérico.
+        let result = check_source("fn f(m: Map<Int, String>) -> String? { m.get(\"x\") }");
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("K = String"), "el error debería explicar la restricción: {msg}");
+    }
+
+    #[test]
+    fn map_lit_composes_with_group_by_from_a5() {
+        // El caso real que motivó A6: groupBy (A5) ya construye un
+        // Map<String, T[]>, ahora se puede CONSULTAR de vuelta.
+        let src = r#"
+            type City = { name: String, province: String }
+            fn firstOfProvince(cities: City[], province: String) -> City[]? {
+                cities.groupBy(|c: City| { c.province }).get(province)
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 
     // ---- pdf.build (GRAMMAR.md §3.201) ----

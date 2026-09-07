@@ -9643,6 +9643,48 @@ fn byProvince(cities: City[]) -> Map<String, City[]> {
 
 **Verificado**: 12 tests de `checker.rs` (tipo/arity de cada uno de los 7 métodos, incluidos los rechazos: `flatMap` con callback que no devuelve lista, `unique`/`indexOf` sobre `List<Struct>`, `groupBy` con selector no-`String`, `zip` con argumento no-lista, `reduce` con callback que no matchea el acumulador) + 10 tests de comportamiento reales (`linkc test`) cubriendo los 7 métodos con datos reales, incluida la verificación del orden de `groupBy` (primera clave aparece antes que la segunda en el JSON) vía `json.stringify` -- `Map<K,V>` todavía no tiene forma de indexarse por clave desde código c-script, así que verificar su FORMA se hace por el wire, no por un método de consulta que no existe hasta A6 -- más verificación manual de `slice` fuera de rango. Suite completa (1365 tests) sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.273 `Map<K,V>`: literal `{"clave": valor}` + API real (`get`/`set`/`has`/`remove`/`keys`/`values`/`entries`) — cierra la Fase 0 de PLAN.md §9.24 (ítem A6, el último)
+
+Origen: PLAN.md §9.24.3 ítem A6 -- `Map<K,V>` existía como tipo (§2.2) desde el principio pero sin NINGÚN método (`checker.rs` no tenía ni un arm para `Type::MapOf`) ni forma de construirlo desde código de usuario salvo `List<T>.groupBy` (§3.272, recién agregado) -- que a su vez no tenía forma de CONSULTARSE de vuelta. Con esto, la Fase 0 entera de §9.24 queda cerrada.
+
+**Literal `{"clave": valor, ...}`, distinguido de un struct-lit anónimo por el PRIMER token adentro de `{`** -- un `Str` entre comillas en vez de un identificador. `{a: 1}` sigue siendo un struct-lit (campo `a`); `{"a": 1}` es un literal de `Map<String, Int>`. Todos los VALORES tienen que unificar a un único tipo `V` (mismo criterio que `[1, 2, 3]` para `List<T>`, GRAMMAR.md §2.3) -- a diferencia de un struct-lit, cuyos campos son heterogéneos a propósito. `{}` vacío sigue siendo SIEMPRE el struct-lit anónimo de siempre (no hay nada adentro para decidir) -- pero también typa como `Map<K,V>` vacío cuando el contexto lo pide (`let m: Map<String, Int> = {};`), mismo criterio que `[]` vacío necesita un tipo esperado.
+
+**API completa, acotada a `K = String`** -- mismo motivo que `groupBy` (§3.272): `Map<K,V>` es `Value::Struct` en runtime (la MISMA forma que `db.tableStats()` ya usa, §3.151), que ya es string-keyed; generalizar a un `K` arbitrario exigiría decidir qué significa una clave `Int`/`Uuid` en un objeto JSON real, sin ningún caso concreto que lo pida todavía. Un `Map<Int, V>` (el tipo lo permite sintácticamente) rechaza los 7 métodos con un mensaje que explica la restricción, no un "método desconocido" genérico.
+
+| Método | Firma | Nota |
+|---|---|---|
+| `get` | `(key: String) -> V?` | `null` si la clave no existe, nunca un error |
+| `set` | `(key: String, value: V) -> Map<String, V>` | devuelve un Map NUEVO -- nunca muta el receptor. Actualizar una clave existente preserva su posición; una nueva se agrega al final |
+| `has` | `(key: String) -> Bool` | |
+| `remove` | `(key: String) -> Map<String, V>` | Map nuevo sin esa clave |
+| `keys` | `() -> String[]` | |
+| `values` | `() -> V[]` | |
+| `entries` | `() -> (String, V)[]` | usa el tipo `Tuple` ya existente (§2.2), mismo criterio que `List<T>.zip` (§3.272) |
+
+<!-- linkc:check -->
+```rust
+fn f() -> Bool {
+  let m: Map<String, Int> = {"a": 1, "b": 2};
+  m.get("a") == 1 && m.get("z") == null && m.has("b")
+}
+
+fn iterate(m: Map<String, Int>) -> Int {
+  let mut total = 0;
+  for pair in m.entries() {
+    total = total + pair.1;
+  }
+  total
+}
+```
+
+**"Iteración" (parte del ítem A6) sin inventar destructuring en el patrón de un `for`** -- `for (k, v) in map { }` queda explícitamente fuera de alcance (§3.271 ya lo documentaba). `entries() -> (String, V)[]` + `for par in map.entries() { par.0; par.1; }` cubre el caso real reusando sintaxis que ya existe, sin agregar ninguna forma nueva de patrón.
+
+**Bug real encontrado y arreglado ANTES de shipear: los 7 métodos eran completamente inalcanzables al principio.** `Map<K,V>` es `Value::Struct` en runtime SIN ninguna marca que lo distinga de un struct declarado real -- `Expr::FieldAccess` (el mecanismo que decide si `x.campo` es una LECTURA de dato o el principio de una llamada a método) trataba CUALQUIER nombre sobre un `Value::Struct` como una clave a buscar, y devolvía `Value::Null` si no la encontraba -- así que `m.get("a")` evaluaba `m.get` primero (ninguna clave "get" en el mapa → `Null`) y DESPUÉS intentaba invocar ese `Null`, con "no se puede llamar un valor Null". Mismo problema estructural, y misma familia de solución, que ya existía para `.isSome()`/`.isNone()` sobre un `Optional` presente (§3.9) -- interceptar la llamada ANTES del `FieldAccess` genérico. La resolución tiene un matiz que el caso de `isSome`/`isNone` no necesitaba: ahí "¿hay un campo real con ese nombre?" alcanza (nombres raros de colisionar); acá un Map real PUEDE tener una clave literal "get"/"set"/etc (ej. agrupado por un valor que por casualidad es esa palabra), y en ESE caso el método tiene que seguir funcionando SIEMPRE, para cualquier clave que se le pida -- no solo dejar de andar la primera vez que el mapa contiene esa clave. La distinción real es si el valor guardado ahí es CALLABLE (closure/fn-ref/bound-method): si lo es, es un campo de closure de un struct DECLARADO de verdad (`type Repo = { get: (String) -> Int }`, GRAMMAR.md §3.10) y se llama tal cual; si no, se ignora la coincidencia y se usa el método builtin del Map. **Límite honesto**: un `Map<String, Fn>` (valores de tipo función) con una clave literal que coincida con uno de estos 7 nombres es el único caso que esto no cubre -- sin evidencia de que exista hoy.
+
+**Verificado**: 4 tests de `parser.rs` (`{"a":1}` parsea como `MapLit`, `{a:1}` sigue siendo `StructLit`, `{}` vacío sigue siendo `StructLit` vacío, una clave sin comillas después de la primera con comillas es un error de parseo limpio) + 9 tests de `checker.rs` (unificación de valores, rechazo de tipos mixtos, `{}` vacío contra un `Map` esperado, tipo de cada uno de los 7 métodos, rechazo con mensaje claro sobre `Map<Int, V>`, composición real con `groupBy` de A5) + 8 tests de comportamiento reales (`linkc test`) cubriendo los 7 métodos, el Map vacío anotado, que `set`/`remove` no mutan el receptor original, que `set` sobre una clave existente preserva su posición, iteración real vía `entries()` + `for`, y la composición completa `groupBy(...).get(...)` -- más una verificación manual de que un campo de closure real llamado `get` sobre un struct DECLARADO (no un Map) sigue funcionando sin cambios. Suite completa (1378 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
+**Con esto, PLAN.md §9.24 Fase 0 queda completa** -- los 7 ítems (A1, A4, A5, A6, A7) shipeados. Sigue: crear `examples/site/` (layout + 3 páginas + datos de `db`, con tests) como entregable verificable de que la Fase 0 realmente resuelve el problema que la motivó, y después empezar la Fase 1 (HTTP transversal).
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

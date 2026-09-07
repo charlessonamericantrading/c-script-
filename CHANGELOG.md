@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.216.0] - 2026-09-07
+
+### ✨ Añadido
+**`Map<K,V>` con API real -- cierra el ítem A6 de la Fase 0 de PLAN.md §9.24, y con esto la Fase 0 ENTERA.** `Map<K,V>` existía como tipo desde el principio sin ningún método. Ahora:
+- **Literal `{"clave": valor, ...}`** -- distinguido de un struct-lit anónimo por el primer token adentro de `{` (un `Str` en vez de un identificador). Todos los valores unifican a un único `V`, mismo criterio que `[1, 2, 3]` para `List<T>`. `{}` vacío sigue siendo struct-lit, pero también typa como Map vacío cuando el contexto lo pide.
+- **`get/set/has/remove/keys/values/entries`**, acotado a `K = String` (mismo motivo que `groupBy`, v1.215.0: `Map<K,V>` es `Value::Struct` en runtime, string-keyed por construcción). `set`/`remove` devuelven un Map NUEVO, nunca mutan. `entries()` reusa el tipo `Tuple` ya existente -- `for par in map.entries() { }` cubre la iteración real sin inventar destructuring en el patrón de un `for`.
+
+**Bug real encontrado y arreglado antes de shipear**: los 7 métodos eran completamente inalcanzables al principio -- `Map<K,V>` es `Value::Struct` sin marca que lo distinga de un struct declarado real, así que `m.get("a")` intentaba leer una clave literal "get" (ausente → `null`) y después invocar ese `null`. Mismo problema estructural que ya existía para `.isSome()`/`.isNone()` sobre un `Optional` presente -- misma familia de solución (interceptar antes del `FieldAccess` genérico), con un matiz nuevo: la distinción no es "¿hay una clave con ese nombre?" (un Map real puede tener una clave literal "get") sino "¿el valor guardado ahí es CALLABLE?" -- así el método sigue funcionando siempre, sin importar qué claves tenga el mapa. Ver GRAMMAR.md §3.273.
+
+Verificado con 4 tests de parser + 9 de checker + 8 de comportamiento reales (`linkc test`, incluida la composición completa `groupBy(...).get(...)`) más verificación manual del caso adversarial (un campo de closure real llamado `get` sobre un struct declarado sigue funcionando). Suite completa (1378 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.215.0] - 2026-09-07
 
 ### ✨ Añadido

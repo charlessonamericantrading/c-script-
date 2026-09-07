@@ -121,9 +121,20 @@ fn render_const_value(e: &Expr, checker: &Checker) -> Result<String, String> {
             }
             Ok(format!("{{ {} }}", parts.join(", ")))
         }
+        // GRAMMAR.md §3.273: `{k:?}` (no `{k}` desnudo, a diferencia de un
+        // campo de struct) porque una clave de Map puede traer cualquier
+        // caracter -- espacios, comillas, lo que sea -- que un identificador
+        // de campo nunca podría.
+        Expr::MapLit(fields) => {
+            let parts: Vec<String> = fields
+                .iter()
+                .map(|(k, fe)| Ok(format!("{k:?}: {}", render_const_value(&fe.node, checker)?)))
+                .collect::<Result<_, String>>()?;
+            Ok(format!("{{ {} }}", parts.join(", ")))
+        }
         other => Err(format!(
-            "el valor de un 'const' tiene que ser un literal (número, string, bool, null, array, tupla o \
-             struct/variant literal) -- se encontró {other:?}, que es una computación en runtime sin ningún \
+            "el valor de un 'const' tiene que ser un literal (número, string, bool, null, array, tupla, \
+             struct/variant literal o Map literal) -- se encontró {other:?}, que es una computación en runtime sin ningún \
              equivalente como constante estática de TS"
         )),
     }

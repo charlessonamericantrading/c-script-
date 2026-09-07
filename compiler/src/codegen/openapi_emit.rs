@@ -45,7 +45,7 @@ pub(crate) fn literal_expr_to_json(e: &Expr) -> Value {
             _ => Value::Null,
         },
         Expr::ArrayLit(items) | Expr::TupleLit(items) => Value::Array(items.iter().map(|i| literal_expr_to_json(&i.node)).collect()),
-        Expr::StructLit { fields, .. } => {
+        Expr::StructLit { fields, .. } | Expr::MapLit(fields) => {
             let mut obj = serde_json::Map::new();
             for (name, value) in fields {
                 obj.insert(name.clone(), literal_expr_to_json(&value.node));

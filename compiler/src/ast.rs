@@ -1148,6 +1148,15 @@ pub enum Expr {
         variant: Option<String>,
         fields: Vec<(String, Spanned<Expr>)>,
     },
+    /// `{"clave": valor, ...}` (GRAMMAR.md §3.273) -- literal de `Map<String,
+    /// V>`. AST aparte de `StructLit` A PROPÓSITO, aunque el runtime
+    /// termine representando los dos con la MISMA forma (`Value::Struct`):
+    /// acá el checker exige que TODOS los valores unifiquen a un único `V`
+    /// (mismo criterio que `ArrayLit` con el elemento de una lista), algo
+    /// que un `StructLit` normal nunca exige (sus campos son heterogéneos a
+    /// propósito). Distinguido en el parser por el PRIMER token dentro de
+    /// `{` -- un `Str` en vez de un identificador.
+    MapLit(Vec<(String, Spanned<Expr>)>),
     Match {
         scrutinee: Box<Spanned<Expr>>,
         arms: Vec<MatchArm>,
