@@ -10,7 +10,7 @@
 // de la misma fuente de verdad, cero duplicación manual).
 
 use super::session::SessionStore;
-use super::{as_int, encryption, generate_uuid_v4, json_to_typed_value, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
+use super::{as_int, encryption, generate_uuid_v4, json_to_typed_value, os_random_bytes, simple_enum_names, value_to_json, ConditionExpr, RuntimeError, Value};
 use crate::ast::{BinaryOp, FieldCheck, Item, OnDelete, Program, TimeGranularity, TypeAnnotation, TypeExpr};
 use crate::checker::Checker;
 use crate::rate_limit::RateLimitSpec;
@@ -1791,6 +1791,15 @@ thread_local! {
     /// siempre es un bug del lado del programa, a diferencia de varias
     /// cookies (un caso de uso legítimo real).
     static RESPONSE_HEADERS_OVERRIDE: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
+    /// `response.nonce()` (GRAMMAR.md §3.280) -- a diferencia de los
+    /// `RESPONSE_*_OVERRIDE` de arriba (el cuerpo ESCRIBE, `handle_rpc`
+    /// CONSUME una sola vez), este thread_local se LEE muchas veces dentro
+    /// de la misma request (una vez para armar el header `Content-Security-
+    /// Policy` vía `response.setHeader`, otra por cada `<script nonce="...">`
+    /// interpolado en el HTML) y tiene que devolver SIEMPRE el mismo valor
+    /// -- por eso `Db::current_nonce` genera el valor LAZY, en la primera
+    /// llamada, y lo cachea acá para las siguientes.
+    static CURRENT_NONCE: RefCell<Option<String>> = const { RefCell::new(None) };
     /// GRAMMAR.md §3.260: `true` mientras ESTE hilo está evaluando el
     /// cuerpo de un rpc `@readReplica` -- mismo criterio EXACTO que
     /// `CURRENT_REQUEST` (un hilo por request, así que "está corriendo un
@@ -3287,6 +3296,7 @@ db { users: User[] }
         });
         RESPONSE_COOKIES_OVERRIDE.with(|c| c.borrow_mut().clear());
         RESPONSE_HEADERS_OVERRIDE.with(|c| c.borrow_mut().clear());
+        CURRENT_NONCE.with(|c| *c.borrow_mut() = None);
     }
 
     /// Llamado por `response.setStatus(code)` (GRAMMAR.md §3.46) -- guarda
@@ -3355,6 +3365,25 @@ db { users: User[] }
     /// Simétrico de `take_response_cookies`.
     pub(crate) fn take_response_headers(&self) -> Vec<(String, String)> {
         RESPONSE_HEADERS_OVERRIDE.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    /// `response.nonce()` (GRAMMAR.md §3.280) -- 16 bytes del CSPRNG del
+    /// sistema, en base64 (mismo encoder que `crypto.encodeBase64`/
+    /// `image.thumbnail`), generados UNA sola vez por request y cacheados
+    /// en `CURRENT_NONCE` para que llamadas repetidas dentro del mismo rpc
+    /// (una para el header `Content-Security-Policy`, una por cada
+    /// `<script nonce="...">`) vean el MISMO valor -- un nonce que no
+    /// coincide entre el header y el atributo hace que el browser BLOQUEE
+    /// el script, rompiendo la página en vez de protegerla.
+    pub(crate) fn current_nonce(&self) -> Result<String, RuntimeError> {
+        if let Some(existing) = CURRENT_NONCE.with(|c| c.borrow().clone()) {
+            return Ok(existing);
+        }
+        use base64::Engine;
+        let bytes = os_random_bytes(16)?;
+        let nonce = base64::engine::general_purpose::STANDARD.encode(bytes);
+        CURRENT_NONCE.with(|c| *c.borrow_mut() = Some(nonce.clone()));
+        Ok(nonce)
     }
 
     /// `""` -- no `None` -- fuera de una request HTTP real (ej. invocado

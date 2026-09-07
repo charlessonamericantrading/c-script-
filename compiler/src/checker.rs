@@ -6007,6 +6007,10 @@ impl Checker {
                 self.check_expr(value, &Type::String, env)?;
                 Some(Type::Void)
             }
+            (Type::Response, "nonce") => {
+                self.expect_no_args(args, "nonce")?;
+                Some(Type::String)
+            }
             (Type::Base64, "decode") => {
                 let [str_arg] = args else {
                     return Err(err("'base64.decode' toma exactamente 1 argumento (base64_str: String)"));
@@ -11625,6 +11629,33 @@ type T = { id: Int, s: Status }")
         assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie(1, "b", {}) } }"#).is_err());
         assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie("a", 2, {}) } }"#).is_err());
         assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie("a", "b", { httpOnly: "not-a-bool" }) } }"#).is_err());
+    }
+
+    // ---- `response.nonce` (GRAMMAR.md §3.280, PLAN.md §9.24 Fase 1 ítem C5) ----
+
+    #[test]
+    fn response_nonce_takes_no_arguments_and_types_as_string() {
+        let src = r#"
+            service S {
+                rpc f() -> String { response.nonce() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        assert!(check_source(r#"service S { rpc f() -> String { response.nonce("x") } }"#).is_err());
+    }
+
+    #[test]
+    fn response_nonce_can_build_a_csp_header_via_set_header() {
+        let src = r#"
+            service S {
+                rpc page() -> Void {
+                    let n = response.nonce();
+                    response.setHeader("Content-Security-Policy", "script-src 'self' 'nonce-" + n + "'")
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 
     // ---- `response.setHeader` (GRAMMAR.md §3.279, PLAN.md §9.24 Fase 1 ítem C4) ----

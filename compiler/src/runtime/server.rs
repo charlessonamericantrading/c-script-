@@ -292,6 +292,17 @@ struct CorsHeaders {
     /// reciben, sin agregar un parámetro más a los 16 call-sites de
     /// `cors_response`/`cors_response_with_type`.
     hsts: Option<String>,
+    /// GRAMMAR.md §3.280 (PLAN.md §9.24 Fase 1 ítem C5): el valor de
+    /// `X-Frame-Options` a mandar en TODA respuesta -- `"DENY"` por default
+    /// (sin cambio de comportamiento), o `"SAMEORIGIN"`/lo que
+    /// `--frame-options`/`LINK_FRAME_OPTIONS` configure. A diferencia de
+    /// `hsts` (que puede estar ausente del todo), este SIEMPRE tiene un
+    /// valor -- el header se manda siempre, solo cambia CUÁL.
+    frame_options: String,
+    /// GRAMMAR.md §3.280: mismo criterio que `frame_options`, para
+    /// `Referrer-Policy` -- `"no-referrer"` por default, configurable vía
+    /// `--referrer-policy`/`LINK_REFERRER_POLICY`.
+    referrer_policy: String,
 }
 
 /// `@cors("...")` (GRAMMAR.md §3.147) a un `CorsConfig` -- mismo formato
@@ -316,11 +327,27 @@ impl CorsConfig {
         // valida esto), así que no vale la pena depender solo de esa
         // garantía ajena.
         let request_origin = request_origin.filter(|o| !o.contains(['\r', '\n']));
+        // `frame_options`/`referrer_policy` quedan con un placeholder acá --
+        // `handle_request` los pisa con el valor real configurado del
+        // proceso justo después de llamar `headers_for`, mismo patrón que
+        // ya usaba `hsts: None` arriba (ver el comentario ahí).
         match self {
-            CorsConfig::Any => CorsHeaders { allow_origin: Some("*".to_string()), vary_origin: false, hsts: None },
+            CorsConfig::Any => CorsHeaders {
+                allow_origin: Some("*".to_string()),
+                vary_origin: false,
+                hsts: None,
+                frame_options: String::new(),
+                referrer_policy: String::new(),
+            },
             CorsConfig::Allowlist(list) => {
                 let matched = request_origin.filter(|o| list.iter().any(|a| a == o)).map(str::to_string);
-                CorsHeaders { allow_origin: matched, vary_origin: true, hsts: None }
+                CorsHeaders {
+                    allow_origin: matched,
+                    vary_origin: true,
+                    hsts: None,
+                    frame_options: String::new(),
+                    referrer_policy: String::new(),
+                }
             }
         }
     }
@@ -394,6 +421,12 @@ pub struct ServeConfig {
     pub service_api_key: Option<String>,
     pub log: LogConfig,
     pub hsts: Option<String>,
+    /// GRAMMAR.md §3.280: `--frame-options`/`LINK_FRAME_OPTIONS` --
+    /// `"DENY"` si no se configuró nada (cero cambio de comportamiento).
+    pub frame_options: String,
+    /// GRAMMAR.md §3.280: `--referrer-policy`/`LINK_REFERRER_POLICY` --
+    /// `"no-referrer"` si no se configuró nada.
+    pub referrer_policy: String,
     pub mcp_secret: Option<String>,
     /// GRAMMAR.md §3.234: `--models-dir`/`LINK_MODELS_DIR`, base de las
     /// rutas relativas de `ai { }`.
@@ -443,6 +476,8 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         service_api_key,
         log,
         hsts,
+        frame_options,
+        referrer_policy,
         mcp_secret,
     } = config;
     let host = host.as_str();
@@ -777,6 +812,8 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
             let metrics_store = std::sync::Arc::clone(&metrics_store);
             let cors = cors.clone();
             let hsts = hsts.clone();
+            let frame_options = frame_options.clone();
+            let referrer_policy = referrer_policy.clone();
             let service_api_key = service_api_key.clone();
             let mcp_secret = mcp_secret.clone();
             let mcp_state = mcp_state.clone();
@@ -823,6 +860,8 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                     &metrics_store,
                     &cors,
                     hsts.as_deref(),
+                    &frame_options,
+                    &referrer_policy,
                     max_body_bytes,
                     trust_proxy,
                     service_api_key.as_deref(),
@@ -919,6 +958,8 @@ fn handle_request(
     metrics_store: &parking_lot::Mutex<MetricsStore>,
     cors: &CorsConfig,
     hsts: Option<&str>,
+    frame_options: &str,
+    referrer_policy: &str,
     max_body_bytes: u64,
     trust_proxy: bool,
     service_api_key: Option<&str>,
@@ -954,6 +995,11 @@ fn handle_request(
     // ya viaja a cada respuesta, en vez de agregar un parámetro más a los
     // 16 call-sites de `cors_response`/`cors_response_with_type`.
     cors_headers.hsts = hsts.map(str::to_string);
+    // GRAMMAR.md §3.280: mismo criterio y mismo motivo que `hsts` arriba --
+    // constante para todo el proceso, copiado acá una vez por request en
+    // vez de agregar 2 parámetros más a cada call-site de respuesta.
+    cors_headers.frame_options = frame_options.to_string();
+    cors_headers.referrer_policy = referrer_policy.to_string();
 
     if *request.method() == tiny_http::Method::Options {
         let resp = cors_response(204, String::new(), &cors_headers, &request);
@@ -2598,7 +2644,16 @@ fn sse_preamble(cors: &CorsHeaders) -> String {
             header.push_str("Vary: Origin\r\n");
         }
     }
-    header.push_str("X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n");
+    // GRAMMAR.md §3.280: `frame_options`/`referrer_policy` vienen
+    // validados contra un set fijo de valores conocidos en el arranque
+    // (`main.rs::resolve_frame_options`/`resolve_referrer_policy`) --
+    // interpolarlos acá sin volver a chequear CR/LF es seguro por esa
+    // garantía previa, mismo criterio que `hsts` (abajo) ya asumía.
+    header.push_str("X-Content-Type-Options: nosniff\r\nX-Frame-Options: ");
+    header.push_str(&cors.frame_options);
+    header.push_str("\r\nReferrer-Policy: ");
+    header.push_str(&cors.referrer_policy);
+    header.push_str("\r\n");
     if let Some(value) = &cors.hsts {
         header.push_str("Strict-Transport-Security: ");
         header.push_str(value);
@@ -3022,24 +3077,39 @@ fn cors_response_with_type(
         response = response.with_header(vary_header);
     }
 
-    // Headers de seguridad fijos (GRAMMAR.md §3.41) -- en TODA respuesta,
-    // sin depender de `@content_type` ni de si el rpc devuelve HTML:
+    // Headers de seguridad -- en TODA respuesta, sin depender de
+    // `@content_type` ni de si el rpc devuelve HTML:
     //  - `nosniff`: un browser no debe "adivinar" el tipo de un body y
     //    ejecutarlo como algo distinto de lo que dice el Content-Type real.
-    //  - `X-Frame-Options: DENY`: ninguna respuesta de este servidor se
-    //    puede embeber en un <iframe> de otro sitio (protección clickjacking).
-    //  - `Referrer-Policy: no-referrer`: la URL completa de una request a
-    //    este servidor (que puede tener datos sensibles en el path o query)
-    //    nunca sale en el header `Referer` de un link que salga desde acá.
-    // CSP queda afuera a propósito (depende del contenido de cada página,
-    // GRAMMAR.md §3.41). HSTS (GRAMMAR.md §3.143) SÍ se manda, pero solo si
+    //    Fijo, sin configuración -- ningún caso de uso real necesita
+    //    relajarlo.
+    //  - `X-Frame-Options`: `DENY` por default (ninguna respuesta de este
+    //    servidor se puede embeber en un <iframe> de otro sitio, protección
+    //    clickjacking) -- GRAMMAR.md §3.280 (PLAN.md §9.24 Fase 1 ítem C5)
+    //    lo hizo CONFIGURABLE vía `--frame-options`/`LINK_FRAME_OPTIONS`
+    //    (ej. `SAMEORIGIN`, para poder embeber en iframes del MISMO sitio),
+    //    preservando el default seguro para quien no configura nada.
+    //  - `Referrer-Policy`: `no-referrer` por default (la URL completa de
+    //    una request a este servidor, que puede tener datos sensibles en el
+    //    path o query, nunca sale en el header `Referer` de un link que
+    //    salga desde acá) -- también configurable, mismo criterio, vía
+    //    `--referrer-policy`/`LINK_REFERRER_POLICY`.
+    // CSP queda afuera de este bloque a propósito (depende del contenido de
+    // cada página, GRAMMAR.md §3.41) -- un rpc arma la suya con
+    // `response.setHeader("Content-Security-Policy", ...)` + `response.
+    // nonce()` (GRAMMAR.md §3.280), reusando C4 en vez de un mecanismo
+    // nuevo. HSTS (GRAMMAR.md §3.143) SÍ se manda, pero solo si
     // `--hsts`/`LINK_HSTS` lo configuró explícitamente -- `linkc serve`
     // nunca termina TLS por sí solo, así que sin ese opt-in no hay forma de
     // saber que esta respuesta de verdad viajó (o va a viajar) sobre HTTPS.
     let nosniff = tiny_http::Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap();
-    let frame_options = tiny_http::Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap();
-    let referrer_policy = tiny_http::Header::from_bytes(&b"Referrer-Policy"[..], &b"no-referrer"[..]).unwrap();
-    response = response.with_header(nosniff).with_header(frame_options).with_header(referrer_policy);
+    response = response.with_header(nosniff);
+    if let Ok(frame_options) = tiny_http::Header::from_bytes(&b"X-Frame-Options"[..], cors.frame_options.as_bytes()) {
+        response = response.with_header(frame_options);
+    }
+    if let Ok(referrer_policy) = tiny_http::Header::from_bytes(&b"Referrer-Policy"[..], cors.referrer_policy.as_bytes()) {
+        response = response.with_header(referrer_policy);
+    }
     if let Some(value) = &cors.hsts {
         if let Ok(hsts_header) = tiny_http::Header::from_bytes(&b"Strict-Transport-Security"[..], value.as_bytes()) {
             response = response.with_header(hsts_header);

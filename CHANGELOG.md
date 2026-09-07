@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.224.0] - 2026-09-07
+
+### ✨ Añadido
+**Headers de seguridad configurables + `response.nonce()` -- cierra el ítem C5 de la Fase 1 de PLAN.md §9.24, y con él, TODA la Fase 1.** `X-Frame-Options`/`Referrer-Policy` eran fijos (`DENY`/`no-referrer`); ahora configurables vía `--frame-options`/`LINK_FRAME_OPTIONS` (`DENY`/`SAMEORIGIN`) y `--referrer-policy`/`LINK_REFERRER_POLICY` (los 8 tokens de la especificación Referrer Policy) -- flags de PROCESO, no anotación, misma familia que `--hsts`/`--cors-origin`: la postura de seguridad de estos headers es del sitio entero, no una decisión por rpc. Validados contra un set fijo de valores conocidos al ARRANCAR -- un valor mal escrito rompería la protección de todo el sitio en silencio, así que se rechaza antes de aceptar la primera conexión. Sin ninguno de los dos: comportamiento IDÉNTICO al de antes. `nosniff` sigue fijo, sin configuración -- nadie necesita relajarlo.
+
+`response.nonce() -> String` genera un valor aleatorio del CSPRNG del sistema (16 bytes, base64) UNA sola vez por request -- llamadas repetidas dentro del mismo rpc ven el MISMO valor, la propiedad que hace correcto un nonce de CSP (si el header y el atributo `nonce="..."` no coinciden exactamente, el browser bloquea el script). Sin mecanismo nuevo para el header `Content-Security-Policy` en sí -- `response.setHeader` (v1.223.0) ya alcanza, porque CSP nunca estuvo en su lista de reservados (depende del contenido de cada página). Ver GRAMMAR.md §3.280.
+
+Verificado con 2 tests de checker + verificación manual de punta a punta contra un `linkc serve` real: el nonce del header CSP coincide exactamente con el mismo valor leído por separado en la misma respuesta; `--frame-options SAMEORIGIN --referrer-policy strict-origin-when-cross-origin` cambia los dos headers reales; valores inválidos de cualquiera de los dos flags se rechazan al arrancar, antes de servir ninguna request. Suite completa (1406 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.223.0] - 2026-09-07
 
 ### ✨ Añadido

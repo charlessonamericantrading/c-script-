@@ -4951,6 +4951,7 @@ fn call_method(
                 db.set_response_header(name.clone(), value.clone());
                 Ok(Value::Null)
             }
+            "nonce" => Ok(Value::Str(db.current_nonce()?)),
             other => Err(err(format!("método desconocido sobre response: '{other}'"))),
         },
         Value::Http => match method {

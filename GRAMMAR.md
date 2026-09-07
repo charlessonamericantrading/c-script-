@@ -9857,11 +9857,33 @@ fn home() -> String {
 | El motor los fija SIEMPRE | `Content-Length`, `Content-Encoding`, `ETag`, `Vary`, `X-Request-Id`, los 4 `Access-Control-Allow-*`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Strict-Transport-Security` | dejar que `setHeader` los pise produciría un header DUPLICADO (uno del motor, uno del programa), no un reemplazo -- la mayoría son singleton por RFC y un browser/proxy ante dos valores del mismo header hace algo indefinido, nunca "el último gana" de forma confiable |
 | Hop-by-hop (RFC 7230 §6.1) | `Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade` | ningún handler de aplicación debería fijarlos nunca -- son del transporte, no de la respuesta lógica |
 
-Relajar los tres headers de seguridad fijos (`X-Frame-Options`/`Referrer-Policy`/además `Strict-Transport-Security` opt-in) queda deliberadamente FUERA de `setHeader` -- es el ítem C5 de esta misma fase, con su propio mecanismo (`--security-headers`/`@headers`), para no tener dos formas distintas de lograr lo mismo con semántica de "último gana" ambigua entre ellas.
+Relajar los tres headers de seguridad fijos (`X-Frame-Options`/`Referrer-Policy`/además `Strict-Transport-Security` opt-in) queda deliberadamente FUERA de `setHeader` -- es el ítem C5 de esta misma fase (§3.280), con su propio mecanismo, para no tener dos formas distintas de lograr lo mismo con semántica de "último gana" ambigua entre ellas.
 
 Rechazado dentro de un `stream`, mismo motivo que `setStatus`/`setCookie`/`redirect`: una conexión SSE ya mandó sus headers antes de que el cuerpo corra.
 
 **Verificado**: 3 tests de `checker.rs` (tipa con 2 argumentos String; exige exactamente 2; rechazado dentro de un `stream`) + verificación manual de punta a punta contra un `linkc serve` real: dos headers custom reales (`X-Robots-Tag`, `Link`) aparecen tal cual en la respuesta; intentar pisar `X-Frame-Options` (un nombre reservado) da un error de runtime claro en vez de un header duplicado silencioso. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
+### 3.280 Headers de seguridad configurables + `response.nonce()` para CSP — cierra Fase 1 ítem C5 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem C5 -- `X-Frame-Options: DENY` y `Referrer-Policy: no-referrer` (GRAMMAR.md §3.41) eran fijos, sin forma de relajarlos para un sitio que sí necesita embeberse en un `<iframe>` propio o mandar el origen en `Referer` entre páginas del mismo sitio. Tampoco había forma de generar un nonce por request para Content-Security-Policy.
+
+<!-- linkc:check -->
+```rust
+fn page() -> Void {
+  let n = response.nonce();
+  response.setHeader("Content-Security-Policy", "script-src 'self' 'nonce-" + n + "'")
+}
+```
+
+`response.nonce() -> String` genera 16 bytes del CSPRNG del sistema, en base64, **una sola vez por request** -- llamadas repetidas dentro del mismo rpc devuelven SIEMPRE el mismo valor (verificado: un `X-Nonce-Echo` con el valor crudo coincide byte a byte con el nonce embebido en el `Content-Security-Policy` de la misma respuesta). Esto es lo que hace que el mecanismo sea CORRECTO: un nonce que no coincide entre el header y el atributo `nonce="..."` de un `<script>` hace que el browser BLOQUEE ese script en vez de permitirlo.
+
+**Sin mecanismo nuevo para el header CSP en sí** -- `response.setHeader` (§3.279) ya alcanza, porque `Content-Security-Policy` NO está en su lista de nombres reservados (a propósito: el contenido de una CSP depende de cada página, así que el motor nunca podría fijarlo por su cuenta). `response.nonce()` es la única pieza que faltaba: una API genérica de `setHeader` más una forma de generar el valor aleatorio memoizado por request.
+
+**`X-Frame-Options`/`Referrer-Policy` configurables vía flag de proceso, no anotación**: a diferencia de `@csrf`/`@rate_limit` (decisiones por rpc), la postura de seguridad de estos dos headers es del SITIO ENTERO -- mismo criterio que `--hsts`/`--cors-origin`/`--trust-proxy`, todos flags globales de `linkc serve`/`linkc serve-all`, nunca anotaciones. `--frame-options <DENY|SAMEORIGIN>`/`LINK_FRAME_OPTIONS` y `--referrer-policy <token>`/`LINK_REFERRER_POLICY` (los 8 tokens de la especificación Referrer Policy) se validan contra un set FIJO de valores conocidos al arrancar -- un valor mal escrito rompería la protección de TODO el sitio en silencio, así que rechazarlo antes de servir el primer request es preferible a aceptarlo y fallar callado. Sin ninguno de los dos flags: `DENY`/`no-referrer`, IDÉNTICO al comportamiento antes de este ítem.
+
+**`nosniff` (`X-Content-Type-Options`) sigue fijo, sin configuración** -- ningún caso de uso real necesita relajarlo, a diferencia de los otros dos.
+
+**Verificado**: 2 tests de `checker.rs` (`nonce` tipa sin argumentos como `String`; compone con `setHeader` para armar un CSP real) + verificación manual de punta a punta contra un `linkc serve` real: el nonce del header `Content-Security-Policy` coincide exactamente con el mismo valor leído por separado (`X-Nonce-Echo`) en la MISMA respuesta; `--frame-options SAMEORIGIN --referrer-policy strict-origin-when-cross-origin` cambia los dos headers de la respuesta real; `--frame-options BOGUS`/`--referrer-policy BOGUS` rechazados al arrancar con un mensaje claro, antes de aceptar ninguna conexión; sin ninguno de los dos flags, la respuesta es byte-idéntica a antes de este ítem (`DENY`/`no-referrer`). Suite completa (1406 tests) sin regresiones, `cargo clippy -D warnings` limpio.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
