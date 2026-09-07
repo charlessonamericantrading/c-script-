@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.214.0] - 2026-09-07
+
+### ✨ Añadido
+**`Int.toLocaleString(locale)` + seis métodos nuevos de `String` -- cierra los ítems A4 y A7 de la Fase 0 de PLAN.md §9.24 ("c-script como servidor web completo").** Todos builtins, sin sintaxis nueva:
+- `Int.toLocaleString(locale: String) -> String` -- agrupa en miles con el separador del locale (`"1.234.567"` en `es-ES`/`es`, `"1,234,567"` en `en-US`/`en`). Alcance angosto a propósito: sin monedas ni fechas. Un locale fuera de la tabla es un error de ejecución con mensaje claro, no un fallback silencioso. Ver GRAMMAR.md §3.269.
+- `String.repeat(n)`, `.indexOf(needle)` (índice en CARACTERES, `-1` si no aparece, misma convención que JS), `.charAt(index)` (a diferencia de JS, un índice inválido se RECHAZA en vez de devolver `""` en silencio), `.truncate(n, suffix)` (el sufijo cuenta DENTRO del largo `n`, mismo contrato que `_.truncate` de lodash), `.slugify()` (acentos latinos comunes -- español y vecinos -- reducidos a su letra base vía una tabla hand-rolleada, no una dependencia de normalización Unicode NFD; motivado por `trailingSlash.ts` de Segurma), `.lines()`. `repeat` tiene un tope de 10.000.000 bytes en el resultado -- mismo motivo que el tope ya existente de `padStart`/`padEnd` (incidente real de `crypto.randomToken`, `AUDIT-2026-08-27.md`). Ver GRAMMAR.md §3.270.
+
 ## [1.213.0] - 2026-09-07
 
 ### ✨ Añadido

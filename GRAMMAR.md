@@ -9536,6 +9536,54 @@ service Site {
 
 **Verificado**: 12 tests de `lexer.rs` (texto sin interpolación, multilínea sin escape especial, separación texto/expresión, profundidad de `{`/`}` a nivel de token, anidar `html` dentro de `${...}`, escapes `` \` ``/`\$`/`\\`, `${}` vacío rechazado, sin cerrar rechazado con el span apuntando a la comilla de apertura, `html` sin backtick sigue siendo un identificador normal) + 7 tests de `checker.rs` (tipa como `Html`, interpola `String`/`Html`, interpola `Int`/`Int64`/`Float`/`Bool`, interpola `Html[]`, rechaza un tipo no soportado con mensaje claro, `rawHtml()` da `Html`, `Html` como retorno de rpc aceptado, `Html` como parámetro de rpc rechazado) + 8 tests de comportamiento reales (`test { }`) contra el binario real: texto literal, escape de un `<script>` inyectado, composición sin doble-escape, números/bool vía `.toString()`, `rawHtml()`, composición de funciones (`greeting`+`page`), concatenación de `Html[]`, y preservación de saltos de línea en un literal multilínea -- más una verificación manual de punta a punta contra un `linkc serve` real confirmando el `Content-Type: text/html; charset=utf-8` automático. Suite completa (1333 tests) sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.269 `Int.toLocaleString(locale: String) -> String`: separador de miles por locale — cierra Fase 0 ítem A4 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem A4 -- una plantilla real (ej. "1.234.567 habitantes") necesita el mismo agrupado en miles que `Intl.NumberFormat('es-ES').format(n)` da en JavaScript, y no había forma de producirlo sin concatenar dígito por dígito a mano.
+
+**Alcance deliberadamente angosto**: SOLO agrupa en miles con el separador del locale pedido -- sin monedas, sin fechas, sin decimales (`Int` no tiene parte fraccionaria; para eso existe `Decimal`/`Float`). No es un `Intl.NumberFormat` completo, es la única pieza que una plantilla de sitio realmente necesita.
+
+<!-- linkc:check -->
+```rust
+fn f(poblacion: Int) -> String {
+  poblacion.toLocaleString("es-ES") // "1.234.567"
+}
+```
+
+**Tabla de locales soportados** (crece cuando un caso real lo pida, no especulativamente -- mismo criterio que el resto de los límites honestos de este documento):
+
+| Locale | Separador de miles |
+|---|---|
+| `"es-ES"` / `"es"` | `.` |
+| `"en-US"` / `"en"` | `,` |
+
+**El locale es un `String` de runtime, no un tipo/enum cerrado** -- el checker solo valida que sea `String` (vía `builtin_args!`, mismo mecanismo que `String.substring`/`String.replace`, §3.198). Un locale fuera de la tabla es entonces un error de EJECUCIÓN, no de compilación: `'toLocaleString': locale no soportado: 'fr-FR' (soportados: es-ES, en-US)`. Documentado como límite honesto a propósito -- cerrar esto en el checker exigiría un tipo enum nuevo solo para dos valores, sin caso real todavía que lo justifique.
+
+**Verificado**: 3 tests de `checker.rs` (acepta `Int` + un `String`, rechaza sin argumento/con dos argumentos/con un `Int` en vez de `String`, rechaza sobre `Float`) + 6 tests de comportamiento reales (`linkc test` contra el binario real) cubriendo es-ES/en-US, sin agrupar bajo 4 dígitos, signo negativo preservado, cero, y los alias cortos `"es"`/`"en"` -- más una verificación manual del mensaje de error exacto ante un locale no soportado. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
+### 3.270 `String`: `repeat`/`indexOf`/`charAt`/`truncate`/`slugify`/`lines` — cierra Fase 0 ítem A7 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem A7 -- la superficie de `String` que faltaba para portar plantillas reales: repetir un separador, ubicar/recortar texto, y el slug de URL que `trailingSlash.ts` de Segurma calcula a mano hoy para redirigir ciudades con tilde a su URL canónica.
+
+- **`repeat(n: Int) -> String`**: repite el string `n` veces. `n < 0` rechazado; y el tamaño del resultado tiene un tope de 10.000.000 bytes -- mismo motivo que el tope de `padStart`/`padEnd` (§3.198): sin él, un `n` adversarial asignaría un string gigante en vez de fallar limpio (incidente real de `crypto.randomToken`, `AUDIT-2026-08-27.md`).
+- **`indexOf(needle: String) -> Int`**: índice en CARACTERES (no bytes, mismo criterio que `substring`/`charAt`) de la primera ocurrencia, o `-1` si no aparece -- misma convención que `Array.prototype.indexOf` de JS, deliberada para que migrar desde Node/Express no exija reaprender el contrato.
+- **`charAt(index: Int) -> String`**: el carácter en esa posición. A diferencia de `String.prototype.charAt` de JS (que devuelve `""` fuera de rango, en silencio), acá un índice inválido se RECHAZA -- mismo criterio "fail loud" que `substring` (§3.198), no un string vacío que enmascara un bug de índice.
+- **`truncate(n: Int, suffix: String) -> String`**: si el string ya tiene `n` caracteres o menos, se devuelve tal cual; si no, se recorta de forma que el resultado (texto + `suffix`) nunca supere `n` caracteres en total -- mismo contrato que `_.truncate` de lodash (el sufijo cuenta DENTRO del largo pedido, no se agrega después), la propiedad que un layout de ancho fijo realmente necesita.
+- **`slugify() -> String`**: minúsculas + acentos latinos comunes (español y vecinos: francés/portugués/italiano) reducidos a su letra base + cualquier corrida de caracteres no alfanuméricos colapsada a un solo `-`, sin guion inicial/final. Tabla de acentos hand-rolleada A PROPÓSITO en vez de una dependencia de normalización Unicode NFD real -- el caso real es nombres de ciudad/provincia en español, una tabla FIJA y chica, mismo criterio que UUID/HMAC/ISO-8601 ya hand-rolleados en este lenguaje, no el de `regex`/`flate2` (formato real y complejo sin alternativa razonable). **Límite honesto**: un script sin acento latino (cirílico, CJK, árabe) no se transcribe -- cada carácter así se trata como separador, igual que un espacio.
+- **`lines() -> String[]`**: separa por salto de línea (`\n` o `\r\n`), sin un elemento vacío final si el string termina en salto de línea -- mismo comportamiento que `str::lines()` de Rust.
+
+<!-- linkc:check -->
+```rust
+fn cityLink(name: String) -> String {
+  "/alarmas/" + name.slugify()
+}
+
+fn excerpt(body: String) -> String {
+  body.truncate(140, "...")
+}
+```
+
+**Verificado**: 5 tests de `checker.rs` (arity/tipo de cada método, incluido el rechazo de `Float.charAt`/`String` como retorno de `lines`) + 6 tests de comportamiento reales (`linkc test`) cubriendo repeat/indexOf con Unicode (`ñoño`)/charAt con Unicode/truncate corto y largo/slugify con tildes+apóstrofe+espacios múltiples/lines -- más verificación manual de los tres rechazos en runtime (`repeat` negativo, `repeat` sobre el tope de 10M, `charAt` fuera de rango). Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

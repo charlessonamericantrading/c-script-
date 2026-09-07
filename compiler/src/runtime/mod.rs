@@ -1506,6 +1506,51 @@ fn pad_to_length(method_name: &str, s: &str, target_length: i64, pad: &str, at_s
     Ok(Value::Str(if at_start { format!("{fill}{s}") } else { format!("{s}{fill}") }))
 }
 
+/// `String.slugify()` (GRAMMAR.md §3.270, PLAN.md §9.24 Fase 0 ítem A7) --
+/// Segurma la usa en `trailingSlash.ts` para redirigir URLs de ciudad con
+/// tilde a su slug canónico. Tabla de acentos hand-rolleada A PROPÓSITO en
+/// vez de una dependencia de normalización Unicode NFD real (crate
+/// `unicode-normalization`): el caso real es nombres de ciudad/provincia
+/// en español (y vecinos: francés/portugués/italiano comparten el mismo
+/// bloque Latin-1 Supplement), una tabla FIJA y chica -- mismo criterio que
+/// UUID/HMAC/ISO-8601 ya hand-rolleados en este archivo
+/// (`is_canonical_uuid` etc.), no el de `regex`/`flate2` (formato real y
+/// complejo sin alternativa razonable). Límite honesto: un script sin
+/// acento latino (cirílico, CJK, árabe) no se transcribe -- cada carácter
+/// no-ASCII-alfanumérico se trata como separador, igual que un espacio.
+fn strip_latin_diacritic(c: char) -> char {
+    match c {
+        'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
+        'é' | 'è' | 'ê' | 'ë' => 'e',
+        'í' | 'ì' | 'î' | 'ï' => 'i',
+        'ó' | 'ò' | 'ô' | 'ö' | 'õ' => 'o',
+        'ú' | 'ù' | 'û' | 'ü' => 'u',
+        'ñ' => 'n',
+        'ç' => 'c',
+        'ý' | 'ÿ' => 'y',
+        other => other,
+    }
+}
+
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_dash = true; // arranca en true para que un separador inicial no deje un '-' colgando
+    for c in s.to_lowercase().chars() {
+        let c = strip_latin_diacritic(c);
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            last_was_dash = false;
+        } else if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 /// Mensaje para `/`/`%`: distingue divisor cero (el caso casi siempre
 /// alcanzado con datos de usuario) del desborde real (`i64::MIN / -1`).
 fn div_or_rem_overflow_message(verb: &str, a: i64, b: i64) -> RuntimeError {
@@ -1865,6 +1910,37 @@ fn decimal_from_int(n: i64) -> Result<Value, RuntimeError> {
         .checked_mul(DECIMAL_SCALE)
         .map(Value::Decimal)
         .ok_or_else(|| err(format!("{n} no entra en el rango de Decimal al escalar a 4 decimales")))
+}
+
+/// `Int.toLocaleString(locale)` (GRAMMAR.md §3.269, PLAN.md §9.24 Fase 0
+/// ítem A4) -- SOLO agrupa en miles con el separador del locale, no hay
+/// soporte de monedas/fechas/decimales (`Int` no tiene parte fraccionaria).
+/// Tabla de locales deliberadamente chica: se agranda cuando un caso real
+/// lo pida, no especulativamente -- mismo criterio que el resto de los
+/// límites honestos documentados en GRAMMAR.md.
+fn format_int_locale(n: i64, locale: &str) -> Result<String, RuntimeError> {
+    let sep = match locale {
+        "es-ES" | "es" => '.',
+        "en-US" | "en" => ',',
+        other => {
+            return Err(err(format!(
+                "'toLocaleString': locale no soportado: '{other}' (soportados: es-ES, en-US)"
+            )));
+        }
+    };
+    let digits = n.unsigned_abs().to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            grouped.push(sep);
+        }
+        grouped.push(c);
+    }
+    let mut result: String = grouped.chars().rev().collect();
+    if n < 0 {
+        result.insert(0, '-');
+    }
+    Ok(result)
 }
 
 /// `Float.toDecimal()` -- redondea el f64 YA PARSEADO al 4to decimal
@@ -3607,6 +3683,13 @@ fn call_method(
             "toInt64" => Ok(Value::Int64(n)),
             "toDecimal" => decimal_from_int(n),
             "toString" => Ok(Value::Str(n.to_string())),
+            "toLocaleString" => {
+                let locale = match args.first() {
+                    Some(Value::Str(l)) => l.as_str(),
+                    _ => return Err(err("'toLocaleString' requiere un argumento String (locale)")),
+                };
+                format_int_locale(n, locale).map(Value::Str)
+            }
             other => Err(err(format!("método desconocido sobre Int: '{other}'"))),
         },
         Value::Int64(n) => match method {
@@ -3723,6 +3806,77 @@ fn call_method(
                 };
                 pad_to_length("padEnd", &s, length, pad, false)
             }
+            // Tope acotado por la MISMA razón que `pad_to_length` (arriba):
+            // sin esto, un `n` adversarial permitiría asignar un string
+            // gigante en vez de fallar limpio (AUDIT-2026-08-27.md).
+            "repeat" => {
+                const MAX_REPEAT_LEN: usize = 10_000_000;
+                let n = match args.first() {
+                    Some(Value::Int(n)) => *n,
+                    _ => return Err(err("'repeat' requiere un argumento Int (n)")),
+                };
+                if n < 0 {
+                    return Err(err(format!("'repeat' requiere n >= 0, se recibió {n}")));
+                }
+                let total_len = s.len().saturating_mul(n as usize);
+                if total_len > MAX_REPEAT_LEN {
+                    return Err(err(format!(
+                        "'repeat': el resultado ({total_len} bytes) supera el tope de {MAX_REPEAT_LEN}"
+                    )));
+                }
+                Ok(Value::Str(s.repeat(n as usize)))
+            }
+            "indexOf" => {
+                let needle = match args.first() {
+                    Some(Value::Str(n)) => n,
+                    _ => return Err(err("'indexOf' requiere un argumento String (needle)")),
+                };
+                match s.find(needle.as_str()) {
+                    Some(byte_idx) => Ok(Value::Int(s[..byte_idx].chars().count() as i64)),
+                    None => Ok(Value::Int(-1)),
+                }
+            }
+            // GRAMMAR.md §3.270: a diferencia de `String.prototype.charAt`
+            // de JS (que devuelve "" fuera de rango, silencioso), un índice
+            // inválido acá se RECHAZA -- mismo criterio que `substring`
+            // arriba, "fail loud" en vez de un string vacío que enmascara
+            // un bug de índice.
+            "charAt" => {
+                let index = match args.first() {
+                    Some(Value::Int(i)) => *i,
+                    _ => return Err(err("'charAt' requiere un argumento Int (index)")),
+                };
+                let len = s.chars().count() as i64;
+                if index < 0 || index >= len {
+                    return Err(err(format!(
+                        "'charAt' fuera de rango: index={index}, longitud={len} (se exige 0 <= index < longitud)"
+                    )));
+                }
+                Ok(Value::Str(s.chars().nth(index as usize).expect("index ya validado dentro de rango").to_string()))
+            }
+            // Igual que `_.truncate` de lodash: el `suffix` cuenta DENTRO
+            // del largo `n`, no se agrega después -- así el resultado nunca
+            // supera `n` caracteres, la propiedad que un layout con ancho
+            // fijo realmente necesita.
+            "truncate" => {
+                let (n, suffix) = match (args.first(), args.get(1)) {
+                    (Some(Value::Int(n)), Some(Value::Str(suf))) => (*n, suf),
+                    _ => return Err(err("'truncate' requiere un argumento Int (n) y un argumento String (suffix)")),
+                };
+                if n < 0 {
+                    return Err(err(format!("'truncate' requiere n >= 0, se recibió {n}")));
+                }
+                let n = n as usize;
+                if s.chars().count() <= n {
+                    return Ok(Value::Str(s));
+                }
+                let keep = n.saturating_sub(suffix.chars().count());
+                let mut out: String = s.chars().take(keep).collect();
+                out.push_str(suffix);
+                Ok(Value::Str(out))
+            }
+            "slugify" => Ok(Value::Str(slugify(&s))),
+            "lines" => Ok(Value::List(s.lines().map(|l| Value::Str(l.to_string())).collect())),
             other => Err(err(format!("método desconocido sobre String: '{other}'"))),
         },
         Value::Timestamp(ms) => match method {

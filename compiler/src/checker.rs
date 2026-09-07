@@ -5161,6 +5161,17 @@ impl Checker {
                 self.expect_no_args(args, "toFloat")?;
                 Some(Type::Float)
             }
+            // GRAMMAR.md §3.269 (PLAN.md §9.24 Fase 0 ítem A4): SOLO
+            // separador de miles por locale ("1.234.567" en es-ES), sin
+            // monedas ni fechas -- alcance deliberadamente angosto, igual
+            // que `toDecimal()` no intenta ser un `Intl.NumberFormat`
+            // completo. El locale es un `String` de runtime (no un enum),
+            // así que un locale no soportado es un error de EJECUCIÓN, no
+            // de compilación -- documentado como límite honesto.
+            (Type::Int, "toLocaleString") => builtin_args!(
+                self, args, env, "Int.toLocaleString",
+                [(locale, "locale: String", Type::String)] -> Type::String
+            ),
             // Ambas direcciones son exactas (mismo rango i64), nunca lossy
             // -- a diferencia de toFloat/toInt entre Int y Float. Es la
             // ÚNICA forma de obtener un Int64 desde código fuente en v0: un
@@ -5290,6 +5301,38 @@ impl Checker {
                 self, args, env, "String.padEnd",
                 [(length, "length: Int", Type::Int), (pad, "pad: String", Type::String)] -> Type::String
             ),
+            // GRAMMAR.md §3.270 (PLAN.md §9.24 Fase 0 ítem A7): completa la
+            // superficie de `String` que una plantilla real de sitio pide --
+            // repetir separadores, ubicar/recortar texto, y slugs de URL.
+            (Type::String, "repeat") => builtin_args!(
+                self, args, env, "String.repeat",
+                [(n, "n: Int", Type::Int)] -> Type::String
+            ),
+            // Devuelve el índice en CARACTERES (no bytes, mismo criterio que
+            // `substring`/`charAt`) de la primera ocurrencia, o -1 si no
+            // aparece -- misma convención que `Array.prototype.indexOf` de
+            // JS, deliberada para que la migración desde Node/Express no
+            // tenga que re-aprender el contrato.
+            (Type::String, "indexOf") => builtin_args!(
+                self, args, env, "String.indexOf",
+                [(needle, "needle: String", Type::String)] -> Type::Int
+            ),
+            (Type::String, "charAt") => builtin_args!(
+                self, args, env, "String.charAt",
+                [(index, "index: Int", Type::Int)] -> Type::String
+            ),
+            (Type::String, "truncate") => builtin_args!(
+                self, args, env, "String.truncate",
+                [(n, "n: Int", Type::Int), (suffix, "suffix: String", Type::String)] -> Type::String
+            ),
+            (Type::String, "slugify") => {
+                self.expect_no_args(args, "slugify")?;
+                Some(Type::String)
+            }
+            (Type::String, "lines") => {
+                self.expect_no_args(args, "lines")?;
+                Some(Type::List(Box::new(Type::String)))
+            }
             (Type::Timestamp, "toMillis") => {
                 self.expect_no_args(args, "toMillis")?;
                 Some(Type::Int64)
@@ -7479,6 +7522,21 @@ type T = { id: Int, s: Status }")
         assert!(check_source("fn f(n: Decimal) -> Int { n.toInt() }").is_err());
     }
 
+    // ---- Int.toLocaleString (GRAMMAR.md §3.269, PLAN.md §9.24 A4) ----
+
+    #[test]
+    fn int_to_locale_string_takes_one_string_arg_and_returns_string() {
+        assert!(check_source("fn f(n: Int) -> String { n.toLocaleString(\"es-ES\") }").is_ok());
+    }
+
+    #[test]
+    fn int_to_locale_string_rejects_wrong_arity_or_receiver() {
+        assert!(check_source("fn f(n: Int) -> String { n.toLocaleString() }").is_err(), "requiere el locale");
+        assert!(check_source("fn f(n: Int) -> String { n.toLocaleString(\"es-ES\", \"x\") }").is_err(), "solo 1 argumento");
+        assert!(check_source("fn f(n: Int) -> String { n.toLocaleString(1) }").is_err(), "el locale es String, no Int");
+        assert!(check_source("fn f(n: Float) -> String { n.toLocaleString(\"es-ES\") }").is_err(), "toLocaleString es de Int, no de Float");
+    }
+
     #[test]
     fn decimal_does_not_mix_implicitly_with_float_or_int_in_arithmetic_or_comparisons() {
         assert!(check_source("fn f(a: Decimal, b: Float) -> Decimal { a + b }").is_err());
@@ -7646,6 +7704,43 @@ type T = { id: Int, s: Status }")
         assert!(check_source("fn f(s: String) -> String { s.padEnd(10, \"0\") }").is_ok());
         assert!(check_source("fn f(s: String) -> String { s.padStart(\"10\", \"0\") }").is_err(), "length tiene que ser Int");
         assert!(check_source("fn f(s: String) -> String { s.padEnd(10, 0) }").is_err(), "pad tiene que ser String");
+    }
+
+    // ---- String: repeat/indexOf/charAt/truncate/slugify/lines (GRAMMAR.md §3.270, PLAN.md §9.24 A7) ----
+
+    #[test]
+    fn string_repeat_takes_an_int_and_returns_string() {
+        assert!(check_source("fn f(s: String) -> String { s.repeat(3) }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.repeat(\"3\") }").is_err(), "n tiene que ser Int");
+        assert!(check_source("fn f(s: String) -> String { s.repeat() }").is_err(), "requiere 1 argumento");
+    }
+
+    #[test]
+    fn string_index_of_takes_a_string_and_returns_int() {
+        assert!(check_source("fn f(s: String) -> Int { s.indexOf(\"x\") }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.indexOf(\"x\") }").is_err(), "indexOf devuelve Int, no String");
+        assert!(check_source("fn f(s: String) -> Int { s.indexOf(1) }").is_err(), "needle tiene que ser String");
+    }
+
+    #[test]
+    fn string_char_at_takes_an_int_and_returns_string() {
+        assert!(check_source("fn f(s: String) -> String { s.charAt(0) }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.charAt(\"0\") }").is_err(), "index tiene que ser Int");
+    }
+
+    #[test]
+    fn string_truncate_takes_an_int_and_a_string_and_returns_string() {
+        assert!(check_source("fn f(s: String) -> String { s.truncate(10, \"...\") }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.truncate(10) }").is_err(), "requiere el sufijo");
+        assert!(check_source("fn f(s: String) -> String { s.truncate(\"10\", \"...\") }").is_err(), "n tiene que ser Int");
+    }
+
+    #[test]
+    fn string_slugify_and_lines_take_no_args() {
+        assert!(check_source("fn f(s: String) -> String { s.slugify() }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.slugify(1) }").is_err(), "sin argumentos");
+        assert!(check_source("fn f(s: String) -> String[] { s.lines() }").is_ok());
+        assert!(check_source("fn f(s: String) -> String { s.lines() }").is_err(), "lines devuelve String[], no String");
     }
 
     /// Los dos casos reales citados por un adoptador (MyFinance): sanear
