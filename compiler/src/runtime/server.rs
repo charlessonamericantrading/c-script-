@@ -1074,6 +1074,16 @@ fn handle_request(
     let (path_only, query_string) = path.split_once('?').map_or((path.as_str(), None), |(p, q)| (p, Some(q)));
     let query = query_string.map(parse_query_string_ordered).unwrap_or_default();
     let user_agent = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v.clone());
+    // GRAMMAR.md §3.277 (PLAN.md §9.24 Fase 1 ítem C1): el header `Cookie`
+    // entrante trae TODOS los pares de esta request en un solo valor
+    // (`nombre1=valor1; nombre2=valor2`), a diferencia de `Set-Cookie` en la
+    // respuesta (uno por cookie) -- se parte acá, una sola vez, igual que
+    // `query`/`user_agent` de arriba.
+    let cookies = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .map(|(_, v)| parse_cookie_header(v))
+        .unwrap_or_default();
     let ip = client_ip_for_rate_limit(&request, trust_proxy);
     let method_str = request.method().as_str().to_uppercase();
     let path_only = path_only.to_string();
@@ -1089,6 +1099,7 @@ fn handle_request(
         ip,
         user_agent,
         url,
+        cookies,
     });
 
     // `/live` y `/ready` (GRAMMAR.md §3.220, PLAN.md §9.18 Eje E ítem 2):
@@ -1217,7 +1228,7 @@ fn handle_request(
         let outbound_http_stats = db.outbound_http_stats();
         let ai_stats = db.ai_stats();
         let metrics_text = metrics_store.lock().render_prometheus_text(&subscriber_counts, size_bytes, &oversized_notify_drop_counts, &outbound_http_stats, &ai_stats);
-        let resp = cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None, &request);
+        let resp = cors_response_with_type(200, metrics_text, "text/plain; version=0.0.4", &cors_headers, None, None, &[], &request);
         let _ = request.respond(resp);
         log_done(log, req_id, Some("metrics"), 200, start, "");
         return;
@@ -1315,7 +1326,7 @@ fn handle_request(
             if let Some((status, body_text, content_type)) =
                 not_found_response(program, db, sessions, extract_bearer_token(&request).as_deref())
             {
-                let resp = cors_response_with_type(status, body_text, &content_type, &cors_headers, None, None, &request);
+                let resp = cors_response_with_type(status, body_text, &content_type, &cors_headers, None, None, &[], &request);
                 let _ = request.respond(resp);
                 log_done(log, req_id, None, status, start, "");
                 return;
@@ -1347,7 +1358,7 @@ fn handle_request(
         if let Some((status, body_text, content_type)) =
             not_found_response(program, db, sessions, extract_bearer_token(&request).as_deref())
         {
-            let resp = cors_response_with_type(status, body_text, &content_type, &cors_headers, None, None, &request);
+            let resp = cors_response_with_type(status, body_text, &content_type, &cors_headers, None, None, &[], &request);
             let _ = request.respond(resp);
             log_done(log, req_id, None, status, start, "");
             return;
@@ -1372,7 +1383,7 @@ fn handle_request(
         if let Some((status, body_text, content_type)) =
             not_found_response(program, db, sessions, extract_bearer_token(&request).as_deref())
         {
-            let resp = cors_response_with_type(status, body_text, &content_type, &cors_headers, None, None, &request);
+            let resp = cors_response_with_type(status, body_text, &content_type, &cors_headers, None, None, &[], &request);
             let _ = request.respond(resp);
             log_done(log, req_id, Some(&method), status, start, "");
             return;
@@ -1579,7 +1590,7 @@ fn handle_request(
             Ok(job_id) => (200, serde_json::json!({ "jobId": job_id }).to_string(), "background=\"enqueued\"".to_string()),
             Err(e) => (status_for(&e), error_json(&e.to_string()), format!("error={:?}", e.to_string())),
         };
-        let resp = cors_response_with_type(status, response_body, JSON_CONTENT_TYPE, &cors_headers, None, None, &request);
+        let resp = cors_response_with_type(status, response_body, JSON_CONTENT_TYPE, &cors_headers, None, None, &[], &request);
         let _ = request.respond(resp);
         log_done_with_audit(log, req_id, Some(&method), status, start, &extra, auth_audit.as_ref());
         db.clear_request_context();
@@ -1604,7 +1615,7 @@ fn handle_request(
         // 30 requests concurrentes insertaron 2 filas para un solo cargo).
         match idempotency_store.lock().reserve(service_name, rpc_name, key, &request_hash) {
             Lookup::Hit { status, body: cached_body, content_type } => {
-                let resp = cors_response_with_type(status, cached_body, &content_type, &cors_headers, None, None, &request);
+                let resp = cors_response_with_type(status, cached_body, &content_type, &cors_headers, None, None, &[], &request);
                 let _ = request.respond(resp);
                 log_done_with_audit(log, req_id, Some(&method), status, start, "idempotent=\"replayed\"", auth_audit.as_ref());
                 db.clear_request_context();
@@ -1656,7 +1667,7 @@ fn handle_request(
             None => cache_store.lock().get(service_name, rpc_name, key),
         };
         if let Some((status, body, content_type)) = hit {
-            let resp = cors_response_with_type(status, body, &content_type, &cors_headers, None, None, &request);
+            let resp = cors_response_with_type(status, body, &content_type, &cors_headers, None, None, &[], &request);
             let _ = request.respond(resp);
             log_done_with_audit(log, req_id, Some(&method), status, start, "cache=\"hit\"", auth_audit.as_ref());
             db.clear_request_context();
@@ -1664,7 +1675,7 @@ fn handle_request(
         }
     }
 
-    let (status, response_body, response_type, response_location, response_cache_control) =
+    let (status, response_body, response_type, response_location, response_cache_control, response_cookies) =
         handle_rpc(program, db, sessions, token.as_deref(), service_name, rpc_name, args_json);
     // `@idempotent`: solo se graba un ÉXITO (2xx) -- un error no se graba,
     // para que el caller pueda corregir y reintentar con la MISMA clave
@@ -1728,6 +1739,7 @@ fn handle_request(
         &cors_headers,
         response_location.as_deref(),
         response_cache_control.as_deref(),
+        &response_cookies,
         &request,
     );
     let _ = request.respond(resp);
@@ -1901,6 +1913,22 @@ fn parse_query_string(qs: &str) -> std::collections::HashMap<String, String> {
 /// duplicada -- un `Map` con dos pares para la misma clave no tendría
 /// sentido. O(n²) a propósito: una query string real tiene un puñado de
 /// parámetros, nunca miles.
+/// GRAMMAR.md §3.277: parte el header `Cookie` entrante (RFC 6265 §4.2:
+/// pares `nombre=valor` separados por `; `) en sus pares -- SIN
+/// percent-decode, ver la doc de `RequestContext::cookies` (db.rs) para el
+/// porqué. Un segmento sin `=` (cookie malformada, o un agente que manda
+/// solo un nombre) se descarta en vez de inventarle un valor vacío.
+fn parse_cookie_header(value: &str) -> Vec<(String, String)> {
+    value
+        .split(';')
+        .filter_map(|pair| {
+            let pair = pair.trim();
+            let (name, value) = pair.split_once('=')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
 fn parse_query_string_ordered(qs: &str) -> Vec<(String, String)> {
     let mut result: Vec<(String, String)> = Vec::new();
     for pair in qs.split('&').filter(|p| !p.is_empty()) {
@@ -2305,7 +2333,7 @@ fn not_found_response(
     token: Option<&str>,
 ) -> Option<(u16, String, String)> {
     let (service_name, rpc_name) = not_found_rpc(program)?;
-    let (status, body, content_type, _location, _cache_control) =
+    let (status, body, content_type, _location, _cache_control, _cookies) =
         handle_rpc(program, db, sessions, token, service_name, rpc_name, serde_json::json!({}));
     let status = if status == 200 { 404 } else { status };
     Some((status, body, content_type))
@@ -2341,17 +2369,19 @@ pub(crate) fn handle_rpc(
     service_name: &str,
     rpc_name: &str,
     args_json: serde_json::Value,
-) -> (u16, String, String, Option<String>, Option<String>) {
+) -> (u16, String, String, Option<String>, Option<String>, Vec<String>) {
     match invoke_rpc_with_sessions(program, service_name, rpc_name, &args_json, db, sessions, token) {
         Ok(result) => {
             // `response.setStatus(code)` (GRAMMAR.md §3.46) / `response.
-            // redirect(url, permanent)` (GRAMMAR.md §3.111): consumidos ACÁ,
-            // una sola vez, solo en el camino de éxito -- un `Err` de abajo
-            // nunca llega a este `match`, así que un override que el cuerpo
-            // haya pedido antes de fallar simplemente no se usa (queda para
-            // que `clear_request_context` lo limpie al final de la request).
+            // redirect(url, permanent)` (GRAMMAR.md §3.111) / `response.
+            // setCookie(...)` (GRAMMAR.md §3.277): consumidos ACÁ, una sola
+            // vez, solo en el camino de éxito -- un `Err` de abajo nunca
+            // llega a este `match`, así que un override que el cuerpo haya
+            // pedido antes de fallar simplemente no se usa (queda para que
+            // `clear_request_context` lo limpie al final de la request).
             let status = db.take_response_status().unwrap_or(200);
             let location = db.take_response_location();
+            let cookies = db.take_response_cookies();
             let cache_control = declared_cache_control(program, service_name, rpc_name);
             let html_content_type = declared_return_is_html(program, service_name, rpc_name)
                 .then(|| "text/html; charset=utf-8".to_string());
@@ -2364,9 +2394,9 @@ pub(crate) fn handle_rpc(
                 // para no inventar un panic si esa invariante se rompiera.
                 Some(ct) => {
                     let text = result.as_str().map(str::to_string).unwrap_or_else(|| result.to_string());
-                    (status, text, ct, location, cache_control)
+                    (status, text, ct, location, cache_control, cookies)
                 }
-                None => (status, result.to_string(), JSON_CONTENT_TYPE.to_string(), location, cache_control),
+                None => (status, result.to_string(), JSON_CONTENT_TYPE.to_string(), location, cache_control, cookies),
             }
         }
         // Un error SIEMPRE sale como JSON, aunque el rpc declare otro
@@ -2378,12 +2408,14 @@ pub(crate) fn handle_rpc(
         // camino que el cuerpo haya intentado armar. Un `Cache-Control`
         // declarado tampoco se agrega -- una respuesta de error nunca debe
         // quedar cacheada con la política pensada para el camino de éxito.
+        // Cookies: mismo criterio, ninguna sobrevive a un `Err`.
         Err(e) => (
             status_for(&e),
             error_json(&e.to_string()),
             JSON_CONTENT_TYPE.to_string(),
             None,
             None,
+            Vec::new(),
         ),
     }
 }
@@ -2453,7 +2485,7 @@ fn proxy_to_upstream(
             return;
         }
     };
-    let resp = cors_response_with_type(status, text, &content_type, cors, None, None, &request);
+    let resp = cors_response_with_type(status, text, &content_type, cors, None, None, &[], &request);
     let _ = request.respond(resp);
     log_done(log, req_id, None, status, start, &format!("proxied=true upstream={}", outbound_host_for_log(&url)));
 }
@@ -2773,7 +2805,7 @@ fn maybe_gzip(body: &str, request_accepts_gzip: bool) -> Option<Vec<u8>> {
 }
 
 fn cors_response(status: u16, body: String, cors: &CorsHeaders, request: &tiny_http::Request) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    cors_response_with_type(status, body, JSON_CONTENT_TYPE, cors, None, None, request)
+    cors_response_with_type(status, body, JSON_CONTENT_TYPE, cors, None, None, &[], request)
 }
 
 /// Igual que `cors_response` pero con el Content-Type que pidió el rpc
@@ -2802,6 +2834,16 @@ fn cors_response(status: u16, body: String, cors: &CorsHeaders, request: &tiny_h
 /// que `location`). El checker ya rechaza un valor vacío en compilación,
 /// así que acá solo queda el mismo resguardo defensivo de "no tirar el
 /// proceso" que el resto de los headers armados a partir de un `String`.
+///
+/// `cookies`: los `Set-Cookie` de `response.setCookie(...)` (GRAMMAR.md
+/// §3.277), vacío en cualquier respuesta que no sea un éxito de un rpc que
+/// haya llamado `setCookie` (mismo criterio que `location`/`cache_control`
+/// -- ver `handle_rpc`). Cada entrada ya es el valor COMPLETO del header
+/// (armado por `response.setCookie`); acá solo se agrega UN header
+/// `Set-Cookie` por entrada -- NUNCA se unen con comas como el resto de los
+/// headers repetibles, porque `Set-Cookie` es la única excepción del
+/// estándar HTTP a esa regla (RFC 6265 §3).
+#[allow(clippy::too_many_arguments)]
 fn cors_response_with_type(
     status: u16,
     body: String,
@@ -2809,6 +2851,7 @@ fn cors_response_with_type(
     cors: &CorsHeaders,
     location: Option<&str>,
     cache_control: Option<&str>,
+    cookies: &[String],
     request: &tiny_http::Request,
 ) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
     let content_type = tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type_value.as_bytes())
@@ -2860,6 +2903,11 @@ fn cors_response_with_type(
     if let Some(value) = cache_control {
         if let Ok(cache_control_header) = tiny_http::Header::from_bytes(&b"Cache-Control"[..], value.as_bytes()) {
             response = response.with_header(cache_control_header);
+        }
+    }
+    for cookie in cookies {
+        if let Ok(cookie_header) = tiny_http::Header::from_bytes(&b"Set-Cookie"[..], cookie.as_bytes()) {
+            response = response.with_header(cookie_header);
         }
     }
 

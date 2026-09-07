@@ -1773,6 +1773,14 @@ thread_local! {
     /// `response.redirect(url, permanent)` (GRAMMAR.md §3.111) -- mismo
     /// mecanismo y mismo ciclo de vida que `RESPONSE_STATUS_OVERRIDE`.
     static RESPONSE_LOCATION_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// `response.setCookie(...)` (GRAMMAR.md §3.277) -- `Vec`, no
+    /// `Option<String>` como `RESPONSE_LOCATION_OVERRIDE`, porque un rpc
+    /// puede llamarlo varias veces para mandar varios `Set-Cookie` en la
+    /// misma respuesta (uno no reemplaza al otro, a diferencia de
+    /// `setStatus`/`redirect`). Cada entrada ya es el valor COMPLETO del
+    /// header (`nombre=valor; HttpOnly; Secure; ...`), armado por
+    /// `response.setCookie` -- este thread_local solo los acumula.
+    static RESPONSE_COOKIES_OVERRIDE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     /// GRAMMAR.md §3.260: `true` mientras ESTE hilo está evaluando el
     /// cuerpo de un rpc `@readReplica` -- mismo criterio EXACTO que
     /// `CURRENT_REQUEST` (un hilo por request, así que "está corriendo un
@@ -1862,6 +1870,13 @@ pub(crate) struct RequestContext {
     pub ip: String,
     pub user_agent: Option<String>,
     pub url: String,
+    /// GRAMMAR.md §3.277 (PLAN.md §9.24 Fase 1 ítem C1): pares tal como
+    /// llegaron en el header `Cookie` (`nombre=valor; nombre2=valor2`), SIN
+    /// percent-decode -- `response.setCookie` tampoco percent-encodea al
+    /// escribir (RFC 6265 no lo exige, y encode/decode asimétrico es una
+    /// fuente clásica de bugs), así que lo que un cliente reenvía es
+    /// exactamente lo que este servidor mandó.
+    pub cookies: Vec<(String, String)>,
 }
 
 /// Única forma de abrir una conexión NUEVA a PostgreSQL -- usada tanto por
@@ -3260,6 +3275,7 @@ db { users: User[] }
         RESPONSE_LOCATION_OVERRIDE.with(|c| {
             c.borrow_mut().take();
         });
+        RESPONSE_COOKIES_OVERRIDE.with(|c| c.borrow_mut().clear());
     }
 
     /// Llamado por `response.setStatus(code)` (GRAMMAR.md §3.46) -- guarda
@@ -3292,6 +3308,23 @@ db { users: User[] }
     /// Simétrico de `take_response_status`.
     pub(crate) fn take_response_location(&self) -> Option<String> {
         RESPONSE_LOCATION_OVERRIDE.with(|c| c.borrow_mut().take())
+    }
+
+    /// Llamado por `response.setCookie(...)` (GRAMMAR.md §3.277) -- ACUMULA
+    /// (`push`, no reemplaza), a diferencia de `set_response_status`/
+    /// `set_response_location`: varias llamadas en el mismo rpc arman varios
+    /// `Set-Cookie` en la respuesta, no que la última gane.
+    pub(crate) fn set_response_cookie(&self, formatted_cookie: String) {
+        RESPONSE_COOKIES_OVERRIDE.with(|c| c.borrow_mut().push(formatted_cookie));
+    }
+
+    /// Simétrico de `take_response_status`/`take_response_location` --
+    /// vacía la lista para que ninguna sobreviva a la request que sigue en
+    /// el mismo hilo reciclado. Solo se consume en el camino de éxito de
+    /// `handle_rpc`, mismo criterio que status/location: una respuesta de
+    /// error nunca manda cookies que el cuerpo haya pedido antes de fallar.
+    pub(crate) fn take_response_cookies(&self) -> Vec<String> {
+        RESPONSE_COOKIES_OVERRIDE.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
     /// `""` -- no `None` -- fuera de una request HTTP real (ej. invocado
@@ -3353,6 +3386,14 @@ db { users: User[] }
 
     pub(crate) fn current_request_url(&self) -> String {
         CURRENT_REQUEST.with(|c| c.borrow().as_ref().map(|c| c.url.clone()).unwrap_or_default())
+    }
+
+    /// GRAMMAR.md §3.277: `None` -- no `""` -- si la cookie no vino, mismo
+    /// criterio que `current_request_header` (una ausencia real es una
+    /// distinción que el caller necesita ver, a diferencia de `path`/
+    /// `method`/etc. que siempre existen para una request real).
+    pub(crate) fn current_request_cookie(&self, name: &str) -> Option<String> {
+        CURRENT_REQUEST.with(|c| c.borrow().as_ref().and_then(|c| c.cookies.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())))
     }
 
     pub fn call(&self, collection: &str, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {

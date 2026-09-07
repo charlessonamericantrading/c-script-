@@ -4732,6 +4732,13 @@ fn call_method(
             "url" => Ok(Value::Str(db.current_request_url())),
             "userAgent" => Ok(db.current_request_user_agent().map(Value::Str).unwrap_or(Value::Null)),
             "query" => Ok(Value::Struct(db.current_request_query().into_iter().map(|(k, v)| (k, Value::Str(v))).collect())),
+            "cookie" => {
+                let name = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("request.cookie requiere un argumento String")),
+                };
+                Ok(db.current_request_cookie(name).map(Value::Str).unwrap_or(Value::Null))
+            }
             other => Err(err(format!("método desconocido sobre request: '{other}'"))),
         },
         Value::Smtp => match method {
@@ -4828,6 +4835,76 @@ fn call_method(
                 }
                 db.set_response_status(if permanent { 301 } else { 302 });
                 db.set_response_location(url.clone());
+                Ok(Value::Null)
+            }
+            "setCookie" => {
+                let (name, value, options) = match (args.first(), args.get(1), args.get(2)) {
+                    (Some(Value::Str(n)), Some(Value::Str(v)), Some(Value::Struct(o))) => (n, v, o),
+                    _ => return Err(err("response.setCookie requiere (name: String, value: String, options: {...})")),
+                };
+                if name.is_empty() {
+                    return Err(err("response.setCookie: 'name' no puede ser un string vacío"));
+                }
+                // Mismo motivo que `response.redirect` de arriba: `name`/
+                // `value` terminan crudos adentro de un header `Set-Cookie`,
+                // y `;`/CR/LF ahí abren la puerta a inyectar atributos u
+                // otro header entero.
+                for (field, s) in [("name", name.as_str()), ("value", value.as_str())] {
+                    if s.contains(';') || s.contains('\r') || s.contains('\n') {
+                        return Err(err(format!("response.setCookie: '{field}' no puede contener ';' ni un salto de línea")));
+                    }
+                }
+                let http_only = match options.iter().find(|(k, _)| k == "httpOnly") {
+                    Some((_, Value::Bool(b))) => *b,
+                    _ => true,
+                };
+                let secure = match options.iter().find(|(k, _)| k == "secure") {
+                    Some((_, Value::Bool(b))) => *b,
+                    _ => true,
+                };
+                let same_site = match options.iter().find(|(k, _)| k == "sameSite") {
+                    Some((_, Value::Str(s))) => s.clone(),
+                    _ => "lax".to_string(),
+                };
+                let same_site = match same_site.to_ascii_lowercase().as_str() {
+                    "strict" => "Strict",
+                    "lax" => "Lax",
+                    "none" => "None",
+                    other => {
+                        return Err(err(format!(
+                            "response.setCookie: 'sameSite' inválido: '{other}' -- se esperaba \"strict\", \"lax\" o \"none\""
+                        )));
+                    }
+                };
+                let path = match options.iter().find(|(k, _)| k == "path") {
+                    Some((_, Value::Str(s))) => s.clone(),
+                    _ => "/".to_string(),
+                };
+                if path.contains(';') || path.contains('\r') || path.contains('\n') {
+                    return Err(err("response.setCookie: 'path' no puede contener ';' ni un salto de línea"));
+                }
+                let max_age = match options.iter().find(|(k, _)| k == "maxAge") {
+                    Some((_, Value::Int(n))) => Some(*n),
+                    _ => None,
+                };
+                let mut cookie = format!("{name}={value}");
+                if http_only {
+                    cookie.push_str("; HttpOnly");
+                }
+                if secure {
+                    cookie.push_str("; Secure");
+                }
+                cookie.push_str("; SameSite=");
+                cookie.push_str(same_site);
+                cookie.push_str("; Path=");
+                cookie.push_str(&path);
+                if let Some(age) = max_age {
+                    if age < 0 {
+                        return Err(err(format!("response.setCookie: 'maxAge' no puede ser negativo, se recibió {age}")));
+                    }
+                    cookie.push_str(&format!("; Max-Age={age}"));
+                }
+                db.set_response_cookie(cookie);
                 Ok(Value::Null)
             }
             other => Err(err(format!("método desconocido sobre response: '{other}'"))),

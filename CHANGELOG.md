@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.221.0] - 2026-09-07
+
+### ✨ Añadido
+**Cookies: `request.cookie(name)` / `response.setCookie(name, value, options)` -- cierra el ítem C1 de la Fase 1 de PLAN.md §9.24, prerrequisito directo de C2 (`@csrf`).** Antes de esto no había forma de leer ni escribir una cookie -- sesiones y JWT viajaban solo como `Authorization: Bearer`. `setCookie` acumula un `Set-Cookie` por llamada (varias cookies en la misma respuesta, a diferencia de `setStatus`/`redirect` donde la última gana); `options` es estructural y opcional campo a campo, con defaults SEGUROS por decisión de diseño (`httpOnly`/`secure` en `true`, `sameSite` en `"lax"`, `path` en `"/"`, cookie de sesión si `maxAge` no viene) -- no los de Express. `sameSite` se valida en runtime contra `"strict"/"lax"/"none"`. `name`/`value`/`path` rechazan `;`/CR/LF (misma protección de inyección de headers que `response.redirect`). Sin percent-encode/decode en ningún sentido (RFC 6265 no lo exige, evita asimetría encode/decode). Nunca sobrevive a un error del rpc, ni tiene efecto dentro de un `stream` -- mismo mecanismo y mismo criterio que `setStatus`/`redirect`. Ver GRAMMAR.md §3.277.
+
+Verificado con 6 tests de checker + verificación manual de punta a punta contra un `linkc serve` real: dos `Set-Cookie` reales en la misma respuesta con atributos correctos (defaults y opciones explícitas incluido `httpOnly:false`), `request.cookie(...)` lee el valor exacto de vuelta y `null` cuando no vino, y una request que setea una cookie y luego falla no manda ningún `Set-Cookie` en su 500. Suite completa (1398 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.220.0] - 2026-09-07
 
 ### ✨ Añadido

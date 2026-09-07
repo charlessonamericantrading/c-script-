@@ -125,6 +125,28 @@ fn http_response_type() -> Type {
 /// `http_response_type()`/`image_dimensions_type()`. `result` es `Dynamic?`
 /// porque cada rpc `@background` produce una forma distinta -- no hay un
 /// tipo único que este builtin pueda exigir de antemano.
+/// GRAMMAR.md §3.277: lo que `response.setCookie(name, value, options)`
+/// (PLAN.md §9.24 Fase 1 ítem C1) espera como tercer argumento -- las CINCO
+/// opciones son opcionales a propósito, así que `{}` (todos los defaults
+/// seguros: `httpOnly`/`secure` en `true`, `sameSite` en `"lax"`, `path` en
+/// `"/"`, cookie de sesión si `maxAge` no viene) es un valor válido, igual
+/// que `sitemap_url_type`/`robots_rule_type` de arriba. `sameSite` es
+/// `String`, no un enum del lenguaje: se valida en RUNTIME contra
+/// `"strict"/"lax"/"none"` (case-insensitive) porque es un argumento común,
+/// no una anotación -- mismo criterio que el locale de `Int.toLocaleString`.
+fn set_cookie_options_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "httpOnly".to_string(), optional: true, ty: Type::Bool },
+            FieldType { name: "secure".to_string(), optional: true, ty: Type::Bool },
+            FieldType { name: "sameSite".to_string(), optional: true, ty: Type::String },
+            FieldType { name: "path".to_string(), optional: true, ty: Type::String },
+            FieldType { name: "maxAge".to_string(), optional: true, ty: Type::Int },
+        ],
+    }
+}
+
 fn background_job_status_type() -> Type {
     Type::Struct {
         name: None,
@@ -5860,6 +5882,10 @@ impl Checker {
                 self.expect_no_args(args, "query")?;
                 Some(Type::MapOf(Box::new(Type::String), Box::new(Type::String)))
             }
+            (Type::Request, "cookie") => builtin_args!(
+                self, args, env, "request.cookie",
+                [(name, "name: String", Type::String)] -> Type::Optional(Box::new(Type::String))
+            ),
             (Type::Smtp, "send") => {
                 let [to, subject, body] = args else {
                     return Err(err("'smtp.send' toma exactamente 3 argumentos (to: String, subject: String, body: String)"));
@@ -5931,6 +5957,22 @@ impl Checker {
                 }
                 self.check_expr(url, &Type::String, env)?;
                 self.check_expr(permanent, &Type::Bool, env)?;
+                Some(Type::Void)
+            }
+            (Type::Response, "setCookie") => {
+                let [name, value, options] = args else {
+                    return Err(err(
+                        "'response.setCookie' toma exactamente 3 argumentos (name: String, value: String, options: { httpOnly: Bool?, secure: Bool?, sameSite: String?, path: String?, maxAge: Int? })",
+                    ));
+                };
+                if self.in_stream_body.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(err(
+                        "'response.setCookie' no tiene efecto dentro de un 'stream': mismo motivo que 'response.setStatus' (GRAMMAR.md §3.46) -- una conexión SSE ya envió sus headers antes de que el cuerpo corra",
+                    ));
+                }
+                self.check_expr(name, &Type::String, env)?;
+                self.check_expr(value, &Type::String, env)?;
+                self.check_expr(options, &set_cookie_options_type(), env)?;
                 Some(Type::Void)
             }
             (Type::Base64, "decode") => {
@@ -11451,6 +11493,74 @@ type T = { id: Int, s: Status }")
         assert!(check_source(r#"service S { rpc f() -> String { request.url("x") } }"#).is_err());
         assert!(check_source(r#"service S { rpc f() -> String? { request.userAgent("x") } }"#).is_err());
         assert!(check_source(r#"service S { rpc f() -> Map<String,String> { request.query("x") } }"#).is_err());
+    }
+
+    // ---- `request.cookie` / `response.setCookie` (GRAMMAR.md §3.277, PLAN.md §9.24 Fase 1 ítem C1) ----
+
+    #[test]
+    fn request_cookie_takes_one_string_and_types_as_optional_string() {
+        let src = r#"
+            service S {
+                rpc c(name: String) -> String? { request.cookie(name) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        assert!(check_source(r#"service S { rpc f() -> String? { request.cookie() } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> String? { request.cookie(1) } }"#).is_err());
+    }
+
+    #[test]
+    fn response_set_cookie_accepts_empty_options_and_types_as_void() {
+        let src = r#"
+            service S {
+                rpc login() -> Void { response.setCookie("session", "abc123", {}) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn response_set_cookie_accepts_all_options_explicitly() {
+        let src = r#"
+            service S {
+                rpc login() -> Void {
+                    response.setCookie("csrf", "abc123", { httpOnly: false, secure: true, sameSite: "strict", path: "/admin", maxAge: 3600 })
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn response_set_cookie_requires_exactly_three_arguments() {
+        let res = check_source(r#"service S { rpc f() -> Void { response.setCookie("a", "b") } }"#);
+        assert!(res.is_err());
+        assert!(format!("{:?}", res.unwrap_err()).contains("setCookie"));
+    }
+
+    #[test]
+    fn response_set_cookie_rejects_wrong_argument_types() {
+        assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie(1, "b", {}) } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie("a", 2, {}) } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie("a", "b", { httpOnly: "not-a-bool" }) } }"#).is_err());
+    }
+
+    #[test]
+    fn response_set_cookie_is_rejected_inside_a_stream() {
+        let src = r#"
+            type Item = { id: Int }
+            db { items: Item[] }
+            service Items {
+                stream watchAll() -> Item {
+                    response.setCookie("a", "b", {});
+                    db.items.all()
+                }
+            }
+        "#;
+        let res = check_source(src);
+        assert!(res.is_err());
+        assert!(format!("{:?}", res.unwrap_err()).contains("setCookie"));
     }
 
     #[test]

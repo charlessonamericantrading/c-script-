@@ -9762,6 +9762,45 @@ fn nameParam() -> String? {
 
 **Verificado**: 5 tests de `checker.rs` (los cuatro `String` lisos, `userAgent` Optional, `query` como `Map<String,String>`, rechazo de argumentos en los seis) + verificación manual de punta a punta contra un `linkc serve` real: `path`/`method`/`url` correctos sobre una request con query string; `userAgent` presente devuelve el header tal cual; `query().get(...)` con una clave presente (incluido percent-decode real, `%20` → espacio) y una ausente (`null`); `ip` devuelve `127.0.0.1` sobre una conexión local real. Suite completa (1392 tests) sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.277 Cookies: `request.cookie(name)` y `response.setCookie(name, value, options)` — cierra Fase 1 ítem C1 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem C1 -- sin esto, ninguna sesión basada en cookie (el mecanismo estándar para una app que sirve HTML, a diferencia del bearer token que ya tenía auth v0) era expresable en c-script, y es el prerrequisito directo del ítem C2 (`@csrf`, doble-submit cookie+header).
+
+<!-- linkc:check -->
+```rust
+fn login() -> Void {
+  response.setCookie("session", "abc123", {})
+}
+
+fn loginWithOptions() -> Void {
+  response.setCookie("csrf", "xyz", { httpOnly: false, secure: true, sameSite: "strict", path: "/admin", maxAge: 3600 })
+}
+
+fn whoAmI() -> String? {
+  request.cookie("session")
+}
+```
+
+`response.setCookie(name: String, value: String, options: { httpOnly: Bool?, secure: Bool?, sameSite: String?, path: String?, maxAge: Int? }) -> Void` acumula un header `Set-Cookie` por llamada -- varias llamadas en el mismo rpc mandan varias cookies en la misma respuesta, a diferencia de `setStatus`/`redirect` (donde la última gana). `options` es estructural (subtipado de ancho, §3.2): un `{}` vacío es válido y usa los defaults SEGUROS por decisión de diseño, no los de Express (que por default manda una cookie de sesión SIN `HttpOnly`/`Secure`):
+
+| Opción | Default | Nota |
+|---|---|---|
+| `httpOnly` | `true` | protección real contra robo por XSS; se pasa `false` explícito solo si JS del cliente necesita leer la cookie (ej. un token CSRF de doble-submit) |
+| `secure` | `true` | nunca viaja en claro salvo que el rpc la desactive a propósito (útil en `localhost` sin TLS durante desarrollo) |
+| `sameSite` | `"lax"` | `"strict"`/`"lax"`/`"none"` (case-insensitive), validado en RUNTIME porque es un argumento común, no una anotación -- mismo criterio que el locale de `Int.toLocaleString` (§3.243) |
+| `path` | `"/"` | — |
+| `maxAge` | ausente (cookie de sesión) | segundos; rechazado si es negativo |
+
+`request.cookie(name: String) -> String?` lee el header `Cookie` entrante -- `null` si esa cookie no vino, mismo criterio que `request.header(name)` (§3.38).
+
+**Sin percent-encode/decode en ningún sentido**: a diferencia de `query()` (§3.276, que SÍ percent-decodea porque así codifica una query string por estándar), una cookie no lo requiere por RFC 6265 §4.1.1 -- y una asimetría encode-al-escribir/no-decode-al-leer (o viceversa) es una fuente clásica de bugs. `name`/`value`/`path` rechazan `;`/CR/LF (mismo motivo de inyección de headers que `response.redirect`, §3.111): sin esto, un valor armado con datos de usuario podría inyectar atributos de cookie extra o un header HTTP entero.
+
+**`Set-Cookie` nunca se une con comas** como el resto de los headers repetibles de este servidor (`Vary`, por ejemplo) -- es la única excepción real de HTTP a esa regla (RFC 6265 §3): cada cookie es un header `Set-Cookie` separado, verificado con dos `setCookie` reales en la misma respuesta.
+
+**Nunca sobrevive a un error**: mismo mecanismo y mismo criterio que `response.setStatus`/`response.redirect` (§3.46/§3.111) -- si un rpc llama `setCookie` y DESPUÉS falla, la respuesta de error no lleva ninguna cookie. Dentro de un `stream` es un error de compilación, mismo motivo que `setStatus`/`redirect`: una conexión SSE ya mandó sus headers antes de que el cuerpo corra.
+
+**Verificado**: 6 tests de `checker.rs` (`request.cookie` tipa y exige 1 argumento String; `setCookie` acepta `{}` y todas las opciones explícitas; exige exactamente 3 argumentos; rechaza tipos incorrectos incluido un `sameSite` no-String; rechazado dentro de un `stream`) + verificación manual de punta a punta contra un `linkc serve` real: dos `Set-Cookie` en la misma respuesta con los atributos correctos (uno con los defaults, otro con las cinco opciones explícitas incluida `httpOnly:false`/`secure:false`); `request.cookie(...)` devuelve el valor exacto mandado en un `Cookie:` de la request siguiente, y `null` cuando no vino; una request que setea una cookie y LUEGO falla (`panic`) no manda ningún `Set-Cookie` en su 500. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
