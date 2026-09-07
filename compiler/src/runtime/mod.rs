@@ -4725,6 +4725,7 @@ fn call_method(
                 };
                 Ok(db.current_request_header(name).map(Value::Str).unwrap_or(Value::Null))
             }
+            "id" => Ok(Value::Str(db.current_request_id())),
             other => Err(err(format!("método desconocido sobre request: '{other}'"))),
         },
         Value::Smtp => match method {

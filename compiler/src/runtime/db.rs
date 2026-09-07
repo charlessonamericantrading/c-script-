@@ -1791,6 +1791,17 @@ pub(crate) fn read_replica_active() -> bool {
     CURRENT_READ_REPLICA.with(|c| c.get())
 }
 
+/// GRAMMAR.md §3.275: función LIBRE, no un método de `Db` -- a propósito,
+/// para que `server.rs` pueda leer el `X-Request-Id` de la request actual
+/// desde `cors_response`/`log_done` (decenas de sitios de llamada en ese
+/// archivo, ninguno tiene una instancia de `Db` en la mano en ese punto)
+/// sin tener que agregar un parámetro `db: &Db` nuevo a cada una. Mismo
+/// criterio que `read_replica_active` de arriba: el `thread_local!` ya es
+/// la fuente de verdad, no hace falta pasar `Db` para leerlo.
+pub(crate) fn current_thread_request_id() -> String {
+    CURRENT_REQUEST.with(|c| c.borrow().as_ref().map(|c| c.request_id.clone()).unwrap_or_default())
+}
+
 /// RAII: `new(true)` al entrar al cuerpo de un rpc `@readReplica`,
 /// restaura el valor ANTERIOR (no simplemente `false`) al salir -- mismo
 /// motivo que cualquier guard de anidamiento de este archivo: un rpc no
@@ -1830,6 +1841,12 @@ pub(crate) struct RequestContext {
     /// intérprete. `server.rs` lo fija en el mismo lugar que `raw_body`/
     /// `headers`, antes de cualquier dispatch.
     pub current_token: Option<String>,
+    /// GRAMMAR.md §3.275: el `X-Request-Id` de ESTA request -- el que vino
+    /// en el header entrante, o uno generado si no vino ninguno. Resuelto
+    /// UNA vez por request en `server.rs` (mismo lugar y momento que
+    /// `raw_body`/`headers`), antes de cualquier dispatch -- el mismo valor
+    /// que la respuesta ecoa y que cada línea de log de esta request lleva.
+    pub request_id: String,
 }
 
 /// Única forma de abrir una conexión NUEVA a PostgreSQL -- usada tanto por
@@ -3280,6 +3297,15 @@ db { users: User[] }
                 .as_ref()
                 .and_then(|c| c.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone()))
         })
+    }
+
+    /// `""` fuera de una request HTTP real -- mismo criterio que
+    /// `current_request_body` (arriba): bajo `linkc test` no hay ningún
+    /// `X-Request-Id` real que devolver, y un `String` vacío es más simple
+    /// que forzar a todo caller de `request.id()` a manejar `null` por un
+    /// caso que en la práctica nunca importa.
+    pub(crate) fn current_request_id(&self) -> String {
+        current_thread_request_id()
     }
 
     pub fn call(&self, collection: &str, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {

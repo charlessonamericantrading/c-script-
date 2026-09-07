@@ -9713,6 +9713,25 @@ service Site {
 
 **Verificado**: 6 tests de `checker.rs` (tipa sola con `Html` de retorno, rechazo en un `stream`, rechazo al combinar con otra anotación, rechazo con parámetros, rechazo con un retorno que no sea `Html`, rechazo de un segundo `@notFound` en el mismo programa) + verificación manual de punta a punta contra un `linkc serve` real: un path totalmente mal formado, una forma `/Service/rpc` con servicio/rpc no declarado, y el acceso directo a la dirección del propio `@notFound` -- los tres devuelven la misma página con `Content-Type: text/html; charset=utf-8` y status 404; un rpc normal (`identity`) sigue funcionando sin cambios; un programa SIN `@notFound` sigue devolviendo el 404 JSON de siempre (sin regresión). Suite completa (1387 tests) sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.275 `X-Request-Id` (eco o generado) + `request.id()` — cierra Fase 1 ítem C10 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem C10 -- correlacionar una request real (la que un cliente, un proxy, u otro servicio reportó con SU PROPIO id) con la línea de log/la respuesta de este servidor. Ya existía un contador `req_id` interno (`[req N]` en cada línea de log), pero es puramente NUMÉRICO y de ESTE proceso -- nunca viaja en la respuesta, nunca acepta uno entrante, inútil para correlacionar con un sistema externo.
+
+<!-- linkc:check -->
+```rust
+service Site {
+  rpc whichRequest() -> String {
+    request.id()
+  }
+}
+```
+
+**`linkc serve` resuelve un `X-Request-Id` por request, SIEMPRE, antes de cualquier dispatch**: el header entrante gana si vino y no viene vacío (correlación real detrás de un proxy que ya lo agrega); si no, se genera un UUIDv4 nuevo (`generate_uuid_v4`, el mismo generador que `crypto.uuid()`, GRAMMAR.md §3.70) -- con el contador `req_id` numérico interno como último fallback si hasta la generación de UUID fallara (el CSPRNG del sistema no disponible), para que la request nunca se caiga por esto. El mismo valor: (1) se ECOA en la respuesta como header `X-Request-Id`, en TODA respuesta sin excepción (mismo criterio que los headers de seguridad fijos, §3.41); (2) aparece en cada línea de log de esa request (`request_id=...` en texto, `"request_id"` en JSON), al lado del `req_id` numérico de siempre; (3) `request.id() -> String` lo expone al cuerpo de un rpc -- nunca `null` (a diferencia de `request.header(...)`, que sí puede faltar): el servidor SIEMPRE resuelve uno.
+
+**Implementación sin agregar un parámetro nuevo a decenas de funciones**: `cors_response`/`cors_response_with_type`/`log_done`/`log_done_with_audit` tienen ~40 sitios de llamada cada una en `server.rs`, ninguno con una instancia de `Db` a mano en ese punto -- en vez de threadear un parámetro `db: &Db` (o el id mismo) por todos esos call sites, `db.rs` expone una función LIBRE (`current_thread_request_id`, no un método `&self`) que lee directo el mismo `thread_local!` que ya guarda el contexto de la request actual (`CURRENT_REQUEST`, §3.253) -- mismo criterio que `read_replica_active` (§3.260), que ya resolvía el mismo problema de forma para otro dato.
+
+**Verificado**: 1 test de `checker.rs` (tipa como `String` liso, sin argumentos) + verificación manual de punta a punta contra un `linkc serve` real: sin `X-Request-Id` entrante, el header de respuesta y `request.id()` devuelven el MISMO UUID recién generado (confirmado con una sola request, header y body juntos); con un `X-Request-Id` entrante custom, se ecoa tal cual en la respuesta y en `request.id()`; el log de texto muestra `request_id=...` en cada línea. Suite completa (1388 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

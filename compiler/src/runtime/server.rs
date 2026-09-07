@@ -38,7 +38,7 @@ use super::encryption;
 use super::store::Backend;
 use super::session::SessionStore;
 use super::{
-    ai_stream_member, invoke_rpc_with_sessions, is_cron_member, is_not_found_member, is_stream_member, live_subscribe_collection, program_has_any_background_rpc,
+    ai_stream_member, generate_uuid_v4, invoke_rpc_with_sessions, is_cron_member, is_not_found_member, is_stream_member, live_subscribe_collection, program_has_any_background_rpc,
     required_auth, required_background, required_cache, required_cors, required_idempotent, required_rate_limit,
 };
 use crate::ast::{Annotation, Item, Member};
@@ -162,9 +162,18 @@ fn log_done_with_audit(
     }
     let elapsed_ms = start.elapsed().as_millis();
     let method_field = method.unwrap_or("-");
+    // GRAMMAR.md §3.275 (PLAN.md §9.24 Fase 1 ítem C10): el mismo
+    // `X-Request-Id` que la respuesta ecoa, ahora en el log -- para
+    // correlacionar una línea de log con la request real que un cliente/
+    // proxy reportó, sin depender de `req_id` (el contador NUMÉRICO interno
+    // de este proceso, nunca visible afuera).
+    let request_id = super::db::current_thread_request_id();
     match log.format {
         LogFormat::Text => {
             let mut line = format!("[req {req_id}] method={method_field} status={status} duration_ms={elapsed_ms}");
+            if !request_id.is_empty() {
+                line.push_str(&format!(" request_id={request_id}"));
+            }
             if let Some(a) = audit {
                 line.push_str(&format!(
                     " auth_role={:?} auth_user_id={} auth_allowed={}",
@@ -182,6 +191,7 @@ fn log_done_with_audit(
         LogFormat::Json => {
             let mut json = serde_json::json!({
                 "req_id": req_id,
+                "request_id": if request_id.is_empty() { None } else { Some(&request_id) },
                 "method": method,
                 "status": status,
                 "duration_ms": elapsed_ms,
@@ -1041,7 +1051,21 @@ fn handle_request(
     // consumirlo), así que llamarla de nuevo más abajo para el auth gate
     // sigue siendo correcto, sin ningún costo real.
     let current_token = extract_bearer_token(&request);
-    db.set_request_context(super::db::RequestContext { raw_body: body.clone(), headers, current_token });
+    // GRAMMAR.md §3.275 (PLAN.md §9.24 Fase 1 ítem C10): el `X-Request-Id`
+    // entrante gana si vino (y no viene vacío) -- correlación real entre
+    // servicios detrás de un proxy que ya lo agrega -- o uno generado acá
+    // si no. `generate_uuid_v4` puede fallar en teoría (CSPRNG del sistema
+    // no disponible) -- el `req_id` numérico interno de siempre (SIEMPRE
+    // disponible, nunca falla) es el último fallback, para que la request
+    // jamás se caiga por esto.
+    let request_id = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-request-id"))
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
+        .or_else(|| generate_uuid_v4().ok())
+        .unwrap_or_else(|| req_id.to_string());
+    db.set_request_context(super::db::RequestContext { raw_body: body.clone(), headers, current_token, request_id: request_id.clone() });
 
     // `/live` y `/ready` (GRAMMAR.md §3.220, PLAN.md §9.18 Eje E ítem 2):
     // las DOS preguntas que `/health` (§3.87) contesta juntas, separadas
@@ -2850,6 +2874,22 @@ fn cors_response_with_type(
     if let Some(value) = &cors.hsts {
         if let Ok(hsts_header) = tiny_http::Header::from_bytes(&b"Strict-Transport-Security"[..], value.as_bytes()) {
             response = response.with_header(hsts_header);
+        }
+    }
+    // GRAMMAR.md §3.275 (PLAN.md §9.24 Fase 1 ítem C10): en TODA respuesta,
+    // sin excepción -- mismo criterio que los headers de seguridad de
+    // arriba. Lee `current_thread_request_id()` (thread_local, ver db.rs)
+    // en vez de recibirlo como parámetro -- esta función tiene decenas de
+    // call sites en este archivo, ninguno con una instancia de `Db` a mano
+    // en ese punto. `super::db::CURRENT_REQUEST` puede estar vacío para
+    // caminos que responden ANTES de que `server.rs` lo fije (ej. un 413
+    // por body demasiado grande, todavía no llegó a esa línea) -- en ese
+    // caso `current_thread_request_id()` da `""`, y no se agrega ningún
+    // header en vez de mandar uno vacío.
+    let request_id = super::db::current_thread_request_id();
+    if !request_id.is_empty() {
+        if let Ok(request_id_header) = tiny_http::Header::from_bytes(&b"X-Request-Id"[..], request_id.as_bytes()) {
+            response = response.with_header(request_id_header);
         }
     }
     response

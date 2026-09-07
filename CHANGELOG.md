@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.219.0] - 2026-09-07
+
+### ✨ Añadido
+**`X-Request-Id` (eco o generado) + `request.id()` -- cierra el ítem C10 de la Fase 1 de PLAN.md §9.24.** `linkc serve` resuelve un `X-Request-Id` por request, siempre: el header entrante gana si vino (correlación real detrás de un proxy que ya lo agrega), si no se genera un UUIDv4 nuevo (mismo generador que `crypto.uuid()`). El valor se ecoa en TODA respuesta como header, aparece en cada línea de log (texto y JSON, al lado del `req_id` numérico interno de siempre), y `request.id() -> String` lo expone al cuerpo de un rpc -- nunca `null`. Implementado sin agregar un parámetro nuevo a las ~40 funciones de respuesta/log de `server.rs`: una función libre en `db.rs` (`current_thread_request_id`) lee directo el `thread_local!` que ya guarda el contexto de la request, mismo criterio que `read_replica_active`. Ver GRAMMAR.md §3.275.
+
+Verificado con 1 test de checker + verificación manual de punta a punta contra un `linkc serve` real (sin header entrante: header de respuesta y `request.id()` coinciden en el mismo UUID; con header entrante custom: se ecoa tal cual). Suite completa (1388 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.218.0] - 2026-09-07
 
 ### ✨ Añadido

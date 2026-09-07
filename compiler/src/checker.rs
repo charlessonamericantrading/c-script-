@@ -5832,6 +5832,15 @@ impl Checker {
                 self.check_expr(name_arg, &Type::String, env)?;
                 Some(Type::Optional(Box::new(Type::String)))
             }
+            // GRAMMAR.md §3.275 (PLAN.md §9.24 Fase 1 ítem C10): el mismo
+            // `X-Request-Id` que ya viaja en la respuesta y en cada línea de
+            // log -- nunca `null` (a diferencia de `header`, que sí puede
+            // faltar): el servidor SIEMPRE resuelve uno, entrante o
+            // generado.
+            (Type::Request, "id") => {
+                self.expect_no_args(args, "id")?;
+                Some(Type::String)
+            }
             (Type::Smtp, "send") => {
                 let [to, subject, body] = args else {
                     return Err(err("'smtp.send' toma exactamente 3 argumentos (to: String, subject: String, body: String)"));
@@ -11360,6 +11369,25 @@ type T = { id: Int, s: Status }")
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("currentRole"), "debería mencionar 'currentRole': {msg}");
+    }
+
+    // ---- `request.id()` (GRAMMAR.md §3.275, PLAN.md §9.24 Fase 1 ítem C10) ----
+
+    #[test]
+    fn request_id_types_as_plain_string_and_takes_no_arguments() {
+        let src = r#"
+            service S {
+                rpc whichRequest() -> String { request.id() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+
+        let bad = r#"
+            service S {
+                rpc whichRequest() -> String { request.id("x") }
+            }
+        "#;
+        assert!(check_source(bad).is_err(), "'request.id' no toma argumentos");
     }
 
     #[test]
