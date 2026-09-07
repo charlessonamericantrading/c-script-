@@ -6210,6 +6210,18 @@ pub fn is_not_found_member(program: &Program, service_name: &str, rpc_name: &str
     })
 }
 
+/// Si `service_name.rpc_name` declaró `@csrf` (GRAMMAR.md §3.278) -- mismo
+/// patrón EXACTO que `is_not_found_member`, arriba. `server.rs` lo consulta
+/// en el gate de `check_csrf_gate`, ANTES de invocar el rpc.
+pub fn requires_csrf(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) if s.name == service_name => {
+            s.members.iter().any(|m| matches!(m, Member::Rpc(r) if r.name == rpc_name && r.csrf()))
+        }
+        _ => false,
+    })
+}
+
 /// Anotación `@authenticated`/`@requires(...)` de `{service_name}.{rpc_name}`,
 /// si tiene una -- hermana de `is_stream_member` (mismo archivo/patrón, ya
 /// usada por `server.rs` antes de invocar nada). `None` cubre tanto "sin

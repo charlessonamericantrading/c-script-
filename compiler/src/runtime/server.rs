@@ -38,8 +38,8 @@ use super::encryption;
 use super::store::Backend;
 use super::session::SessionStore;
 use super::{
-    ai_stream_member, generate_uuid_v4, invoke_rpc_with_sessions, is_cron_member, is_not_found_member, is_stream_member, live_subscribe_collection, program_has_any_background_rpc,
-    required_auth, required_background, required_cache, required_cors, required_idempotent, required_rate_limit,
+    ai_stream_member, constant_time_eq, generate_uuid_v4, invoke_rpc_with_sessions, is_cron_member, is_not_found_member, is_stream_member, live_subscribe_collection, program_has_any_background_rpc,
+    required_auth, required_background, required_cache, required_cors, required_idempotent, required_rate_limit, requires_csrf,
 };
 use crate::ast::{Annotation, Item, Member};
 use crate::ast::Program;
@@ -1438,6 +1438,22 @@ fn handle_request(
         }
     }
 
+    // `@csrf` (GRAMMAR.md §3.278): corre ANTES del gate de auth de abajo, a
+    // propósito -- mismo criterio que `@rate_limit` de arriba, una request
+    // forjada cross-site no debería aprender "esto necesita auth" antes de
+    // ni siquiera pasar la verificación de origen. Independiente del rol:
+    // un token CSRF válido no prueba nada sobre QUIÉN es el caller, solo que
+    // la request se originó en una página que pudo leer su propia cookie
+    // (imposible para un sitio cross-origin sin CORS que se lo permita).
+    if requires_csrf(program, service_name, rpc_name) {
+        if let Err((status, msg)) = check_csrf_gate(db) {
+            let resp = cors_response(status, error_json(msg), &cors_headers, &request);
+            let _ = request.respond(resp);
+            log_done(log, req_id, Some(&method), status, start, &format!("error={msg:?}"));
+            return;
+        }
+    }
+
     // El gate de autorización corre ACÁ, antes de `parse_args`/
     // `json_to_typed_value` en cualquiera de las dos ramas de abajo --
     // un rpc protegido rechaza la request sin filtrar el shape de sus
@@ -2207,9 +2223,38 @@ pub(crate) fn check_auth_gate(
         | Annotation::Cache(_)
         | Annotation::Cors(_)
         | Annotation::Cron(_)
-        | Annotation::NotFound => Ok(()),
+        | Annotation::NotFound
+        | Annotation::Csrf => Ok(()),
     };
     AuthGateResult { audit: mk_audit(outcome.is_ok()), outcome }
+}
+
+/// GRAMMAR.md §3.278: nombres FIJOS, sin configuración -- coinciden a
+/// propósito con la convención que la referencia Express/`csurf` de
+/// PLAN.md §9.24.3 (ítem C2) ya usaba, para que una migración estranguladora
+/// ruta por ruta (Fase 4) no tenga que reconciliar dos nombres de cookie/
+/// header distintos entre el backend viejo y `linkc serve`.
+const CSRF_COOKIE_NAME: &str = "_csrf";
+const CSRF_HEADER_NAME: &str = "x-csrf-token";
+
+/// `@csrf` (GRAMMAR.md §3.278) -- doble-submit cookie+header: la cookie
+/// `_csrf` (que solo un origen que pudo leerla con `document.cookie` puede
+/// haber visto) tiene que coincidir, en tiempo CONSTANTE (`constant_time_eq`,
+/// la misma función que expone `crypto.timingSafeEqual`), con el header
+/// `x-csrf-token` que el cliente manda de vuelta. Ninguno de los dos viene
+/// nunca del lado servidor en texto plano comparable con `==` normal: un
+/// atacante que mide la latencia de la respuesta no puede usar esa señal
+/// para adivinar el valor byte a byte. Cualquier ausencia (cookie sin
+/// mandar el token todavía, request cross-site sin la cookie del todo) cae
+/// al mismo 403 genérico -- no distingue "faltaba" de "no coincidía" para
+/// no regalarle a un atacante cuál de los dos casos está probando.
+fn check_csrf_gate(db: &Db) -> Result<(), (u16, &'static str)> {
+    let cookie = db.current_request_cookie(CSRF_COOKIE_NAME);
+    let header = db.current_request_header(CSRF_HEADER_NAME);
+    match (cookie, header) {
+        (Some(cookie), Some(header)) if !cookie.is_empty() && constant_time_eq(cookie.as_bytes(), header.as_bytes()) => Ok(()),
+        _ => Err((403, "token CSRF ausente o inválido")),
+    }
 }
 
 /// `@requires(..., ownerOf: <colección>, id: <parámetro>, field: <campo>)`

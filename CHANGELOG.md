@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.222.0] - 2026-09-07
+
+### ✨ Añadido
+**`@csrf` -- protección CSRF de doble-submit cookie+header, cierra el ítem C2 de la Fase 1 de PLAN.md §9.24.** Hoy `POST /LeadsService/createLead` vía c-script ya está fuera del CSRF que Express aplicaba -- una brecha real, no solo futura. `@csrf` es opt-in POR RPC (no protección global con exenciones como la referencia Express/`csurf`): un rpc que la declara queda protegido, uno que no la declara no la necesita -- menos mecanismo nuevo (sin `@csrf(exempt)`), misma propiedad de seguridad real. Doble-submit: la cookie `_csrf` (nombres fijos, misma convención que la referencia Express, para no reconciliar dos nombres distintos durante la migración estranguladora de Fase 4) tiene que coincidir en tiempo CONSTANTE con el header `x-csrf-token`; un sitio cross-origin puede forzar el envío de la cookie pero nunca puede leerla para poner el mismo valor en el header. Corre ANTES del gate de auth (mismo criterio que `@rate_limit`) y compone libremente con `@requires`/`@rate_limit`/cualquier otra anotación -- a diferencia de `@notFound`/`@cron`, que rechazan combinarse. Rechazado sobre un `stream` (de solo lectura, protegerlo no significa nada). c-script no auto-genera un endpoint de token -- la primitiva ya existía (`response.setCookie` de C1 + `crypto.uuid()`), exponerla es una decisión del programa. Ver GRAMMAR.md §3.278.
+
+Verificado con 3 tests de checker + verificación manual de punta a punta contra un `linkc serve` real: un rpc `@csrf` sin token da 403, el mismo rpc sin la anotación funciona sin pedir nada, cookie+header coincidentes pasan, cookie sin header o con un header que no coincide dan 403 los dos. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.221.0] - 2026-09-07
 
 ### ✨ Añadido

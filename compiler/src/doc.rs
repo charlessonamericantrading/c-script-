@@ -334,7 +334,7 @@ fn annotation_badges(r: &RpcDecl) -> String {
         Some(Annotation::Authenticated) => r#"<span class="badge auth-badge">🔒 @authenticated</span>"#.to_string(),
         // `auth()` nunca devuelve ContentType, Route, RateLimit,
         // Deprecated, CacheControl, Example, Invalidates,
-        // Infinite, Idempotent ni NotFound; el brazo existe para que
+        // Infinite, Idempotent, NotFound ni Csrf; el brazo existe para que
         // agregar una anotación nueva rompa acá y no pase de
         // largo mostrando "Público" por descarte.
         Some(Annotation::ContentType(_))
@@ -352,6 +352,7 @@ fn annotation_badges(r: &RpcDecl) -> String {
         | Some(Annotation::Cors(_))
         | Some(Annotation::Cron(_))
         | Some(Annotation::NotFound)
+        | Some(Annotation::Csrf)
         | None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
     };
     let rate_limit_badge = match r.rate_limit() {

@@ -1076,9 +1076,11 @@ impl Parser {
                 }
                 // Sin argumentos, mismo criterio que "idempotent"/"cron" (GRAMMAR.md §3.274).
                 "notFound" => Annotation::NotFound,
+                // Sin argumentos, mismo criterio que "idempotent"/"notFound" (GRAMMAR.md §3.278).
+                "csrf" => Annotation::Csrf,
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)', '@idempotent', '@cache(\"60s\")', '@cors(\"https://origen.com\")', '@cron(\"5m\")' o '@notFound')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)', '@idempotent', '@cache(\"60s\")', '@cors(\"https://origen.com\")', '@cron(\"5m\")', '@notFound' o '@csrf')"
                     )))
                 }
             };

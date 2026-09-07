@@ -794,6 +794,11 @@ impl RpcDecl {
         self.annotations.iter().any(|a| matches!(a, Annotation::NotFound))
     }
 
+    /// `true` si este rpc lleva `@csrf` (GRAMMAR.md §3.278).
+    pub fn csrf(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, Annotation::Csrf))
+    }
+
     /// Mismo heurístico "nombre por forma" en UN solo lugar -- lo usan
     /// `codegen::ts_emit::emit_hooks` (para decidir si un rpc genera un
     /// hook `use...Query`) Y `checker::check_invalidates_annotation` (para
@@ -968,6 +973,14 @@ pub enum Annotation {
     /// `Html` (no `Void`), porque lo que produce es una página real para
     /// quien visita una URL que no existe. A lo sumo UNO por programa.
     NotFound,
+    /// `@csrf` (GRAMMAR.md §3.278, PLAN.md §9.24 Fase 1 ítem C2): protección
+    /// CSRF de doble-submit cookie+header sobre ESTE rpc -- opt-in por rpc, a
+    /// propósito, mismo criterio que `@rate_limit`/`@cors`/toda otra
+    /// anotación transversal de este lenguaje: un rpc que la declara queda
+    /// protegido, uno que no la declara simplemente no la necesita (nunca un
+    /// escape hatch tipo `@csrf(exempt)`, porque nunca hubo protección
+    /// global de la que escapar). Rechazado sobre un `stream`.
+    Csrf,
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

@@ -9801,6 +9801,39 @@ fn whoAmI() -> String? {
 
 **Verificado**: 6 tests de `checker.rs` (`request.cookie` tipa y exige 1 argumento String; `setCookie` acepta `{}` y todas las opciones explícitas; exige exactamente 3 argumentos; rechaza tipos incorrectos incluido un `sameSite` no-String; rechazado dentro de un `stream`) + verificación manual de punta a punta contra un `linkc serve` real: dos `Set-Cookie` en la misma respuesta con los atributos correctos (uno con los defaults, otro con las cinco opciones explícitas incluida `httpOnly:false`/`secure:false`); `request.cookie(...)` devuelve el valor exacto mandado en un `Cookie:` de la request siguiente, y `null` cuando no vino; una request que setea una cookie y LUEGO falla (`panic`) no manda ningún `Set-Cookie` en su 500. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.278 `@csrf`: protección CSRF de doble-submit cookie+header — cierra Fase 1 ítem C2 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem C2, prerrequisito directo cerrado por C1 (§3.277). Hoy `POST /LeadsService/createLead` vía c-script YA está fuera del CSRF que Express aplicaba (nginx lo manda directo al puerto de c-script) -- una brecha real y EXISTENTE, no solo un gap futuro a evitar durante la migración.
+
+<!-- linkc:check -->
+```rust
+service Leads {
+  // GET /Leads/csrfToken (via @route, no incluido acá para el ejemplo):
+  // el cliente lee esta cookie con `document.cookie` y la reenvía como
+  // header en cada POST -- httpOnly:false es INTENCIONAL, ver más abajo.
+  rpc csrfToken() -> Void {
+    response.setCookie("_csrf", crypto.uuid().toString(), { httpOnly: false, sameSite: "strict" })
+  }
+
+  @csrf
+  rpc create(name: String) -> String {
+    "creado: " + name
+  }
+}
+```
+
+`@csrf` es **opt-in por rpc**, a propósito -- mismo criterio que `@rate_limit`/`@cors`/`@requires` y cualquier otra anotación transversal de este lenguaje: un rpc que la declara queda protegido, uno que no la declara simplemente no la necesita. Esto es una simplificación real respecto de la referencia Express/`csurf` que PLAN.md cita (protección global con una lista de prefijos EXENTOS, `@csrf(exempt)`): con opt-in por rpc no hace falta ningún escape hatch, porque nunca hubo una protección global de la que escapar -- menos mecanismo nuevo, misma propiedad de seguridad real (solo los rpcs que la declaran quedan protegidos). Compone libremente con cualquier otra anotación (a diferencia de `@notFound`/`@cron`, que rechazan combinarse) -- un rpc puede llevar `@csrf`, `@requires(...)` y `@rate_limit(...)` a la vez, sin ningún orden particular.
+
+**Mecanismo -- doble-submit cookie+header, nombres FIJOS**: la cookie `_csrf` (httpOnly:false, para que JS del mismo origen pueda leerla) tiene que coincidir, en tiempo CONSTANTE, con el header `x-csrf-token` que el cliente reenvía. Un sitio cross-origin puede forzar a un browser a mandar la cookie automáticamente (esa es la naturaleza del ataque), pero NUNCA puede leerla para poner el mismo valor en el header -- la política de mismo origen se lo impide. Nombres fijos, sin configuración: coinciden a propósito con la convención que la referencia Express ya usaba, para que una migración estranguladora ruta por ruta (Fase 4) no tenga que reconciliar dos nombres distintos entre el backend viejo y `linkc serve`.
+
+**Corre ANTES del gate de auth**, mismo criterio que `@rate_limit` (que también corre antes): una request forjada cross-site no debería poder distinguir "esto necesita auth" de "esto no existe" antes de pasar la verificación de origen. Es independiente del rol -- un token CSRF válido no prueba OTRA cosa que "esta request se originó en una página que pudo leer su propia cookie", nunca quién es el caller.
+
+**Sin distinguir "faltaba" de "no coincidía"**: los dos casos (cookie ausente, header ausente, o los dos presentes pero distintos) dan el mismo `403 {"error": "token CSRF ausente o inválido"}` -- contarle a un atacante cuál de los dos está probando no aporta nada a un caller legítimo y sí ayuda a uno que no lo es.
+
+**Qué NO hace c-script por vos**: no inyecta un endpoint `GET /api/csrf-token` automático -- mismo criterio que `@notFound` (que tampoco auto-genera la página 404): la primitiva ya existe (`response.setCookie` de C1 + `crypto.uuid()`, ya existente), así que exponerla como un rpc común es una decisión del programa, no magia del compilador. Un `stream` no puede llevar `@csrf`: es de solo lectura, protegerlo contra CSRF no significa nada.
+
+**Verificado**: 3 tests de `checker.rs` (tipa solo con un rpc común; rechazado sobre un `stream`; compone sin error junto a `@requires`+`@rate_limit`) + verificación manual de punta a punta contra un `linkc serve` real: un rpc `@csrf` sin ningún token da 403; el mismo rpc sin `@csrf` con los mismos argumentos funciona sin pedir nada; cookie+header coincidentes pasan; cookie sin header, y cookie con un header que no coincide, dan 403 los dos. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

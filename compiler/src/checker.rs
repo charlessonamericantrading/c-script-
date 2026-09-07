@@ -2792,6 +2792,24 @@ impl Checker {
         Ok(())
     }
 
+    /// `@csrf` (GRAMMAR.md §3.278) -- rechazado sobre un `stream`, mismo
+    /// motivo que `@idempotent`/`@background`: una conexión SSE es de solo
+    /// lectura (nunca cambia estado del lado servidor de una forma que un
+    /// atacante cross-site pudiera explotar forjando la request), así que
+    /// protegerla con CSRF no significa nada. Sin restricción de combinación
+    /// con otras anotaciones a propósito -- a diferencia de `@notFound`/
+    /// `@cron`, `@csrf` es transversal (compone con `@requires`/
+    /// `@rate_limit`/etc.), mismo criterio que esas dos.
+    fn check_csrf_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        if r.csrf() && is_stream {
+            return Err(err(format!(
+                "`@csrf` en el stream '{}': una conexión SSE es de solo lectura, protegerla contra CSRF no tiene efecto (GRAMMAR.md §3.278) -- llamalo desde un 'rpc' normal",
+                r.name
+            )));
+        }
+        Ok(())
+    }
+
     /// `@validate(...)` (GRAMMAR.md §3.73) sobre cada campo de `fields` --
     /// llamado tanto para un `type X = { ... }` como para los campos de cada
     /// variante de un `enum` (comparten `Field`, ver `ast.rs`). Dos cosas se
@@ -3718,6 +3736,7 @@ impl Checker {
         self.check_cors_annotation(r)?;
         self.check_cron_annotation(r, is_stream)?;
         self.check_not_found_annotation(r, is_stream)?;
+        self.check_csrf_annotation(r, is_stream)?;
         let Some(Annotation::Requires { enum_name, variant_names, ownership }) = r.auth() else {
             return Ok(());
         };
@@ -10133,6 +10152,55 @@ type T = { id: Int, s: Status }")
             err.iter().any(|e| e.message.contains("a lo sumo UNO")),
             "mensaje inesperado: {err:?}"
         );
+    }
+
+    // ---- `@csrf` (GRAMMAR.md §3.278, PLAN.md §9.24 Fase 1 ítem C2) ----
+
+    #[test]
+    fn csrf_annotation_type_checks_alone() {
+        let src = r#"
+            service Leads {
+                @csrf
+                rpc create(name: String) -> Void {}
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn csrf_annotation_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @csrf
+                stream list() -> Task {
+                    db.tasks.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("csrf") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    /// A diferencia de `@notFound`/`@cron`, `@csrf` es transversal: tiene
+    /// que componer libremente con auth/rate-limit, nunca rechazar la
+    /// combinación (GRAMMAR.md §3.278).
+    #[test]
+    fn csrf_annotation_composes_freely_with_other_annotations() {
+        let src = r#"
+            enum Role { Admin, Member }
+            service Leads {
+                @csrf
+                @requires(Role.Admin)
+                @rate_limit("10/1h")
+                rpc create(name: String) -> Void {}
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 
     #[test]
