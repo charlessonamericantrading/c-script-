@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.227.0] - 2026-09-08
+
+### ✨ Añadido
+**SQL crudo -- `@rawSql` + `db.query`/`db.execute` -- cierra el ítem B1 de la Fase 1 de PLAN.md §9.24, la ÚLTIMA de sus 10 ítems.** El ORM tipado (`find`/`findWhere`/`aggregateBy`/etc.) cubre la mayoría de los casos, pero una analítica con `RANK() OVER (...)`, un `FILTER (WHERE ...)`, o cualquier construcción específica de un motor concreto necesitaba una escapatoria -- exactamente lo que un Express con `pg`/`knex` crudo ya tenía. `db.query(sql, params) -> Dynamic[]` (solo lectura, enforced de verdad contra los dos motores) y `db.execute(sql, params) -> Int` (filas afectadas), ambos SOLO dentro de un rpc `@rawSql`, con `sql` restringido a un literal de `String` o una referencia a un `const` de nivel superior -- nunca una `String` calculada, así los datos siempre van bindeados en `params`, nunca concatenados al texto de la consulta. `db.execute` (escritura) está prohibido dentro de un `@readReplica`; `db.query` (lectura) sí funciona ahí. Enforcement de solo-lectura real: SQLite reusa la conexión "reader" ya existente (`query_only`); Postgres abre una transacción propia por llamada con `SET TRANSACTION READ ONLY` (nunca `SET` directo sobre la conexión pooleada compartida, que filtraría la restricción a la siguiente request). Placeholders `$1, $2` (sintaxis nativa de Postgres) se traducen a `?1, ?2` para SQLite con un scanner consciente de comillas. Leer una VIEW ya existente funciona desde el día uno sin ningún flag nuevo -- `db.query`/`db.execute` nunca pasan por el sistema de colecciones declaradas ni por `--adopt-existing`. Ver GRAMMAR.md §3.283.
+
+Bug de checker real encontrado y corregido en el camino: un array literal no vacío con elementos de tipos MEZCLADOS (`[delta: Float, id: Int]`, el caso común y real de `params`) no tipaba contra el `Dynamic[]` esperado -- el checker sintetizaba el tipo del array desde el primer elemento y exigía que el resto coincidiera, en vez de chequear cada elemento por separado contra `Dynamic` cuando el tipo esperado ya lo pedía. Sin este fix, la feature no podía usarse para el caso que la motiva.
+
+Verificado: 5 tests de `checker.rs` (las tres restricciones + params mezclados + `db.query` compilando dentro de `@readReplica` mientras `db.execute` no) + 4 tests de integración reales en `cli_raw_sql.rs` contra SQLite real (SELECT con binding, UPDATE con conteo de filas afectadas, rechazo limpio de una escritura vía `db.query`, rechazo de compilación sin `@rawSql`) + un test en `pg_integration.rs` (corre en CI, `LINK_TEST_PG_URL`) probando `RANK() OVER (...)` -- sintaxis exclusiva de Postgres -- y el mismo enforcement de solo-lectura contra el motor real. Suite completa sin regresiones, `cargo clippy -D warnings` limpio. Con esto, **los 10 ítems de la Fase 1 de PLAN.md §9.24 quedan completos**.
+
 ## [1.226.2] - 2026-09-07
 
 ### 🐛 Corregido

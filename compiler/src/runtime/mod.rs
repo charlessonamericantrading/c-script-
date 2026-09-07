@@ -983,20 +983,45 @@ pub(crate) fn eval_expr(
             // (que solo mira `callee` de un `Call`, nunca un `FieldAccess`
             // intermedio).
             if let Expr::FieldAccess { base, field } = &callee.node {
-                if (field == "vacuum" || field == "tableStats") && matches!(&base.node, Expr::Ident(n) if n == "db") && !env.contains_key("db")
+                if matches!(field.as_str(), "vacuum" | "tableStats" | "query" | "execute")
+                    && matches!(&base.node, Expr::Ident(n) if n == "db") && !env.contains_key("db")
                 {
                     let arg_vs = eval_args(args, env, db, fns, checker, sessions, current_token, step_budget)?;
-                    if !arg_vs.is_empty() {
-                        return Err(err(format!("'db.{field}' no toma argumentos")));
-                    }
                     return match field.as_str() {
                         "vacuum" => {
+                            if !arg_vs.is_empty() {
+                                return Err(err("'db.vacuum' no toma argumentos"));
+                            }
                             db.run_vacuum().map_err(|e| err(format!("db.vacuum falló: {e}")))?;
                             Ok(Value::Null)
                         }
-                        _ => {
+                        "tableStats" => {
+                            if !arg_vs.is_empty() {
+                                return Err(err("'db.tableStats' no toma argumentos"));
+                            }
                             let stats = db.table_stats().map_err(|e| err(format!("db.tableStats falló: {e}")))?;
                             Ok(Value::Struct(stats.into_iter().map(|(name, count)| (name, Value::Int(count))).collect()))
+                        }
+                        // GRAMMAR.md §3.283 (PLAN.md §9.24.5(2) / Fase 1
+                        // ítem B1): el checker ya garantizó -- antes de que
+                        // esto corra -- que `sql` es un literal o un `const`
+                        // (nunca una String calculada), que este rpc lleva
+                        // `@rawSql`, y (para `execute`) que no está dentro de
+                        // un `@readReplica`. Acá solo queda EJECUTAR.
+                        "query" => {
+                            let (sql, params) = match (arg_vs.first(), arg_vs.get(1)) {
+                                (Some(Value::Str(s)), Some(Value::List(p))) => (s, p),
+                                _ => return Err(err("db.query requiere (sql: String, params: Dynamic[])")),
+                            };
+                            db.raw_sql_query(sql, params).map_err(|e| err(format!("db.query falló: {e}")))
+                        }
+                        _ => {
+                            let (sql, params) = match (arg_vs.first(), arg_vs.get(1)) {
+                                (Some(Value::Str(s)), Some(Value::List(p))) => (s, p),
+                                _ => return Err(err("db.execute requiere (sql: String, params: Dynamic[])")),
+                            };
+                            let affected = db.raw_sql_execute(sql, params).map_err(|e| err(format!("db.execute falló: {e}")))?;
+                            Ok(Value::Int(affected))
                         }
                     };
                 }

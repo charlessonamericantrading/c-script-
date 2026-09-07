@@ -9934,6 +9934,59 @@ Al recibir `SIGTERM`/`SIGINT` (Unix) o `Ctrl-C`/`Ctrl-Break`/cierre de consola (
 
 **TERCER bug real, un error de DISEÑO esta vez (no de configuración de dependencia), encontrado por CI en `ubuntu-latest` sobre el fix del segundo bug**: la primera versión de este ítem hacía que el accept loop dejara de aceptar conexiones POR COMPLETO apenas `draining` se prendía -- pero eso significa que `/ready` (paso 2 de la secuencia de arriba) queda tan INALCANZABLE como cualquier otra request nueva durante el drenado: nada llega a responder ese `503`, así que ningún proxy real podría observarlo nunca. El test `graceful_shutdown_lets_an_in_flight_request_finish_then_exits_cleanly` lo agarró en `ubuntu-latest` (en Windows la ventana de tiempo entre "se prende `draining`" y "el drain-wait ya terminó" resultó ser lo bastante angosta como para que la request de `/ready` del test casi siempre llegara ANTES de que el loop terminara de aceptar -- una carrera que en Linux, con timing distinto, perdía más seguido). Corregido moviendo el rechazo de requests nuevas a la ADMISIÓN de `spawn_handler!` (un `503 "está drenando"` inmediato para cualquier path que no sea `/`/`/health`/`/status`/`/live`/`/ready`, sin gastar un hilo) en vez de dejar de aceptar conexiones -- el accept loop ahora sigue llamando `accept()` hasta que `in_flight` llega a 0 o se agota `drain_timeout`, exactamente como la secuencia documentada arriba siempre dijo que debía funcionar. El test se hizo más estricto de paso: ya no tolera en silencio que `/ready` no responda durante el drenado, y agrega una request nueva real para confirmar el rechazo 503.
 
+### 3.283 SQL crudo — `@rawSql` + `db.query`/`db.execute` — cierra Fase 1 ítem B1 de PLAN.md §9.24, la última del plan
+
+Origen: PLAN.md §9.24.5, "las dos decisiones de diseño del lenguaje que este plan toma" -- la primera fue `Html` (Fase 0, §3.271 y siguientes), esta es la segunda, YA DECIDIDA por el propio plan, no abierta a rediseño: el ORM de `db.<colección>.*` (find/findWhere/aggregateBy/etc.) cubre el 95% de los casos reales, pero una analítica con `RANK() OVER (...)`, un `FILTER (WHERE ...)`, o cualquier construcción específica de un motor concreto necesita una escapatoria -- exactamente lo que un Express con `pg`/`knex` crudo ya tenía y c-script no.
+
+<!-- linkc:check -->
+```rust
+type Sale = { id: Int, region: String, amount: Float }
+db { sales: Sale[] }
+
+type RankedSale = { region: String, amount: Float, rank: Int }
+
+service Reports {
+  @rawSql
+  rpc topByRegion() -> RankedSale[] {
+    db.query(
+      "SELECT region, amount, RANK() OVER (PARTITION BY region ORDER BY amount DESC) AS rank FROM sales",
+      []
+    )
+  }
+
+  @rawSql
+  rpc bumpAmount(id: Int, delta: Float) -> Int {
+    db.execute("UPDATE sales SET amount = amount + $1 WHERE id = $2", [delta, id])
+  }
+}
+```
+
+`db.query(sql: String, params: Dynamic[]) -> Dynamic[]` y `db.execute(sql: String, params: Dynamic[]) -> Int` (filas afectadas). `Dynamic` es puramente interno del checker (§3.2) -- nunca se escribe en código fuente; para consumir el resultado se declara un tipo CONCRETO más angosto como retorno del rpc (`RankedSale[]` arriba) y el subtipado estructural lo acepta, mismo patrón ya establecido por `background.status` y `json.parse`.
+
+**Tres restricciones, las tres en compilación, nunca en runtime** -- el criterio de siempre: lo que se puede rechazar en `linkc build`, se rechaza ahí, nunca como una sorpresa a mitad de una request real.
+
+1. **Solo dentro de un rpc `@rawSql`.** `db.query`/`db.execute` fuera de uno de estos rpcs es un error del checker -- una anotación explícita, visible en el código fuente y en `contract.d.ts`/OpenAPI, para algo que se salta toda la protección estructural del ORM.
+2. **`sql` tiene que ser un literal de `String` o una referencia a un `const` de nivel superior -- nunca una `String` calculada.** Esto es lo que hace que el mecanismo sea seguro contra inyección por construcción: los datos SIEMPRE van en `params` (bindeados), nunca concatenados al texto de la consulta, porque el texto de la consulta no puede depender de ningún valor en tiempo de ejecución.
+3. **`db.execute` (escritura) está prohibido dentro de un rpc `@readReplica`** (§3.260) -- esa anotación enruta lecturas a una réplica configurada, y una réplica de lectura no acepta escrituras. `db.query` sí funciona ahí: lee de la réplica como cualquier otro `db.<colección>.*` de lectura.
+
+**`params: Dynamic[]` acepta una lista de tipos MEZCLADOS en el mismo literal** (`[delta, id]` con `delta: Float` e `id: Int` arriba) -- un array literal no vacío contra un `List<Dynamic>` esperado chequea cada elemento por separado contra `Dynamic` en vez de exigir un tipo sintetizado homogéneo (el camino genérico del checker para arrays SÍ exige eso, correcto para todo lo demás: sintetiza el tipo del primer elemento y compara el resto contra él). Sin este caso especial, el uso real y común de esta feature -- pasar varios parámetros de tipos distintos en la misma llamada -- no compilaría nunca.
+
+**Traducción de placeholders entre motores**: el texto de `sql` siempre se escribe con `$1, $2, ...` (la sintaxis nativa de Postgres). Contra SQLite, un traductor de una sola pasada, consciente de comillas, reescribe cada `$N` a `?N` (la sintaxis de placeholders NUMERADOS real de SQLite, no una invención de este proyecto) fuera de literales `'...'` -- así un `$1` dentro de un string literal de la propia consulta nunca se toca por error.
+
+**Enforcement de solo-lectura de `db.query`, real en los dos motores, no solo documentado**:
+- **SQLite**: reusa la conexión "reader" que el pool ya abre con el pragma `query_only` (o, si eso falla, con `SQLITE_OPEN_READ_ONLY`) para el resto del ORM -- gratis, sin código nuevo.
+- **Postgres**: cada llamada abre su PROPIA transacción (`client.transaction()`) con `SET TRANSACTION READ ONLY` como primera sentencia. Deliberadamente NUNCA `SET`/`SET LOCAL` directo sobre el `postgres::Client` compartido y pooleado -- eso filtraría la restricción de solo-lectura a la SIGUIENTE request que tome esa misma conexión prestada del pool, un bug de aislamiento silencioso y mucho peor que el problema que el mecanismo intenta resolver.
+
+Una escritura real intentada vía `db.query` (un `DELETE`/`UPDATE`/`INSERT` en el texto) falla limpio en los dos motores -- error de runtime con mensaje claro, la fila sigue intacta, nunca un panic ni una escritura parcial.
+
+**Conversión de filas sin esquema declarado**: cada fila del resultado de `db.query` se arma como un `Value::Struct` (claves = nombres de columna) con conversión de tipo REAL por columna -- mismo match exhaustivo por `postgres::types::Type` que ya usa `db_admin.rs` para decodificar columnas nativas (`PgUuidText`/`PgDecimal`/`PgTimestampMicros`/`PgDateDays`/`PgJsonText`), pero produciendo `Value`s tipados de verdad en vez de siempre convertir a string -- perder fidelidad de tipo rompería aritmética sobre resultados de agregación (`COUNT`/`SUM`/`AVG`), el caso de uso que más motiva esta feature.
+
+**Límite honesto en `params`, v1**: `Null`/`Int`/`Float`/`Decimal`/`String`/`Bool` se convierten directo a parámetro bindeado; `Struct`/`List` se convierten vía `Cell::Json`. `Uuid`/`Timestamp`/`Vector`/`Html` NO son bindeables directamente todavía -- el código c-script que llama a `db.query`/`db.execute` los convierte primero a `String`/`Int` de su lado (`.toString()`, milisegundos epoch, etc.). Mecánico de extender más adelante si hace falta; no bloquea ningún caso real hoy.
+
+**Leer una VIEW (o cualquier otra cosa del esquema) ya funciona, sin ningún flag ni marcador nuevo**: `db.query`/`db.execute` nunca pasan por el sistema de colecciones declaradas (`db { ... }`) ni por la verificación de adopción de `--adopt-existing` (§3.67) -- hablan directo contra la conexión con el SQL tal cual se escribió. Una `CREATE VIEW`/vista materializada/lo que sea que ya exista en el esquema es alcanzable desde el día uno vía `db.query("SELECT ... FROM esa_vista", [])`, sin que este ítem necesitara ningún trabajo adicional para eso.
+
+**Verificado**: 5 tests de `checker.rs` (las tres restricciones + el caso feliz con params mezclados + que `db.query` SÍ compila dentro de un `@readReplica` mientras `db.execute` no) + 4 tests de integración reales en `cli_raw_sql.rs` contra un `linkc serve` real sobre SQLite (SELECT con binding posicional filtra correctamente; UPDATE devuelve la cantidad de filas afectadas correcta; un DELETE vía `db.query` se rechaza limpio y no borra nada; `db.query` sin `@rawSql` rechaza la compilación) + un test de integración en `pg_integration.rs` (`LINK_TEST_PG_URL`, corre de verdad en CI) que prueba `RANK() OVER (...)` -- sintaxis exclusiva de Postgres, imposible de probar contra SQLite -- más el mismo enforcement de solo-lectura contra el motor real. Verificación manual de punta a punta adicional: una `VIEW` creada vía `db.execute` y leída acto seguido vía `db.query`, sin ningún flag extra. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

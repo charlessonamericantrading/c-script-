@@ -746,6 +746,13 @@ pub struct Checker {
     /// rechazar cualquier método de escritura de `db` sin duplicar la
     /// clasificación lectura/escritura en runtime.
     in_read_replica_rpc: std::sync::atomic::AtomicBool,
+    /// GRAMMAR.md §3.283: `true` mientras se chequea el CUERPO de un rpc
+    /// `@rawSql` -- mismo mecanismo EXACTO que `in_read_replica_rpc`, para
+    /// que `db.query`/`db.execute` (GRAMMAR.md §3.283) sean un error de
+    /// compilación fuera de un rpc que declaró la anotación explícitamente
+    /// (restricción 2 de PLAN.md §9.24.5(2): "cuántos rpcs usan SQL crudo"
+    /// tiene que ser una pregunta con respuesta real).
+    in_raw_sql_rpc: std::sync::atomic::AtomicBool,
 }
 
 /// `enum PdfBlock { Text { content: String, bold: Bool, size: Int }, Table {
@@ -966,6 +973,7 @@ impl Checker {
             in_stream_body: std::sync::atomic::AtomicBool::new(false),
             in_transaction: std::sync::atomic::AtomicBool::new(false),
             in_read_replica_rpc: std::sync::atomic::AtomicBool::new(false),
+            in_raw_sql_rpc: std::sync::atomic::AtomicBool::new(false),
         };
         // `PdfBlock` (GRAMMAR.md §3.201) es un ADT reservado por el
         // compilador, no un enum que el usuario declare -- su forma la dicta
@@ -1917,9 +1925,11 @@ impl Checker {
         }
         let prev_in_stream = self.in_stream_body.swap(is_stream, std::sync::atomic::Ordering::Relaxed);
         let prev_in_read_replica = self.in_read_replica_rpc.swap(r.read_replica(), std::sync::atomic::Ordering::Relaxed);
+        let prev_in_raw_sql = self.in_raw_sql_rpc.swap(r.raw_sql(), std::sync::atomic::Ordering::Relaxed);
         let result = self.check_block(&r.body, &expected, &env);
         self.in_stream_body.store(prev_in_stream, std::sync::atomic::Ordering::Relaxed);
         self.in_read_replica_rpc.store(prev_in_read_replica, std::sync::atomic::Ordering::Relaxed);
+        self.in_raw_sql_rpc.store(prev_in_raw_sql, std::sync::atomic::Ordering::Relaxed);
         result
     }
 
@@ -4034,6 +4044,24 @@ impl Checker {
                     "un array vacío '[]' requiere un tipo esperado de lista, se esperaba {other}"
                 ))),
             },
+            // GRAMMAR.md §3.283: un array NO vacío contra `Dynamic[]` (el
+            // `params: Dynamic[]` de `db.query`/`db.execute`, la única
+            // posición hoy donde el checker sintetiza ese tipo). El
+            // fallback genérico de más abajo SINTETIZA el array primero --
+            // eso exige elementos HOMOGÉNEOS (infiere el tipo del primero y
+            // chequea el resto contra ÉL), lo que rechazaría justo el caso
+            // real que esto tiene que soportar: params de tipos MEZCLADOS
+            // en la misma lista (un Int id, un String nombre, un Float
+            // umbral). Contra un `List<Dynamic>` esperado, cada elemento se
+            // checkea individualmente contra `Dynamic` (acepta cualquier
+            // tipo, GRAMMAR.md sobre subtipado) en vez de exigir un tipo
+            // sintetizado común.
+            Expr::ArrayLit(items) if matches!(expected, Type::List(inner) if matches!(**inner, Type::Dynamic)) => {
+                for item in items {
+                    self.check_expr(item, &Type::Dynamic, env)?;
+                }
+                Ok(())
+            }
             // GRAMMAR.md §3.273: un struct-lit anónimo VACÍO (`{}`) es la
             // ÚNICA forma en que el parser puede producir "nada adentro de
             // las llaves" -- `Expr::MapLit` nunca es vacío (ver su nota en
@@ -5367,6 +5395,44 @@ impl Checker {
                 self.expect_no_args(args, "tableStats")?;
                 Some(Type::MapOf(Box::new(Type::String), Box::new(Type::Int)))
             }
+            // GRAMMAR.md §3.283 (PLAN.md §9.24.5(2) / Fase 1 ítem B1): la
+            // escotilla de SQL crudo. Las tres restricciones que la
+            // mantienen honesta se validan ACÁ, en compilación, nunca en
+            // runtime -- exactamente el criterio de este lenguaje: lo que
+            // se puede rechazar en `linkc build`, se rechaza ahí.
+            (Type::Db, "query") => {
+                let [sql, params] = args else {
+                    return Err(err("'db.query' toma exactamente 2 argumentos (sql: String, params: Dynamic[])"));
+                };
+                if !self.in_raw_sql_rpc.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(err(
+                        "'db.query' solo se puede usar dentro de un rpc '@rawSql' (GRAMMAR.md §3.283) -- agregá la anotación si este rpc de verdad necesita SQL crudo",
+                    ));
+                }
+                self.check_raw_sql_literal_shape(sql, "db.query")?;
+                self.check_expr(sql, &Type::String, env)?;
+                self.check_expr(params, &Type::List(Box::new(Type::Dynamic)), env)?;
+                Some(Type::List(Box::new(Type::Dynamic)))
+            }
+            (Type::Db, "execute") => {
+                let [sql, params] = args else {
+                    return Err(err("'db.execute' toma exactamente 2 argumentos (sql: String, params: Dynamic[])"));
+                };
+                if !self.in_raw_sql_rpc.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(err(
+                        "'db.execute' solo se puede usar dentro de un rpc '@rawSql' (GRAMMAR.md §3.283) -- agregá la anotación si este rpc de verdad necesita SQL crudo",
+                    ));
+                }
+                if self.in_read_replica_rpc.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(err(
+                        "'db.execute' es una escritura -- no está permitido dentro del cuerpo de un rpc '@readReplica' (GRAMMAR.md §3.260/§3.283), que solo enruta lecturas a la réplica configurada. 'db.query' sí funciona ahí (lee de la réplica, como cualquier otra lectura).",
+                    ));
+                }
+                self.check_raw_sql_literal_shape(sql, "db.execute")?;
+                self.check_expr(sql, &Type::String, env)?;
+                self.check_expr(params, &Type::List(Box::new(Type::Dynamic)), env)?;
+                Some(Type::Int)
+            }
             (Type::Int, "toFloat") => {
                 self.expect_no_args(args, "toFloat")?;
                 Some(Type::Float)
@@ -6384,6 +6450,31 @@ impl Checker {
     /// §2.1) -- resueltos contra `element_ty` de verdad, así que un método
     /// desconocido ya es un error de tipos acá, no algo que se descubre en
     /// runtime (`Type::Dynamic` dejaba pasar cualquier nombre antes).
+    /// Restricción 1 de PLAN.md §9.24.5(2) para `db.query`/`db.execute`
+    /// (GRAMMAR.md §3.283): `sql` tiene que ser un LITERAL de String o una
+    /// referencia a un `const` de nivel superior -- NUNCA una String
+    /// calculada (concatenación, interpolación, el resultado de una
+    /// función). Esto es lo que hace la inyección imposible POR
+    /// CONSTRUCCIÓN: el texto de la consulta es siempre estático (visible
+    /// en el propio código fuente), los datos van SIEMPRE en `params`
+    /// ($1, $2, ...). No reusa `validate_check_expr_shape` (§3.173) --
+    /// esa valida un árbol de expresión ENTERO para traducir a SQL;
+    /// acá solo hace falta reconocer DOS formas puntuales en la RAÍZ.
+    fn check_raw_sql_literal_shape(&self, sql: &Spanned<Expr>, method: &str) -> Result<(), CheckError> {
+        let is_literal_shape = match &sql.node {
+            Expr::Str(_) => true,
+            Expr::Ident(name) => self.consts.contains_key(name),
+            _ => false,
+        };
+        if is_literal_shape {
+            Ok(())
+        } else {
+            Err(err(format!(
+                "'{method}': 'sql' tiene que ser un literal de String o una referencia a un 'const' de nivel superior -- nunca una String calculada (GRAMMAR.md §3.283): los datos siempre van en 'params', nunca en el texto de la consulta"
+            )))
+        }
+    }
+
     fn check_db_method(&self, element_ty: &Type, method: &str, args: &[Spanned<Expr>], env: &Env) -> Result<Type, CheckError> {
         // GRAMMAR.md §3.255: una colección con `@primaryKey(...)` (PK
         // compuesta) solo soporta el núcleo CRUD en esta ronda -- todo lo
@@ -11629,6 +11720,90 @@ type T = { id: Int, s: Status }")
         assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie(1, "b", {}) } }"#).is_err());
         assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie("a", 2, {}) } }"#).is_err());
         assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie("a", "b", { httpOnly: "not-a-bool" }) } }"#).is_err());
+    }
+
+    // ---- `@rawSql` / `db.query` / `db.execute` (GRAMMAR.md §3.283, PLAN.md §9.24.5(2) / Fase 1 ítem B1) ----
+
+    #[test]
+    fn db_query_and_execute_type_check_inside_a_raw_sql_rpc_with_a_literal() {
+        // `db.query` devuelve `Dynamic[]` -- "Dynamic" no se puede ESCRIBIR
+        // como tipo en código fuente (es puramente interno, igual que en
+        // `background.status`/`json.parse`), así que el rpc declara un
+        // type CONCRETO como retorno: subtipado estructural de ancho
+        // (GRAMMAR.md §3.2) acepta la forma real (`Dynamic[]`, más ancha)
+        // contra la declarada (`Row[]`, más angosta) -- mismo patrón que
+        // `background_status_narrower_declared_type_accepts_the_wider_real_shape`.
+        let src = r#"
+            type Row = { n: Int }
+            service S {
+                @rawSql
+                rpc read() -> Row[] { db.query("SELECT 1", []) }
+                @rawSql
+                rpc write() -> Int { db.execute("DELETE FROM x WHERE id = $1", [1]) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn db_query_accepts_a_reference_to_a_top_level_const() {
+        let src = r#"
+            type Row = { n: Int }
+            const SQL: String = "SELECT 1";
+            service S {
+                @rawSql
+                rpc read() -> Row[] { db.query(SQL, []) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn db_query_rejects_a_computed_sql_string() {
+        let src = r#"
+            type Row = { n: Int }
+            service S {
+                @rawSql
+                rpc read(table: String) -> Row[] { db.query("SELECT * FROM " + table, []) }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("literal") && e.message.contains("const")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn db_query_outside_a_raw_sql_rpc_is_rejected() {
+        let src = r#"
+            type Row = { n: Int }
+            service S {
+                rpc read() -> Row[] { db.query("SELECT 1", []) }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("@rawSql")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn db_execute_is_rejected_inside_a_read_replica_rpc_but_query_is_not() {
+        let bad = r#"
+            service S {
+                @rawSql
+                @readReplica
+                rpc write() -> Int { db.execute("DELETE FROM x WHERE id = $1", [1]) }
+            }
+        "#;
+        let err = check_source(bad).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("@readReplica")), "mensaje inesperado: {err:?}");
+
+        let ok = r#"
+            type Row = { n: Int }
+            service S {
+                @rawSql
+                @readReplica
+                rpc read() -> Row[] { db.query("SELECT 1", []) }
+            }
+        "#;
+        assert!(check_source(ok).is_ok(), "{:?}", check_source(ok));
     }
 
     // ---- `response.nonce` (GRAMMAR.md §3.280, PLAN.md §9.24 Fase 1 ítem C5) ----

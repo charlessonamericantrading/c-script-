@@ -1853,6 +1853,90 @@ fn search_pushes_down_to_tsvector_and_plainto_tsquery_against_real_postgres() {
 }
 
 #[test]
+fn raw_sql_query_and_execute_work_against_real_postgres_including_a_window_function() {
+    // GRAMMAR.md §3.283 (@rawSql / db.query / db.execute): esto es lo único
+    // que un test contra SQLite no puede probar -- que el escape hatch
+    // realmente deja usar sintaxis EXCLUSIVA de Postgres (una window
+    // function), que `db.execute` empuja un UPDATE de verdad, y que la
+    // conexión de solo-lectura de `db.query` (`SET TRANSACTION READ ONLY`,
+    // ver `Db::raw_sql_query` en runtime/db.rs) rechaza una escritura contra
+    // el motor real, no solo contra el fallback de SQLite.
+    const COLLECTION: &str = "rawsql_items";
+    let Some(url) = pg_url() else {
+        eprintln!("saltado: LINK_TEST_PG_URL no está definida (en CI sí lo está)");
+        return;
+    };
+    let _setup = SETUP.lock().unwrap_or_else(|e| e.into_inner());
+    reset_schema(&url, COLLECTION);
+    let temp = TempDir::new("rawsql");
+    let src = temp.write(
+        "app.link",
+        &format!(
+            r#"
+type Item = {{ id: Int, name: String, price: Float }}
+db {{ {COLLECTION}: Item[] }}
+
+type Row = {{ id: Int, name: String, price: Float }}
+type RankedRow = {{ id: Int, name: String, price: Float, rank: Int }}
+
+service S {{
+    rpc seed() -> Void {{
+        db.{COLLECTION}.insert(Item {{ id: 0, name: "widget", price: 9.99 }});
+        db.{COLLECTION}.insert(Item {{ id: 0, name: "gadget", price: 19.99 }});
+        db.{COLLECTION}.insert(Item {{ id: 0, name: "gizmo", price: 14.99 }});
+    }}
+
+    @rawSql
+    rpc rankByPrice() -> RankedRow[] {{
+        db.query("SELECT id, name, price, RANK() OVER (ORDER BY price DESC)::int AS rank FROM {COLLECTION}", [])
+    }}
+
+    @rawSql
+    rpc bumpPrice(id: Int, delta: Float) -> Int {{
+        db.execute("UPDATE {COLLECTION} SET price = price + $1 WHERE id = $2", [delta, id])
+    }}
+
+    @rawSql
+    rpc attemptWriteViaQuery(id: Int) -> Row[] {{
+        db.query("DELETE FROM {COLLECTION} WHERE id = $1", [id])
+    }}
+}}
+"#
+        ),
+    );
+    let server = Serve::start(&src, &url);
+
+    server.rpc("S/seed", "{}");
+
+    let ranked = server.rpc("S/rankByPrice", "{}");
+    let ranked = ranked.as_array().expect("rankByPrice devuelve una lista");
+    assert_eq!(ranked.len(), 3, "RANK() OVER tiene que devolver una fila por item: {ranked:?}");
+    assert_eq!(ranked[0]["name"], "gadget", "la más cara ranquea primero: {ranked:?}");
+    assert_eq!(ranked[0]["rank"], 1);
+    assert_eq!(ranked[2]["name"], "widget", "la más barata ranquea última: {ranked:?}");
+    assert_eq!(ranked[2]["rank"], 3);
+
+    let id = ranked[0]["id"].as_i64().expect("id es un entero");
+    let affected = server.rpc("S/bumpPrice", &format!(r#"{{"id": {id}, "delta": 5.0}}"#));
+    assert_eq!(affected, 1, "el UPDATE afecta exactamente una fila");
+
+    let bumped = server.rpc("S/rankByPrice", "{}");
+    let bumped_row = bumped.as_array().unwrap().iter().find(|r| r["id"] == id).expect("la fila sigue estando");
+    assert_eq!(bumped_row["price"], 24.99, "9.99 + 5 al precio que ya venía más caro (19.99 + 5): {bumped_row:?}");
+
+    let err = server
+        .try_rpc("S/attemptWriteViaQuery", &format!(r#"{{"id": {id}}}"#))
+        .expect_err("un DELETE vía db.query tiene que fallar -- la conexión es de solo lectura");
+    assert!(
+        err.to_lowercase().contains("read"),
+        "el error tiene que dejar claro que la transacción es de solo lectura: {err}"
+    );
+
+    let still_there = server.rpc("S/rankByPrice", "{}");
+    assert_eq!(still_there.as_array().unwrap().len(), 3, "el DELETE rechazado no borró nada: {still_there:?}");
+}
+
+#[test]
 fn a_bad_connection_url_fails_with_a_message_instead_of_a_panic() {
     // Este no necesita base: prueba justamente el camino en que no hay ninguna.
     let temp = TempDir::new("badurl");

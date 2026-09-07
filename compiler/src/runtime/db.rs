@@ -2092,6 +2092,136 @@ pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
+/// GRAMMAR.md §3.283: convierte UN parámetro `Dynamic` de `db.query`/
+/// `db.execute` a `Cell` -- sin conocer ninguna columna destino (a
+/// diferencia de cualquier otro camino de escritura de este archivo, que
+/// siempre tiene un `ColumnKind` a mano). `Uuid`/`Timestamp`/`Vector`/`Html`
+/// quedan explícitamente AFUERA de v1 (límite honesto, documentado en
+/// GRAMMAR.md): el llamador que necesite bindear uno de esos tiene que
+/// convertirlo a `String`/`Int` en su propio código c-script primero
+/// (`.toString()`, milisegundos crudos) -- extender esto es mecánico si
+/// alguna vez hace falta de verdad.
+fn value_to_raw_sql_cell(v: &Value) -> Result<Cell, String> {
+    match v {
+        Value::Null => Ok(Cell::Null),
+        Value::Int(n) => Ok(Cell::Int(*n)),
+        Value::Float(f) => Ok(Cell::Float(*f)),
+        Value::Decimal(raw) => Ok(Cell::Decimal(*raw)),
+        Value::Str(s) => Ok(Cell::Text(s.clone())),
+        Value::Bool(b) => Ok(Cell::Bool(*b)),
+        Value::Struct(_) | Value::List(_) => Ok(Cell::Json(value_to_json(v, &std::collections::HashSet::new()))),
+        other => Err(format!(
+            "db.query/db.execute: el parámetro {other:?} no se puede bindear tal cual -- convertilo a String/Int/Float/Bool/Decimal, o a un struct/lista (se bindea como JSON) antes de pasarlo (GRAMMAR.md §3.283)"
+        )),
+    }
+}
+
+/// GRAMMAR.md §3.283: `$1, $2, ...` es la sintaxis CANÓNICA que el
+/// lenguaje acepta para los dos backends -- Postgres la entiende nativa
+/// (sin tocar nada), SQLite necesita su propia sintaxis numerada `?1, ?2,
+/// ...` (real de SQLite, no inventada por `rusqlite`). Traduce SOLO fuera
+/// de un literal de String -- un toggle simple en cada `'` maneja gratis
+/// el escape estándar de SQL (`''` adentro de un literal): la primera
+/// comilla de un `''` togglea afuera, la segunda togglea de vuelta adentro,
+/// dejando el estado neto sin cambios, exactamente el comportamiento
+/// correcto para no cortar el literal a mitad.
+fn translate_dollar_placeholders_for_sqlite(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '\'' {
+            in_string = !in_string;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if !in_string && c == '$' && bytes.get(i + 1).is_some_and(u8::is_ascii_digit) {
+            out.push('?');
+            i += 1;
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// GRAMMAR.md §3.283: UNA celda de una fila SQLite sin conocer su tipo de
+/// antemano -- SQLite en sí es dinámicamente tipado por VALOR (no por
+/// columna), así que `rusqlite::types::ValueRef` ya es exactamente el set
+/// cerrado de 5 variantes que hace falta cubrir, sin fallback "tipo no
+/// soportado" posible (a diferencia de Postgres, con decenas de tipos).
+/// `Blob` se expone en base64 -- mismo criterio que `image.thumbnail`/
+/// `pdf.build` (bytes crudos siempre viajan en base64 en el borde de
+/// c-script, nunca como `Value` binario propio).
+fn sqlite_cell_ref_to_value(v: rusqlite::types::ValueRef<'_>) -> Value {
+    use base64::Engine;
+    match v {
+        rusqlite::types::ValueRef::Null => Value::Null,
+        rusqlite::types::ValueRef::Integer(n) => Value::Int(n),
+        rusqlite::types::ValueRef::Real(f) => Value::Float(f),
+        rusqlite::types::ValueRef::Text(t) => Value::Str(String::from_utf8_lossy(t).into_owned()),
+        rusqlite::types::ValueRef::Blob(b) => Value::Str(base64::engine::general_purpose::STANDARD.encode(b)),
+    }
+}
+
+/// GRAMMAR.md §3.283: una fila Postgres COMPLETA -> `Value::Struct`, una
+/// entrada por columna, con su NOMBRE real (a diferencia de cualquier otro
+/// camino de lectura de este archivo, que siempre conoce el `ColumnKind`
+/// esperado de antemano vía el schema declarado). Cubre los mismos tipos
+/// nativos que `db_admin.rs::format_pg_cell` (mismo REPL de `db shell`,
+/// mismo criterio de qué vale la pena decodificar) pero produciendo un
+/// `Value` TIPADO de verdad (Int/Float/Bool/Decimal/Timestamp/Str/un JSON
+/// real parseado) en vez de siempre texto -- perder tipo acá rompería
+/// aritmética sobre resultados agregados (`COUNT`/`SUM`/`AVG`), que es
+/// buena parte del motivo real de este ítem. Un tipo no cubierto (point,
+/// tsvector, un tipo de extensión) cae a un `Value::Str` de mejor esfuerzo
+/// -- nunca hace fallar la consulta ENTERA por una sola columna exótica.
+fn postgres_row_to_dynamic_value(row: &postgres::Row) -> Value {
+    use postgres::types::Type as PgType;
+    fn cell<'a, T>(row: &'a postgres::Row, i: usize) -> Option<T>
+    where
+        T: postgres::types::FromSql<'a>,
+    {
+        row.try_get::<_, Option<T>>(i).ok().flatten()
+    }
+    let fields = row
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, col)| {
+            let value = match *col.type_() {
+                PgType::BOOL => cell::<bool>(row, i).map(Value::Bool),
+                PgType::INT2 => cell::<i16>(row, i).map(|n| Value::Int(n as i64)),
+                PgType::INT4 => cell::<i32>(row, i).map(|n| Value::Int(n as i64)),
+                PgType::INT8 => cell::<i64>(row, i).map(Value::Int),
+                PgType::FLOAT4 => cell::<f32>(row, i).map(|n| Value::Float(n as f64)),
+                PgType::FLOAT8 => cell::<f64>(row, i).map(Value::Float),
+                PgType::TEXT | PgType::VARCHAR | PgType::BPCHAR | PgType::NAME => cell::<String>(row, i).map(Value::Str),
+                PgType::UUID => cell::<super::store::PgUuidText>(row, i).map(|super::store::PgUuidText(s)| Value::Str(s)),
+                PgType::NUMERIC => cell::<super::store::PgDecimal>(row, i).map(|super::store::PgDecimal(raw)| Value::Decimal(raw)),
+                PgType::TIMESTAMP | PgType::TIMESTAMPTZ => cell::<super::store::PgTimestampMicros>(row, i)
+                    .map(|super::store::PgTimestampMicros(micros)| Value::Timestamp(super::timestamp::millis_from_pg_timestamp_micros(micros))),
+                PgType::DATE => cell::<super::store::PgDateDays>(row, i)
+                    .map(|super::store::PgDateDays(days)| Value::Timestamp(super::timestamp::millis_from_pg_date_days(days))),
+                PgType::JSON | PgType::JSONB => cell::<super::store::PgJsonText>(row, i).and_then(|super::store::PgJsonText(s)| {
+                    serde_json::from_str::<serde_json::Value>(&s).ok().map(|j| super::json_to_value(&j))
+                }),
+                _ => cell::<String>(row, i).map(Value::Str),
+            };
+            (col.name().to_string(), value.unwrap_or(Value::Null))
+        })
+        .collect();
+    Value::Struct(fields)
+}
+
 impl Db {
     /// Única forma real de construcción -- `db_path` puede ser un archivo
     /// de verdad (persistencia real, lo que usa `linkc serve`) o el string
@@ -3235,6 +3365,67 @@ db { users: User[] }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
+    }
+
+    /// `db.query(sql, params) -> Dynamic[]` (GRAMMAR.md §3.283, PLAN.md
+    /// §9.24.5(2)) -- SOLO lectura, forzada por el motor mismo (nunca
+    /// parseando palabras clave del SQL, mismo criterio que ya documentó
+    /// `db_admin.rs::run_shell_postgres` para `default_transaction_read_only`:
+    /// un `WITH x AS (INSERT ...) SELECT ...` engañaría cualquier parser de
+    /// keywords del lado cliente, nunca al motor real). Postgres: una
+    /// transacción de UNA sola consulta con `SET TRANSACTION READ ONLY`
+    /// como PRIMERA sentencia (no `SET LOCAL` en la conexión pooled
+    /// compartida -- eso filtraría la restricción a la PRÓXIMA request que
+    /// tome esa misma conexión del pool). SQLite: reusa `with_reader` tal
+    /// cual (§3.246) -- sus conexiones YA abren con el pragma `query_only`
+    /// o `SQLITE_OPEN_READ_ONLY`, cero código nuevo hace falta ahí.
+    pub(crate) fn raw_sql_query(&self, sql: &str, params: &[Value]) -> Result<Value, String> {
+        let cells: Vec<Cell> = params.iter().map(value_to_raw_sql_cell).collect::<Result<_, _>>()?;
+        match self.backend() {
+            Backend::Sqlite(pool) => {
+                let sql = translate_dollar_placeholders_for_sqlite(sql);
+                pool.with_reader(|conn| {
+                    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let col_names: Vec<String> = stmt.column_names().into_iter().map(str::to_string).collect();
+                    let refs: Vec<&dyn rusqlite::ToSql> = cells.iter().map(|c| c as &dyn rusqlite::ToSql).collect();
+                    let mut rows = stmt.query(refs.as_slice()).map_err(|e| e.to_string())?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                        let mut fields = Vec::with_capacity(col_names.len());
+                        for (i, name) in col_names.iter().enumerate() {
+                            let cell_ref = row.get_ref(i).map_err(|e| e.to_string())?;
+                            fields.push((name.clone(), sqlite_cell_ref_to_value(cell_ref)));
+                        }
+                        out.push(Value::Struct(fields));
+                    }
+                    Ok(Value::List(out))
+                })
+            }
+            Backend::Postgres(pool) => pool.with_client(|client| {
+                let mut tx = client.transaction()?;
+                tx.batch_execute("SET TRANSACTION READ ONLY")?;
+                let refs: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                    cells.iter().map(|c| c as &(dyn postgres::types::ToSql + Sync)).collect();
+                let rows = tx.query(sql, refs.as_slice())?;
+                let out = rows.iter().map(postgres_row_to_dynamic_value).collect();
+                tx.commit()?;
+                Ok(Value::List(out))
+            }),
+        }
+    }
+
+    /// `db.execute(sql, params) -> Int` (GRAMMAR.md §3.283) -- INSERT/
+    /// UPDATE/DELETE parametrizado, devuelve filas afectadas. A diferencia
+    /// de `raw_sql_query`, reusa `Backend::execute` tal cual (ya es
+    /// schemaless: no necesita decodificar filas, solo un conteo) -- lo
+    /// ÚNICO propio acá es la traducción de placeholders para SQLite.
+    pub(crate) fn raw_sql_execute(&self, sql: &str, params: &[Value]) -> Result<i64, String> {
+        let cells: Vec<Cell> = params.iter().map(value_to_raw_sql_cell).collect::<Result<_, _>>()?;
+        let sql = match self.backend() {
+            Backend::Sqlite(_) => translate_dollar_placeholders_for_sqlite(sql),
+            Backend::Postgres(_) => sql.to_string(),
+        };
+        self.backend().execute(&sql, &cells).map(|n| n as i64)
     }
 
     /// `GET /metrics` (GRAMMAR.md §3.149): cuántos clientes están

@@ -2392,7 +2392,8 @@ pub(crate) fn check_auth_gate(
         | Annotation::Cors(_)
         | Annotation::Cron(_)
         | Annotation::NotFound
-        | Annotation::Csrf => Ok(()),
+        | Annotation::Csrf
+        | Annotation::RawSql => Ok(()),
     };
     AuthGateResult { audit: mk_audit(outcome.is_ok()), outcome }
 }

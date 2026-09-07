@@ -799,6 +799,11 @@ impl RpcDecl {
         self.annotations.iter().any(|a| matches!(a, Annotation::Csrf))
     }
 
+    /// `true` si este rpc lleva `@rawSql` (GRAMMAR.md §3.283).
+    pub fn raw_sql(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, Annotation::RawSql))
+    }
+
     /// Mismo heurístico "nombre por forma" en UN solo lugar -- lo usan
     /// `codegen::ts_emit::emit_hooks` (para decidir si un rpc genera un
     /// hook `use...Query`) Y `checker::check_invalidates_annotation` (para
@@ -981,6 +986,14 @@ pub enum Annotation {
     /// escape hatch tipo `@csrf(exempt)`, porque nunca hubo protección
     /// global de la que escapar). Rechazado sobre un `stream`.
     Csrf,
+    /// `@rawSql` (GRAMMAR.md §3.283, PLAN.md §9.24.5(2) / Fase 1 ítem B1):
+    /// habilita `db.query`/`db.execute` (SQL crudo parametrizado) DENTRO de
+    /// este rpc -- sin ella, esas dos llamadas son un error de compilación.
+    /// Opt-in explícito a propósito, para que "cuántos rpcs usan SQL
+    /// crudo" sea una pregunta con respuesta real (visible en el contrato,
+    /// `llms.txt` y `linkc lint`), no algo que haya que grepear el código
+    /// fuente para saber.
+    RawSql,
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver
