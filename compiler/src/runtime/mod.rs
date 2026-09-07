@@ -70,6 +70,13 @@ pub enum Value {
     /// plano" una vez que la información de tipo ESTÁTICO ya no está
     /// disponible en runtime.
     Uuid(String),
+    /// HTML ya armado -- texto y `${...}` ya escapados/insertados según su
+    /// tipo (GRAMMAR.md §3.268). Igual que `Uuid`, variante propia en vez de
+    /// reusar `Str`: sin esto, un `String` cualquiera podría colarse donde
+    /// el checker ya garantizó `Html` (el retorno de un `@route`/rpc), y
+    /// `runtime/server.rs` no podría distinguir "mandar como body crudo
+    /// `text/html`" de "serializar como JSON".
+    Html(String),
     /// `f32`, no `f64` -- ver la doc de `Type::Vector` (types.rs, GRAMMAR.md
     /// §3.254): pgvector almacena precisión simple, y sin sintaxis de
     /// literal en v0 este `Value` solo nace de un wire decode (parámetro de
@@ -181,6 +188,7 @@ fn supports_bound_method_access(v: &Value) -> bool {
         | Value::Bool(_)
         | Value::Str(_)
         | Value::Uuid(_)
+        | Value::Html(_)
         | Value::Timestamp(_)
         | Value::Auth
         | Value::Math
@@ -258,6 +266,7 @@ fn is_marker_singleton(v: &Value) -> bool {
         | Value::Float(_)
         | Value::Str(_)
         | Value::Uuid(_)
+        | Value::Html(_)
         | Value::Vector(_)
         | Value::Bool(_)
         | Value::Null
@@ -285,6 +294,7 @@ impl PartialEq for Value {
             (Float(a), Float(b)) => a == b,
             (Str(a), Str(b)) => a == b,
             (Uuid(a), Uuid(b)) => a == b,
+            (Html(a), Html(b)) => a == b,
             (Vector(a), Vector(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Null, Null) => true,
@@ -323,6 +333,7 @@ impl std::fmt::Debug for Value {
             Value::Float(n) => f.debug_tuple("Float").field(n).finish(),
             Value::Str(s) => f.debug_tuple("Str").field(s).finish(),
             Value::Uuid(s) => f.debug_tuple("Uuid").field(s).finish(),
+            Value::Html(s) => f.debug_tuple("Html").field(s).finish(),
             Value::Vector(v) => f.debug_tuple("Vector").field(v).finish(),
             Value::Bool(b) => f.debug_tuple("Bool").field(b).finish(),
             Value::Null => write!(f, "Null"),
@@ -540,6 +551,50 @@ pub(crate) fn eval_expr(
         Expr::Str(s) => Ok(Value::Str(s.clone())),
         Expr::Bool(b) => Ok(Value::Bool(*b)),
         Expr::Null => Ok(Value::Null),
+        // GRAMMAR.md §3.268: el checker YA garantizó que cada `${...}`
+        // resuelve a uno de los 6 tipos de acá abajo -- este `match` es
+        // defensivo (nunca debería alcanzar `other`), no una validación
+        // real. Escape POR TIPO: `String`/`Int`/`Int64`/`Float`/`Bool` se
+        // escapan (los últimos cuatro vía el mismo `.toString()` que ya usa
+        // cada tipo, GRAMMAR.md §3.55), `Html`/`Html[]` se insertan tal
+        // cual (ya vienen escapados/armados desde adentro).
+        Expr::Html(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                match part {
+                    HtmlPart::Text(s) => out.push_str(s),
+                    HtmlPart::Expr(inner) => {
+                        let v = eval_expr(inner, env, db, fns, checker, sessions, current_token, step_budget)?;
+                        match v {
+                            Value::Str(s) => out.push_str(&escape_html(&s)),
+                            Value::Html(s) => out.push_str(&s),
+                            Value::Int(n) => out.push_str(&escape_html(&n.to_string())),
+                            Value::Int64(n) => out.push_str(&escape_html(&n.to_string())),
+                            Value::Float(n) => out.push_str(&escape_html(&n.to_string())),
+                            Value::Bool(b) => out.push_str(&escape_html(&b.to_string())),
+                            Value::List(items) => {
+                                for item in items {
+                                    match item {
+                                        Value::Html(s) => out.push_str(&s),
+                                        other => {
+                                            return Err(err(format!(
+                                                "un elemento de 'Html[]' dentro de un literal 'html' no es Html en runtime: {other:?}"
+                                            )))
+                                        }
+                                    }
+                                }
+                            }
+                            other => {
+                                return Err(err(format!(
+                                    "un '${{...}}' de un literal 'html' resolvió a un tipo no soportado en runtime: {other:?}"
+                                )))
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Value::Html(out))
+        }
         Expr::Paren(inner) => eval_expr(inner, env, db, fns, checker, sessions, current_token, step_budget),
         Expr::Ident(name) => {
             // El lookup de variables va PRIMERO -- antes, "db" se chequeaba
@@ -3612,6 +3667,12 @@ fn call_method(
             "toUpper" => Ok(Value::Str(s.to_uppercase())),
             "toLower" => Ok(Value::Str(s.to_lowercase())),
             "escapeHtml" => Ok(Value::Str(escape_html(&s))),
+            // GRAMMAR.md §3.268: la única escotilla para insertar texto YA
+            // escapado/confiable en un literal `html` sin volver a
+            // escaparlo -- el checker ya garantizó `(Type::String,
+            // "rawHtml")`, acá solo cambia la ETIQUETA del `Value` (mismo
+            // string, sin ninguna transformación).
+            "rawHtml" => Ok(Value::Html(s)),
             // GRAMMAR.md §3.198: indexado por CARACTER, no por byte -- igual
             // que `length()` (`chars().count()`, no `.len()`), para que las
             // dos formas de medir un string coincidan siempre en cualquier
@@ -5798,6 +5859,13 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         // Mismo texto plano que un String -- ver la nota simétrica en
         // json_to_typed_value (que sí exige el formato al DECODIFICAR).
         Value::Uuid(s) => json!(s),
+        // GRAMMAR.md §3.268: en la práctica `server.rs` intercepta un
+        // retorno `Html` ANTES de llegar acá (lo manda como body crudo
+        // `text/html`, nunca como JSON -- mismo mecanismo que
+        // `@content_type`) -- este brazo es el fallback para cualquier otro
+        // camino que sí serialice a JSON (logging, `linkc test`, etc.):
+        // texto plano, igual que `Uuid`/`String` arriba.
+        Value::Html(s) => json!(s),
         // `number[]` liso -- GRAMMAR.md §3.254. `f32 -> f64` es exacto (todo
         // f32 representa exactamente en f64, nunca al revés), así que
         // serializar como número JSON normal no pierde nada.

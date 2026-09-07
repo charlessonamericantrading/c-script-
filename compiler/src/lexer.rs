@@ -1,4 +1,4 @@
-use crate::token::{keyword_from_str, Span, Token, TokenKind};
+use crate::token::{keyword_from_str, HtmlPart, Span, Token, TokenKind};
 
 #[derive(Debug)]
 pub struct LexError {
@@ -161,31 +161,139 @@ impl Lexer {
     fn run(mut self) -> Result<Vec<Token>, LexError> {
         let mut tokens = Vec::new();
         loop {
-            self.skip_trivia()?;
-            let start = self.pos;
-            let line = self.line;
-            let col = self.col;
-            let Some(c) = self.peek() else {
-                tokens.push(Token::new(TokenKind::Eof, Span::new(start, start, line, col)));
-                break;
-            };
-
-            let kind = if c.is_ascii_digit() {
-                self.lex_number()?
-            } else if is_ident_start(c) {
-                self.lex_ident_or_keyword()
-            } else if c == '"' {
-                self.lex_string()?
-            } else {
-                self.lex_punct()?
-            };
-
-            let end = self.pos;
-            let mut token = Token::new(kind, Span::new(start, end, line, col));
-            token.leading_doc = self.pending_doc.take();
+            let token = self.next_token()?;
+            let is_eof = matches!(token.kind, TokenKind::Eof);
             tokens.push(token);
+            if is_eof {
+                break;
+            }
         }
         Ok(tokens)
+    }
+
+    /// Produce UN token -- extraído del loop de `run()` (antes en línea ahí
+    /// mismo) para poder reusarlo al sub-tokenizar el interior de un
+    /// `${...}` de un literal `html` (`lex_html_literal`, GRAMMAR.md
+    /// §3.268): mismo lexer, sin ningún camino de tokenización aparte.
+    fn next_token(&mut self) -> Result<Token, LexError> {
+        self.skip_trivia()?;
+        let start = self.pos;
+        let line = self.line;
+        let col = self.col;
+        let Some(c) = self.peek() else {
+            return Ok(Token::new(TokenKind::Eof, Span::new(start, start, line, col)));
+        };
+
+        let kind = if c.is_ascii_digit() {
+            self.lex_number()?
+        } else if is_ident_start(c) {
+            let ident_kind = self.lex_ident_or_keyword();
+            match &ident_kind {
+                TokenKind::Ident(name) if name == "html" && self.peek() == Some('`') => self.lex_html_literal()?,
+                _ => ident_kind,
+            }
+        } else if c == '"' {
+            self.lex_string()?
+        } else {
+            self.lex_punct()?
+        };
+
+        let end = self.pos;
+        let mut token = Token::new(kind, Span::new(start, end, line, col));
+        token.leading_doc = self.pending_doc.take();
+        Ok(token)
+    }
+
+    /// Literal `html\`...\`` (GRAMMAR.md §3.268) -- interpolado, multilínea
+    /// (un `\n` crudo adentro se acepta tal cual, igual que cualquier otro
+    /// carácter -- a diferencia de `lex_string`, que SOLO admite `\n` vía
+    /// escape). Acá solo se separa texto de expresión -- el checker decide
+    /// cómo se escapa cada `${...}` según su tipo (GRAMMAR.md §3.268),
+    /// nunca el lexer. `self.peek() == Some('\`')` ya lo confirmó el
+    /// caller; esta función consume la comilla de apertura.
+    fn lex_html_literal(&mut self) -> Result<TokenKind, LexError> {
+        let open_start = self.pos;
+        let open_line = self.line;
+        let open_col = self.col;
+        self.advance(); // ` de apertura
+        let mut parts = Vec::new();
+        let mut text = String::new();
+        loop {
+            match self.peek() {
+                None => return Err(self.error_span(open_start, open_start + 1, open_line, open_col, "literal 'html`...`' sin cerrar")),
+                Some('`') => {
+                    self.advance();
+                    parts.push(HtmlPart::Text(std::mem::take(&mut text)));
+                    break;
+                }
+                Some('\\') => {
+                    let esc_start = self.pos;
+                    let esc_line = self.line;
+                    let esc_col = self.col;
+                    self.advance();
+                    match self.advance() {
+                        Some('`') => text.push('`'),
+                        Some('$') => text.push('$'),
+                        Some('\\') => text.push('\\'),
+                        Some('n') => text.push('\n'),
+                        Some('t') => text.push('\t'),
+                        Some(other) => {
+                            return Err(self.error_span(
+                                esc_start,
+                                self.pos,
+                                esc_line,
+                                esc_col,
+                                format!("secuencia de escape desconocida en 'html`...`': \\{other}"),
+                            ))
+                        }
+                        None => return Err(self.error_span(open_start, open_start + 1, open_line, open_col, "literal 'html`...`' sin cerrar")),
+                    }
+                }
+                Some('$') if self.peek_at(1) == Some('{') => {
+                    parts.push(HtmlPart::Text(std::mem::take(&mut text)));
+                    self.advance(); // $
+                    self.advance(); // {
+                    let expr_start = self.pos;
+                    let expr_line = self.line;
+                    let expr_col = self.col;
+                    let mut expr_tokens = Vec::new();
+                    let mut depth = 0i32;
+                    loop {
+                        let tok = self.next_token()?;
+                        match &tok.kind {
+                            TokenKind::Eof => {
+                                return Err(self.error_span(
+                                    expr_start,
+                                    self.pos,
+                                    expr_line,
+                                    expr_col,
+                                    "expresión '${...}' de un literal 'html' sin cerrar",
+                                ))
+                            }
+                            TokenKind::LBrace => {
+                                depth += 1;
+                                expr_tokens.push(tok);
+                            }
+                            TokenKind::RBrace if depth == 0 => break,
+                            TokenKind::RBrace => {
+                                depth -= 1;
+                                expr_tokens.push(tok);
+                            }
+                            _ => expr_tokens.push(tok),
+                        }
+                    }
+                    if expr_tokens.is_empty() {
+                        return Err(self.error_span(expr_start, self.pos, expr_line, expr_col, "'${}' vacío en un literal 'html' -- falta la expresión"));
+                    }
+                    parts.push(HtmlPart::Expr(expr_tokens));
+                }
+                Some(c) => {
+                    text.push(c);
+                    self.advance();
+                }
+            }
+        }
+        Ok(TokenKind::HtmlLit(parts))
     }
 
     /// Saltea espacios en blanco, comentarios de línea (`//`) y de bloque (`/* */`).
@@ -812,6 +920,125 @@ service Users {
         let source = "type X = { id: Int } # no es un pragma";
         let err = tokenize(source).unwrap_err();
         assert!(!err.message.contains("mal formado"), "{err:?}");
+    }
+
+    // ---- literal `html`...`` (GRAMMAR.md §3.268) ----
+
+    fn html_parts(source: &str) -> Vec<HtmlPart> {
+        let tokens = tokenize(source).unwrap_or_else(|e| panic!("{e}"));
+        match &tokens[0].kind {
+            TokenKind::HtmlLit(parts) => parts.clone(),
+            other => panic!("se esperaba HtmlLit, se encontró {other:?}"),
+        }
+    }
+
+    #[test]
+    fn html_literal_with_no_interpolation_is_a_single_text_part() {
+        let parts = html_parts("html`<h1>Hola</h1>`");
+        assert_eq!(parts, vec![HtmlPart::Text("<h1>Hola</h1>".into())]);
+    }
+
+    #[test]
+    fn html_literal_supports_raw_multiline_text_without_any_escape() {
+        // A diferencia de un string "...", un '\n' CRUDO adentro es válido tal cual.
+        let parts = html_parts("html`<div>\n  <p>hola</p>\n</div>`");
+        assert_eq!(parts, vec![HtmlPart::Text("<div>\n  <p>hola</p>\n</div>".into())]);
+    }
+
+    #[test]
+    fn html_literal_splits_text_and_interpolated_expression() {
+        let parts = html_parts("html`<h1>${name}</h1>`");
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        assert_eq!(parts[0], HtmlPart::Text("<h1>".into()));
+        match &parts[1] {
+            HtmlPart::Expr(tokens) => assert_eq!(tokens.iter().map(|t| &t.kind).collect::<Vec<_>>(), vec![&TokenKind::Ident("name".into())]),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(parts[2], HtmlPart::Text("</h1>".into()));
+    }
+
+    #[test]
+    fn html_literal_interpolation_can_contain_a_full_expression_with_braces() {
+        // El conteo de profundidad es a nivel de TOKEN (LBrace/RBrace), no de
+        // carácter crudo -- un `{`/`}` de un literal de struct adentro de un
+        // `${...}` no cierra la interpolación antes de tiempo.
+        let parts = html_parts("html`${Point { x: 1, y: 2 }}`");
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        assert_eq!(parts[0], HtmlPart::Text("".into()));
+        match &parts[1] {
+            HtmlPart::Expr(tokens) => {
+                let kinds: Vec<&TokenKind> = tokens.iter().map(|t| &t.kind).collect();
+                assert_eq!(
+                    kinds,
+                    vec![
+                        &TokenKind::Ident("Point".into()),
+                        &TokenKind::LBrace,
+                        &TokenKind::Ident("x".into()),
+                        &TokenKind::Colon,
+                        &TokenKind::Int(1),
+                        &TokenKind::Comma,
+                        &TokenKind::Ident("y".into()),
+                        &TokenKind::Colon,
+                        &TokenKind::Int(2),
+                        &TokenKind::RBrace,
+                    ]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(parts[2], HtmlPart::Text("".into()));
+    }
+
+    #[test]
+    fn html_literal_can_nest_another_html_literal_inside_an_interpolation() {
+        let parts = html_parts("html`<div>${html`<span>x</span>`}</div>`");
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        match &parts[1] {
+            HtmlPart::Expr(tokens) => {
+                assert_eq!(tokens.len(), 1);
+                match &tokens[0].kind {
+                    TokenKind::HtmlLit(inner) => assert_eq!(*inner, vec![HtmlPart::Text("<span>x</span>".into())]),
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn html_literal_supports_escaped_backtick_dollar_and_backslash() {
+        let parts = html_parts(r#"html`\`\$\\`"#);
+        assert_eq!(parts, vec![HtmlPart::Text("`$\\".into())]);
+    }
+
+    #[test]
+    fn html_literal_rejects_an_empty_interpolation() {
+        let err = tokenize("html`${}`").unwrap_err();
+        assert!(err.message.contains("vacío"), "{err:?}");
+    }
+
+    #[test]
+    fn html_literal_rejects_being_unterminated() {
+        let err = tokenize("html`<div>").unwrap_err();
+        assert!(err.message.contains("sin cerrar"), "{err:?}");
+    }
+
+    #[test]
+    fn html_literal_rejects_an_unterminated_interpolation() {
+        let err = tokenize("html`${name").unwrap_err();
+        assert!(err.message.contains("'${...}'") && err.message.contains("sin cerrar"), "{err:?}");
+    }
+
+    #[test]
+    fn an_identifier_named_html_without_a_backtick_is_a_plain_identifier() {
+        let kinds = kinds("html + 1");
+        assert_eq!(kinds, vec![TokenKind::Ident("html".into()), TokenKind::Plus, TokenKind::Int(1), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn html_literal_error_span_points_at_the_opening_backtick() {
+        let err = tokenize("let x = html`unterminated").unwrap_err();
+        assert_eq!(err.span.col, 13, "{err:?}"); // 1-based: la ` de apertura
     }
 
     #[test]

@@ -66,6 +66,13 @@ pub enum TokenKind {
     Float(f64),
     Str(String),
     Ident(String),
+    /// Literal `html\`...\`` (GRAMMAR.md §3.268) -- interpolado, multilínea.
+    /// Ya separado en texto crudo / expresiones sin parsear (`Vec<Token>`
+    /// por cada `${...}`, tokens producidos por el MISMO lexer -- soporta
+    /// anidar otro `html\`...\`` adentro de un `${...}` gratis) -- el
+    /// parser recién arma el AST (`ast::Expr::Html`) parseando cada
+    /// sub-secuencia de tokens como una expresión completa.
+    HtmlLit(Vec<HtmlPart>),
 
     // Palabras clave (GRAMMAR.md §1)
     Type,
@@ -128,6 +135,18 @@ pub enum TokenKind {
     Bang,     // !
 
     Eof,
+}
+
+/// Una porción de un literal `html\`...\`` -- GRAMMAR.md §3.268.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HtmlPart {
+    /// Texto crudo TAL CUAL apareció entre `` ` ``/`${`/`}` -- sin escapar
+    /// todavía (eso lo hace el checker/runtime al construir el `Value::Html`,
+    /// según el tipo de CADA parte -- acá es puro texto de fuente).
+    Text(String),
+    /// Los tokens de UNA expresión `${...}`, ya lexeados pero sin parsear.
+    /// Nunca vacío -- `lex_html_literal` rechaza `${}` como error léxico.
+    Expr(Vec<Token>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

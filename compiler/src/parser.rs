@@ -4,7 +4,7 @@
 // documento sin traducir mentalmente.
 
 use crate::ast::*;
-use crate::token::{Span, Token, TokenKind};
+use crate::token::{HtmlPart as TokenHtmlPart, Span, Token, TokenKind};
 
 /// `code` (GRAMMAR.md §3.210): mismo criterio que `CheckError::code`
 /// (`checker.rs`) -- `None` por defecto, estampado solo en el puñado de
@@ -1874,6 +1874,44 @@ impl Parser {
         Ok(e)
     }
 
+    /// Literal `html\`...\`` (GRAMMAR.md §3.268) -- el lexer ya separó texto
+    /// crudo de los tokens de cada `${...}` (`token::HtmlPart`); acá se
+    /// parsea CADA `${...}` como una expresión completa e independiente,
+    /// con un `Parser` nuevo sobre exactamente esos tokens (+ un EOF propio
+    /// -- `peek()`/`advance()` indexan `self.tokens` directo, sin chequeo de
+    /// límite, así que hace falta uno). Cualquier token sobrante después de
+    /// la expresión (`${1 2}`, dos expresiones sin operador entre medio) es
+    /// un error de sintaxis, igual que en cualquier otro lado del lenguaje.
+    fn parse_html_literal(&mut self) -> Result<Spanned<Expr>, ParseError> {
+        let t = self.advance();
+        let TokenKind::HtmlLit(parts) = t.kind else {
+            unreachable!("parse_html_literal solo se llama tras confirmar TokenKind::HtmlLit");
+        };
+        let mut ast_parts = Vec::with_capacity(parts.len());
+        for part in parts {
+            match part {
+                TokenHtmlPart::Text(s) => ast_parts.push(HtmlPart::Text(s)),
+                TokenHtmlPart::Expr(mut tokens) => {
+                    tokens.push(Token::new(TokenKind::Eof, t.span));
+                    let mut sub = Parser { tokens, pos: 0, errors: Vec::new() };
+                    let expr = sub.parse_expr()?;
+                    if !sub.errors.is_empty() {
+                        return Err(sub.errors.into_iter().next().unwrap());
+                    }
+                    if !matches!(sub.peek(), TokenKind::Eof) {
+                        return Err(ParseError {
+                            message: "expresión inválida dentro de un '${...}' de un literal 'html' -- sobran tokens después de la expresión".to_string(),
+                            span: sub.span(),
+                            code: None,
+                        });
+                    }
+                    ast_parts.push(HtmlPart::Expr(Box::new(expr)));
+                }
+            }
+        }
+        Ok(Spanned { node: Expr::Html(ast_parts), span: t.span })
+    }
+
     fn parse_primary_expr(&mut self, no_struct_lit: bool) -> Result<Spanned<Expr>, ParseError> {
         match self.peek().clone() {
             TokenKind::Int(n) => {
@@ -1888,6 +1926,7 @@ impl Parser {
                 let t = self.advance();
                 Ok(Spanned { node: Expr::Str(s), span: t.span })
             }
+            TokenKind::HtmlLit(_) => self.parse_html_literal(),
             TokenKind::True => {
                 let t = self.advance();
                 Ok(Spanned { node: Expr::Bool(true), span: t.span })

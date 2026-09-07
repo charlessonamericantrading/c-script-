@@ -47,6 +47,20 @@ pub enum Type {
     /// Se guarda como `TEXT`/`string` en los dos backends SQL y en TS --
     /// mismo criterio de "sin rama por backend" que el resto del lenguaje.
     Uuid,
+    /// `html\`...\`` (GRAMMAR.md §3.268) -- tipo nominal aparte de `String`,
+    /// mismo criterio que `Uuid`: sin mezcla implícita, para que "olvidarse
+    /// de escapar" sea un error de compilación en vez de un bug de XSS. Un
+    /// `${expr}` dentro del literal se resuelve según el tipo de `expr`:
+    /// `String`/`Int`/`Int64`/`Float`/`Bool` se escapan (los últimos cuatro
+    /// vía `.toString()` primero), `Html`/`Html[]` se insertan tal cual
+    /// (composición), cualquier otro tipo es un error de compilación. La
+    /// única escotilla explícita para insertar texto YA escapado/confiable
+    /// sin volver a escaparlo es `String.rawHtml() -> Html` (un método
+    /// sobre `String`, mismo patrón que `Int.toDecimal()` -- nunca una
+    /// función estática `Html.raw(...)`, que no tiene precedente en el
+    /// lenguaje). Un `@route`/`fn` que devuelve `Html` emite
+    /// `text/html; charset=utf-8` sin necesitar `@content_type` (§3.35).
+    Html,
     /// `Vector<N>` (GRAMMAR.md §3.254, PLAN.md §9.21 Fase 4 ítem 13): un
     /// vector de `N` componentes `f32`, `N` fijo en el TIPO (parte de la
     /// igualdad de `Type` -- `Vector<768>` y `Vector<1536>` son tipos
@@ -210,6 +224,7 @@ impl std::fmt::Display for Type {
             Type::Float => write!(f, "Float"),
             Type::String => write!(f, "String"),
             Type::Uuid => write!(f, "Uuid"),
+            Type::Html => write!(f, "Html"),
             Type::Vector(n) => write!(f, "Vector<{n}>"),
             Type::Bool => write!(f, "Bool"),
             Type::Void => write!(f, "Void"),

@@ -9493,6 +9493,49 @@ No cierra ningún ítem de la hoja de ruta de PLAN.md §9.23 -- es un bug real e
 
 **Verificado de punta a punta contra un endpoint HTTPS real** (no un mock): `http.get("https://api.github.com/zen")` devuelve el texto real de la API pública de GitHub contra un `linkc serve` real, antes fallaba con el error de arriba. Test de regresión agregado (`cli_http.rs`, sin depender de la red real): contra un puerto local cerrado con esquema `https://`, el error tiene que ser el de conexión rechazada (prueba que sí se intentó el handshake TLS), nunca el de "no hay backend TLS" -- si esta regresión volviera, el test fallaría con el mensaje viejo en vez de uno de conexión.
 
+### 3.268 `Html` + literal `html\`...\``: HTML server-side con escape POR TIPO — RESUELTO, cierra Fase 0 ítem A1 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24, la pieza fundacional ("la piedra angular") de todo el plan para que c-script pueda hacer SSR/HTML igual que Node -- sin esto, portar las ~6.000 líneas de plantillas de un sitio real significaba concatenar con `+` a mano, escapando cada interpolación por disciplina en vez de por el compilador. Diseño tomado en el propio PLAN.md (§9.24.5, punto 1): escape por TIPO, no por convención -- olvidarse de escapar pasa a ser un error de compilación, mismo espíritu que `Uuid`/`Int64` como tipos nominales aparte de `String`/`Int`.
+
+**`Html` es un tipo nominal nuevo, sin mezcla implícita con `String` (mismo criterio que `Uuid`).** Un literal `html\`...\`` (backtick, no comilla doble) produce un valor `Html`; adentro, cualquier cantidad de `${expr}` interpola una expresión completa -- multilínea sin ningún escape especial para el salto de línea (a diferencia de un `"..."` normal, que solo acepta `\n` vía escape). Cada `${expr}` se resuelve según el TIPO de `expr`, decidido en el checker antes de llegar a runtime:
+
+| Tipo de `expr` | Comportamiento |
+|---|---|
+| `String` | se escapa (mismos 5 caracteres que `String.escapeHtml()`, §3.45) |
+| `Html` | se inserta TAL CUAL -- composición, sin volver a escapar |
+| `Int`/`Int64`/`Float`/`Bool` | se convierte con el mismo `.toString()` que cada tipo ya usa (§3.55), y ESE resultado se escapa |
+| `Html[]` | cada elemento se concatena tal cual, en orden |
+| cualquier otro tipo | error de COMPILACIÓN -- nunca un escape faltante que se note en producción |
+
+<!-- linkc:check -->
+```rust
+fn greeting(name: String) -> Html {
+  html`<b>${name}</b>`
+}
+
+fn page(title: String, body: Html) -> Html {
+  html`<!doctype html><html><head><title>${title}</title></head><body>${body}</body></html>`
+}
+
+service Site {
+  rpc home(name: String) -> Html {
+    page("Inicio", greeting(name))
+  }
+}
+```
+
+**`String.rawHtml() -> Html` es la ÚNICA escotilla explícita para insertar texto ya escapado/confiable sin volver a escaparlo** -- mismo patrón que `Int.toDecimal()` (conversión vía método SOBRE EL VALOR de origen), deliberadamente NO una función estática `Html.raw(...)`: no hay precedente en el lenguaje para "llamar un método sobre el nombre de un tipo" (los únicos casos con esa forma son `Enum.Variante`, construcción de enum, algo semánticamente distinto). `html.algo(...)` en cambio SÍ queda libre para un futuro módulo builtin `html` (sin colisión: el lexer solo entra al literal cuando `html` está INMEDIATAMENTE seguido de una comilla invertida, sin espacio -- `html.foo` lexea como identificador normal seguido de `.`).
+
+**`-> Html` en un `rpc`/`@route` se comporta como `@content_type("text/html; charset=utf-8")` implícito, sin declararlo a mano** -- verificado contra un `linkc serve` real: `POST /Site/home` devuelve `Content-Type: text/html; charset=utf-8` y el body crudo (`<h1>...`), nunca envuelto en comillas de JSON. Un `@content_type` explícito distinto sigue ganando si el `.link` lo declara (ej. sobre `application/xhtml+xml`).
+
+**`Html` solo es válido como el retorno COMPLETO de un `rpc`/`stream`/`@route` -- nunca como parámetro, ni anidado en un campo/lista/`Optional` de una firma expuesta a la red (mismo criterio EXACTO que `Void`, `check_wire_safe` en checker.rs).** Ningún cliente manda "Html" como dato de entrada -- no tiene sentido que viaje en esa dirección. Como parámetro/campo de un `fn` interno (nunca expuesto por HTTP) esta restricción NO aplica -- `fn pageLayout(head: Html, main: Html) -> Html` es exactamente el patrón esperado para componer plantillas.
+
+**Implementación**: el lexer (`lex_html_literal`, `lexer.rs`) separa texto crudo de cada `${...}` en tokens YA lexeados (reusando el mismo `next_token()` que el resto del archivo -- soporta anidar otro `html\`...\`` adentro de una interpolación gratis, y el conteo de profundidad `{`/`}` es a nivel de TOKEN, no de carácter crudo, así que un literal de struct dentro de un `${...}` no cierra la interpolación antes de tiempo). El parser recién arma la expresión completa de cada `${...}` con un sub-`Parser` sobre exactamente esos tokens. `linkc fmt` reproduce un literal `html` TAL CUAL del source original (vía su span) en vez de reformatear su interior -- fuera de alcance de esta ronda.
+
+**Límites honestos**: sin motor de plantillas (layouts/parciales/slots) -- `Html` es un TIPO y una forma de interpolar, la composición (layout + partials) se arma con `fn`s normales que devuelven `Html`, como en el ejemplo de arriba. Sin brand/formato especial en TS/OpenAPI: `Html` cruza el wire como `string` liso (§4), la disciplina de escape es puramente del lado del servidor. `linkc fmt` no reindenta el interior de un literal `html` todavía.
+
+**Verificado**: 12 tests de `lexer.rs` (texto sin interpolación, multilínea sin escape especial, separación texto/expresión, profundidad de `{`/`}` a nivel de token, anidar `html` dentro de `${...}`, escapes `` \` ``/`\$`/`\\`, `${}` vacío rechazado, sin cerrar rechazado con el span apuntando a la comilla de apertura, `html` sin backtick sigue siendo un identificador normal) + 7 tests de `checker.rs` (tipa como `Html`, interpola `String`/`Html`, interpola `Int`/`Int64`/`Float`/`Bool`, interpola `Html[]`, rechaza un tipo no soportado con mensaje claro, `rawHtml()` da `Html`, `Html` como retorno de rpc aceptado, `Html` como parámetro de rpc rechazado) + 8 tests de comportamiento reales (`test { }`) contra el binario real: texto literal, escape de un `<script>` inyectado, composición sin doble-escape, números/bool vía `.toString()`, `rawHtml()`, composición de funciones (`greeting`+`page`), concatenación de `Html[]`, y preservación de saltos de línea en un literal multilínea -- más una verificación manual de punta a punta contra un `linkc serve` real confirmando el `Content-Type: text/html; charset=utf-8` automático. Suite completa (1333 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

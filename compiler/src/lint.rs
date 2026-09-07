@@ -1,7 +1,7 @@
 //! Linter estático para análisis de calidad de código en Link.
 //! Detecta variables no utilizadas, mutabilidad redundante y tests vacíos.
 
-use crate::ast::{BinaryOp, Block, ConstDecl, Expr, Item, Member, MatchArmBody, Program, Spanned, Stmt};
+use crate::ast::{BinaryOp, Block, ConstDecl, Expr, HtmlPart, Item, Member, MatchArmBody, Program, Spanned, Stmt};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LintWarning {
@@ -397,6 +397,13 @@ fn lint_secret_comparisons_in_expr(expr: &Spanned<Expr>, warnings: &mut Vec<Lint
         }
         Expr::Closure { body, .. } => lint_secret_comparisons_in_block(body, warnings),
         Expr::Transaction(block) => lint_secret_comparisons_in_block(block, warnings),
+        Expr::Html(parts) => {
+            for part in parts {
+                if let HtmlPart::Expr(e) = part {
+                    lint_secret_comparisons_in_expr(e, warnings);
+                }
+            }
+        }
         Expr::Int(_) | Expr::Float(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null | Expr::Ident(_) => {}
     }
 }

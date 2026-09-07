@@ -227,6 +227,7 @@ fn type_key(ty: &Type) -> String {
         Type::Float => "Float".into(),
         Type::String => "String".into(),
         Type::Uuid => "Uuid".into(),
+        Type::Html => "Html".into(),
         Type::Vector(n) => format!("Vector{n}"),
         Type::Bool => "Bool".into(),
         Type::Void => "Void".into(),
@@ -305,6 +306,12 @@ fn render_check(ty: &Type, expr: &str, worklist: &mut Vec<Type>, seen: &mut Vec<
         Type::Vector(n) => format!(
             "(Array.isArray({expr}) && {expr}.length === {n} && {expr}.every((item: unknown) => typeof item === \"number\" && Number.isFinite(item)))"
         ),
+        // GRAMMAR.md §3.268: `Html` en el wire es texto crudo, sin ninguna
+        // forma que validar más allá de "es un string" -- mismo criterio
+        // que `String` (arriba); el checker ya restringió `Html` a ser solo
+        // el retorno completo de un rpc/@route, así que esta rama en la
+        // práctica solo se alcanza ahí.
+        Type::Html => format!("typeof {expr} === \"string\""),
         Type::Bool => format!("typeof {expr} === \"boolean\""),
         // Void nunca es un payload real (solo retorno de rpc, tabla de
         // mapeo GRAMMAR.md §4) -- no hay nada que validar.

@@ -3,6 +3,11 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.213.0] - 2026-09-07
+
+### ✨ Añadido
+**`Html` + literal `html\`...\`` -- HTML server-side con escape por TIPO (PLAN.md §9.24 Fase 0 ítem A1, la pieza fundacional de "c-script como servidor web completo").** Tipo nominal nuevo (sin mezcla implícita con `String`, mismo criterio que `Uuid`). Un literal `html\`...\`` (multilínea, sin escape especial para `\n`) interpola `${expr}` según el TIPO de `expr`, decidido en el checker: `String` se escapa, `Html`/`Html[]` se inserta tal cual (composición), `Int`/`Int64`/`Float`/`Bool` se convierten con `.toString()` y se escapan, cualquier otro tipo es un error de COMPILACIÓN -- nunca un escape faltante que se note en producción. `String.rawHtml() -> Html` es la única escotilla explícita (mismo patrón que `Int.toDecimal()`, nunca una función estática `Html.raw(...)`, sin precedente en el lenguaje). `-> Html` en un `rpc`/`@route` emite `Content-Type: text/html; charset=utf-8` automático, verificado contra un `linkc serve` real. `Html` solo válido como retorno completo de un rpc expuesto (mismo criterio que `Void`) -- como parámetro/campo de un `fn` interno no hay restricción, es el patrón esperado para componer layouts (`fn pageLayout(head: Html, main: Html) -> Html`). Ver GRAMMAR.md §3.268.
+
 ## [1.212.0] - 2026-09-07
 
 ### ✨ Añadido

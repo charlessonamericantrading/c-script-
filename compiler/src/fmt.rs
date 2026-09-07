@@ -132,6 +132,13 @@ pub fn format_source(src: &str) -> Result<String, String> {
                 indent_level += 1;
             }
             TokenKind::RBrace => out.push('}'),
+            // GRAMMAR.md §3.268: un literal `html\`...\`` se reproduce TAL
+            // CUAL del source original (vía su span) en vez de reconstruirse
+            // desde `HtmlPart` -- reformatear el interior (indentación de
+            // cada `${...}`, espaciado) es un problema aparte, fuera de
+            // alcance de esta ronda; lo importante acá es que `linkc fmt`
+            // no rompa ni pierda ningún literal `html` existente.
+            TokenKind::HtmlLit(_) => out.push_str(&chars[tok.span.start..tok.span.end].iter().collect::<String>()),
             TokenKind::Eof => {}
         }
 

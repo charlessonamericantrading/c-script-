@@ -1171,6 +1171,22 @@ pub enum Expr {
     /// `while`, GRAMMAR.md §3.15) -- las dos reglas se verifican en
     /// checker.rs, no acá.
     Transaction(Block),
+    /// Literal `html\`...\`` (GRAMMAR.md §3.268) -- cada `${...}` ya es una
+    /// `Expr` completa parseada (`parser.rs::parse_primary_expr`, un
+    /// sub-`Parser` sobre los tokens que el lexer ya separó,
+    /// `token::HtmlPart::Expr`). El checker decide en modo CHEQUEO cómo se
+    /// escapa cada parte según su tipo (String/Html/Int/Int64/Float/Bool/
+    /// Html[] -- cualquier otro tipo es un error de compilación) y produce
+    /// el tipo del literal completo: `Html`.
+    Html(Vec<HtmlPart>),
+}
+
+/// Una porción ya parseada de un literal `html\`...\`` -- ver
+/// `token::HtmlPart` para la forma sin parsear (texto/tokens crudos).
+#[derive(Debug, Clone, PartialEq)]
+pub enum HtmlPart {
+    Text(String),
+    Expr(Box<Spanned<Expr>>),
 }
 
 /// `nombre` o `nombre: Tipo` dentro de `|...|`. Sin anotación solo es válido

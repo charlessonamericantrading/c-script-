@@ -2153,6 +2153,26 @@ fn declared_content_type(program: &Program, service_name: &str, rpc_name: &str) 
     })
 }
 
+/// GRAMMAR.md §3.268: `-> Html` se comporta como `@content_type("text/html;
+/// charset=utf-8")` implícito -- sin que el `.link` tenga que declararlo a
+/// mano. Chequeo puramente SINTÁCTICO sobre `return_type` (mismo criterio
+/// que `declared_content_type`/`declared_cache_control`, que tampoco
+/// resuelven tipos acá) -- el checker ya garantizó que `Html` como retorno
+/// de un rpc solo puede escribirse como el nombre `Html` liso, nunca
+/// envuelto en `Optional`/`List`/etc. (`check_wire_safe`), así que esta
+/// comparación de texto no tiene falsos negativos en la práctica.
+fn declared_return_is_html(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|item| match item {
+        crate::ast::Item::Service(s) if s.name == service_name => s.members.iter().any(|m| match m {
+            crate::ast::Member::Rpc(r) if r.name == rpc_name => {
+                matches!(&r.return_type, crate::ast::TypeExpr::Named(name, args, _) if name == "Html" && args.is_empty())
+            }
+            _ => false,
+        }),
+        _ => false,
+    })
+}
+
 /// Como `declared_content_type`, para `@cache_control("...")` (GRAMMAR.md
 /// §3.113) -- estático (viene del AST, no de un override por request como
 /// `response.redirect`), así que se resuelve UNA vez por request igual que
@@ -2195,10 +2215,15 @@ pub(crate) fn handle_rpc(
             let status = db.take_response_status().unwrap_or(200);
             let location = db.take_response_location();
             let cache_control = declared_cache_control(program, service_name, rpc_name);
-            match declared_content_type(program, service_name, rpc_name) {
-                // El checker ya garantizó que un rpc con `@content_type` devuelve
-                // `String`, así que `as_str()` acá siempre acierta; el fallback
-                // existe para no inventar un panic si esa invariante se rompiera.
+            let html_content_type = declared_return_is_html(program, service_name, rpc_name)
+                .then(|| "text/html; charset=utf-8".to_string());
+            match declared_content_type(program, service_name, rpc_name).or(html_content_type) {
+                // El checker ya garantizó que un rpc con `@content_type` (o
+                // que devuelve `Html`, GRAMMAR.md §3.268) devuelve un valor
+                // que serializa a un `String` JSON (`value_to_json` de
+                // `Value::Html` es `json!(s)`, igual que `Value::Str`), así
+                // que `as_str()` acá siempre acierta; el fallback existe
+                // para no inventar un panic si esa invariante se rompiera.
                 Some(ct) => {
                     let text = result.as_str().map(str::to_string).unwrap_or_else(|| result.to_string());
                     (status, text, ct, location, cache_control)

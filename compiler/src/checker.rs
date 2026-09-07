@@ -529,6 +529,19 @@ fn check_wire_safe(ty: &Type, position: &str, top_level_ret: bool) -> Result<(),
             "{position} usa 'Void', que solo es válido como el retorno completo de un rpc (GRAMMAR.md §4)"
         ))),
         Type::Void => Ok(()),
+        // GRAMMAR.md §3.268: mismo criterio exacto que `Void` arriba --
+        // `Html` nunca viaja como JSON (un `@route`/rpc que devuelve `Html`
+        // emite el texto crudo como body, `text/html`), así que solo tiene
+        // sentido como el retorno COMPLETO de un rpc/`@route`/`stream`,
+        // nunca como parámetro (nada envía "Html" desde un cliente) ni
+        // anidado en un campo/lista/Optional de una firma expuesta a la
+        // red. Como parámetro/campo de un `fn` interno (nunca expuesto por
+        // HTTP) no pasa por acá -- `check_wire_safe` solo se llama sobre
+        // firmas de rpc/stream/@route.
+        Type::Html if !top_level_ret => Err(err(format!(
+            "{position} usa 'Html', que solo es válido como el retorno completo de un rpc/@route (GRAMMAR.md §3.268) -- ningún cliente manda 'Html' como parámetro"
+        ))),
+        Type::Html => Ok(()),
         Type::Optional(inner) | Type::List(inner) | Type::PatchOf(inner) => {
             check_wire_safe(inner, position, false)
         }
@@ -1602,6 +1615,7 @@ impl Checker {
             "Float" => Ok(Type::Float),
             "String" => Ok(Type::String),
             "Uuid" => Ok(Type::Uuid),
+            "Html" => Ok(Type::Html),
             // GRAMMAR.md §3.254: `Vector<N>` -- `N` NO es un argumento de
             // tipo real, es un entero literal que `parse_primary_type`
             // (parser.rs) reempaqueta como `TypeExpr::Named("<dígitos>", [],
@@ -2082,9 +2096,16 @@ impl Checker {
             )));
         }
         let ret = self.resolve_type(&r.return_type)?;
-        if ret != Type::String {
+        // GRAMMAR.md §3.268: `Html` entra acá con el mismo criterio que
+        // `String` -- las dos formas serializan a un `String` JSON
+        // (`value_to_json`), así que el cuerpo se puede escribir tal cual.
+        // El caso real es combinar `-> Html` con un `@content_type`
+        // EXPLÍCITO distinto de `text/html` (ej. `application/xhtml+xml`) --
+        // el `@content_type` explícito gana (`server.rs::declared_return_is_html`
+        // solo aplica su default cuando no hay ninguno declarado).
+        if ret != Type::String && ret != Type::Html {
             return Err(err(format!(
-                "`@content_type` en '{}': el rpc tiene que devolver `String` -- el cuerpo de la respuesta se escribe tal cual, y {} no es texto que se pueda mandar sin serializar a JSON (GRAMMAR.md §3.35)",
+                "`@content_type` en '{}': el rpc tiene que devolver `String` o `Html` -- el cuerpo de la respuesta se escribe tal cual, y {} no es texto que se pueda mandar sin serializar a JSON (GRAMMAR.md §3.35)",
                 r.name,
                 ret
             )));
@@ -4830,6 +4851,29 @@ impl Checker {
             Expr::Transaction { .. } => Err(err(
                 "'transaction' en posición de síntesis no soportado — necesita un tipo esperado del contexto (GRAMMAR.md §3.154, misma familia que if/match)",
             )),
+            Expr::Html(parts) => {
+                // GRAMMAR.md §3.268: escape POR TIPO -- cada `${...}` se
+                // sintetiza de forma independiente (nunca hereda un tipo
+                // esperado del literal completo, que siempre es `Html`) y
+                // tiene que resolver a uno de los tipos que el runtime sabe
+                // escapar/insertar; cualquier otro es un error de
+                // compilación, no un escape faltante que se note en
+                // producción.
+                for part in parts {
+                    if let HtmlPart::Expr(e) = part {
+                        let ty = self.synth_expr(e, env)?;
+                        let allowed = matches!(ty, Type::String | Type::Html | Type::Int | Type::Int64 | Type::Float | Type::Bool)
+                            || matches!(&ty, Type::List(inner) if inner.as_ref() == &Type::Html);
+                        if !allowed {
+                            return Err(err(format!(
+                                "'${{...}}' de un literal 'html' solo acepta String/Html/Int/Int64/Float/Bool/Html[] -- se encontró '{ty}' (GRAMMAR.md §3.268)"
+                            ))
+                            .with_span(e.span));
+                        }
+                    }
+                }
+                Ok(Type::Html)
+            }
             Expr::Binary { op, left, right } => self.synth_binary(*op, left, right, env),
             Expr::Unary { op, operand } => self.synth_unary(*op, operand, env),
             // Un array vacío no sintetiza -- no hay de dónde inferir el
@@ -5212,6 +5256,16 @@ impl Checker {
             (Type::String, "escapeHtml") => {
                 self.expect_no_args(args, "escapeHtml")?;
                 Some(Type::String)
+            }
+            // GRAMMAR.md §3.268: la ÚNICA escotilla explícita para insertar
+            // texto YA escapado/confiable en un literal `html\`...\`` sin
+            // volver a escaparlo -- mismo patrón que `Int.toDecimal()`
+            // (conversión vía método sobre el VALOR de origen), nunca una
+            // función estática `Html.raw(...)`, sin precedente en el
+            // lenguaje.
+            (Type::String, "rawHtml") => {
+                self.expect_no_args(args, "rawHtml")?;
+                Some(Type::Html)
             }
             // GRAMMAR.md §3.198: slicing/replace/split/padding -- superficie
             // que faltaba, bloqueaba exports de texto real (fixed-width,
@@ -8200,6 +8254,75 @@ type T = { id: Int, s: Status }")
             fn create(email: String) -> Lead { db.leads.insert(NewLead { email: email }) }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    // ---- literal `html`...`` (GRAMMAR.md §3.268) ----
+
+    #[test]
+    fn html_literal_with_no_interpolation_typechecks_as_html() {
+        let src = r#"fn page() -> Html { html`<h1>Hola</h1>` }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn html_literal_interpolates_a_string_and_another_html() {
+        let src = r#"
+            fn greeting(name: String) -> Html { html`<b>${name}</b>` }
+            fn page(name: String) -> Html { html`<h1>${greeting(name)}</h1>` }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn html_literal_interpolates_numeric_and_bool_types() {
+        let src = r#"fn page(n: Int, n64: Int64, f: Float, b: Bool) -> Html { html`${n}${n64}${f}${b}` }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn html_literal_interpolates_a_list_of_html() {
+        let src = r#"
+            fn item(x: Int) -> Html { html`<li>${x}</li>` }
+            fn list(xs: Int[]) -> Html { html`<ul>${xs.map(item)}</ul>` }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn html_literal_rejects_an_unsupported_interpolated_type() {
+        let src = r#"
+            type User = { id: Int, name: String }
+            fn page(u: User) -> Html { html`${u}` }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "un struct entero interpolado en 'html' tiene que rechazarse -- no hay forma segura de escaparlo");
+    }
+
+    #[test]
+    fn string_raw_html_produces_html_without_escaping() {
+        let src = r#"fn page(trusted: String) -> Html { html`${trusted.rawHtml()}` }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn html_as_an_rpc_return_type_is_allowed() {
+        let src = r#"
+            service S {
+                rpc page() -> Html { html`<h1>Hola</h1>` }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn html_as_an_rpc_parameter_type_is_rejected() {
+        let src = r#"
+            service S {
+                rpc page(fragment: Html) -> Html { fragment }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "'Html' como parámetro de un rpc tiene que rechazarse -- ningún cliente manda Html");
     }
 
     // ---- `smtp.sendWithConfig` (GRAMMAR.md §3.265) ----
