@@ -1074,9 +1074,11 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::Cron(every)
                 }
+                // Sin argumentos, mismo criterio que "idempotent"/"cron" (GRAMMAR.md §3.274).
+                "notFound" => Annotation::NotFound,
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)', '@idempotent', '@cache(\"60s\")', '@cors(\"https://origen.com\")' o '@cron(\"5m\")')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)', '@idempotent', '@cache(\"60s\")', '@cors(\"https://origen.com\")', '@cron(\"5m\")' o '@notFound')"
                     )))
                 }
             };

@@ -6109,6 +6109,23 @@ pub fn is_cron_member(program: &Program, service_name: &str, rpc_name: &str) -> 
     })
 }
 
+/// Si `service_name.rpc_name` declaró `@notFound` (GRAMMAR.md §3.274) --
+/// mismo patrón EXACTO que `is_cron_member`, arriba: `server.rs` lo consulta
+/// ANTES de invocar nada por la dirección `/Service/rpc` normal, para
+/// devolver la MISMA página de 404 (con status 404 de verdad, no el 200 que
+/// una invocación directa daría por default) en vez de dejar que este rpc
+/// sea alcanzable por su propia dirección -- rompería "nunca se llama vía
+/// HTTP directo", la garantía que el checker (`check_not_found_annotation`)
+/// documenta como parte del contrato de `@notFound`.
+pub fn is_not_found_member(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) if s.name == service_name => {
+            s.members.iter().any(|m| matches!(m, Member::Rpc(r) if r.name == rpc_name && r.not_found()))
+        }
+        _ => false,
+    })
+}
+
 /// Anotación `@authenticated`/`@requires(...)` de `{service_name}.{rpc_name}`,
 /// si tiene una -- hermana de `is_stream_member` (mismo archivo/patrón, ya
 /// usada por `server.rs` antes de invocar nada). `None` cubre tanto "sin

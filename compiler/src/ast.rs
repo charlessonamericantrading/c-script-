@@ -789,6 +789,11 @@ impl RpcDecl {
         })
     }
 
+    /// `true` si este rpc lleva `@notFound` (GRAMMAR.md §3.274).
+    pub fn not_found(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, Annotation::NotFound))
+    }
+
     /// Mismo heurístico "nombre por forma" en UN solo lugar -- lo usan
     /// `codegen::ts_emit::emit_hooks` (para decidir si un rpc genera un
     /// hook `use...Query`) Y `checker::check_invalidates_annotation` (para
@@ -953,6 +958,16 @@ pub enum Annotation {
     /// -- ninguna tiene sentido sobre algo que nunca recibe una request
     /// real), sin parámetros, y retorno `Void`.
     Cron(String),
+    /// `@notFound` (GRAMMAR.md §3.274, PLAN.md §9.24 Fase 1 ítem A10) -- el
+    /// rpc que `linkc serve` invoca para CUALQUIER path que no matchea
+    /// ninguna `@route` ni la forma `/Service/rpc` de siempre (y sin
+    /// `--fallback-upstream` configurado, que sigue ganando primero -- el
+    /// estrangulador de siempre no cambia). Mismo criterio que `@cron`:
+    /// nunca alcanzable por su propia dirección `/Service/rpc`, el checker
+    /// exige que sea la ÚNICA anotación, sin parámetros -- pero retorno
+    /// `Html` (no `Void`), porque lo que produce es una página real para
+    /// quien visita una URL que no existe. A lo sumo UNO por programa.
+    NotFound,
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

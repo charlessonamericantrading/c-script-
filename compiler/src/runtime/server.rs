@@ -38,7 +38,7 @@ use super::encryption;
 use super::store::Backend;
 use super::session::SessionStore;
 use super::{
-    ai_stream_member, invoke_rpc_with_sessions, is_cron_member, is_stream_member, live_subscribe_collection, program_has_any_background_rpc,
+    ai_stream_member, invoke_rpc_with_sessions, is_cron_member, is_not_found_member, is_stream_member, live_subscribe_collection, program_has_any_background_rpc,
     required_auth, required_background, required_cache, required_cors, required_idempotent, required_rate_limit,
 };
 use crate::ast::{Annotation, Item, Member};
@@ -1262,6 +1262,16 @@ fn handle_request(
                 proxy_to_upstream(upstream, db, &path, &body, &cors_headers, request, req_id, start, log);
                 return;
             }
+            // GRAMMAR.md §3.274: la página real de `@notFound` si el
+            // programa declara una, el 404 JSON de siempre si no.
+            if let Some((status, body_text, content_type)) =
+                not_found_response(program, db, sessions, extract_bearer_token(&request).as_deref())
+            {
+                let resp = cors_response_with_type(status, body_text, &content_type, &cors_headers, None, None, &request);
+                let _ = request.respond(resp);
+                log_done(log, req_id, None, status, start, "");
+                return;
+            }
             let resp = cors_response(404, error_json("URL debe tener la forma /Service/method"), &cors_headers, &request);
             let _ = request.respond(resp);
             log_done(log, req_id, None, 404, start, "");
@@ -1286,6 +1296,14 @@ fn handle_request(
         // Sin upstream: 404, no el 500 de "rpc desconocido" que daba
         // invoke_rpc_with_sessions -- desde afuera este rpc no existe,
         // exactamente como uno mal escrito (mismo criterio que  abajo).
+        if let Some((status, body_text, content_type)) =
+            not_found_response(program, db, sessions, extract_bearer_token(&request).as_deref())
+        {
+            let resp = cors_response_with_type(status, body_text, &content_type, &cors_headers, None, None, &request);
+            let _ = request.respond(resp);
+            log_done(log, req_id, None, status, start, "");
+            return;
+        }
         let resp = cors_response(404, error_json("no existe ese rpc"), &cors_headers, &request);
         let _ = request.respond(resp);
         log_done(log, req_id, None, 404, start, "");
@@ -1293,12 +1311,24 @@ fn handle_request(
     }
     let method = format!("{service_name}.{rpc_name}");
 
-    // `@cron` (GRAMMAR.md §3.159): nunca alcanzable vía HTTP -- el checker
-    // ya garantiza que nunca coexiste con `@route`, pero el path por
-    // defecto `POST /{Service}/{rpc}` de arriba encuentra cualquier rpc por
-    // NOMBRE sin mirar sus anotaciones. 404, no 403 -- desde afuera, este
-    // rpc "no existe" como endpoint, exactamente como uno mal escrito.
-    if is_cron_member(program, service_name, rpc_name) {
+    // `@cron` (GRAMMAR.md §3.159) y `@notFound` (GRAMMAR.md §3.274): dos
+    // anotaciones distintas, MISMA razón acá -- ninguna de las dos es
+    // alcanzable vía HTTP por su propia dirección; el checker ya garantiza
+    // que ninguna coexiste con `@route`, pero el path por defecto
+    // `POST /{Service}/{rpc}` de arriba encuentra cualquier rpc por NOMBRE
+    // sin mirar sus anotaciones. Para `@notFound` puntualmente esto termina
+    // devolviendo la MISMA página (vía `not_found_response`, que la busca
+    // por su cuenta) -- consistente en vez de un caso especial "acceso
+    // directo devuelve otra cosa".
+    if is_cron_member(program, service_name, rpc_name) || is_not_found_member(program, service_name, rpc_name) {
+        if let Some((status, body_text, content_type)) =
+            not_found_response(program, db, sessions, extract_bearer_token(&request).as_deref())
+        {
+            let resp = cors_response_with_type(status, body_text, &content_type, &cors_headers, None, None, &request);
+            let _ = request.respond(resp);
+            log_done(log, req_id, Some(&method), status, start, "");
+            return;
+        }
         let resp = cors_response(404, error_json("no existe ese rpc"), &cors_headers, &request);
         let _ = request.respond(resp);
         log_done(log, req_id, Some(&method), 404, start, "");
@@ -2076,7 +2106,8 @@ pub(crate) fn check_auth_gate(
         | Annotation::Background
         | Annotation::Cache(_)
         | Annotation::Cors(_)
-        | Annotation::Cron(_) => Ok(()),
+        | Annotation::Cron(_)
+        | Annotation::NotFound => Ok(()),
     };
     AuthGateResult { audit: mk_audit(outcome.is_ok()), outcome }
 }
@@ -2171,6 +2202,41 @@ fn declared_return_is_html(program: &Program, service_name: &str, rpc_name: &str
         }),
         _ => false,
     })
+}
+
+/// GRAMMAR.md §3.274: ¿el programa declara un `@notFound`? `(service_name,
+/// rpc_name)` si sí -- a lo sumo uno, `check_not_found_conflicts` (checker.rs)
+/// ya lo garantiza en compile-time.
+fn not_found_rpc(program: &Program) -> Option<(&str, &str)> {
+    program.items.iter().find_map(|item| match item {
+        crate::ast::Item::Service(s) => s.members.iter().find_map(|m| match m {
+            crate::ast::Member::Rpc(r) if r.not_found() => Some((s.name.as_str(), r.name.as_str())),
+            _ => None,
+        }),
+        _ => None,
+    })
+}
+
+/// La respuesta para un path que no matchea NADA -- la página real de
+/// `@notFound` si el programa declara una, `None` si no (el caller cae
+/// entonces al 404 JSON de siempre). Reusa `handle_rpc` entero (Content-Type
+/// automático si el retorno es `Html`, `response.setStatus` si el cuerpo lo
+/// llamó) y solo AJUSTA el status: 200 (el default de `handle_rpc` cuando el
+/// cuerpo no llamó a `response.setStatus`) se reemplaza por 404 -- una
+/// página de 404 real tiene que devolver 404 de verdad para que Google la
+/// trate como tal, nunca 200 por descuido. Un status explícito que el
+/// cuerpo sí haya pedido (ej. un 410 puntual) se respeta tal cual.
+fn not_found_response(
+    program: &Program,
+    db: &Db,
+    sessions: &SessionStore,
+    token: Option<&str>,
+) -> Option<(u16, String, String)> {
+    let (service_name, rpc_name) = not_found_rpc(program)?;
+    let (status, body, content_type, _location, _cache_control) =
+        handle_rpc(program, db, sessions, token, service_name, rpc_name, serde_json::json!({}));
+    let status = if status == 200 { 404 } else { status };
+    Some((status, body, content_type))
 }
 
 /// Como `declared_content_type`, para `@cache_control("...")` (GRAMMAR.md

@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.218.0] - 2026-09-07
+
+### ✨ Añadido
+**`@notFound` -- página global de 404 real, cierra el ítem A10 de la Fase 1 ("HTTP transversal") de PLAN.md §9.24.** Un `rpc` marcado `@notFound` (retorno `Html`, sin parámetros, a lo sumo uno por programa) se invoca automáticamente para cualquier path que no matchea ninguna `@route` ni la forma `/Service/rpc` con un servicio/rpc real declarado -- en vez del `{"error": "..."}` genérico del motor. `--fallback-upstream` sigue ganando primero sin cambios (el estrangulador de una migración en curso no se ve afectado); `@notFound` es el fallback del fallback. Status 404 real siempre, salvo que el cuerpo pida otro explícitamente vía `response.setStatus`. El propio rpc tampoco es alcanzable por su dirección `/Service/rpc` normal -- visitarla directo devuelve la misma página. Ver GRAMMAR.md §3.274.
+
+`examples/site/site.link` (el entregable de la Fase 0) extendido con una página de 404 real, primer paso del entregable de la Fase 1.
+
+Verificado con 6 tests de checker + verificación manual de punta a punta contra un `linkc serve` real (path mal formado, rpc no declarado, acceso directo al propio `@notFound`, y confirmación de que un programa SIN `@notFound` sigue devolviendo el JSON de siempre). Suite completa (1387 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.217.0] - 2026-09-07
 
 ### ✨ Añadido

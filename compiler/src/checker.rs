@@ -1482,6 +1482,10 @@ impl Checker {
         // rpc individual (el mensaje ya nombra a los dos), así que estos
         // errores no pasan por `file_for`.
         errors.extend(checker.check_route_conflicts(program));
+        // Mismo motivo que `check_route_conflicts` -- "¿hay más de UN
+        // `@notFound` en todo el programa?" no es una propiedad de un rpc
+        // individual (GRAMMAR.md §3.274).
+        errors.extend(checker.check_not_found_conflicts(program));
 
         (checker, errors)
     }
@@ -2726,6 +2730,46 @@ impl Checker {
         Ok(())
     }
 
+    /// `@notFound` (GRAMMAR.md §3.274, PLAN.md §9.24 Fase 1 ítem A10) --
+    /// mismo criterio de forma EXACTO que `@cron` (arriba): única anotación
+    /// (nunca alcanzable vía HTTP directo, así que combinarla con
+    /// `@route`/`@authenticated`/etc. no tendría efecto), sin parámetros
+    /// (nada externo lo dispara con argumentos), nunca sobre un `stream`.
+    /// Difiere en el tipo de retorno exigido: `Html`, no `Void` -- este rpc
+    /// SÍ produce una respuesta real, la página que ve quien visita una URL
+    /// que no existe.
+    fn check_not_found_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        if !r.not_found() {
+            return Ok(());
+        }
+        if is_stream {
+            return Err(err(format!(
+                "`@notFound` en el stream '{}': la página de 404 es una respuesta única, no una conexión SSE -- declarala como 'rpc' (GRAMMAR.md §3.274)",
+                r.name
+            )));
+        }
+        if r.annotations.len() > 1 {
+            return Err(err(format!(
+                "'{}' combina `@notFound` con otra anotación -- este rpc nunca se llama vía HTTP directo (solo internamente cuando ningún path matchea), así que `@route`/`@authenticated`/`@rate_limit`/etc. no tendrían ningún efecto ahí (GRAMMAR.md §3.274)",
+                r.name
+            )));
+        }
+        if !r.params.is_empty() {
+            return Err(err(format!(
+                "'{}' declara `@notFound` con parámetros -- nada externo dispara este rpc con argumentos (GRAMMAR.md §3.274)",
+                r.name
+            )));
+        }
+        let ret = self.resolve_type(&r.return_type)?;
+        if !matches!(ret, Type::Html) {
+            return Err(err(format!(
+                "'{}' declara `@notFound` con retorno '{}' -- tiene que ser 'Html', la página real que se muestra (GRAMMAR.md §3.274)",
+                r.name, ret
+            )));
+        }
+        Ok(())
+    }
+
     /// `@validate(...)` (GRAMMAR.md §3.73) sobre cada campo de `fields` --
     /// llamado tanto para un `type X = { ... }` como para los campos de cada
     /// variante de un `enum` (comparten `Field`, ver `ast.rs`). Dos cosas se
@@ -3604,6 +3648,34 @@ impl Checker {
         errors
     }
 
+    /// A lo sumo UN `@notFound` en todo el programa (GRAMMAR.md §3.274) --
+    /// dos candidatos serían ambiguos (¿cuál corre cuando ningún path
+    /// matchea?), y "el primero declarado gana" es exactamente el tipo de
+    /// regla implícita que este proyecto evita (mismo motivo que
+    /// `check_route_conflicts`, arriba).
+    fn check_not_found_conflicts(&self, program: &Program) -> Vec<CheckError> {
+        let mut seen: Option<String> = None;
+        let mut errors = Vec::new();
+        for item in &program.items {
+            let Item::Service(s) = item else { continue };
+            for m in &s.members {
+                let Member::Rpc(r) = m else { continue };
+                if !r.not_found() {
+                    continue;
+                }
+                if let Some(other) = &seen {
+                    errors.push(err(format!(
+                        "'{}' declara `@notFound`, pero '{other}' ya lo había declarado -- a lo sumo UNO por programa, no hay forma determinística de elegir entre dos páginas de 404 (GRAMMAR.md §3.274)",
+                        r.name
+                    )));
+                } else {
+                    seen = Some(r.name.clone());
+                }
+            }
+        }
+        errors
+    }
+
     /// `@requires(Enum.Variante)` (GRAMMAR.md §3.14, auth v0) tiene que
     /// nombrar un enum de verdad y una variante que de verdad exista en él --
     /// si no, el error aparece acá, en tiempo de compilación, no como un 403
@@ -3623,6 +3695,7 @@ impl Checker {
         self.check_cache_annotation(r, is_stream)?;
         self.check_cors_annotation(r)?;
         self.check_cron_annotation(r, is_stream)?;
+        self.check_not_found_annotation(r, is_stream)?;
         let Some(Annotation::Requires { enum_name, variant_names, ownership }) = r.auth() else {
             return Ok(());
         };
@@ -9904,6 +9977,92 @@ type T = { id: Int, s: Status }")
         "#;
         let err = check_source(src).unwrap_err();
         assert!(err.iter().any(|e| e.message.contains("Void")), "mensaje inesperado: {err:?}");
+    }
+
+    // ---- `@notFound` (GRAMMAR.md §3.274, PLAN.md §9.24 Fase 1 ítem A10) ----
+
+    #[test]
+    fn not_found_annotation_type_checks_alone_with_no_params_and_html_return() {
+        let src = r#"
+            service Site {
+                @notFound
+                rpc pageNotFound() -> Html { html`<h1>404</h1>` }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn not_found_annotation_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @notFound
+                stream list() -> Task {
+                    db.tasks.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("notFound") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn not_found_annotation_rejects_combining_with_another_annotation() {
+        let src = r#"
+            service Site {
+                @notFound
+                @rate_limit("1/1m")
+                rpc pageNotFound() -> Html { html`<h1>404</h1>` }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("combina")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn not_found_annotation_rejects_parameters() {
+        let src = r#"
+            service Site {
+                @notFound
+                rpc pageNotFound(id: Int) -> Html { html`<h1>404</h1>` }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("parámetros")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn not_found_annotation_rejects_a_non_html_return_type() {
+        let src = r#"
+            service Site {
+                @notFound
+                rpc pageNotFound() -> String { "404" }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("Html")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn not_found_annotation_rejects_a_second_one_in_the_same_program() {
+        let src = r#"
+            service Site {
+                @notFound
+                rpc pageNotFoundA() -> Html { html`<h1>404 A</h1>` }
+                @notFound
+                rpc pageNotFoundB() -> Html { html`<h1>404 B</h1>` }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("a lo sumo UNO")),
+            "mensaje inesperado: {err:?}"
+        );
     }
 
     #[test]

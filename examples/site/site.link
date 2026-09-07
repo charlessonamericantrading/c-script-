@@ -58,6 +58,12 @@ fn notFoundBody(id: Int) -> Html {
 }
 
 service Site {
+  // PLAN.md §9.24 Fase 1 ítem A10 (GRAMMAR.md §3.274): la página que
+  // `linkc serve` invoca automáticamente para CUALQUIER path que no
+  // matchea nada -- 404 real, no el JSON del motor.
+  @notFound rpc pageNotFound() -> Html {
+    pageLayout("Página no encontrada", html`<h1>404</h1><p>La página que buscás no existe.</p>`)
+  }
   rpc home() -> Html {
     let grouped = db.cities.all().groupBy(| c: City | {
       c.province
@@ -79,6 +85,13 @@ service Site {
       c: City => pageLayout(c.name, cityDetailBody(c)), null => pageLayout("No encontrado", notFoundBody(id)),
     }
   }
+}
+
+test "pageNotFound (@notFound) devuelve una pagina 404 real" {
+  let out = Site.pageNotFound();
+  let s = out.toString();
+  assert(s.contains("<!doctype html>"));
+  assert(s.contains("<h1>404</h1>"));
 }
 
 test "home agrupa por provincia con el conteo correcto" {

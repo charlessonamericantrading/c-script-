@@ -9689,6 +9689,30 @@ fn iterate(m: Map<String, Int>) -> Int {
 
 **Con esto, PLAN.md §9.24 Fase 0 queda completa** -- los 7 ítems (A1, A4, A5, A6, A7) shipeados. Sigue: crear `examples/site/` (layout + 3 páginas + datos de `db`, con tests) como entregable verificable de que la Fase 0 realmente resuelve el problema que la motivó, y después empezar la Fase 1 (HTTP transversal).
 
+### 3.274 `@notFound`: página global de 404 real — cierra Fase 1 ítem A10 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem A10 -- un path que no matchea ninguna `@route` ni la forma `/Service/rpc` de siempre devolvía el 404 JSON del motor (`{"error": "..."}`), que no es lo que un visitante humano ni Google deberían ver. Primer ítem de la Fase 1 ("Lenguaje: HTTP transversal").
+
+<!-- linkc:check -->
+```rust
+service Site {
+  @notFound
+  rpc pageNotFound() -> Html {
+    html`<!doctype html><html><body><h1>404 -- no encontrado</h1></body></html>`
+  }
+}
+```
+
+**Un `rpc` (nunca `stream`) marcado `@notFound`, invocado automáticamente para CUALQUIER path que no matchea nada -- ni una `@route`, ni la forma `/Service/rpc` con un servicio/rpc real declarado.** Mismo criterio de forma que `@cron` (§3.159): tiene que ser la ÚNICA anotación del rpc (nunca se llama vía HTTP directo, así que `@route`/`@authenticated`/`@rate_limit`/etc. no tendrían ningún efecto ahí), sin parámetros (nada externo lo dispara con argumentos), a lo sumo UNO por programa (dos serían ambiguos: ¿cuál gana?). Difiere de `@cron` en el retorno exigido: `Html`, no `Void` -- este rpc SÍ produce una respuesta real.
+
+**`--fallback-upstream` (GRAMMAR.md §3.238) sigue ganando primero, sin cambios** -- el estrangulador de una migración en curso no se ve afectado: un path no declarado se proxea al backend viejo igual que siempre; `@notFound` es el fallback DEL fallback, solo entra en juego cuando no hay upstream configurado (o cuando ya no hace falta, migración completa).
+
+**Status 404 de verdad, siempre, salvo que el cuerpo pida otra cosa explícitamente.** El mecanismo reusa `handle_rpc` entero (mismo Content-Type automático de `-> Html`, mismo `response.setStatus` si el cuerpo lo llama) -- la única diferencia: si el cuerpo NO llamó a `response.setStatus` (el 200 default de `handle_rpc`), el servidor lo reemplaza por 404. Sin esto, una página de 404 real devolvería 200 por descuido, y Google seguiría indexando URLs muertas como si fueran contenido válido -- exactamente el problema que este ítem existe para cerrar.
+
+**El propio rpc `@notFound` tampoco es alcanzable por su dirección normal `/Service/rpc`** -- visitarla directo devuelve la MISMA página de 404 (vía el mismo mecanismo, no una copia), consistente con "nunca se llama vía HTTP directo" en vez de un caso especial que la rompería.
+
+**Verificado**: 6 tests de `checker.rs` (tipa sola con `Html` de retorno, rechazo en un `stream`, rechazo al combinar con otra anotación, rechazo con parámetros, rechazo con un retorno que no sea `Html`, rechazo de un segundo `@notFound` en el mismo programa) + verificación manual de punta a punta contra un `linkc serve` real: un path totalmente mal formado, una forma `/Service/rpc` con servicio/rpc no declarado, y el acceso directo a la dirección del propio `@notFound` -- los tres devuelven la misma página con `Content-Type: text/html; charset=utf-8` y status 404; un rpc normal (`identity`) sigue funcionando sin cambios; un programa SIN `@notFound` sigue devolviendo el 404 JSON de siempre (sin regresión). Suite completa (1387 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
