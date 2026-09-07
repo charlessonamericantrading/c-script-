@@ -90,6 +90,8 @@ pub fn format_source(src: &str) -> Result<String, String> {
             TokenKind::If => out.push_str("if"),
             TokenKind::Else => out.push_str("else"),
             TokenKind::While => out.push_str("while"),
+            TokenKind::For => out.push_str("for"),
+            TokenKind::In => out.push_str("in"),
             TokenKind::Match => out.push_str("match"),
             TokenKind::Return => out.push_str("return"),
             TokenKind::Test => out.push_str("test"),
@@ -120,6 +122,9 @@ pub fn format_source(src: &str) -> Result<String, String> {
             TokenKind::Arrow => out.push_str("->"),
             TokenKind::FatArrow => out.push_str("=>"),
             TokenKind::Dot => out.push('.'),
+            // GRAMMAR.md §3.271: sin espacios a ningún lado (`0..10`), mismo
+            // criterio visual que `Dot` para una llamada encadenada.
+            TokenKind::DotDot => out.push_str(".."),
             TokenKind::Comma => out.push(','),
             TokenKind::Colon => out.push(':'),
             TokenKind::Semi => out.push(';'),
@@ -172,12 +177,16 @@ fn needs_space_before(prev: &TokenKind, curr: &TokenKind) -> bool {
             | TokenKind::RParen
             | TokenKind::RBracket
             | TokenKind::Dot
+            | TokenKind::DotDot
             | TokenKind::Question
     ) {
         return false;
     }
 
-    if matches!(prev, TokenKind::Dot | TokenKind::Bang | TokenKind::LParen | TokenKind::LBracket | TokenKind::At) {
+    if matches!(
+        prev,
+        TokenKind::Dot | TokenKind::DotDot | TokenKind::Bang | TokenKind::LParen | TokenKind::LBracket | TokenKind::At
+    ) {
         return false;
     }
 
@@ -199,6 +208,8 @@ fn needs_space_before(prev: &TokenKind, curr: &TokenKind) -> bool {
             | TokenKind::If
             | TokenKind::Else
             | TokenKind::While
+            | TokenKind::For
+            | TokenKind::In
             | TokenKind::Match
             | TokenKind::Return
             | TokenKind::Test
@@ -299,6 +310,8 @@ fn is_word_like(kind: &TokenKind) -> bool {
             | TokenKind::If
             | TokenKind::Else
             | TokenKind::While
+            | TokenKind::For
+            | TokenKind::In
             | TokenKind::Match
             | TokenKind::Return
             | TokenKind::Test

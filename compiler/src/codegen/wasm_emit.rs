@@ -187,6 +187,17 @@ fn emit_stmt(stmt: &ast::Stmt, ctx: &mut WasmFuncCtx, func: &mut Function) -> Re
             }
             func.instruction(&Instruction::Return);
         }
+        // GRAMMAR.md §3.271: el codegen wasm nativo es solo funciones/
+        // escalares (ver la doc de este archivo más arriba) -- `for` casi
+        // siempre recorre una `List<T>`, un tipo compuesto que este backend
+        // ya no soporta en ninguna otra posición (mismo límite que ya
+        // aplica a parámetros/retornos `List<T>`). El rango entero `a..b`
+        // SÍ sería expresable con los locals que ya existen, pero separar
+        // "for-sobre-rango: sí, for-sobre-lista: no" es una distinción que
+        // ningún caso real pidió todavía -- se rechaza el `for` entero acá.
+        ast::Stmt::For { .. } => {
+            return Err("el codegen wasm nativo no soporta 'for' todavía -- usá 'while' con un índice manual".to_string())
+        }
     }
     Ok(())
 }

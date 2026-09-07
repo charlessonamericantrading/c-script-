@@ -526,6 +526,52 @@ pub(crate) fn eval_block(
                     }
                 }
             },
+            // GRAMMAR.md §3.271: azúcar sobre `while` -- cuenta contra el
+            // MISMO `step_budget`/`MAX_WHILE_ITERATIONS`, así que ningún
+            // `for` (sobre lista o rango) puede colgar un hilo para siempre.
+            // El rango NUNCA materializa un `Vec` -- un `for i in 0..n`
+            // cuenta iteración por iteración, igual que el índice manual de
+            // un `while` ya hacía, así que un `n` gigante corta por el
+            // límite de arriba antes de intentar reservar memoria (mismo
+            // motivo que ya justificó el tope de `String.repeat`, §3.270).
+            Stmt::For { var, iter, body } => match iter {
+                ForIter::List(list_expr) => {
+                    let v = eval_expr(list_expr, &local, db, fns, checker, sessions, current_token, step_budget)?;
+                    let Value::List(items) = v else {
+                        return Err(err(format!("el iterable de 'for' no es una lista en runtime: {v:?}")));
+                    };
+                    for item in items {
+                        step_budget.set(step_budget.get() + 1);
+                        if step_budget.get() > MAX_WHILE_ITERATIONS {
+                            return Err(err(format!(
+                                "límite de {MAX_WHILE_ITERATIONS} iteraciones de 'for' excedido -- \
+                                 posible loop infinito (GRAMMAR.md §3.271)"
+                            )));
+                        }
+                        let mut iter_local = local.clone();
+                        iter_local.insert(var.clone(), cell(item));
+                        eval_block(body, &iter_local, db, fns, checker, sessions, current_token, step_budget)?;
+                    }
+                }
+                ForIter::Range { start, end } => {
+                    let start_v = as_int(&eval_expr(start, &local, db, fns, checker, sessions, current_token, step_budget)?)?;
+                    let end_v = as_int(&eval_expr(end, &local, db, fns, checker, sessions, current_token, step_budget)?)?;
+                    let mut i = start_v;
+                    while i < end_v {
+                        step_budget.set(step_budget.get() + 1);
+                        if step_budget.get() > MAX_WHILE_ITERATIONS {
+                            return Err(err(format!(
+                                "límite de {MAX_WHILE_ITERATIONS} iteraciones de 'for' excedido -- \
+                                 posible loop infinito (GRAMMAR.md §3.271)"
+                            )));
+                        }
+                        let mut iter_local = local.clone();
+                        iter_local.insert(var.clone(), cell(Value::Int(i)));
+                        eval_block(body, &iter_local, db, fns, checker, sessions, current_token, step_budget)?;
+                        i += 1;
+                    }
+                }
+            },
         }
     }
     match &block.tail {
@@ -3675,6 +3721,99 @@ fn call_method(
             "contains" => {
                 let target = args.into_iter().next().ok_or_else(|| err("'contains' requiere 1 argumento"))?;
                 Ok(Value::Bool(items.contains(&target)))
+            }
+            // GRAMMAR.md §3.272 (PLAN.md §9.24 Fase 0 ítem A5).
+            "reduce" => {
+                let (initial, f) = match (args.first(), args.get(1)) {
+                    (Some(i), Some(f)) => (i.clone(), f.clone()),
+                    _ => return Err(err("'reduce' requiere 2 argumentos (initial, f)")),
+                };
+                let mut acc = initial;
+                for item in items {
+                    acc = call_callable(f.clone(), vec![acc, item], db, fns, checker, sessions, current_token, step_budget)?;
+                }
+                Ok(acc)
+            }
+            "flatMap" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'flatMap' requiere 1 argumento"))?;
+                let mut out = Vec::new();
+                for item in items {
+                    match call_callable(f.clone(), vec![item], db, fns, checker, sessions, current_token, step_budget)? {
+                        Value::List(sub) => out.extend(sub),
+                        other => return Err(err(format!("'flatMap': el callback no devolvió una lista en runtime: {other:?}"))),
+                    }
+                }
+                Ok(Value::List(out))
+            }
+            // Índices por ELEMENTO -- mismo criterio de rango que
+            // `String.substring` (§3.198), sin distinción byte/char porque
+            // acá no aplica.
+            "slice" => {
+                let (from, to) = match (args.first(), args.get(1)) {
+                    (Some(Value::Int(a)), Some(Value::Int(b))) => (*a, *b),
+                    _ => return Err(err("'slice' requiere dos argumentos Int (from, to)")),
+                };
+                let len = items.len() as i64;
+                if from < 0 || to > len || from > to {
+                    return Err(err(format!(
+                        "'slice' fuera de rango: from={from}, to={to}, longitud={len} (se exige 0 <= from <= to <= longitud)"
+                    )));
+                }
+                Ok(Value::List(items.into_iter().skip(from as usize).take((to - from) as usize).collect()))
+            }
+            // O(n²) a propósito -- mismo tamaño de dato real (cientos de
+            // elementos, ej. 504 ciudades) que ya justifica el enfoque
+            // simple de `sortBy`/`unique` en el resto del lenguaje; sin
+            // evidencia de que haga falta un `HashSet` (que además exigiría
+            // `Value: Hash`, algo que este `enum` no implementa hoy).
+            "unique" => {
+                let mut out: Vec<Value> = Vec::with_capacity(items.len());
+                for item in items {
+                    if !out.contains(&item) {
+                        out.push(item);
+                    }
+                }
+                Ok(Value::List(out))
+            }
+            // GRAMMAR.md §3.272: `Value::Struct` ordenado por PRIMERA
+            // aparición de cada clave -- mismo criterio determinista que
+            // `db.tableStats()` ya usa para `Map<String, Int>`.
+            "groupBy" => {
+                let f = args.into_iter().next().ok_or_else(|| err("'groupBy' requiere 1 argumento"))?;
+                let mut order: Vec<String> = Vec::new();
+                let mut groups: std::collections::HashMap<String, Vec<Value>> = std::collections::HashMap::new();
+                for item in items {
+                    let key_v = call_callable(f.clone(), vec![item.clone()], db, fns, checker, sessions, current_token, step_budget)?;
+                    let Value::Str(key) = key_v else {
+                        return Err(err(format!("'groupBy': el selector no devolvió un String en runtime: {key_v:?}")));
+                    };
+                    if !groups.contains_key(&key) {
+                        order.push(key.clone());
+                    }
+                    groups.entry(key).or_default().push(item);
+                }
+                let fields = order
+                    .into_iter()
+                    .map(|k| {
+                        let group_items = groups.remove(&k).expect("clave recién insertada en 'order'");
+                        (k, Value::List(group_items))
+                    })
+                    .collect();
+                Ok(Value::Struct(fields))
+            }
+            "indexOf" => {
+                let target = args.into_iter().next().ok_or_else(|| err("'indexOf' requiere 1 argumento"))?;
+                Ok(Value::Int(items.iter().position(|it| it == &target).map(|i| i as i64).unwrap_or(-1)))
+            }
+            // Se corta en la lista MÁS CORTA de las dos -- mismo
+            // comportamiento que `Iterator::zip` de Rust (y el `zip` de la
+            // mayoría de lenguajes), nunca rellena con `null`.
+            "zip" => {
+                let other = match args.into_iter().next() {
+                    Some(Value::List(o)) => o,
+                    _ => return Err(err("'zip' requiere un argumento List<U>")),
+                };
+                Ok(Value::List(items.into_iter().zip(other).map(|(a, b)| Value::Tuple(vec![a, b])).collect()))
             }
             other => Err(err(format!("método de lista desconocido: '{other}'"))),
         },

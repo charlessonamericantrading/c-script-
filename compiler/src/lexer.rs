@@ -528,7 +528,13 @@ impl Lexer {
                 }
             }
             '@' => TokenKind::At,
-            '.' => TokenKind::Dot,
+            // GRAMMAR.md §3.271: `..` (rango de un `for i in a..b { }`) es un
+            // token DISTINTO de `Dot`, nunca ambiguo con un número (un float
+            // como `1.5` ya se consume ENTERO más arriba, en `lex_number`,
+            // antes de que este método vea el `.`) ni con acceso posicional
+            // a tupla (`t.0`, que sigue siendo un `Dot` seguido de un
+            // `Int`).
+            '.' => self.one_or_two('.', TokenKind::Dot, TokenKind::DotDot),
             '+' => TokenKind::Plus,
             '*' => TokenKind::Star,
             '/' => TokenKind::Slash,
@@ -650,6 +656,65 @@ mod tests {
                 TokenKind::Dot,
                 TokenKind::Ident("foo".into()),
                 TokenKind::Eof
+            ]
+        );
+    }
+
+    // ---- `for`/`in`/`..` (GRAMMAR.md §3.271) ----
+
+    #[test]
+    fn for_in_and_dotdot_tokenize_as_their_own_kinds() {
+        assert_eq!(
+            kinds("for i in 0..n"),
+            vec![
+                TokenKind::For,
+                TokenKind::Ident("i".into()),
+                TokenKind::In,
+                TokenKind::Int(0),
+                TokenKind::DotDot,
+                TokenKind::Ident("n".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    /// `1.2` (un float) sigue lexeando como UN token -- `lex_number` ya
+    /// consume el `.` seguido de dígito ANTES de que `lex_punct` vea nada;
+    /// `1..2` en cambio nunca entra a `lex_number` para el `..` porque no
+    /// hay un dígito inmediatamente después del primer punto.
+    #[test]
+    fn dotdot_never_swallows_a_float_literal() {
+        assert_eq!(kinds("1.2"), vec![TokenKind::Float(1.2), TokenKind::Eof]);
+        assert_eq!(
+            kinds("1..2"),
+            vec![TokenKind::Int(1), TokenKind::DotDot, TokenKind::Int(2), TokenKind::Eof]
+        );
+    }
+
+    /// `t.0` (acceso posicional a tupla, GRAMMAR.md §2.2) sigue siendo un
+    /// `Dot` simple seguido de un `Int` -- no hay forma de que colisione con
+    /// `..` porque acá solo hay UN punto.
+    #[test]
+    fn single_dot_tuple_index_is_unaffected() {
+        assert_eq!(
+            kinds("t.0"),
+            vec![TokenKind::Ident("t".into()), TokenKind::Dot, TokenKind::Int(0), TokenKind::Eof]
+        );
+    }
+
+    /// `for`/`in` como palabra COMPLETA -- un identificador que solo
+    /// CONTIENE esas letras (`login`, `format`, `interior`) nunca se
+    /// confunde, porque `lex_ident_or_keyword` ya consumió el identificador
+    /// ENTERO antes de consultar la tabla de palabras clave.
+    #[test]
+    fn for_and_in_do_not_collide_with_identifiers_that_contain_them() {
+        assert_eq!(
+            kinds("login format interior"),
+            vec![
+                TokenKind::Ident("login".into()),
+                TokenKind::Ident("format".into()),
+                TokenKind::Ident("interior".into()),
+                TokenKind::Eof,
             ]
         );
     }

@@ -9584,6 +9584,65 @@ fn excerpt(body: String) -> String {
 
 **Verificado**: 5 tests de `checker.rs` (arity/tipo de cada método, incluido el rechazo de `Float.charAt`/`String` como retorno de `lines`) + 6 tests de comportamiento reales (`linkc test`) cubriendo repeat/indexOf con Unicode (`ñoño`)/charAt con Unicode/truncate corto y largo/slugify con tildes+apóstrofe+espacios múltiples/lines -- más verificación manual de los tres rechazos en runtime (`repeat` negativo, `repeat` sobre el tope de 10M, `charAt` fuera de rango). Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.271 Constructo de loop: `for` — RESUELTO, azúcar sobre `while` (cierra Fase 0 ítem A5 de PLAN.md §9.24, la mitad de sintaxis)
+
+Origen: §3.15 había dejado `for` explícitamente afuera de v0 ("agregarlo antes de que `while` se haya usado en programas reales sería azúcar prematuro"). Con `while` ya en uso real y PLAN.md §9.24 necesitando recorrer listas de cientos de elementos (504 ciudades, 52 provincias) para generar HTML, el azúcar dejó de ser prematura: `for` es sintácticamente MÁS SEGURO que `while` + índice manual (sin forma de escribir `i <= xs.length()` por error de un-off-by-one) y más legible para migrar plantillas reales.
+
+<!-- linkc:check -->
+```rust
+fn sum(xs: Int[]) -> Int {
+  let mut total = 0;
+  for x in xs {
+    total = total + x;
+  }
+  total
+}
+
+fn sum_to(n: Int) -> Int {
+  let mut total = 0;
+  for i in 0..n {
+    total = total + i;
+  }
+  total
+}
+
+test "for recorre una lista y un rango" {
+  assert(sum([1, 2, 3, 4]) == 10);
+  assert(sum_to(5) == 10); // 0+1+2+3+4, n EXCLUSIVO
+}
+```
+
+**Dos formas fijas, sin protocolo de iterador genérico**: `for x in lista { }` (recorre una `List<T>` ya evaluada, `x: T`) y `for i in a..b { }` (`a..b` es un rango entero SEMIABIERTO -- `b` exclusivo, igual que Rust -- `i: Int`). `..` es un token nuevo (`DotDot`), válido ÚNICAMENTE como rango de un `for` en v0 -- sin slicing `arr[a..b]`, sin spread `...xs`, sin rango como valor de primera clase.
+
+**Mismo trato EXACTO que `while` (§3.15) en todas las capas, a propósito -- `for` es azúcar, no un mecanismo nuevo de control de flujo**: nunca un `Expr` (siempre `Stmt`, corre por puro efecto, se chequea contra `Type::Void`), sin `break`/`continue`, `return` dentro del cuerpo RECHAZADO con el mismo mensaje (sacá el valor final con un `let mut` declarado antes del loop), y cuenta contra el MISMO `MAX_WHILE_ITERATIONS` (`step_budget` compartido) -- un `for i in 0..99999999999` corta por el límite ANTES de intentar nada, nunca materializa un rango gigante en memoria (mismo motivo que ya justificó el tope de `String.repeat`, §3.270).
+
+**La variable del loop NO sobrevive al loop** -- a diferencia de un `let mut i = 0;` declarado ANTES de un `while`, que sigue vivo después a propósito, `x`/`i` de un `for` se liga en un scope aparte que el checker descarta al salir del bloque. Referenciarla después es el mismo error que cualquier variable no declarada.
+
+**Fuera de alcance, a propósito**: `break`/`continue` (mismo motivo que `while`, §3.15); rango con paso (`0..10..2`); rango decreciente (`10..0` simplemente no itera, igual que `for i in 5..5 { }`); destructuring en el patrón (`for (k, v) in map { }`, espera a que `Map<K,V>` tenga iteración real, §3.272); codegen wasm nativo (`linkc wasm`) -- `for` sobre una `List<T>` necesita el mismo tipo compuesto que ya está fuera del alcance de ese backend, así que CUALQUIER `for` (incluido sobre un rango, que sí sería expresable) se rechaza ahí con un error claro, por consistencia en vez de una distinción arbitraria.
+
+**Verificado**: 4 tests de `lexer.rs` (`for`/`in`/`..` tokenizan aparte, `1.2` sigue siendo UN float mientras que `1..2` da tres tokens distintos, `t.0` de tupla sin cambios, `for`/`in` no colisionan con identificadores que los contienen como substring como `login`/`format`) + 9 tests de `checker.rs` (lista, lista de otro tipo de elemento, rechazo de un iterable no-lista, rango, rechazo de límites no-Int, `return` rechazado, la variable NO sobrevive al loop, `let mut` externo mutable adentro, loops anidados con su propia variable cada uno) + 6 tests de comportamiento reales (`linkc test`: suma sobre lista, rango semiabierto, rango vacío, lista de strings, anidado, mutación de una variable externa) + verificación manual de las 4 formas de rechazo (leak de variable, `return`, tipo de iterable, tipo de límite de rango) y del límite de iteraciones sobre un rango de 2.000.000 sin materializar nada. `linkc fmt` verificado a mano: `for x in xs { }`/`for i in 0..10 { }` con espaciado de palabra clave normal y `..` SIN espacios a ningún lado. Suite completa (1365 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
+### 3.272 `List<T>` completa: `reduce`/`flatMap`/`slice`/`unique`/`groupBy`/`indexOf`/`zip` — cierra Fase 0 ítem A5 de PLAN.md §9.24 (la mitad de builtins)
+
+Origen: PLAN.md §9.24.3 ítem A5 -- la otra mitad de lo que generar listas/tablas/links reales desde datos (`db`) necesitaba, junto con `for` (§3.271). Todos builtins sobre `List<T>`, sin sintaxis nueva.
+
+- **`reduce(initial: U, f: (U, T) -> U) -> U`**: el tipo del acumulador (`U`) se toma de `initial`, no se sintetiza del callback -- por eso el orden de argumentos es `(initial, f)`, DELIBERADAMENTE distinto de `.reduce(f, initial)` de JS: así `U` queda resuelto antes de tocar el callback.
+- **`flatMap(f: (T) -> List<U>) -> List<U>`**: como `.map()` pero aplana un nivel -- el checker rechaza un callback que no devuelva una lista (`.map()` es lo que corresponde ahí).
+- **`slice(from: Int, to: Int) -> List<T>`**: por índice de ELEMENTO (no aplica la distinción byte/char que sí tiene `String.substring`, §3.198) -- mismo contrato de rango, `0 <= from <= to <= length`.
+- **`unique() -> List<T>`**: dedup preservando el orden de PRIMERA aparición. Acotado a los mismos tipos de elemento "de igualdad segura" que `.contains()` (`Int`/`Int64`/`Float`/`String`/`Bool`/`Uuid`/`Timestamp` -- `Decimal`/`Struct`/`Variant` quedan afuera por el mismo motivo documentado en §3.200) -- centralizado en un único `is_safe_equality_type` para que los dos métodos (más `indexOf`, abajo) no puedan divergir por accidente.
+- **`groupBy(selector: (T) -> String) -> Map<String, T[]>`**: `K` acotado a `String` en esta ronda -- `Map<K,V>` se representa en runtime como `Value::Struct` (ver la nota de `db.tableStats()`, §3.151), que YA es string-keyed; generalizar a un `K` arbitrario exigiría decidir qué significa una clave `Int`/`Uuid` en un objeto JSON de verdad, sin ningún caso real que lo pida todavía. **`groupBy` es la primera forma de que CÓDIGO DE USUARIO construya un `Map<K,V>`** -- antes solo `db.tableStats()` lo hacía, internamente. El `Map` resultante se puede devolver, pasar, o volcar con `json.stringify(...)`, pero todavía no tiene NINGÚN método de consulta propio (`.get()`/`.has()`/etc.) -- eso es exactamente lo que falta en el ítem A6, deliberadamente afuera de esta ronda.
+- **`indexOf(item: T) -> Int`**: índice de la primera ocurrencia, `-1` si no aparece -- misma convención que `String.indexOf` (§3.270) y `Array.prototype.indexOf` de JS.
+- **`zip(other: List<U>) -> List<(T, U)>`**: empareja por posición usando el tipo `Tuple` YA existente en el lenguaje (§2.2, `t.0`/`t.1`) -- sin inventar un `{first, second}` estructural nuevo. Se corta en la lista MÁS CORTA de las dos (mismo comportamiento que `Iterator::zip` de Rust), nunca rellena con `null`.
+
+<!-- linkc:fragment -->
+```rust
+fn byProvince(cities: City[]) -> Map<String, City[]> {
+  cities.groupBy(|c: City| { c.province })
+}
+```
+
+**Verificado**: 12 tests de `checker.rs` (tipo/arity de cada uno de los 7 métodos, incluidos los rechazos: `flatMap` con callback que no devuelve lista, `unique`/`indexOf` sobre `List<Struct>`, `groupBy` con selector no-`String`, `zip` con argumento no-lista, `reduce` con callback que no matchea el acumulador) + 10 tests de comportamiento reales (`linkc test`) cubriendo los 7 métodos con datos reales, incluida la verificación del orden de `groupBy` (primera clave aparece antes que la segunda en el JSON) vía `json.stringify` -- `Map<K,V>` todavía no tiene forma de indexarse por clave desde código c-script, así que verificar su FORMA se hace por el wire, no por un método de consulta que no existe hasta A6 -- más verificación manual de `slice` fuera de rango. Suite completa (1365 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

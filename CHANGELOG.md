@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.215.0] - 2026-09-07
+
+### ✨ Añadido
+**Constructo de loop `for` + `List<T>` completa -- cierra el ítem A5 de la Fase 0 de PLAN.md §9.24 ("c-script como servidor web completo").**
+- **`for x in lista { }` / `for i in a..b { }`** -- azúcar sobre `while` (§3.15) a propósito: mismo trato EXACTO en todas las capas (nunca un `Expr`, sin `break`/`continue`, `return` en el cuerpo rechazado, cuenta contra el MISMO `MAX_WHILE_ITERATIONS` compartido -- un rango gigante corta por el límite sin materializar nada en memoria). `..` es un token nuevo (`DotDot`), rango semiabierto (`b` exclusivo, igual que Rust), válido solo como iterable de un `for` en v0. La variable del loop no sobrevive fuera de él. Ver GRAMMAR.md §3.271.
+- **`List<T>.reduce/flatMap/slice/unique/groupBy/indexOf/zip`** -- todos builtins. `reduce(initial, f)` toma el acumulador de `initial` (orden deliberadamente distinto de `.reduce(f, initial)` de JS). `groupBy(selector: (T) -> String) -> Map<String, T[]>` es la primera forma de que código de usuario construya un `Map<K,V>` (antes solo `db.tableStats()` lo hacía) -- `K` acotado a `String` esta ronda. `zip` usa el tipo `Tuple` ya existente del lenguaje, se corta en la lista más corta. `unique`/`indexOf` comparten con `contains` la misma lista acotada de tipos de igualdad segura. Ver GRAMMAR.md §3.272.
+
+Verificado con 21 tests nuevos de lexer/checker + 16 tests de comportamiento reales (`linkc test` contra el binario real, incluido un rango de 2.000.000 confirmando el tope de iteraciones sin materializar memoria). Suite completa (1365 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.214.0] - 2026-09-07
 
 ### ✨ Añadido

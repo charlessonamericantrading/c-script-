@@ -1087,6 +1087,25 @@ pub enum Stmt {
         cond: Spanned<Expr>,
         body: Block,
     },
+    /// `for x in lista { body }` / `for i in a..b { body }` (GRAMMAR.md
+    /// §3.271) -- azúcar sobre `while` a propósito: mismo trato en TODAS
+    /// las capas (nunca un `Expr`, sin `break`/`continue`, `return` en el
+    /// cuerpo rechazado, cuenta contra el MISMO `MAX_WHILE_ITERATIONS`),
+    /// exactamente la misma justificación que ya cerró `while` en §3.15.
+    For {
+        var: String,
+        iter: ForIter,
+        body: Block,
+    },
+}
+
+/// Lo que un `for` recorre -- dos formas fijas, sin protocolo de iterador
+/// genérico (GRAMMAR.md §3.271): una `List<T>` ya evaluada, o un rango
+/// entero semiabierto `a..b` (`b` EXCLUSIVO, igual que Rust).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForIter {
+    List(Spanned<Expr>),
+    Range { start: Spanned<Expr>, end: Spanned<Expr> },
 }
 
 #[derive(Debug, Clone, PartialEq)]

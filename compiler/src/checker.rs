@@ -447,6 +447,9 @@ fn block_has_return(block: &Block) -> bool {
         // "esconder" un return de este bloque -- mismo tratamiento
         // (GRAMMAR.md §3.15).
         Stmt::While { cond, body } => expr_has_return(&cond.node) || block_has_return(body),
+        // GRAMMAR.md §3.271: mismo trato que `While` -- `for` es la CUARTA
+        // forma de "esconder" un return de este bloque.
+        Stmt::For { iter, body, .. } => for_iter_has_return(iter) || block_has_return(body),
     }) || block.tail.as_deref().is_some_and(|e| expr_has_return(&e.node))
 }
 
@@ -470,6 +473,16 @@ fn expr_has_return(e: &Expr) -> bool {
         // Todo lo demás no puede contener un `return` sintácticamente --
         // `return` es una sentencia, nunca anidada dentro de una expresión.
         _ => false,
+    }
+}
+
+/// Igual que revisar `cond` de un `while` -- el iterable de un `for` es un
+/// `Expr` en posición de VALOR (podría ser un `if`/`match` que devuelva la
+/// lista/rango), así que puede esconder un `return` de la misma forma.
+fn for_iter_has_return(iter: &ForIter) -> bool {
+    match iter {
+        ForIter::List(e) => expr_has_return(&e.node),
+        ForIter::Range { start, end } => expr_has_return(&start.node) || expr_has_return(&end.node),
     }
 }
 
@@ -2001,6 +2014,39 @@ impl Checker {
                     ));
                 }
                 self.check_block(body, &Type::Void, local)
+            }
+            // GRAMMAR.md §3.271: azúcar sobre `while` -- mismo trato exacto
+            // (Void, `return` rechazado, mismo mensaje). Lo único propio de
+            // `for` es resolver el tipo de `var`: el tipo de ELEMENTO de la
+            // lista, o `Int` para un rango. `var` se liga en una copia
+            // APARTE de `local` (nunca mutando `local` directo) para que no
+            // sobreviva al loop -- a diferencia de un `let mut` declarado
+            // ANTES de un `while`, que sigue vivo después a propósito.
+            Stmt::For { var, iter, body } => {
+                let elem_ty = match iter {
+                    ForIter::List(list_expr) => match self.synth_expr(list_expr, local)? {
+                        Type::List(inner) => *inner,
+                        other => {
+                            return Err(err(format!(
+                                "'for {var} in ...' espera una List<T>, se encontró {other} (GRAMMAR.md §3.271)"
+                            )))
+                        }
+                    },
+                    ForIter::Range { start, end } => {
+                        self.check_expr(start, &Type::Int, local)?;
+                        self.check_expr(end, &Type::Int, local)?;
+                        Type::Int
+                    }
+                };
+                if block_has_return(body) {
+                    return Err(err(
+                        "'return' no está permitido dentro del cuerpo de un 'for' en v0 (GRAMMAR.md §3.271) -- \
+                         usá una variable 'mut' declarada antes del loop y un valor de cola después de él",
+                    ));
+                }
+                let mut body_env = local.clone();
+                body_env.insert(var.clone(), immutable(elem_ty));
+                self.check_block(body, &Type::Void, &body_env)
             }
         }
     }
@@ -3740,6 +3786,28 @@ impl Checker {
             Stmt::While { cond, body } => {
                 self.check_expr(cond, &Type::Bool, local)?;
                 self.check_block(body, &Type::Void, local)
+            }
+            // Mismo brazo que check_stmt, sin la validación de `return`
+            // (idéntico motivo que `While` arriba).
+            Stmt::For { var, iter, body } => {
+                let elem_ty = match iter {
+                    ForIter::List(list_expr) => match self.synth_expr(list_expr, local)? {
+                        Type::List(inner) => *inner,
+                        other => {
+                            return Err(err(format!(
+                                "'for {var} in ...' espera una List<T>, se encontró {other} (GRAMMAR.md §3.271)"
+                            )))
+                        }
+                    },
+                    ForIter::Range { start, end } => {
+                        self.check_expr(start, &Type::Int, local)?;
+                        self.check_expr(end, &Type::Int, local)?;
+                        Type::Int
+                    }
+                };
+                let mut body_env = local.clone();
+                body_env.insert(var.clone(), immutable(elem_ty));
+                self.check_block(body, &Type::Void, &body_env)
             }
         }
     }
@@ -5880,22 +5948,99 @@ impl Checker {
                 let result_ty = self.synth_callback_result(f_arg, inner, env)?;
                 Some(Type::List(Box::new(result_ty)))
             }
-            // PLAN.md §9.14 ítem 2: ¿aparece `item` en la lista? Acotado a
-            // los tipos de elemento donde `==` en runtime (Value::PartialEq)
-            // ya es sólido -- Decimal queda fuera (el bug de igualdad,
-            // §3.195, recién se cerró esta misma ronda) y también Struct/
-            // Variant (su PartialEq es sensible al ORDEN textual de un
-            // literal fuente -- un bug latente preexistente que extender
-            // `.contains()` ahí lo heredaría en silencio, fuera de alcance
-            // de esta pieza). `List<T>` anidada tampoco entra, sin evidencia
-            // de demanda todavía.
-            (Type::List(inner), "contains") if matches!(
-                inner.as_ref(),
-                Type::Int | Type::Int64 | Type::Float | Type::String | Type::Bool | Type::Uuid | Type::Timestamp
-            ) => builtin_args!(
+            // PLAN.md §9.14 ítem 2: ¿aparece `item` en la lista? Ver
+            // `is_safe_equality_type` para el motivo del tipo acotado.
+            (Type::List(inner), "contains") if Self::is_safe_equality_type(inner) => builtin_args!(
                 self, args, env, "contains",
                 [(item, "item: T", (**inner).clone())] -> Type::Bool
             ),
+            // GRAMMAR.md §3.272 (PLAN.md §9.24 Fase 0 ítem A5): completa
+            // `List<T>` para generar listas/tablas/links a partir de datos
+            // reales (ej. 504 ciudades) sin tener que salir a `while` +
+            // índice manual para cada operación.
+            //
+            // `reduce`: el tipo del ACUMULADOR (U) se conoce de ENTRADA, no
+            // hay nada que sintetizar -- a diferencia de `map`, alcanza con
+            // `synth_expr(initial)` + `check_expr` del callback contra el
+            // `Type::Function` ya armado. Orden de argumentos (initial, f)
+            // deliberado, DISTINTO del `.reduce(f, initial)` de JS: así U
+            // está resuelto ANTES de tocar el callback, sin necesitar
+            // sintetizar su tipo de retorno primero.
+            (Type::List(inner), "reduce") => {
+                let [initial_arg, f_arg] = args else {
+                    return Err(err("'reduce' toma exactamente 2 argumentos (initial: U, f: (U, T) -> U)"));
+                };
+                let acc_ty = self.synth_expr(initial_arg, env)?;
+                let expected_fn = Type::Function(vec![acc_ty.clone(), (**inner).clone()], Box::new(acc_ty.clone()));
+                self.check_expr(f_arg, &expected_fn, env)?;
+                Some(acc_ty)
+            }
+            // El caso DIFÍCIL otra vez (como `map`): el callback devuelve
+            // `List<U>`, y U no se conoce de entrada.
+            (Type::List(inner), "flatMap") => {
+                let [f_arg] = args else {
+                    return Err(err("'flatMap' toma exactamente 1 argumento (f: (T) -> List<U>)"));
+                };
+                let result_ty = self.synth_callback_result(f_arg, inner, env)?;
+                match result_ty {
+                    Type::List(u) => Some(Type::List(u)),
+                    other => {
+                        return Err(err(format!(
+                            "'flatMap' espera que el callback devuelva una List<U>, devolvió {other} -- usá 'map' si no hay nada que aplanar"
+                        )))
+                    }
+                }
+            }
+            // Índices por ELEMENTO (no byte/char como `String.substring`,
+            // acá no aplica) -- 0 <= from <= to <= length, mismo criterio de
+            // rango que `substring`/`padStart`.
+            (Type::List(inner), "slice") => builtin_args!(
+                self, args, env, "slice",
+                [(from, "from: Int", Type::Int), (to, "to: Int", Type::Int)] -> Type::List(inner.clone())
+            ),
+            (Type::List(inner), "unique") if Self::is_safe_equality_type(inner) => {
+                self.expect_no_args(args, "unique")?;
+                Some(Type::List(inner.clone()))
+            }
+            // GRAMMAR.md §3.272: `K` acotado a `String` -- `Map<K,V>`
+            // (§3.264 nota, `db.tableStats()`) se representa en runtime como
+            // `Value::Struct`, que YA es string-keyed; generalizar a un `K`
+            // arbitrario exigiría decidir qué significa una clave `Int`/
+            // `Uuid` en un objeto JSON, sin ningún caso real que lo pida
+            // todavía. `groupBy` es la primera forma de que CÓDIGO DE
+            // USUARIO construya un `Map<K,V>` (antes solo `db.tableStats()`
+            // lo hacía, internamente) -- por eso el límite se documenta acá
+            // explícito, no heredado en silencio.
+            (Type::List(inner), "groupBy") => {
+                let [f_arg] = args else {
+                    return Err(err("'groupBy' toma exactamente 1 argumento (selector: (T) -> K)"));
+                };
+                let key_ty = self.synth_callback_result(f_arg, inner, env)?;
+                if !matches!(key_ty, Type::String) {
+                    return Err(err(format!(
+                        "'groupBy': la clave es {key_ty} -- en esta ronda solo se admite String (GRAMMAR.md §3.272)"
+                    )));
+                }
+                Some(Type::MapOf(Box::new(Type::String), Box::new(Type::List(inner.clone()))))
+            }
+            (Type::List(inner), "indexOf") if Self::is_safe_equality_type(inner) => builtin_args!(
+                self, args, env, "indexOf",
+                [(item, "item: T", (**inner).clone())] -> Type::Int
+            ),
+            // El otro caso DIFÍCIL: el tipo del elemento de `other` (U) no
+            // se conoce de entrada -- se sintetiza directo (no hay callback
+            // acá, `other` ya es una expresión de valor concreto).
+            (Type::List(inner), "zip") => {
+                let [other_arg] = args else {
+                    return Err(err("'zip' toma exactamente 1 argumento (other: List<U>)"));
+                };
+                match self.synth_expr(other_arg, env)? {
+                    Type::List(u) => Some(Type::List(Box::new(Type::Tuple(vec![(**inner).clone(), *u])))),
+                    other => {
+                        return Err(err(format!("'zip' espera un argumento List<U>, se encontró {other}")))
+                    }
+                }
+            }
             _ => None,
         };
         Ok(ty)
@@ -6829,6 +6974,20 @@ impl Checker {
     /// nombre de la variante, que ningún programa real quiere.
     fn is_orderable_key(ty: &Type) -> bool {
         matches!(ty, Type::Int | Type::Int64 | Type::Float | Type::Decimal | Type::String | Type::Bool | Type::Timestamp | Type::Uuid)
+    }
+
+    /// Tipos de elemento donde `==`/`Value::PartialEq` en runtime ya es
+    /// sólido -- compartido por `List<T>.contains`/`.unique`/`.indexOf`
+    /// (GRAMMAR.md §3.270/§3.272). `Decimal` queda afuera (el bug de
+    /// igualdad, §3.195, es reciente) y también `Struct`/`Variant` (su
+    /// `PartialEq` es sensible al orden TEXTUAL de un literal fuente, un bug
+    /// latente preexistente que estos tres métodos heredarían en silencio
+    /// si se los dejara pasar). `List<T>` anidada tampoco entra, sin
+    /// evidencia de demanda todavía. Centralizado en un solo lugar para que
+    /// los tres métodos no puedan divergir por accidente si alguno se
+    /// extiende más adelante.
+    fn is_safe_equality_type(ty: &Type) -> bool {
+        matches!(ty, Type::Int | Type::Int64 | Type::Float | Type::String | Type::Bool | Type::Uuid | Type::Timestamp)
     }
 
     /// Métodos sobre una consulta ya ordenada (GRAMMAR.md §3.230): solo los
@@ -11198,6 +11357,116 @@ type T = { id: Int, s: Status }")
         assert!(check_source(src).is_err());
     }
 
+    // ---- List<T> completa: reduce/flatMap/slice/unique/groupBy/indexOf/zip (GRAMMAR.md §3.272, PLAN.md §9.24 A5) ----
+
+    #[test]
+    fn list_reduce_infers_the_accumulator_type_from_initial() {
+        let src = r#"
+            fn sum(xs: Int[]) -> Int { xs.reduce(0, |acc: Int, x: Int| { acc + x }) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+        // El acumulador es String acá, no Int -- el callback tiene que
+        // devolver String, no lo que devuelve `xs`.
+        let joined = r#"
+            fn joined(xs: String[]) -> String { xs.reduce("", |acc: String, x: String| { acc + x }) }
+        "#;
+        assert!(check_source(joined).is_ok(), "{:?}", check_source(joined));
+    }
+
+    #[test]
+    fn list_reduce_rejects_a_callback_that_does_not_match_the_accumulator_type() {
+        let src = r#"
+            fn f(xs: Int[]) -> Int { xs.reduce(0, |acc: String, x: Int| { acc }) }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn list_flat_map_flattens_the_callback_result_type() {
+        let src = r#"
+            fn expand(xs: Int[]) -> Int[] { xs.flatMap(|x: Int| { [x, x] }) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_flat_map_rejects_a_callback_that_does_not_return_a_list() {
+        let src = r#"
+            fn f(xs: Int[]) -> Int[] { xs.flatMap(|x: Int| { x }) }
+        "#;
+        assert!(check_source(src).is_err(), "'flatMap' con un callback que devuelve Int (no List<Int>) debería rechazarse");
+    }
+
+    #[test]
+    fn list_slice_takes_two_ints_and_returns_the_same_list_type() {
+        let src = r#"
+            fn f(xs: Int[]) -> Int[] { xs.slice(1, 3) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+        assert!(check_source("fn f(xs: Int[]) -> Int[] { xs.slice(1) }").is_err(), "requiere 2 argumentos");
+    }
+
+    #[test]
+    fn list_unique_on_a_safe_equality_type_returns_the_same_list_type() {
+        let src = r#"
+            fn f(xs: String[]) -> String[] { xs.unique() }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_unique_on_a_list_of_struct_is_rejected() {
+        let src = r#"
+            type Item = { id: Int }
+            fn f(xs: Item[]) -> Item[] { xs.unique() }
+        "#;
+        assert!(check_source(src).is_err(), "'.unique()' sobre List<Struct> no debería tipar, mismo motivo que '.contains()'");
+    }
+
+    #[test]
+    fn list_group_by_with_a_string_selector_returns_map_of_string_to_list() {
+        let src = r#"
+            type City = { name: String, province: String }
+            fn byProvince(cities: City[]) -> Map<String, City[]> {
+                cities.groupBy(|c: City| { c.province })
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_group_by_with_a_non_string_selector_is_rejected() {
+        let src = r#"
+            type Item = { id: Int }
+            fn f(xs: Item[]) -> Map<Int, Item[]> { xs.groupBy(|x: Item| { x.id }) }
+        "#;
+        assert!(check_source(src).is_err(), "'groupBy' en esta ronda solo admite clave String");
+    }
+
+    #[test]
+    fn list_index_of_on_a_safe_equality_type_returns_int() {
+        let src = r#"
+            fn f(xs: Int[], target: Int) -> Int { xs.indexOf(target) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_zip_infers_the_second_element_type() {
+        let src = r#"
+            fn f(names: String[], ages: Int[]) -> (String, Int)[] { names.zip(ages) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn list_zip_rejects_a_non_list_argument() {
+        let src = r#"
+            fn f(xs: Int[]) -> (Int, Int)[] { xs.zip("no es lista") }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
     // ---- pdf.build (GRAMMAR.md §3.201) ----
 
     #[test]
@@ -11511,6 +11780,98 @@ type T = { id: Int, s: Status }")
     fn assigning_to_a_non_mut_variable_inside_a_while_body_is_rejected() {
         let result = check_source("fn f() -> Int { let total = 0; while true { total = 1; } total }");
         assert!(result.is_err());
+    }
+
+    // ---- constructo de loop: `for` (GRAMMAR.md §3.271) ----
+
+    #[test]
+    fn for_over_a_list_binds_the_element_type() {
+        let src = r#"
+            fn sum(xs: Int[]) -> Int {
+                let mut total = 0;
+                for x in xs {
+                    total = total + x;
+                }
+                total
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn for_over_a_list_of_strings_binds_string_not_int() {
+        let src = r#"
+            fn f(names: String[]) -> String {
+                let mut joined = "";
+                for n in names {
+                    joined = joined + n;
+                }
+                joined
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn for_over_a_non_list_expression_is_rejected() {
+        let result = check_source("fn f() -> Int { for x in \"hola\" { } 0 }");
+        assert!(result.is_err(), "'for' sobre un String (no una lista) debería rechazarse");
+    }
+
+    #[test]
+    fn for_over_a_range_binds_int() {
+        let src = r#"
+            fn sum_to(n: Int) -> Int {
+                let mut total = 0;
+                for i in 0..n {
+                    total = total + i;
+                }
+                total
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn for_range_bounds_must_be_int() {
+        assert!(check_source("fn f() -> Int { for i in \"a\"..\"z\" { } 0 }").is_err(), "los dos extremos tienen que ser Int");
+        assert!(check_source("fn f() -> Int { for i in 0..\"z\" { } 0 }").is_err(), "el extremo final tiene que ser Int");
+    }
+
+    #[test]
+    fn return_inside_a_for_body_is_rejected() {
+        let result = check_source("fn f() -> Int { for i in 0..3 { return i; } 0 }");
+        assert!(result.is_err(), "un 'return' dentro de un 'for' debería rechazarse en v0");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("'return'"), "el error debería mencionar 'return': {msg}");
+    }
+
+    #[test]
+    fn the_for_loop_variable_does_not_leak_outside_the_loop() {
+        let result = check_source("fn f() -> Int { for i in 0..3 { } i }");
+        assert!(result.is_err(), "'i' no debería seguir visible después del 'for'");
+    }
+
+    #[test]
+    fn a_let_mut_declared_before_a_for_is_visible_and_assignable_inside() {
+        let src = "fn f(xs: Int[]) -> Int { let mut total = 0; for x in xs { total = total + x; } total }";
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn nested_for_loops_each_bind_their_own_variable() {
+        let src = r#"
+            fn count_pairs(xs: Int[], ys: Int[]) -> Int {
+                let mut count = 0;
+                for x in xs {
+                    for y in ys {
+                        count = count + 1;
+                    }
+                }
+                count
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
     }
 
     // ---- transacciones multi-escritura: `transaction { ... }` (GRAMMAR.md §3.154) ----

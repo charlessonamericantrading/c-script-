@@ -1329,6 +1329,7 @@ impl Parser {
                 TokenKind::Let => stmts.push(self.parse_let_stmt()?),
                 TokenKind::Return => stmts.push(self.parse_return_stmt()?),
                 TokenKind::While => stmts.push(self.parse_while_stmt()?),
+                TokenKind::For => stmts.push(self.parse_for_stmt()?),
                 // `identifier =` (y no `==`, ya son tokens distintos) es una
                 // asignación -- se detecta con 1 token de lookahead antes de
                 // caer al parseo genérico de expresión, igual que la
@@ -1466,6 +1467,31 @@ impl Parser {
         let body = self.parse_block()?;
         let span = merge(start, self.prev_span());
         Ok(Spanned { node: Stmt::While { cond, body }, span })
+    }
+
+    /// `for x in lista { body }` / `for i in a..b { body }` (GRAMMAR.md
+    /// §3.271) -- se parsea PRIMERO la expresión de después de `in` (misma
+    /// restricción anti-ambigüedad-con-struct-lit que `while`); si el
+    /// siguiente token es `..`, esa expresión era el extremo INICIAL de un
+    /// rango y se parsea una segunda expresión para el extremo final --
+    /// nunca al revés, así que no hace falta ningún lookahead más allá de 1
+    /// token después de tener la primera expresión completa.
+    fn parse_for_stmt(&mut self) -> Result<Spanned<Stmt>, ParseError> {
+        let start = self.span();
+        self.eat(&TokenKind::For)?;
+        let var = self.eat_ident()?;
+        self.eat(&TokenKind::In)?;
+        let first = self.parse_coalesce_expr(true)?;
+        let iter = if self.check(&TokenKind::DotDot) {
+            self.advance();
+            let end = self.parse_coalesce_expr(true)?;
+            ForIter::Range { start: first, end }
+        } else {
+            ForIter::List(first)
+        };
+        let body = self.parse_block()?;
+        let span = merge(start, self.prev_span());
+        Ok(Spanned { node: Stmt::For { var, iter, body }, span })
     }
 
     fn parse_expr(&mut self) -> Result<Spanned<Expr>, ParseError> {

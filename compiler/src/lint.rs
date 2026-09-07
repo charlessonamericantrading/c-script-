@@ -1,7 +1,7 @@
 //! Linter estático para análisis de calidad de código en Link.
 //! Detecta variables no utilizadas, mutabilidad redundante y tests vacíos.
 
-use crate::ast::{BinaryOp, Block, ConstDecl, Expr, HtmlPart, Item, Member, MatchArmBody, Program, Spanned, Stmt};
+use crate::ast::{BinaryOp, Block, ConstDecl, Expr, ForIter, HtmlPart, Item, Member, MatchArmBody, Program, Spanned, Stmt};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LintWarning {
@@ -118,6 +118,9 @@ fn lint_block(block: &Block, warnings: &mut Vec<LintWarning>) {
                 }
             }
             Stmt::While { body, .. } => {
+                lint_block(body, warnings);
+            }
+            Stmt::For { body, .. } => {
                 lint_block(body, warnings);
             }
             _ => {}
@@ -321,6 +324,16 @@ fn lint_secret_comparisons_in_block(block: &Block, warnings: &mut Vec<LintWarnin
             // acá TAMBIÉN duplicaría cada warning que caiga adentro de un
             // `while`.
             Stmt::While { cond, .. } => lint_secret_comparisons_in_expr(cond, warnings),
+            // Mismo motivo que `While` arriba -- el BODY no se recorre acá
+            // (ya lo hace `lint_block`), pero el iterable sí puede contener
+            // una comparación (ej. `for x in xs.filter(|y| secret == y)`).
+            Stmt::For { iter, .. } => match iter {
+                ForIter::List(e) => lint_secret_comparisons_in_expr(e, warnings),
+                ForIter::Range { start, end } => {
+                    lint_secret_comparisons_in_expr(start, warnings);
+                    lint_secret_comparisons_in_expr(end, warnings);
+                }
+            },
         }
     }
     if let Some(tail) = &block.tail {
@@ -433,6 +446,24 @@ fn block_uses_ident(block: &Block, target: &str) -> bool {
                     count += 1;
                 }
             }
+            // GRAMMAR.md §3.115/issue #11 otra vez, para `for`: sin este
+            // arm, `target` usado SOLO en el iterable o el cuerpo de un
+            // `for` sería invisible para `unused-var`. Sin chequeo de
+            // shadowing por `var` (si `var == target`, un uso adentro del
+            // cuerpo se cuenta igual) -- mismo límite que ya tienen
+            // `Expr::Closure`/`Expr::Match` acá mismo, no una regresión
+            // nueva de esta ronda.
+            Stmt::For { iter, body, .. } => {
+                count += match iter {
+                    ForIter::List(e) => expr_count_ident(&e.node, target),
+                    ForIter::Range { start, end } => {
+                        expr_count_ident(&start.node, target) + expr_count_ident(&end.node, target)
+                    }
+                };
+                if block_uses_ident(body, target) {
+                    count += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -450,6 +481,9 @@ fn block_reassigns_ident(block: &Block, target: &str) -> bool {
                 if block_reassigns_ident(body, target) => {
                     return true;
                 }
+            Stmt::For { body, .. } if block_reassigns_ident(body, target) => {
+                return true;
+            }
             _ => {}
         }
     }
@@ -530,6 +564,15 @@ fn block_calls_auth_identity(block: &Block) -> bool {
             Stmt::Expr(e) | Stmt::Return(Some(e)) => expr_calls_auth_identity(&e.node),
             Stmt::Return(None) => false,
             Stmt::While { cond, body } => expr_calls_auth_identity(&cond.node) || block_calls_auth_identity(body),
+            Stmt::For { iter, body, .. } => {
+                let iter_calls = match iter {
+                    ForIter::List(e) => expr_calls_auth_identity(&e.node),
+                    ForIter::Range { start, end } => {
+                        expr_calls_auth_identity(&start.node) || expr_calls_auth_identity(&end.node)
+                    }
+                };
+                iter_calls || block_calls_auth_identity(body)
+            }
         };
         if found {
             return true;

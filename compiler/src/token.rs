@@ -49,6 +49,8 @@ impl TokenKind {
             TokenKind::If => Some("if"),
             TokenKind::Else => Some("else"),
             TokenKind::While => Some("while"),
+            TokenKind::For => Some("for"),
+            TokenKind::In => Some("in"),
             TokenKind::Test => Some("test"),
             TokenKind::Transaction => Some("transaction"),
             TokenKind::True => Some("true"),
@@ -92,6 +94,13 @@ pub enum TokenKind {
     If,
     Else,
     While,
+    /// `for` (GRAMMAR.md §3.271) -- azúcar sobre `while`, nunca aparece
+    /// sola: siempre `for <ident> in <lista_o_rango> { ... }`.
+    For,
+    /// `in`, la palabra clave que separa la variable del iterable en un
+    /// `for` -- no es un operador de membresía general (no hay `x in list`
+    /// como expresión booleana en v0, eso ya lo cubre `List<T>.contains`).
+    In,
     Test,
     /// `transaction { ... }` (GRAMMAR.md §3.154).
     Transaction,
@@ -119,6 +128,11 @@ pub enum TokenKind {
     Arrow,    // ->
     FatArrow, // =>
     Dot,      // .
+    /// `..` (GRAMMAR.md §3.271) -- SOLO válido como rango de un `for i in
+    /// a..b { }` en v0, nunca un operador de propósito general (sin slicing
+    /// `arr[a..b]`, sin spread `...xs`, sin rest-pattern). `b` es EXCLUSIVO,
+    /// igual que Rust.
+    DotDot,   // ..
 
     // Operadores (GRAMMAR.md §2.3/§3.7)
     Plus,     // +
@@ -190,6 +204,8 @@ pub fn keyword_from_str(s: &str) -> Option<TokenKind> {
         "if" => TokenKind::If,
         "else" => TokenKind::Else,
         "while" => TokenKind::While,
+        "for" => TokenKind::For,
+        "in" => TokenKind::In,
         "test" => TokenKind::Test,
         "transaction" => TokenKind::Transaction,
         "true" => TokenKind::True,
