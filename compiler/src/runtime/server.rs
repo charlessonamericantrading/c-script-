@@ -432,6 +432,17 @@ pub struct ServeConfig {
     /// rpc), independiente de cualquier `@rate_limit` por rpc. `None` =
     /// sin tope global, comportamiento idéntico al de siempre.
     pub rate_limit_global: Option<RateLimitSpec>,
+    /// GRAMMAR.md §3.282 (PLAN.md §9.18 Eje E ítem 1 / §9.24 Fase 1 ítem
+    /// C14): drenado gracioso. `draining` es compartido (`Arc`, no un
+    /// `bool` de una vez) a propósito -- el CALLER (`main.rs`) instala UN
+    /// manejador de señal por PROCESO (`ctrlc::set_handler` solo se puede
+    /// llamar una vez) y lo comparte entre TODAS las instancias de `serve`
+    /// que corran en ese proceso (`serve-all` corre varias en hilos
+    /// separados del MISMO proceso) -- así una sola señal drena a todas a
+    /// la vez, no solo a la primera.
+    pub draining: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `--drain-timeout`/`LINK_DRAIN_TIMEOUT`, 10s por default.
+    pub drain_timeout: Duration,
     pub mcp_secret: Option<String>,
     /// GRAMMAR.md §3.234: `--models-dir`/`LINK_MODELS_DIR`, base de las
     /// rutas relativas de `ai { }`.
@@ -484,6 +495,8 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         frame_options,
         referrer_policy,
         rate_limit_global,
+        draining,
+        drain_timeout,
         mcp_secret,
     } = config;
     let host = host.as_str();
@@ -804,7 +817,15 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     // `cors`/`hsts`/`service_api_key` son pequeños (un enum con un
     // `Vec<String>` a lo sumo, dos `Option<String>`) -- clonarlos por
     // request es más simple que otro `Arc` y el costo es insignificante.
-    // GRAMMAR.md §3.241: requests en vuelo, para `--max-concurrency`.
+    // GRAMMAR.md §3.241: requests en vuelo, para `--max-concurrency`. GRAMMAR.md
+    // §3.282: el MISMO contador, ahora incrementado SIEMPRE (no solo con
+    // `--max-concurrency` configurado) -- el drenado gracioso necesita saber
+    // cuántas requests reales siguen en vuelo sin importar si hay un tope
+    // configurado o no. Una conexión SSE/MCP de larga duración NO cuenta
+    // (el hilo que este contador rastrea entrega la request a su propio
+    // hilo escritor y vuelve enseguida, ver `write_live_stream`/`write_stream`
+    // más abajo), así que esperar a que este contador llegue a 0 nunca
+    // cuelga el drenado esperando una conexión de streaming.
     let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     macro_rules! spawn_handler {
         ($request:expr) => {{
@@ -824,22 +845,24 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
             let mcp_secret = mcp_secret.clone();
             let mcp_state = mcp_state.clone();
             let fallback_upstream = fallback_upstream.clone();
+            let draining = std::sync::Arc::clone(&draining);
             let request = $request;
-            // GRAMMAR.md §3.241: admisión ANTES de gastar un hilo. `/live`
-            // nunca cuenta ni se rechaza: un orquestador tiene que poder
-            // preguntar "¿vivo?" justo cuando el proceso está saturado.
-            let counted = max_concurrency.is_some() && request.url() != "/live";
-            let admitted = match max_concurrency {
-                Some(max) if counted => {
-                    let before = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if before >= max {
+            // GRAMMAR.md §3.241/§3.282: admisión ANTES de gastar un hilo.
+            // `/live` nunca cuenta ni se rechaza: un orquestador tiene que
+            // poder preguntar "¿vivo?" justo cuando el proceso está
+            // saturado O drenando.
+            let counted = request.url() != "/live";
+            let admitted = if counted {
+                let before = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match max_concurrency {
+                    Some(max) if before >= max => {
                         in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                         false
-                    } else {
-                        true
                     }
+                    _ => true,
                 }
-                _ => true,
+            } else {
+                true
             };
             if !admitted {
                 metrics_store.lock().record_saturated();
@@ -869,6 +892,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                     &frame_options,
                     &referrer_policy,
                     rate_limit_global,
+                    &draining,
                     max_body_bytes,
                     trust_proxy,
                     service_api_key.as_deref(),
@@ -878,6 +902,12 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                     fallback_upstream.as_deref(),
                     request,
                 );
+                // `/live` nunca incrementó `in_flight` (arriba) -- decrementar
+                // acá sin este chequeo restaría de un contador que esta
+                // request nunca sumó, subyacándolo (`AtomicUsize` da la
+                // vuelta a un número gigante en vez de negativo) y rompiendo
+                // TODA cuenta de `--max-concurrency`/drenado hasta el próximo
+                // reinicio.
                 if counted {
                     in_flight_for_thread.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -886,58 +916,72 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         }};
     }
 
-    match remote_changes {
-        None => {
-            for request in server.incoming_requests() {
-                spawn_handler!(request);
+    // GRAMMAR.md §3.282 (PLAN.md §9.18 Eje E ítem 1 / §9.24 Fase 1 ítem
+    // C14): las DOS formas de esperar la próxima request (bloqueante de
+    // siempre vs. con timeout para drenar cambios remotos, comentario de
+    // arriba) se unifican en UNA sola -- las dos necesitan revisar
+    // `draining` entre una request y la siguiente, y `recv_timeout` es lo
+    // que hace eso posible sin agregar un hilo/timer nuevo. El costo real
+    // (despertar cada `DRAIN_POLL_INTERVAL` aunque no llegue nada) ya lo
+    // pagaba el camino `Some(remote_rx)`; ahora lo paga también el camino
+    // sin Postgres, a cambio de que un `Ctrl-C`/SIGTERM se note en como
+    // mucho ese intervalo en vez de nunca.
+    let poll_interval = if remote_changes.is_some() { REMOTE_CHANGE_POLL_INTERVAL } else { DRAIN_POLL_INTERVAL };
+    loop {
+        if let Some(remote_rx) = &remote_changes {
+            while let Ok(change) = remote_rx.try_recv() {
+                // GRAMMAR.md §3.150: latencia real de propagación --
+                // `sent_at_ms` viajó en el propio payload del NOTIFY
+                // (armado por la instancia que escribió), nunca un
+                // valor local inventado. `max(0, ...)` por si los
+                // relojes de las dos instancias están levemente
+                // desalineados -- una latencia negativa no tiene
+                // sentido y solo ensuciaría el promedio.
+                let latency_ms = (now_ms() - change.sent_at_ms).max(0);
+                metrics_store.lock().record_notify_latency(std::time::Duration::from_millis(latency_ms as u64));
+                match &change.external {
+                    // GRAMMAR.md §3.225: escritura de OTRO sistema,
+                    // anunciada por el trigger de `linkc triggers`.
+                    Some(external) => db.publish_external(&change.collection, external),
+                    None => db.publish_remote(&change.collection, change.event),
+                }
             }
-            // Inalcanzable en la práctica -- `incoming_requests()` solo
-            // termina si el `Server` se apaga desde OTRO hilo (`.unblock()`),
-            // algo que `serve` nunca hace hoy. Existe para que el tipo de
-            // retorno sea honesto (`Result`, no un `loop {}` que tipa `!`).
-            Ok(())
+            // GRAMMAR.md §3.150: reintenta cualquier NOTIFY que haya
+            // fallado por una conexión caída transitoria -- mismo tick
+            // que ya drena `remote_rx` arriba, sin ningún hilo/timer nuevo.
+            db.flush_pending_notify_retries();
         }
-        Some(remote_rx) => {
-            // Además de aceptar requests, hay que drenar los cambios que
-            // anunciaron OTRAS instancias (GRAMMAR.md §3.44) -- por eso
-            // `recv_timeout` en vez del `incoming_requests()` bloqueante de
-            // siempre: sin esto, un cambio remoto podría quedar esperando
-            // indefinidamente si no llega ninguna request HTTP nueva que
-            // "despierte" al loop. Este loop en sí sigue siendo UN solo
-            // hilo -- lo único que cambia con el Pilar 1 es que YA NO
-            // procesa la request en línea, la delega a un hilo nuevo y
-            // sigue enseguida a la próxima vuelta.
-            loop {
-                while let Ok(change) = remote_rx.try_recv() {
-                    // GRAMMAR.md §3.150: latencia real de propagación --
-                    // `sent_at_ms` viajó en el propio payload del NOTIFY
-                    // (armado por la instancia que escribió), nunca un
-                    // valor local inventado. `max(0, ...)` por si los
-                    // relojes de las dos instancias están levemente
-                    // desalineados -- una latencia negativa no tiene
-                    // sentido y solo ensuciaría el promedio.
-                    let latency_ms = (now_ms() - change.sent_at_ms).max(0);
-                    metrics_store.lock().record_notify_latency(std::time::Duration::from_millis(latency_ms as u64));
-                    match &change.external {
-                        // GRAMMAR.md §3.225: escritura de OTRO sistema,
-                        // anunciada por el trigger de `linkc triggers`.
-                        Some(external) => db.publish_external(&change.collection, external),
-                        None => db.publish_remote(&change.collection, change.event),
-                    }
-                }
-                // GRAMMAR.md §3.150: reintenta cualquier NOTIFY que haya
-                // fallado por una conexión caída transitoria -- mismo tick
-                // que ya drena `remote_rx` arriba, sin ningún hilo/timer
-                // nuevo.
-                db.flush_pending_notify_retries();
-                match server.recv_timeout(REMOTE_CHANGE_POLL_INTERVAL) {
-                    Ok(Some(request)) => spawn_handler!(request),
-                    Ok(None) => {}
-                    Err(e) => eprintln!("error aceptando una conexión: {e}"),
-                }
-            }
+        // GRAMMAR.md §3.282: revisado en CADA vuelta, antes de aceptar la
+        // próxima request -- una señal recibida mientras el loop esperaba
+        // en `recv_timeout` se nota acá, como mucho `poll_interval` después.
+        if draining.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        match server.recv_timeout(poll_interval) {
+            Ok(Some(request)) => spawn_handler!(request),
+            Ok(None) => {}
+            Err(e) => eprintln!("error aceptando una conexión: {e}"),
         }
     }
+
+    // GRAMMAR.md §3.282: el loop de arriba ya dejó de aceptar -- lo único
+    // que falta es esperar a que las requests YA en vuelo (`in_flight`,
+    // incrementado por `spawn_handler!` de arriba) terminen solas, hasta
+    // `drain_timeout`. Poll corto (no otro canal/`Condvar`): el número de
+    // wakeups de sobra en el peor caso (unos pocos por segundo, por unos
+    // pocos segundos) no vale la complejidad de sincronización real.
+    eprintln!("señal de apagado recibida -- drenando requests en vuelo (hasta {drain_timeout:?})...");
+    let drain_started = std::time::Instant::now();
+    while in_flight.load(std::sync::atomic::Ordering::SeqCst) > 0 && drain_started.elapsed() < drain_timeout {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let remaining = in_flight.load(std::sync::atomic::Ordering::SeqCst);
+    if remaining > 0 {
+        eprintln!("drenado incompleto: {remaining} request(s) seguían en vuelo después de {drain_timeout:?}, saliendo de todos modos");
+    } else {
+        eprintln!("drenado completo en {:?}, saliendo", drain_started.elapsed());
+    }
+    Ok(())
 }
 
 /// Cada cuánto el loop principal vuelve a revisar el canal de cambios
@@ -946,6 +990,13 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
 /// cross-instancia no se sienta atrasada en un servidor inactivo, sin
 /// gastar CPU despertando el loop con más frecuencia de la que hace falta.
 const REMOTE_CHANGE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// GRAMMAR.md §3.282: cada cuánto el accept loop revisa `draining` cuando
+/// NO hay cambios remotos que drenar (así que no tiene ya un intervalo de
+/// poll propio) -- mismo orden de magnitud que `REMOTE_CHANGE_POLL_INTERVAL`,
+/// lo bastante seguido para que un `Ctrl-C`/SIGTERM se sienta inmediato,
+/// sin gastar CPU de más en un servidor inactivo.
+const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// El cuerpo de siempre del loop principal, extraído a función para poder
 /// llamarse desde las dos formas de esperar la próxima request (bloqueante
@@ -968,6 +1019,7 @@ fn handle_request(
     frame_options: &str,
     referrer_policy: &str,
     rate_limit_global: Option<RateLimitSpec>,
+    draining: &std::sync::atomic::AtomicBool,
     max_body_bytes: u64,
     trust_proxy: bool,
     service_api_key: Option<&str>,
@@ -1211,15 +1263,21 @@ fn handle_request(
         return;
     }
     if path == "/ready" {
-        let (status, db_check) = match db.health_check() {
+        // GRAMMAR.md §3.282: `draining` gana sobre el chequeo de base --
+        // una vez que el proceso empezó a apagarse, no importa si la base
+        // sigue respondiendo, un proxy tiene que dejar de enrutar tráfico
+        // nuevo hacia acá.
+        let is_draining = draining.load(std::sync::atomic::Ordering::SeqCst);
+        let (db_status, db_check) = match db.health_check() {
             Ok(()) => (200, serde_json::json!("ok")),
             Err(e) => (503, serde_json::json!(e)),
         };
+        let status = if is_draining { 503 } else { db_status };
         let body = serde_json::json!({
             "status": if status == 200 { "ready" } else { "not_ready" },
             "engine": "c-script",
             "version": crate::VERSION,
-            "checks": { "database": db_check },
+            "checks": { "database": db_check, "draining": is_draining },
         })
         .to_string();
         let resp = cors_response(status, body, &cors_headers, &request);

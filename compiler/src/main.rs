@@ -316,7 +316,7 @@ fn print_usage(to_stderr: bool) {
     out("     linkc db import <archivo.link> <archivo.json> [--db <url|archivo>] [--db-schema <nombre>] (escribe las filas de un archivo de 'db export' contra un target, preservando el id original de cada fila -- un target vacío ES el caso 'seed')");
     out("     linkc db shell <archivo.link> [--db <url|archivo>] [--db-schema <nombre>] (REPL de solo lectura sobre stdin/stdout, una consulta SQL por línea -- SQLite abre de solo lectura, Postgres corre con default_transaction_read_only)");
     out("     linkc dev <archivo.link> <outdir>      (observa y reconstruye automáticamente)");
-    out("     linkc serve <archivo.link> <puerto> [--db <url>] [--db-schema <nombre>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--mcp-jwt-secret <secreto>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]  (servidor HTTP; sin tope de requests en vuelo por default, o backpressure real vía --max-concurrency/LINK_MAX_CONCURRENCY: la request N+1 recibe 503 + Retry-After en vez de un hilo, /live nunca cuenta, GRAMMAR.md §3.241; toda request que este .link no declara (path sin forma /Service/rpc, o rpc inexistente) se reenvía tal cual al backend viejo vía --fallback-upstream/LINK_FALLBACK_UPSTREAM y se devuelve su status/body -- el estrangulador a nivel de proceso, GRAMMAR.md §3.238; modelos de 'ai { }' resueltos al arrancar -- nombre de Ollama ya descargado o ruta .gguf relativa a --models-dir/LINK_MODELS_DIR, con --ai-memory-budget-mb/LINK_AI_MEMORY_BUDGET_MB como tope de modelos residentes a la vez, GRAMMAR.md §3.234; ai.generate/ai.chat con timeout de 60s por default, configurable vía --ai-timeout/LINK_AI_TIMEOUT, GRAMMAR.md §3.235; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; pool de conexiones PostgreSQL con 10 por default, o configurable vía --db-pool-size/LINK_DATABASE_POOL_SIZE; sin schema propio por default (el 'public' de siempre), o namespacing vía --db-schema/LINK_DATABASE_SCHEMA (crea el schema si no existe, salvo --adopt-existing) para compartir una base entre varios .link sin colisión de nombre de tabla -- solo PostgreSQL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; clave de @encrypted vía --encryption-key/LINK_ENCRYPTION_KEY (32 bytes en base64), obligatoria si el programa declara algún campo @encrypted; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante; X-Frame-Options en 'DENY' por default, o 'SAMEORIGIN' vía --frame-options/LINK_FRAME_OPTIONS; Referrer-Policy en 'no-referrer' por default, o uno de los 8 tokens válidos vía --referrer-policy/LINK_REFERRER_POLICY, ej. 'strict-origin-when-cross-origin', GRAMMAR.md §3.280; sin tope de rate limit GLOBAL por default (solo el de cada @rate_limit individual, si el programa declara alguno), o un tope para TODO el sitio por IP vía --rate-limit-global/LINK_RATE_LIMIT_GLOBAL, mismo formato 'N/ventana' que @rate_limit, ej. '200/15m', GRAMMAR.md §3.281)");
+    out("     linkc serve <archivo.link> <puerto> [--db <url>] [--db-schema <nombre>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--drain-timeout <duración>] [--mcp-jwt-secret <secreto>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]  (servidor HTTP; sin tope de requests en vuelo por default, o backpressure real vía --max-concurrency/LINK_MAX_CONCURRENCY: la request N+1 recibe 503 + Retry-After en vez de un hilo, /live nunca cuenta, GRAMMAR.md §3.241; toda request que este .link no declara (path sin forma /Service/rpc, o rpc inexistente) se reenvía tal cual al backend viejo vía --fallback-upstream/LINK_FALLBACK_UPSTREAM y se devuelve su status/body -- el estrangulador a nivel de proceso, GRAMMAR.md §3.238; modelos de 'ai { }' resueltos al arrancar -- nombre de Ollama ya descargado o ruta .gguf relativa a --models-dir/LINK_MODELS_DIR, con --ai-memory-budget-mb/LINK_AI_MEMORY_BUDGET_MB como tope de modelos residentes a la vez, GRAMMAR.md §3.234; ai.generate/ai.chat con timeout de 60s por default, configurable vía --ai-timeout/LINK_AI_TIMEOUT, GRAMMAR.md §3.235; SQLite embebido, o PostgreSQL con --db/LINK_DATABASE_URL; pool de conexiones PostgreSQL con 10 por default, o configurable vía --db-pool-size/LINK_DATABASE_POOL_SIZE; sin schema propio por default (el 'public' de siempre), o namespacing vía --db-schema/LINK_DATABASE_SCHEMA (crea el schema si no existe, salvo --adopt-existing) para compartir una base entre varios .link sin colisión de nombre de tabla -- solo PostgreSQL; escucha en todas las interfaces (0.0.0.0) por default, o solo en una dirección puntual vía --host/LINK_HOST, ej. '127.0.0.1'; CORS abierto por default, o allowlist con --cors-origin/LINK_CORS_ORIGINS; sesiones sin expiración por default, o con TTL vía --session-ttl/LINK_SESSION_TTL, ej. '7d'; costo de crypto.hashPassword al default de Argon2id, o configurable vía --argon2-memory-kib/LINK_ARGON2_MEMORY_KIB y --argon2-iterations/LINK_ARGON2_ITERATIONS; clave de @encrypted vía --encryption-key/LINK_ENCRYPTION_KEY (32 bytes en base64), obligatoria si el programa declara algún campo @encrypted; sin JWT externo por default, o verificando JWTs HS256 de un backend ya existente vía --jwt-secret/LINK_JWT_SECRET, con --jwt-role-claim/LINK_JWT_ROLE_CLAIM y --jwt-user-id-claim/LINK_JWT_USER_ID_CLAIM para elegir qué claims traen el rol y el id, default 'role'/'sub'; body de request acotado a 10 MiB por default, configurable vía --max-body-bytes/LINK_MAX_BODY_BYTES (bytes); llamadas http.* salientes con timeout de 30s por default, configurable vía --http-timeout/LINK_HTTP_TIMEOUT (ej. '10s'); @rate_limit identifica por remote_addr() por default, o por X-Forwarded-For con --trust-proxy/LINK_TRUST_PROXY (solo detrás de un proxy de confianza); crea/migra tablas por default, o --adopt-existing/LINK_ADOPT_EXISTING para asumir que ya existen y no tocar DDL; sin reintento nativo por default, o backoff exponencial ante un fallo de bind/conexión vía --restart-backoff/LINK_RESTART_BACKOFF, ej. '1s'; sin autenticación servidor-a-servidor por default, o exigir el header X-Service-Api-Key en toda request que no sea /health vía --service-api-key/LINK_SERVICE_API_KEY; log de texto por default, o JSON por línea vía --log-format/LINK_LOG_FORMAT; nivel de log 'info' por default -- las dos líneas por request de siempre --, o 'warn'/'error' para solo ver 4xx/5xx en producción con tráfico real, vía --log-level/LINK_LOG_LEVEL; sin Strict-Transport-Security por default -- linkc serve nunca termina TLS por sí solo --, o con el valor literal que se pase vía --hsts/LINK_HSTS, ej. 'max-age=63072000; includeSubDomains', SOLO si un proxy de confianza termina TLS delante; X-Frame-Options en 'DENY' por default, o 'SAMEORIGIN' vía --frame-options/LINK_FRAME_OPTIONS; Referrer-Policy en 'no-referrer' por default, o uno de los 8 tokens válidos vía --referrer-policy/LINK_REFERRER_POLICY, ej. 'strict-origin-when-cross-origin', GRAMMAR.md §3.280; sin tope de rate limit GLOBAL por default (solo el de cada @rate_limit individual, si el programa declara alguno), o un tope para TODO el sitio por IP vía --rate-limit-global/LINK_RATE_LIMIT_GLOBAL, mismo formato 'N/ventana' que @rate_limit, ej. '200/15m', GRAMMAR.md §3.281; SIGTERM/Ctrl-C dispara drenado gracioso -- deja de aceptar, espera a que las requests en vuelo terminen solas hasta --drain-timeout/LINK_DRAIN_TIMEOUT (10s por default), recién ahí sale con código 0, GRAMMAR.md §3.282)");
     out("     linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--service-api-key-exempt <nombre1,nombre2,...>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>] [mismos flags globales que 'linkc serve', salvo --db]  (UN proceso sirve TODOS los .link de <directorio>, cada uno en su propio hilo y puerto N/N+1/N+2/... en orden alfabético; cada servicio conserva su propio archivo SQLite -- --db/LINK_DATABASE_URL compartido no está soportado; --port-map-out escribe {\"nombre_archivo\": puerto, ...} a un JSON antes de arrancar, para que un gateway externo lea la asignación real en vez de replicarla a mano)");
     out("     linkc lsp                              (inicia el servidor Language Server Protocol)");
     out("     linkc --version                        (imprime la versión exacta de este binario -- la misma que queda estampada en cada archivo que 'linkc build' genera)");
@@ -2315,7 +2315,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--mcp-jwt-secret <clave>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--drain-timeout <duración>] [--mcp-jwt-secret <clave>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
         );
         return ExitCode::FAILURE;
     };
@@ -2477,6 +2477,29 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let drain_timeout = match resolve_drain_timeout(args) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // GRAMMAR.md §3.282 (PLAN.md §9.18 Eje E ítem 1 / §9.24 Fase 1 ítem
+    // C14): UN manejador de señal para todo el proceso -- `ctrlc::
+    // set_handler` solo se puede llamar una vez, y `linkc serve` (a
+    // diferencia de `serve-all`) corre un solo servicio, así que esto es
+    // seguro acá. El handler en sí solo fija el flag -- el drenado real
+    // corre en el loop principal de `runtime::server::serve`.
+    let draining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let draining = std::sync::Arc::clone(&draining);
+        if let Err(e) = ctrlc::set_handler(move || {
+            draining.store(true, std::sync::atomic::Ordering::SeqCst);
+        }) {
+            eprintln!("no se pudo instalar el manejador de señal para el drenado gracioso: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     let mcp_secret = match resolve_mcp_config(args) {
         Ok(s) => s,
@@ -2564,6 +2587,8 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         frame_options,
         referrer_policy,
         rate_limit_global,
+        draining,
+        drain_timeout,
         mcp_secret,
     };
     let attempt = || runtime::server::serve(&program, config.clone());
@@ -2841,7 +2866,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
     };
     let Some(dir) = args.first() else {
         eprintln!(
-            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--service-api-key-exempt <nombre1,nombre2,...>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
+            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--service-api-key-exempt <nombre1,nombre2,...>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--drain-timeout <duración>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
         );
         return ExitCode::FAILURE;
     };
@@ -3084,6 +3109,28 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let drain_timeout = match resolve_drain_timeout(args) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // GRAMMAR.md §3.282: UN manejador de señal para TODO el proceso
+    // `serve-all` -- `ctrlc::set_handler` solo se puede llamar una vez, y
+    // acá corren VARIOS servicios en hilos separados del MISMO proceso, así
+    // que el flag se comparte (mismo `Arc`) entre todos: una sola señal
+    // drena a todos a la vez.
+    let draining = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let draining = std::sync::Arc::clone(&draining);
+        if let Err(e) = ctrlc::set_handler(move || {
+            draining.store(true, std::sync::atomic::Ordering::SeqCst);
+        }) {
+            eprintln!("no se pudo instalar el manejador de señal para el drenado gracioso: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     let mcp_secret = match resolve_mcp_config(args) {
         Ok(s) => s,
         Err(msg) => {
@@ -3213,6 +3260,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             let hsts = hsts.clone();
             let frame_options = frame_options.clone();
             let referrer_policy = referrer_policy.clone();
+            let draining = std::sync::Arc::clone(&draining);
             let mcp_secret = mcp_secret.clone();
             let label = path.to_string_lossy().to_string();
             let (models_dir, ai_memory_budget_bytes, ai_timeout) = ai_flags.clone();
@@ -3252,6 +3300,8 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
                     frame_options,
                     referrer_policy,
                     rate_limit_global,
+                    draining,
+                    drain_timeout,
                     mcp_secret,
                 };
                 let attempt = || runtime::server::serve(&program, config.clone());
@@ -3349,6 +3399,19 @@ fn resolve_http_timeout(args: &[String]) -> Result<std::time::Duration, String> 
     let raw = read_flag_or_env(args, "--http-timeout", "LINK_HTTP_TIMEOUT")?;
     let Some(raw) = raw else {
         return Ok(std::time::Duration::from_secs(30));
+    };
+    parse_duration(&raw)
+}
+
+/// GRAMMAR.md §3.282 (PLAN.md §9.18 Eje E ítem 1 / §9.24 Fase 1 ítem C14):
+/// `--drain-timeout`/`LINK_DRAIN_TIMEOUT` -- cuánto espera el drenado
+/// gracioso a que las requests en vuelo terminen solas antes de salir de
+/// todos modos. 10s por default -- PLAN.md ya lo proponía como default;
+/// mismo parser que `--http-timeout`/`--session-ttl` (`parse_duration`).
+fn resolve_drain_timeout(args: &[String]) -> Result<std::time::Duration, String> {
+    let raw = read_flag_or_env(args, "--drain-timeout", "LINK_DRAIN_TIMEOUT")?;
+    let Some(raw) = raw else {
+        return Ok(std::time::Duration::from_secs(10));
     };
     parse_duration(&raw)
 }

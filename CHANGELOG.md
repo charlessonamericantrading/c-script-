@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.226.0] - 2026-09-07
+
+### ✨ Añadido
+**Drenado gracioso ante SIGTERM/Ctrl-C -- cierra PLAN.md §9.18 Eje E ítem 1 y el ítem C14 de la Fase 1 de §9.24.** Hasta ahora `linkc serve` no instalaba ningún manejador de señales -- una request en curso durante un `pm2 restart`/`systemctl restart` simplemente se cortaba a mitad, una regresión operativa real frente al Express que reemplaza. Ahora, al recibir `SIGTERM`/`SIGINT` (Unix) o `Ctrl-C`/`Ctrl-Break`/cierre de consola (Windows): deja de aceptar conexiones nuevas, `/ready` pasa a 503 de inmediato (`checks: {draining: true}`), espera a que las requests YA en vuelo terminen solas hasta `--drain-timeout`/`LINK_DRAIN_TIMEOUT` (10s por default), y sale con código 0. `/live` nunca cuenta ni deja de responder. `serve-all` comparte un solo manejador de señal entre todos sus servicios (proceso único, hilos separados). `ctrlc` -- novena excepción real a "cero dependencias nuevas" -- porque señales en Unix y Windows son dos APIs nativas sin nada en común. Fuera de alcance a propósito: streams SSE/MCP no reciben un evento final de cierre durante el drenado (quedan cortados al salir, igual que antes). Ver GRAMMAR.md §3.282 (actualiza §3.17, que documentaba el comportamiento viejo).
+
+El conteo de requests en vuelo (`in_flight`, ya existía para `--max-concurrency`, §3.241) pasó a incrementarse SIEMPRE (antes solo con ese flag configurado) -- el drenado necesita saberlo sin importar si hay un tope de concurrencia. Bug real encontrado y corregido ANTES de shippear: la primera versión de este cambio decrementaba `in_flight` incondicionalmente al terminar cada request, pero `/live` nunca lo incrementa -- eso producía un underflow de `AtomicUsize` (da la vuelta a un número gigante) que rompía TODA la lógica de `--max-concurrency` hasta el próximo reinicio. Atrapado por `cli_max_concurrency.rs` (test ya existente) en la corrida de la suite COMPLETA -- la suite `--lib` sola no lo hubiera visto, porque ese test vive en `tests/` (subprocesos reales); recordatorio concreto de por qué "corrí `--lib` y salió verde" no alcanza antes de shippear un cambio al accept loop.
+
+Verificado con 2 tests de integración nuevos en `cli_graceful_drain.rs`, cada uno mandando la señal REAL de su plataforma (nunca `Child::kill()`, que es SIGKILL en Unix) -- `libc::kill(pid, SIGTERM)` en Unix, `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)` en Windows contra un hijo creado con `CREATE_NEW_PROCESS_GROUP` -- confirmando que una request lenta ya en vuelo termina con éxito en vez de cortarse, y que un `--drain-timeout` corto de verdad corta la espera en vez de colgarse. Suite completa sin regresiones tras el fix del underflow, `cargo clippy -D warnings` limpio.
+
 ## [1.225.0] - 2026-09-07
 
 ### ✨ Añadido
