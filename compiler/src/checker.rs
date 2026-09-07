@@ -5794,6 +5794,21 @@ impl Checker {
                 self.check_expr(hash, &Type::String, env)?;
                 Some(Type::Bool)
             }
+            // GRAMMAR.md §3.284 (PLAN.md §9.24 Fase 2 ítem D1): verificación
+            // de un formato de hash AJENO (`pbkdf2:<iter>:<salt>:<hashHex>`,
+            // el que un boilerplate típico de Node genera con
+            // `crypto.pbkdf2Sync`) -- deliberadamente SEPARADO de
+            // `verifyPassword` (que solo entiende Argon2id/bcrypt/el legado
+            // `sha256$...` propio de este lenguaje), para no convertir ese
+            // método en un parser universal de formatos de terceros.
+            (Type::Crypto, "verifyPbkdf2Sha256") => {
+                let [pwd, stored] = args else {
+                    return Err(err("'crypto.verifyPbkdf2Sha256' toma exactamente 2 argumentos (password: String, stored: String)"));
+                };
+                self.check_expr(pwd, &Type::String, env)?;
+                self.check_expr(stored, &Type::String, env)?;
+                Some(Type::Bool)
+            }
             (Type::Crypto, "isLegacyHash") => {
                 let [hash] = args else {
                     return Err(err("'crypto.isLegacyHash' toma exactamente 1 argumento (hash: String)"));

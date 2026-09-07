@@ -8,6 +8,7 @@ pub mod db;
 pub(crate) mod encryption;
 pub(crate) mod excel;
 pub mod mcp;
+pub(crate) mod pbkdf2;
 pub(crate) mod pdf;
 pub mod server;
 pub mod session;
@@ -4441,6 +4442,49 @@ fn call_method(
                         .verify_password(pwd.as_bytes(), &parsed)
                         .is_ok(),
                 ))
+            }
+            // GRAMMAR.md §3.284: `pbkdf2:<iter>:<salt>:<hashHex>` -- el
+            // formato de un boilerplate típico de Node
+            // (`crypto.pbkdf2Sync(password, salt, iter, hashHex.length/2,
+            // 'sha256')`, salt usada TAL CUAL como bytes UTF-8, no
+            // hex-decodeada -- la convención más común para este template
+            // exacto). El largo de la clave derivada se toma de
+            // `hashHex.len()/2`, no de un valor fijo, así que funciona sea
+            // cual sea el `dkLen` con el que el valor original se generó.
+            // Cualquier desvío del formato (partes de más/menos, iteraciones
+            // no numéricas, hex inválido) falla CERRADO con `false` -- igual
+            // que `verifyPassword` con un hash que no reconoce, nunca un
+            // error de runtime por un valor ajeno con forma inesperada.
+            "verifyPbkdf2Sha256" => {
+                let pwd = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("crypto.verifyPbkdf2Sha256 requiere contraseña")),
+                };
+                let stored = match args.get(1) {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("crypto.verifyPbkdf2Sha256 requiere el valor guardado")),
+                };
+                let mut parts = stored.splitn(4, ':');
+                let (Some("pbkdf2"), Some(iter_str), Some(salt), Some(hash_hex), None) =
+                    (parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
+                else {
+                    return Ok(Value::Bool(false));
+                };
+                let Ok(iterations) = iter_str.parse::<u32>() else {
+                    return Ok(Value::Bool(false));
+                };
+                let Ok(expected) = (0..hash_hex.len())
+                    .step_by(2)
+                    .map(|i| hash_hex.get(i..i + 2).and_then(|b| u8::from_str_radix(b, 16).ok()).ok_or(()))
+                    .collect::<Result<Vec<u8>, ()>>()
+                else {
+                    return Ok(Value::Bool(false));
+                };
+                if hash_hex.len() % 2 != 0 || expected.is_empty() || iterations == 0 {
+                    return Ok(Value::Bool(false));
+                }
+                let derived = pbkdf2::pbkdf2_hmac_sha256(pwd.as_bytes(), salt.as_bytes(), iterations, expected.len());
+                Ok(Value::Bool(constant_time_eq(&derived, &expected)))
             }
             "isLegacyHash" => {
                 let hash = match args.first() {

@@ -9987,6 +9987,31 @@ Una escritura real intentada vía `db.query` (un `DELETE`/`UPDATE`/`INSERT` en e
 
 **Verificado**: 5 tests de `checker.rs` (las tres restricciones + el caso feliz con params mezclados + que `db.query` SÍ compila dentro de un `@readReplica` mientras `db.execute` no) + 4 tests de integración reales en `cli_raw_sql.rs` contra un `linkc serve` real sobre SQLite (SELECT con binding posicional filtra correctamente; UPDATE devuelve la cantidad de filas afectadas correcta; un DELETE vía `db.query` se rechaza limpio y no borra nada; `db.query` sin `@rawSql` rechaza la compilación) + un test de integración en `pg_integration.rs` (`LINK_TEST_PG_URL`, corre de verdad en CI) que prueba `RANK() OVER (...)` -- sintaxis exclusiva de Postgres, imposible de probar contra SQLite -- más el mismo enforcement de solo-lectura contra el motor real. Verificación manual de punta a punta adicional: una `VIEW` creada vía `db.execute` y leída acto seguido vía `db.query`, sin ningún flag extra. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.284 `crypto.verifyPbkdf2Sha256`: verificar un hash `pbkdf2:<iter>:<salt>:<hashHex>` ajeno — cierra Fase 2 ítem D1 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.4 Fase 2 ítem D1 -- muchos backends Node hashean contraseñas a mano con `crypto.pbkdf2Sync` en vez de una librería (bcrypt/argon2), guardando el resultado como `pbkdf2:<iteraciones>:<salt>:<hashHex>`. `crypto.verifyPassword` (§3.34/§3.226) solo entiende Argon2id/bcrypt/el legado propio `sha256$...` -- ninguno de los tres es este formato. Sin esto, migrar un backend así a `linkc serve` significa que la contraseña real de cada usuario deja de verificar el día del corte.
+
+<!-- linkc:check -->
+```rust
+service Auth {
+  rpc login(password: String, stored: String) -> Bool {
+    crypto.verifyPbkdf2Sha256(password, stored)
+  }
+}
+```
+
+**Deliberadamente SEPARADO de `verifyPassword`, no un cuarto formato que ese método aprenda a reconocer** -- `verifyPassword` decide SOLO entre los formatos que este lenguaje mismo puede producir o migrar de forma ambigua (Argon2id fresco, bcrypt/legado reconocibles por su prefijo fijo). Un `pbkdf2:...` es un formato de TERCEROS, elegido por quien migra porque así lo tenía su app vieja -- convertir `verifyPassword` en un parser universal de convenciones ajenas lo volvería cada vez menos predecible. `verifyPbkdf2Sha256` es su propio método, con su propio contrato.
+
+**Formato esperado, exactamente 4 partes separadas por `:`**: el literal `pbkdf2`, las iteraciones (entero positivo), la sal, y la clave derivada en hex. La sal se usa TAL CUAL como sus bytes UTF-8 -- NO se hex-decodea de vuelta a bytes -- porque esa es la convención real que un boilerplate típico de Node produce (`salt = crypto.randomBytes(16).toString('hex')` guardado y reusado directamente como el string salt de `pbkdf2Sync`, nunca decodeado de vuelta). El largo de la clave derivada sale de `hashHex.length / 2`, nunca de una constante fija -- distintos boilerplates piden distintos `dkLen` (32 o 64 son los más comunes), y derivar exactamente tantos bytes como el valor guardado tiene es lo que hace que esto funcione sin importar cuál se usó originalmente.
+
+**Cualquier desvío del formato falla CERRADO con `false`, nunca con un error de runtime**: menos o más de 4 partes, iteraciones no numéricas o cero, hex inválido en la clave derivada -- todos devuelven `false` directamente, mismo criterio que `verifyPassword` con un hash que no reconoce. Un valor guardado con forma inesperada es exactamente el tipo de dato que puede aparecer en una fila vieja/corrupta de una migración real; que el login falle con un `false` en vez de tumbar la request completa es la diferencia entre un usuario que no puede entrar y un 500 en producción.
+
+**Implementación**: PBKDF2-HMAC-SHA256 (RFC 8018 §5.2) hand-rolleado en `runtime/pbkdf2.rs` sobre `hmac`+`sha2` -- las dos YA son dependencias de este binario (`crypto.hmacSha256`/`hashSha256`), así que esto no es una décima excepción a "cero dependencias nuevas": es la misma composición que un dev armaría a mano en cualquier lenguaje sin un builtin de PBKDF2, sobre primitivos criptográficos que este compilador ya trae. La comparación final contra la clave derivada es en tiempo constante (`constant_time_eq`, ya usado por `verifyPassword`/`timingSafeEqual`) -- comparar con `==` filtraría, vía cuánto tarda la respuesta, en qué posición difiere del valor esperado.
+
+**Verificado**: 6 tests unitarios de `runtime/pbkdf2.rs` contra vectores de referencia generados con `hashlib.pbkdf2_hmac` de Python (los tres primeros coinciden con RFC 7914 apéndice A, ya ampliamente citados para PBKDF2-HMAC-SHA256; uno more con `dkLen` no múltiplo de 32, ejercitando el truncado del último bloque) + 3 tests de integración en `cli_pbkdf2.rs` contra un hash REAL generado con `crypto.pbkdf2Sync` de Node (no un valor auto-generado por este mismo binario -- lo único que prueba interoperabilidad real, no solo consistencia interna): la contraseña correcta verifica, la incorrecta no, un `dkLen` de 32 bytes (además del de 64 del fixture principal) también verifica, y 10 variantes de formato inválido devuelven `false` sin ningún error. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
+**Nota de proceso -- un error de transcripción real, atrapado por el propio test, no shippeado**: la primera versión de los 5 vectores de referencia en `runtime/pbkdf2.rs` se escribió a mano copiando la salida de Python vector por vector; 3 de los 5 literales quedaron con un dígito hex de menos (un carácter perdido al tipear un string de 64+ caracteres), haciendo que esos tests fallaran contra una implementación que en realidad ya era correcta. Reescrito generando el bloque de tests completo por script a partir del JSON que Python produjo, en vez de retipear -- mismo patrón que [[feedback_dont_retype_long_generated_strings]] ya documenta para fixtures largos.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

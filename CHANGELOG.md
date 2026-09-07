@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.229.0] - 2026-09-08
+
+### ✨ Añadido
+**`crypto.verifyPbkdf2Sha256` -- cierra el ítem D1 de la Fase 2 de PLAN.md §9.24, primer ítem de la nueva fase.** Muchos backends Node hashean contraseñas a mano con `crypto.pbkdf2Sync` en vez de una librería, guardando `pbkdf2:<iteraciones>:<salt>:<hashHex>` -- un formato que `crypto.verifyPassword` (Argon2id/bcrypt/legado propio) no entiende. Deliberadamente un método SEPARADO, no un cuarto formato que `verifyPassword` aprenda: es un formato de TERCEROS, no algo que este lenguaje mismo produce o migra de forma ambigua. La sal se usa tal cual como bytes UTF-8 (sin hex-decodear), y el largo de la clave derivada sale de `hashHex.length/2` en vez de una constante fija -- funciona sea cual sea el `dkLen` que el valor original usó. Cualquier formato ajeno/corrupto falla cerrado con `false`, nunca con un error de runtime. Ver GRAMMAR.md §3.284.
+
+Implementado como PBKDF2-HMAC-SHA256 (RFC 8018) hand-rolleado en `runtime/pbkdf2.rs` sobre `hmac`+`sha2`, ya dependencias de este binario -- no una excepción nueva a "cero dependencias nuevas".
+
+Verificado: 6 tests unitarios contra vectores de referencia de `hashlib.pbkdf2_hmac` de Python (3 coinciden con RFC 7914 apéndice A) + 3 tests de integración en `cli_pbkdf2.rs` contra un hash REAL generado con `crypto.pbkdf2Sync` de Node v24 (no un valor auto-generado por este mismo binario) -- password correcta verifica, incorrecta no, `dkLen` de 32 y 64 bytes ambos verifican, 10 formatos inválidos dan `false` sin error. Un error de transcripción real (3 de 5 vectores de referencia hand-tipeados quedaron un dígito hex cortos) fue atrapado por el propio test antes de shippear, no después -- corregido generando los literales por script en vez de retipearlos.
+
+Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.228.0] - 2026-09-08
 
 ### ✨ Añadido
