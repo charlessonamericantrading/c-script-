@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.212.0] - 2026-09-07
+
+### ✨ Añadido
+**PLAN.md §9.23 -- cuatro brechas reales encontradas migrando Segurma a producción**, priorizadas por urgencia real (no por dificultad):
+1. **`#linkc >= "X.Y.Z"`** -- pragma de versión mínima al tope del `.link` (entre las líneas en blanco/`//` del principio). Motivado por un incidente real: el binario compartido de una VPS con 14+ procesos de 6+ negocios estaba 15 versiones atrás, y el síntoma fue un crash-loop en runtime, no un error de compilación claro. Falla ahora con un mensaje de una línea, ANTES de tokenizar nada más. Ver GRAMMAR.md §3.263.
+2. **`@naturalKey`** sobre el campo escalar `id` (`String`/`Uuid`) -- `insert`/`insertMany`/`upsert` dejan de autogenerar su valor, el caller lo provee siempre; una clave repetida da el mismo 400 limpio que `@unique`. Cierra el bloqueo real de una tabla de clave natural (ej. `settings.key`) que ninguna de las 3 formas de PK escalar existentes cubría. Ver GRAMMAR.md §3.264.
+3. **`smtp.sendWithConfig(config, to, subject, body)`** -- única variante de `smtp.*` cuya conexión (host/puerto/usuario/clave) es un valor explícito en vez de `LINK_SMTP_URL` (env fija al arrancar), para el caso real de un panel de admin con SMTP configurable en caliente. Deliberadamente SIN campo `from` en `config` -- el remitente sigue viniendo de `LINK_SMTP_FROM`, la misma garantía anti-spoofing de las otras cuatro variantes. Ver GRAMMAR.md §3.265.
+4. **`linkc self-install <versión> [--dir <ruta>]`** -- descarga el binario de un release real de GitHub para el SO/arch actual, verifica su SHA256 contra `SHA256SUMS.txt` del mismo release, y lo deja ejecutable en una ruta aislada (default `./.c-script/bin/`) sin tocar ningún binario compartido. Extrae con el `tar` del sistema (bsdtar en Windows 10/11 también extrae `.zip`) -- sin ninguna dependencia nueva de (des)compresión. Ver GRAMMAR.md §3.266.
+
+### 🐛 Corregido
+**`http.*` no podía hacer NINGUNA llamada `https://` -- bug real encontrado auditando dependencias para el ítem 4.** `ureq` estaba compilado sin su feature `tls`, así que toda URL `https://` fallaba con "no TLS backend is configured" antes de intentar conectar. Nunca lo agarró ningún test porque `cli_http.rs`/`cli_smtp.rs` prueban contra servidores de mentira locales en texto plano. La sección §3.141 de GRAMMAR.md llegó a afirmar que Stripe/SendGrid "ya funcionan hoy completas" -- falso mientras este bug estuvo presente (esas APIs son `https://` sin excepción). `ureq` ahora se compila con `tls` (backend `rustls`, reusa el `rustls` ya dependencia directa del proyecto) -- un solo paquete transitivo nuevo (`webpki-roots`). Verificado contra un endpoint HTTPS real (`https://api.github.com/zen`). Ver GRAMMAR.md §3.267.
+
 ## [1.211.0] - 2026-09-05
 
 ### 🐛 Corregido

@@ -2268,6 +2268,70 @@ fn send_email(to: &[String], subject: &str, body: &str, is_html: bool) -> Result
     Ok(())
 }
 
+/// `smtp.sendWithConfig(config, to, subject, body)` (GRAMMAR.md §3.265) --
+/// única variante de `smtp.*` cuya CONEXIÓN (host/puerto/usuario/clave) es
+/// un valor EXPLÍCITO en vez de `LINK_SMTP_URL` (env fija al arrancar el
+/// proceso, ver `send_email` arriba) -- pensada para el caso real de un
+/// panel de admin que deja cambiar el servidor SMTP en caliente, guardado
+/// en la propia base de la app (`db`), nunca en env vars fijas (GRAMMAR.md
+/// §3.265). Deliberadamente SIN un campo `from` en `config`: el remitente
+/// SIGUE viniendo de `LINK_SMTP_FROM` (env), mismo motivo que `send_email`
+/// -- dejar que el caller elija el remitente abriría la puerta a spoofear
+/// el `From:` con datos de la request, justo la garantía que ese diseño ya
+/// protegía. `secure: true` -> TLS implícito (SMTPS, puerto típico 465);
+/// `secure: false` -> STARTTLS (puerto típico 587) -- las dos formas
+/// cifradas que `lettre` expone vía su builder tipado (`relay`/
+/// `starttls_relay` + `.credentials(...)`), sin construir ninguna URL a
+/// mano -- a diferencia de `LINK_SMTP_URL`, evita cualquier bug de
+/// escaping si host/user/pass tuvieran caracteres especiales.
+fn send_email_with_config(config: &[(String, Value)], to: &str, subject: &str, body: &str) -> Result<(), RuntimeError> {
+    let host = match config.iter().find(|(n, _)| n == "host") {
+        Some((_, Value::Str(s))) => s.clone(),
+        _ => return Err(err("smtp.sendWithConfig: falta 'host' en 'config', o no es String")),
+    };
+    let port: u16 = match config.iter().find(|(n, _)| n == "port") {
+        Some((_, v)) => as_int(v)?
+            .try_into()
+            .map_err(|_| err("smtp.sendWithConfig: 'port' en 'config' tiene que ser un puerto válido (0-65535)"))?,
+        _ => return Err(err("smtp.sendWithConfig: falta 'port' en 'config', o no es Int")),
+    };
+    let user = match config.iter().find(|(n, _)| n == "user") {
+        Some((_, Value::Str(s))) => s.clone(),
+        _ => return Err(err("smtp.sendWithConfig: falta 'user' en 'config', o no es String")),
+    };
+    let pass = match config.iter().find(|(n, _)| n == "pass") {
+        Some((_, Value::Str(s))) => s.clone(),
+        _ => return Err(err("smtp.sendWithConfig: falta 'pass' en 'config', o no es String")),
+    };
+    let secure = match config.iter().find(|(n, _)| n == "secure") {
+        Some((_, Value::Bool(b))) => *b,
+        _ => return Err(err("smtp.sendWithConfig: falta 'secure' en 'config', o no es Bool")),
+    };
+
+    let from = std::env::var("LINK_SMTP_FROM").map_err(|_| err("smtp: falta la variable de entorno LINK_SMTP_FROM (la dirección remitente)"))?;
+    let from_mbox: lettre::message::Mailbox =
+        from.parse().map_err(|e| err(format!("smtp: LINK_SMTP_FROM ('{from}') no es una dirección válida: {e}")))?;
+    let to_mbox: lettre::message::Mailbox =
+        to.parse().map_err(|e| err(format!("smtp.sendWithConfig: 'to' ('{to}') no es una dirección válida: {e}")))?;
+
+    let email = lettre::Message::builder()
+        .from(from_mbox)
+        .to(to_mbox)
+        .subject(subject)
+        .body(body.to_string())
+        .map_err(|e| err(format!("smtp.sendWithConfig: no se pudo armar el mensaje: {e}")))?;
+
+    use lettre::Transport;
+    let relay_builder = if secure { lettre::SmtpTransport::relay(&host) } else { lettre::SmtpTransport::starttls_relay(&host) }
+        .map_err(|e| err(format!("smtp.sendWithConfig: 'host' ('{host}') inválido: {e}")))?;
+    let mailer = relay_builder
+        .port(port)
+        .credentials(lettre::transport::smtp::authentication::Credentials::new(user, pass))
+        .build();
+    mailer.send(&email).map_err(|e| err(format!("smtp.sendWithConfig: no se pudo mandar el email: {e}")))?;
+    Ok(())
+}
+
 /// Un adjunto ya validado, listo para `Attachment::new(...).body(bytes,
 /// content_type)` -- `bytes` viene de DECODIFICAR el `contentBase64` del
 /// struct, sin pasar por `base64.decode` (§3.43) porque ESE builtin exige
@@ -4248,6 +4312,15 @@ fn call_method(
                     ));
                 };
                 send_email_advanced(fields)?;
+                Ok(Value::Null)
+            }
+            "sendWithConfig" => {
+                let (Some(Value::Struct(config)), Some(Value::Str(to)), Some(Value::Str(subject)), Some(Value::Str(body))) =
+                    (args.first(), args.get(1), args.get(2), args.get(3))
+                else {
+                    return Err(err("smtp.sendWithConfig requiere (config: { host, port, user, pass, secure }, to: String, subject: String, body: String)"));
+                };
+                send_email_with_config(config, to, subject, body)?;
                 Ok(Value::Null)
             }
             other => Err(err(format!("método desconocido sobre smtp: '{other}'"))),

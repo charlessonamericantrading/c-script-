@@ -290,6 +290,28 @@ fn smtp_message_type() -> Type {
     }
 }
 
+/// El tipo que `smtp.sendWithConfig(config, ...)` (GRAMMAR.md §3.265) espera
+/// para `config` -- a diferencia de `send`/`sendToMany`/`sendHtml`/
+/// `sendMessage`, que SIEMPRE leen la conexión de `LINK_SMTP_URL` (env fija
+/// al arrancar), acá host/puerto/credenciales son un valor explícito.
+/// Deliberadamente SIN campo `from`: el remitente sigue viniendo de
+/// `LINK_SMTP_FROM` (env), nunca de acá -- dejar que el caller lo elija
+/// abriría la puerta a spoofear el `From:` con datos de la request, el
+/// mismo motivo por el que `send_email` (runtime/mod.rs) ya lo saca del
+/// entorno.
+fn smtp_config_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "host".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "port".to_string(), optional: false, ty: Type::Int },
+            FieldType { name: "user".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "pass".to_string(), optional: false, ty: Type::String },
+            FieldType { name: "secure".to_string(), optional: false, ty: Type::Bool },
+        ],
+    }
+}
+
 impl CheckError {
     /// El PRIMER stamp gana: a medida que un error burbujea desde adentro
     /// hacia afuera (ej. de una sub-expresión hasta la sentencia que la
@@ -1383,6 +1405,7 @@ impl Checker {
                                 .chain(checker.check_field_soft_delete(fields, &t.type_params))
                                 .chain(checker.check_field_encrypted(fields, &t.type_params))
                                 .chain(checker.check_field_hidden(fields))
+                                .chain(checker.check_field_natural_key(fields, &t.type_params))
                                 .chain(checker.check_field_checks(fields, &t.type_params))
                                 .chain(checker.check_field_columns(fields, &t.name))
                                 .chain(checker.check_field_refs(fields, &t.type_params, &t.name))
@@ -2802,6 +2825,48 @@ impl Checker {
                     .with_span(f.name_span)
             })
             .collect()
+    }
+
+    /// `@naturalKey` (GRAMMAR.md §3.264): solo sobre el campo escalar `id`,
+    /// y solo cuando es `String` o `Uuid` -- `Int` queda afuera a propósito
+    /// (autoincrementa vía `SERIAL`/`AUTOINCREMENT`, un DEFAULT de columna
+    /// real que este alcance v1 no toca; `String`/`Uuid` en cambio YA se
+    /// generan del lado de la aplicación sin ningún DEFAULT, ver el
+    /// comentario de `create_postgres_table_sql` -- @naturalKey solo
+    /// decide SI se genera, nunca cómo).
+    fn check_field_natural_key(&self, fields: &[Field], type_params: &[String]) -> Vec<CheckError> {
+        let mut errors = Vec::new();
+        for f in fields {
+            if !f.natural_key() {
+                continue;
+            }
+            if f.name != "id" {
+                errors.push(
+                    err(format!(
+                        "'@naturalKey' en el campo '{}': solo aplica sobre el campo 'id' -- es la anotación que le dice a 'insert' que NO autogenere esa clave (GRAMMAR.md §3.264)",
+                        f.name
+                    ))
+                    .with_span(f.name_span),
+                );
+                continue;
+            }
+            let ty = if type_params.is_empty() {
+                self.resolve_type(&f.ty)
+            } else {
+                self.resolve_type_abstract(&f.ty, type_params)
+            };
+            match ty {
+                Ok(Type::String) | Ok(Type::Uuid) => {}
+                Ok(ty) => errors.push(
+                    err(format!(
+                        "'@naturalKey' sobre 'id': solo aplica cuando 'id' es 'String' o 'Uuid' -- es '{ty}' ('Int' autoincrementa a nivel de base, fuera de este alcance, GRAMMAR.md §3.264)"
+                    ))
+                    .with_span(f.name_span),
+                ),
+                Err(e) => errors.push(e.with_span(f.name_span)),
+            }
+        }
+        errors
     }
 
     /// `@column("nombre_sql")` (GRAMMAR.md §3.242 / PLAN.md §9.21):
@@ -5528,6 +5593,18 @@ impl Checker {
                 self.check_expr(message, &smtp_message_type(), env)?;
                 Some(Type::Void)
             }
+            (Type::Smtp, "sendWithConfig") => {
+                let [config, to, subject, body] = args else {
+                    return Err(err(
+                        "'smtp.sendWithConfig' toma exactamente 4 argumentos (config: { host: String, port: Int, user: String, pass: String, secure: Bool }, to: String, subject: String, body: String)",
+                    ));
+                };
+                self.check_expr(config, &smtp_config_type(), env)?;
+                self.check_expr(to, &Type::String, env)?;
+                self.check_expr(subject, &Type::String, env)?;
+                self.check_expr(body, &Type::String, env)?;
+                Some(Type::Void)
+            }
             (Type::Response, "setStatus") => {
                 let [code_arg] = args else {
                     return Err(err("'response.setStatus' toma exactamente 1 argumento (code: Int)"));
@@ -6186,6 +6263,13 @@ impl Checker {
         if !fields.iter().any(|f| f.name == "id") {
             return Err(err("cada colección de 'db' necesita un campo 'id: Int'"));
         }
+        // GRAMMAR.md §3.264: `@naturalKey` -- el caller SIEMPRE provee "id"
+        // en el insert (nunca se autogenera), así que NO se excluye del
+        // shape insertable como el resto de las PKs escalares de abajo.
+        if self.has_natural_key(element_ty) {
+            let without_tenant: Vec<FieldType> = fields.iter().filter(|f| Some(&f.name) != tenant_field.as_ref()).cloned().collect();
+            return Ok(Type::Struct { name: None, fields: without_tenant });
+        }
         let without_id: Vec<FieldType> =
             fields.iter().filter(|f| f.name != "id" && Some(&f.name) != tenant_field.as_ref()).cloned().collect();
         Ok(Type::Struct { name: None, fields: without_id })
@@ -6315,6 +6399,17 @@ impl Checker {
         let decl = self.types.get(type_name)?;
         let TypeExpr::Struct(fields) = &decl.ty else { return None };
         fields.iter().find(|f| f.tenant_claim_name().is_some()).map(|f| f.name.clone())
+    }
+
+    /// ¿El campo escalar `id` de `element_ty` es `@naturalKey` (GRAMMAR.md
+    /// §3.264)? Mismo cruce que `tenant_field_name`/`composite_pk_fields` --
+    /// la anotación vive en el AST (`ast::Field`), no en el `Type` ya
+    /// resuelto (`FieldType` no lleva anotaciones).
+    pub(crate) fn has_natural_key(&self, element_ty: &Type) -> bool {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { return false };
+        let Some(decl) = self.types.get(type_name) else { return false };
+        let TypeExpr::Struct(fields) = &decl.ty else { return false };
+        fields.iter().any(|f| f.name == "id" && f.natural_key())
     }
 
     /// Nombres de TODOS los campos `@searchable` de `element_ty`, en el
@@ -8103,6 +8198,107 @@ type T = { id: Int, s: Status }")
             type NewLead = { email: String }
             db { leads: Lead[] }
             fn create(email: String) -> Lead { db.leads.insert(NewLead { email: email }) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    // ---- `smtp.sendWithConfig` (GRAMMAR.md §3.265) ----
+
+    #[test]
+    fn smtp_send_with_config_accepts_the_right_shape() {
+        let src = r#"
+            service S {
+                rpc notify(host: String, port: Int, user: String, pass: String, secure: Bool) -> Void {
+                    smtp.sendWithConfig({ host: host, port: port, user: user, pass: pass, secure: secure }, "a@x.com", "asunto", "cuerpo")
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn smtp_send_with_config_rejects_a_config_missing_a_field() {
+        let src = r#"
+            service S {
+                rpc notify(host: String, port: Int) -> Void {
+                    smtp.sendWithConfig({ host: host, port: port }, "a@x.com", "asunto", "cuerpo")
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "'config' sin 'user'/'pass'/'secure' tiene que rechazarse");
+    }
+
+    #[test]
+    fn smtp_send_with_config_rejects_wrong_argument_count() {
+        let src = r#"
+            service S {
+                rpc notify() -> Void {
+                    smtp.sendWithConfig("a@x.com", "asunto", "cuerpo")
+                }
+            }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "'sendWithConfig' exige 4 argumentos (config, to, subject, body)");
+    }
+
+    // ---- `@naturalKey` (GRAMMAR.md §3.264) ----
+
+    #[test]
+    fn natural_key_id_field_is_required_in_the_insertable_shape() {
+        let src = r#"
+            type Setting = { @naturalKey id: String, value: String }
+            db { settings: Setting[] }
+            fn create(key: String, value: String) -> Setting { db.settings.insert(Setting { id: key, value: value }) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn natural_key_insert_missing_id_is_rejected() {
+        let src = r#"
+            type Setting = { @naturalKey id: String, value: String }
+            db { settings: Setting[] }
+            type NewSetting = { value: String }
+            fn create(value: String) -> Setting { db.settings.insert(NewSetting { value: value }) }
+        "#;
+        let result = check_source(src);
+        assert!(result.is_err(), "una colección '@naturalKey' exige 'id' en el insert -- sin autogenerar, no puede faltar");
+    }
+
+    #[test]
+    fn natural_key_on_a_uuid_id_is_allowed() {
+        let src = r#"
+            type Session = { @naturalKey id: Uuid, token: String }
+            db { sessions: Session[] }
+            fn create(id: Uuid, token: String) -> Session { db.sessions.insert(Session { id: id, token: token }) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn natural_key_on_a_non_id_field_is_rejected() {
+        let src = "type Setting = { id: Int, @naturalKey value: String } db { settings: Setting[] }";
+        let result = check_source(src);
+        assert!(result.is_err(), "'@naturalKey' solo aplica sobre 'id'");
+    }
+
+    #[test]
+    fn natural_key_on_an_int_id_is_rejected() {
+        let src = "type Setting = { @naturalKey id: Int, value: String } db { settings: Setting[] }";
+        let result = check_source(src);
+        assert!(result.is_err(), "'@naturalKey' sobre 'id: Int' queda fuera de este alcance (autoincrementa a nivel de DDL)");
+    }
+
+    #[test]
+    fn a_collection_without_natural_key_still_omits_id_as_before() {
+        // Sin la anotación, comportamiento IDÉNTICO al de antes de esta
+        // ronda: 'id' sigue excluido del shape insertable.
+        let src = r#"
+            type Setting = { id: String, value: String }
+            db { settings: Setting[] }
+            type NewSetting = { value: String }
+            fn create(value: String) -> Setting { db.settings.insert(NewSetting { value: value }) }
         "#;
         assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
     }

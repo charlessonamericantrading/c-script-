@@ -42,6 +42,11 @@ service Sys {
     smtp.sendMessage(msg);
     "enviado"
   }
+
+  rpc notifyWithConfig(host: String, port: Int, user: String, pass: String, secure: Bool, to: String, subject: String, body: String) -> String {
+    smtp.sendWithConfig({ host: host, port: port, user: user, pass: pass, secure: secure }, to, subject, body);
+    "enviado"
+  }
 }
 "#;
 
@@ -491,4 +496,82 @@ fn smtp_send_message_rejects_invalid_base64_cleanly_not_with_a_panic() {
     );
     assert_eq!(status, 500, "body: {body}");
     assert!(!body.contains("panicked"), "base64 inválido es un error normal, no un panic: {body}");
+}
+
+// ---- `smtp.sendWithConfig` (GRAMMAR.md §3.265) ----
+//
+// A diferencia de `send`/`sendToMany`/`sendHtml`/`sendMessage` (arriba,
+// probados de punta a punta contra `FakeSmtp`, que solo habla SMTP en texto
+// plano), `sendWithConfig` SIEMPRE cifra la conexión (TLS implícito o
+// STARTTLS, GRAMMAR.md §3.265) -- así que un envío realmente completado no es
+// probable acá sin un servidor de mentira que también hable TLS, fuera de
+// alcance de esta ronda. Lo que SÍ se prueba de punta a punta, real, sin
+// mockear nada: que `LINK_SMTP_FROM` sigue siendo obligatoria (la garantía
+// central del diseño -- ni con 'config' explícito el caller puede elegir el
+// remitente), que una dirección inválida falla limpio ANTES de intentar
+// conectar, y que un host inalcanzable falla limpio (nunca un panic) --
+// mismo criterio que ya prueban `smtp_send_against_an_unreachable_host_*`/
+// `smtp_send_with_an_invalid_recipient_address_*` arriba para las otras
+// cuatro variantes.
+
+#[test]
+fn smtp_send_with_config_without_link_smtp_from_fails_cleanly() {
+    // La garantía central: 'config' NO tiene campo 'from' -- ni siquiera con
+    // conexión explícita el caller puede elegir el remitente, sigue viniendo
+    // de LINK_SMTP_FROM (env). Sin esa variable, falla ANTES de intentar
+    // conectar a ningún host -- ni siquiera importa que el host sea real.
+    let temp = TempDir::new("with-config-no-from");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &[]);
+
+    let (status, body) = server.post(
+        "/Sys/notifyWithConfig",
+        &serde_json::json!({
+            "host": "127.0.0.1", "port": 465, "user": "u", "pass": "p", "secure": true,
+            "to": "a@example.com", "subject": "x", "body": "y"
+        })
+        .to_string(),
+    );
+    assert_eq!(status, 500, "body: {body}");
+    assert!(body.contains("LINK_SMTP_FROM"), "el mensaje debe nombrar la variable que falta, ni con config explícito hay remitente: {body}");
+}
+
+#[test]
+fn smtp_send_with_config_rejects_an_invalid_recipient_address_before_connecting() {
+    let temp = TempDir::new("with-config-bad-address");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &[("LINK_SMTP_FROM", "remitente@example.com")]);
+
+    let (status, body) = server.post(
+        "/Sys/notifyWithConfig",
+        &serde_json::json!({
+            "host": "127.0.0.1", "port": 465, "user": "u", "pass": "p", "secure": true,
+            "to": "esto-no-es-un-email", "subject": "x", "body": "y"
+        })
+        .to_string(),
+    );
+    assert_eq!(status, 500, "body: {body}");
+    assert!(!body.contains("panicked"), "una dirección inválida es un error normal, no un panic: {body}");
+}
+
+#[test]
+fn smtp_send_with_config_against_an_unreachable_host_fails_cleanly_not_with_a_panic() {
+    let temp = TempDir::new("with-config-unreachable");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &[("LINK_SMTP_FROM", "remitente@example.com")]);
+    // Puerto libre, nada escuchando -- simula el relay caído. `secure:
+    // false` (STARTTLS) para que el intento de conexión TCP en sí sea lo que
+    // falla, antes de siquiera necesitar completar un handshake TLS real.
+    let dead_port = free_port();
+
+    let (status, body) = server.post(
+        "/Sys/notifyWithConfig",
+        &serde_json::json!({
+            "host": "127.0.0.1", "port": dead_port, "user": "u", "pass": "p", "secure": false,
+            "to": "a@example.com", "subject": "x", "body": "y"
+        })
+        .to_string(),
+    );
+    assert_eq!(status, 500, "body: {body}");
+    assert!(!body.contains("panicked"), "una conexión caída es una condición operativa normal, no un panic: {body}");
 }

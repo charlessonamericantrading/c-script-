@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.211.0"
+version = "1.212.0"
 edition = "2021"
 default-run = "linkc"
 
@@ -68,7 +68,17 @@ wasm-encoder = "0.200"
 regex = "1"
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 sha2 = "0.10"
-ureq = { version = "2.9", default-features = false, optional = true }
+# GRAMMAR.md §3.263: bug real encontrado auditando dependencias para
+# `self-install` -- `default-features = false` sin `tls` dejaba a TODO
+# `http.*` (get/post/getWithHeaders/postWithHeaders/getWithStatus/
+# postWithStatus) incapaz de hablar con NINGÚN endpoint https://, el error
+# real es "cannot make HTTPS request because no TLS backend is configured".
+# Nunca se notó porque cli_http*.rs prueba contra servidores de mentira
+# locales en http:// plano -- ningún test ejercitaba jamás el camino TLS.
+# `tls` (rustls, sin webpki-roots extra: reusa el `rustls` ya dependencia
+# directa del proyecto para Postgres) en vez de `native-tls` -- mismo
+# criterio "sin dependencias C" que ya eligieron para eso.
+ureq = { version = "2.9", default-features = false, features = ["tls"], optional = true }
 base64 = { version = "0.22", optional = true }
 argon2 = { version = "0.5", optional = true }
 # GRAMMAR.md §3.226: bcrypt SOLO para VERIFICAR (migrar) hashes que otra app

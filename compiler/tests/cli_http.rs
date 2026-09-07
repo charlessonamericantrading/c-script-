@@ -626,6 +626,32 @@ fn post_with_retry_rejects_a_non_positive_max_attempts() {
     assert!(upstream.recv(Duration::from_millis(200)).is_none(), "con maxAttempts inválido no debería haberse mandado ninguna request real");
 }
 
+/// GRAMMAR.md §3.267: bug real encontrado auditando dependencias para
+/// `self-install` -- `ureq` sin su feature `tls` compilado rechazaba TODA
+/// URL `https://` con "Unknown Scheme: cannot make HTTPS request because no
+/// TLS backend is configured", ANTES de intentar siquiera abrir un socket.
+/// Nunca lo agarró ningún test porque este mismo archivo (como todos los
+/// `cli_http*`) solo habla contra `FakeHttp` en `http://` plano. Sin
+/// levantar un servidor TLS real acá (fuera de alcance -- necesitaría un
+/// certificado autofirmado y otra dependencia solo para el test), lo que SÍ
+/// se puede confirmar de forma determinística y sin red real: contra un
+/// puerto local CERRADO con esquema `https://`, el error tiene que ser el
+/// de conexión rechazada (prueba que sí llegó a intentar el handshake TLS),
+/// nunca el de "no hay backend TLS" -- si esa regresión volviera, este test
+/// fallaría con el mensaje viejo en vez de uno de conexión.
+#[test]
+fn https_urls_no_longer_fail_with_no_tls_backend_configured() {
+    let temp = TempDir::new("https-scheme");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+    let dead_port = free_port();
+
+    let (status, body) = server.post("/Sys/plainGet", &serde_json::json!({"url": format!("https://127.0.0.1:{dead_port}")}).to_string());
+    assert_eq!(status, 500, "body: {body}");
+    assert!(!body.contains("no TLS backend"), "regresión real: 'https://' volvió a rechazarse antes de intentar conectar: {body}");
+    assert!(!body.contains("Unknown Scheme"), "regresión real: 'https://' volvió a rechazarse antes de intentar conectar: {body}");
+}
+
 #[test]
 fn an_http_timeout_flag_with_an_invalid_duration_is_a_clean_cli_error() {
     let temp = TempDir::new("badvalue");

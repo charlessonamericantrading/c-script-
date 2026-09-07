@@ -701,6 +701,13 @@ impl Parser {
                     }
                     annotations.push(FieldAnnotation::Hidden);
                 }
+                // Sin paréntesis, mismo criterio (GRAMMAR.md §3.264).
+                "naturalKey" => {
+                    if annotations.iter().any(|a| matches!(a, FieldAnnotation::NaturalKey)) {
+                        return Err(self.error("'@naturalKey' repetido sobre el mismo campo".to_string()));
+                    }
+                    annotations.push(FieldAnnotation::NaturalKey);
+                }
                 // `@column("nombre_sql")` (GRAMMAR.md §3.242 / PLAN.md §9.21)
                 "column" => {
                     if annotations.iter().any(|a| matches!(a, FieldAnnotation::Column(_))) {

@@ -154,6 +154,7 @@ fn main() -> ExitCode {
         Some("pm2-config") => cmd_pm2_config(&args[2..]),
         Some("introspect") => cmd_introspect(&args[2..]),
         Some("explain") => cmd_explain(&args[2..]),
+        Some("self-install") => cmd_self_install(&args[2..]),
         // `--help` es una peticion valida, no un error: va a stdout y sale 0.
         // Sin este brazo caia en `cmd_check("--help")`, que respondia con un
         // mensaje sobre archivos .link inexistentes.
@@ -304,6 +305,7 @@ fn print_usage(to_stderr: bool) {
     out("     linkc pm2-config <archivo.link> <puerto> [-o <archivo>]   (genera un ecosystem.json de PM2, default ./ecosystem.json)");
     out("     linkc introspect <db-url|archivo.db> [> main.link] (genera un .link de partida leyendo el schema de una base PostgreSQL o SQLite ya existente -- punto de partida para revisar a mano, no listo para producción sin mirarlo)");
     out("     linkc explain <código>                 (explica un código de error estable, ej. 'linkc explain L0001' -- NO todo error tiene uno, GRAMMAR.md §3.210)");
+    out("     linkc self-install <versión> [--dir <ruta>]   (baja el binario de linkc de un release de GitHub para este SO/arch, verifica su SHA256 contra SHA256SUMS.txt del mismo release, y lo deja ejecutable en --dir/LINK_SELF_INSTALL_DIR -- default './.c-script/bin/' -- SIN tocar ningún binario ya instalado en otra ruta; usa el 'tar' del sistema para extraer, GRAMMAR.md §3.266)");
     out("     linkc triggers <archivo.link> [--db-schema <nombre>] [--only-streams]   (imprime el DDL idempotente de PostgreSQL -- una función + un trigger AFTER INSERT/UPDATE/DELETE por colección -- que hace que un stream de 'linkc serve' reaccione a escrituras hechas por OTRO sistema sobre la misma base, vía el mismo canal LISTEN/NOTIFY; no se conecta a nada ni aplica nada, GRAMMAR.md §3.225; --only-streams limita el DDL a las colecciones que algún stream observa con db.<c>.subscribe())");
     out("     linkc migrate <archivo.link> --db <url-postgres> --dry-run (muestra el DDL exacto que 'linkc serve' ejecutaría al conectar a esa base, sin aplicar nada -- solo PostgreSQL, SQLite ya reporta el diff exacto al conectar de verdad)");
     out("     linkc migrate generate <archivo.link> <nombre> --db <url-postgres> [--migrations-dir <dir>] (guarda el mismo diff en un archivo de migración nuevo y numerado -- migrations/0001_<nombre>.sql -- sin aplicarlo; GRAMMAR.md §3.252)");
@@ -1033,6 +1035,196 @@ fn cmd_doctor(args: &[String]) -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Repo canónico de c-script -- el mismo que resuelve `git remote -v` en
+/// este árbol, y el que publica los binarios que `self-install` baja.
+const SELF_INSTALL_REPO: &str = "charlessonamericantrading/c-script-";
+
+/// `(target triple del release, extensión del archivo)` para el SO/arch
+/// ACTUAL -- los 4 assets reales que publica cada release (ver
+/// `.github/workflows/release.yml`): `x86_64-unknown-linux-gnu.tar.gz`,
+/// `x86_64-apple-darwin.tar.gz`, `aarch64-apple-darwin.tar.gz`,
+/// `x86_64-pc-windows-msvc.zip`. Sin Linux ARM64 todavía -- honesto: error
+/// claro en vez de fingir soporte.
+fn self_install_target() -> Result<(&'static str, &'static str), String> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => Ok(("x86_64-pc-windows-msvc", "zip")),
+        ("macos", "x86_64") => Ok(("x86_64-apple-darwin", "tar.gz")),
+        ("macos", "aarch64") => Ok(("aarch64-apple-darwin", "tar.gz")),
+        ("linux", "x86_64") => Ok(("x86_64-unknown-linux-gnu", "tar.gz")),
+        (os, arch) => Err(format!(
+            "self-install: no hay binario publicado para {os}/{arch} -- los releases de c-script cubren linux/x86_64, macos/x86_64, macos/aarch64 y windows/x86_64"
+        )),
+    }
+}
+
+/// GRAMMAR.md §3.266: `linkc self-install <versión> [--dir <ruta>]` --
+/// descarga el binario de un release de GitHub para ESTE SO/arch, verifica
+/// su SHA256 contra `SHA256SUMS.txt` del MISMO release, y lo deja ejecutable
+/// en `--dir` (default `./.c-script/bin/`) SIN tocar ningún binario ya
+/// instalado en otra ruta (`/root/.c-script/bin/linkc`, un `linkc` del
+/// PATH, etc.) -- pensado para que un proyecto fije su propia versión de
+/// `linkc` sin depender del binario compartido de una VPS con más
+/// proyectos, el incidente real que motiva esto (PLAN.md §9.23 ítem 1: un
+/// binario compartido 15 versiones atrás rompió en producción). Extrae con
+/// el `tar` del sistema -- en Windows 10/11 el `tar.exe` que trae el SO es
+/// bsdtar, que también sabe extraer `.zip` (documentado por Microsoft),
+/// así que un solo camino sirve para los dos formatos de asset sin agregar
+/// ninguna dependencia nueva de (des)compresión.
+fn cmd_self_install(args: &[String]) -> ExitCode {
+    let Some(version_arg) = args.first() else {
+        eprintln!("uso: linkc self-install <versión> [--dir <ruta>]");
+        return ExitCode::FAILURE;
+    };
+    let version = version_arg.trim_start_matches('v');
+    let dir = match read_flag_or_env(args, "--dir", "LINK_SELF_INSTALL_DIR") {
+        Ok(Some(d)) => std::path::PathBuf::from(d),
+        Ok(None) => std::path::PathBuf::from(".c-script").join("bin"),
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (target, ext) = match self_install_target() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let asset_name = format!("linkc-{target}.{ext}");
+    let base_url = format!("https://github.com/{SELF_INSTALL_REPO}/releases/download/v{version}");
+
+    println!("linkc self-install -- bajando '{asset_name}' de la release v{version}...");
+
+    let checksums = match ureq::get(&format!("{base_url}/SHA256SUMS.txt")).call() {
+        Ok(resp) if resp.status() == 200 => match resp.into_string() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("self-install: no se pudo leer SHA256SUMS.txt: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Ok(resp) => {
+            eprintln!("self-install: SHA256SUMS.txt de la release v{version} respondió {} -- ¿existe esa versión?", resp.status());
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("self-install: no se pudo bajar SHA256SUMS.txt: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(expected_hash) = checksums.lines().find_map(|line| {
+        let (hash, name) = line.trim().split_once(char::is_whitespace)?;
+        (name.trim() == asset_name).then(|| hash.to_string())
+    }) else {
+        eprintln!("self-install: SHA256SUMS.txt de la release v{version} no menciona '{asset_name}'");
+        return ExitCode::FAILURE;
+    };
+
+    let archive_bytes = match ureq::get(&format!("{base_url}/{asset_name}")).call() {
+        Ok(resp) if resp.status() == 200 => {
+            let mut buf = Vec::new();
+            if let Err(e) = std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf) {
+                eprintln!("self-install: no se pudo leer '{asset_name}': {e}");
+                return ExitCode::FAILURE;
+            }
+            buf
+        }
+        Ok(resp) => {
+            eprintln!("self-install: '{asset_name}' de la release v{version} respondió {}", resp.status());
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("self-install: no se pudo bajar '{asset_name}': {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    use sha2::Digest;
+    let actual_hash = format!("{:x}", sha2::Sha256::digest(&archive_bytes));
+    if !actual_hash.eq_ignore_ascii_case(&expected_hash) {
+        eprintln!("self-install: SHA256 de '{asset_name}' no coincide -- esperado {expected_hash}, calculado {actual_hash} (descarga corrupta o comprometida, NO instalado)");
+        return ExitCode::FAILURE;
+    }
+    println!("checksum SHA256 verificado.");
+
+    let work_dir = std::env::temp_dir().join(format!("linkc-self-install-{}-{}", std::process::id(), version));
+    let extract_dir = work_dir.join("extract");
+    if let Err(e) = std::fs::create_dir_all(&extract_dir) {
+        eprintln!("self-install: no se pudo crear un directorio temporal: {e}");
+        return ExitCode::FAILURE;
+    }
+    let archive_path = work_dir.join(&asset_name);
+    if let Err(e) = std::fs::write(&archive_path, &archive_bytes) {
+        eprintln!("self-install: no se pudo escribir el archivo descargado: {e}");
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return ExitCode::FAILURE;
+    }
+
+    let tar_status = Command::new("tar").arg("-xf").arg(&archive_path).arg("-C").arg(&extract_dir).status();
+    match tar_status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            eprintln!("self-install: 'tar -xf' terminó con {s} -- ¿está 'tar' en el PATH? (Windows 10 1803+/macOS/Linux lo traen por default)");
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("self-install: no se pudo ejecutar 'tar': {e} -- ¿está en el PATH?");
+            let _ = std::fs::remove_dir_all(&work_dir);
+            return ExitCode::FAILURE;
+        }
+    }
+
+    let bin_name = if cfg!(windows) { "linkc.exe" } else { "linkc" };
+    // El binario puede quedar directo en `extract_dir` o adentro de un
+    // subdirectorio del archivo -- se busca en los dos niveles en vez de
+    // asumir uno solo, sin recursión completa (ningún release real anida
+    // más de un nivel).
+    let found = std::iter::once(extract_dir.join(bin_name))
+        .chain(std::fs::read_dir(&extract_dir).into_iter().flatten().flatten().map(|e| e.path().join(bin_name)))
+        .find(|p| p.is_file());
+    let Some(extracted_bin) = found else {
+        eprintln!("self-install: no se encontró '{bin_name}' dentro de '{asset_name}' -- release con forma inesperada");
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return ExitCode::FAILURE;
+    };
+
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("self-install: no se pudo crear '{}': {e}", dir.display());
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return ExitCode::FAILURE;
+    }
+    let installed_path = dir.join(bin_name);
+    if let Err(e) = std::fs::copy(&extracted_bin, &installed_path) {
+        eprintln!("self-install: no se pudo copiar el binario a '{}': {e}", installed_path.display());
+        let _ = std::fs::remove_dir_all(&work_dir);
+        return ExitCode::FAILURE;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(&installed_path) {
+            let mut perms = meta.permissions();
+            perms.set_mode(perms.mode() | 0o755);
+            let _ = std::fs::set_permissions(&installed_path, perms);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&work_dir);
+
+    match Command::new(&installed_path).arg("--version").output() {
+        Ok(out) if out.status.success() => {
+            print!("{}", String::from_utf8_lossy(&out.stdout));
+            println!("instalado en '{}'.", installed_path.display());
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("self-install: el binario se copió a '{}' pero no respondió a --version -- revisá manualmente", installed_path.display());
+            ExitCode::FAILURE
+        }
     }
 }
 

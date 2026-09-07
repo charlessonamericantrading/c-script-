@@ -401,6 +401,14 @@ impl Field {
     pub fn searchable(&self) -> bool {
         self.annotations.iter().any(|a| matches!(a, FieldAnnotation::Searchable))
     }
+
+    /// ¿Lleva `@naturalKey`? (GRAMMAR.md §3.264) -- solo tiene sentido sobre
+    /// el campo escalar `id`: `insert`/`insertMany`/`upsert` NO autogeneran
+    /// su valor, el caller SIEMPRE lo provee (el checker ya no lo excluye
+    /// del shape insertable, `omit_id_field`).
+    pub fn natural_key(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, FieldAnnotation::NaturalKey))
+    }
 }
 
 impl PartialEq for Field {
@@ -485,6 +493,18 @@ pub enum FieldAnnotation {
     /// espíritu que varios `@tenant`/`@index` conviviendo, ninguno excluye
     /// a los demás.
     Searchable,
+    /// `@naturalKey` (sin paréntesis) -- GRAMMAR.md §3.264. Solo sobre el
+    /// campo escalar `id`, y solo cuando es `String` o `Uuid` (`Int` queda
+    /// afuera de este alcance -- autoincrementa a nivel de DDL, un cambio
+    /// que esta ronda no cubre). Sin esto, `id: String`/`id: Uuid` SIEMPRE
+    /// generan un UUID v4 nuevo en cada `insert`, ignorando cualquier valor
+    /// que el caller haya puesto (§3.251/§3.177) -- exactamente el límite
+    /// que impide adoptar una tabla de clave natural elegida por quien
+    /// llama (ej. `settings.key`, sin columna `id` propia). Con
+    /// `@naturalKey`, `insert` toma el valor tal cual del caller y una
+    /// clave repetida falla con el mismo error limpio de `@unique`
+    /// (violación de PRIMARY KEY, `write_error` en runtime/db.rs).
+    NaturalKey,
 }
 
 /// Acción de `ON DELETE` para un `@ref(...)` (GRAMMAR.md §3.249). Vocabulario

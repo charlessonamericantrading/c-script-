@@ -9391,6 +9391,108 @@ service Tasks {
 
 **Verificado**: tests de checker (`@background` tipa en un rpc de solo ida, rechazado en un `stream` con mensaje claro, rechazado combinado con `@idempotent`/`@cache`/`@cache_control`/`@content_type` -- los cuatro con su propio test -- combina limpio con `@authenticated`/`@rate_limit`, aridad/tipo de `background.status`, y el subtipado estructural de ancho que deja declarar un tipo de retorno más angosto que omita `result`) + `compiler/tests/cli_background.rs` contra un `linkc serve` real sobre SQLite: un `@background` responde `{jobId}` de inmediato, nunca la forma real; el job corre de verdad (la fila cambia) y `background.status` pasa de `pending`/`running` a `done`; un job que falla (un `applyPatch` sobre un id inexistente) queda `failed` con el mensaje de error real; un `jobId` desconocido da `not_found`; y el caso que más importaba verificar de punta a punta -- un job encolado con un token de sesión real, corrido por el worker minutos "después" (en otro hilo, sin ninguna request HTTP de por medio), donde `auth.currentRole()` ADENTRO del cuerpo del job sigue viendo el rol de quien lo encoló. `@background` combinado con `@readReplica`, con `pdf.build`, y 20 jobs encolados concurrentemente contra el pool fijo de 4 workers (sin ninguno perdido ni duplicado) verificados aparte en la misma auditoría. Suite completa sin regresiones.
 
+### 3.263 `#linkc >= "X.Y.Z"`: guardia de versión mínima al tope del archivo — RESUELTO, cierra el ítem 1 de PLAN.md §9.23
+
+Origen: PLAN.md §9.23 ítem 1, motivado por un incidente real durante la migración de Segurma a producción -- el binario `linkc` de la VPS compartida estaba en v1.185.1, 15+ versiones antes de que `@column` (§3.242) existiera. El síntoma no fue un error de parseo claro sino un crash-loop en runtime con un mensaje sobre columnas de Postgres inexistentes -- minutos reales de diagnóstico para llegar a "es la versión del binario". Esa misma VPS comparte el binario entre 14+ procesos de 6+ negocios distintos, así que el mismo desfase puede estar sentado en silencio en cualquiera de ellos.
+
+**Una directiva opcional, `#linkc >= "X.Y.Z"`, en cualquier línea antes del primer token real del archivo** (entre las líneas en blanco/`//` del principio -- el mismo lugar donde ya viven los headers de licencia/descripción de la mayoría de los `.link` reales). Si aparece, `linkc` la compara contra su propia versión ANTES de tokenizar nada más -- si no se cumple, un error fatal de una sola línea ("este .link pide linkc >= X.Y.Z, esta instalación es Y") en vez de dejar que la incompatibilidad real se manifieste como un error de runtime irrelevante más adelante.
+
+<!-- linkc:check -->
+```rust
+#linkc >= "1.200.0"
+
+type User = { id: Int, name: String }
+
+service Users {
+  rpc getById(id: Int) -> User? {
+    db.users.find(id)
+  }
+}
+
+db { users: User[] }
+```
+
+**Alcance v1, a propósito**: solo `>=` -- es el único operador que el caso real pide; `<`/`==`/`~`/`^` (rangos, pines exactos) quedan afuera hasta que un caso real los necesite. Si la línea empieza con `#linkc` pero no matchea exactamente `#linkc >= "X.Y.Z"`, es un error de "pragma mal formado" (no el error genérico de "carácter inesperado: '#'" que un `#` suelto en cualquier otro lugar del archivo sigue dando, sin cambios).
+
+**Verificado**: 7 tests de `lexer.rs` -- pragma cumplida tokeniza normal (incluso después de comentarios/líneas en blanco), pragma incumplida falla ANTES de tokenizar nada más (con la versión pedida y la instalada en el mensaje), pragma mal formada da un error claro distinto del de "carácter inesperado", el span del error apunta a la línea del pragma, y un `#` suelto en cualquier otro lugar del archivo (antes o después del primer token real) sigue dando el mismo error de siempre -- cero cambio de comportamiento para un `.link` que no usa la anotación.
+
+### 3.264 `@naturalKey`: clave primaria elegida por quien llama, sin autogenerar — RESUELTO, cierra el ítem 2 de PLAN.md §9.23
+
+Origen: PLAN.md §9.23 ítem 2, el bloqueo concreto que impidió migrar la tabla `settings` de Segurma (clave de texto elegida por el caller, ej. `"smtp_host"`, sin columna `id` propia) a c-script. Las tres formas de PK escalar (`id: Int`/`id: Uuid`/`id: String`, §3.177/§3.251) SIEMPRE autogeneran su valor en cada `insert` -- confirmado contra el código real antes de intentar adoptar esa tabla. `@primaryKey(...)` (§3.255, PK compuesta) tampoco sirve: exige 2+ campos, y envolver una clave natural de UN campo en un struct compuesto (`db.<c>.find({key: "smtp_host"})` en vez de `find("smtp_host")`) sería peor ergonomía que el problema que resuelve.
+
+**`@naturalKey` sobre el campo escalar `id` (solo `String`/`Uuid` -- `Int` queda afuera, ver "Límites honestos" abajo) le dice a `insert`/`insertMany`/`upsert` que NO autogeneren su valor: el caller SIEMPRE lo provee, y una clave repetida falla con el mismo error limpio de `@unique` (violación de PRIMARY KEY, nunca un 500).**
+
+<!-- linkc:check -->
+```rust
+type Setting = {
+  @naturalKey id: String,
+  value: String,
+}
+
+db { settings: Setting[] }
+
+service Settings {
+  rpc set(key: String, value: String) -> Setting {
+    db.settings.insert(Setting { id: key, value: value })
+  }
+
+  rpc get(key: String) -> Setting? {
+    db.settings.find(key)
+  }
+}
+```
+
+**Por qué no hace falta ningún cambio de tipo generado**: `insert`/`insertMany`/`upsert` ya exigían un struct de LITERAL completo en la fuente (con un valor de `id` cualquiera, ignorado hasta ahora) -- `omit_id_field` (checker.rs) es lo único que cambia: para una colección `@naturalKey`, deja de excluir `id` del tipo insertable (`Omit<T,"id">`), así que ahora es un campo REQUERIDO como cualquier otro. Cero cambio en `contract.d.ts`/`client.ts`/Zod/OpenAPI.
+
+**Límites honestos**: `@naturalKey` sobre `id: Int` es un error del checker, a propósito -- un `Int` autoincrementa vía `SERIAL`/`AUTOINCREMENT`, un `DEFAULT` real de columna que este alcance v1 no toca (a diferencia de `String`/`Uuid`, que YA se generan del lado de la aplicación sin ningún `DEFAULT`, así que "no generar" no cambia ningún DDL). `@naturalKey` solo aplica sobre el campo `id` -- ponerlo sobre cualquier otro campo es un error del checker.
+
+**Verificado**: 6 tests de `checker.rs` (id requerido en el shape insertable, insert sin id rechazado, `Uuid` permitido, campo no-id rechazado, `id: Int` rechazado, colección SIN la anotación sigue excluyendo `id` como siempre) + 2 tests de `runtime/db.rs` contra SQLite real (`insert` usa el valor exacto del caller, nunca uno generado; una clave repetida se rechaza como `BadRequest`, nunca duplica la fila en silencio).
+
+### 3.265 `smtp.sendWithConfig(config, to, subject, body)`: conexión SMTP explícita, remitente sigue fijo — RESUELTO, cierra el ítem 3 de PLAN.md §9.23
+
+Origen: PLAN.md §9.23 ítem 3. `smtp.send`/`sendToMany`/`sendHtml`/`sendMessage` (§3.43/§3.63/§3.141) SIEMPRE leen la conexión de `LINK_SMTP_URL` (env fija al arrancar el proceso) -- pero una app real con un panel de admin que deja cambiar host/usuario/clave SMTP en caliente (guardado en su propia tabla `settings`, cifrado, editable sin redeploy) no puede expresar eso: es la razón real por la que el email de Segurma sigue siendo 100% responsabilidad de Express en vez de c-script.
+
+**`smtp.sendWithConfig({ host, port, user, pass, secure }, to, subject, body)` toma la conexión como un VALOR explícito en vez de leerla del entorno.** `secure: true` usa TLS implícito (SMTPS, puerto típico 465); `secure: false` usa STARTTLS (puerto típico 587) -- las dos formas cifradas que el transporte SMTP subyacente expone vía credenciales tipadas, sin construir ninguna URL de conexión a mano (a diferencia de `LINK_SMTP_URL`, evita cualquier bug de escaping si host/usuario/clave tuvieran caracteres especiales).
+
+<!-- linkc:check -->
+```rust
+type SmtpConfig = { host: String, port: Int, user: String, pass: String, secure: Bool }
+
+service Notifications {
+  rpc notify(config: SmtpConfig, to: String, subject: String, body: String) -> Void {
+    smtp.sendWithConfig(config, to, subject, body)
+  }
+}
+```
+
+**Deliberadamente SIN un campo `from` en `config`: el remitente SIGUE viniendo de `LINK_SMTP_FROM` (env), igual que las otras cuatro variantes.** Dejar que el caller elija el remitente abriría la puerta a spoofear el `From:` con datos de la request -- exactamente la garantía que `send_email` (runtime/mod.rs) ya protegía para las variantes existentes, y que esta quinta variante no relaja.
+
+**Verificado**: 3 tests de `checker.rs` (forma exacta del struct `config`, campo faltante rechazado, aridad incorrecta rechazada) + 3 tests de `cli_smtp.rs` contra un `linkc serve` real -- `LINK_SMTP_FROM` sigue siendo obligatoria incluso con `config` explícito (la garantía central), una dirección de destino inválida falla limpio antes de conectar, y un host inalcanzable falla limpio (nunca un panic). A diferencia de las otras cuatro variantes (probadas de punta a punta contra un servidor SMTP de mentira en texto plano), un envío realmente COMPLETADO no se prueba acá -- `sendWithConfig` siempre cifra la conexión, y un servidor de mentira que hable TLS queda fuera de este alcance.
+
+### 3.266 `linkc self-install <versión>`: binario fijado por proyecto, sin tocar uno compartido — RESUELTO, cierra el ítem 4 de PLAN.md §9.23
+
+Origen: PLAN.md §9.23 ítem 4, operativo más que de sintaxis -- para no actualizar el binario COMPARTIDO de la VPS de Segurma (§3.263 arriba) hubo que bajar a mano el asset correcto de GitHub Releases, verificar su SHA256 y copiarlo a una ruta aislada. Funcionó, pero es exactamente el tipo de paso manual que un segundo operador -- o cualquiera de los otros 5+ proyectos que ya comparten esa misma VPS -- se va a saltear bajo presión.
+
+```bash
+linkc self-install 1.211.0 --dir ./c-script/bin
+# baja linkc-<target>.{tar.gz,zip} del release v1.211.0, verifica su SHA256
+# contra SHA256SUMS.txt del MISMO release, y lo deja ejecutable en
+# ./c-script/bin/linkc -- sin tocar ningún binario en otra ruta (PATH,
+# /root/.c-script/bin/, etc.)
+```
+
+**`--dir`/`LINK_SELF_INSTALL_DIR` (default `./.c-script/bin/`) aísla el binario instalado -- pensado para que cada proyecto en una VPS con más de un `.link` fije su propia versión, sin que actualizar uno fuerce a actualizar (o arriesgue romper) los demás.** El target (`x86_64-unknown-linux-gnu`/`x86_64-apple-darwin`/`aarch64-apple-darwin`/`x86_64-pc-windows-msvc`) se detecta del SO/arch actual -- sin Linux ARM64 todavía, error claro en vez de fingir soporte. Extrae con el `tar` del sistema (en Windows 10/11 el `tar.exe` que trae el SO es bsdtar, que también sabe extraer `.zip` -- documentado por Microsoft), así que un solo camino cubre los dos formatos de asset sin agregar ninguna dependencia nueva de (des)compresión.
+
+**Verificado**: 4 tests de `cli_self_install.rs`, tres de ellos contra un release REAL y ya publicado de GitHub (v1.211.0, el mismo que agregó esta característica) -- sin argumento de versión da un error de uso claro; una instalación real descarga, verifica el checksum, extrae, e instala; el binario instalado responde `linkc 1.211.0` a `--version` por sí solo (no solo durante la instalación misma); `v1.211.0` con `v` inicial se acepta igual que `1.211.0`; una versión inexistente falla limpio (nunca un panic) sin dejar nada instalado. A diferencia de `cli_smtp.rs`/`cli_http.rs` (que evitan la red real con un servidor de mentira local), acá no hay forma de probar el camino real sin tocar GitHub -- el propósito entero del comando es bajar de ahí.
+
+### 3.267 `http.*` contra `https://` real — bug real corregido, encontrado auditando dependencias para §3.266
+
+No cierra ningún ítem de la hoja de ruta de PLAN.md §9.23 -- es un bug real encontrado DURANTE el trabajo del ítem 4 (self-install necesita bajar de `https://github.com/...`), no un ítem planeado. `ureq` (la crate detrás de `http.get`/`post`/`getWithHeaders`/`postWithHeaders`/`getWithStatus`/`postWithStatus`/`postWithRetry`, §3.47/§3.60/§3.160) estaba compilado con `default-features = false` y SIN su feature `tls` -- así que TODA llamada saliente a cualquier URL `https://` fallaba con "Unknown Scheme: cannot make HTTPS request because no TLS backend is configured", ANTES de intentar siquiera abrir un socket. Nunca lo agarró ningún test porque `cli_http.rs`/`cli_smtp.rs` (y cualquier otro test de builtins salientes) prueban contra servidores de mentira locales en `http://`/SMTP plano -- ningún test en la suite completa ejercitaba jamás el camino TLS real. La sección §3.141 del propio GRAMMAR.md llegó a afirmar "Stripe, SendGrid, y cualquier API con `Authorization: Bearer <token>` YA funcionan hoy completas" -- afirmación falsa mientras este bug estuvo presente, ya que esas APIs son `https://` sin excepción.
+
+**Corrección: `ureq` ahora se compila con su feature `tls` (backend `rustls`, reusa el `rustls` que YA era dependencia directa del proyecto para TLS de Postgres -- consistente con la elección "sin dependencias C" que ya regía ahí).** Un solo paquete nuevo transitivo (`webpki-roots`, el bundle de CAs raíz) -- `rustls`/`rustls-pki-types` ya estaban en el árbol.
+
+**Verificado de punta a punta contra un endpoint HTTPS real** (no un mock): `http.get("https://api.github.com/zen")` devuelve el texto real de la API pública de GitHub contra un `linkc serve` real, antes fallaba con el error de arriba. Test de regresión agregado (`cli_http.rs`, sin depender de la red real): contra un puerto local cerrado con esquema `https://`, el error tiene que ser el de conexión rechazada (prueba que sí se intentó el handshake TLS), nunca el de "no hay backend TLS" -- si esta regresión volviera, el test fallaría con el mensaje viejo en vez de uno de conexión.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

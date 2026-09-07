@@ -13,7 +13,90 @@ impl std::fmt::Display for LexError {
 }
 
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source).run()
+    let sanitized = check_version_pragma(source)?;
+    Lexer::new(&sanitized).run()
+}
+
+/// GRAMMAR.md §3.263: `#linkc >= "X.Y.Z"` opcional, solo entre las líneas en
+/// blanco/`//` del principio del archivo (antes del primer token real) --
+/// mismo lugar donde ya viven los headers de licencia/descripción de la
+/// mayoría de los `.link` reales. Si aparece y esta versión no la cumple,
+/// falla ACÁ, antes de tokenizar nada más, con un mensaje de una línea --
+/// nunca dejando que la incompatibilidad real se manifieda como un error de
+/// runtime irrelevante más adelante (el incidente real que motiva esto:
+/// GRAMMAR.md §3.263 mismo). Si la pragma está presente y se cumple, se
+/// devuelve el source con esa línea reemplazada por espacios (mismo largo
+/// exacto, así que línea/columna de TODO lo demás queda idéntica) -- el
+/// lexer normal de acá abajo no sabe nada de pragmas, `#` en cualquier otro
+/// lugar sigue siendo su error de "carácter inesperado" de siempre.
+fn check_version_pragma(source: &str) -> Result<String, LexError> {
+    let mut line_no = 0usize;
+    let mut offset = 0usize;
+    for raw_line in source.split_inclusive('\n') {
+        line_no += 1;
+        let line = raw_line.trim_end_matches('\n').trim_end_matches('\r');
+        let trimmed = line.trim_start();
+        let leading_ws = line.len() - trimmed.len();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            offset += raw_line.len();
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("#linkc") {
+            let col = leading_ws + 1;
+            let span = Span::new(offset + leading_ws, offset + line.len(), line_no, col);
+            let required = parse_version_pragma(rest).ok_or_else(|| LexError {
+                message: format!(
+                    "pragma de versión mal formado -- se esperaba `#linkc >= \"X.Y.Z\"`, se encontró `{trimmed}`"
+                ),
+                span,
+            })?;
+            let current = parse_semver(crate::VERSION).unwrap_or((0, 0, 0));
+            if current < required {
+                return Err(LexError {
+                    message: format!(
+                        "este .link pide linkc >= {}.{}.{}, esta instalación es {} -- actualizá el binario o ajustá el pragma",
+                        required.0, required.1, required.2, crate::VERSION
+                    ),
+                    span,
+                });
+            }
+            let mut sanitized = String::with_capacity(source.len());
+            sanitized.push_str(&source[..offset]);
+            for ch in line.chars() {
+                sanitized.push(if ch == '\t' { '\t' } else { ' ' });
+            }
+            sanitized.push_str(&source[offset + line.len()..]);
+            return Ok(sanitized);
+        }
+        // Primera línea real (no blanco, no `//`, no `#linkc`): no hay
+        // pragma -- el resto del archivo lo procesa el lexer normal, `#`
+        // sueltos ahí abajo siguen siendo el error de "carácter inesperado"
+        // de siempre.
+        return Ok(source.to_string());
+    }
+    Ok(source.to_string())
+}
+
+/// `>= "X.Y.Z"` -> `(X, Y, Z)`. Solo `>=` -- es el único operador que el
+/// caso real pide (GRAMMAR.md §3.263); `<`/`==`/`~`/`^` quedan fuera a
+/// propósito hasta que un caso real los necesite.
+fn parse_version_pragma(rest: &str) -> Option<(u32, u32, u32)> {
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix(">=")?;
+    let rest = rest.trim();
+    let rest = rest.strip_prefix('"')?.strip_suffix('"')?;
+    parse_semver(rest)
+}
+
+fn parse_semver(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
 }
 
 struct Lexer {
@@ -673,6 +756,62 @@ service Users {
         assert_eq!(tokens[1].span.col, 4); // cd
         assert_eq!(tokens[2].span.col, 1); // ef, línea 2
         assert_eq!(tokens[2].span.line, 2);
+    }
+
+    // ---- pragma `#linkc >= "X.Y.Z"` (GRAMMAR.md §3.263) ----
+
+    #[test]
+    fn version_pragma_satisfied_tokenizes_normally() {
+        let source = "#linkc >= \"0.1.0\"\ntype User = { id: Int }";
+        let tokens = tokenize(source).unwrap();
+        assert_eq!(tokens.first().map(|t| &t.kind), Some(&TokenKind::Type));
+    }
+
+    #[test]
+    fn version_pragma_after_leading_blank_and_comment_lines_is_still_recognized() {
+        // Mismo lugar donde ya viven los headers de licencia/descripción.
+        let source = "\n// segurma.link -- header real\n//\n#linkc >= \"0.1.0\"\ntype User = { id: Int }";
+        assert!(tokenize(source).is_ok());
+    }
+
+    #[test]
+    fn version_pragma_unsatisfied_fails_before_lexing_anything_else() {
+        let source = "#linkc >= \"999.0.0\"\ntype User = { id: Int }";
+        let err = tokenize(source).unwrap_err();
+        assert!(err.message.contains("999.0.0"), "{err:?}");
+        assert!(err.message.contains(crate::VERSION), "{err:?}");
+    }
+
+    #[test]
+    fn version_pragma_malformed_gives_a_clear_error_not_a_lex_error_on_hash() {
+        let source = "#linkc >= 1.0.0\ntype User = { id: Int }";
+        let err = tokenize(source).unwrap_err();
+        assert!(err.message.contains("mal formado"), "{err:?}");
+    }
+
+    #[test]
+    fn version_pragma_error_span_points_at_the_pragma_line() {
+        let source = "// header\n#linkc >= \"999.0.0\"\ntype User = { id: Int }";
+        let err = tokenize(source).unwrap_err();
+        assert_eq!(err.span.line, 2, "{err:?}");
+        assert_eq!(err.span.col, 1, "{err:?}");
+    }
+
+    #[test]
+    fn no_pragma_present_is_unaffected_and_bare_hash_later_still_errors_as_before() {
+        // `#` en cualquier otro lado del archivo sigue siendo el error de
+        // "carácter inesperado" de siempre -- el pragma solo se reconoce
+        // entre las líneas en blanco/`//` del principio.
+        let source = "type User = { id: Int }\n# esto no es un pragma";
+        let err = tokenize(source).unwrap_err();
+        assert!(!err.message.contains("linkc"), "{err:?}");
+    }
+
+    #[test]
+    fn hash_after_real_code_on_first_line_is_not_treated_as_pragma() {
+        let source = "type X = { id: Int } # no es un pragma";
+        let err = tokenize(source).unwrap_err();
+        assert!(!err.message.contains("mal formado"), "{err:?}");
     }
 
     #[test]

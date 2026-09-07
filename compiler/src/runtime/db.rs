@@ -424,6 +424,30 @@ pub(crate) fn searchable_fields_by_collection(program: &Program, checker: &Check
     result
 }
 
+/// Nombre de colección -> `true` si su PK escalar `id` es `@naturalKey`
+/// (GRAMMAR.md §3.264) -- `insert`/`insertMany`/`upsert` toman el valor tal
+/// cual del caller en vez de generar un UUID v4 nuevo. Ausente del mapa
+/// (o `false`) == autogenerar como siempre, comportamiento IDÉNTICO al de
+/// antes de esta ronda para cualquier programa que no use la anotación.
+/// Mismo cruce que `searchable_fields_by_collection`.
+pub(crate) fn natural_key_collections(program: &Program, checker: &Checker) -> HashSet<String> {
+    let mut result = HashSet::new();
+    for (coll_name, element_ty) in checker.db_collections() {
+        let Type::Struct { name: Some(type_name), .. } = element_ty else { continue };
+        for item in &program.items {
+            let Item::Type(t) = item else { continue };
+            if &t.name != type_name {
+                continue;
+            }
+            let TypeExpr::Struct(fields) = &t.ty else { continue };
+            if fields.iter().any(|f| f.name == "id" && f.natural_key()) {
+                result.insert(coll_name.clone());
+            }
+        }
+    }
+    result
+}
+
 /// Un componente de una clave primaria COMPUESTA (`@primaryKey(...)`,
 /// GRAMMAR.md §3.255): su nombre lógico y su columna SQL física (alias
 /// `@column` si existe, mismo criterio que `FkRef`/`TenantField`). Sin un
@@ -861,7 +885,9 @@ fn is_foreign_key_violation(msg: &str) -> bool {
 /// etc.).
 fn write_error(action: &str, e: String) -> RuntimeError {
     if is_unique_violation(&e) {
-        RuntimeError::bad_request(format!("ya existe una fila con ese valor único (@unique, GRAMMAR.md §3.80) -- {e}"))
+        RuntimeError::bad_request(format!(
+            "ya existe una fila con ese valor único o esa clave primaria (@unique GRAMMAR.md §3.80, o una clave @naturalKey repetida GRAMMAR.md §3.264) -- {e}"
+        ))
     } else if is_check_violation(&e) {
         RuntimeError::bad_request(format!("un valor no cumple una restricción @check (GRAMMAR.md §3.96) -- {e}"))
     } else if is_foreign_key_violation(&e) {
@@ -1630,6 +1656,9 @@ pub struct Db {
     /// sin ninguno. Calculado una vez al abrir la conexión, igual que
     /// `tenant_fields`/`soft_delete_fields`.
     searchable_fields: HashMap<String, Vec<String>>,
+    /// Nombre de colección -> tiene `@naturalKey` en su `id` (GRAMMAR.md
+    /// §3.264). Vacío == comportamiento idéntico al de antes de esta ronda.
+    natural_key_collections: HashSet<String>,
 }
 
 /// Un cambio anunciado por OTRA instancia de `linkc serve` contra la misma
@@ -2172,6 +2201,7 @@ impl Db {
         let soft_delete_fields = soft_delete_fields_by_collection(program, &checker);
         let tenant_fields = tenant_field_by_collection(program, &checker);
         let searchable_fields = searchable_fields_by_collection(program, &checker);
+        let natural_key_collections = natural_key_collections(program, &checker);
         let pool_size = pool_size.unwrap_or(Self::DEFAULT_SQLITE_READER_POOL_SIZE);
 
         Db {
@@ -2209,6 +2239,7 @@ impl Db {
             distributed_rate_limit: false,
             distributed_cache: false,
             searchable_fields,
+            natural_key_collections,
         }
     }
 
@@ -2291,6 +2322,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
         let refs_by_collection = ref_fields_by_collection(program, &checker, &aliases_by_collection);
         let tenant_fields = tenant_field_by_collection(program, &checker);
         let searchable_fields = searchable_fields_by_collection(program, &checker);
+        let natural_key_collections = natural_key_collections(program, &checker);
         let encrypted_by_collection = encrypted_fields_by_collection(program, &checker);
         let empty_checks: Vec<(String, FieldCheck)> = Vec::new();
         let empty_type_checks: Vec<String> = Vec::new();
@@ -2531,6 +2563,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 distributed_rate_limit,
                 distributed_cache,
                 searchable_fields,
+                natural_key_collections,
             },
             remote_rx,
         ))
@@ -3337,8 +3370,30 @@ db { users: User[] }
                 // la única diferencia entre los dos es el tipo de columna
                 // SQL (ver `create_postgres_table_sql`/`create_table_sql`),
                 // nunca el valor generado en sí.
+                //
+                // GRAMMAR.md §3.264: `@naturalKey` es la ÚNICA excepción --
+                // acá SÍ viene "id" en `fields` (omit_id_field lo dejó
+                // adentro del shape insertable para esta colección), y el
+                // valor es el del caller tal cual, nunca generado. Una
+                // clave repetida falla más abajo como cualquier violación
+                // de PRIMARY KEY (`write_error`), un 400 limpio.
                 let generated_uuid = match self.id_kind(collection) {
                     IdKind::Int => None,
+                    IdKind::Uuid | IdKind::String if self.natural_key_collections.contains(collection) => {
+                        let id_value = fields.iter().find(|(n, _)| n == "id").map(|(_, v)| v).ok_or_else(|| {
+                            RuntimeError::new("insert: falta 'id' -- esta colección tiene '@naturalKey' (GRAMMAR.md §3.264), quien llama tiene que proveer el valor")
+                        })?;
+                        let s = match id_value {
+                            Value::Str(s) => s.clone(),
+                            Value::Uuid(s) => s.clone(),
+                            other => {
+                                return Err(RuntimeError::new(format!(
+                                    "insert: 'id' de una colección '@naturalKey' tiene que ser String/Uuid, se encontró {other:?}"
+                                )))
+                            }
+                        };
+                        Some(s)
+                    }
                     IdKind::Uuid | IdKind::String => Some(generate_uuid_v4()?),
                 };
                 if let Some(uuid) = &generated_uuid {
@@ -6494,6 +6549,56 @@ mod tests {
             vec![Value::Int(b_id), Value::Struct(vec![("email".into(), Value::Str("a@x.com".into()))])],
         );
         let err = patched.expect_err("pisar el email de 'b' con el de 'a' (ya único) debe rechazarse");
+        assert_eq!(err.kind, crate::runtime::ErrorKind::BadRequest, "{err:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---- `@naturalKey` (GRAMMAR.md §3.264) ----
+
+    #[test]
+    fn natural_key_insert_uses_the_callers_value_not_a_generated_one() {
+        let path = std::env::temp_dir().join("c_script_test_natural_key_insert.db");
+        let _ = std::fs::remove_file(&path);
+        let program = program_from("type Setting = { @naturalKey id: String, value: String } db { settings: Setting[] }");
+        let db = Db::new(&program, &path);
+
+        let inserted = db
+            .call(
+                "settings",
+                "insert",
+                vec![Value::Struct(vec![("id".into(), Value::Str("smtp_host".into())), ("value".into(), Value::Str("smtp.hostinger.com".into()))])],
+            )
+            .unwrap();
+        let Value::Struct(fields) = &inserted else { panic!("se esperaba struct") };
+        let id = fields.iter().find(|(n, _)| n == "id").map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(id, Value::Str("smtp_host".into()), "el id tiene que ser EXACTAMENTE el que mandó el caller, no un UUID generado");
+
+        let found = db.call("settings", "find", vec![Value::Str("smtp_host".into())]).unwrap();
+        assert_ne!(found, Value::Null, "find(\"smtp_host\") tiene que encontrar la fila recién insertada por su clave natural");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn natural_key_duplicate_insert_is_rejected_as_bad_request() {
+        let path = std::env::temp_dir().join("c_script_test_natural_key_duplicate.db");
+        let _ = std::fs::remove_file(&path);
+        let program = program_from("type Setting = { @naturalKey id: String, value: String } db { settings: Setting[] }");
+        let db = Db::new(&program, &path);
+
+        db.call(
+            "settings",
+            "insert",
+            vec![Value::Struct(vec![("id".into(), Value::Str("smtp_host".into())), ("value".into(), Value::Str("a".into()))])],
+        )
+        .unwrap();
+        let second = db.call(
+            "settings",
+            "insert",
+            vec![Value::Struct(vec![("id".into(), Value::Str("smtp_host".into())), ("value".into(), Value::Str("b".into()))])],
+        );
+        let err = second.expect_err("una segunda fila con la misma clave natural tiene que rechazarse, nunca duplicarse en silencio");
         assert_eq!(err.kind, crate::runtime::ErrorKind::BadRequest, "{err:?}");
 
         let _ = std::fs::remove_file(&path);
