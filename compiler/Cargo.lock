@@ -1129,7 +1129,7 @@ dependencies = [
 
 [[package]]
 name = "linkc"
-version = "1.222.0"
+version = "1.223.0"
 dependencies = [
  "aes-gcm",
  "argon2",

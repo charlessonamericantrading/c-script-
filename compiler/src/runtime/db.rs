@@ -1781,6 +1781,16 @@ thread_local! {
     /// header (`nombre=valor; HttpOnly; Secure; ...`), armado por
     /// `response.setCookie` -- este thread_local solo los acumula.
     static RESPONSE_COOKIES_OVERRIDE: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// `response.setHeader(name, value)` (GRAMMAR.md §3.279) -- `Vec<(String,
+    /// String)>`, no un `HashMap`: orden de INSERCIÓN determinista (mismo
+    /// criterio que `RequestContext.query`/`.cookies`), y una lista corta de
+    /// headers custom no necesita lookup O(1). A diferencia de
+    /// `RESPONSE_COOKIES_OVERRIDE` (que ACUMULA), llamar `setHeader` dos
+    /// veces con el MISMO nombre reemplaza el valor anterior en su posición
+    /// -- mandar el mismo header custom dos veces con valores distintos casi
+    /// siempre es un bug del lado del programa, a diferencia de varias
+    /// cookies (un caso de uso legítimo real).
+    static RESPONSE_HEADERS_OVERRIDE: RefCell<Vec<(String, String)>> = const { RefCell::new(Vec::new()) };
     /// GRAMMAR.md §3.260: `true` mientras ESTE hilo está evaluando el
     /// cuerpo de un rpc `@readReplica` -- mismo criterio EXACTO que
     /// `CURRENT_REQUEST` (un hilo por request, así que "está corriendo un
@@ -3276,6 +3286,7 @@ db { users: User[] }
             c.borrow_mut().take();
         });
         RESPONSE_COOKIES_OVERRIDE.with(|c| c.borrow_mut().clear());
+        RESPONSE_HEADERS_OVERRIDE.with(|c| c.borrow_mut().clear());
     }
 
     /// Llamado por `response.setStatus(code)` (GRAMMAR.md §3.46) -- guarda
@@ -3325,6 +3336,25 @@ db { users: User[] }
     /// error nunca manda cookies que el cuerpo haya pedido antes de fallar.
     pub(crate) fn take_response_cookies(&self) -> Vec<String> {
         RESPONSE_COOKIES_OVERRIDE.with(|c| std::mem::take(&mut *c.borrow_mut()))
+    }
+
+    /// Llamado por `response.setHeader(name, value)` (GRAMMAR.md §3.279) --
+    /// REEMPLAZA un valor existente para el mismo nombre (comparación
+    /// case-insensitive, como manda HTTP) en su posición original, en vez de
+    /// agregar una entrada duplicada -- mismo criterio que `Map::set`.
+    pub(crate) fn set_response_header(&self, name: String, value: String) {
+        RESPONSE_HEADERS_OVERRIDE.with(|c| {
+            let mut headers = c.borrow_mut();
+            match headers.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&name)) {
+                Some((_, existing)) => *existing = value,
+                None => headers.push((name, value)),
+            }
+        });
+    }
+
+    /// Simétrico de `take_response_cookies`.
+    pub(crate) fn take_response_headers(&self) -> Vec<(String, String)> {
+        RESPONSE_HEADERS_OVERRIDE.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
     /// `""` -- no `None` -- fuera de una request HTTP real (ej. invocado

@@ -397,7 +397,7 @@ fn handle_tools_call(
     }
     let result = handle_rpc(program, db, sessions, Some(session_token), &service_name, &rpc_name, arguments);
     clear_current();
-    let (status, body_str, _content_type, _location, _cache_control, _cookies) = result;
+    let (status, body_str, _content_type, _location, _cache_control, _cookies, _headers) = result;
     if (200..300).contains(&status) {
         let result_value: serde_json::Value = serde_json::from_str(&body_str).unwrap_or(serde_json::Value::Null);
         // Un `rpc -> String` no debe terminar con comillas JSON de más

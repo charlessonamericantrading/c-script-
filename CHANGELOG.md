@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.223.0] - 2026-09-07
+
+### ✨ Añadido
+**`response.setHeader(name, value)` -- headers de respuesta arbitrarios, cierra el ítem C4 de la Fase 1 de PLAN.md §9.24.** Antes de esto los únicos headers por ruta eran `Content-Type` (`@content_type`) y `Cache-Control` (`@cache_control`) -- las páginas SSR de Segurma necesitan 6 headers de SEO propios (`X-Robots-Tag`, `Link: <canonical>; rel=canonical`, `X-AI-Allowed`, etc.) y `llms.txt`/feeds necesitan `Last-Modified`. `setHeader` agrega o REEMPLAZA (mismo nombre, case-insensitive) un header custom; rechaza CR/LF en nombre y valor (mismo motivo que `setCookie`/`redirect`). Lista negra en RUNTIME de nombres reservados: los que ya tienen mecanismo dedicado (`Content-Type`/`Set-Cookie`/`Location`/`Cache-Control`), los que el motor fija SIEMPRE (`Content-Length`, `ETag`, `Vary`, `X-Request-Id`, los CORS, los 3 headers de seguridad fijos), y los hop-by-hop de RFC 7230 §6.1 -- pisar cualquiera de estos produciría un header DUPLICADO, no un reemplazo. Relajar los headers de seguridad fijos queda deliberadamente para C5, con su propio mecanismo. Rechazado dentro de un `stream`. Ver GRAMMAR.md §3.279.
+
+Verificado con 3 tests de checker + verificación manual de punta a punta contra un `linkc serve` real: dos headers custom reales aparecen tal cual en la respuesta; intentar pisar `X-Frame-Options` da un error de runtime claro en vez de un header duplicado silencioso. `handle_rpc` creció a un tupla de 7 elementos -- factoreada a un alias `RpcResponseParts` para que `clippy::type_complexity` (nuevo con este cambio) quede limpio. Suite completa (1404 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.222.0] - 2026-09-07
 
 ### ✨ Añadido

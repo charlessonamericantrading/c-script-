@@ -9834,6 +9834,35 @@ service Leads {
 
 **Verificado**: 3 tests de `checker.rs` (tipa solo con un rpc común; rechazado sobre un `stream`; compone sin error junto a `@requires`+`@rate_limit`) + verificación manual de punta a punta contra un `linkc serve` real: un rpc `@csrf` sin ningún token da 403; el mismo rpc sin `@csrf` con los mismos argumentos funciona sin pedir nada; cookie+header coincidentes pasan; cookie sin header, y cookie con un header que no coincide, dan 403 los dos. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.279 `response.setHeader(name, value)`: headers de respuesta arbitrarios — cierra Fase 1 ítem C4 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem C4 -- las páginas SSR de Segurma mandan seis headers de SEO propios (`X-Robots-Tag`, `Link: <canonical>; rel=canonical`, `X-AI-Allowed`, `X-Content-Language`, `X-Brand-Name`, `X-AI-Policy`) y `llms.txt`/los feeds necesitan `Last-Modified` -- antes de esto, los únicos headers por ruta que c-script podía fijar eran `Content-Type` (`@content_type`) y `Cache-Control` (`@cache_control`); cualquier otro era imposible de mandar.
+
+<!-- linkc:check -->
+```rust
+fn home() -> String {
+  response.setHeader("X-Robots-Tag", "noindex");
+  response.setHeader("Link", "<https://example.com/>; rel=canonical");
+  "hola"
+}
+```
+
+`response.setHeader(name: String, value: String) -> Void` agrega (o REEMPLAZA, si ya se llamó con el mismo nombre -- case-insensitive, como manda HTTP) un header custom a la respuesta. `name`/`value` rechazan CR/LF (mismo motivo de inyección de headers que `response.redirect`/`response.setCookie`).
+
+**Lista negra de nombres RESERVADOS** (case-insensitive) -- rechazados en runtime con un error claro, nunca dejados pasar para pisar en silencio un header que el motor ya fija:
+
+| Categoría | Nombres | Por qué |
+|---|---|---|
+| Mecanismo dedicado propio | `Content-Type`, `Set-Cookie`, `Location`, `Cache-Control` | ya existen `@content_type`/`response.setCookie`/`response.redirect`/`@cache_control` -- dos caminos para lo mismo es peor que uno |
+| El motor los fija SIEMPRE | `Content-Length`, `Content-Encoding`, `ETag`, `Vary`, `X-Request-Id`, los 4 `Access-Control-Allow-*`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Strict-Transport-Security` | dejar que `setHeader` los pise produciría un header DUPLICADO (uno del motor, uno del programa), no un reemplazo -- la mayoría son singleton por RFC y un browser/proxy ante dos valores del mismo header hace algo indefinido, nunca "el último gana" de forma confiable |
+| Hop-by-hop (RFC 7230 §6.1) | `Connection`, `Keep-Alive`, `Proxy-Authenticate`, `Proxy-Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade` | ningún handler de aplicación debería fijarlos nunca -- son del transporte, no de la respuesta lógica |
+
+Relajar los tres headers de seguridad fijos (`X-Frame-Options`/`Referrer-Policy`/además `Strict-Transport-Security` opt-in) queda deliberadamente FUERA de `setHeader` -- es el ítem C5 de esta misma fase, con su propio mecanismo (`--security-headers`/`@headers`), para no tener dos formas distintas de lograr lo mismo con semántica de "último gana" ambigua entre ellas.
+
+Rechazado dentro de un `stream`, mismo motivo que `setStatus`/`setCookie`/`redirect`: una conexión SSE ya mandó sus headers antes de que el cuerpo corra.
+
+**Verificado**: 3 tests de `checker.rs` (tipa con 2 argumentos String; exige exactamente 2; rechazado dentro de un `stream`) + verificación manual de punta a punta contra un `linkc serve` real: dos headers custom reales (`X-Robots-Tag`, `Link`) aparecen tal cual en la respuesta; intentar pisar `X-Frame-Options` (un nombre reservado) da un error de runtime claro en vez de un header duplicado silencioso. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

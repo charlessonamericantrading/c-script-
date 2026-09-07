@@ -5994,6 +5994,19 @@ impl Checker {
                 self.check_expr(options, &set_cookie_options_type(), env)?;
                 Some(Type::Void)
             }
+            (Type::Response, "setHeader") => {
+                let [name, value] = args else {
+                    return Err(err("'response.setHeader' toma exactamente 2 argumentos (name: String, value: String)"));
+                };
+                if self.in_stream_body.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(err(
+                        "'response.setHeader' no tiene efecto dentro de un 'stream': mismo motivo que 'response.setStatus' (GRAMMAR.md §3.46) -- una conexión SSE ya envió sus headers antes de que el cuerpo corra",
+                    ));
+                }
+                self.check_expr(name, &Type::String, env)?;
+                self.check_expr(value, &Type::String, env)?;
+                Some(Type::Void)
+            }
             (Type::Base64, "decode") => {
                 let [str_arg] = args else {
                     return Err(err("'base64.decode' toma exactamente 1 argumento (base64_str: String)"));
@@ -11612,6 +11625,42 @@ type T = { id: Int, s: Status }")
         assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie(1, "b", {}) } }"#).is_err());
         assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie("a", 2, {}) } }"#).is_err());
         assert!(check_source(r#"service S { rpc f() -> Void { response.setCookie("a", "b", { httpOnly: "not-a-bool" }) } }"#).is_err());
+    }
+
+    // ---- `response.setHeader` (GRAMMAR.md §3.279, PLAN.md §9.24 Fase 1 ítem C4) ----
+
+    #[test]
+    fn response_set_header_takes_two_strings_and_types_as_void() {
+        let src = r#"
+            service S {
+                rpc f() -> Void { response.setHeader("X-Robots-Tag", "noindex") }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn response_set_header_requires_exactly_two_string_arguments() {
+        assert!(check_source(r#"service S { rpc f() -> Void { response.setHeader("a") } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> Void { response.setHeader(1, "b") } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> Void { response.setHeader("a", 2) } }"#).is_err());
+    }
+
+    #[test]
+    fn response_set_header_is_rejected_inside_a_stream() {
+        let src = r#"
+            type Item = { id: Int }
+            db { items: Item[] }
+            service Items {
+                stream watchAll() -> Item {
+                    response.setHeader("X-Robots-Tag", "noindex");
+                    db.items.all()
+                }
+            }
+        "#;
+        let res = check_source(src);
+        assert!(res.is_err());
+        assert!(format!("{:?}", res.unwrap_err()).contains("setHeader"));
     }
 
     #[test]

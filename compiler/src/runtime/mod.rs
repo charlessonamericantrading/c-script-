@@ -4907,6 +4907,50 @@ fn call_method(
                 db.set_response_cookie(cookie);
                 Ok(Value::Null)
             }
+            "setHeader" => {
+                let (name, value) = match (args.first(), args.get(1)) {
+                    (Some(Value::Str(n)), Some(Value::Str(v))) => (n, v),
+                    _ => return Err(err("response.setHeader requiere (name: String, value: String)")),
+                };
+                if name.is_empty() {
+                    return Err(err("response.setHeader: 'name' no puede ser un string vacío"));
+                }
+                // Mismo motivo que `redirect`/`setCookie` de arriba: un
+                // valor con CR/LF adentro podría inyectar un header (o un
+                // atributo) extra.
+                for (field, s) in [("name", name.as_str()), ("value", value.as_str())] {
+                    if s.contains('\r') || s.contains('\n') {
+                        return Err(err(format!("response.setHeader: '{field}' no puede contener un salto de línea")));
+                    }
+                }
+                // Headers con un mecanismo DEDICADO propio en este lenguaje,
+                // o que el motor ya decide por su cuenta en TODA respuesta
+                // (`cors_response_with_type`, `runtime/server.rs`) -- dejar
+                // que `setHeader` los pise produciría un header DUPLICADO
+                // (uno del motor, uno del programa) en vez de un reemplazo,
+                // que es peor que rechazarlo en el momento: la mayoría de
+                // estos son singleton por RFC y un browser/proxy real ante
+                // dos valores del mismo header hace algo indefinido, nunca
+                // "el último gana" de forma confiable. Más la lista
+                // hop-by-hop de RFC 7230 §6.1, que ningún handler de
+                // aplicación debería fijar nunca.
+                const RESERVED: &[&str] = &[
+                    "content-type", "content-length", "content-encoding", "set-cookie", "location",
+                    "cache-control", "etag", "vary", "x-request-id",
+                    "access-control-allow-origin", "access-control-allow-methods", "access-control-allow-headers",
+                    "access-control-allow-credentials",
+                    "x-content-type-options", "x-frame-options", "referrer-policy", "strict-transport-security",
+                    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
+                    "transfer-encoding", "upgrade",
+                ];
+                if RESERVED.iter().any(|reserved| name.eq_ignore_ascii_case(reserved)) {
+                    return Err(err(format!(
+                        "response.setHeader: '{name}' ya lo maneja el motor (o tiene su propio método dedicado, ej. 'response.setCookie'/'response.redirect') -- no se puede sobrescribir"
+                    )));
+                }
+                db.set_response_header(name.clone(), value.clone());
+                Ok(Value::Null)
+            }
             other => Err(err(format!("método desconocido sobre response: '{other}'"))),
         },
         Value::Http => match method {
