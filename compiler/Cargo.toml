@@ -1,6 +1,6 @@
 [package]
 name = "linkc"
-version = "1.226.0"
+version = "1.226.1"
 edition = "2021"
 default-run = "linkc"
 
@@ -207,8 +207,18 @@ jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"]
 # `ctrlc` (chico, sin dependencias propias más allá de `libc`/`windows-sys`
 # ya transitivas del ecosistema, ampliamente usado) -- exactamente la
 # recomendación que este ítem ya traía escrita en PLAN.md antes de
-# implementarse.
-ctrlc = { version = "3", optional = true }
+# implementarse. `features = ["termination"]` NO es opcional -- sin esto,
+# `ctrlc` en Unix solo maneja SIGINT (Ctrl-C interactivo); SIGTERM (la señal
+# real que manda `pm2`/`systemctl stop`/un orquestador, el caso que motiva
+# TODO este ítem) queda con la disposición DEFAULT del sistema operativo
+# (mata el proceso sin drenar nada). Bug real: la primera versión de este
+# cambio lo shippeó sin este feature, y pasó localmente (Windows, donde
+# `SIGTERM` no existe como tal y el feature no aplica) pero CI en
+# `ubuntu-latest` lo agarró de inmediato -- un SIGTERM real mataba el
+# proceso sin pasar por el drenado (`cli_graceful_drain.rs`, ambos tests
+# fallaron con "unix_wait_status(15)": terminado POR la señal, no salido
+# solo).
+ctrlc = { version = "3", features = ["termination"], optional = true }
 # GRAMMAR.md §3.233: el motor de inferencia vendorizado (feature `inference`).
 # `server` es el crate que junta cargador GGUF, cache de modelos residentes y
 # resolución de alias de Ollama; `model-core` trae los traits

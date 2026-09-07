@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.226.1] - 2026-09-07
+
+### 🐛 Corregido
+**`ctrlc` sin el feature `termination` -- SIGTERM real no drenaba nada, mataba el proceso directo (v1.226.0 quedó en rojo en CI por esto).** En Unix, `ctrlc` maneja `SIGINT` (Ctrl-C interactivo) por default; `SIGTERM` -- la señal que manda `pm2 restart`/`systemctl stop`, el caso real que motiva TODO el ítem C14 -- necesita el feature de Cargo `termination` activado explícitamente. Sin él, un `SIGTERM` real caía con la disposición DEFAULT del sistema operativo (mata inmediato), exactamente el problema que el drenado gracioso existe para resolver -- v1.226.0 lo shippeó sin ese feature. Pasó inadvertido en desarrollo local (Windows, donde `SIGTERM` POSIX no existe) y CI en `ubuntu-latest` lo agarró de inmediato: los dos tests de `cli_graceful_drain.rs` fallaron con `unix_wait_status(15)` (terminado POR la señal, no salido solo). Ver GRAMMAR.md §3.282.
+
+Verificado: `cargo build`/`clippy` limpios con el feature activado; los 2 tests de `cli_graceful_drain.rs` siguen pasando en Windows (mecanismo distinto, no afectado); pendiente confirmación de CI en `ubuntu-latest` (el ambiente real que encontró el bug) para cerrar el ciclo.
+
 ## [1.226.0] - 2026-09-07
 
 ### ✨ Añadido
