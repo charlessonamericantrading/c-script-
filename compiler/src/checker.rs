@@ -5841,6 +5841,25 @@ impl Checker {
                 self.expect_no_args(args, "id")?;
                 Some(Type::String)
             }
+            // GRAMMAR.md §3.276 (PLAN.md §9.24 Fase 1 ítem C3): datos de la
+            // request que faltaban -- `path`/`method`/`ip`/`url` nunca son
+            // `null` (siempre hay uno, a diferencia de `header`); `query`
+            // usa `Map<K,V>` (§3.273, recién cerrado) en vez de inventar un
+            // tipo estructural propio.
+            (Type::Request, "path" | "method" | "ip" | "url") => {
+                self.expect_no_args(args, field.as_str())?;
+                Some(Type::String)
+            }
+            // `userAgent` SÍ puede faltar (un cliente no está obligado a
+            // mandar `User-Agent`) -- Optional, mismo criterio que `header`.
+            (Type::Request, "userAgent") => {
+                self.expect_no_args(args, "userAgent")?;
+                Some(Type::Optional(Box::new(Type::String)))
+            }
+            (Type::Request, "query") => {
+                self.expect_no_args(args, "query")?;
+                Some(Type::MapOf(Box::new(Type::String), Box::new(Type::String)))
+            }
             (Type::Smtp, "send") => {
                 let [to, subject, body] = args else {
                     return Err(err("'smtp.send' toma exactamente 3 argumentos (to: String, subject: String, body: String)"));
@@ -11388,6 +11407,50 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(bad).is_err(), "'request.id' no toma argumentos");
+    }
+
+    // ---- `request.path/method/query/ip/userAgent/url` (GRAMMAR.md §3.276, PLAN.md §9.24 Fase 1 ítem C3) ----
+
+    #[test]
+    fn request_path_method_ip_and_url_type_as_plain_string() {
+        let src = r#"
+            service S {
+                rpc info() -> String {
+                    request.path() + request.method() + request.ip() + request.url()
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn request_user_agent_types_as_optional_string() {
+        let src = r#"
+            service S {
+                rpc ua() -> String? { request.userAgent() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn request_query_types_as_map_of_string_to_string() {
+        let src = r#"
+            service S {
+                rpc q(key: String) -> String? { request.query().get(key) }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn request_path_method_ip_url_and_query_take_no_arguments() {
+        assert!(check_source(r#"service S { rpc f() -> String { request.path("x") } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> String { request.method("x") } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> String { request.ip("x") } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> String { request.url("x") } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> String? { request.userAgent("x") } }"#).is_err());
+        assert!(check_source(r#"service S { rpc f() -> Map<String,String> { request.query("x") } }"#).is_err());
     }
 
     #[test]

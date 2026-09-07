@@ -4726,6 +4726,12 @@ fn call_method(
                 Ok(db.current_request_header(name).map(Value::Str).unwrap_or(Value::Null))
             }
             "id" => Ok(Value::Str(db.current_request_id())),
+            "path" => Ok(Value::Str(db.current_request_path())),
+            "method" => Ok(Value::Str(db.current_request_method())),
+            "ip" => Ok(Value::Str(db.current_request_ip())),
+            "url" => Ok(Value::Str(db.current_request_url())),
+            "userAgent" => Ok(db.current_request_user_agent().map(Value::Str).unwrap_or(Value::Null)),
+            "query" => Ok(Value::Struct(db.current_request_query().into_iter().map(|(k, v)| (k, Value::Str(v))).collect())),
             other => Err(err(format!("método desconocido sobre request: '{other}'"))),
         },
         Value::Smtp => match method {

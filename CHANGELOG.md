@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.220.0] - 2026-09-07
+
+### ✨ Añadido
+**`request.path/method/query/ip/userAgent/url` -- cierra el ítem C3 de la Fase 1 de PLAN.md §9.24.** Lo único que existía antes de esto era `request.header(name)`/`request.rawBody()`. Ahora: `path()`/`method()`/`ip()`/`url()` (nunca `null`), `userAgent()` (`String?`, el único que puede faltar), y `query() -> Map<String, String>` (usa `Map<K,V>`, §3.273; orden de aparición en la URL, no alfabético). `ip()` reusa LITERALMENTE el mismo cálculo que `@rate_limit` ya usaba internamente (conexión TCP real, o `X-Forwarded-For` con `--trust-proxy`); el parseo de `query()` reusa la misma lógica de `@route`, preservando el orden en vez de perderlo en un `HashMap`. Ver GRAMMAR.md §3.276.
+
+Verificado con 5 tests de checker + verificación manual de punta a punta contra un `linkc serve` real (path/method/url sobre una request con query string, `userAgent` presente, `query().get(...)` con clave presente -- incluido percent-decode real -- y ausente, `ip` sobre una conexión local real). Suite completa (1392 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.219.0] - 2026-09-07
 
 ### ✨ Añadido

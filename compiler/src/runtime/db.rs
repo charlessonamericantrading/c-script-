@@ -1847,6 +1847,21 @@ pub(crate) struct RequestContext {
     /// `raw_body`/`headers`), antes de cualquier dispatch -- el mismo valor
     /// que la respuesta ecoa y que cada línea de log de esta request lleva.
     pub request_id: String,
+    /// GRAMMAR.md §3.276 (PLAN.md §9.24 Fase 1 ítem C3): datos de la
+    /// request que `request.path/method/query/ip/userAgent/url()` exponen.
+    /// `path` es SOLO el path (sin query); `url` es el request-target
+    /// crudo tal como llegó (path + `?query`, si había) -- el mismo `req.
+    /// originalUrl` que una clave de cache SSR necesitaría.
+    pub path: String,
+    pub method: String,
+    /// Orden de APARICIÓN en la query string, no alfabético ni de
+    /// `HashMap` -- mismo criterio determinista que `List<T>.groupBy`
+    /// (§3.272), para que `.keys()`/`.entries()` sobre el `Map` resultante
+    /// no varíen de una corrida a otra para la misma URL.
+    pub query: Vec<(String, String)>,
+    pub ip: String,
+    pub user_agent: Option<String>,
+    pub url: String,
 }
 
 /// Única forma de abrir una conexión NUEVA a PostgreSQL -- usada tanto por
@@ -3306,6 +3321,38 @@ db { users: User[] }
     /// caso que en la práctica nunca importa.
     pub(crate) fn current_request_id(&self) -> String {
         current_thread_request_id()
+    }
+
+    /// GRAMMAR.md §3.276: mismo criterio "`\"\"`/vacío fuera de una request
+    /// real" que `current_request_body`/`current_request_id` de arriba --
+    /// bajo `linkc test` no hay ninguna request HTTP real de la que sacar
+    /// esto.
+    pub(crate) fn current_request_path(&self) -> String {
+        CURRENT_REQUEST.with(|c| c.borrow().as_ref().map(|c| c.path.clone()).unwrap_or_default())
+    }
+
+    pub(crate) fn current_request_method(&self) -> String {
+        CURRENT_REQUEST.with(|c| c.borrow().as_ref().map(|c| c.method.clone()).unwrap_or_default())
+    }
+
+    pub(crate) fn current_request_query(&self) -> Vec<(String, String)> {
+        CURRENT_REQUEST.with(|c| c.borrow().as_ref().map(|c| c.query.clone()).unwrap_or_default())
+    }
+
+    pub(crate) fn current_request_ip(&self) -> String {
+        CURRENT_REQUEST.with(|c| c.borrow().as_ref().map(|c| c.ip.clone()).unwrap_or_default())
+    }
+
+    /// `None`, no `""` -- a diferencia de `path`/`method`/`ip`/`url` (que
+    /// SIEMPRE existen para una request real), un `User-Agent` ausente es
+    /// una distinción real que el caller necesita ver, mismo criterio que
+    /// `current_request_header`.
+    pub(crate) fn current_request_user_agent(&self) -> Option<String> {
+        CURRENT_REQUEST.with(|c| c.borrow().as_ref().and_then(|c| c.user_agent.clone()))
+    }
+
+    pub(crate) fn current_request_url(&self) -> String {
+        CURRENT_REQUEST.with(|c| c.borrow().as_ref().map(|c| c.url.clone()).unwrap_or_default())
     }
 
     pub fn call(&self, collection: &str, method: &str, args: Vec<Value>) -> Result<Value, RuntimeError> {

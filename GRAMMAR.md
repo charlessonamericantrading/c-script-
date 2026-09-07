@@ -9732,6 +9732,36 @@ service Site {
 
 **Verificado**: 1 test de `checker.rs` (tipa como `String` liso, sin argumentos) + verificación manual de punta a punta contra un `linkc serve` real: sin `X-Request-Id` entrante, el header de respuesta y `request.id()` devuelven el MISMO UUID recién generado (confirmado con una sola request, header y body juntos); con un `X-Request-Id` entrante custom, se ecoa tal cual en la respuesta y en `request.id()`; el log de texto muestra `request_id=...` en cada línea. Suite completa (1388 tests) sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.276 Datos de la request: `path`/`method`/`query`/`ip`/`userAgent`/`url` — cierra Fase 1 ítem C3 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem C3 -- lo único que existía antes era `request.header(name)`/`request.rawBody()` (§3.38); nada exponía el path, el método, los query params ya parseados, la IP real del cliente, el User-Agent, o la URL completa (la clave que una cache SSR necesitaría, `req.originalUrl` en términos de Express).
+
+<!-- linkc:check -->
+```rust
+fn logLine() -> String {
+  request.method() + " " + request.path() + " desde " + request.ip()
+}
+
+fn nameParam() -> String? {
+  request.query().get("name")
+}
+```
+
+| Método | Firma | Nota |
+|---|---|---|
+| `path` | `() -> String` | solo el path, sin la query string |
+| `method` | `() -> String` | `"GET"`/`"POST"`/etc., siempre mayúsculas |
+| `query` | `() -> Map<String, String>` | usa `Map<K,V>` (§3.273); orden de APARICIÓN en la URL, no alfabético -- mismo criterio determinista que `List<T>.groupBy` (§3.272) |
+| `ip` | `() -> String` | mismo cálculo que ya usa `@rate_limit`: la conexión TCP real, o el último valor de `X-Forwarded-For` con `--trust-proxy` (§3.89) |
+| `userAgent` | `() -> String?` | `null` si el cliente no lo mandó -- el único de los seis que puede faltar |
+| `url` | `() -> String` | el request-target crudo tal cual llegó, path + `?query` si había |
+
+**`path`/`method`/`ip`/`url` nunca son `null` -- siempre hay uno para una request real** (a diferencia de `header(name)`, que puede faltar). `userAgent` es la única excepción explícita, mismo motivo que `header`: un cliente no está obligado a mandarlo.
+
+**Reusa mecanismos que ya existían para otro propósito, en vez de duplicarlos**: el cálculo de `ip` es LITERALMENTE el mismo `client_ip_for_rate_limit` que `@rate_limit` (§3.39/§3.89) ya usaba internamente -- ahora también accesible desde el `.link`; el parseo de query string reusa la misma lógica de `resolve_route` (§3.62), solo que preservando el ORDEN (un `HashMap` lo pierde) para que el `Map` resultante sea determinista.
+
+**Verificado**: 5 tests de `checker.rs` (los cuatro `String` lisos, `userAgent` Optional, `query` como `Map<String,String>`, rechazo de argumentos en los seis) + verificación manual de punta a punta contra un `linkc serve` real: `path`/`method`/`url` correctos sobre una request con query string; `userAgent` presente devuelve el header tal cual; `query().get(...)` con una clave presente (incluido percent-decode real, `%20` → espacio) y una ausente (`null`); `ip` devuelve `127.0.0.1` sobre una conexión local real. Suite completa (1392 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

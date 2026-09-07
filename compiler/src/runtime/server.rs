@@ -1065,7 +1065,31 @@ fn handle_request(
         .filter(|v| !v.is_empty())
         .or_else(|| generate_uuid_v4().ok())
         .unwrap_or_else(|| req_id.to_string());
-    db.set_request_context(super::db::RequestContext { raw_body: body.clone(), headers, current_token, request_id: request_id.clone() });
+    // GRAMMAR.md §3.276 (PLAN.md §9.24 Fase 1 ítem C3): `path`/`method`/
+    // `query`/`ip`/`userAgent`/`url`, resueltos ACÁ mismo (una sola vez por
+    // request, mismo momento que el resto del contexto). `path` es el
+    // `path`/`query_string` que `resolve_route` (más abajo) va a partir de
+    // la MISMA forma -- se recalcula acá porque `resolve_route` todavía no
+    // corrió a esta altura, no porque la lógica difiera.
+    let (path_only, query_string) = path.split_once('?').map_or((path.as_str(), None), |(p, q)| (p, Some(q)));
+    let query = query_string.map(parse_query_string_ordered).unwrap_or_default();
+    let user_agent = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("user-agent")).map(|(_, v)| v.clone());
+    let ip = client_ip_for_rate_limit(&request, trust_proxy);
+    let method_str = request.method().as_str().to_uppercase();
+    let path_only = path_only.to_string();
+    let url = path.clone();
+    db.set_request_context(super::db::RequestContext {
+        raw_body: body.clone(),
+        headers,
+        current_token,
+        request_id: request_id.clone(),
+        path: path_only,
+        method: method_str,
+        query,
+        ip,
+        user_agent,
+        url,
+    });
 
     // `/live` y `/ready` (GRAMMAR.md §3.220, PLAN.md §9.18 Eje E ítem 2):
     // las DOS preguntas que `/health` (§3.87) contesta juntas, separadas
@@ -1865,6 +1889,30 @@ fn parse_query_string(qs: &str) -> std::collections::HashMap<String, String> {
             (percent_decode_query_value(k), percent_decode_query_value(v))
         })
         .collect()
+}
+
+/// Como `parse_query_string`, pero preserva el orden de APARICIÓN en la
+/// query string en vez de perderlo en un `HashMap` -- lo que `request.
+/// query()` (GRAMMAR.md §3.276) necesita para que `Map<String,String>.
+/// keys()`/`.entries()` no varíen de una corrida a otra para la misma URL
+/// (mismo criterio determinista que `List<T>.groupBy`, §3.272). Clave
+/// repetida: se ACTUALIZA el valor en su posición original (gana la
+/// ÚLTIMA, mismo criterio que `parse_query_string`), nunca una entrada
+/// duplicada -- un `Map` con dos pares para la misma clave no tendría
+/// sentido. O(n²) a propósito: una query string real tiene un puñado de
+/// parámetros, nunca miles.
+fn parse_query_string_ordered(qs: &str) -> Vec<(String, String)> {
+    let mut result: Vec<(String, String)> = Vec::new();
+    for pair in qs.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let k = percent_decode_query_value(k);
+        let v = percent_decode_query_value(v);
+        match result.iter_mut().find(|(existing_k, _)| existing_k == &k) {
+            Some((_, existing_v)) => *existing_v = v,
+            None => result.push((k, v)),
+        }
+    }
+    result
 }
 
 /// Identificador de cliente que usa `@rate_limit` (GRAMMAR.md §3.39/§3.89/
