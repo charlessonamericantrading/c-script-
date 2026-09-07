@@ -427,6 +427,11 @@ pub struct ServeConfig {
     /// GRAMMAR.md §3.280: `--referrer-policy`/`LINK_REFERRER_POLICY` --
     /// `"no-referrer"` si no se configuró nada.
     pub referrer_policy: String,
+    /// GRAMMAR.md §3.281: `--rate-limit-global`/`LINK_RATE_LIMIT_GLOBAL` --
+    /// un tope para TODO el sitio (una sola clave por IP, sin importar qué
+    /// rpc), independiente de cualquier `@rate_limit` por rpc. `None` =
+    /// sin tope global, comportamiento idéntico al de siempre.
+    pub rate_limit_global: Option<RateLimitSpec>,
     pub mcp_secret: Option<String>,
     /// GRAMMAR.md §3.234: `--models-dir`/`LINK_MODELS_DIR`, base de las
     /// rutas relativas de `ai { }`.
@@ -478,6 +483,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         hsts,
         frame_options,
         referrer_policy,
+        rate_limit_global,
         mcp_secret,
     } = config;
     let host = host.as_str();
@@ -862,6 +868,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                     hsts.as_deref(),
                     &frame_options,
                     &referrer_policy,
+                    rate_limit_global,
                     max_body_bytes,
                     trust_proxy,
                     service_api_key.as_deref(),
@@ -960,6 +967,7 @@ fn handle_request(
     hsts: Option<&str>,
     frame_options: &str,
     referrer_policy: &str,
+    rate_limit_global: Option<RateLimitSpec>,
     max_body_bytes: u64,
     trust_proxy: bool,
     service_api_key: Option<&str>,
@@ -1018,6 +1026,33 @@ fn handle_request(
             LogFormat::Text => println!("[req {req_id}] {} {path}", request.method()),
             LogFormat::Json => {
                 println!("{}", serde_json::json!({"req_id": req_id, "http_method": request.method().to_string(), "path": path}))
+            }
+        }
+    }
+
+    // `--rate-limit-global`/`LINK_RATE_LIMIT_GLOBAL` (GRAMMAR.md §3.281,
+    // PLAN.md §9.24 Fase 1 ítem C8a): tope para TODO el sitio, una sola
+    // clave por IP sin importar qué rpc -- corre ANTES que cualquier otra
+    // cosa (incluso `--service-api-key`), mismo criterio que `@rate_limit`
+    // ya aplicaba más abajo: no vale la pena gastar ningún otro chequeo
+    // antes de rechazar una ráfaga. Mismas rutas EXENTAS que
+    // `--service-api-key`/`--max-concurrency`: un orquestador haciendo
+    // liveness probing no debería poder quedar bloqueado por tráfico real
+    // de otros clientes. `"*global*"` como service/rpc: un caracter (`*`)
+    // que ningún identificador real de c-script puede tener, así que este
+    // bucket nunca colisiona con el de un `@rate_limit` de verdad (mismo
+    // `RateLimiter`, `HashMap` compartido).
+    if let Some(spec) = rate_limit_global {
+        if path != "/" && path != "/health" && path != "/status" && path != "/live" && path != "/ready" {
+            let client_ip = client_ip_for_rate_limit(&request, trust_proxy);
+            let allowed = rate_limiter.lock().check(&client_ip, "*global*", "*global*", spec);
+            if !allowed {
+                let method = request.method().as_str().to_string();
+                metrics_store.lock().record_rate_limit_rejection(&method);
+                let resp = cors_response(429, error_json("demasiadas requests, probá de nuevo en un momento"), &cors_headers, &request);
+                let _ = request.respond(resp);
+                log_done(log, req_id, Some(&method), 429, start, "");
+                return;
             }
         }
     }

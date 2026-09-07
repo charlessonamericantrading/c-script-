@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.225.0] - 2026-09-07
+
+### ✨ Añadido
+**`--rate-limit-global` -- tope de rate limit para TODO el sitio, cierra el ítem C8a de la Fase 1 de PLAN.md §9.24.** `@rate_limit` (§3.39) protege POR RPC, pero nada acotaba el tráfico total del sitio entero. `--rate-limit-global <N/ventana>`/`LINK_RATE_LIMIT_GLOBAL` reusa el mismo parser que `@rate_limit` (`RateLimitSpec::parse`, mismo formato "N/ventana") y el mismo `RateLimiter`, con una clave sentinela (`"*global*"`) que nunca colisiona con un bucket real. Corre ANTES que cualquier otra cosa, incluso `--service-api-key` -- mismo criterio que `@rate_limit` ya aplicaba respecto del gate de auth. Mismas rutas exentas que `--service-api-key`/`--max-concurrency` (`/health`, `/live`, `/ready`, etc.) -- un orquestador haciendo liveness probing no debería poder quedar bloqueado por tráfico real de otros clientes. El sub-ítem (b) de C8 (límite condicional por User-Agent para bots) queda deliberadamente afuera -- el propio PLAN.md lo marca "no recomendado". Ver GRAMMAR.md §3.281.
+
+Verificado con 5 tests de integración nuevos en `cli_rate_limit_global.rs` (mismo patrón que `cli_hsts.rs`) contra un `linkc serve` real: sin el flag, una ráfaga de 10 requests responde 200 todas; con `--rate-limit-global 2/1m`, la 3ra request da 429; `/live` sigue devolviendo 200 con el bucket global agotado; un formato inválido rechaza el arranque; `LINK_RATE_LIMIT_GLOBAL` como variable de entorno. Suite COMPLETA de verdad esta vez -- no solo `--lib` -- corrida entera (1965 tests en 80 binarios) sin un solo fallo, `cargo clippy -D warnings` limpio.
+
 ## [1.224.0] - 2026-09-07
 
 ### ✨ Añadido

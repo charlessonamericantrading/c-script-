@@ -9885,6 +9885,22 @@ fn page() -> Void {
 
 **Verificado**: 2 tests de `checker.rs` (`nonce` tipa sin argumentos como `String`; compone con `setHeader` para armar un CSP real) + verificación manual de punta a punta contra un `linkc serve` real: el nonce del header `Content-Security-Policy` coincide exactamente con el mismo valor leído por separado (`X-Nonce-Echo`) en la MISMA respuesta; `--frame-options SAMEORIGIN --referrer-policy strict-origin-when-cross-origin` cambia los dos headers de la respuesta real; `--frame-options BOGUS`/`--referrer-policy BOGUS` rechazados al arrancar con un mensaje claro, antes de aceptar ninguna conexión; sin ninguno de los dos flags, la respuesta es byte-idéntica a antes de este ítem (`DENY`/`no-referrer`). Suite completa (1406 tests) sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.281 Rate limit GLOBAL (`--rate-limit-global`) — cierra Fase 1 ítem C8a de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.3 ítem C8, sub-ítem (a) -- `@rate_limit` (§3.39) protege POR RPC, pero nada acotaba el tráfico total del sitio entero. El sub-ítem (b) de C8 (límite condicional por User-Agent, "bots ×10") queda deliberadamente AFUERA -- el propio PLAN.md lo marca "no recomendado": el techo de bots existe solo para no bloquear crawlers legítimos, y un límite global generoso ya cubre ese caso sin la complejidad de parsear/confiar en un header que cualquier cliente puede falsificar.
+
+```bash
+linkc serve app.link 8080 --rate-limit-global 200/15m
+```
+
+`--rate-limit-global <N/ventana>`/`LINK_RATE_LIMIT_GLOBAL` -- mismo formato "N/ventana" que `@rate_limit` (mismo parser, `RateLimitSpec::parse`: dos gramáticas para la misma idea sería exactamente la divergencia entre capas que este proyecto viene evitando desde GRAMMAR.md §3.9). Sin el flag: `None`, sin tope global -- comportamiento IDÉNTICO al de siempre (el único límite sigue siendo el de cada `@rate_limit` individual, si el programa declara alguno).
+
+**Una sola clave por IP, no por (IP, servicio, rpc)** como `@rate_limit` -- reusa el mismo `RateLimiter`/`HashMap` de siempre, con un service/rpc SENTINELA (`"*global*"`, un `*` que ningún identificador real de c-script puede tener) para que el bucket global nunca colisione con el de un `@rate_limit` de verdad.
+
+**Corre ANTES que cualquier otra cosa**, incluso `--service-api-key` -- mismo criterio que `@rate_limit` ya aplicaba respecto del gate de auth: no vale la pena gastar ningún otro chequeo antes de rechazar una ráfaga. Mismas rutas EXENTAS que `--service-api-key`/`--max-concurrency` (`/`, `/health`, `/status`, `/live`, `/ready`): un orquestador haciendo liveness probing no debería poder quedar bloqueado por el tráfico real de otros clientes -- verificado con `/live` devolviendo 200 incluso con el bucket global agotado.
+
+**Verificado**: 5 tests de integración en `cli_rate_limit_global.rs` contra un `linkc serve` real (mismo criterio que `cli_hsts.rs`) -- sin el flag, una ráfaga de 10 requests responde 200 todas; con `--rate-limit-global 2/1m`, la 3ra request da 429; `/live` sigue devolviendo 200 con el bucket global ya agotado; `--rate-limit-global bogus` rechaza el arranque; `LINK_RATE_LIMIT_GLOBAL` como variable de entorno. Suite completa (1406 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
