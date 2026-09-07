@@ -5311,7 +5311,16 @@ impl Checker {
             // mismo (concatenar, `.length()`, etc.) -- mismo criterio que
             // `.toInt64()`/`.toInt()`, nunca mezcla implícita entre los dos
             // tipos (GRAMMAR.md §3.70).
-            | (Type::Uuid, "toString") => {
+            | (Type::Uuid, "toString")
+            // GRAMMAR.md §3.268 (actualizado): mismo "downgrade" que Uuid --
+            // sin esto, un `Html` armado por una `fn`/`rpc` no tenía NINGUNA
+            // forma de inspeccionarse desde un `test { }` (`assert` necesita
+            // comparar contra un `String`), lo que dejaba imposible escribir
+            // tests reales para una página completa (`examples/site/`,
+            // PLAN.md §9.24 Fase 0). No afecta la restricción de wire-safety
+            // de `Html` (`check_wire_safe`) -- esto es un método sobre un
+            // valor YA obtenido, no un cambio de dónde `Html` puede viajar.
+            | (Type::Html, "toString") => {
                 self.expect_no_args(args, "toString")?;
                 Some(Type::String)
             }
@@ -8659,6 +8668,12 @@ type T = { id: Int, s: Status }")
         "#;
         let result = check_source(src);
         assert!(result.is_err(), "'Html' como parámetro de un rpc tiene que rechazarse -- ningún cliente manda Html");
+    }
+
+    #[test]
+    fn html_to_string_downgrades_to_a_plain_string() {
+        let src = r#"fn f() -> String { html`<b>hola</b>`.toString() }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
     }
 
     // ---- `smtp.sendWithConfig` (GRAMMAR.md §3.265) ----

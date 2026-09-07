@@ -3,6 +3,18 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.217.0] - 2026-09-07
+
+### ✨ Añadido
+**`examples/site/site.link` -- el entregable verificable de la Fase 0 de PLAN.md §9.24, ahora COMPLETA.** "Ciudades por provincia" (el mismo dominio que motivó todo el plan): layout compartido + 3 páginas (inicio agrupado por provincia vía `groupBy`+`Map`, listado completo vía `sortBy`+`map`, detalle con `match` sobre `Optional` y página de no-encontrado real) + 6 tests reales, incluidos dos que prueban escape por tipo con un `<script>` inyectado. Wireado en `.github/workflows/ci.yml` para correr en cada push.
+
+**`Html.toString() -> String`** -- mismo "downgrade" explícito que `Uuid.toString()`. Encontrado escribiendo el ejemplo de arriba: sin esto, un `Html` no tenía NINGUNA forma de inspeccionarse desde un `test { }`, así que era imposible testear una página completa. Ver GRAMMAR.md §3.268 (actualizado).
+
+### 🐛 Corregido
+**`linkc lint` perdía `unused-var`/`manual-role-check-without-requires` para cualquier variable o llamada a `auth.currentRole()`/`currentUserId()` usada SOLO adentro de un `${...}` de un literal `html`.** Bug real, preexistente desde que `Html` shippeó (v1.213.0), encontrado por el primer programa real (no sintético) que ejercitó la interacción -- misma causa raíz que "issue #11" (`expr_count_ident`/`expr_calls_auth_identity` sin arm para `Expr::Html`), cerrado con el mismo criterio que ya cerró ese issue para closures/structs/match/transaction.
+
+Suite completa (1381 tests) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.216.0] - 2026-09-07
 
 ### ✨ Añadido

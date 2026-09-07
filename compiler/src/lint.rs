@@ -546,6 +546,17 @@ fn expr_count_ident(expr: &Expr, target: &str) -> usize {
             }
             c
         }
+        // Bug real encontrado por dogfooding (`examples/site/site.link`,
+        // PLAN.md §9.24 Fase 0): faltaba este arm, así que una variable
+        // usada SOLO adentro de un `${...}` de un literal `html` salía
+        // marcada `unused-var` aunque sí estuviera usada -- exactamente la
+        // misma clase de bug que issue #11 (los seis arms de más arriba),
+        // ahora para `Html` (§3.268), la forma más nueva del lenguaje.
+        Expr::Html(parts) => parts
+            .iter()
+            .filter_map(|p| if let HtmlPart::Expr(e) = p { Some(e) } else { None })
+            .map(|e| expr_count_ident(&e.node, target))
+            .sum(),
         _ => 0,
     }
 }
@@ -614,6 +625,14 @@ fn expr_calls_auth_identity(expr: &Expr) -> bool {
                         }
                 })
         }
+        // Mismo motivo que el arm de `Expr::Html` en `expr_count_ident`
+        // (arriba): `auth.currentRole()`/`currentUserId()` llamado SOLO
+        // adentro de un `${...}` de un literal `html` (ej. mostrar el rol
+        // actual en una página) sería invisible para
+        // `manual-role-check-without-requires` sin este arm.
+        Expr::Html(parts) => parts
+            .iter()
+            .any(|p| matches!(p, HtmlPart::Expr(e) if expr_calls_auth_identity(&e.node))),
         _ => false,
     }
 }
@@ -950,6 +969,42 @@ mod tests {
         assert!(
             !warnings.iter().any(|w| w.rule == "unused-var" && w.message.contains("label")),
             "'label' se usa en los dos arms del match: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_variable_used_only_inside_an_html_interpolation_is_not_a_false_positive() {
+        // Bug real encontrado por dogfooding, no por reporte externo
+        // (examples/site/site.link, PLAN.md §9.24 Fase 0) -- misma causa
+        // raíz que los dos tests de arriba (issue #11), esta vez para
+        // `Expr::Html` (§3.268), la forma más nueva del lenguaje: faltaba
+        // el arm en `expr_count_ident`.
+        let code = r#"
+            fn greet(name: String) -> Html {
+                html`<b>${name}</b>`
+            }
+        "#;
+        let warnings = lint_warnings(code);
+        assert!(
+            !warnings.iter().any(|w| w.rule == "unused-var" && w.message.contains("name")),
+            "'name' se usa adentro de un '${{...}}' de un literal 'html': {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn calling_auth_current_role_only_inside_an_html_interpolation_is_still_flagged() {
+        // Mismo motivo que el test de arriba, para el OTRO walker
+        // (`expr_calls_auth_identity`) que necesitaba el mismo arm.
+        let code = r#"
+            service S {
+                rpc page() -> Html {
+                    html`<p>Rol: ${auth.currentRole()}</p>`
+                }
+            }
+        "#;
+        assert!(
+            lint_warnings(code).iter().any(|w| w.rule == "manual-role-check-without-requires"),
+            "una llamada a auth.currentRole() adentro de un literal 'html', sin @requires/@authenticated en el rpc, debería seguir disparando el lint"
         );
     }
 

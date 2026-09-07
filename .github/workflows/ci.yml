@@ -112,6 +112,19 @@ jobs:
           git diff --exit-code -- examples/taskboard/frontend/src/gen \
             || { echo "::error::los artefactos generados del taskboard derivaron -- regenerá con 'linkc build examples/taskboard/backend/taskboard.link examples/taskboard/frontend/src/gen' y commitealos"; exit 1; }
 
+      - name: examples/site (PLAN.md §9.24 Fase 0, entregable verificable) sigue tipando y pasando sus tests
+        # Sin snapshot -- a diferencia de users.link (arriba), nada consume
+        # el contrato generado de este demo (es HTML server-side, sin
+        # cliente), así que lo único que importa es que siga tipando y que
+        # sus propios `test { }` sigan pasando. Encontró dos bugs reales en
+        # `Html`/`linkc lint` la primera vez que se escribió (GRAMMAR.md
+        # §3.268) -- exactamente el motivo de que esto quede corriendo en
+        # CI para siempre, no solo verificado una vez a mano.
+        run: |
+          BIN=compiler/target/debug/linkc
+          [ "$RUNNER_OS" = "Windows" ] && BIN="${BIN}.exe"
+          "$BIN" test examples/site/site.link
+
       - name: Confirmar que el frontend tipa limpio contra el contrato generado
         working-directory: frontend
         run: npx tsc --noEmit

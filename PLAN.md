@@ -1350,7 +1350,11 @@ Terminación TLS, HTTP/2, brotli, servir binarios/directorios (todo nginx, halla
 
 ~~**A6, `Map<K,V>` con API real.**~~ **HECHO (07/09/2026, v1.216.0, GRAMMAR.md §3.273)** -- literal `{"k": v}` + `get/set/has/remove/keys/values/entries`, acotado a `K = String`. Bug real encontrado y arreglado antes de shipear: los 7 métodos eran inalcanzables al principio (`Map<K,V>` es `Value::Struct` en runtime sin marca propia, mismo problema estructural que `.isSome()`/`.isNone()`).
 
-**Con A6, la Fase 0 de §9.24 está COMPLETA: A1/A4/A5/A6/A7, los 5 ítems, shipeados v1.213.0→v1.216.0 en una sola sesión vía `/loop`.** Falta un único paso antes de arrancar la Fase 1: crear `examples/site/` (layout + 3 páginas + datos de `db`, con tests) -- el entregable verificable de que la Fase 0 realmente resuelve "portar HTML real sin concatenar con `+`", no solo que cada pieza tipa por separado.
+**Con A6, la Fase 0 de §9.24 está COMPLETA: A1/A4/A5/A6/A7, los 5 ítems, shipeados v1.213.0→v1.216.0 en una sola sesión vía `/loop`.**
+
+~~**El entregable verificable: `examples/site/`.**~~ **HECHO (07/09/2026, v1.216.0)** -- `examples/site/site.link`, "ciudades por provincia" (el mismo dominio que motivó todo el plan): layout compartido + 3 páginas (inicio agrupado por provincia vía `groupBy`+`Map`, listado completo vía `sortBy`+`map`, detalle con `match` sobre `Optional` y página de no-encontrado real) + datos sembrados en `db` desde los propios `test { }` + 6 tests reales, incluidos dos que prueban escape por tipo con un `<script>` inyectado. Wireado en CI (`.github/workflows/ci.yml`) para correr en cada push, no solo verificado una vez a mano.
+
+**El primer programa real (no sintético) que ejercitó `Html` de punta a punta encontró DOS bugs reales, los dos preexistentes desde que `Html` shippeó (v1.213.0), ninguno nuevo de esta ronda**: (1) `Html` no tenía NINGUNA forma de inspeccionarse desde un `test { }` (`assert` compara contra `String`) -- cerrado agregando `Html.toString() -> String`, mismo "downgrade" que `Uuid.toString()`; (2) `linkc lint` marcaba `unused-var`/perdía `manual-role-check-without-requires` para cualquier variable o llamada usada SOLO adentro de un `${...}` de un literal `html` -- misma causa raíz que "issue #11" (`expr_count_ident`/`expr_calls_auth_identity` sin arm para `Expr::Html`), cerrado con el mismo criterio que ya cerró ese issue para closures/structs/match/transaction. Ver GRAMMAR.md §3.268 (actualizado).
 
 ---
 

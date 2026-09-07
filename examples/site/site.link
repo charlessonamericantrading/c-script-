@@ -1,0 +1,165 @@
+// examples/site/site.link -- PLAN.md §9.24 Fase 0, "el entregable
+// verificable": layout + 3 páginas + datos de `db` que renderiza HTML real,
+// escapa por tipo, y tiene tests -- la prueba de que la Fase 0 realmente
+// resuelve "portar HTML sin concatenar con +", no solo que cada pieza tipa
+// por separado. Usa deliberadamente TODO lo que la Fase 0 shippeó en esta
+// misma sesión: `Html` + literal `html\`...\`` (§3.268), `Int.toLocaleString`
+// + `String.slugify` (§3.269/§3.270), `for` + `List<T>` completa
+// (§3.271/§3.272), y `Map<K,V>` (§3.273).
+//
+// Forma deliberadamente chica: "ciudades por provincia", el mismo dominio
+// que motivó el plan entero (PLAN.md §9.24, inventario de Segurma). Sin
+// rutas HTTP con parámetros (`@route("/ciudades/:slug")`) ni formularios --
+// esos dependen de piezas de la Fase 1 (`request.path()`, etc., todavía sin
+// empezar) y quedan fuera de alcance a propósito en esta ronda.
+type City = {
+  id: Int, name: String, province: String, population: Int,
+}
+
+db {
+  cities: City[],
+}
+
+// ---- layout compartido ----
+fn pageLayout(title: String, main: Html) -> Html {
+  html`<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>${title}</title>
+</head>
+<body>
+  <header><a href="/">Inicio</a></header>
+  <main>${main}</main>
+  <footer>c-script demo site</footer>
+</body>
+</html>`
+}
+
+// ---- página 1: inicio, provincias agrupadas (groupBy + Map + slugify) ----
+fn provinceItem(pair: (String, City[])) -> Html {
+  let province = pair.0;
+  let count = pair.1.length();
+  html`<li><a href="/provincia/${province.slugify()}">${province}</a> (${count.toLocaleString("es-ES")} ciudades)</li>`
+}
+
+// ---- página 2: listado completo de ciudades (sortBy + for + toLocaleString) ----
+fn cityRow(c: City) -> Html {
+  html`<tr><td>${c.name}</td><td>${c.province}</td><td>${c.population.toLocaleString("es-ES")}</td></tr>`
+}
+
+// ---- página 3: detalle de una ciudad (match sobre Optional, not-found real) ----
+fn cityDetailBody(c: City) -> Html {
+  html`<h1>${c.name}</h1><p>Provincia: ${c.province}</p><p>Población: ${c.population.toLocaleString("es-ES")} habitantes.</p>`
+}
+
+fn notFoundBody(id: Int) -> Html {
+  html`<h1>No encontrado</h1><p>No existe ninguna ciudad con id ${id}.</p>`
+}
+
+service Site {
+  rpc home() -> Html {
+    let grouped = db.cities.all().groupBy(| c: City | {
+      c.province
+    }
+    );
+    let items = grouped.entries().map(provinceItem);
+    pageLayout("Inicio", html`<h1>Provincias</h1><ul>${items}</ul>`)
+  }
+  rpc cityList() -> Html {
+    let cities = db.cities.all().sortBy(| c: City | {
+      c.name
+    }
+    );
+    let rows = cities.map(cityRow);
+    pageLayout("Ciudades", html`<h1>Ciudades</h1><table><tbody>${rows}</tbody></table>`)
+  }
+  rpc cityDetail(id: Int) -> Html {
+    match db.cities.find(id) {
+      c: City => pageLayout(c.name, cityDetailBody(c)), null => pageLayout("No encontrado", notFoundBody(id)),
+    }
+  }
+}
+
+test "home agrupa por provincia con el conteo correcto" {
+  db.cities.insert(City {
+    id: 0, name: "Malaga", province: "Andalucia", population: 578460
+  }
+  );
+  db.cities.insert(City {
+    id: 0, name: "Marbella", province: "Andalucia", population: 147557
+  }
+  );
+  db.cities.insert(City {
+    id: 0, name: "Bilbao", province: "PaisVasco", population: 345821
+  }
+  );
+  let out = Site.home();
+  let s = out.toString();
+  assert(s.contains("<!doctype html>"));
+  assert(s.contains("Andalucia"));
+  assert(s.contains("PaisVasco"));
+  // "2 ciudades" agrupadas bajo Andalucia -- el número formateado (sin
+  // separador de miles, es chico) confirma que toLocaleString corrió.
+  assert(s.contains("(2 ciudades)"));
+  assert(s.contains("(1 ciudades)"));
+}
+
+test "cityList ordena alfabeticamente y formatea la poblacion con separador de miles" {
+  db.cities.insert(City {
+    id: 0, name: "Zaragoza", province: "Aragon", population: 675301
+  }
+  );
+  db.cities.insert(City {
+    id: 0, name: "Alicante", province: "Valencia", population: 337482
+  }
+  );
+  let out = Site.cityList();
+  let s = out.toString();
+  assert(s.contains("<table>"));
+  // "675.301" -- separador de miles es-ES, prueba real de Int.toLocaleString.
+  assert(s.contains("675.301"));
+  assert(s.contains("337.482"));
+  // orden alfabetico: Alicante antes que Zaragoza en el HTML.
+  assert(s.indexOf("Alicante") < s.indexOf("Zaragoza"));
+}
+
+test "cityDetail con id existente muestra la ciudad" {
+  let created = db.cities.insert(City {
+    id: 0, name: "Sevilla", province: "Andalucia", population: 688711
+  }
+  );
+  let out = Site.cityDetail(created.id);
+  let s = out.toString();
+  assert(s.contains("<h1>Sevilla</h1>"));
+  assert(s.contains("688.711"));
+}
+
+test "cityDetail con id inexistente muestra la pagina de no encontrado" {
+  let out = Site.cityDetail(999999);
+  let s = out.toString();
+  assert(s.contains("No encontrado"));
+  assert(s.contains("999999"));
+}
+
+test "el nombre de una ciudad se escapa por tipo, nunca se inyecta HTML crudo" {
+  let created = db.cities.insert(City {
+    id: 0, name: "<script>alert(1)</script>", province: "Test", population: 1,
+  }
+  );
+  let out = Site.cityDetail(created.id);
+  let s = out.toString();
+  assert(!s.contains("<script>alert(1)</script>"));
+  assert(s.contains("&lt;script&gt;"));
+}
+
+test "el listado completo tambien escapa nombres con caracteres especiales" {
+  db.cities.insert(City {
+    id: 0, name: "A & B \"Ciudad\"", province: "Test", population: 1
+  }
+  );
+  let out = Site.cityList();
+  let s = out.toString();
+  assert(s.contains("&amp;"));
+  assert(!s.contains("A & B"));
+}

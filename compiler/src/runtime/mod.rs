@@ -3962,6 +3962,14 @@ fn call_method(
             "toString" => Ok(Value::Str(s)),
             other => Err(err(format!("método desconocido sobre Uuid: '{other}' -- '.toString()' lo baja a String"))),
         },
+        // GRAMMAR.md §3.268 (actualizado): mismo "downgrade" que Uuid --
+        // el `String` interno YA está completamente resuelto (escapado/
+        // compuesto en el momento de evaluar el literal `html`), así que
+        // esto es una copia directa, sin ningún trabajo adicional.
+        Value::Html(s) => match method {
+            "toString" => Ok(Value::Str(s)),
+            other => Err(err(format!("método desconocido sobre Html: '{other}' -- '.toString()' lo baja a String"))),
+        },
         Value::Str(s) => match method {
             // chars().count(), no .len(): .len() cuenta bytes UTF-8, no
             // caracteres -- "é" son 2 bytes pero 1 carácter.
