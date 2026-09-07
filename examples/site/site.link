@@ -7,29 +7,51 @@
 // + `String.slugify` (§3.269/§3.270), `for` + `List<T>` completa
 // (§3.271/§3.272), y `Map<K,V>` (§3.273).
 //
-// Forma deliberadamente chica: "ciudades por provincia", el mismo dominio
-// que motivó el plan entero (PLAN.md §9.24, inventario de Segurma). Sin
-// rutas HTTP con parámetros (`@route("/ciudades/:slug")`) ni formularios --
-// esos dependen de piezas de la Fase 1 (`request.path()`, etc., todavía sin
-// empezar) y quedan fuera de alcance a propósito en esta ronda.
+// Extendido para el entregable de la Fase 1 (PLAN.md §9.24, línea ~1257):
+// "`examples/site/` con cookie de CSRF real, formulario que POSTea, 404
+// propio, headers de SEO, drenado graceful probado con un `pm2 restart`
+// bajo carga". El 404 (A10) ya estaba. Lo nuevo acá: SEO (`metaTags`/
+// `openGraphTags`/`canonicalLink`, A9) en `pageLayout`, y una página de
+// contacto real con `@csrf` (C1+C2) -- un form que hace `fetch()` con el
+// header `x-csrf-token` leído de `document.cookie`, porque un `<form>` HTML
+// plano no puede mandar un header custom en su POST. El drenado bajo carga
+// vive en `cli_graceful_drain.rs` (C14), no acá -- este archivo es contenido
+// de página, no infraestructura de proceso.
 type City = {
   id: Int, name: String, province: String, population: Int,
 }
 
-db {
-  cities: City[],
+type ContactMessage = {
+  id: Int, name: String, message: String,
 }
 
-// ---- layout compartido ----
-fn pageLayout(title: String, main: Html) -> Html {
+type Meta = { name: String, content: String }
+type Og = { property: String, content: String }
+
+db {
+  cities: City[],
+  contactMessages: ContactMessage[],
+}
+
+// ---- layout compartido, con SEO (A9: description/canonical/og:*) ----
+fn pageLayout(title: String, description: String, path: String, main: Html) -> Html {
+  let seoHead = (metaTags([
+    Meta { name: "description", content: description },
+    Meta { name: "viewport", content: "width=device-width, initial-scale=1" },
+  ]) + "\n" + openGraphTags([
+    Og { property: "og:title", content: title },
+    Og { property: "og:type", content: "website" },
+    Og { property: "og:description", content: description },
+  ]) + "\n" + canonicalLink("https://example.cscript.dev" + path)).rawHtml();
   html`<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8">
   <title>${title}</title>
+  ${seoHead}
 </head>
 <body>
-  <header><a href="/">Inicio</a></header>
+  <header><a href="/">Inicio</a> · <a href="/contacto">Contacto</a></header>
   <main>${main}</main>
   <footer>c-script demo site</footer>
 </body>
@@ -57,12 +79,53 @@ fn notFoundBody(id: Int) -> Html {
   html`<h1>No encontrado</h1><p>No existe ninguna ciudad con id ${id}.</p>`
 }
 
+// ---- página 4: contacto, con protección CSRF real (GRAMMAR.md §3.278) ----
+// Un <form> HTML plano no puede mandar un header custom en su POST, así que
+// el envío es un fetch() de JS leyendo la cookie `_csrf` (httpOnly:false a
+// propósito, ver §3.278) y reenviándola como header `x-csrf-token` -- el
+// mecanismo de doble-submit tal cual está documentado, no una simulación.
+fn contactFormBody() -> Html {
+  html`<h1>Contacto</h1>
+<form id="contactForm">
+  <label>Nombre <input type="text" id="contactName" required></label>
+  <label>Mensaje <textarea id="contactMessage" required></textarea></label>
+  <button type="submit">Enviar</button>
+</form>
+<div id="contactResult"></div>
+<script>
+function cscriptCookie(name) {
+  var match = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
+  return match ? match.pop() : '';
+}
+document.getElementById('contactForm').addEventListener('submit', function (ev) {
+  ev.preventDefault();
+  var body = JSON.stringify({
+    name: document.getElementById('contactName').value,
+    message: document.getElementById('contactMessage').value
+  });
+  fetch('/Site/submitContact', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-csrf-token': cscriptCookie('_csrf') },
+    body: body
+  }).then(function (res) {
+    return res.text();
+  }).then(function (resultHtml) {
+    document.getElementById('contactResult').innerHTML = resultHtml;
+  });
+});
+</script>`
+}
+
+fn contactThanksBody(name: String) -> Html {
+  html`<p>Gracias, ${name}. Recibimos tu mensaje.</p>`
+}
+
 service Site {
   // PLAN.md §9.24 Fase 1 ítem A10 (GRAMMAR.md §3.274): la página que
   // `linkc serve` invoca automáticamente para CUALQUIER path que no
   // matchea nada -- 404 real, no el JSON del motor.
   @notFound rpc pageNotFound() -> Html {
-    pageLayout("Página no encontrada", html`<h1>404</h1><p>La página que buscás no existe.</p>`)
+    pageLayout("Página no encontrada", "La página que buscás no existe.", "/404", html`<h1>404</h1><p>La página que buscás no existe.</p>`)
   }
   rpc home() -> Html {
     let grouped = db.cities.all().groupBy(| c: City | {
@@ -70,7 +133,7 @@ service Site {
     }
     );
     let items = grouped.entries().map(provinceItem);
-    pageLayout("Inicio", html`<h1>Provincias</h1><ul>${items}</ul>`)
+    pageLayout("Inicio", "Directorio de provincias y ciudades de España.", "/", html`<h1>Provincias</h1><ul>${items}</ul>`)
   }
   rpc cityList() -> Html {
     let cities = db.cities.all().sortBy(| c: City | {
@@ -78,12 +141,27 @@ service Site {
     }
     );
     let rows = cities.map(cityRow);
-    pageLayout("Ciudades", html`<h1>Ciudades</h1><table><tbody>${rows}</tbody></table>`)
+    pageLayout("Ciudades", "Listado completo de ciudades.", "/ciudades", html`<h1>Ciudades</h1><table><tbody>${rows}</tbody></table>`)
   }
   rpc cityDetail(id: Int) -> Html {
     match db.cities.find(id) {
-      c: City => pageLayout(c.name, cityDetailBody(c)), null => pageLayout("No encontrado", notFoundBody(id)),
+      c: City => pageLayout(c.name, "Información de " + c.name + ".", "/ciudad/" + id.toString(), cityDetailBody(c)),
+      null => pageLayout("No encontrado", "No existe ninguna ciudad con ese id.", "/ciudad/" + id.toString(), notFoundBody(id)),
     }
+  }
+
+  // GRAMMAR.md §3.278: cookie httpOnly:false a propósito -- JS del mismo
+  // origen (`cscriptCookie()` en `contactFormBody`) necesita poder leerla
+  // para reenviarla como header. Se renueva en cada visita a la página.
+  rpc contactPage() -> Html {
+    response.setCookie("_csrf", crypto.uuid().toString(), { httpOnly: false, sameSite: "strict" });
+    pageLayout("Contacto", "Formulario de contacto del sitio de ejemplo.", "/contacto", contactFormBody())
+  }
+
+  @csrf
+  rpc submitContact(name: String, message: String) -> Html {
+    db.contactMessages.insert(ContactMessage { id: 0, name: name, message: message });
+    contactThanksBody(name)
   }
 }
 
@@ -175,4 +253,34 @@ test "el listado completo tambien escapa nombres con caracteres especiales" {
   let s = out.toString();
   assert(s.contains("&amp;"));
   assert(!s.contains("A & B"));
+}
+
+test "pageLayout agrega meta description, Open Graph y canonical link (A9)" {
+  let out = Site.home();
+  let s = out.toString();
+  assert(s.contains("<meta name=\"description\" content=\"Directorio de provincias y ciudades de Espa"));
+  assert(s.contains("<meta property=\"og:title\" content=\"Inicio\">"));
+  assert(s.contains("<link rel=\"canonical\" href=\"https://example.cscript.dev/\">"));
+}
+
+test "cada pagina tiene su propio canonical (path distinto)" {
+  let out = Site.cityList();
+  let s = out.toString();
+  assert(s.contains("https://example.cscript.dev/ciudades"));
+}
+
+test "contactPage renderiza el formulario y arma el fetch con x-csrf-token" {
+  let out = Site.contactPage();
+  let s = out.toString();
+  assert(s.contains("<form id=\"contactForm\">"));
+  assert(s.contains("x-csrf-token"));
+  assert(s.contains("/Site/submitContact"));
+}
+
+test "submitContact guarda el mensaje y escapa el nombre en la respuesta" {
+  let out = Site.submitContact("<b>Ada</b>", "hola");
+  let s = out.toString();
+  assert(!s.contains("<b>Ada</b>"));
+  assert(s.contains("&lt;b&gt;Ada&lt;/b&gt;"));
+  assert(db.contactMessages.count() == 1);
 }

@@ -3,6 +3,17 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.228.0] - 2026-09-08
+
+### ✨ Añadido
+**Entregable de PLAN.md §9.24 Fase 1: `examples/site/` extendido con CSRF real, SEO, y drenado bajo carga real -- Fase 1 queda 100% cerrada, código Y entregable.** Los 10 ítems de lenguaje de la Fase 1 ya estaban `HECHO` desde v1.227.0 (B1); esta versión completa el entregable que PLAN.md pedía explícitamente para dar la fase por terminada.
+
+`examples/site/site.link` gana una página de contacto real (`Site.contactPage`/`Site.submitContact`) protegida con `@csrf` (§3.278) -- un `<form>` HTML plano no puede mandar un header custom en su POST, así que el envío es un `fetch()` de JS que lee la cookie `_csrf` (`document.cookie`) y la reenvía como header `x-csrf-token`, el mecanismo de doble-submit tal cual documentado, no una simulación. Verificado con `curl` real contra un `linkc serve` real: sin el header, 403; header con valor incorrecto, 403; cookie+header coincidiendo, 200 con la respuesta esperada. `pageLayout` gana SEO (`metaTags`/`openGraphTags`/`canonicalLink`, A9) -- cada página tiene su propia `description`/`og:*`/canonical, verificado en el HTML real de una respuesta. El 404 propio (A10) ya estaba shippeado desde la Fase 0/1.
+
+`cli_graceful_drain.rs` (C14) gana un tercer test, `graceful_shutdown_drains_many_concurrent_in_flight_requests_under_real_load`: 20 requests concurrentes en vuelo cuando llega la señal completan TODAS con éxito (no solo la primera, a diferencia de los dos tests preexistentes que usaban una sola request), mientras tráfico nuevo concurrente se sigue rechazando con 503 durante toda la ventana de drenado -- la prueba "bajo carga" que el propio texto de PLAN.md pedía para este entregable, más allá del caso trivial de una request.
+
+Verificado: 11 tests de `examples/site/site.link` (los 6 preexistentes + 5 nuevos: SEO en `pageLayout`, canonical por página, render del formulario de contacto, y `submitContact` guardando y escapando el nombre) vía `linkc test`, ya cubiertos por el paso dedicado de CI que corre este archivo en cada push; 3 tests de `cli_graceful_drain.rs` (2 preexistentes + 1 nuevo de carga concurrente). Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.227.0] - 2026-09-08
 
 ### ✨ Añadido

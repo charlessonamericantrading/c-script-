@@ -251,6 +251,59 @@ fn graceful_shutdown_lets_an_in_flight_request_finish_then_exits_cleanly() {
 }
 
 #[test]
+fn graceful_shutdown_drains_many_concurrent_in_flight_requests_under_real_load() {
+    // Las dos pruebas de arriba usan UNA request en vuelo -- suficiente para
+    // probar el mecanismo, pero un `pm2 restart` real llega en medio de
+    // tráfico concurrente de VARIOS clientes a la vez, no de uno solo. Esta
+    // prueba manda 20 requests lentas simultáneas (simulando carga real) y
+    // confirma que la señal las deja terminar a TODAS -- no solo a la
+    // primera -- mientras sigue rechazando tráfico nuevo con 503 durante
+    // toda la ventana de drenado. Es lo que PLAN.md §9.24 pide como parte
+    // del entregable de la Fase 1 ("drenado graceful probado con un `pm2
+    // restart` bajo carga").
+    const CONCURRENT_REQUESTS: usize = 20;
+    let upstream_port = start_slow_upstream(Duration::from_secs(2));
+    let temp = TempDir::new("load");
+    let source = PROGRAM.replace("{{UPSTREAM_PORT}}", &upstream_port.to_string());
+    let out = build(&temp, &source);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut server = Serve::start_with_args(&temp.0.join("app.link"), &["--drain-timeout", "8s"]);
+    let port = server.port;
+    let pid = server.pid();
+
+    // 20 clientes concurrentes, todos en vuelo antes de que llegue la señal.
+    let in_flight: Vec<_> = (0..CONCURRENT_REQUESTS).map(|_| std::thread::spawn(move || request(port, "POST", "/Slow/wait", "{}"))).collect();
+    std::thread::sleep(Duration::from_millis(300));
+
+    signal::send_graceful_shutdown(pid);
+
+    // Mientras las 20 siguen en vuelo, tráfico NUEVO concurrente se sigue
+    // rechazando con 503 -- no solo la primera request nueva después de la
+    // señal, varias, para confirmar que el rechazo en la ADMISIÓN sigue
+    // funcionando request tras request durante toda la ventana de drenado.
+    std::thread::sleep(Duration::from_millis(200));
+    for _ in 0..5 {
+        let (status, body) = request(port, "POST", "/Slow/fast", "{}").expect("debería responder con un rechazo, no colgarse");
+        assert_eq!(status, 503, "{body}");
+    }
+
+    // Las 20 requests que YA estaban en vuelo antes de la señal completan
+    // TODAS con éxito -- el drenado no favorece a la primera y corta el
+    // resto, espera a que las 20 realmente terminen.
+    let mut ok_count = 0;
+    for handle in in_flight {
+        let (status, body) = handle.join().unwrap().expect("cada request en vuelo debería completar, no fallar la conexión");
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("slow-ok"), "{body}");
+        ok_count += 1;
+    }
+    assert_eq!(ok_count, CONCURRENT_REQUESTS, "las 20 requests concurrentes en vuelo tienen que completar, no solo algunas");
+
+    let status = server.child.wait().expect("esperar la salida del proceso");
+    assert!(status.success(), "el proceso sale con código 0 tras drenar 20 requests concurrentes: {status:?}");
+}
+
+#[test]
 fn drain_timeout_forces_exit_even_if_a_request_is_still_running() {
     // El upstream tarda MÁS que el drain-timeout -- el drenado tiene que
     // cortar la espera igual, no colgarse para siempre.

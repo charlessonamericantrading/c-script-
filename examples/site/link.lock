@@ -1,9 +1,9 @@
 {
   "version": 1,
   "entries": {
-    "site.link": {
-      "path": "site.link",
-      "hash": "67459ad18dac699aaf0f116395a2915e991dd8592961a7cadb776247dc70afa7"
+    "//?/C:/Users/repre/Desktop/c-script/examples/site/site.link": {
+      "path": "//?/C:/Users/repre/Desktop/c-script/examples/site/site.link",
+      "hash": "b6850cfd4969fe307fb84f44d5b9e573011f03e208c5c021410a71f0c00a4da9"
     }
   },
   "git_dependencies": {}
