@@ -15,10 +15,26 @@ use std::process::Command;
 
 struct TempDir(PathBuf);
 
+/// Desambigua nombres de tempdir dentro de este mismo proceso -- la
+/// resolución del reloj de Windows puede ser tan gruesa como ~15ms, así que
+/// dos tests corriendo en paralelo (mismo PID, todos con el mismo `name`
+/// "run" acá) pueden pedir `SystemTime::now()` dentro de la MISMA ventana y
+/// obtener el mismo valor en nanosegundos pese a la precisión nominal de la
+/// API. Confirmado como causa real de un fallo de CI (run 34158505367,
+/// windows-latest, 07/09/2026): `tenant_annotation_rejects_more_than_one_
+/// field_in_the_same_struct` leyó el `app.link` de OTRO test (el de
+/// `rejects_combination_with_encrypted`, corriendo en paralelo) por esa
+/// colisión de nombre de directorio -- el checker rechazó el programa
+/// correcto, pero con el mensaje de error del programa AJENO. Un contador
+/// atómico por proceso hace la colisión imposible sin depender de ninguna
+/// resolución de reloj.
+static TEMP_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl TempDir {
     fn new(name: &str) -> Self {
+        let n = TEMP_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let unique = format!(
-            "linkc-tenant-{name}-{}-{}",
+            "linkc-tenant-{name}-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         );

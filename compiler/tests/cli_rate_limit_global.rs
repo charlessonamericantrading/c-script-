@@ -18,10 +18,21 @@ service Sys {
 
 struct TempDir(PathBuf);
 
+/// Desambigua nombres de tempdir dentro de este mismo proceso -- la
+/// resolución del reloj de Windows puede ser tan gruesa como ~15ms, así que
+/// dos tests corriendo en paralelo (mismo PID) pueden pedir
+/// `SystemTime::now()` dentro de la MISMA ventana y obtener el mismo valor
+/// en nanosegundos pese a la precisión nominal de la API -- un CI real de
+/// este repo (run 34158505367, windows-latest) mostró un test leyendo el
+/// `.link` de OTRO test por esa colisión. Un contador atómico por proceso
+/// hace la colisión imposible sin depender de ninguna resolución de reloj.
+static TEMP_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl TempDir {
     fn new(name: &str) -> Self {
+        let n = TEMP_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "linkc-rlg-{name}-{}-{}",
+            "linkc-rlg-{name}-{}-{}-{n}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
