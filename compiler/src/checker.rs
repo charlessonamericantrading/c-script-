@@ -2726,11 +2726,12 @@ impl Checker {
     /// `check_rpc_crosses_the_wire` ya aplica en general, pero acá son
     /// obligatorios, no solo permitidos.
     fn check_cron_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
-        let values: Vec<&String> = r.annotations.iter().filter_map(|a| match a { Annotation::Cron(v) => Some(v), _ => None }).collect();
+        let values: Vec<(&String, &Option<String>)> =
+            r.annotations.iter().filter_map(|a| match a { Annotation::Cron { schedule, initial_delay } => Some((schedule, initial_delay)), _ => None }).collect();
         if values.len() > 1 {
-            return Err(err(format!("'{}' declara `@cron` más de una vez: un rpc corre con un solo intervalo", r.name)));
+            return Err(err(format!("'{}' declara `@cron` más de una vez: un rpc corre con un solo horario", r.name)));
         }
-        let Some(raw) = values.first() else {
+        let Some((raw, initial_delay)) = values.first().copied() else {
             return Ok(());
         };
         if is_stream {
@@ -2745,7 +2746,11 @@ impl Checker {
                 r.name
             )));
         }
-        crate::cron::parse_interval(raw).map_err(|e| err(format!("`@cron(\"{raw}\")` en '{}': {e}", r.name)))?;
+        crate::cron::parse_schedule(raw).map_err(|e| err(format!("`@cron(\"{raw}\")` en '{}': {e}", r.name)))?;
+        if let Some(delay) = initial_delay {
+            crate::cron::parse_interval(delay)
+                .map_err(|e| err(format!("`@cron(..., initialDelay: \"{delay}\")` en '{}': {e}", r.name)))?;
+        }
         if !r.params.is_empty() {
             return Err(err(format!(
                 "'{}' declara `@cron` con parámetros -- nada externo dispara una tarea recurrente, así que no hay de dónde sacar sus argumentos en cada corrida (GRAMMAR.md §3.159)",
@@ -6086,6 +6091,20 @@ impl Checker {
                 self.check_expr(body, &Type::String, env)?;
                 Some(Type::Void)
             }
+            // GRAMMAR.md §3.288 (PLAN.md §9.24 Fase 2 ítem E4): "probar
+            // credenciales SMTP sin mandar nada" -- conecta + EHLO + auth
+            // (`lettre::SmtpTransport::test_connection`, NOOP tras
+            // autenticar), nunca llega a `MAIL FROM`. Mismo `config` que
+            // `sendWithConfig`, cero campos nuevos.
+            (Type::Smtp, "verifyConfig") => {
+                let [config] = args else {
+                    return Err(err(
+                        "'smtp.verifyConfig' toma exactamente 1 argumento (config: { host: String, port: Int, user: String, pass: String, secure: Bool })",
+                    ));
+                };
+                self.check_expr(config, &smtp_config_type(), env)?;
+                Some(Type::Void)
+            }
             (Type::Response, "setStatus") => {
                 let [code_arg] = args else {
                     return Err(err("'response.setStatus' toma exactamente 1 argumento (code: Int)"));
@@ -9053,6 +9072,44 @@ type T = { id: Int, s: Status }")
         assert!(result.is_err(), "'sendWithConfig' exige 4 argumentos (config, to, subject, body)");
     }
 
+    // ---- `smtp.verifyConfig` (GRAMMAR.md §3.288) ----
+
+    #[test]
+    fn smtp_verify_config_accepts_the_right_shape() {
+        let src = r#"
+            service S {
+                rpc check(host: String, port: Int, user: String, pass: String, secure: Bool) -> Void {
+                    smtp.verifyConfig({ host: host, port: port, user: user, pass: pass, secure: secure })
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src).unwrap_err());
+    }
+
+    #[test]
+    fn smtp_verify_config_rejects_a_config_missing_a_field() {
+        let src = r#"
+            service S {
+                rpc check(host: String, port: Int) -> Void {
+                    smtp.verifyConfig({ host: host, port: port })
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err(), "'config' sin 'user'/'pass'/'secure' tiene que rechazarse");
+    }
+
+    #[test]
+    fn smtp_verify_config_rejects_wrong_argument_count() {
+        let src = r#"
+            service S {
+                rpc check() -> Void {
+                    smtp.verifyConfig({ host: "x", port: 1, user: "u", pass: "p", secure: true }, "extra")
+                }
+            }
+        "#;
+        assert!(check_source(src).is_err(), "'verifyConfig' exige exactamente 1 argumento (config)");
+    }
+
     // ---- `@naturalKey` (GRAMMAR.md §3.264) ----
 
     #[test]
@@ -10241,6 +10298,52 @@ type T = { id: Int, s: Status }")
         "#;
         let err = check_source(src).unwrap_err();
         assert!(err.iter().any(|e| e.message.contains("Void")), "mensaje inesperado: {err:?}");
+    }
+
+    // ---- `@cron` con `initialDelay` y expresión cron real (GRAMMAR.md §3.289, PLAN.md §9.24 Fase 2 ítem F1) ----
+
+    #[test]
+    fn cron_annotation_accepts_a_real_five_field_expression() {
+        let src = r#"
+            service Jobs {
+                @cron("0 4 * * *")
+                rpc sweep() -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn cron_annotation_rejects_an_expression_with_an_out_of_range_field() {
+        let src = r#"
+            service Jobs {
+                @cron("60 4 * * *")
+                rpc sweep() -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_err(), "minuto 60 no existe");
+    }
+
+    #[test]
+    fn cron_annotation_accepts_an_initial_delay() {
+        let src = r#"
+            service Jobs {
+                @cron("5m", initialDelay: "30s")
+                rpc sweep() -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn cron_annotation_rejects_a_malformed_initial_delay() {
+        let src = r#"
+            service Jobs {
+                @cron("5m", initialDelay: "not-a-duration")
+                rpc sweep() -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_err());
     }
 
     // ---- `@startup` (GRAMMAR.md §3.287, PLAN.md §9.24 Fase 2 ítem E6) ----

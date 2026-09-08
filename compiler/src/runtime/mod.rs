@@ -2598,6 +2598,50 @@ fn send_email_with_config(config: &[(String, Value)], to: &str, subject: &str, b
     Ok(())
 }
 
+/// GRAMMAR.md §3.288 (PLAN.md §9.24 Fase 2 ítem E4): "probar credenciales
+/// SMTP sin mandar nada" -- `SmtpTransport::test_connection` abre la
+/// conexión (que YA incluye EHLO + AUTH con las credenciales del builder,
+/// mismo mecanismo que `send_email_with_config` de arriba) y manda un NOOP,
+/// nunca un `MAIL FROM`/`DATA` real. Reusa el parseo de `config` campo por
+/// campo -- mismos 5 campos, mismos mensajes de error, que
+/// `send_email_with_config` ya validaba.
+fn verify_smtp_config(config: &[(String, Value)]) -> Result<(), RuntimeError> {
+    let host = match config.iter().find(|(n, _)| n == "host") {
+        Some((_, Value::Str(s))) => s.clone(),
+        _ => return Err(err("smtp.verifyConfig: falta 'host' en 'config', o no es String")),
+    };
+    let port: u16 = match config.iter().find(|(n, _)| n == "port") {
+        Some((_, v)) => {
+            as_int(v)?.try_into().map_err(|_| err("smtp.verifyConfig: 'port' en 'config' tiene que ser un puerto válido (0-65535)"))?
+        }
+        _ => return Err(err("smtp.verifyConfig: falta 'port' en 'config', o no es Int")),
+    };
+    let user = match config.iter().find(|(n, _)| n == "user") {
+        Some((_, Value::Str(s))) => s.clone(),
+        _ => return Err(err("smtp.verifyConfig: falta 'user' en 'config', o no es String")),
+    };
+    let pass = match config.iter().find(|(n, _)| n == "pass") {
+        Some((_, Value::Str(s))) => s.clone(),
+        _ => return Err(err("smtp.verifyConfig: falta 'pass' en 'config', o no es String")),
+    };
+    let secure = match config.iter().find(|(n, _)| n == "secure") {
+        Some((_, Value::Bool(b))) => *b,
+        _ => return Err(err("smtp.verifyConfig: falta 'secure' en 'config', o no es Bool")),
+    };
+
+    let relay_builder = if secure { lettre::SmtpTransport::relay(&host) } else { lettre::SmtpTransport::starttls_relay(&host) }
+        .map_err(|e| err(format!("smtp.verifyConfig: 'host' ('{host}') inválido: {e}")))?;
+    let mailer = relay_builder
+        .port(port)
+        .credentials(lettre::transport::smtp::authentication::Credentials::new(user, pass))
+        .build();
+    let connected = mailer.test_connection().map_err(|e| err(format!("smtp.verifyConfig: no se pudo conectar/autenticar: {e}")))?;
+    if !connected {
+        return Err(err("smtp.verifyConfig: la conexión se estableció pero el servidor no respondió como esperado al NOOP"));
+    }
+    Ok(())
+}
+
 /// Un adjunto ya validado, listo para `Attachment::new(...).body(bytes,
 /// content_type)` -- `bytes` viene de DECODIFICAR el `contentBase64` del
 /// struct, sin pasar por `base64.decode` (§3.43) porque ESE builtin exige
@@ -4901,6 +4945,13 @@ fn call_method(
                     return Err(err("smtp.sendWithConfig requiere (config: { host, port, user, pass, secure }, to: String, subject: String, body: String)"));
                 };
                 send_email_with_config(config, to, subject, body)?;
+                Ok(Value::Null)
+            }
+            "verifyConfig" => {
+                let Some(Value::Struct(config)) = args.first() else {
+                    return Err(err("smtp.verifyConfig requiere (config: { host, port, user, pass, secure })"));
+                };
+                verify_smtp_config(config)?;
                 Ok(Value::Null)
             }
             other => Err(err(format!("método desconocido sobre smtp: '{other}'"))),

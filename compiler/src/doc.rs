@@ -350,7 +350,7 @@ fn annotation_badges(r: &RpcDecl) -> String {
         | Some(Annotation::Background)
         | Some(Annotation::Cache(_))
         | Some(Annotation::Cors(_))
-        | Some(Annotation::Cron(_))
+        | Some(Annotation::Cron { .. })
         | Some(Annotation::NotFound)
         | Some(Annotation::Csrf)
         | Some(Annotation::RawSql)

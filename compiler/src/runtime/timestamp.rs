@@ -21,7 +21,7 @@ const MS_PER_SEC: i64 = 1_000;
 /// para `y >= 0`, otra para `y < 0`) SÍ importan acá, no son código muerto:
 /// hasta un año tan "reciente" como 0000 ya cae del lado negativo (ver el
 /// test de la frontera correspondiente).
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = y - i64::from(m <= 2);
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = y - era * 400; // [0, 399]
@@ -32,7 +32,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// Inversa de `days_from_civil`: días desde 1970-01-01 -> (año, mes, día).
 /// Puerto directo del `civil_from_days` de Hinnant.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // [0, 146096]

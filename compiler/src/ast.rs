@@ -779,12 +779,24 @@ impl RpcDecl {
         })
     }
 
-    /// El valor crudo de `@cron("5m")`, si hay (GRAMMAR.md §3.159) -- texto
-    /// sin parsear, mismo criterio que `cache()`. El checker ya garantizó
-    /// que si esto es `Some`, es la ÚNICA anotación del rpc.
+    /// El `schedule` crudo de `@cron(...)`, si hay (GRAMMAR.md §3.159) --
+    /// texto sin parsear, mismo criterio que `cache()`. El checker ya
+    /// garantizó que si esto es `Some`, es la ÚNICA anotación del rpc.
     pub fn cron(&self) -> Option<&str> {
         self.annotations.iter().find_map(|a| match a {
-            Annotation::Cron(v) => Some(v.as_str()),
+            Annotation::Cron { schedule, .. } => Some(schedule.as_str()),
+            _ => None,
+        })
+    }
+
+    /// El `initialDelay` crudo de `@cron(..., initialDelay: "...")`, si lo
+    /// declaró (GRAMMAR.md §9.24 Fase 2 ítem F1) -- `None` tanto si no hay
+    /// `@cron` como si lo hay sin ese segundo argumento (comportamiento
+    /// idéntico a antes de este ítem: primera corrida tras un intervalo
+    /// completo, sin demora extra).
+    pub fn cron_initial_delay(&self) -> Option<&str> {
+        self.annotations.iter().find_map(|a| match a {
+            Annotation::Cron { initial_delay, .. } => initial_delay.as_deref(),
             _ => None,
         })
     }
@@ -970,14 +982,21 @@ pub enum Annotation {
     /// detrás de un allowlist, salvo un endpoint público (un widget, un
     /// sitemap) que necesita otro origen o `*`.
     Cors(String),
-    /// `@cron("5m")` (GRAMMAR.md §3.159) -- tarea recurrente nativa dentro
-    /// de `linkc serve`: el rpc corre solo, cada `Ns`/`Nm`/`Nh`/`Nd`
-    /// (mismo formato que `@cache`/`--session-ttl`), en su propio hilo,
-    /// nunca alcanzable vía HTTP. El checker exige que sea la ÚNICA
-    /// anotación del rpc (sin `@route`/`@authenticated`/`@rate_limit`/etc.
-    /// -- ninguna tiene sentido sobre algo que nunca recibe una request
-    /// real), sin parámetros, y retorno `Void`.
-    Cron(String),
+    /// `@cron("5m")` / `@cron("0 4 * * *")` (GRAMMAR.md §3.159/§3.289) --
+    /// tarea recurrente nativa dentro de `linkc serve`: el rpc corre solo,
+    /// en su propio hilo, nunca alcanzable vía HTTP. `schedule` es UN string
+    /// que puede ser un intervalo fijo `Ns`/`Nm`/`Nh`/`Nd` (mismo formato
+    /// que `@cache`/`--session-ttl`) O una expresión cron real de 5 campos
+    /// (`minuto hora día-mes mes día-semana`) -- se distinguen por si el
+    /// string tiene un espacio (ningún intervalo lo tiene, ninguna expresión
+    /// cron real deja de tenerlo). `initial_delay` (GRAMMAR.md §9.24 Fase 2
+    /// ítem F1, opcional, mismo formato de intervalo fijo) retrasa la
+    /// PRIMERA corrida -- evita que varias tareas pesadas arranquen todas
+    /// juntas en el instante 0 del proceso. El checker exige que `@cron` sea
+    /// la ÚNICA anotación del rpc (sin `@route`/`@authenticated`/
+    /// `@rate_limit`/etc. -- ninguna tiene sentido sobre algo que nunca
+    /// recibe una request real), sin parámetros, y retorno `Void`.
+    Cron { schedule: String, initial_delay: Option<String> },
     /// `@notFound` (GRAMMAR.md §3.274, PLAN.md §9.24 Fase 1 ítem A10) -- el
     /// rpc que `linkc serve` invoca para CUALQUIER path que no matchea
     /// ninguna `@route` ni la forma `/Service/rpc` de siempre (y sin

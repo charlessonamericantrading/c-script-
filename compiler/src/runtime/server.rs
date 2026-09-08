@@ -771,9 +771,23 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         let Item::Service(service) = item else { continue };
         for member in &service.members {
             let Member::Rpc(rpc) = member else { continue };
-            let Some(raw_interval) = rpc.cron() else { continue };
-            let interval = crate::cron::parse_interval(raw_interval)
+            let Some(raw_schedule) = rpc.cron() else { continue };
+            let schedule = crate::cron::parse_schedule(raw_schedule)
                 .expect("check_cron_annotation (checker.rs) ya validó este formato en compilación");
+            // GRAMMAR.md §9.24 Fase 2 ítem F1: opcional, mismo formato de
+            // intervalo fijo que arriba (nunca una expresión cron -- una
+            // demora es siempre una duración simple, no un horario). `None`
+            // es CERO cambio de comportamiento: la primera corrida espera
+            // el intervalo/horario completo, como siempre.
+            let initial_delay = rpc.cron_initial_delay().map(|raw| {
+                crate::cron::parse_interval(raw).expect("check_cron_annotation (checker.rs) ya validó este formato en compilación")
+            });
+            // Clonado a `String` -- `raw_schedule` es un `&str` prestado del
+            // `program` de ESTA iteración, con un lifetime que no llega a
+            // `'static`; el hilo spawneado abajo necesita su propia copia
+            // dueña para el mensaje de log de una expresión que nunca
+            // matchea, no una referencia al AST original.
+            let raw_schedule_owned = raw_schedule.to_string();
             let method = format!("{}.{}", service.name, rpc.name);
             let service_name = service.name.clone();
             let rpc_name = rpc.name.clone();
@@ -781,8 +795,37 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
             let db = std::sync::Arc::clone(&db);
             let sessions = std::sync::Arc::clone(&sessions);
             let metrics_store = std::sync::Arc::clone(&metrics_store);
-            std::thread::spawn(move || loop {
-                std::thread::sleep(interval);
+            std::thread::spawn(move || {
+                if let Some(delay) = initial_delay {
+                    std::thread::sleep(delay);
+                }
+                loop {
+                // GRAMMAR.md §9.24 Fase 2 ítem F1: un intervalo fijo duerme
+                // esa duración exacta, siempre (mismo comportamiento que
+                // antes de este ítem); una expresión cron real recalcula
+                // "cuánto falta" contra el reloj de pared en CADA vuelta --
+                // nunca una duración fija, porque el hueco real entre dos
+                // corridas de "todos los días a las 4am" varía con la hora
+                // actual (y, en teoría, con saltos de reloj del sistema).
+                // Una expresión que jamás matchea (límite honesto: un día de
+                // mes fijo combinado con un mes que nunca lo tiene, sin
+                // día-de-semana de respaldo) apaga esta tarea puntual con un
+                // log claro, en vez de quedarse recalculando para siempre.
+                match &schedule {
+                    crate::cron::Schedule::Interval(interval) => std::thread::sleep(*interval),
+                    crate::cron::Schedule::Expression(expr) => {
+                        let now = super::db::now_ms();
+                        match expr.next_run_after(now) {
+                            Some(next) => std::thread::sleep(Duration::from_millis((next - now).max(0) as u64)),
+                            None => {
+                                eprintln!(
+                                    "[cron] '{method}' -- la expresión '{raw_schedule_owned}' no matchea ningún instante dentro de los próximos 4 años, la tarea se detiene"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
                 let start = std::time::Instant::now();
                 let no_args = serde_json::Value::Object(serde_json::Map::new());
                 let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -802,6 +845,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                         metrics_store.lock().record_cron_run(&method, false);
                         log_cron_tick(log, &method, false, start.elapsed(), &format!("panic={msg:?}"));
                     }
+                }
                 }
             });
         }
@@ -2468,7 +2512,7 @@ pub(crate) fn check_auth_gate(
         | Annotation::Background
         | Annotation::Cache(_)
         | Annotation::Cors(_)
-        | Annotation::Cron(_)
+        | Annotation::Cron { .. }
         | Annotation::NotFound
         | Annotation::Csrf
         | Annotation::RawSql

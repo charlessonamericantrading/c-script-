@@ -1068,11 +1068,28 @@ impl Parser {
                     self.eat(&TokenKind::RParen)?;
                     Annotation::Cors(value)
                 }
+                // `@cron("5m")` o, desde GRAMMAR.md §9.24 Fase 2 ítem F1,
+                // `@cron("5m", initialDelay: "30s")` -- mismo molde EXACTO
+                // que `@rate_limit(..., key: <param>)`: `initialDelay` es la
+                // ÚNICA palabra clave aceptada como segundo argumento.
                 "cron" => {
                     self.eat(&TokenKind::LParen)?;
-                    let every = self.eat_string()?;
+                    let schedule = self.eat_string()?;
+                    let initial_delay = if self.check(&TokenKind::Comma) {
+                        self.advance();
+                        let kw = self.eat_ident()?;
+                        if kw != "initialDelay" {
+                            return Err(self.error(format!(
+                                "'@cron' solo acepta 'initialDelay: \"...\"' como segundo argumento, no '{kw}'"
+                            )));
+                        }
+                        self.eat(&TokenKind::Colon)?;
+                        Some(self.eat_string()?)
+                    } else {
+                        None
+                    };
                     self.eat(&TokenKind::RParen)?;
-                    Annotation::Cron(every)
+                    Annotation::Cron { schedule, initial_delay }
                 }
                 // Sin argumentos, mismo criterio que "idempotent"/"cron" (GRAMMAR.md §3.274).
                 "notFound" => Annotation::NotFound,
@@ -2713,6 +2730,41 @@ mod tests {
     #[test]
     fn rate_limit_annotation_rejects_a_second_argument_that_is_not_key() {
         let tokens = tokenize(r#"service S { @rate_limit("5/1m", other: email) rpc f(email: String) -> Int { 1 } }"#).unwrap();
+        assert!(parse(tokens).is_err());
+    }
+
+    // ---- @cron(..., initialDelay: "...") -- GRAMMAR.md §3.289, PLAN.md §9.24 Fase 2 ítem F1 ----
+
+    #[test]
+    fn cron_annotation_without_initial_delay_parses_as_before() {
+        let prog = parse_source(r#"service S { @cron("5m") rpc f() -> Void { } }"#);
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(r.annotations, vec![Annotation::Cron { schedule: "5m".to_string(), initial_delay: None }]);
+    }
+
+    #[test]
+    fn cron_annotation_parses_an_optional_initial_delay_clause() {
+        let prog = parse_source(r#"service S { @cron("5m", initialDelay: "30s") rpc f() -> Void { } }"#);
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(
+            r.annotations,
+            vec![Annotation::Cron { schedule: "5m".to_string(), initial_delay: Some("30s".to_string()) }]
+        );
+    }
+
+    #[test]
+    fn cron_annotation_parses_a_real_five_field_expression_as_the_schedule_string() {
+        let prog = parse_source(r#"service S { @cron("0 4 * * *") rpc f() -> Void { } }"#);
+        let Item::Service(s) = &prog.items[0] else { panic!() };
+        let Member::Rpc(r) = &s.members[0] else { panic!() };
+        assert_eq!(r.annotations, vec![Annotation::Cron { schedule: "0 4 * * *".to_string(), initial_delay: None }]);
+    }
+
+    #[test]
+    fn cron_annotation_rejects_a_second_argument_that_is_not_initial_delay() {
+        let tokens = tokenize(r#"service S { @cron("5m", delay: "30s") rpc f() -> Void { } }"#).unwrap();
         assert!(parse(tokens).is_err());
     }
 

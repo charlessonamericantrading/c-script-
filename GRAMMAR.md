@@ -6293,6 +6293,8 @@ Ver §3.16 para el detalle completo de los dos bugs y su fix.
 
 ### 3.159 `@cron("Ns"/"Nm"/"Nh"/"Nd")`: tareas recurrentes nativas dentro de `linkc serve` — RESUELTO
 
+**Actualizado (08/09/2026): `@cron` también acepta una expresión cron real de 5 campos (`"0 4 * * *"`) y un `initialDelay` opcional -- ver GRAMMAR.md §3.289, PLAN.md §9.24 Fase 2 ítem F1.** Todo lo que sigue en esta sección (el formato `Ns`/`Nm`/`Nh`/`Nd`, la ejecución en un hilo dedicado, la observabilidad, los límites honestos) sigue vigente tal cual para el caso de intervalo fijo.
+
 **Origen**: PLAN.md §9.7 ítem 4, reprorizado el 24/08/2026 por evidencia fuerte de Glowapp (no usa c-script, pero es la señal de demanda) -- 10+ schedulers hand-rolled con `setInterval` (`appointmentReminderScheduler.ts`, `abandonedCartScheduler.ts`, `automationScheduler.ts`, `enrichmentScheduler.ts`, `goalsRecalculator.ts`, etc.), más un `schedulerSupervisor.ts` completo (registro de jobs, guard contra solapamiento, arranque escalonado, hasta un workaround para el límite de 32 bits de `setInterval` en intervalos largos). Atacado recién ahora porque necesitaba, sin saberlo hasta escribirlo, la infraestructura de hilos reales de §3.158 -- antes de esa ronda, correr una tarea de fondo real hubiera significado inventar concurrencia de un solo uso solo para esto.
 
 **Sintaxis: una anotación sobre un `rpc` normal, reusando la gramática de anotaciones que ya existe -- ninguna palabra reservada ni bloque de nivel superior nuevo.**
@@ -10073,6 +10075,62 @@ service Boot {
 **Resiliencia: un `@startup` que falla (error de runtime o panic) se loguea y el arranque SIGUE** -- mismo criterio que una corrida de `@cron` fallida no apaga la tarea entera: un seed roto no debería impedir que el resto del servidor (rpcs normales, otros seeds) funcione. La visibilidad del fallo es la línea `[startup] '<Service.rpc>' falló: ...`/`paniqueó: ...` en el log, no un proceso que simplemente no llega a levantar.
 
 **Verificado**: 6 tests de `checker.rs` (tipa solo con `Void`/sin params; DOS `@startup` en el mismo programa se aceptan, a diferencia de `@notFound`; rechazado en un `stream`; rechazado combinado con otra anotación; rechaza parámetros; rechaza un retorno no-`Void`) + 3 tests de integración en `cli_startup.rs` contra un `linkc serve` real: dos rpcs `@startup` independientes SIEMBRAN sus datos, visibles en la primerísima request real que llega; un hit directo a `/Boot/seedA` da 404 limpio y NO vuelve a correr el seed (la cuenta de filas no cambia); un `@startup` que hace `panic()` a propósito no impide que el resto del servidor arranque y sirva con normalidad. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
+### 3.288 `smtp.verifyConfig(config)`: probar credenciales SMTP sin mandar nada — cierra Fase 2 ítem E4 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.4 ítem E4 -- el equivalente de `nodemailer.verify()`: un panel de admin que deja configurar el SMTP en caliente necesita un botón "probar conexión" que confirme host/usuario/clave ANTES de guardar esa configuración, sin mandar un email real de prueba cada vez.
+
+<!-- linkc:check -->
+```rust
+service Admin {
+  rpc testSmtpConnection(host: String, port: Int, user: String, pass: String, secure: Bool) -> Void {
+    smtp.verifyConfig({ host: host, port: port, user: user, pass: pass, secure: secure })
+  }
+}
+```
+
+`smtp.verifyConfig(config: { host: String, port: Int, user: String, pass: String, secure: Bool }) -> Void` -- MISMO `config` que `smtp.sendWithConfig` (§3.265), cero campos nuevos. Abre la conexión (EHLO + AUTH con las credenciales dadas) y manda un NOOP -- nunca llega a `MAIL FROM`/`DATA`, así que probar la configuración no puede, ni por accidente, mandar un email real. Éxito es un `Void` silencioso; cualquier falla (host inalcanzable, TLS/STARTTLS rechazado, credenciales incorrectas) es un error de runtime con el motivo -- el admin lo ve como el mensaje de error de su propia UI, sin necesitar un código de estado especial.
+
+**Implementación**: `lettre::SmtpTransport::test_connection()` -- ya hace exactamente esto (conecta con las credenciales del builder, que incluye la negociación AUTH, y prueba con NOOP en vez de un envío real), así que no hizo falta ningún protocolo SMTP hand-rolleado nuevo. Mismas dos formas cifradas que `sendWithConfig` (`secure: true` = TLS implícito, `secure: false` = STARTTLS).
+
+**Límite honesto, el MISMO que `sendWithConfig` ya documenta**: las dos formas de conexión son SIEMPRE cifradas, así que un servidor de mentira en texto plano no puede completar una conexión real con ninguna -- verificar el camino FELIZ (credenciales correctas aceptadas) contra un servidor real queda fuera de este alcance; se prueba lo que sí es alcanzable sin TLS real (un host inalcanzable falla limpio en las dos ramas).
+
+**Verificado**: 3 tests de `checker.rs` (forma exacta del `config`, campo faltante rechazado, aridad incorrecta rechazada) + 4 tests de `cli_smtp_verify_config.rs` contra un `linkc serve` real -- un host inalcanzable falla limpio (nunca un panic) tanto con `secure: true` como con `secure: false`, un `config` con forma incorrecta se rechaza en compilación, y una aridad incorrecta también. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
+### 3.289 `@cron` con expresión cron real e `initialDelay` — cierra Fase 2 ítem F1 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.4 ítem F1 -- dos límites reales de `@cron` (§3.159) hasta esta ronda: (1) solo intervalos fijos ("cada N minutos/horas"), sin forma de expresar "todos los días a las 4am" (un horario de CALENDARIO, no una duración relativa); (2) varios `@cron` en el mismo programa arrancan su PRIMERA corrida todos juntos en el instante 0 del proceso, porque el intervalo se cuenta desde el arranque -- 3 schedulers pesados compitiendo por la base al mismo tiempo el día que el proceso reinicia.
+
+<!-- linkc:check -->
+```rust
+service Jobs {
+  // Todos los días a las 4:00 UTC -- horario de calendario real, no "cada
+  // 24 horas desde que arrancó el proceso" (que iría corriéndose de a
+  // poco cada vez que el proceso se reinicia en un momento distinto).
+  @cron("0 4 * * *")
+  rpc nightlySweep() -> Void { }
+
+  // Intervalo fijo de siempre (§3.159), más una demora antes de la
+  // PRIMERA corrida -- para que esta tarea y otras no arranquen todas
+  // juntas en el instante 0.
+  @cron("15m", initialDelay: "5m")
+  rpc heavyJob() -> Void { }
+}
+```
+
+**`schedule` (primer argumento) acepta DOS gramáticas, distinguidas por si el string tiene un espacio** -- un intervalo (`"5m"`) nunca lo tiene, una expresión cron real de 5 campos (`minuto hora día-mes mes día-semana`) siempre tiene 4 (uno entre cada campo). Cada campo acepta `*` (cualquier valor), un valor exacto, un rango (`1-5`), una lista separada por comas (`1,15,30`), y un paso (`*/15`, `1-30/5`) -- las formas que cubren la enorme mayoría de horarios reales. **Semántica día-mes/día-semana ESTÁNDAR de cron** (la misma que `cron(8)` de Unix): si los DOS campos están restringidos (ninguno es `*`), un día matchea si CUALQUIERA de los dos lo acepta (OR, no AND) -- una cron real bien conocida por quien migra desde Node/Linux, no una invención de este lenguaje. El día de la semana acepta tanto `0` como `7` para domingo (las dos convenciones que coexisten en la práctica).
+
+**`initialDelay: "..."` (segundo argumento opcional, mismo molde que `@rate_limit(..., key: <param>)`)** -- mismo formato de intervalo fijo que `schedule` (nunca una expresión cron: una demora es siempre una duración simple). Retrasa la PRIMERA corrida de esta tarea puntual; sin él, comportamiento IDÉNTICO a como `@cron` siempre funcionó (primera corrida tras un intervalo/horario completo). Aplica una sola vez al arrancar -- no afecta ninguna corrida posterior.
+
+**Ejecución de una expresión cron real: se recalcula "cuánto falta" contra el reloj de pared en CADA vuelta, nunca una duración fija reinterpretada.** Un intervalo fijo sigue durmiendo esa duración exacta siempre (cero cambio de comportamiento). Una expresión cron real llama a `CronExpr::next_run_after(ahora)` -- que avanza minuto a minuto desde el instante actual hasta encontrar el próximo que matchea los 5 campos -- y duerme exactamente esa diferencia; al despertar, se recalcula de nuevo para la corrida SIGUIENTE (nunca se asume un intervalo fijo entre corridas, porque el hueco real entre "hoy a las 4am" y "mañana a las 4am" puede variar).
+
+**Límite honesto: una expresión que nunca matchea dentro de 4 años apaga esa tarea puntual con un log claro, no un colgado silencioso.** Un horario imposible (ej. `"0 0 31 2 *"` -- 31 de febrero, un día que ningún mes tiene) buscaría para siempre sin este tope -- 4 años es un margen generoso sobre cualquier horario real (el caso legítimo más extremo, un 29 de febrero fijo sin día-de-semana de respaldo, ocurre cada 4 años).
+
+**Sin soporte para nombres (`JAN`/`MON`) ni caracteres especiales de dialectos extendidos (`L`/`W`/`#`)** -- alcance deliberadamente angosto a los 5 campos numéricos estándar más `*`/rango/lista/paso, la forma que cubre la gran mayoría de horarios reales (incluido el ejemplo del propio PLAN.md, `"0 4 * * *"`). Ampliar esto es mecánico si un caso real lo pide.
+
+**Implementación**: el evaluador de expresiones cron es hand-rolleado en `cron.rs`, sobre el mismo cálculo de calendario ya existente en `runtime/timestamp.rs` (el algoritmo de Howard Hinnant que `Timestamp`/ISO-8601 ya usan, §3.31) -- sin ninguna dependencia nueva. Cada campo se precompila a un `Vec<bool>` indexado por valor al parsear (una sola vez, en compilación), así que evaluar un candidato en runtime es un lookup, no volver a interpretar rangos/pasos en cada minuto.
+
+**Verificado**: 15 tests de `cron.rs` contra vectores de referencia generados con `croniter` de Python (una implementación de referencia real, no vectores inventados a mano -- mismo criterio que PBKDF2, GRAMMAR.md §3.284) cubriendo horario diario, paso (`*/15`), día-de-mes fijo, día-de-semana solo, lista de días, rango de días de semana, la combinación OR día-mes/día-semana, el caso 29-de-febrero saltando años no bisiestos, y el alias 0/7 para domingo + 4 tests de `parser.rs` (forma del AST con y sin `initialDelay`, una expresión real como `schedule`, un segundo argumento con otra palabra clave rechazado) + 6 tests de `checker.rs` (acepta una expresión real, rechaza un campo fuera de rango, acepta `initialDelay`, rechaza un `initialDelay` con formato inválido) + 5 tests de integración en `cli_cron_schedule.rs` contra un `linkc serve` real: `initialDelay` confirmado NO haber corrido a 1.5s pero SÍ haber corrido pasados los 3s de demora + 1s de intervalo; una expresión cron construida para el PRÓXIMO minuto de reloj real efectivamente dispara en ese minuto (prueba de reloj de pared real, no simulado); un campo fuera de rango y un `initialDelay` malformado se rechazan en compilación. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 

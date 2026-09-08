@@ -3,6 +3,22 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.234.0] - 2026-09-08
+
+### ✨ Añadido
+**`@cron` con `initialDelay` y expresión cron real de 5 campos -- cierra el ítem F1 de la Fase 2 de PLAN.md §9.24.** Dos límites reales hasta esta ronda: `@cron` solo aceptaba intervalos fijos ("cada N minutos"), sin forma de expresar un horario de calendario real ("todos los días a las 4am"); y varias tareas `@cron` arrancaban su primera corrida todas juntas en el instante 0 del proceso. Ahora `schedule` acepta O un intervalo `Ns`/`Nm`/`Nh`/`Nd` de siempre O una expresión cron real (`"0 4 * * *"`, con `*`/rango/lista/paso en cada campo, semántica día-mes/día-semana estándar de cron -- OR entre los dos si ambos están restringidos), distinguidas por si el string tiene un espacio. `@cron("5m", initialDelay: "30s")` retrasa la PRIMERA corrida, mismo molde que `@rate_limit(..., key: <param>)`. Una expresión cron real recalcula "cuánto falta" contra el reloj de pared en cada vuelta -- nunca una duración fija reinterpretada. Ver GRAMMAR.md §3.289 (actualiza §3.159).
+
+Implementado hand-rolleado en `cron.rs` sobre el cálculo de calendario que `Timestamp`/ISO-8601 ya usaban (Howard Hinnant, GRAMMAR.md §3.31) -- sin ninguna dependencia nueva.
+
+Verificado: 15 tests de `cron.rs` contra vectores de referencia generados con `croniter` de Python (implementación de referencia real) + 4 de `parser.rs` + 6 de `checker.rs` + 5 de integración en `cli_cron_schedule.rs` contra un `linkc serve` real -- incluye una expresión cron construida para el PRÓXIMO minuto de reloj real, confirmando que efectivamente dispara en ese minuto (prueba de reloj de pared real, no simulada), y `initialDelay` confirmado no haber corrido antes de tiempo pero sí después de la demora. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
+## [1.233.0] - 2026-09-08
+
+### ✨ Añadido
+**`smtp.verifyConfig(config)` -- cierra el ítem E4 de la Fase 2 de PLAN.md §9.24.** El equivalente de `nodemailer.verify()`: un panel de admin que deja configurar el SMTP en caliente necesita un botón "probar conexión" sin mandar un email real cada vez. Mismo `config` que `smtp.sendWithConfig` (§3.265), cero campos nuevos. Abre la conexión (EHLO + AUTH) y manda un NOOP -- nunca `MAIL FROM`/`DATA`. Implementado sobre `lettre::SmtpTransport::test_connection()`, que ya hacía exactamente esto -- sin protocolo SMTP nuevo. Ver GRAMMAR.md §3.288.
+
+Verificado: 3 tests de `checker.rs` + 4 de integración en `cli_smtp_verify_config.rs` contra un `linkc serve` real -- un host inalcanzable falla limpio (nunca un panic) con las dos formas de conexión (`secure: true`/`false`), un `config` con forma incorrecta se rechaza en compilación, aridad incorrecta también. Mismo límite honesto que `sendWithConfig` ya documenta: las dos formas de conexión son siempre cifradas, así que el camino feliz contra un servidor de mentira en texto plano queda fuera de este alcance. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.232.0] - 2026-09-08
 
 ### ✨ Añadido
