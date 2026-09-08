@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.230.0] - 2026-09-08
+
+### ✨ Añadido
+**`--metrics-token`/`LINK_METRICS_TOKEN` -- cierra el ítem D6 de la Fase 2 de PLAN.md §9.24.** `GET /metrics` ya podía protegerse con `--service-api-key`, pero esa capa exige el header custom `X-Service-Api-Key`, mientras que Prometheus mismo habla nativamente `Authorization: Bearer <token>`. Este flag agrega una capa DEDICADA a `/metrics`, independiente de `--service-api-key` -- las dos pueden convivir (cada una exige su propio header, ninguna reemplaza a la otra). Comparación en tiempo constante contra el token, mismo mecanismo que `--service-api-key`/`crypto.timingSafeEqual`. `serve-all` comparte un solo token entre todos los servicios. Ver GRAMMAR.md §3.285.
+
+Verificado: 8 tests de integración en `cli_metrics_token.rs` contra un `linkc serve` real -- sin el flag público como siempre; sin/con token incorrecto 401; token correcto 200 con el texto Prometheus real; los dos flags (`--service-api-key` + `--metrics-token`) configurados a la vez exigen los DOS headers; `/health` sigue exento; variable de entorno; valor vacío por flag se comporta como ausente. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.229.0] - 2026-09-08
 
 ### ✨ Añadido

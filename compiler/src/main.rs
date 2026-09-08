@@ -2315,7 +2315,7 @@ fn cmd_dev(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let (Some(path), Some(port_str)) = (args.first(), args.get(1)) else {
         eprintln!(
-            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--drain-timeout <duración>] [--mcp-jwt-secret <clave>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
+            "uso: linkc serve <archivo.link> <puerto> [--db <url|archivo>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--metrics-token <token>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--drain-timeout <duración>] [--mcp-jwt-secret <clave>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
         );
         return ExitCode::FAILURE;
     };
@@ -2429,6 +2429,13 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     };
     let service_api_key = match resolve_service_api_key(args) {
         Ok(k) => k,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let metrics_token = match resolve_metrics_token(args) {
+        Ok(t) => t,
         Err(msg) => {
             eprintln!("{msg}");
             return ExitCode::FAILURE;
@@ -2582,6 +2589,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         http_timeout,
         trust_proxy,
         service_api_key,
+        metrics_token,
         log,
         hsts,
         frame_options,
@@ -2686,6 +2694,21 @@ fn resolve_service_api_key(args: &[String]) -> Result<Option<String>, String> {
     // vacío es un error explícito", no "tratalo como ausente" -- el filtro
     // va acá, puntual, para este secreto.
     Ok(read_flag_or_env(args, "--service-api-key", "LINK_SERVICE_API_KEY")?.filter(|v| !v.trim().is_empty()))
+}
+
+/// `--metrics-token <token>`/`LINK_METRICS_TOKEN` (GRAMMAR.md §3.285,
+/// PLAN.md §9.24 Fase 2 ítem D6): un secreto DEDICADO a `GET /metrics`,
+/// distinto de `--service-api-key` -- ese ya puede proteger `/metrics` (no
+/// está en su lista de rutas exentas), pero exige el header custom
+/// `X-Service-Api-Key`, mientras que Prometheus mismo espera nativamente un
+/// `Authorization: Bearer <token>` (`scrape_configs.authorization.credentials`
+/// en `prometheus.yml`) -- este flag existe para no obligar a un operador que
+/// solo quiere proteger el scrape a configurar TODO el sitio detrás de un
+/// secreto server-a-servidor que no necesita para nada más. Sin el flag/env
+/// var: `None`, `/metrics` sigue exactamente como antes (público, salvo que
+/// `--service-api-key` ya lo cubra).
+fn resolve_metrics_token(args: &[String]) -> Result<Option<String>, String> {
+    Ok(read_flag_or_env(args, "--metrics-token", "LINK_METRICS_TOKEN")?.filter(|v| !v.trim().is_empty()))
 }
 
 /// `--hsts <valor>`/`LINK_HSTS` (GRAMMAR.md §3.143): el valor LITERAL del
@@ -2866,7 +2889,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
     };
     let Some(dir) = args.first() else {
         eprintln!(
-            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--service-api-key-exempt <nombre1,nombre2,...>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--drain-timeout <duración>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
+            "uso: linkc serve-all <directorio> --port-base <N> [--port-map-out <archivo.json>] [--port-registry <archivo.json>] [--host <dirección>] [--cors-origin <origen>] [--session-ttl <duración>] [--argon2-memory-kib <N>] [--argon2-iterations <N>] [--encryption-key <clave-base64>] [--jwt-secret <secreto>] [--jwt-role-claim <nombre>] [--jwt-user-id-claim <nombre>] [--max-body-bytes <N>] [--http-timeout <duración>] [--trust-proxy] [--adopt-existing] [--restart-backoff <duración>] [--service-api-key <clave>] [--service-api-key-exempt <nombre1,nombre2,...>] [--metrics-token <token>] [--log-format text|json] [--log-level debug|info|warn|error] [--hsts <valor>] [--frame-options <valor>] [--referrer-policy <valor>] [--rate-limit-global <N/ventana>] [--drain-timeout <duración>] [--models-dir <directorio>] [--ai-memory-budget-mb <N>] [--ai-timeout <duración>] [--fallback-upstream <url>] [--max-concurrency <N>] [--db-pool-size <N>]"
         );
         return ExitCode::FAILURE;
     };
@@ -3028,6 +3051,13 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
     };
     let service_api_key = match resolve_service_api_key(args) {
         Ok(k) => k,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let metrics_token = match resolve_metrics_token(args) {
+        Ok(t) => t,
         Err(msg) => {
             eprintln!("{msg}");
             return ExitCode::FAILURE;
@@ -3257,6 +3287,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
             // tocar el resto de los servicios que sí lo exigen.
             let is_exempt = path.file_stem().and_then(|s| s.to_str()).is_some_and(|name| service_api_key_exempt.contains(name));
             let service_api_key = if is_exempt { None } else { service_api_key.clone() };
+            let metrics_token = metrics_token.clone();
             let hsts = hsts.clone();
             let frame_options = frame_options.clone();
             let referrer_policy = referrer_policy.clone();
@@ -3295,6 +3326,7 @@ fn cmd_serve_all(args: &[String]) -> ExitCode {
                     http_timeout,
                     trust_proxy,
                     service_api_key,
+                    metrics_token,
                     log,
                     hsts,
                     frame_options,

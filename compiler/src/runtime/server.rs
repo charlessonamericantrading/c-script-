@@ -419,6 +419,12 @@ pub struct ServeConfig {
     pub http_timeout: Duration,
     pub trust_proxy: bool,
     pub service_api_key: Option<String>,
+    /// GRAMMAR.md §3.285: `--metrics-token`/`LINK_METRICS_TOKEN` -- secreto
+    /// DEDICADO a `GET /metrics` (`Authorization: Bearer <token>`, la
+    /// convención nativa de Prometheus), independiente de
+    /// `service_api_key`. `None` = `/metrics` sin este chequeo puntual
+    /// (comportamiento idéntico al de siempre).
+    pub metrics_token: Option<String>,
     pub log: LogConfig,
     pub hsts: Option<String>,
     /// GRAMMAR.md §3.280: `--frame-options`/`LINK_FRAME_OPTIONS` --
@@ -490,6 +496,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         http_timeout,
         trust_proxy,
         service_api_key,
+        metrics_token,
         log,
         hsts,
         frame_options,
@@ -842,6 +849,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
             let frame_options = frame_options.clone();
             let referrer_policy = referrer_policy.clone();
             let service_api_key = service_api_key.clone();
+            let metrics_token = metrics_token.clone();
             let mcp_secret = mcp_secret.clone();
             let mcp_state = mcp_state.clone();
             let fallback_upstream = fallback_upstream.clone();
@@ -917,6 +925,7 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
                     max_body_bytes,
                     trust_proxy,
                     service_api_key.as_deref(),
+                    metrics_token.as_deref(),
                     log,
                     mcp_secret.as_deref(),
                     mcp_state,
@@ -1051,6 +1060,7 @@ fn handle_request(
     max_body_bytes: u64,
     trust_proxy: bool,
     service_api_key: Option<&str>,
+    metrics_token: Option<&str>,
     log: LogConfig,
     mcp_secret: Option<&str>,
     mcp_state: super::mcp::McpSharedState,
@@ -1372,6 +1382,33 @@ fn handle_request(
     // configuró esa capa, Prometheus también tiene que mandarla (soportado
     // nativamente por `scrape_configs.authorization` en `prometheus.yml`).
     if path == "/metrics" {
+        // `--metrics-token`/`LINK_METRICS_TOKEN` (GRAMMAR.md §3.285): capa
+        // DEDICADA a este endpoint, independiente de `--service-api-key`
+        // (que ya puede cubrir `/metrics` con su propio header custom).
+        // Prometheus mismo habla nativamente `Authorization: Bearer <token>`
+        // (`scrape_configs.authorization.credentials` en `prometheus.yml`),
+        // así que exigir ESE formato acá evita forzar a un operador que solo
+        // quiere proteger el scrape a levantar todo un secreto
+        // servidor-a-servidor que no necesita para nada más.
+        if let Some(expected) = metrics_token {
+            let provided = request
+                .headers()
+                .iter()
+                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("Authorization"))
+                .and_then(|h| h.value.as_str().strip_prefix("Bearer "));
+            let ok = provided.is_some_and(|p| super::constant_time_eq(p.as_bytes(), expected.as_bytes()));
+            if !ok {
+                let resp = cors_response(
+                    401,
+                    error_json("falta o es inválido el header 'Authorization: Bearer <token>' -- este endpoint requiere --metrics-token/LINK_METRICS_TOKEN"),
+                    &cors_headers,
+                    &request,
+                );
+                let _ = request.respond(resp);
+                log_done(log, req_id, Some("metrics"), 401, start, "error=\"metrics token\"");
+                return;
+            }
+        }
         // AUDIT-2026-08-27.md #9: por orden de evaluación de Rust, el
         // receptor de una llamada a método se evalúa ANTES que sus
         // argumentos, y el `MutexGuard` temporal que devuelve `.lock()`

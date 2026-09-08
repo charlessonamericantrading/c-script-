@@ -10012,6 +10012,22 @@ service Auth {
 
 **Nota de proceso -- un error de transcripción real, atrapado por el propio test, no shippeado**: la primera versión de los 5 vectores de referencia en `runtime/pbkdf2.rs` se escribió a mano copiando la salida de Python vector por vector; 3 de los 5 literales quedaron con un dígito hex de menos (un carácter perdido al tipear un string de 64+ caracteres), haciendo que esos tests fallaran contra una implementación que en realidad ya era correcta. Reescrito generando el bloque de tests completo por script a partir del JSON que Python produjo, en vez de retipear -- mismo patrón que [[feedback_dont_retype_long_generated_strings]] ya documenta para fixtures largos.
 
+### 3.285 `--metrics-token` para `GET /metrics` — cierra Fase 2 ítem D6 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.4 ítem D6 -- `GET /metrics` (§3.149) ya puede protegerse con `--service-api-key` (no está en su lista de rutas exentas), pero esa capa exige el header custom `X-Service-Api-Key`, mientras que Prometheus mismo habla nativamente `Authorization: Bearer <token>` (`scrape_configs.authorization.credentials` en `prometheus.yml`). Sin este ítem, proteger solo el scrape de métricas obligaba a levantar TODO el secreto servidor-a-servidor de `--service-api-key` sobre el sitio entero.
+
+```bash
+linkc serve app.link 8080 --metrics-token s3cr3t-de-prometheus
+```
+
+`--metrics-token <token>`/`LINK_METRICS_TOKEN` -- una capa DEDICADA a `/metrics`, totalmente independiente de `--service-api-key`: las dos pueden estar configuradas a la vez (cada una exige su propio header, ninguna reemplaza a la otra) o cualquier combinación de una sola. Sin el flag/env var: `/metrics` sin este chequeo puntual -- comportamiento IDÉNTICO al de siempre (público, salvo que `--service-api-key` ya lo cubra). Mismo filtro de valor vacío que `--service-api-key` (`--metrics-token ""` se comporta como si el flag nunca se hubiera pasado).
+
+**Comparación en tiempo constante** (`constant_time_eq`, la misma que `--service-api-key`/`crypto.timingSafeEqual`) contra el valor después de `Bearer ` en el header `Authorization` -- comparar con `==` filtraría, vía cuánto tarda la respuesta, en qué posición difiere del token esperado.
+
+**`serve-all` (§3.92) comparte UN solo `--metrics-token` entre todos los servicios**, sin mecanismo de exención por nombre (a diferencia de `--service-api-key-exempt`) -- el caso real que motiva este ítem es un scrape de Prometheus centralizado apuntando a varios servicios con la misma credencial, no una política distinta por servicio.
+
+**Verificado**: 8 tests de integración en `cli_metrics_token.rs` contra un `linkc serve` real (mismo criterio que `cli_service_api_key.rs`): sin el flag, `/metrics` sigue público; sin el header `Authorization`, 401; con el token incorrecto, 401; con el token correcto, 200 con el texto Prometheus real; `--service-api-key` y `--metrics-token` configurados A LA VEZ exigen los DOS headers, ninguno sustituye al otro; `/health` sigue exento; `LINK_METRICS_TOKEN` como variable de entorno; un valor vacío por flag se comporta como si el flag no existiera. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |
