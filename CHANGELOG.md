@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.239.0] - 2026-09-08
+
+### 🐛 Corregido
+**`@cors`/`--cors-origin` ahora manda `Access-Control-Allow-Credentials: true` cuando corresponde -- cierra el ítem C6-verificación de PLAN.md §9.24 Fase 2, con eso, LA FASE 2 QUEDA COMPLETA salvo D2 (bloqueado deliberadamente).** GRAMMAR.md §3.41 documentaba que este header no hacía falta porque "la auth de c-script es exclusivamente `Authorization: Bearer`, sin `Set-Cookie` en ningún lado del runtime" -- una afirmación que quedó desactualizada el día que `response.setCookie` (§3.277) se agregó, sin que nadie volviera a revisar esta sección. Con cookies de sesión/CSRF ya soportadas, un frontend cross-origin que las necesita manda `fetch(..., {credentials: "include"})`, y sin este header el navegador descarta la respuesta ANTES de que el JavaScript la vea, aunque el `Origin` haya matcheado el allowlist.
+
+Sin sintaxis nueva: se manda automáticamente cuando `Access-Control-Allow-Origin` es un origen PUNTUAL que matcheó contra un allowlist (global o `@cors("origen puntual")` por rpc) -- nunca con `*` (el propio estándar CORS prohíbe combinar ambos; un navegador real ignora la respuesta igual si se manda de todos modos). Aplica también al preflight `OPTIONS` y al preámbulo armado a mano de un `stream` SSE, para no divergir de una respuesta normal. Ver GRAMMAR.md §3.41.
+
+Verificado: 3 tests nuevos de integración en `cli_cors.rs` contra un `linkc serve` real (origen allowlisteado lo recibe en la respuesta real y en el preflight, un origen que no matchea no lo recibe, `*` global y `@cors("*")` nunca lo mandan, un `stream` con allowlist activo también lo lleva). Suite completa sin regresiones, clippy limpio.
+
 ## [1.238.0] - 2026-09-08
 
 ### ✨ Añadido

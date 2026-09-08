@@ -319,6 +319,18 @@ struct CorsHeaders {
     /// `*` la respuesta es la misma para cualquiera, así que `Vary` no
     /// aporta nada y no se manda.
     vary_origin: bool,
+    /// Si además hay que mandar `Access-Control-Allow-Credentials: true`
+    /// (PLAN.md §9.24 Fase 2 ítem C6-verificación, GRAMMAR.md §3.147): solo
+    /// cuando `allow_origin` es un origen PUNTUAL que matcheó contra un
+    /// `Allowlist` -- nunca con `CorsConfig::Any` (`*`), porque el propio
+    /// estándar CORS prohíbe combinar `Access-Control-Allow-Origin: *` con
+    /// este header (un browser real ignora silenciosamente la respuesta si
+    /// se manda igual), y un frontend que manda cookies cross-origin
+    /// (`fetch(..., {credentials: 'include'})`) siempre necesita un origen
+    /// puntual de por sí, no un wildcard. No hay sintaxis nueva para esto:
+    /// se infiere del propio `@cors("origen puntual")`/`--cors-origin`
+    /// existente, igual que PLAN.md pedía verificar (nunca opt-in aparte).
+    allow_credentials: bool,
     /// El valor de `Strict-Transport-Security` a mandar en TODA respuesta,
     /// si `--hsts`/`LINK_HSTS` (GRAMMAR.md §3.143) lo configuró -- `None`
     /// por default, mismo criterio que `allow_origin`: nunca se INVENTA un
@@ -372,15 +384,18 @@ impl CorsConfig {
             CorsConfig::Any => CorsHeaders {
                 allow_origin: Some("*".to_string()),
                 vary_origin: false,
+                allow_credentials: false,
                 hsts: None,
                 frame_options: String::new(),
                 referrer_policy: String::new(),
             },
             CorsConfig::Allowlist(list) => {
                 let matched = request_origin.filter(|o| list.iter().any(|a| a == o)).map(str::to_string);
+                let allow_credentials = matched.is_some();
                 CorsHeaders {
                     allow_origin: matched,
                     vary_origin: true,
+                    allow_credentials,
                     hsts: None,
                     frame_options: String::new(),
                     referrer_policy: String::new(),
@@ -2947,6 +2962,9 @@ fn sse_preamble(cors: &CorsHeaders) -> String {
         if cors.vary_origin {
             header.push_str("Vary: Origin\r\n");
         }
+        if cors.allow_credentials {
+            header.push_str("Access-Control-Allow-Credentials: true\r\n");
+        }
     }
     // GRAMMAR.md §3.280: `frame_options`/`referrer_policy` vienen
     // validados contra un set fijo de valores conocidos en el arranque
@@ -3364,6 +3382,11 @@ fn cors_response_with_type(
                 tiny_http::Header::from_bytes(&b"Access-Control-Allow-Headers"[..], &b"Content-Type, Authorization"[..])
                     .unwrap();
             response = response.with_header(allow_methods).with_header(allow_headers);
+            if cors.allow_credentials {
+                let allow_credentials =
+                    tiny_http::Header::from_bytes(&b"Access-Control-Allow-Credentials"[..], &b"true"[..]).unwrap();
+                response = response.with_header(allow_credentials);
+            }
         }
     }
     // Un solo `Vary` con cada dimensión que aplique (GRAMMAR.md §3.41 para

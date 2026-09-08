@@ -2313,14 +2313,36 @@ abajo):
   [`docs/routing.md`](../docs/routing.md)) sería una promesa falsa. Le
   corresponde a quien SÍ termina TLS -- el reverse proxy (nginx/Caddy) del
   deploy real, no al proceso c-script.
-- **`Access-Control-Allow-Credentials`**: solo importa para requests que
-  llevan cookies o `credentials: "include"`. La auth de c-script es
-  exclusivamente `Authorization: Bearer` (§3.14, sin `Set-Cookie` en ningún
-  lado del runtime) -- no hay credential ambiente que este header necesite
-  habilitar.
 - **Ningún origen con wildcard parcial** (`https://*.midominio.com`): cada
   entrada de la allowlist es un match EXACTO, sin patrones. Un subdominio
   nuevo necesita agregarse a la lista explícitamente.
+
+**`Access-Control-Allow-Credentials: true` (08/09/2026, v1.239.0, PLAN.md
+§9.24 Fase 2 ítem C6-verificación): la afirmación de arriba quedó
+DESACTUALIZADA por `response.setCookie` (§3.277), agregado después de que
+esta sección se escribió.** Una vez que el runtime SÍ puede mandar cookies
+(sesión, CSRF de doble-submit, §3.278), un frontend cross-origin que las
+necesite tiene que mandar `fetch(..., {credentials: "include"})` -- y sin
+este header, el navegador descarta la respuesta ANTES de que el JavaScript
+la vea, aunque el `Origin` haya matcheado el allowlist. Sin sintaxis nueva:
+se manda automáticamente en toda respuesta (incluida la de un `stream` SSE)
+cuando `Access-Control-Allow-Origin` es un origen PUNTUAL que matcheó contra
+un `Allowlist` (`--cors-origin`/`LINK_CORS_ORIGINS`, o el override
+`@cors("...")` de §3.147) -- **nunca con `CorsConfig::Any` (`*`)**, porque
+el propio estándar CORS prohíbe combinar ese header con un wildcard (un
+navegador real ignora la respuesta igual si se manda de todos modos, así
+que omitirlo ahí no le cuesta nada a nadie). Aplica tanto al CORS global
+como a un override `@cors("origen puntual")` por rpc, sin distinción --
+`@cors("*")` sigue sin mandarlo, igual que el global `*`.
+
+**Verificado**: 3 tests de integración en `cli_cors.rs` contra un `linkc
+serve` real (este archivo, como el resto de `runtime/server.rs`, se prueba
+por completo así, sin un módulo de tests unitarios propio): un origen
+allowlisteado recibe `Access-Control-Allow-Credentials: true` en la
+respuesta real Y en el preflight `OPTIONS`, un origen que NO matchea no lo
+recibe; un servidor sin `--cors-origin` (`*` de siempre, global o vía
+`@cors("*")` por rpc) nunca lo manda; un `stream` SSE con un allowlist
+activo también lo lleva en su preámbulo armado a mano.
 
 **Dónde vive el código.** `runtime/server.rs`: `CorsConfig` (la política,
 armada una vez al arrancar) y `CorsHeaders` (ya resuelta para una request

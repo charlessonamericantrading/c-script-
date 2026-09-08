@@ -296,6 +296,77 @@ fn a_stream_response_carries_the_same_cors_policy_as_a_normal_rpc() {
     assert!(Serve::header(&headers, "access-control-allow-origin").is_none(), "headers: {headers:?}");
 }
 
+// ---- `Access-Control-Allow-Credentials` (PLAN.md §9.24 Fase 2 ítem
+// C6-verificación) ----
+
+#[test]
+fn matching_allowlist_origin_gets_allow_credentials_but_a_non_matching_one_does_not() {
+    let temp = TempDir::new("credentials");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--cors-origin", "https://app.example.com"], &[]);
+
+    let (status, headers, _) = server.request("POST", "/Sys/ping", &[("Origin", "https://app.example.com")], "{}");
+    assert_eq!(status, 200);
+    assert_eq!(Serve::header(&headers, "access-control-allow-credentials"), Some("true"), "headers: {headers:?}");
+
+    let (_, headers, _) = server.request("POST", "/Sys/ping", &[("Origin", "https://evil.example.com")], "{}");
+    assert!(
+        Serve::header(&headers, "access-control-allow-credentials").is_none(),
+        "sin un origen que matchee, tampoco va este header: {headers:?}"
+    );
+
+    // El preflight lo lleva también -- mismo criterio que el resto de los
+    // headers de CORS (§3.147: tiene que aplicar a los dos, o el navegador
+    // nunca llega a mandar la request real).
+    let (status, headers, _) = server.request(
+        "OPTIONS",
+        "/Sys/ping",
+        &[("Origin", "https://app.example.com"), ("Access-Control-Request-Method", "POST")],
+        "",
+    );
+    assert_eq!(status, 204);
+    assert_eq!(Serve::header(&headers, "access-control-allow-credentials"), Some("true"), "headers: {headers:?}");
+}
+
+#[test]
+fn a_wildcard_origin_never_sends_allow_credentials() {
+    // El propio estándar CORS prohíbe combinar Access-Control-Allow-Origin: *
+    // con Access-Control-Allow-Credentials -- un navegador real ignora la
+    // respuesta igual si se manda de todos modos, así que este servidor
+    // nunca lo hace.
+    let temp = TempDir::new("credentials-wildcard");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &[], &[]); // default: '*'
+
+    let (status, headers, _) = server.request("POST", "/Sys/ping", &[("Origin", "https://anything.example.com")], "{}");
+    assert_eq!(status, 200);
+    assert_eq!(Serve::header(&headers, "access-control-allow-origin"), Some("*"), "headers: {headers:?}");
+    assert!(
+        Serve::header(&headers, "access-control-allow-credentials").is_none(),
+        "'*' nunca debe combinarse con este header: {headers:?}"
+    );
+
+    // Un override `@cors("*")` por rpc tampoco lo manda -- mismo criterio
+    // que el `*` global.
+    let (_, headers, _) = server.request("POST", "/Sys/pingOpen", &[("Origin", "https://anything.example.com")], "{}");
+    assert!(Serve::header(&headers, "access-control-allow-credentials").is_none(), "headers: {headers:?}");
+}
+
+#[test]
+fn a_stream_response_also_gets_allow_credentials_for_a_matching_allowlist_origin() {
+    // `sse_preamble` arma este header a mano, sin pasar por el builder de
+    // `tiny_http` -- se prueba por separado para que no diverja de la
+    // respuesta de un rpc normal (mismo criterio que
+    // `a_stream_response_carries_the_same_cors_policy_as_a_normal_rpc`).
+    let temp = TempDir::new("credentials-stream");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src, &["--cors-origin", "https://app.example.com"], &[]);
+
+    let (status, headers, _) = server.request("POST", "/Sys/watchAll", &[("Origin", "https://app.example.com")], "{}");
+    assert_eq!(status, 200);
+    assert_eq!(Serve::header(&headers, "access-control-allow-credentials"), Some("true"), "headers: {headers:?}");
+}
+
 // ---- `@cors("...")` override por ruta (GRAMMAR.md §3.147) ----
 
 #[test]
