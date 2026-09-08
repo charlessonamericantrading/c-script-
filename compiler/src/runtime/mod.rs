@@ -136,6 +136,8 @@ pub enum Value {
     Background,
     /// Marcador interno para el módulo `time` (GRAMMAR.md §3.286)
     Time,
+    /// Marcador interno para el módulo `log` (GRAMMAR.md §3.291)
+    Log,
     /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
     Env,
     /// Marcador interno para el módulo `request` (GRAMMAR.md §3.38) -- body
@@ -206,6 +208,7 @@ fn supports_bound_method_access(v: &Value) -> bool {
         | Value::Image
         | Value::Background
         | Value::Time
+        | Value::Log
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -260,6 +263,7 @@ fn is_marker_singleton(v: &Value) -> bool {
         | Value::Image
         | Value::Background
         | Value::Time
+        | Value::Log
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -368,6 +372,7 @@ impl std::fmt::Debug for Value {
             Value::Image => write!(f, "Image"),
             Value::Background => write!(f, "Background"),
             Value::Time => write!(f, "Time"),
+            Value::Log => write!(f, "Log"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
             Value::Smtp => write!(f, "Smtp"),
@@ -702,6 +707,9 @@ pub(crate) fn eval_expr(
             }
             if name == "time" {
                 return Ok(Value::Time);
+            }
+            if name == "log" {
+                return Ok(Value::Log);
             }
             if name == "env" {
                 return Ok(Value::Env);
@@ -4868,6 +4876,28 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre time: '{other}'"))),
         },
+        // GRAMMAR.md §3.291 (PLAN.md §9.24 Fase 2 ítem G5): trazas de
+        // negocio/`[AUDIT]` desde código de usuario -- respeta el MISMO
+        // `--log-format`/`--log-level` que el resto del log del servidor
+        // (`db.log_config()`, fijado una vez al arrancar en `serve()`).
+        Value::Log => {
+            let level = match method {
+                "info" => server::LogLevel::Info,
+                "warn" => server::LogLevel::Warn,
+                "error" => server::LogLevel::Error,
+                other => return Err(err(format!("método desconocido sobre log: '{other}'"))),
+            };
+            let msg = match args.first() {
+                Some(Value::Str(s)) => s,
+                _ => return Err(err(format!("log.{method} requiere un argumento String (msg)"))),
+            };
+            let meta_json = match args.get(1) {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(value_to_json(v, &std::collections::HashSet::new())),
+            };
+            server::log_user_message(db.log_config(), level, msg, meta_json.as_ref());
+            Ok(Value::Null)
+        }
         Value::Mcp => match method {
             "sample" => {
                 let prompt = match args.into_iter().next() {
@@ -6663,7 +6693,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Image | Value::Background | Value::Time | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Image | Value::Background | Value::Time | Value::Log | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }

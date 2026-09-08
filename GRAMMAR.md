@@ -10159,6 +10159,27 @@ service Validator {
 
 **Verificado**: 6 tests de `checker.rs` (`matchAll`/`match` tipan correctamente, `matchAll` rechaza un patrón no-`String`, `json.tryParse` tipa como `Optional<Dynamic>` y de verdad se declara como un tipo concreto más angosto, aridad incorrecta rechazada) + 1 test de regresión dedicado en `types.rs` para el bug de subtipado (`Optional(Dynamic) <: Optional(T)` en las dos direcciones, mismo criterio que el test ya existente de `Dynamic` sola) + 5 tests de integración en `cli_regex_json.rs` contra el binario real: `matchAll` extrae los bloques ld+json reales de un HTML (el caso motivador exacto), lista vacía sin coincidencias; `match` da la primera coincidencia o `null`; un patrón inválido tipa bien (es un `String` de runtime) y falla limpio en ejecución, nunca un panic; `json.tryParse` da el struct o `null` sin abortar ante JSON mal formado; y un pipeline realista combinando `matchAll` + `tryParse` + `List.filter` para contar bloques válidos ignorando uno roto -- el caso completo de SchemaValidator que motiva este ítem. Suite completa (1452 tests de `--lib`) sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.291 `log.info/warn/error(msg, meta?)` — cierra Fase 2 ítem G5 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.4 ítem G5 -- `--log-format json` (§3.122) ya estructura las líneas que el MOTOR emite (recibida/completada, `@cron`), pero código de USUARIO no tenía forma de emitir su propia línea de log en ese mismo formato -- un `[AUDIT]` de una acción administrativa, o una traza de negocio puntual, terminaban sin ningún lugar real donde ir.
+
+<!-- linkc:check -->
+```rust
+type Meta = { userId: Int, action: String }
+
+service Admin {
+  rpc purgeOldRecords(userId: Int) -> Void {
+    log.info("purge ejecutado", Meta { userId: userId, action: "purge" })
+  }
+}
+```
+
+`log.info/warn/error(msg: String, meta: Dynamic?) -> Void` -- tres funciones idénticas salvo el nivel de severidad que le asignan a la línea. `meta` es cualquier valor (`Dynamic?`, mismo patrón de tipo concreto-más-angosto que `db.query`/`json.tryParse`, §3.290) o `null` si no hace falta ninguno -- omitido del todo en la línea de texto/objeto JSON cuando es `null` (nunca un `meta=null`/`meta={}` vacío inventado).
+
+**Respeta el MISMO `--log-format`/`--log-level` que el resto del proceso -- nunca un `println!` de usuario suelto, sin filtro ni forma.** `log.info(...)` con `--log-level warn` configurado se SUPRIME, igual que una línea de request 2xx normal se suprime en ese mismo nivel; `log.error(...)` siempre pasa. En texto: `[log] level=info msg="..." meta={...}`; en JSON: `{"level":"info","msg":"...","meta":{...}}` (`meta` ausente del objeto -- no `null` -- cuando no se pasó ninguno). El `LogConfig` real (`--log-format`/`--log-level` ya resueltos al arrancar) se fija en `Db` una sola vez en `serve()`, ANTES de correr cualquier `@startup` (§3.287) -- así un seed que también quiere loguear ya ve la configuración correcta desde su primera línea.
+
+**Verificado**: 4 tests de `checker.rs` (las tres funciones tipan con `(String, Dynamic?)`, rechaza un mensaje no-`String`, rechaza aridad incorrecta, rechaza un método desconocido como `log.debug`) + 4 tests de integración en `cli_log.rs` contra un `linkc serve` real leyendo su stdout capturado: las tres severidades aparecen en texto con el formato exacto; en modo JSON cada línea parsea como JSON válido con `msg`/`meta` correctos; `--log-level warn` suprime `log.info` pero deja pasar `log.warn`/`log.error` (mismo filtro que las líneas de request normales); sin `meta`, la línea de texto no tiene ningún ` meta=` colgado. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

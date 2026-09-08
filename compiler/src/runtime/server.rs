@@ -238,6 +238,43 @@ fn log_cron_tick(log: LogConfig, method: &str, ok: bool, elapsed: std::time::Dur
     }
 }
 
+/// `log.info/warn/error(msg, meta?)` (GRAMMAR.md §3.291, PLAN.md §9.24 Fase
+/// 2 ítem G5) -- una línea de log emitida por CÓDIGO DE USUARIO (trazas de
+/// negocio, un `[AUDIT]` de una acción administrativa), mismo formato/nivel
+/// que el resto del proceso (`log_done`/`log_cron_tick`, arriba) -- nunca un
+/// formato ad-hoc distinto solo porque el emisor es el `.link` del usuario
+/// en vez del propio motor. `meta` se omite del todo (nunca `null`/`{}`
+/// vacío) cuando el caller no pasó ninguno -- mismo criterio "nunca
+/// inventar un valor vacío" que `extra`/`auth` en `log_done`.
+pub(crate) fn log_user_message(log: LogConfig, level: LogLevel, msg: &str, meta: Option<&serde_json::Value>) {
+    if level < log.level {
+        return;
+    }
+    let level_str = match level {
+        LogLevel::Debug => "debug",
+        LogLevel::Info => "info",
+        LogLevel::Warn => "warn",
+        LogLevel::Error => "error",
+    };
+    match log.format {
+        LogFormat::Text => {
+            let mut line = format!("[log] level={level_str} msg={msg:?}");
+            if let Some(m) = meta {
+                line.push_str(&format!(" meta={m}"));
+            }
+            println!("{line}");
+        }
+        LogFormat::Json => {
+            let json = serde_json::json!({
+                "level": level_str,
+                "msg": msg,
+                "meta": meta,
+            });
+            println!("{json}");
+        }
+    }
+}
+
 /// De dónde salen los datos que sirve este servidor (GRAMMAR.md §3.36).
 /// El resto del programa no cambia según cuál sea: el mismo `.link`, los
 /// mismos rpc, el mismo contrato TypeScript generado.
@@ -589,6 +626,12 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
         None => None,
     };
     db.set_encryption_key(encryption_key);
+    // GRAMMAR.md §3.291: fijado ACÁ, antes de aceptar la primera conexión
+    // (y antes de que corra ningún `@startup`, que también podría llamar
+    // `log.*`) -- así `log.info/warn/error` desde código de usuario
+    // respeta el MISMO `--log-format`/`--log-level` que el resto de las
+    // líneas de log de este proceso.
+    db.set_log_config(log);
     // GRAMMAR.md §3.234: los modelos de `ai { }` se resuelven ANTES de
     // aceptar la primera request -- un alias que no está en disco es un
     // error al ARRANCAR (mismo criterio que `@encrypted` sin clave, arriba),

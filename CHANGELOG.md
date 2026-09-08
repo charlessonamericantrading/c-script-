@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.236.0] - 2026-09-08
+
+### ✨ Añadido
+**`log.info/warn/error(msg, meta?)` -- cierra el ítem G5 de la Fase 2 de PLAN.md §9.24.** `--log-format json` ya estructuraba las líneas que el MOTOR emite, pero código de usuario no tenía forma de emitir su propia línea (un `[AUDIT]` de una acción administrativa, una traza de negocio) en ese mismo formato. `log.info/warn/error(msg: String, meta: Dynamic?) -> Void` respeta el MISMO `--log-format`/`--log-level` que el resto del proceso -- `log.info(...)` se suprime con `--log-level warn` igual que una línea de request 2xx normal; `meta` se omite del todo (nunca `null`/`{}` vacío) cuando no se pasó ninguno. El `LogConfig` real se fija en `Db` antes de correr cualquier `@startup`, así un seed que también loguea ya ve la configuración correcta. Ver GRAMMAR.md §3.291.
+
+Verificado: 4 tests de `checker.rs` + 4 de integración en `cli_log.rs` contra un `linkc serve` real leyendo su stdout capturado -- las tres severidades en texto con el formato exacto, cada línea JSON parsea válida con `msg`/`meta` correctos, `--log-level warn` filtra `log.info` pero deja pasar `log.warn`/`log.error`, sin `meta` la línea de texto no tiene ningún `meta=` colgado. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.235.0] - 2026-09-08
 
 ### ✨ Añadido

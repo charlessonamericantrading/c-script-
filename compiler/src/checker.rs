@@ -4848,6 +4848,9 @@ impl Checker {
                 if name == "time" {
                     return Ok(Type::Time);
                 }
+                if name == "log" {
+                    return Ok(Type::Log);
+                }
                 if name == "env" {
                     return Ok(Type::Env);
                 }
@@ -5785,6 +5788,14 @@ impl Checker {
             (Type::Time, "sleep") => builtin_args!(
                 self, args, env, "time.sleep",
                 [(ms, "ms: Int", Type::Int)] -> Type::Void
+            ),
+            // GRAMMAR.md §3.291 (PLAN.md §9.24 Fase 2 ítem G5): trazas de
+            // negocio/`[AUDIT]` desde código de usuario, mismo formato/nivel
+            // que el resto del log del servidor -- nunca un `println!` de
+            // usuario suelto, sin filtro de `--log-level` ni forma JSON.
+            (Type::Log, "info" | "warn" | "error") => builtin_args!(
+                self, args, env, "log.info/warn/error",
+                [(msg, "msg: String", Type::String), (meta, "meta: Dynamic?", Type::Optional(Box::new(Type::Dynamic)))] -> Type::Void
             ),
             (Type::Crypto, "hashSha256") => {
                 let [data] = args else {
@@ -9099,6 +9110,53 @@ type T = { id: Int, s: Status }")
         "#;
         let result = check_source(src);
         assert!(result.is_err(), "'sendWithConfig' exige 4 argumentos (config, to, subject, body)");
+    }
+
+    // ---- `log.info/warn/error` (GRAMMAR.md §3.291) ----
+
+    #[test]
+    fn log_info_warn_error_all_accept_message_and_meta() {
+        let src = r#"
+            type Meta = { userId: Int }
+            service S {
+                rpc f() -> Void {
+                    log.info("a", Meta { userId: 1 });
+                    log.warn("b", null);
+                    log.error("c", null)
+                }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn log_info_rejects_a_non_string_message() {
+        let src = r#"
+            service S {
+                rpc f() -> Void { log.info(1, null) }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn log_info_rejects_wrong_argument_count() {
+        let src = r#"
+            service S {
+                rpc f() -> Void { log.info("a") }
+            }
+        "#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn log_rejects_an_unknown_method() {
+        let src = r#"
+            service S {
+                rpc f() -> Void { log.debug("a", null) }
+            }
+        "#;
+        assert!(check_source(src).is_err());
     }
 
     // ---- `smtp.verifyConfig` (GRAMMAR.md §3.288) ----

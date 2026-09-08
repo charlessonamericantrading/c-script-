@@ -1600,6 +1600,14 @@ pub struct Db {
     /// `write_param`/`decode_row` lo leen para cifrar/descifrar cada campo
     /// `ColumnPlan::encrypted`.
     encryption_key: parking_lot::RwLock<Option<[u8; encryption::KEY_LEN]>>,
+    /// GRAMMAR.md §3.291 (`log.info/warn/error`) -- mismo criterio EXACTO
+    /// que `encryption_key` arriba: fijado UNA vez por `serve()` al arrancar
+    /// con el `LogConfig` real (`--log-format`/`--log-level`), para que un
+    /// `log.info(...)` de código de usuario respete el MISMO formato/nivel
+    /// que el resto de las líneas de log del servidor -- nunca un formato
+    /// ad-hoc distinto. `Default` (texto, nivel Info) hasta que se
+    /// sobreescriba, idéntico al default de `LogConfig` mismo.
+    log_config: parking_lot::RwLock<super::server::LogConfig>,
     /// GRAMMAR.md §3.260 (`@readReplica`): conexión de SOLO LECTURA separada
     /// de `backend`, fijada una vez por `serve()` si se configuró
     /// `--read-replica-url`/`LINK_READ_REPLICA_URL` -- mismo criterio EXACTO
@@ -2419,6 +2427,7 @@ impl Db {
             argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
             http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
             encryption_key: parking_lot::RwLock::new(None),
+            log_config: parking_lot::RwLock::new(super::server::LogConfig::default()),
             read_replica: parking_lot::RwLock::new(None),
             background_jobs: parking_lot::Mutex::new(super::background::BackgroundJobStore::new()),
             #[cfg(feature = "inference")]
@@ -2746,6 +2755,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 argon2_params: parking_lot::RwLock::new(argon2::Params::default()),
                 http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
                 encryption_key: parking_lot::RwLock::new(None),
+                log_config: parking_lot::RwLock::new(super::server::LogConfig::default()),
                 read_replica: parking_lot::RwLock::new(None),
                 background_jobs: parking_lot::Mutex::new(super::background::BackgroundJobStore::new()),
                 #[cfg(feature = "inference")]
@@ -2995,6 +3005,17 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
 
     pub(crate) fn set_encryption_key(&self, key: Option<[u8; encryption::KEY_LEN]>) {
         *self.encryption_key.write() = key;
+    }
+
+    /// GRAMMAR.md §3.291: `serve()` la fija UNA vez al arrancar con el
+    /// `LogConfig` real -- así `log.info/warn/error` respeta el mismo
+    /// `--log-format`/`--log-level` que el resto del servidor.
+    pub(crate) fn set_log_config(&self, config: super::server::LogConfig) {
+        *self.log_config.write() = config;
+    }
+
+    pub(crate) fn log_config(&self) -> super::server::LogConfig {
+        *self.log_config.read()
     }
 
     /// La clave configurada, si hay -- la leen `write_param`/`decode_row`
