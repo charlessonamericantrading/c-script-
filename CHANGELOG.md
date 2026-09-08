@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.238.0] - 2026-09-08
+
+### ✨ Añadido
+**`cache.clear`/`cache.stats` + `X-Cache: HIT|MISS` automático -- cierra el ítem G4 de la Fase 2 de PLAN.md §9.24, el ÚLTIMO ítem de la fase.** `@cache("24h")` ya cacheaba respuestas, pero era de solo-escritura: sin invalidación manual, sin métricas, sin la señal `X-Cache` que un operador/CDN real espera. `cache.clear()`/`cache.clear(prefix: String)` (borra un service o un rpc puntual) y `cache.stats() -> {entries, hits, misses}` (hits/misses acumulativos, nunca reseteados por `clear()`) operan sobre el MISMO `CacheStore` que sirve el tráfico real. `X-Cache: HIT/MISS` automático en toda respuesta `@cache` -- ausente en cualquier rpc sin esa anotación. `response.setHeader` rechaza `'X-Cache'` en su lista reservada. Prewarm (la tercera pieza del ítem original) no necesitó feature nueva: un `@startup` llamando a las páginas vía `http.get` a sí mismo ya lo resuelve. Ver GRAMMAR.md §3.293.
+
+Con esto, **los 11 ítems de la Fase 2 de PLAN.md §9.24 quedan completos, salvo D2** (`crypto.aesGcmDecrypt`, deliberadamente bloqueado -- necesita el código real de `server/crypto.ts` de Segurma o un fixture de cifrado real, no algo que se pueda adivinar sin arriesgar romper el `smtp_pass` real de producción).
+
+Verificado: 8 tests unitarios de `cache.rs` + 5 de `checker.rs` + 6 de integración en `cli_cache.rs` contra un `linkc serve` real -- `X-Cache` pasa de MISS a HIT entre dos llamadas, ausente sin `@cache`, `stats()` refleja la secuencia real de llamadas, `clear()`/`clear(prefix)` invalidan correctamente, y pisar `X-Cache` a mano falla limpio en runtime. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.237.0] - 2026-09-08
 
 ### ✨ Añadido

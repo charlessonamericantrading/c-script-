@@ -10200,6 +10200,36 @@ service Crawler {
 
 **Verificado**: 3 tests de integración en `cli_http.rs` contra un servidor HTTP de mentira real (mismo arnés que `getWithStatus`, escrito a mano sobre un `TcpStream` real, GRAMMAR.md §3.60) -- confirma que el método HTTP que efectivamente viaja es `HEAD` (no un `GET` disfrazado), que un 4xx/5xx llega como dato sin tumbar el rpc, y que un host inalcanzable falla limpio, nunca un panic. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.293 `cache.clear`/`cache.stats` + `X-Cache: HIT|MISS` automático — cierra Fase 2 ítem G4 de PLAN.md §9.24, el último ítem de la fase
+
+Origen: PLAN.md §9.24.4 ítem G4 -- `@cache("24h")` (§3.144) ya cachea `(status, body, content-type)` por rpc, pero era un cache de solo-escritura: sin forma de invalidarlo a mano (el admin corrige un dato y el cache viejo lo sigue sirviendo por horas), sin ver cuántas entradas hay ni qué tan bien está funcionando, y sin la señal `X-Cache` que un operador/CDN real espera para saber si una respuesta vino del cache o se recalculó.
+
+<!-- linkc:check -->
+```rust
+type Stats = { entries: Int, hits: Int, misses: Int }
+
+service Admin {
+  rpc purgePage(routeName: String) -> Void {
+    cache.clear(routeName)
+  }
+  rpc cacheHealth() -> Stats {
+    cache.stats()
+  }
+}
+```
+
+**`cache.clear() -> Void`** vacía TODO el cache en memoria de esta instancia. **`cache.clear(prefix: String) -> Void`** borra solo las entradas cuya clave `"{Service}.{rpc}"` empieza con `prefix` -- `cache.clear("Pages")` invalida un service entero, `cache.clear("Pages.home")` un rpc puntual (todas sus variantes de argumentos). **`cache.stats() -> { entries: Int, hits: Int, misses: Int }`** -- `entries` son las vivas AHORA MISMO (una entrada vencida no cuenta, aunque el barrido periódico todavía no la haya sacado); `hits`/`misses` son contadores ACUMULATIVOS desde que arrancó el proceso, que `cache.clear()` NUNCA resetea (son una métrica de uso histórico, no del contenido actual).
+
+**`X-Cache: HIT`/`X-Cache: MISS` automático en toda respuesta de un rpc `@cache`** -- HIT cuando la respuesta vino del cache (en memoria o distribuido, §3.256), MISS cuando se recalculó fresca. Un rpc SIN `@cache` nunca tiene este header. `response.setHeader` (§3.279) ahora rechaza `'X-Cache'` en su lista reservada -- mismo criterio que el resto de los headers que el motor ya decide por su cuenta: dejar que el programa lo pise produciría un header duplicado, no un reemplazo confiable.
+
+**`cache.clear`/`cache.stats` operan sobre el MISMO `CacheStore` que sirve los hits reales** -- no una copia ni una vista separada, así que invalidar desde un rpc de administración tiene efecto inmediato sobre el tráfico real. Fuera de `linkc serve` (`linkc test`/`linkc build`) son no-ops seguros: no hay ningún cache HTTP corriendo del que hablar, así que `cache.clear()` no hace nada y `cache.stats()` devuelve ceros, nunca un error.
+
+**Límite honesto, ya documentado para el resto de `@cache`**: estas dos funciones solo ven el `CacheStore` EN MEMORIA de esta instancia -- bajo N réplicas detrás de un balanceador, `cache.clear()` en una instancia no invalida las otras N-1 (mismo límite de "sin coordinación entre instancias" que §3.159/§3.39 ya documentan). El cache DISTRIBUIDO (§3.256, la tabla interna de Postgres) sigue funcionando para SERVIR hits entre instancias -- lo que este ítem no cubre es su invalidación remota, fuera de alcance sin evidencia real de que haga falta.
+
+**Prewarm (la tercera pieza que PLAN.md menciona) no necesitó ningún feature nuevo** -- un `@startup` (§3.287) que llama a las páginas que se quieren precalentar vía `http.get` contra sí mismo ya lo resuelve con las piezas existentes.
+
+**Verificado**: 8 tests unitarios de `cache.rs` (`clear()` vacía todo; `clear(prefix)` borra solo lo que matchea, tanto un rpc puntual como un service entero; `stats()` reporta el conteo de vivas y los acumulados de hit/miss correctos; una entrada vencida no cuenta como viva; `clear()` NO resetea los contadores históricos) + 5 tests de `checker.rs` (aridad 0/1 de `clear`, rechaza un argumento no-`String`/de más, `stats()` tipa como el struct esperado, rechaza un argumento) + 6 tests de integración en `cli_cache.rs` contra un `linkc serve` real: `X-Cache` pasa de `MISS` a `HIT` entre dos llamadas, un rpc sin `@cache` nunca lo tiene, `stats()` refleja hits/misses/entries reales tras una secuencia de llamadas, `clear()` vacía el cache y la siguiente llamada vuelve a ser un miss, `clear(prefix)` borra solo el rpc puntual sin tocar otro del mismo/otro service, e intentar `response.setHeader("X-Cache", ...)` a mano falla limpio en runtime. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

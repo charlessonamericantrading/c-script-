@@ -109,6 +109,21 @@ fn http_header_type() -> Type {
 /// nombre, así que cualquier `type` que el programa declare con estos tres
 /// campos exactos sirve como destino, sin que el lenguaje tenga que inventar
 /// un `HttpResponse` propio.
+/// Lo que `cache.stats()` devuelve (GRAMMAR.md §3.293) -- estructural sin
+/// nombre reservado, mismo criterio que `http_response_type()`. `entries`
+/// son las vivas AHORA MISMO; `hits`/`misses` son contadores acumulativos
+/// desde que arrancó el proceso, nunca reseteados por `cache.clear()`.
+fn cache_stats_type() -> Type {
+    Type::Struct {
+        name: None,
+        fields: vec![
+            FieldType { name: "entries".to_string(), optional: false, ty: Type::Int },
+            FieldType { name: "hits".to_string(), optional: false, ty: Type::Int },
+            FieldType { name: "misses".to_string(), optional: false, ty: Type::Int },
+        ],
+    }
+}
+
 fn http_response_type() -> Type {
     Type::Struct {
         name: None,
@@ -4851,6 +4866,9 @@ impl Checker {
                 if name == "log" {
                     return Ok(Type::Log);
                 }
+                if name == "cache" {
+                    return Ok(Type::Cache);
+                }
                 if name == "env" {
                     return Ok(Type::Env);
                 }
@@ -5797,6 +5815,22 @@ impl Checker {
                 self, args, env, "log.info/warn/error",
                 [(msg, "msg: String", Type::String), (meta, "meta: Dynamic?", Type::Optional(Box::new(Type::Dynamic)))] -> Type::Void
             ),
+            // GRAMMAR.md §3.293 (PLAN.md §9.24 Fase 2 ítem G4): aridad
+            // VARIABLE (0 o 1 argumento) -- fuera del molde fijo de
+            // `builtin_args!`, mismo criterio manual que `expect_no_args`
+            // usa para el resto de los casos con forma no estándar.
+            (Type::Cache, "clear") => match args {
+                [] => Some(Type::Void),
+                [prefix] => {
+                    self.check_expr(prefix, &Type::String, env)?;
+                    Some(Type::Void)
+                }
+                _ => return Err(err("'cache.clear' toma 0 o 1 argumento (prefix: String)")),
+            },
+            (Type::Cache, "stats") => {
+                self.expect_no_args(args, "stats")?;
+                Some(cache_stats_type())
+            }
             (Type::Crypto, "hashSha256") => {
                 let [data] = args else {
                     return Err(err("'crypto.hashSha256' toma exactamente 1 argumento (data: String)"));
@@ -9123,6 +9157,40 @@ type T = { id: Int, s: Status }")
         "#;
         let result = check_source(src);
         assert!(result.is_err(), "'sendWithConfig' exige 4 argumentos (config, to, subject, body)");
+    }
+
+    // ---- `cache.clear`/`cache.stats` (GRAMMAR.md §3.293) ----
+
+    #[test]
+    fn cache_clear_accepts_zero_or_one_string_argument() {
+        assert!(check_source(r#"service S { rpc f() -> Void { cache.clear() } }"#).is_ok());
+        assert!(check_source(r#"service S { rpc f() -> Void { cache.clear("Pages") } }"#).is_ok());
+    }
+
+    #[test]
+    fn cache_clear_rejects_a_non_string_argument() {
+        assert!(check_source(r#"service S { rpc f() -> Void { cache.clear(1) } }"#).is_err());
+    }
+
+    #[test]
+    fn cache_clear_rejects_more_than_one_argument() {
+        assert!(check_source(r#"service S { rpc f() -> Void { cache.clear("a", "b") } }"#).is_err());
+    }
+
+    #[test]
+    fn cache_stats_types_as_a_struct_with_entries_hits_misses() {
+        let src = r#"
+            type Stats = { entries: Int, hits: Int, misses: Int }
+            service S {
+                rpc f() -> Stats { cache.stats() }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn cache_stats_rejects_an_argument() {
+        assert!(check_source(r#"service S { rpc f() -> Void { cache.stats(1) } }"#).is_err());
     }
 
     // ---- `log.info/warn/error` (GRAMMAR.md §3.291) ----

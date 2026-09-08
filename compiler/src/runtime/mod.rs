@@ -138,6 +138,8 @@ pub enum Value {
     Time,
     /// Marcador interno para el módulo `log` (GRAMMAR.md §3.291)
     Log,
+    /// Marcador interno para el módulo `cache` (GRAMMAR.md §3.293)
+    Cache,
     /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
     Env,
     /// Marcador interno para el módulo `request` (GRAMMAR.md §3.38) -- body
@@ -209,6 +211,7 @@ fn supports_bound_method_access(v: &Value) -> bool {
         | Value::Background
         | Value::Time
         | Value::Log
+        | Value::Cache
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -264,6 +267,7 @@ fn is_marker_singleton(v: &Value) -> bool {
         | Value::Background
         | Value::Time
         | Value::Log
+        | Value::Cache
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -373,6 +377,7 @@ impl std::fmt::Debug for Value {
             Value::Background => write!(f, "Background"),
             Value::Time => write!(f, "Time"),
             Value::Log => write!(f, "Log"),
+            Value::Cache => write!(f, "Cache"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
             Value::Smtp => write!(f, "Smtp"),
@@ -710,6 +715,9 @@ pub(crate) fn eval_expr(
             }
             if name == "log" {
                 return Ok(Value::Log);
+            }
+            if name == "cache" {
+                return Ok(Value::Cache);
             }
             if name == "env" {
                 return Ok(Value::Env);
@@ -4898,6 +4906,33 @@ fn call_method(
             server::log_user_message(db.log_config(), level, msg, meta_json.as_ref());
             Ok(Value::Null)
         }
+        // GRAMMAR.md §3.293 (PLAN.md §9.24 Fase 2 ítem G4): opera sobre el
+        // MISMO `CacheStore` que sirve los hits de `@cache` (`db.cache_store()`,
+        // fijado una vez al arrancar en `serve()`) -- `None` fuera de
+        // `linkc serve` (`linkc test`/`linkc build`) es un no-op seguro, no
+        // un error: un programa de test no tiene ningún cache HTTP del que
+        // hablar.
+        Value::Cache => match method {
+            "clear" => {
+                if let Some(store) = db.cache_store() {
+                    match args.first() {
+                        None => store.lock().clear(),
+                        Some(Value::Str(prefix)) => store.lock().clear_prefix(prefix),
+                        Some(_) => return Err(err("cache.clear requiere 0 argumentos, o 1 argumento String (prefix)")),
+                    }
+                }
+                Ok(Value::Null)
+            }
+            "stats" => {
+                let (entries, hits, misses) = db.cache_store().map(|s| s.lock().stats()).unwrap_or((0, 0, 0));
+                Ok(Value::Struct(vec![
+                    ("entries".to_string(), Value::Int(entries as i64)),
+                    ("hits".to_string(), Value::Int(hits as i64)),
+                    ("misses".to_string(), Value::Int(misses as i64)),
+                ]))
+            }
+            other => Err(err(format!("método desconocido sobre cache: '{other}'"))),
+        },
         Value::Mcp => match method {
             "sample" => {
                 let prompt = match args.into_iter().next() {
@@ -5153,7 +5188,7 @@ fn call_method(
                 // aplicación debería fijar nunca.
                 const RESERVED: &[&str] = &[
                     "content-type", "content-length", "content-encoding", "set-cookie", "location",
-                    "cache-control", "etag", "vary", "x-request-id",
+                    "cache-control", "etag", "vary", "x-request-id", "x-cache",
                     "access-control-allow-origin", "access-control-allow-methods", "access-control-allow-headers",
                     "access-control-allow-credentials",
                     "x-content-type-options", "x-frame-options", "referrer-policy", "strict-transport-security",
@@ -6716,7 +6751,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Image | Value::Background | Value::Time | Value::Log | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Image | Value::Background | Value::Time | Value::Log | Value::Cache | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }

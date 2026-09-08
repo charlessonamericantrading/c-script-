@@ -1608,6 +1608,15 @@ pub struct Db {
     /// ad-hoc distinto. `Default` (texto, nivel Info) hasta que se
     /// sobreescriba, idéntico al default de `LogConfig` mismo.
     log_config: parking_lot::RwLock<super::server::LogConfig>,
+    /// GRAMMAR.md §3.293 (`cache.clear`/`cache.stats`) -- mismo `CacheStore`
+    /// que `server.rs` ya usa para servir hits de `@cache`, compartido acá
+    /// (`Arc` clonado, no una copia) para que código de usuario pueda
+    /// invalidar/inspeccionar el MISMO cache que las respuestas HTTP
+    /// realmente usan. `None` fuera de `linkc serve` (ej. `linkc test`) --
+    /// ahí `cache.clear()`/`cache.stats()` son no-ops seguros, nunca un
+    /// error: un programa de test no tiene ningún cache HTTP corriendo del
+    /// que hablar.
+    cache_store: parking_lot::RwLock<Option<std::sync::Arc<parking_lot::Mutex<crate::cache::CacheStore>>>>,
     /// GRAMMAR.md §3.260 (`@readReplica`): conexión de SOLO LECTURA separada
     /// de `backend`, fijada una vez por `serve()` si se configuró
     /// `--read-replica-url`/`LINK_READ_REPLICA_URL` -- mismo criterio EXACTO
@@ -2428,6 +2437,7 @@ impl Db {
             http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
             encryption_key: parking_lot::RwLock::new(None),
             log_config: parking_lot::RwLock::new(super::server::LogConfig::default()),
+            cache_store: parking_lot::RwLock::new(None),
             read_replica: parking_lot::RwLock::new(None),
             background_jobs: parking_lot::Mutex::new(super::background::BackgroundJobStore::new()),
             #[cfg(feature = "inference")]
@@ -2756,6 +2766,7 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
                 http_timeout: parking_lot::RwLock::new(DEFAULT_HTTP_TIMEOUT),
                 encryption_key: parking_lot::RwLock::new(None),
                 log_config: parking_lot::RwLock::new(super::server::LogConfig::default()),
+                cache_store: parking_lot::RwLock::new(None),
                 read_replica: parking_lot::RwLock::new(None),
                 background_jobs: parking_lot::Mutex::new(super::background::BackgroundJobStore::new()),
                 #[cfg(feature = "inference")]
@@ -3016,6 +3027,18 @@ pub const DEFAULT_POSTGRES_POOL_SIZE: usize = 10;
 
     pub(crate) fn log_config(&self) -> super::server::LogConfig {
         *self.log_config.read()
+    }
+
+    /// GRAMMAR.md §3.293: `serve()` la fija UNA vez al arrancar, con el
+    /// MISMO `Arc<Mutex<CacheStore>>` que sirve los hits de `@cache` -- así
+    /// `cache.clear()`/`cache.stats()` desde código de usuario operan sobre
+    /// el cache real, no una copia separada.
+    pub(crate) fn set_cache_store(&self, store: std::sync::Arc<parking_lot::Mutex<crate::cache::CacheStore>>) {
+        *self.cache_store.write() = Some(store);
+    }
+
+    pub(crate) fn cache_store(&self) -> Option<std::sync::Arc<parking_lot::Mutex<crate::cache::CacheStore>>> {
+        self.cache_store.read().clone()
     }
 
     /// La clave configurada, si hay -- la leen `write_param`/`decode_row`

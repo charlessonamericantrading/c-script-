@@ -211,6 +211,12 @@ pub enum Type {
     /// Tipo interno para el módulo `log` builtin (GRAMMAR.md §3.291) --
     /// `log.info/warn/error(msg, meta?)`, PLAN.md §9.24 Fase 2 ítem G5.
     Log,
+    /// Tipo interno para el módulo `cache` builtin (GRAMMAR.md §3.293) --
+    /// `cache.clear()`/`cache.clear(prefix)`/`cache.stats()`, PLAN.md §9.24
+    /// Fase 2 ítem G4. Deliberadamente SEPARADO de `@cache` (la anotación,
+    /// GRAMMAR.md §3.144) -- una es la política declarativa por rpc, esta es
+    /// la API imperativa para invalidar/inspeccionar el cache resultante.
+    Cache,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -302,6 +308,7 @@ impl std::fmt::Display for Type {
             Type::Background => write!(f, "background"),
             Type::Time => write!(f, "time"),
             Type::Log => write!(f, "log"),
+            Type::Cache => write!(f, "cache"),
         }
     }
 }

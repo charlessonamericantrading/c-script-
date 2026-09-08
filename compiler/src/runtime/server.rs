@@ -738,6 +738,10 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     let rate_limiter = std::sync::Arc::new(parking_lot::Mutex::new(rate_limiter));
     let idempotency_store = std::sync::Arc::new(parking_lot::Mutex::new(idempotency_store));
     let cache_store = std::sync::Arc::new(parking_lot::Mutex::new(cache_store));
+    // GRAMMAR.md §3.293: el MISMO `Arc` que sirve hits de `@cache` más
+    // abajo -- así `cache.clear()`/`cache.stats()` (llamables desde
+    // cualquier rpc, incluso un `@startup`) operan sobre el cache real.
+    db.set_cache_store(std::sync::Arc::clone(&cache_store));
     let metrics_store = std::sync::Arc::new(parking_lot::Mutex::new(metrics_store));
 
     // `@startup` (GRAMMAR.md §3.287, PLAN.md §9.24 Fase 2 ítem E6): corre
@@ -2015,7 +2019,13 @@ fn handle_request(
             None => cache_store.lock().get(service_name, rpc_name, key),
         };
         if let Some((status, body, content_type)) = hit {
-            let resp = cors_response_with_type(status, body, &content_type, &cors_headers, None, None, &[], &[], &request);
+            // GRAMMAR.md §3.293 (PLAN.md §9.24 Fase 2 ítem G4): `X-Cache`
+            // automático -- HIT acá, MISS más abajo donde se graba la
+            // respuesta fresca. `response.setHeader` (§3.279) tiene 'x-cache'
+            // en su lista reservada, así que esto nunca puede duplicarse con
+            // uno que el programa haya puesto a mano.
+            let x_cache_hit = [("X-Cache".to_string(), "HIT".to_string())];
+            let resp = cors_response_with_type(status, body, &content_type, &cors_headers, None, None, &[], &x_cache_hit, &request);
             let _ = request.respond(resp);
             log_done_with_audit(log, req_id, Some(&method), status, start, "cache=\"hit\"", auth_audit.as_ref());
             db.clear_request_context();
@@ -2023,8 +2033,14 @@ fn handle_request(
         }
     }
 
-    let (status, response_body, response_type, response_location, response_cache_control, response_cookies, response_headers) =
+    let (status, response_body, response_type, response_location, response_cache_control, response_cookies, mut response_headers) =
         handle_rpc(program, db, sessions, token.as_deref(), service_name, rpc_name, args_json);
+    // GRAMMAR.md §3.293: llegar hasta ACÁ con `@cache` declarado (`cache_ttl`
+    // vino `Some` más arriba) significa que el bloque de HIT de arriba ya
+    // devolvió `None` -- por construcción, esto es un MISS.
+    if cache_ttl.is_some() {
+        response_headers.push(("X-Cache".to_string(), "MISS".to_string()));
+    }
     // `@idempotent`: solo se graba un ÉXITO (2xx) -- un error no se graba,
     // para que el caller pueda corregir y reintentar con la MISMA clave
     // (GRAMMAR.md §3.140, mismo criterio que Stripe: la clave protege

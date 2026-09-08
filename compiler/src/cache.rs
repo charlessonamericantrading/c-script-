@@ -54,11 +54,17 @@ const SWEEP_EVERY: u32 = 1000;
 pub struct CacheStore {
     entries: HashMap<(String, String, String), Entry>,
     checks_since_sweep: u32,
+    /// GRAMMAR.md §3.293 (PLAN.md §9.24 Fase 2 ítem G4): contadores
+    /// ACUMULATIVOS desde que arrancó el proceso -- `cache.stats()` los
+    /// expone tal cual, nunca se resetean solos (ni `clear()` los toca: son
+    /// una métrica de USO histórico, no del contenido actual del cache).
+    hits: u64,
+    misses: u64,
 }
 
 impl CacheStore {
     pub fn new() -> Self {
-        CacheStore { entries: HashMap::new(), checks_since_sweep: 0 }
+        CacheStore { entries: HashMap::new(), checks_since_sweep: 0, hits: 0, misses: 0 }
     }
 
     fn sweep_if_due(&mut self, now: Instant) {
@@ -76,11 +82,14 @@ impl CacheStore {
     pub fn get(&mut self, service: &str, rpc: &str, args_key: &str) -> Option<(u16, String, String)> {
         let now = Instant::now();
         self.sweep_if_due(now);
-        let entry = self.entries.get(&(service.to_string(), rpc.to_string(), args_key.to_string()))?;
-        if entry.expires_at <= now {
-            return None;
+        let entry = self.entries.get(&(service.to_string(), rpc.to_string(), args_key.to_string()));
+        let hit = entry.filter(|e| e.expires_at > now).map(|e| (e.status, e.body.clone(), e.content_type.clone()));
+        if hit.is_some() {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
         }
-        Some((entry.status, entry.body.clone(), entry.content_type.clone()))
+        hit
     }
 
     // Una escritura plana de clave compuesta + entrada: los 8 argumentos SON
@@ -91,6 +100,34 @@ impl CacheStore {
             (service.to_string(), rpc.to_string(), args_key.to_string()),
             Entry { status, body, content_type, expires_at: Instant::now() + ttl },
         );
+    }
+
+    /// GRAMMAR.md §3.293: `cache.clear()` -- vacía TODO el cache en memoria
+    /// de esta instancia. No toca el cache DISTRIBUIDO (`@cache` con la
+    /// tabla interna de Postgres, GRAMMAR.md §3.256) -- alcance v0, mismo
+    /// límite que documenta esa sección para cualquier operación que solo
+    /// vea el estado de UN proceso.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// `cache.clear(prefix)` -- borra solo las entradas cuya clave
+    /// `"{service}.{rpc}"` empieza con `prefix`. Cubre los dos casos reales:
+    /// `cache.clear("Pages")` (todo un service) y
+    /// `cache.clear("Pages.home")` (un rpc puntual, todas sus variantes de
+    /// argumentos).
+    pub fn clear_prefix(&mut self, prefix: &str) {
+        self.entries.retain(|(service, rpc, _), _| !format!("{service}.{rpc}").starts_with(prefix));
+    }
+
+    /// `cache.stats()`: cantidad de entradas VIVAS ahora mismo (no cuenta
+    /// las vencidas todavía no barridas -- `sweep_if_due` no corre acá a
+    /// propósito, esto es de solo lectura y no debería tener el efecto
+    /// secundario de barrer) más los contadores acumulativos de hit/miss.
+    pub fn stats(&self) -> (usize, u64, u64) {
+        let now = Instant::now();
+        let live_entries = self.entries.values().filter(|e| e.expires_at > now).count();
+        (live_entries, self.hits, self.misses)
     }
 }
 
@@ -150,5 +187,75 @@ mod tests {
         let mut store = CacheStore::new();
         store.put("Stats", "summary", "{\"id\":1}", 200, "one".to_string(), "application/json".to_string(), Duration::from_secs(60));
         assert!(store.get("Stats", "summary", "{\"id\":2}").is_none());
+    }
+
+    // ---- `cache.clear`/`cache.stats` (GRAMMAR.md §3.293, PLAN.md §9.24 Fase 2 ítem G4) ----
+
+    #[test]
+    fn clear_removes_every_entry() {
+        let mut store = CacheStore::new();
+        store.put("Pages", "home", "{}", 200, "a".to_string(), "text/html".to_string(), Duration::from_secs(60));
+        store.put("Pages", "about", "{}", 200, "b".to_string(), "text/html".to_string(), Duration::from_secs(60));
+        store.clear();
+        assert!(store.get("Pages", "home", "{}").is_none());
+        assert!(store.get("Pages", "about", "{}").is_none());
+    }
+
+    #[test]
+    fn clear_prefix_removes_only_matching_entries() {
+        let mut store = CacheStore::new();
+        store.put("Pages", "home", "{}", 200, "a".to_string(), "text/html".to_string(), Duration::from_secs(60));
+        store.put("Pages", "about", "{}", 200, "b".to_string(), "text/html".to_string(), Duration::from_secs(60));
+        store.put("Api", "stats", "{}", 200, "c".to_string(), "application/json".to_string(), Duration::from_secs(60));
+        store.clear_prefix("Pages.home");
+        // `Pages.home` se borra explícitamente por `clear_prefix`, así que
+        // `get` nunca lo encuentra -- esto no cuenta como un miss real de
+        // negocio, pero `get` no distingue el motivo, mismo criterio que
+        // cualquier otra ausencia de clave.
+        assert!(store.get("Pages", "home", "{}").is_none());
+        assert!(store.get("Pages", "about", "{}").is_some(), "otro rpc del mismo service no debería borrarse");
+        assert!(store.get("Api", "stats", "{}").is_some(), "otro service no debería borrarse");
+    }
+
+    #[test]
+    fn clear_prefix_matching_a_whole_service_removes_all_its_rpcs() {
+        let mut store = CacheStore::new();
+        store.put("Pages", "home", "{}", 200, "a".to_string(), "text/html".to_string(), Duration::from_secs(60));
+        store.put("Pages", "about", "{}", 200, "b".to_string(), "text/html".to_string(), Duration::from_secs(60));
+        store.clear_prefix("Pages");
+        assert!(store.get("Pages", "home", "{}").is_none());
+        assert!(store.get("Pages", "about", "{}").is_none());
+    }
+
+    #[test]
+    fn stats_reports_live_entry_count_and_cumulative_hits_and_misses() {
+        let mut store = CacheStore::new();
+        store.put("Pages", "home", "{}", 200, "a".to_string(), "text/html".to_string(), Duration::from_secs(60));
+        assert!(store.get("Pages", "home", "{}").is_some()); // hit
+        assert!(store.get("Pages", "home", "{}").is_some()); // hit
+        assert!(store.get("Pages", "missing", "{}").is_none()); // miss
+        let (entries, hits, misses) = store.stats();
+        assert_eq!(entries, 1);
+        assert_eq!(hits, 2);
+        assert_eq!(misses, 1);
+    }
+
+    #[test]
+    fn stats_entry_count_excludes_expired_entries() {
+        let mut store = CacheStore::new();
+        store.put("Pages", "home", "{}", 200, "a".to_string(), "text/html".to_string(), Duration::from_millis(0));
+        std::thread::sleep(Duration::from_millis(5));
+        let (entries, _, _) = store.stats();
+        assert_eq!(entries, 0, "una entrada vencida no cuenta como viva, aunque todavía no la haya barrido `sweep_if_due`");
+    }
+
+    #[test]
+    fn clear_does_not_reset_the_cumulative_hit_and_miss_counters() {
+        let mut store = CacheStore::new();
+        store.put("Pages", "home", "{}", 200, "a".to_string(), "text/html".to_string(), Duration::from_secs(60));
+        let _ = store.get("Pages", "home", "{}");
+        store.clear();
+        let (_, hits, _) = store.stats();
+        assert_eq!(hits, 1, "clear() vacía el CONTENIDO, no la métrica histórica de uso");
     }
 }
