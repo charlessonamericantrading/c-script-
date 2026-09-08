@@ -419,6 +419,64 @@ fn a_catchall_route_captures_zero_or_more_trailing_segments() {
     assert_eq!(body, "\"\"");
 }
 
+const ROOT_CATCHALL_PROGRAM: &str = r#"
+service Site {
+  @route("/:rest*")
+  rpc catchAll(rest: String) -> String {
+    "REST=" + rest
+  }
+}
+"#;
+
+#[test]
+fn a_root_catchall_serves_real_content_at_slash_but_health_stays_the_default() {
+    // 08/09/2026, migración real de Segurma (PLAN.md §9.24 Fase 4e): antes,
+    // "/" era un health-check INCONDICIONAL -- ningún programa podía servir
+    // contenido propio en la raíz, ni con un catch-all de 0 segmentos
+    // literales. Ahora, si el programa declara algo que matchea "/" (acá,
+    // un catch-all `/:rest*` con `rest == ""`), esa rpc gana -- el health
+    // check queda como comportamiento por DEFECTO, no como reserva dura.
+    let temp = TempDir::new("root-catchall");
+    let src = temp.write("app.link", ROOT_CATCHALL_PROGRAM);
+    let server = Serve::start(&src);
+
+    let (status, _, body) = server.get("/");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"REST=\"", "'/' tiene que servir la rpc real del programa, no el health-check fijo");
+
+    // El catch-all también sirve cualquier otro path, como siempre.
+    let (status, _, body) = server.get("/algo/mas");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"REST=algo/mas\"");
+
+    // "/health"/"/status" NUNCA le ceden el paso a una ruta de usuario --
+    // siguen siendo el health-check de siempre, sin ambigüedad, para
+    // cualquier orquestador/load balancer que los conozca de antemano.
+    let (status, _, body) = server.get("/health");
+    assert_eq!(status, 200);
+    assert!(body.contains("\"engine\":\"c-script\""), "/health real: {body}");
+    let (status, _, body) = server.get("/status");
+    assert_eq!(status, 200);
+    assert!(body.contains("\"engine\":\"c-script\""), "/status real: {body}");
+}
+
+#[test]
+fn a_program_without_any_root_route_still_gets_the_health_check_at_slash() {
+    // Retrocompatibilidad: CATCHALL_PROGRAM no declara nada que matchee
+    // "/" (su único catch-all tiene el prefijo literal "docs") -- "/" tiene
+    // que seguir devolviendo el health-check de siempre, idéntico al
+    // comportamiento previo a este cambio, para cualquier programa
+    // existente que no declare una ruta en la raíz.
+    let temp = TempDir::new("no-root-route");
+    let src = temp.write("app.link", CATCHALL_PROGRAM);
+    let server = Serve::start(&src);
+
+    let (status, _, body) = server.get("/");
+    assert_eq!(status, 200);
+    assert!(body.contains("\"engine\":\"c-script\""), "sin ninguna ruta en la raíz, '/' tiene que ser el health-check de siempre: {body}");
+    assert!(body.contains("\"status\":\"ok\""), "{body}");
+}
+
 #[test]
 fn a_literal_route_wins_over_a_catchall_that_could_also_match() {
     // "/docs/changelog" (2 segmentos literales) y "/docs/:rest*" (1

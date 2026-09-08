@@ -1488,7 +1488,22 @@ fn handle_request(
         return;
     }
 
-    if path == "/" || path == "/health" || path == "/status" {
+    // `/` deja de ser un health-check INCONDICIONAL (08/09/2026, migración
+    // real de Segurma, PLAN.md §9.24 Fase 4e): antes, `@route("/")` ni
+    // siquiera podía declararse (rechazado en compilación, "hace falta al
+    // menos un segmento") y CUALQUIER programa perdía la home real contra
+    // el JSON de health fijo -- un sitio real necesita su página de más
+    // tráfico en la raíz, no en `/home`. `/health`/`/status` siguen
+    // INCONDICIONALES (nunca le ceden el paso a una ruta de usuario): son
+    // los nombres que un orquestador/load balancer conoce de antemano,
+    // ambigüedad cero deseable ahí. Para `/` puntual: si algo que el
+    // programa declaró (una ruta literal, o un catch-all `/:rest*` con
+    // `rest == ""`, GRAMMAR.md §3.57) matchea, ESA rpc gana; el health
+    // check de siempre queda como comportamiento por DEFECTO, no como
+    // reserva dura -- retrocompatible al 100% para cualquier programa que
+    // no declare nada en la raíz (el resultado es idéntico a antes).
+    let root_claimed_by_route = path == "/" && resolve_route(&path, "", route_table).is_ok();
+    if path == "/health" || path == "/status" || (path == "/" && !root_claimed_by_route) {
         let services: Vec<String> = program
             .items
             .iter()

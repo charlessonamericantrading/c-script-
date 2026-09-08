@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.240.0] - 2026-09-08
+
+### 🐛 Corregido
+**`/` deja de ser un health-check incondicional -- un programa puede servir su home real en la raíz, no solo en `/home`.** Hasta esta versión, `GET /` SIEMPRE devolvía el JSON de health-check de `linkc serve`, sin importar qué declarara el programa -- descubierto migrando el sitio real de Segurma (PLAN.md §9.24 Fase 4e), donde la home necesita vivir en la raíz literal. Ahora: si el programa declara algo que matchea `/` (en la práctica, un catch-all `@route("/:rest*")` con `rest == ""`, GRAMMAR.md §3.57), esa rpc gana con la misma precedencia normal; si no declara nada, `/` sigue siendo el health-check de siempre, byte a byte -- 100% retrocompatible. `/health`/`/status` NUNCA ceden el paso a una ruta de usuario, siguen siendo reserva dura para cualquier orquestador/load balancer. Ver GRAMMAR.md §3.294.
+
+Verificado: 2 tests nuevos en `cli_route.rs` contra el binario real (un catch-all en la raíz sirve contenido propio mientras `/health`/`/status` siguen siendo el health-check de siempre; un programa sin ninguna ruta que matchee `/` sigue dando el health-check de siempre, confirmando la retrocompatibilidad) más los 18+2 tests preexistentes de `cli_route.rs`/`cli_health.rs` sin regresiones.
+
 ## [1.239.0] - 2026-09-08
 
 ### 🐛 Corregido

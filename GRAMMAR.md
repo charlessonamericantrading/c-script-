@@ -7906,7 +7906,32 @@ test "the sitemap lists the static public routes and nothing else" {
 
 **Verificado**: `tests/cli_static_routes.rs` contra el binario real -- `linkc test` corre 3 bloques `test` (orden y unión exacta de `staticRoutes`, `sitemapXml(staticRoutes(...))` con seis rutas de las que solo dos califican: `:param`, catch-all, `@authenticated` y `@requires` excluidas; `hreflangLinks` con la salida exacta y el escape de `"`/`<`/`&`), y `linkc build` escribe un `routes.json` con las seis rutas en orden, los flags correctos por ruta, y `in_sitemap` en exactamente las mismas dos. Suite de la lib (1.205 tests) y `docs_examples`/`docs_drift` en verde.
 
-**Límite honesto**: `@route("/")` no existe como ruta (`/` es `/health`, §3.87), así que la home de un sitio c-script vive en `/home` o similar y el sitemap la lista ahí. Las rutas con parámetro siguen siendo del programa: solo él sabe qué slugs existen (`db.posts.all().map(...)` concatenado a `staticRoutes(...)` con `+`, §3.200). `routes.json` es un artefacto más de `build`, sin `--diff` propio (§3.79 compara `contract.d.ts`).
+**Límite honesto, RESUELTO en parte (08/09/2026, §3.294): "/" ya puede ser la home real de un sitio c-script, no solo "/home".** `@route("/")` sigue sin poder declararse LITERAL, pero un catch-all `@route("/:rest*")` (§3.57) con `rest == ""` sí gana la raíz cuando el programa lo declara -- ver §3.294 para el detalle completo y por qué. Las rutas con parámetro siguen siendo del programa: solo él sabe qué slugs existen (`db.posts.all().map(...)` concatenado a `staticRoutes(...)` con `+`, §3.200). `routes.json` es un artefacto más de `build`, sin `--diff` propio (§3.79 compara `contract.d.ts`).
+
+### 3.294 `/` deja de ser un health-check incondicional — RESUELTO
+
+Origen: migración real de Segurma (PLAN.md §9.24 Fase 4e) -- el primer sitio real que necesitó su home en la raíz literal, no en `/home`. Hasta esta ronda, `linkc serve` respondía el JSON de health-check en `GET /` SIEMPRE, sin excepción, sin importar qué declarara el programa -- y `@route("/")` ni siquiera podía escribirse (`'/' sola no es una ruta válida -- hace falta al menos un segmento`, `route.rs::parse_route_pattern`). Para cualquier sitio real (no solo Segurma), la home es la página de más tráfico -- forzarla a vivir en `/home` es exactamente el tipo de límite que un migrador desde Express/Node no debería tener que absorber.
+
+<!-- linkc:check -->
+```rust
+service Site {
+  @route("/:rest*")
+  rpc catchAll(rest: String) -> String {
+    if rest == "" { "home" } else { "otra cosa: " + rest }
+  }
+}
+```
+
+**La regla nueva, en una frase: el health-check en `/` pasa de reserva DURA a comportamiento por DEFECTO.** Si algo que el programa declaró matchea `/` -- hoy, en la práctica, un catch-all `@route("/:rest*")` con `rest == ""` (§3.57), ya que `@route("/")` literal sigue sin existir como forma -- esa rpc gana, exactamente con la misma precedencia que cualquier otra ruta (`route_table` ya viene ordenada por especificidad, `resolve_route` de siempre). Si NADA matchea, `/` sigue devolviendo el health-check de siempre, byte a byte -- **retrocompatible al 100%**: cualquier programa que no declare nada en la raíz se comporta exactamente igual que antes de este cambio.
+
+**`/health` y `/status` NUNCA le ceden el paso a una ruta de usuario -- siguen siendo reserva dura, sin ambigüedad.** Un orquestador o load balancer que hace liveness probing conoce esos dos nombres de antemano; solo `/` (el nombre que un sitio real también quiere para su propio contenido) pasa a resolverse con la prioridad normal. `/live`/`/ready` (§3.220/§3.282) tampoco cambian -- son endpoints dedicados, sin ambigüedad posible con contenido de usuario.
+
+**Mecanismo**: `handle_request` (`runtime/server.rs`) llamaba a `resolve_route` recién en el camino normal de dispatch, MUCHO después del bloque de health-check -- que corría primero e incondicional para `/`/`/health`/`/status` los tres juntos. Separado: `/health`/`/status` quedan en su chequeo incondicional de siempre; para `/` puntual, se llama a `resolve_route(&path, "", route_table)` (la MISMA llamada, sin body, que §3.147 ya usa para resolver el override de CORS antes del preflight -- reusada, no duplicada) ANTES de decidir si cae al health-check. Si matchea, el camino normal de dispatch (más abajo en la función) se encarga; si no, el health-check corre exactamente como siempre.
+
+**Deliberadamente NO se tocó la restricción de `parse_route_pattern` que rechaza `@route("/")` literal.** El catch-all (`@route("/:rest*")`) ya cubre el caso real (una home que también necesita servir cualquier ruta legacy con redirects/gone/404, el patrón real que motivó esto -- ver el `.link` de Segurma) sin abrir la superficie más chica y más rara de una ruta puramente literal sobre la raíz. Si un caso de uso real solo quiere una home fija SIN catch-all, queda para una ronda futura, no bloqueada por esta.
+
+**Verificado**: 2 tests nuevos en `cli_route.rs` contra el binario real -- un programa con `@route("/:rest*")` sirve contenido real en `/` (y en cualquier otro path), mientras `/health`/`/status` siguen devolviendo el health-check de siempre sin ambigüedad; un programa SIN ninguna ruta que matchee la raíz (`CATCHALL_PROGRAM`, que solo tiene `/docs/:rest*`) sigue dando el health-check de siempre en `/`, byte a byte igual que antes de este cambio -- retrocompatibilidad confirmada, no solo asumida. Más los 18 tests preexistentes de `cli_route.rs` y los 2 de `cli_health.rs` sin regresiones.
+
 ### 3.223 `linkc_http_outbound_*`: latencia y tasa de error de las llamadas `http.*` salientes en `/metrics` — RESUELTO, cierra PLAN.md §9.18 Eje F ítem 5
 
 Origen: `PLAN.md §9.18` Eje F ítem 5. `/metrics` (§3.149) veía solo las requests ENTRANTES; un producto que depende de un proveedor externo (un LLM, una pasarela de pago, un webhook de terceros) vive de la latencia y la tasa de error de ESE proveedor, y hasta ahora la única forma de verla era inferirla de la latencia total del rpc que lo llama -- imposible de separar del tiempo de base o del intérprete.
