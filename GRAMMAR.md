@@ -10132,6 +10132,33 @@ service Jobs {
 
 **Verificado**: 15 tests de `cron.rs` contra vectores de referencia generados con `croniter` de Python (una implementación de referencia real, no vectores inventados a mano -- mismo criterio que PBKDF2, GRAMMAR.md §3.284) cubriendo horario diario, paso (`*/15`), día-de-mes fijo, día-de-semana solo, lista de días, rango de días de semana, la combinación OR día-mes/día-semana, el caso 29-de-febrero saltando años no bisiestos, y el alias 0/7 para domingo + 4 tests de `parser.rs` (forma del AST con y sin `initialDelay`, una expresión real como `schedule`, un segundo argumento con otra palabra clave rechazado) + 6 tests de `checker.rs` (acepta una expresión real, rechaza un campo fuera de rango, acepta `initialDelay`, rechaza un `initialDelay` con formato inválido) + 5 tests de integración en `cli_cron_schedule.rs` contra un `linkc serve` real: `initialDelay` confirmado NO haber corrido a 1.5s pero SÍ haber corrido pasados los 3s de demora + 1s de intervalo; una expresión cron construida para el PRÓXIMO minuto de reloj real efectivamente dispara en ese minuto (prueba de reloj de pared real, no simulado); un campo fuera de rango y un `initialDelay` malformado se rechazan en compilación. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.290 `String.matchAll`/`.match` + `json.tryParse` — cierra Fase 2 ítem F3 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.4 ítem F3 -- el caso real: un SchemaValidator que hace `GET` de una página HTML, extrae cada bloque `<script type="application/ld+json">...</script>` con regex, parsea el contenido de cada uno, y valida su `@type`. Dos gaps bloqueaban portarlo: `@validate(regex, "...")` (§3.190) solo valida CAMPOS contra un patrón fijo conocido en compilación, no extrae texto de un `String` arbitrario en runtime; y `json.parse` (§3.114) aborta toda la request ante un JSON mal formado, pero un bloque roto de un proveedor externo es un resultado ESPERABLE, no una excepción.
+
+<!-- linkc:check -->
+```rust
+type LdJsonBlock = { type_: String }
+
+service Validator {
+  rpc extract(html: String) -> String[] {
+    html.matchAll("<script type=\"application/ld\\+json\">.*?</script>")
+  }
+
+  rpc parseBlock(raw: String) -> LdJsonBlock? {
+    json.tryParse(raw)
+  }
+}
+```
+
+**`String.matchAll(pattern: String) -> String[]`** devuelve el texto de CADA coincidencia (grupo 0 completo, sin capturar subgrupos -- extraer bloques es el caso real, no partes internas), en orden, lista vacía si ninguna matchea. **`String.match(pattern: String) -> String?`** devuelve la PRIMERA coincidencia, `null` si ninguna. Las dos comparten un límite honesto: `pattern` es un `String` de RUNTIME, no un literal -- a diferencia de `@validate(regex, "...")` (que sí puede rechazar un patrón inválido en compilación porque ahí siempre es un literal), acá un patrón inválido es un error de EJECUCIÓN con mensaje claro (mismo criterio "el locale es un String de runtime, no un tipo cerrado" que `Int.toLocaleString`, §3.269), nunca un panic.
+
+**`json.tryParse(text: String) -> Dynamic?`** es la ÚNICA variante `try*` que este lenguaje tiene -- el `try`/`catch` general NUNCA se propone (decisión de diseño de siempre: un error aborta la request, GRAMMAR.md §2), pero un JSON de un proveedor externo que puede genuinamente no ser válido es el caso donde un fallo es un resultado ESPERABLE que el programa quiere seguir manejando, no una excepción. `null` en cualquier fallo de parseo -- nunca expone POR QUÉ falló (a diferencia de `json.parse`, que sí lo nombra en su error), porque el punto es "¿parseó o no", no diagnosticar el motivo. Mismo patrón de `Dynamic` que `db.query`/`background.status` ya establecieron: se declara un tipo concreto más angosto (`LdJsonBlock?` arriba) y el subtipado estructural lo acepta.
+
+**Bug real de subtipado encontrado y corregido escribiendo el primer test de `json.tryParse`**: `Optional(Dynamic)` NO subtipaba en `Optional(T)` para ningún `T` concreto -- `is_subtype` tenía un arm dedicado `(List(a), List(b)) => is_subtype(a, b)` para que `List(Dynamic)` (lo que `db.query` ya devolvía) subtipara en `List(Row)`, pero NINGÚN arm equivalente para `Optional`. El caso `(Optional(Dynamic), Optional(Row))` caía en el arm genérico "Optional-Widen" (`(a, Optional(b)) => is_subtype(a, b)`), que compara el `Optional(Dynamic)` ENTERO del lado izquierdo (sin desenvolverlo) contra el `Row` interno del lado derecho -- una comparación mal formada que siempre daba `false`. Ningún test preexistente de este proyecto había puesto un `Optional` de LOS DOS lados de `is_subtype` a la vez, así que la asimetría con `List` pasó inadvertida hasta ahora. Corregido agregando `(Optional(a), Optional(b)) => is_subtype(a, b)` ANTES del arm genérico -- mismo arreglo mecánico que el de `List`, ahora simétrico entre los dos tipos contenedores genéricos que `Dynamic` necesita atravesar.
+
+**Verificado**: 6 tests de `checker.rs` (`matchAll`/`match` tipan correctamente, `matchAll` rechaza un patrón no-`String`, `json.tryParse` tipa como `Optional<Dynamic>` y de verdad se declara como un tipo concreto más angosto, aridad incorrecta rechazada) + 1 test de regresión dedicado en `types.rs` para el bug de subtipado (`Optional(Dynamic) <: Optional(T)` en las dos direcciones, mismo criterio que el test ya existente de `Dynamic` sola) + 5 tests de integración en `cli_regex_json.rs` contra el binario real: `matchAll` extrae los bloques ld+json reales de un HTML (el caso motivador exacto), lista vacía sin coincidencias; `match` da la primera coincidencia o `null`; un patrón inválido tipa bien (es un `String` de runtime) y falla limpio en ejecución, nunca un panic; `json.tryParse` da el struct o `null` sin abortar ante JSON mal formado; y un pipeline realista combinando `matchAll` + `tryParse` + `List.filter` para contar bloques válidos ignorando uno roto -- el caso completo de SchemaValidator que motiva este ítem. Suite completa (1452 tests de `--lib`) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

@@ -4108,6 +4108,28 @@ fn call_method(
                 };
                 Ok(Value::Str(s.replace(target.as_str(), replacement.as_str())))
             }
+            // GRAMMAR.md §3.290: `pattern` es un `String` de runtime -- un
+            // patrón inválido es un `RuntimeError` limpio nombrando el
+            // patrón, nunca un panic. Solo el match COMPLETO (grupo 0), sin
+            // capturar subgrupos -- el caso real que motiva esto (extraer
+            // bloques `<script type="application/ld+json">...</script>` de
+            // un HTML) solo necesita el texto que matcheó, no sus partes.
+            "matchAll" => {
+                let pattern = match args.first() {
+                    Some(Value::Str(p)) => p,
+                    _ => return Err(err("'matchAll' requiere un argumento String (pattern)")),
+                };
+                let re = regex::Regex::new(pattern).map_err(|e| err(format!("'matchAll': patrón de regex inválido '{pattern}': {e}")))?;
+                Ok(Value::List(re.find_iter(s.as_str()).map(|m| Value::Str(m.as_str().to_string())).collect()))
+            }
+            "match" => {
+                let pattern = match args.first() {
+                    Some(Value::Str(p)) => p,
+                    _ => return Err(err("'match' requiere un argumento String (pattern)")),
+                };
+                let re = regex::Regex::new(pattern).map_err(|e| err(format!("'match': patrón de regex inválido '{pattern}': {e}")))?;
+                Ok(re.find(s.as_str()).map(|m| Value::Str(m.as_str().to_string())).unwrap_or(Value::Null))
+            }
             // Separador vacío: mismo comportamiento que `str::split` nativo
             // de Rust (un elemento vacío antes del primer caracter y
             // después del último, cada caracter en el medio) -- definido y
@@ -4612,6 +4634,18 @@ fn call_method(
                 let s = serde_json::to_string(&json_v)
                     .map_err(|e| err(format!("error al serializar a JSON: {e}")))?;
                 Ok(Value::Str(s))
+            }
+            // GRAMMAR.md §3.290 (PLAN.md §9.24 Fase 2 ítem F3): la ÚNICA
+            // variante `try*` de este lenguaje -- un JSON externo mal
+            // formado es un resultado ESPERABLE (un proveedor de terceros
+            // caído/devolviendo HTML de error en vez de JSON), no algo que
+            // deba tumbar toda la request como `json.parse` sí hace.
+            "tryParse" => {
+                let text = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("json.tryParse requiere un argumento String")),
+                };
+                Ok(serde_json::from_str::<serde_json::Value>(text).ok().map(|v| json_to_value(&v)).unwrap_or(Value::Null))
             }
             other => Err(err(format!("método desconocido sobre json: '{other}'"))),
         },

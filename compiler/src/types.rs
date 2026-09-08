@@ -319,6 +319,21 @@ pub fn is_subtype(sub: &Type, sup: &Type) -> bool {
     match (sub, sup) {
         (Dynamic, _) | (_, Dynamic) => true,
         (Null, Optional(_)) => true,
+        // GRAMMAR.md §3.290: caso PROPIO para Optional-vs-Optional, ANTES
+        // del catch-all "Optional-Widen" de abajo -- sin este arm,
+        // `Optional(Dynamic) <: Optional(Row)` (el patrón real que
+        // `json.tryParse -> Dynamic?` necesita para poder declararse como
+        // `Row?`, mismo criterio que `db.query -> Dynamic[]` ya podía
+        // declararse `Row[]` vía el arm `(List(a), List(b))` de abajo)
+        // caía en el arm de ANCHO genérico de abajo tratando el `Optional`
+        // entero del lado `sub` como el valor "a" a comparar contra el `b`
+        // interno del lado `sup` -- comparaba `Optional(Dynamic)` contra
+        // `Row` (sin desenvolver), no `Dynamic` contra `Row`, y esa
+        // comparación mal formada siempre daba `false`. Encontrado
+        // escribiendo el primer test real de `json.tryParse` -- ningún test
+        // preexistente de este proyecto había puesto un `Optional` de un
+        // lado Y del otro a la vez.
+        (Optional(a), Optional(b)) => is_subtype(a, b),
         (a, Optional(b)) => is_subtype(a, b), // Optional-Widen: S <: T => S <: T?
         (List(a), List(b)) => is_subtype(a, b),
         (Tuple(a), Tuple(b)) if a.len() == b.len() => {
@@ -555,6 +570,24 @@ mod tests {
         assert!(is_subtype(&Type::Dynamic, &Type::Int));
         assert!(is_subtype(&Type::Int, &Type::Dynamic));
         assert!(is_subtype(&Type::Dynamic, &point(None)));
+    }
+
+    /// GRAMMAR.md §3.290: bug real encontrado escribiendo el primer test de
+    /// `json.tryParse -> Dynamic?` -- `Optional(Dynamic) <: Optional(Row)`
+    /// caía en el arm "Optional-Widen" genérico (`(a, Optional(b))`), que
+    /// comparaba el `Optional(Dynamic)` ENTERO del lado izquierdo (sin
+    /// desenvolver) contra el `Row` interno del derecho, en vez de comparar
+    /// `Dynamic` contra `Row`. `List(Dynamic) <: List(Row)` (que
+    /// `db.query -> Dynamic[]` sí necesitaba) funcionaba porque `List` SÍ
+    /// tenía su propio arm dedicado (`(List(a), List(b))`) -- `Optional` no
+    /// lo tenía, la asimetría exacta que este test fija.
+    #[test]
+    fn optional_dynamic_is_a_subtype_of_optional_of_any_concrete_type() {
+        assert!(is_subtype(&Type::Optional(Box::new(Type::Dynamic)), &Type::Optional(Box::new(Type::Int))));
+        assert!(is_subtype(&Type::Optional(Box::new(Type::Dynamic)), &Type::Optional(Box::new(point(None)))));
+        // Mismo criterio de sanidad que `dynamic_is_compatible_with_anything`:
+        // funciona en las dos direcciones.
+        assert!(is_subtype(&Type::Optional(Box::new(Type::Int)), &Type::Optional(Box::new(Type::Dynamic))));
     }
 
     #[test]

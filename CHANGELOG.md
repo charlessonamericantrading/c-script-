@@ -3,6 +3,16 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.235.0] - 2026-09-08
+
+### ✨ Añadido
+**`String.matchAll`/`.match` + `json.tryParse` -- cierra el ítem F3 de la Fase 2 de PLAN.md §9.24.** El caso real: un SchemaValidator que extrae bloques `<script type="application/ld+json">` de un HTML con regex y parsea cada uno sin que uno mal formado tumbe toda la request. `String.matchAll(pattern: String) -> String[]` (todas las coincidencias, grupo 0 completo) y `.match(pattern: String) -> String?` (la primera, o `null`) -- `pattern` es un `String` de runtime, un patrón inválido es un error de ejecución limpio, nunca un panic. `json.tryParse(text: String) -> Dynamic?` es la ÚNICA variante `try*` de este lenguaje -- el `try`/`catch` general nunca se propone, pero un JSON externo que puede no ser válido es un resultado esperable, no una excepción. Ver GRAMMAR.md §3.290.
+
+### 🐛 Corregido
+**Bug real de subtipado: `Optional(Dynamic)` no subtipaba en `Optional(T)` para ningún `T` concreto.** `is_subtype` tenía un arm dedicado para que `List(Dynamic)` (lo que `db.query` ya devolvía) subtipara en `List(Row)`, pero ningún arm equivalente para `Optional` -- el caso caía en el arm genérico "Optional-Widen", que comparaba el `Optional(Dynamic)` entero sin desenvolver contra el tipo interno del otro lado, siempre dando `false`. Encontrado escribiendo el primer test real de `json.tryParse -> Dynamic?` declarado como un tipo concreto (`Payload?`) -- ningún test preexistente había puesto un `Optional` de los dos lados de `is_subtype` a la vez. Corregido con un arm dedicado `(Optional(a), Optional(b)) => is_subtype(a, b)`, simétrico con el de `List`.
+
+Verificado: 6 tests de `checker.rs` + 1 test de regresión dedicado en `types.rs` para el bug de subtipado + 5 tests de integración en `cli_regex_json.rs` contra el binario real -- incluye el caso motivador exacto (extraer bloques ld+json de un HTML real) y un pipeline completo combinando `matchAll`+`tryParse`+`List.filter` para contar bloques válidos ignorando uno roto. Suite completa (1452 tests `--lib`) sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.234.0] - 2026-09-08
 
 ### ✨ Añadido

@@ -5623,6 +5623,20 @@ impl Checker {
                 self, args, env, "String.replace",
                 [(target, "target: String", Type::String), (replacement, "replacement: String", Type::String)] -> Type::String
             ),
+            // GRAMMAR.md §3.290 (PLAN.md §9.24 Fase 2 ítem F3): `pattern` es
+            // un `String` de RUNTIME, no un literal -- a diferencia de
+            // `@validate(regex, "...")` (§3.190, que sí puede validar el
+            // patrón en compilación porque ahí siempre es un literal), acá
+            // un patrón inválido es un error de EJECUCIÓN, mismo criterio
+            // que `Int.toLocaleString`'s locale (§3.269).
+            (Type::String, "matchAll") => builtin_args!(
+                self, args, env, "String.matchAll",
+                [(pattern, "pattern: String", Type::String)] -> Type::List(Box::new(Type::String))
+            ),
+            (Type::String, "match") => builtin_args!(
+                self, args, env, "String.match",
+                [(pattern, "pattern: String", Type::String)] -> Type::Optional(Box::new(Type::String))
+            ),
             (Type::String, "split") => builtin_args!(
                 self, args, env, "String.split",
                 [(separator, "separator: String", Type::String)] -> Type::List(Box::new(Type::String))
@@ -5978,6 +5992,21 @@ impl Checker {
                 };
                 self.check_expr(str_arg, &Type::String, env)?;
                 Some(Type::Dynamic)
+            }
+            // GRAMMAR.md §3.290 (PLAN.md §9.24 Fase 2 ítem F3): la ÚNICA
+            // variante `try*` que este lenguaje tiene -- el `try`/`catch`
+            // general NUNCA se propone (decisión de diseño de siempre: un
+            // error aborta), pero un JSON de un proveedor externo que puede
+            // no ser válido es justo el caso donde un fallo es un resultado
+            // ESPERABLE, no una excepción -- de ahí `Dynamic?` en vez de un
+            // error de runtime que tumbaría toda la request por un solo
+            // documento mal formado.
+            (Type::Json, "tryParse") => {
+                let [str_arg] = args else {
+                    return Err(err("'json.tryParse' toma exactamente 1 argumento (text: String)"));
+                };
+                self.check_expr(str_arg, &Type::String, env)?;
+                Some(Type::Optional(Box::new(Type::Dynamic)))
             }
             (Type::Json, "stringify") => {
                 let [val_arg] = args else {
@@ -9108,6 +9137,45 @@ type T = { id: Int, s: Status }")
             }
         "#;
         assert!(check_source(src).is_err(), "'verifyConfig' exige exactamente 1 argumento (config)");
+    }
+
+    // ---- `String.matchAll`/`.match`, `json.tryParse` (GRAMMAR.md §3.290) ----
+
+    #[test]
+    fn match_all_types_as_a_list_of_string() {
+        let src = r#"fn f(s: String) -> String[] { s.matchAll("[0-9]+") }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn match_types_as_an_optional_string() {
+        let src = r#"fn f(s: String) -> String? { s.match("[0-9]+") }"#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn match_all_rejects_a_non_string_pattern() {
+        let src = r#"fn f(s: String) -> String[] { s.matchAll(1) }"#;
+        assert!(check_source(src).is_err());
+    }
+
+    #[test]
+    fn json_try_parse_types_as_optional_dynamic() {
+        // `Dynamic` no se puede nombrar en la firma de retorno (checker.rs
+        // §3.2, GRAMMAR.md §9963) -- se declara un tipo concreto más angosto
+        // y el subtipado estructural lo acepta, mismo patrón que
+        // `background.status`/`db.query` ya usan.
+        let src = r#"
+            type Row = { n: Int }
+            fn f(s: String) -> Row? { json.tryParse(s) }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn json_try_parse_rejects_wrong_argument_count() {
+        let src = r#"fn f() -> Void { json.tryParse() }"#;
+        assert!(check_source(src).is_err());
     }
 
     // ---- `@naturalKey` (GRAMMAR.md §3.264) ----
