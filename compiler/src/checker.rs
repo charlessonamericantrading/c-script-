@@ -5954,6 +5954,19 @@ impl Checker {
                 self.check_expr(headers, &Type::List(Box::new(http_header_type())), env)?;
                 Some(http_response_type())
             }
+            // GRAMMAR.md §3.292 (PLAN.md §9.24 Fase 2 ítem F2): el verbo que
+            // un crawler de enlaces rotos necesita -- confirmar que una URL
+            // sigue viva sin descargar el body entero. Misma forma que
+            // `getWithStatus` (nunca falla por un 4xx/5xx -- ESE es el dato
+            // que este método existe para exponer).
+            (Type::Http, "head") => {
+                let [url, headers] = args else {
+                    return Err(err("'http.head' toma exactamente 2 argumentos (url: String, headers: {name: String, value: String}[])"));
+                };
+                self.check_expr(url, &Type::String, env)?;
+                self.check_expr(headers, &Type::List(Box::new(http_header_type())), env)?;
+                Some(http_response_type())
+            }
             (Type::Http, "postWithStatus") => {
                 let [url, body, headers] = args else {
                     return Err(err(

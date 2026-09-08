@@ -3,6 +3,15 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.237.0] - 2026-09-08
+
+### ✨ Añadido
+**`http.head(url, headers)` -- cierra el ítem F2 de la Fase 2 de PLAN.md §9.24.** Un crawler de enlaces rotos confirma que cada URL sigue viva con `HEAD`, no `GET` -- no necesita descargar el recurso entero. Misma forma de retorno que `getWithStatus`/`postWithStatus` (`{status, headers, body}`, `body` siempre vacío por definición de HEAD); un 4xx/5xx llega como dato, nunca como error de runtime, mismo criterio que el resto de la familia `*WithStatus`. Ver GRAMMAR.md §3.292.
+
+Concurrencia acotada (la otra mitad de este ítem) deliberadamente NO se construyó -- PLAN.md ya la marcaba opcional ("empezar secuencial" es aceptable para un manifest de pocas URLs); queda para cuando un caso real la justifique.
+
+Verificado: 3 tests de integración en `cli_http.rs` contra un servidor HTTP de mentira real -- confirma que el método que efectivamente viaja es `HEAD` (no un `GET` disfrazado), un 4xx/5xx llega como dato, y un host inalcanzable falla limpio sin panic. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.236.0] - 2026-09-08
 
 ### ✨ Añadido

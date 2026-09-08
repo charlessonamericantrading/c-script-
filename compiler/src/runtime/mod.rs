@@ -5248,6 +5248,29 @@ fn call_method(
                     Err(e) => Err(err(format!("error de red al hacer GET a {url}: {e}"))),
                 }
             }
+            // GRAMMAR.md §3.292: sin body en la request NI en la respuesta
+            // (HEAD por definición) -- el crawler de enlaces rotos que lo
+            // motiva solo necesita el `status` (y a veces `Location`, ya
+            // presente en `headers`), nunca descargar el recurso entero.
+            "head" => {
+                let url = match args.first() {
+                    Some(Value::Str(s)) => s,
+                    _ => return Err(err("http.head requiere un argumento URL String")),
+                };
+                let headers = match args.get(1) {
+                    Some(Value::List(items)) => http_headers_from_value(items)?,
+                    _ => return Err(err("http.head requiere una lista de headers como segundo argumento")),
+                };
+                let mut req = with_trace(ureq::head(url).timeout(db.http_timeout()), db);
+                for (name, value) in &headers {
+                    req = req.set(name, value);
+                }
+                match outbound_http(db, url, std::time::Instant::now(), req.call()) {
+                    Ok(resp) => Ok(ureq_response_to_value(resp)),
+                    Err(ureq::Error::Status(_, resp)) => Ok(ureq_response_to_value(resp)),
+                    Err(e) => Err(err(format!("error de red al hacer HEAD a {url}: {e}"))),
+                }
+            }
             "postWithStatus" => {
                 let url = match args.first() {
                     Some(Value::Str(s)) => s,

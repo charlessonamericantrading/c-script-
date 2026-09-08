@@ -10180,6 +10180,26 @@ service Admin {
 
 **Verificado**: 4 tests de `checker.rs` (las tres funciones tipan con `(String, Dynamic?)`, rechaza un mensaje no-`String`, rechaza aridad incorrecta, rechaza un método desconocido como `log.debug`) + 4 tests de integración en `cli_log.rs` contra un `linkc serve` real leyendo su stdout capturado: las tres severidades aparecen en texto con el formato exacto; en modo JSON cada línea parsea como JSON válido con `msg`/`meta` correctos; `--log-level warn` suprime `log.info` pero deja pasar `log.warn`/`log.error` (mismo filtro que las líneas de request normales); sin `meta`, la línea de texto no tiene ningún ` meta=` colgado. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.292 `http.head(url, headers)` — cierra Fase 2 ítem F2 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.4 ítem F2 -- un crawler de enlaces rotos (`BrokenLinkCrawler`) confirma que cada URL de un manifest sigue viva con `HEAD`, no `GET` -- no necesita descargar el recurso entero, solo el status. `http.getWithStatus` (§3.60) ya existía, pero mandaba siempre `GET`.
+
+<!-- linkc:check -->
+```rust
+service Crawler {
+  rpc checkLink(url: String) -> Bool {
+    let resp = http.head(url, []);
+    resp.status < 400
+  }
+}
+```
+
+`http.head(url: String, headers: {name: String, value: String}[]) -> { status: Int, headers: {...}[], body: String }` -- MISMA forma de retorno que `getWithStatus`/`postWithStatus` (§3.60), reutilizada tal cual: `body` siempre vacío (HEAD nunca trae body por definición del protocolo), `headers` sí es útil (`Location` de un redirect, `Content-Length`, etc.). Mismo criterio que el resto de la familia `*WithStatus`: un 4xx/5xx de la URL consultada es el DATO que este método existe para exponer, nunca un error de runtime -- solo una falla de red genuina (DNS, conexión rechazada, timeout) lo es.
+
+**Bounded concurrency (la otra mitad del ítem F2 de PLAN.md) deliberadamente NO se construyó esta ronda** -- el propio texto de PLAN.md ya lo marca como aceptable: "sin concurrencia, 1 URL por vez es aceptable para un manifest de pocas URLs -- empezar secuencial". Un crawler real puede llamar `http.head` en un loop `for` normal hoy mismo; concurrencia acotada (`background.parallel(items, n, fn)` o similar) queda para una ronda dedicada si un manifest de miles de URLs demuestra que hace falta -- no se construye por especulación sin ese caso real todavía.
+
+**Verificado**: 3 tests de integración en `cli_http.rs` contra un servidor HTTP de mentira real (mismo arnés que `getWithStatus`, escrito a mano sobre un `TcpStream` real, GRAMMAR.md §3.60) -- confirma que el método HTTP que efectivamente viaja es `HEAD` (no un `GET` disfrazado), que un 4xx/5xx llega como dato sin tumbar el rpc, y que un host inalcanzable falla limpio, nunca un panic. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

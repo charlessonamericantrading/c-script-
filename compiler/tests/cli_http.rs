@@ -48,6 +48,10 @@ service Sys {
     http.getWithStatus(url, [])
   }
 
+  rpc headStatus(url: String) -> Resp {
+    http.head(url, [])
+  }
+
   rpc postStatus(url: String, body: String) -> Resp {
     http.postWithStatus(url, body, [])
   }
@@ -410,6 +414,55 @@ fn get_with_status_returns_a_4xx_as_data_not_as_a_runtime_error() {
         headers.iter().any(|h| h["name"].as_str().unwrap_or("").eq_ignore_ascii_case("Retry-After") && h["value"] == "30"),
         "el header Retry-After tiene que llegar para poder implementar backoff: {headers:?}"
     );
+}
+
+#[test]
+fn head_sends_a_real_head_request_and_exposes_the_status_code() {
+    // GRAMMAR.md §3.292 (PLAN.md §9.24 Fase 2 ítem F2): el verbo que un
+    // crawler de enlaces rotos necesita -- confirmar el método HTTP real
+    // que `ureq::head` manda es efectivamente "HEAD", no un GET disfrazado.
+    let upstream = FakeHttp::start_with_response(200, "OK", b"", &[("X-Custom", "yes")]);
+    let temp = TempDir::new("head-2xx");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+
+    let url = format!("http://127.0.0.1:{}/page", upstream.port);
+    let (status, body) = server.post("/Sys/headStatus", &serde_json::json!({"url": url}).to_string());
+    assert_eq!(status, 200, "el rpc en sí siempre responde 200: body {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["status"], 200, "{resp}");
+
+    let received = upstream.recv(Duration::from_secs(2)).expect("el upstream tiene que haber recibido la conexión");
+    assert_eq!(received.method, "HEAD", "tiene que mandar el método HEAD real, no GET: {received:?}");
+}
+
+#[test]
+fn head_returns_a_4xx_as_data_not_as_a_runtime_error_same_as_get_with_status() {
+    let upstream = FakeHttp::start_with_response(404, "Not Found", b"", &[]);
+    let temp = TempDir::new("head-4xx");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+
+    let url = format!("http://127.0.0.1:{}/gone", upstream.port);
+    let (status, body) = server.post("/Sys/headStatus", &serde_json::json!({"url": url}).to_string());
+    assert_eq!(status, 200, "un 404 upstream NO tiene que tirar abajo el rpc: body {body}");
+    let resp: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(resp["status"], 404, "el código real de la URL rota, como dato -- el caso central de un crawler de enlaces: {resp}");
+}
+
+#[test]
+fn head_against_an_unreachable_host_fails_cleanly_not_with_a_panic() {
+    let temp = TempDir::new("head-unreachable");
+    let src = temp.write("app.link", PROGRAM);
+    let server = Serve::start(&src);
+    let dead_port = {
+        let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let url = format!("http://127.0.0.1:{dead_port}/x");
+    let (status, body) = server.post("/Sys/headStatus", &serde_json::json!({"url": url}).to_string());
+    assert_eq!(status, 500, "{body}");
+    assert!(!body.contains("panicked"), "{body}");
 }
 
 #[test]
