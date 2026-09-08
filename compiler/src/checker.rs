@@ -4799,6 +4799,9 @@ impl Checker {
                 if name == "background" {
                     return Ok(Type::Background);
                 }
+                if name == "time" {
+                    return Ok(Type::Time);
+                }
                 if name == "env" {
                     return Ok(Type::Env);
                 }
@@ -5715,6 +5718,14 @@ impl Checker {
                 self.check_expr(b, &Type::Float, env)?;
                 Some(Type::Float)
             }
+            // GRAMMAR.md §3.286 (PLAN.md §9.24 Fase 2 ítem F5): la única
+            // operación que el módulo `time` necesita -- espaciar llamadas
+            // salientes en lotes (ej. IndexNow, F5 mismo lo motiva) sin medio
+            // segundo de `@cron` artificial.
+            (Type::Time, "sleep") => builtin_args!(
+                self, args, env, "time.sleep",
+                [(ms, "ms: Int", Type::Int)] -> Type::Void
+            ),
             (Type::Crypto, "hashSha256") => {
                 let [data] = args else {
                     return Err(err("'crypto.hashSha256' toma exactamente 1 argumento (data: String)"));

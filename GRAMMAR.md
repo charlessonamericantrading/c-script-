@@ -10028,6 +10028,25 @@ linkc serve app.link 8080 --metrics-token s3cr3t-de-prometheus
 
 **Verificado**: 8 tests de integración en `cli_metrics_token.rs` contra un `linkc serve` real (mismo criterio que `cli_service_api_key.rs`): sin el flag, `/metrics` sigue público; sin el header `Authorization`, 401; con el token incorrecto, 401; con el token correcto, 200 con el texto Prometheus real; `--service-api-key` y `--metrics-token` configurados A LA VEZ exigen los DOS headers, ninguno sustituye al otro; `/health` sigue exento; `LINK_METRICS_TOKEN` como variable de entorno; un valor vacío por flag se comporta como si el flag no existiera. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.286 `time.sleep(ms)` — cierra Fase 2 ítem F5 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.4 ítem F5 -- un job de IndexNow (o cualquier integración que pegue a una API de terceros en lotes) necesita espaciar sus llamadas salientes (500ms entre lotes, 1s entre motores, en el caso real citado) para no violar el rate limit del proveedor. Sin esto, la única forma de esperar entre dos pasos del mismo `rpc` era partirlo en dos `@cron` separados -- un cambio de arquitectura solo para insertar una pausa.
+
+<!-- linkc:check -->
+```rust
+service Jobs {
+  rpc submitInBatches(urls: String[]) -> Void {
+    time.sleep(500)
+  }
+}
+```
+
+`time.sleep(ms: Int) -> Void` bloquea el hilo que atiende ESTA request/tarea (nunca el proceso entero -- un hilo por request, Pilar 1 de concurrencia) por `ms` milisegundos. `ms` tiene que estar entre 0 (no-op válido) y 300000 (5 minutos) -- fuera de ese rango es un error de RUNTIME, no de compilación (`ms` suele venir de un cálculo, no de un literal), mismo criterio "fail loud ante un valor adversarial/erróneo" que `String.repeat`/`padStart` (AUDIT-2026-08-27.md #9): un `ms` negativo o absurdamente grande casi siempre es un bug (`ms`/segundos confundidos, un cálculo que dio negativo), y silenciosamente no dormir nada o colgar el hilo para siempre serían los dos peores desenlaces posibles.
+
+**Es la ÚNICA operación del módulo `time`** -- no hay `time.now()` (ya existe `now() -> Timestamp`, sin receptor, §3.32) ni ninguna otra utilidad de reloj; agregar más superficie sin un caso real que la pida sería especular.
+
+**Verificado**: 4 tests de integración en `cli_time_sleep.rs` contra el binario real -- una medición de reloj real alrededor de un `linkc serve` confirma que la request efectivamente tarda al menos lo pedido (no un mock ni un no-op disfrazado); un valor negativo y uno absurdamente grande fallan limpio con el mensaje esperado; `0` es un no-op válido; un argumento de tipo incorrecto (`String` en vez de `Int`) es un error de COMPILACIÓN, nunca un panic. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

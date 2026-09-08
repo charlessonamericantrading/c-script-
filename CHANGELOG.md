@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.231.0] - 2026-09-08
+
+### ✨ Añadido
+**`time.sleep(ms)` -- cierra el ítem F5 de la Fase 2 de PLAN.md §9.24.** Un job de IndexNow (o cualquier integración por lotes contra una API de terceros) necesita espaciar sus llamadas salientes para respetar el rate limit del proveedor -- sin esto, la única forma de pausar entre dos pasos del mismo rpc era partirlo en `@cron`s separados. `time.sleep(ms: Int) -> Void` bloquea el hilo de ESTA request/tarea (nunca el proceso entero) entre 0 y 300000ms (5 minutos) -- fuera de ese rango, error de runtime limpio, mismo criterio "fail loud" que `String.repeat`/`padStart`. Único método del nuevo módulo `time`. Ver GRAMMAR.md §3.286.
+
+Verificado: 4 tests de integración en `cli_time_sleep.rs` -- una medición de reloj REAL alrededor de un `linkc serve` confirma que efectivamente duerme lo pedido (no un no-op disfrazado); negativo/absurdamente grande fallan limpio; `0` es no-op válido; un argumento de tipo incorrecto es error de compilación. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.230.0] - 2026-09-08
 
 ### ✨ Añadido

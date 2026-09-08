@@ -134,6 +134,8 @@ pub enum Value {
     Image,
     /// Marcador interno para el módulo `background` (GRAMMAR.md §3.262)
     Background,
+    /// Marcador interno para el módulo `time` (GRAMMAR.md §3.286)
+    Time,
     /// Marcador interno para el módulo `env` (GRAMMAR.md §3.38)
     Env,
     /// Marcador interno para el módulo `request` (GRAMMAR.md §3.38) -- body
@@ -203,6 +205,7 @@ fn supports_bound_method_access(v: &Value) -> bool {
         | Value::Mcp
         | Value::Image
         | Value::Background
+        | Value::Time
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -256,6 +259,7 @@ fn is_marker_singleton(v: &Value) -> bool {
         | Value::Mcp
         | Value::Image
         | Value::Background
+        | Value::Time
         | Value::Env
         | Value::Request
         | Value::Smtp
@@ -363,6 +367,7 @@ impl std::fmt::Debug for Value {
             Value::Mcp => write!(f, "Mcp"),
             Value::Image => write!(f, "Image"),
             Value::Background => write!(f, "Background"),
+            Value::Time => write!(f, "Time"),
             Value::Env => write!(f, "Env"),
             Value::Request => write!(f, "Request"),
             Value::Smtp => write!(f, "Smtp"),
@@ -694,6 +699,9 @@ pub(crate) fn eval_expr(
             }
             if name == "background" {
                 return Ok(Value::Background);
+            }
+            if name == "time" {
+                return Ok(Value::Time);
             }
             if name == "env" {
                 return Ok(Value::Env);
@@ -4757,6 +4765,31 @@ fn call_method(
             }
             other => Err(err(format!("método desconocido sobre background: '{other}'"))),
         },
+        // GRAMMAR.md §3.286 (PLAN.md §9.24 Fase 2 ítem F5): la única
+        // operación de `time` -- espaciar llamadas salientes en un lote
+        // (ej. IndexNow) sin necesitar un `@cron` artificial por cada pausa.
+        Value::Time => match method {
+            "sleep" => {
+                let ms = match args.into_iter().next() {
+                    Some(Value::Int(n)) => n,
+                    _ => return Err(err("time.sleep requiere un argumento Int (ms)")),
+                };
+                // Tope de 5 minutos: un valor fuera de este rango casi
+                // seguro es un bug (ms/segundos confundidos, o un cálculo
+                // que dio negativo) -- mismo criterio "fail loud ante un
+                // valor adversarial/erróneo" que `String.repeat`/`padStart`
+                // (AUDIT-2026-08-27.md #9) en vez de bloquear el hilo de una
+                // request para siempre o silenciosamente no dormir nada.
+                if !(0..=300_000).contains(&ms) {
+                    return Err(err(format!(
+                        "time.sleep: 'ms' tiene que estar entre 0 y 300000 (5 minutos), se recibió {ms}"
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                Ok(Value::Null)
+            }
+            other => Err(err(format!("método desconocido sobre time: '{other}'"))),
+        },
         Value::Mcp => match method {
             "sample" => {
                 let prompt = match args.into_iter().next() {
@@ -6532,7 +6565,7 @@ pub fn value_to_json(v: &Value, simple_enums: &std::collections::HashSet<String>
         }
         // Salvaguarda: estos marcadores son internos del intérprete y nunca
         // deberían ser el resultado final de un rpc (ver eval_expr::Call).
-        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Image | Value::Background | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
+        Value::Db | Value::DbCollection(_) | Value::DbQuery(_) | Value::Auth | Value::Service(_) | Value::Math | Value::Crypto | Value::Http | Value::Json | Value::Base64 | Value::Pdf | Value::Excel | Value::Ai | Value::Mcp | Value::Image | Value::Background | Value::Time | Value::Env | Value::Request | Value::Smtp | Value::Response | Value::BoundMethod(_, _) | Value::FnRef(_) | Value::Closure(..) => {
             serde_json::Value::Null
         }
     }

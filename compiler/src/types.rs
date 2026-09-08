@@ -204,6 +204,10 @@ pub enum Type {
     /// -- `background.status(jobId)`, consultar el resultado eventual de un
     /// rpc `@background`.
     Background,
+    /// Tipo interno para el módulo `time` builtin (GRAMMAR.md §3.286) --
+    /// `time.sleep(ms)`, la única operación que necesita, PLAN.md §9.24
+    /// Fase 2 ítem F5.
+    Time,
 }
 
 /// Cómo se escribe un tipo EN c-script, para los mensajes de error.
@@ -293,6 +297,7 @@ impl std::fmt::Display for Type {
             Type::Mcp => write!(f, "mcp"),
             Type::Image => write!(f, "image"),
             Type::Background => write!(f, "background"),
+            Type::Time => write!(f, "time"),
         }
     }
 }
