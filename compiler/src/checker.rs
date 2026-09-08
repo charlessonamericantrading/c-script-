@@ -2762,6 +2762,46 @@ impl Checker {
         Ok(())
     }
 
+    /// `@startup` (GRAMMAR.md §3.287, PLAN.md §9.24 Fase 2 ítem E6) -- mismo
+    /// criterio de forma EXACTO que `@cron` (arriba): sin parámetros (nada
+    /// externo lo dispara con argumentos), retorno `Void` (nadie recibe una
+    /// respuesta), nunca sobre un `stream`, nunca combinado con otra
+    /// anotación (nunca alcanzable vía HTTP). A diferencia de `@cron` NO
+    /// hay restricción de "a lo sumo uno por programa" -- varios seeds
+    /// independientes son un caso real (PLAN.md cita "3 email_notifications"
+    /// Y "settings SMTP" como dos seeds separados en el mismo arranque).
+    fn check_startup_annotation(&self, r: &RpcDecl, is_stream: bool) -> Result<(), CheckError> {
+        if !r.startup() {
+            return Ok(());
+        }
+        if is_stream {
+            return Err(err(format!(
+                "`@startup` en el stream '{}': una tarea de arranque no es una conexión SSE que alguien pueda suscribirse -- llamalo desde un 'rpc' normal (GRAMMAR.md §3.287)",
+                r.name
+            )));
+        }
+        if r.annotations.len() > 1 {
+            return Err(err(format!(
+                "'{}' combina `@startup` con otra anotación -- un rpc con `@startup` nunca se llama vía HTTP, así que `@route`/`@authenticated`/`@rate_limit`/`@cache`/etc. no tendrían ningún efecto ahí (GRAMMAR.md §3.287)",
+                r.name
+            )));
+        }
+        if !r.params.is_empty() {
+            return Err(err(format!(
+                "'{}' declara `@startup` con parámetros -- nada externo dispara una tarea de arranque, así que no hay de dónde sacar sus argumentos (GRAMMAR.md §3.287)",
+                r.name
+            )));
+        }
+        let ret = self.resolve_type(&r.return_type)?;
+        if !matches!(ret, Type::Void) {
+            return Err(err(format!(
+                "'{}' declara `@startup` con retorno '{}' -- una tarea de arranque no tiene ningún caller que reciba una respuesta, así que su retorno tiene que ser 'Void' (GRAMMAR.md §3.287)",
+                r.name, ret
+            )));
+        }
+        Ok(())
+    }
+
     /// `@notFound` (GRAMMAR.md §3.274, PLAN.md §9.24 Fase 1 ítem A10) --
     /// mismo criterio de forma EXACTO que `@cron` (arriba): única anotación
     /// (nunca alcanzable vía HTTP directo, así que combinarla con
@@ -3745,6 +3785,7 @@ impl Checker {
         self.check_cache_annotation(r, is_stream)?;
         self.check_cors_annotation(r)?;
         self.check_cron_annotation(r, is_stream)?;
+        self.check_startup_annotation(r, is_stream)?;
         self.check_not_found_annotation(r, is_stream)?;
         self.check_csrf_annotation(r, is_stream)?;
         let Some(Annotation::Requires { enum_name, variant_names, ownership }) = r.auth() else {
@@ -10196,6 +10237,88 @@ type T = { id: Int, s: Status }")
             service Jobs {
                 @cron("5m")
                 rpc sweep() -> Int { 1 }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("Void")), "mensaje inesperado: {err:?}");
+    }
+
+    // ---- `@startup` (GRAMMAR.md §3.287, PLAN.md §9.24 Fase 2 ítem E6) ----
+
+    #[test]
+    fn startup_annotation_type_checks_alone_with_no_params_and_void_return() {
+        let src = r#"
+            service Boot {
+                @startup
+                rpc seed() -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn startup_annotation_allows_more_than_one_per_program_unlike_not_found() {
+        let src = r#"
+            service Boot {
+                @startup
+                rpc seedA() -> Void { }
+                @startup
+                rpc seedB() -> Void { }
+            }
+        "#;
+        assert!(check_source(src).is_ok(), "{:?}", check_source(src));
+    }
+
+    #[test]
+    fn startup_annotation_is_rejected_on_a_stream() {
+        let src = r#"
+            type Task = { id: Int }
+            db { tasks: Task[] }
+            service Tasks {
+                @startup
+                stream list() -> Task {
+                    db.tasks.all()
+                }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(
+            err.iter().any(|e| e.message.contains("startup") && e.message.contains("stream")),
+            "mensaje inesperado: {err:?}"
+        );
+    }
+
+    #[test]
+    fn startup_annotation_rejects_combining_with_another_annotation() {
+        let src = r#"
+            service Boot {
+                @startup
+                @rate_limit("1/1m")
+                rpc seed() -> Void { }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("combina")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn startup_annotation_rejects_parameters() {
+        let src = r#"
+            service Boot {
+                @startup
+                rpc seed(n: Int) -> Void { }
+            }
+        "#;
+        let err = check_source(src).unwrap_err();
+        assert!(err.iter().any(|e| e.message.contains("parámetros")), "mensaje inesperado: {err:?}");
+    }
+
+    #[test]
+    fn startup_annotation_rejects_a_non_void_return_type() {
+        let src = r#"
+            service Boot {
+                @startup
+                rpc seed() -> Int { 1 }
             }
         "#;
         let err = check_source(src).unwrap_err();

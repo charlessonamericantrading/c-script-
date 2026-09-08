@@ -804,6 +804,16 @@ impl RpcDecl {
         self.annotations.iter().any(|a| matches!(a, Annotation::RawSql))
     }
 
+    /// `true` si este rpc lleva `@startup` (GRAMMAR.md §3.287) -- corre UNA
+    /// vez al arrancar `linkc serve`/`serve-all`, antes de aceptar la
+    /// primera conexión. A diferencia de `@notFound`, cualquier cantidad de
+    /// rpcs pueden declararlo (varios seeds independientes, PLAN.md §9.24
+    /// Fase 2 ítem E6) -- corren todos, en el orden en que aparecen en el
+    /// programa.
+    pub fn startup(&self) -> bool {
+        self.annotations.iter().any(|a| matches!(a, Annotation::Startup))
+    }
+
     /// Mismo heurístico "nombre por forma" en UN solo lugar -- lo usan
     /// `codegen::ts_emit::emit_hooks` (para decidir si un rpc genera un
     /// hook `use...Query`) Y `checker::check_invalidates_annotation` (para
@@ -994,6 +1004,12 @@ pub enum Annotation {
     /// `llms.txt` y `linkc lint`), no algo que haya que grepear el código
     /// fuente para saber.
     RawSql,
+    /// `@startup` (GRAMMAR.md §3.287, PLAN.md §9.24 Fase 2 ítem E6): corre
+    /// UNA vez al arrancar el servidor, antes de aceptar la primera
+    /// conexión -- el hueco que `@cron` (recurrente, con un intervalo
+    /// mínimo) no cubre: un seed que solo tiene sentido ejecutar exactamente
+    /// una vez por arranque del proceso.
+    Startup,
 }
 
 /// `name_span`: mismo criterio y mismo motivo que `Field::name_span` (ver

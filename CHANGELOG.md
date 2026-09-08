@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.232.0] - 2026-09-08
+
+### ✨ Añadido
+**`@startup` -- cierra el ítem E6 de la Fase 2 de PLAN.md §9.24.** Un seed de datos que solo tiene sentido correr exactamente una vez por arranque del proceso (el caso real: sembrar `email_notifications`/settings SMTP si faltan) no encajaba en `@cron` (pensado para tareas recurrentes). `@startup` corre el rpc que la lleva SINCRÓNICAMENTE, antes de aceptar la primera conexión real -- el mensaje "escuchando en..." ahora se imprime DESPUÉS de que todas las tareas `@startup` terminaron, no antes. Mismo criterio de forma que `@cron` (sin params, retorno `Void`, nunca en un `stream`, nunca combinado con otra anotación), pero a diferencia de `@notFound` cualquier cantidad de rpcs pueden declararlo -- varios seeds independientes corren todos, en orden. Inalcanzable por su propia dirección HTTP (mismo mecanismo que `@cron`/`@notFound`). Un `@startup` que falla se loguea pero NO impide que el resto del servidor arranque -- misma resiliencia que una corrida de `@cron` fallida. Ver GRAMMAR.md §3.287.
+
+Verificado: 6 tests de `checker.rs` + 3 de integración en `cli_startup.rs` contra un `linkc serve` real -- dos seeds independientes siembran sus datos, visibles en la primerísima request real; un hit directo al rpc da 404 limpio y no vuelve a correr el seed; un `@startup` roto (panic a propósito) no impide que el resto del servidor sirva con normalidad. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## [1.231.0] - 2026-09-08
 
 ### ✨ Añadido

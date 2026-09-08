@@ -38,7 +38,7 @@ use super::encryption;
 use super::store::Backend;
 use super::session::SessionStore;
 use super::{
-    ai_stream_member, constant_time_eq, generate_uuid_v4, invoke_rpc_with_sessions, is_cron_member, is_not_found_member, is_stream_member, live_subscribe_collection, program_has_any_background_rpc,
+    ai_stream_member, constant_time_eq, generate_uuid_v4, invoke_rpc_with_sessions, is_cron_member, is_not_found_member, is_startup_member, is_stream_member, live_subscribe_collection, program_has_any_background_rpc,
     required_auth, required_background, required_cache, required_cors, required_idempotent, required_rate_limit, requires_csrf,
 };
 use crate::ast::{Annotation, Item, Member};
@@ -667,7 +667,6 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     // arriba -- el gate real es `mcp_secret.is_none()` más abajo, en
     // `handle_request`, no la existencia de este estado.
     let mcp_state = super::mcp::McpSharedState::new();
-    println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     // Pilar 1 del roadmap de concurrencia (26/08/2026, a partir del pedido
     // de skynet-d3): un hilo por request, no el loop de un solo hilo de
@@ -697,6 +696,48 @@ pub fn serve(program: &Program, config: ServeConfig) -> Result<(), String> {
     let idempotency_store = std::sync::Arc::new(parking_lot::Mutex::new(idempotency_store));
     let cache_store = std::sync::Arc::new(parking_lot::Mutex::new(cache_store));
     let metrics_store = std::sync::Arc::new(parking_lot::Mutex::new(metrics_store));
+
+    // `@startup` (GRAMMAR.md §3.287, PLAN.md §9.24 Fase 2 ítem E6): corre
+    // SINCRÓNICAMENTE acá, en el orden en que cada rpc aparece en el
+    // programa, ANTES de aceptar la primera conexión -- el hueco que
+    // `@cron` (recurrente, con un intervalo mínimo) no cubre: un seed que
+    // tiene que existir para cuando la primera request real llegue, no una
+    // carrera contra un hilo de fondo. Un error (`RuntimeError` o panic) se
+    // loguea y el arranque SIGUE -- mismo criterio de resiliencia que
+    // `@cron` de abajo (un seed roto no debería tumbar el servidor entero);
+    // la visibilidad del fallo es la línea de log, no un proceso que
+    // simplemente no llega a levantar.
+    for item in program.items.iter() {
+        let Item::Service(service) = item else { continue };
+        for member in &service.members {
+            let Member::Rpc(rpc) = member else { continue };
+            if !rpc.startup() {
+                continue;
+            }
+            let method = format!("{}.{}", service.name, rpc.name);
+            let no_args = serde_json::Value::Object(serde_json::Map::new());
+            let unwind_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                invoke_rpc_with_sessions(&program, &service.name, &rpc.name, &no_args, &db, &sessions, None)
+            }));
+            match unwind_result {
+                Ok(Ok(_)) => eprintln!("[startup] '{method}' corrió OK"),
+                Ok(Err(e)) => eprintln!("[startup] '{method}' falló: {:?} -- el arranque sigue igual (GRAMMAR.md §3.287)", e.message),
+                Err(payload) => {
+                    let msg = super::panic_payload_message(&*payload);
+                    eprintln!("[startup] '{method}' paniqueó: {msg:?} -- el arranque sigue igual (GRAMMAR.md §3.287)");
+                }
+            }
+        }
+    }
+
+    // Movido a ACÁ (después de `@startup`, arriba) a propósito -- este
+    // mensaje es la señal operativa de "el proceso está listo para tráfico
+    // real"; imprimirlo antes de que los seeds de arranque terminaran de
+    // correr sería mentirle a quien mira los logs (`pm2`/`systemctl`/un
+    // health-check externo esperando esta línea) sobre en qué momento el
+    // servidor de verdad puede atender una request con los datos que
+    // `@startup` todavía no terminó de sembrar.
+    println!("c-script server escuchando en http://localhost:{port}  (datos en {backend}, Ctrl+C para detener)");
 
     // `@cron("Ns"/"Nm"/"Nh"/"Nd")` (GRAMMAR.md §3.159): un hilo dedicado
     // POR tarea, spawneado una sola vez acá, nunca por request (a
@@ -1583,7 +1624,7 @@ fn handle_request(
     // devolviendo la MISMA página (vía `not_found_response`, que la busca
     // por su cuenta) -- consistente en vez de un caso especial "acceso
     // directo devuelve otra cosa".
-    if is_cron_member(program, service_name, rpc_name) || is_not_found_member(program, service_name, rpc_name) {
+    if is_cron_member(program, service_name, rpc_name) || is_not_found_member(program, service_name, rpc_name) || is_startup_member(program, service_name, rpc_name) {
         if let Some((status, body_text, content_type)) =
             not_found_response(program, db, sessions, extract_bearer_token(&request).as_deref())
         {
@@ -2430,7 +2471,8 @@ pub(crate) fn check_auth_gate(
         | Annotation::Cron(_)
         | Annotation::NotFound
         | Annotation::Csrf
-        | Annotation::RawSql => Ok(()),
+        | Annotation::RawSql
+        | Annotation::Startup => Ok(()),
     };
     AuthGateResult { audit: mk_audit(outcome.is_ok()), outcome }
 }

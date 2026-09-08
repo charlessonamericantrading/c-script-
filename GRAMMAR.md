@@ -10047,6 +10047,33 @@ service Jobs {
 
 **Verificado**: 4 tests de integración en `cli_time_sleep.rs` contra el binario real -- una medición de reloj real alrededor de un `linkc serve` confirma que la request efectivamente tarda al menos lo pedido (no un mock ni un no-op disfrazado); un valor negativo y uno absurdamente grande fallan limpio con el mensaje esperado; `0` es un no-op válido; un argumento de tipo incorrecto (`String` en vez de `Int`) es un error de COMPILACIÓN, nunca un panic. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
 
+### 3.287 `@startup`: correr un rpc una vez al arrancar — cierra Fase 2 ítem E6 de PLAN.md §9.24
+
+Origen: PLAN.md §9.24.4 ítem E6 -- un caso real citado por el propio plan: sembrar 3 `email_notifications` si la tabla está vacía, y settings SMTP si falta `smtp_host` y hay `SMTP_PASS` en el entorno. `@cron` (§3.159) no sirve para esto -- su intervalo mínimo (`"0s"` no es una expresión válida) asume una tarea RECURRENTE, y forzar una ejecución única con él sería un ajuste incómodo de una feature pensada para otra cosa.
+
+<!-- linkc:check -->
+```rust
+type Setting = { id: Int, key: String, value: String }
+db { settings: Setting[] }
+
+service Boot {
+  @startup
+  rpc seedSmtpDefaults() -> Void {
+    db.settings.insert(Setting { id: 0, key: "smtp_host", value: "localhost" });
+  }
+}
+```
+
+`@startup` corre el rpc que la lleva **exactamente una vez por arranque del proceso**, SINCRÓNICAMENTE, antes de que `linkc serve`/`serve-all` acepten la primera conexión real -- nunca en un hilo de fondo que podría perder la carrera contra la primera request. El mensaje `c-script server escuchando en ...` (la señal operativa de "listo para tráfico real", la línea que un `pm2`/`systemctl`/health-check externo espera) se imprime DESPUÉS de que todas las tareas `@startup` terminaron, nunca antes -- imprimirlo antes sería mentirle a quien mira los logs sobre en qué momento el servidor realmente puede atender una request con los datos que el seed todavía no terminó de escribir.
+
+**Mismo criterio de forma EXACTO que `@cron`**: sin parámetros (nada externo lo dispara con argumentos), retorno `Void` (nadie recibe una respuesta), nunca sobre un `stream`, nunca combinado con otra anotación (`@route`/`@authenticated`/etc. no tendrían ningún efecto en un rpc que nunca es alcanzable vía HTTP). **A diferencia de `@notFound` (a lo sumo uno por programa), cualquier cantidad de rpcs pueden declarar `@startup`** -- varios seeds independientes son el caso real que PLAN.md cita (el de emails y el de SMTP, dos tareas separadas), y corren todos, en el orden en que aparecen en el programa.
+
+**Un rpc `@startup` es inalcanzable por su propia dirección HTTP** (`POST /Service/rpc`), mismo mecanismo que `@cron`/`@notFound` (`is_startup_member`, consultado ANTES de invocar nada por esa vía) -- ya corrió una vez al arrancar, así que alcanzarlo de nuevo no tendría ningún sentido, y menos aún volver a ejecutar un seed que asume "corro una sola vez".
+
+**Resiliencia: un `@startup` que falla (error de runtime o panic) se loguea y el arranque SIGUE** -- mismo criterio que una corrida de `@cron` fallida no apaga la tarea entera: un seed roto no debería impedir que el resto del servidor (rpcs normales, otros seeds) funcione. La visibilidad del fallo es la línea `[startup] '<Service.rpc>' falló: ...`/`paniqueó: ...` en el log, no un proceso que simplemente no llega a levantar.
+
+**Verificado**: 6 tests de `checker.rs` (tipa solo con `Void`/sin params; DOS `@startup` en el mismo programa se aceptan, a diferencia de `@notFound`; rechazado en un `stream`; rechazado combinado con otra anotación; rechaza parámetros; rechaza un retorno no-`Void`) + 3 tests de integración en `cli_startup.rs` contra un `linkc serve` real: dos rpcs `@startup` independientes SIEMBRAN sus datos, visibles en la primerísima request real que llega; un hit directo a `/Boot/seedA` da 404 limpio y NO vuelve a correr el seed (la cuenta de filas no cambia); un `@startup` que hace `panic()` a propósito no impide que el resto del servidor arranque y sirva con normalidad. Suite completa sin regresiones, `cargo clippy -D warnings` limpio.
+
 ## 4. Tabla de Mapeo c-script → TypeScript (exhaustiva)
 
 | Construcción c-script | TypeScript emitido | Forma JSON en el cable | Nota |

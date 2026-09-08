@@ -354,6 +354,7 @@ fn annotation_badges(r: &RpcDecl) -> String {
         | Some(Annotation::NotFound)
         | Some(Annotation::Csrf)
         | Some(Annotation::RawSql)
+        | Some(Annotation::Startup)
         | None => r#"<span class="badge">🌐 Público</span>"#.to_string(),
     };
     let rate_limit_badge = match r.rate_limit() {

@@ -6357,6 +6357,19 @@ pub fn is_not_found_member(program: &Program, service_name: &str, rpc_name: &str
     })
 }
 
+/// Si `service_name.rpc_name` declaró `@startup` (GRAMMAR.md §3.287) --
+/// mismo patrón EXACTO que `is_cron_member`, arriba: ya corrió (una sola
+/// vez) antes de que el servidor aceptara la primera conexión, así que
+/// alcanzarlo de nuevo por `/Service/rpc` no tendría ningún sentido.
+pub fn is_startup_member(program: &Program, service_name: &str, rpc_name: &str) -> bool {
+    program.items.iter().any(|i| match i {
+        Item::Service(s) if s.name == service_name => {
+            s.members.iter().any(|m| matches!(m, Member::Rpc(r) if r.name == rpc_name && r.startup()))
+        }
+        _ => false,
+    })
+}
+
 /// Si `service_name.rpc_name` declaró `@csrf` (GRAMMAR.md §3.278) -- mismo
 /// patrón EXACTO que `is_not_found_member`, arriba. `server.rs` lo consulta
 /// en el gate de `check_csrf_gate`, ANTES de invocar el rpc.

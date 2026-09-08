@@ -1080,9 +1080,11 @@ impl Parser {
                 "csrf" => Annotation::Csrf,
                 // Sin argumentos, mismo criterio que "idempotent"/"csrf" (GRAMMAR.md §3.283).
                 "rawSql" => Annotation::RawSql,
+                // Sin argumentos, mismo criterio que "idempotent"/"rawSql" (GRAMMAR.md §3.287).
+                "startup" => Annotation::Startup,
                 other => {
                     return Err(self.error(format!(
-                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)', '@idempotent', '@cache(\"60s\")', '@cors(\"https://origen.com\")', '@cron(\"5m\")', '@notFound', '@csrf' o '@rawSql')"
+                        "anotación desconocida '@{other}' (se esperaba '@authenticated', '@requires(Enum.Variante)', '@content_type(\"tipo/mime\")', '@route(\"/ruta/:param\")', '@rate_limit(\"N/ventana\")', '@deprecated(\"motivo\")', '@cache_control(\"public, max-age=N\")', '@example(request: ..., response: ...)', '@invalidates(rpc1, rpc2, ...)', '@infinite(cursor, limit)', '@idempotent', '@cache(\"60s\")', '@cors(\"https://origen.com\")', '@cron(\"5m\")', '@notFound', '@csrf', '@rawSql' o '@startup')"
                     )))
                 }
             };
