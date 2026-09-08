@@ -97,6 +97,18 @@ impl RoutePattern {
         matches!(self.segments.last(), Some(Segment::CatchAll(_)))
     }
 
+    /// Un catch-all SIN ningún segmento literal fijo (`/:rest*` a secas,
+    /// nunca `/docs/:rest*`) -- el único caso que `resolve_route`
+    /// (`runtime/server.rs`, 08/09/2026, migración real de Segurma)
+    /// necesita distinguir: matchea CUALQUIER path, así que sin este
+    /// chequeo un programa que declara uno le tapa la dirección normal
+    /// `/Service/rpc` a CUALQUIER otro servicio que no tenga su propio
+    /// `@route` más específico -- exactamente lo opuesto de "@route es un
+    /// alias que se SUMA, nunca reemplaza nada" (GRAMMAR.md §3.37).
+    pub(crate) fn is_full_catchall(&self) -> bool {
+        self.fixed_len() == 0 && self.has_catchall()
+    }
+
     fn overlap_possible(&self, other: &RoutePattern) -> bool {
         if !self.has_catchall() && !other.has_catchall() {
             return self.segments.len() == other.segments.len()

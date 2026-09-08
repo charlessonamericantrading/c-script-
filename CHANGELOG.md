@@ -3,6 +3,13 @@
 Todos los cambios notables en este proyecto serán documentados en este archivo.
 El formato está basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.0.0/), y este proyecto adhiere a [Semantic Versioning](https://semver.org/lang/es/).
 
+## [1.241.0] - 2026-09-08
+
+### 🐛 Corregido
+**Bug real de rutas, mismo día que v1.240.0: un catch-all `@route("/:rest*")` sin segmento literal tapaba la dirección normal `/Service/rpc` de CUALQUIER otro servicio del programa.** Encontrado usando la feature recién shippeada para el login de admin real de Segurma (`AdminAuth.login(email, password)`, parámetros de BODY -- nunca pueden tener su propio `@route`, GRAMMAR.md §3.37): `POST /AdminAuth/login` caía en el catch-all (404 propio) en vez de invocar el rpc real. `resolve_route` ahora prueba, en orden: rutas específicas (sin cambios) → la dirección normal `/Service/rpc` cuando `Service` es un servicio de verdad declarado en el programa (nuevo) → recién ahí el catch-all sin segmento literal, si lo hay. Retrocompatible: un catch-all CON prefijo literal (`/docs/:rest*`) sigue ganando sin cambios; un path cuyo primer segmento no es un servicio real sigue cayendo en el catch-all como siempre. Ver GRAMMAR.md §3.295.
+
+Verificado: 1 test nuevo en `cli_route.rs` (un programa con catch-all + un segundo servicio con parámetros de body: la dirección normal llega al rpc real, un path legacy sigue cayendo en el catch-all) más los 18 tests preexistentes de `cli_route.rs` (incluidos los 2 de v1.240.0/§3.294) sin regresiones.
+
 ## [1.240.0] - 2026-09-08
 
 ### 🐛 Corregido

@@ -7932,6 +7932,43 @@ service Site {
 
 **Verificado**: 2 tests nuevos en `cli_route.rs` contra el binario real -- un programa con `@route("/:rest*")` sirve contenido real en `/` (y en cualquier otro path), mientras `/health`/`/status` siguen devolviendo el health-check de siempre sin ambigüedad; un programa SIN ninguna ruta que matchee la raíz (`CATCHALL_PROGRAM`, que solo tiene `/docs/:rest*`) sigue dando el health-check de siempre en `/`, byte a byte igual que antes de este cambio -- retrocompatibilidad confirmada, no solo asumida. Más los 18 tests preexistentes de `cli_route.rs` y los 2 de `cli_health.rs` sin regresiones.
 
+### 3.295 Un catch-all sin segmento literal ya no tapa `/Service/rpc` de otro servicio — RESUELTO (bug real, mismo día que §3.294)
+
+Origen: seguir usando el catch-all de §3.294 en el `.link` real de Segurma para el LOGIN de admin (PLAN.md §9.24 Fase 4f, ítem D3) -- el primer rpc con parámetros de BODY (`email`/`password`, nunca de segmento de URL) que convivía con `@route("/:rest*")` en el mismo programa. `POST /AdminAuth/login` (la dirección normal, la única posible para un rpc así: §3.37 exige que los parámetros de un `@route` vengan del PATH, nunca del body) devolvía la página 404 propia del catch-all en vez de invocar `AdminAuth.login` -- un bug real, encontrado usando la feature recién shippeada, no en el laboratorio.
+
+**La causa: `resolve_route` probaba TODO el `route_table` -- catch-all incluido -- ANTES de intentar la dirección normal `/Service/rpc`.** Un catch-all sin ningún segmento literal matchea CUALQUIER path (`fixed_len() == 0`), así que ganaba siempre que existiera, sin importar si el path en cuestión en realidad apuntaba a un servicio y rpc reales distintos -- exactamente lo opuesto de "`@route` es un alias que se SUMA, nunca reemplaza nada" (§3.37), esta vez para la dirección normal de CUALQUIER OTRO servicio del programa.
+
+<!-- linkc:check -->
+```rust
+service Site {
+  @route("/:rest*")
+  rpc catchAll(rest: String) -> String {
+    "pagina: " + rest
+  }
+}
+
+service Admin {
+  // Nunca puede tener su propio @route -- sus parámetros son de BODY.
+  rpc login(email: String, password: String) -> String {
+    "login de " + email
+  }
+}
+```
+
+Antes de esta ronda, `POST /Admin/login` de este programa caía en `Site.catchAll` (con `rest == "Admin/login"`), nunca en `Admin.login`.
+
+**El fix, en el orden real que `resolve_route` prueba ahora:**
+1. `route_table` EXCLUYENDO cualquier catch-all sin segmento literal (`RoutePattern::is_full_catchall()`, nuevo en `route.rs`) -- cualquier `@route` genuinamente específico (literal, `:param`, o un catch-all CON prefijo como `/docs/:rest*`) sigue ganando exactamente como antes, sin cambios.
+2. La dirección normal `/Service/rpc` -- pero SOLO si `Service` es de verdad un `service` declarado en el programa (`program.items`, ya disponible en `handle_request`). Esto es lo nuevo: antes, esta rama ni se intentaba si CUALQUIER catch-all existía.
+3. Recién ACÁ, el catch-all sin segmento literal (si lo hay) -- para cualquier path de 2+ segmentos que no matcheó nada específico y cuyo primer segmento no es un servicio real (el caso normal: un slug legacy cualquiera, `/precio-alarma/torrent`, donde "precio-alarma" no es ningún `Item::Service`).
+4. `Err(None)` -- 404/`--fallback-upstream` de siempre.
+
+`build_route_args` (nuevo, `runtime/server.rs`) extrae la lógica de decodificar segmentos capturados + query params a una función compartida entre los pasos 1 y 3 -- antes de este refactor hubiera sido fácil que las dos copias divergieran silenciosamente.
+
+**Por qué esto no rompe nada existente**: un catch-all CON al menos un segmento literal (`/docs/:rest*`) sigue ganando en el paso 1, sin cambios -- solo el caso de CERO segmentos literales (el que agregó §3.294 para la home) se difiere. Un path cuyo primer segmento NO es un servicio real (el caso ampliamente más común: contenido público, slugs legacy) sigue cayendo en el catch-all exactamente igual que antes.
+
+**Verificado**: 1 test nuevo en `cli_route.rs` contra el binario real -- un programa con `@route("/:rest*")` Y un segundo servicio `Admin.login` (parámetros de body): `POST /Admin/login` llega al rpc real (nunca al catch-all), un path de 2 segmentos cuyo primer segmento NO es un servicio real sigue cayendo en el catch-all como siempre. Más los 18 tests preexistentes de `cli_route.rs` (incluidos los 2 de §3.294) sin regresiones.
+
 ### 3.223 `linkc_http_outbound_*`: latencia y tasa de error de las llamadas `http.*` salientes en `/metrics` — RESUELTO, cierra PLAN.md §9.18 Eje F ítem 5
 
 Origen: `PLAN.md §9.18` Eje F ítem 5. `/metrics` (§3.149) veía solo las requests ENTRANTES; un producto que depende de un proveedor externo (un LLM, una pasarela de pago, un webhook de terceros) vive de la latencia y la tasa de error de ESE proveedor, y hasta ahora la única forma de verla era inferirla de la latencia total del rpc que lo llama -- imposible de separar del tiempo de base o del intérprete.

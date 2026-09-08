@@ -460,6 +460,59 @@ fn a_root_catchall_serves_real_content_at_slash_but_health_stays_the_default() {
     assert!(body.contains("\"engine\":\"c-script\""), "/status real: {body}");
 }
 
+const ROOT_CATCHALL_PLUS_OTHER_SERVICE_PROGRAM: &str = r#"
+service Site {
+  @route("/:rest*")
+  rpc catchAll(rest: String) -> String {
+    "CATCHALL=" + rest
+  }
+}
+
+service Admin {
+  rpc login(email: String, password: String) -> String {
+    "LOGIN:" + email
+  }
+}
+"#;
+
+#[test]
+fn a_root_catchall_never_shadows_the_normal_service_rpc_address_of_another_service() {
+    // 08/09/2026, migración real de Segurma: un rpc con parámetros de BODY
+    // (como un login) nunca puede tener su propio `@route` que le gane a
+    // un catch-all (§3.37: un `@route` con parámetro solo los toma del
+    // PATH) -- así que sin este fix, declarar CUALQUIER catch-all sin
+    // segmento literal (`/:rest*` a secas) volvía INALCANZABLE la
+    // dirección normal `/Service/rpc` de CUALQUIER otro servicio del
+    // programa, violando "@route es un alias que se SUMA, nunca reemplaza
+    // nada" (§3.37) -- justo lo opuesto de lo que ese principio promete.
+    let temp = TempDir::new("catchall-vs-other-service");
+    let src = temp.write("app.link", ROOT_CATCHALL_PLUS_OTHER_SERVICE_PROGRAM);
+    let server = Serve::start(&src);
+
+    // `/Admin/login` (2 segmentos, "Admin" es un servicio real) tiene que
+    // llegar al rpc real, NUNCA al catch-all.
+    let mut stream = TcpStream::connect(("127.0.0.1", server.port)).expect("conectar");
+    let body = "{\"email\":\"a@b.com\",\"password\":\"x\"}";
+    let req = format!(
+        "POST /Admin/login HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        server.port,
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    stream.flush().ok();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).ok();
+    assert!(resp.contains("\"LOGIN:a@b.com\""), "tiene que llegar al rpc real de Admin, no al catch-all: {resp}");
+    assert!(!resp.contains("CATCHALL"), "el catch-all NO tiene que interceptar esto: {resp}");
+
+    // El catch-all sigue funcionando para cualquier path que NO sea un
+    // servicio real declarado (acá, "lo-que-sea" no es ningún `service`
+    // del programa).
+    let (status, _, body) = server.get("/lo-que-sea/legacy");
+    assert_eq!(status, 200);
+    assert_eq!(body, "\"CATCHALL=lo-que-sea/legacy\"");
+}
+
 #[test]
 fn a_program_without_any_root_route_still_gets_the_health_check_at_slash() {
     // Retrocompatibilidad: CATCHALL_PROGRAM no declara nada que matchee

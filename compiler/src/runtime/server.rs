@@ -1231,7 +1231,7 @@ fn handle_request(
     // como a la respuesta real, o el browser nunca deja pasar la request
     // real para un origen que el override permite pero el CORS global no.
     let cors_override =
-        resolve_route(&path, "", route_table).ok().and_then(|(service_name, rpc_name, _)| required_cors(program, service_name, rpc_name));
+        resolve_route(program, &path, "", route_table).ok().and_then(|(service_name, rpc_name, _)| required_cors(program, service_name, rpc_name));
     let effective_cors_config = cors_override.map(parse_cors_override);
     let cors: &CorsConfig = effective_cors_config.as_ref().unwrap_or(cors);
     let mut cors_headers = cors.headers_for(request_origin.as_deref());
@@ -1502,7 +1502,7 @@ fn handle_request(
     // check de siempre queda como comportamiento por DEFECTO, no como
     // reserva dura -- retrocompatible al 100% para cualquier programa que
     // no declare nada en la raíz (el resultado es idéntico a antes).
-    let root_claimed_by_route = path == "/" && resolve_route(&path, "", route_table).is_ok();
+    let root_claimed_by_route = path == "/" && resolve_route(program, &path, "", route_table).is_ok();
     if path == "/health" || path == "/status" || (path == "/" && !root_claimed_by_route) {
         let services: Vec<String> = program
             .items
@@ -1677,7 +1677,7 @@ fn handle_request(
             }
         }
 
-    let (service_name, rpc_name, args_json) = match resolve_route(&path, &body, route_table) {
+    let (service_name, rpc_name, args_json) = match resolve_route(program, &path, &body, route_table) {
         Ok(resolved) => resolved,
         Err(None) => {
             // GRAMMAR.md §3.238: un path que no es de este `.link` va al
@@ -2404,7 +2404,71 @@ fn extra_rate_limit_key_as_string(v: &serde_json::Value) -> String {
 /// segmento capturado (o un query param) no convierte al tipo del parámetro,
 /// o falta un query param obligatorio, o (mismo camino de siempre) el body
 /// de un `/Service/rpc` no es JSON válido -- 400 en todos los casos.
+/// Arma `(service, rpc, args)` a partir de UN match ya encontrado contra
+/// `route_table` -- compartida entre las dos pasadas de `resolve_route`
+/// (sin catch-all completo, y con él) para que nunca puedan divergir en
+/// cómo decodifican un segmento o un query param.
+fn build_route_args<'a>(
+    entry: &'a RouteEntry,
+    captured: Vec<String>,
+    query_string: Option<&str>,
+) -> Result<(&'a str, &'a str, serde_json::Value), Option<String>> {
+    // `captured` está en el mismo orden que `entry.pattern.param_names()`
+    // (invariante de `RoutePattern::matches`), que es el mismo orden en
+    // que se armó `entry.param_is_int` en `build_route_table` -- así que
+    // zippearlos con los nombres da la asociación correcta.
+    let mut args = serde_json::Map::new();
+    for ((name, raw_segment), is_int) in entry.pattern.param_names().into_iter().zip(captured).zip(&entry.param_is_int) {
+        let decoded = percent_decode(&raw_segment);
+        let value = if *is_int {
+            match decoded.parse::<i64>() {
+                Ok(n) => serde_json::Value::from(n),
+                Err(_) => {
+                    return Err(Some(format!("parámetro de ruta ':{name}' inválido: se esperaba un entero, se recibió '{decoded}'")));
+                }
+            }
+        } else {
+            serde_json::Value::String(decoded)
+        };
+        args.insert(name.to_string(), value);
+    }
+    // Query string (§3.62): cualquier parámetro del rpc que no vino del
+    // path. Ausente + opcional -> `null`, mismo criterio que cualquier
+    // otro campo opcional del lenguaje; ausente + obligatorio -> 400.
+    if !entry.query_params.is_empty() {
+        let query_map = query_string.map(parse_query_string).unwrap_or_default();
+        for (name, is_int, optional) in &entry.query_params {
+            match query_map.get(name) {
+                Some(raw) => {
+                    let decoded = percent_decode_query_value(raw);
+                    let value = if *is_int {
+                        match decoded.parse::<i64>() {
+                            Ok(n) => serde_json::Value::from(n),
+                            Err(_) => {
+                                return Err(Some(format!(
+                                    "parámetro de query '{name}' inválido: se esperaba un entero, se recibió '{decoded}'"
+                                )));
+                            }
+                        }
+                    } else {
+                        serde_json::Value::String(decoded)
+                    };
+                    args.insert(name.clone(), value);
+                }
+                None if *optional => {
+                    args.insert(name.clone(), serde_json::Value::Null);
+                }
+                None => {
+                    return Err(Some(format!("falta el parámetro de query obligatorio '{name}'")));
+                }
+            }
+        }
+    }
+    Ok((&entry.service_name, &entry.rpc_name, serde_json::Value::Object(args)))
+}
+
 fn resolve_route<'a>(
+    program: &'a Program,
     path: &'a str,
     body: &str,
     route_table: &'a [RouteEntry],
@@ -2425,62 +2489,43 @@ fn resolve_route<'a>(
     // (checker.rs) ya garantiza que nunca hay dos entradas EMPATADAS en
     // especificidad que puedan matchear el mismo path real, así que nunca
     // hay ambigüedad sobre cuál de las que matchean es "la primera".
-    let matched = route_table.iter().find_map(|e| e.pattern.matches(&segments).map(|captured| (e, captured)));
+    //
+    // 08/09/2026 (migración real de Segurma): un catch-all SIN ningún
+    // segmento literal (`@route("/:rest*")` a secas) matchea CUALQUIER
+    // path -- sin excluirlo de ESTA primera pasada, le taparía la
+    // dirección normal `/Service/rpc` a CUALQUIER otro servicio del
+    // programa que no tenga su propio `@route` más específico, violando
+    // "@route es un alias que se SUMA, nunca reemplaza nada" (§3.37) para
+    // TODO lo demás. `is_full_catchall()` (route.rs) es el único caso que
+    // se excluye acá -- un catch-all con AL MENOS un segmento literal
+    // (`/docs/:rest*`) sigue en esta pasada normal, sin cambios.
+    let matched =
+        route_table.iter().filter(|e| !e.pattern.is_full_catchall()).find_map(|e| e.pattern.matches(&segments).map(|captured| (e, captured)));
     if let Some((entry, captured)) = matched {
-        // `captured` está en el mismo orden que `entry.pattern.param_names()`
-        // (invariante de `RoutePattern::matches`), que es el mismo orden en
-        // que se armó `entry.param_is_int` en `build_route_table` -- así que
-        // zippearlos con los nombres da la asociación correcta.
-        let mut args = serde_json::Map::new();
-        for ((name, raw_segment), is_int) in entry.pattern.param_names().into_iter().zip(captured).zip(&entry.param_is_int) {
-            let decoded = percent_decode(&raw_segment);
-            let value = if *is_int {
-                match decoded.parse::<i64>() {
-                    Ok(n) => serde_json::Value::from(n),
-                    Err(_) => {
-                        return Err(Some(format!(
-                            "parámetro de ruta ':{name}' inválido: se esperaba un entero, se recibió '{decoded}'"
-                        )));
-                    }
-                }
-            } else {
-                serde_json::Value::String(decoded)
-            };
-            args.insert(name.to_string(), value);
+        return build_route_args(entry, captured, query_string);
+    }
+    // Dirección normal `/Service/rpc` -- gana sobre un catch-all SIN
+    // segmento literal (excluido de la pasada de arriba) cuando `Service`
+    // es de verdad un servicio declarado en el programa: un rpc con
+    // parámetros de BODY (no de path) -- el caso más común, `createLead`,
+    // `login`, cualquier mutación -- nunca podría tener su propio `@route`
+    // que le gane al catch-all de otra forma (§3.37: un `@route` con
+    // parámetro solo puede tomarlos del PATH). Si `Service` no es un
+    // nombre real, sigue de largo al catch-all de abajo -- así un crawler
+    // pegándole a un slug legacy cualquiera (`/precio-alarma/torrent`,
+    // "servicio" = "precio-alarma", que no es ningún `Item::Service` real)
+    // todavía cae en el catch-all como corresponde.
+    if let Some((service_name, rpc_name)) = parse_path(path) {
+        let is_real_service = program.items.iter().any(|it| matches!(it, crate::ast::Item::Service(s) if s.name == service_name));
+        if is_real_service {
+            let args = parse_args(body).map_err(Some)?;
+            return Ok((service_name, rpc_name, args));
         }
-        // Query string (§3.62): cualquier parámetro del rpc que no vino del
-        // path. Ausente + opcional -> `null`, mismo criterio que cualquier
-        // otro campo opcional del lenguaje; ausente + obligatorio -> 400.
-        if !entry.query_params.is_empty() {
-            let query_map = query_string.map(parse_query_string).unwrap_or_default();
-            for (name, is_int, optional) in &entry.query_params {
-                match query_map.get(name) {
-                    Some(raw) => {
-                        let decoded = percent_decode_query_value(raw);
-                        let value = if *is_int {
-                            match decoded.parse::<i64>() {
-                                Ok(n) => serde_json::Value::from(n),
-                                Err(_) => {
-                                    return Err(Some(format!(
-                                        "parámetro de query '{name}' inválido: se esperaba un entero, se recibió '{decoded}'"
-                                    )));
-                                }
-                            }
-                        } else {
-                            serde_json::Value::String(decoded)
-                        };
-                        args.insert(name.clone(), value);
-                    }
-                    None if *optional => {
-                        args.insert(name.clone(), serde_json::Value::Null);
-                    }
-                    None => {
-                        return Err(Some(format!("falta el parámetro de query obligatorio '{name}'")));
-                    }
-                }
-            }
-        }
-        return Ok((&entry.service_name, &entry.rpc_name, serde_json::Value::Object(args)));
+    }
+    let matched_catchall =
+        route_table.iter().filter(|e| e.pattern.is_full_catchall()).find_map(|e| e.pattern.matches(&segments).map(|captured| (e, captured)));
+    if let Some((entry, captured)) = matched_catchall {
+        return build_route_args(entry, captured, query_string);
     }
     let (service_name, rpc_name) = parse_path(path).ok_or(None)?;
     let args = parse_args(body).map_err(Some)?;
