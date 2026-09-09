@@ -9380,7 +9380,7 @@ Origen: `PLAN.md §9.22` ítem 6. El informe original dejó la promesa condicion
 // Google, misma forma que ya documenta §3.114 para cualquier OAuth2
 // client-credentials.
 rpc sendPushFcm(projectId: String, deviceToken: String, title: String, body: String, serviceAccountEmail: String, privateKeyPem: String) -> String {
-  let iat = now().toMillis() / 1000;
+  let iat = now().toMillis().toInt() / 1000;
   let claims = "{\"iss\":\"" + serviceAccountEmail + "\",\"scope\":\"https://www.googleapis.com/auth/firebase.messaging\",\"aud\":\"https://oauth2.googleapis.com/token\",\"iat\":" + iat.toString() + ",\"exp\":" + (iat + 3600).toString() + "}";
   let assertion = crypto.jwtSignRS256(claims, privateKeyPem);
 
@@ -9388,7 +9388,7 @@ rpc sendPushFcm(projectId: String, deviceToken: String, title: String, body: Str
   let tokenResponse = http.postWithHeaders(
     "https://oauth2.googleapis.com/token",
     tokenBody,
-    [{ name: "Content-Type", value: "application/x-www-form-urlencoded" }],
+    [{ name: "Content-Type", value: "application/x-www-form-urlencoded" }]
   );
   let accessToken = json.parse(tokenResponse).access_token;
 
@@ -9396,7 +9396,7 @@ rpc sendPushFcm(projectId: String, deviceToken: String, title: String, body: Str
   http.postWithHeaders(
     "https://fcm.googleapis.com/v1/projects/" + projectId + "/messages:send",
     message,
-    [{ name: "Authorization", value: "Bearer " + accessToken }, { name: "Content-Type", value: "application/json" }],
+    [{ name: "Authorization", value: "Bearer " + accessToken }, { name: "Content-Type", value: "application/json" }]
   )
 }
 
@@ -9405,7 +9405,7 @@ rpc sendPushFcm(projectId: String, deviceToken: String, title: String, body: Str
 // el Key ID de la clave `.p8` descargada del portal de desarrolladores de
 // Apple; `teamId` va en el claim `iss` del payload, no en el header.
 rpc sendPushApns(deviceToken: String, teamId: String, keyId: String, privateKeyPem: String, bundleId: String, body: String) -> String {
-  let iat = now().toMillis() / 1000;
+  let iat = now().toMillis().toInt() / 1000;
   let claims = "{\"iss\":\"" + teamId + "\",\"iat\":" + iat.toString() + "}";
   let providerToken = crypto.jwtSignES256(claims, privateKeyPem, keyId);
 
@@ -9414,8 +9414,8 @@ rpc sendPushApns(deviceToken: String, teamId: String, keyId: String, privateKeyP
     "{\"aps\":{\"alert\":\"" + body + "\"}}",
     [
       { name: "Authorization", value: "Bearer " + providerToken },
-      { name: "apns-topic", value: bundleId },
-    ],
+      { name: "apns-topic", value: bundleId }
+    ]
   )
 }
 ```
